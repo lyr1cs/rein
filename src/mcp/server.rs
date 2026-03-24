@@ -165,7 +165,7 @@ impl ReinServer {
         let dedup_days = self.config.search.dedup_time_window_days;
 
         let result = self.with_store(|store| {
-            futures_lite_block(store.store_with_dedup(memory, dedup_sim, dedup_days))
+            store.store_with_dedup(memory, dedup_sim, dedup_days)
         });
 
         match result {
@@ -185,7 +185,7 @@ impl ReinServer {
         let id = params.id.clone();
 
         let result = self.with_store(|store| {
-            let mut memory = futures_lite_block(store.get(&params.id))?;
+            let mut memory = store.get(&params.id)?;
             memory.content = params.content.clone();
             memory.summary = params.content.chars().take(100).collect();
             if let Some(ref imp_str) = params.importance {
@@ -196,7 +196,7 @@ impl ReinServer {
                 }
             }
             memory.updated_at = chrono::Utc::now();
-            futures_lite_block(store.update(&memory))
+            store.update(&memory)
         });
 
         match result {
@@ -225,7 +225,7 @@ impl ReinServer {
         let compact = self.compact();
         let id = params.id.clone();
 
-        let result = self.with_store(|store| futures_lite_block(store.delete(&params.id)));
+        let result = self.with_store(|store| store.delete(&params.id));
 
         match result {
             Ok(()) => {
@@ -250,7 +250,7 @@ impl ReinServer {
     fn rein_list_topics(&self) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
 
-        let result = self.with_store(|store| futures_lite_block(store.list_topics()));
+        let result = self.with_store(|store| store.list_topics());
 
         match result {
             Ok(topics) => {
@@ -271,7 +271,7 @@ impl ReinServer {
     fn rein_stats(&self) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
 
-        let result = self.with_store(|store| futures_lite_block(store.stats()));
+        let result = self.with_store(|store| store.stats());
 
         match result {
             Ok(stats) => {
@@ -293,7 +293,7 @@ impl ReinServer {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
 
         let result = self.with_store(|store| {
-            futures_lite_block(store.health(params.topic.as_deref()))
+            store.health(params.topic.as_deref())
         });
 
         match result {
@@ -318,7 +318,7 @@ impl ReinServer {
         let compact = self.compact();
 
         let result = self.with_store(|store| {
-            let old_memories = futures_lite_block(store.consolidate(&params.topic))?;
+            let old_memories = store.consolidate(&params.topic)?;
 
             if old_memories.is_empty() {
                 return Ok((0, String::new()));
@@ -345,7 +345,7 @@ impl ReinServer {
             };
 
             let count = old_memories.len();
-            let id = futures_lite_block(store.store(consolidated))?;
+            let id = store.store(consolidated)?;
             Ok((count, id))
         });
 
@@ -385,7 +385,7 @@ impl ReinServer {
         let compact = self.compact();
 
         let result = self.with_store(|store| {
-            let topics = futures_lite_block(store.list_topics())?;
+            let topics = store.list_topics()?;
             let mut dups_found = 0u32;
             let mut dups_removed = 0u32;
 
@@ -414,7 +414,7 @@ impl ReinServer {
                 }
                 if !dry_run {
                     for id in &to_delete {
-                        if futures_lite_block(store.delete(id)).is_ok() {
+                        if store.delete(id).is_ok() {
                             dups_removed += 1;
                         }
                     }
@@ -450,28 +450,6 @@ impl ReinServer {
     }
 }
 
-/// Block on a future that is known to be synchronous (no real await points).
-/// This is safe for `SqliteStore` methods which are `async fn` but only do
-/// synchronous I/O.
-fn futures_lite_block<F: std::future::Future<Output = T>, T>(f: F) -> T {
-    // Since these futures resolve immediately (no real I/O), we can poll them
-    // once and they will be ready.
-    use std::pin::pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn vtable_noop() -> &'static RawWakerVTable {
-        &RawWakerVTable::new(|p| RawWaker::new(p, vtable_noop()), |_| {}, |_| {}, |_| {})
-    }
-    let raw = RawWaker::new(std::ptr::null(), vtable_noop());
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-
-    let mut fut = pin!(f);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(val) => val,
-        Poll::Pending => unreachable!("rein MemoryStore futures are always immediately ready (synchronous)"),
-    }
-}
 
 #[tool_handler]
 impl ServerHandler for ReinServer {
