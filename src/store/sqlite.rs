@@ -99,6 +99,22 @@ impl SqliteStore {
         Ok(old_memories)
     }
 
+    /// Get all memory (id, topic, summary, content) tuples for cache warmup.
+    pub fn get_all_for_warmup(&self) -> ReinResult<Vec<(String, String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, topic, summary, content FROM memories")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Record an access to a memory (bumps access_count and last_accessed).
     /// Call this only when memories are returned to the user via recall, NOT on internal lookups.
     pub fn record_access(&self, id: &str) -> ReinResult<()> {

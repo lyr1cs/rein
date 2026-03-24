@@ -768,6 +768,17 @@ impl ServerHandler for ReinServer {
 
 /// Start the MCP server over stdio.
 pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
+    // Background warmup: pre-compute embeddings for uncached memories
+    {
+        let warmup_config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            if let Ok(store) = warmup_config.open_store() {
+                rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
+            }
+        });
+    }
+
     let store = config.open_store()?;
     let server = ReinServer::new(store, config);
 
@@ -786,6 +797,17 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
 /// Start the MCP server over HTTP (Streamable HTTP / SSE).
 /// Accessible via Tailscale or LAN for remote memory queries.
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
+    // Background warmup: pre-compute embeddings for uncached memories
+    {
+        let warmup_config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            if let Ok(store) = warmup_config.open_store() {
+                rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
+            }
+        });
+    }
+
     use std::sync::Arc;
     use http_body_util::BodyExt;
     use rmcp::transport::streamable_http_server::{
