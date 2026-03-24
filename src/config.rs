@@ -270,9 +270,24 @@ impl ReinConfig {
     pub fn resolve_db_path(&self) -> PathBuf {
         if self.database.path == "auto" {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let data_dir = PathBuf::from(home).join(".rein");
-            std::fs::create_dir_all(&data_dir).ok();
-            data_dir.join("memories.db")
+            let new_dir = PathBuf::from(&home).join(".rein");
+            let new_path = new_dir.join("memories.db");
+
+            // Check for old location and auto-migrate
+            if !new_path.exists() {
+                if let Some(dirs) = directories::ProjectDirs::from("", "", "rein") {
+                    let old_path = dirs.data_dir().join("memories.db");
+                    if old_path.exists() {
+                        std::fs::create_dir_all(&new_dir).ok();
+                        if std::fs::rename(&old_path, &new_path).is_ok() {
+                            eprintln!("rein: migrated database from {} to {}", old_path.display(), new_path.display());
+                        }
+                    }
+                }
+            }
+
+            std::fs::create_dir_all(&new_dir).ok();
+            new_path
         } else {
             PathBuf::from(&self.database.path)
         }
