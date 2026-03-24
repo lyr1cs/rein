@@ -66,7 +66,7 @@ pub fn check_dedup(
     time_window_days: i64,
 ) -> ReinResult<DedupAction> {
     // Extract key tokens from content for FTS query (take first few words)
-    let query_tokens: Vec<&str> = content.split_whitespace().take(10).collect();
+    let query_tokens: Vec<&str> = content.split_whitespace().take(20).collect();
     if query_tokens.is_empty() {
         return Ok(DedupAction::CreateNew);
     }

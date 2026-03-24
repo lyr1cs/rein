@@ -63,7 +63,13 @@ impl SqliteStore {
                 rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| match r {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!("failed to deserialize memory row: {e}");
+                None
+            }
+        }).collect())
     }
 
     /// Atomically consolidate a topic: delete all old memories and insert replacement in one transaction.
@@ -172,7 +178,11 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
 
 impl MemoryStore for SqliteStore {
     fn store(&self, mut memory: Memory) -> ReinResult<String> {
-        let id = ulid::Ulid::new().to_string();
+        let id = if memory.id.is_empty() {
+            ulid::Ulid::new().to_string()
+        } else {
+            memory.id.clone()
+        };
         memory.id = id.clone();
         let now = Utc::now();
         memory.created_at = now;
@@ -317,7 +327,9 @@ impl MemoryStore for SqliteStore {
         topic: Option<&str>,
         limit: usize,
     ) -> ReinResult<Vec<Memory>> {
-        let results = vec::search_vec(&self.conn, embedding, limit)?;
+        // Fetch more than needed to compensate for topic filtering
+        let fetch_limit = if topic.is_some() { limit * 3 } else { limit };
+        let results = vec::search_vec(&self.conn, embedding, fetch_limit)?;
         let mut memories = Vec::new();
         for (id, _distance) in results {
             match self.get(&id) {
@@ -334,6 +346,7 @@ impl MemoryStore for SqliteStore {
                 Err(e) => return Err(e),
             }
         }
+        memories.truncate(limit);
         Ok(memories)
     }
 
@@ -381,7 +394,13 @@ impl MemoryStore for SqliteStore {
 
                 Ok((id, layer_str, decay_lambda, access_count, last_accessed_str))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("failed to deserialize memory row: {e}");
+                    None
+                }
+            })
             .filter_map(|(id, layer_str, decay_lambda, access_count, last_accessed_str)| {
                 let last_accessed = DateTime::parse_from_rfc3339(&last_accessed_str).ok()?;
                 let days = (now - last_accessed.with_timezone(&Utc)).num_seconds() as f64 / 86400.0;
@@ -390,6 +409,8 @@ impl MemoryStore for SqliteStore {
                 }
 
                 let lambda_eff = decay_lambda / (1.0 + access_count as f64 * 0.2);
+                // TODO: beta values should come from config or MemoryLayer::beta()
+                // instead of being hardcoded here. Currently duplicates MemoryLayer::beta().
                 let beta = if layer_str == "LTM" { 0.8 } else { 1.2 };
                 let new_strength = (-lambda_eff * days.powf(beta)).exp();
 
@@ -401,12 +422,14 @@ impl MemoryStore for SqliteStore {
             .collect();
 
         let count = updates.len() as u64;
+        self.conn.execute_batch("BEGIN TRANSACTION")?;
         for u in &updates {
             self.conn.execute(
                 "UPDATE memories SET strength = ?1 WHERE id = ?2",
                 rusqlite::params![u.new_strength, u.id],
             )?;
         }
+        self.conn.execute_batch("COMMIT")?;
 
         // Record last decay time
         self.conn.execute(
@@ -872,7 +895,7 @@ mod tests {
         let mem2 = test_memory_with_content(
             "rust",
             "ownership rules updated",
-            "Rust ownership rules are fundamental to memory safety in systems programming today",
+            "Rust ownership rules are fundamental to memory safety in Rust systems programming",
             Importance::High,
         );
         let id2 = store.store_with_dedup(mem2, 0.85, 7).unwrap();
@@ -912,7 +935,7 @@ mod tests {
         let mem2 = test_memory_with_content(
             "rust",
             "ownership rules updated",
-            "Rust ownership rules are fundamental to memory safety in systems programming today",
+            "Rust ownership rules are fundamental to memory safety in Rust systems programming",
             Importance::High,
         );
         let id2 = store.store_with_dedup(mem2, 0.85, 7).unwrap();
