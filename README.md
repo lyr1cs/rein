@@ -87,6 +87,7 @@ rein serve
 | `hook post` | Extract facts from tool output | `rein hook post` |
 | `hook compact` | Save context before compaction | `rein hook compact` |
 | `hook prompt` | Inject recalled memories into prompt | `rein hook prompt` |
+| `hook stop` | Save session summary on conversation end | `rein hook stop` |
 
 ### MCP Tools
 
@@ -232,16 +233,25 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
           { "type": "command", "command": "rein hook prompt", "timeout": 10 }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "rein hook stop", "timeout": 30 }
+        ]
+      }
     ]
   }
 }
 ```
 
-**Hook behavior:**
+**Hook behavior (4 hooks):**
 
 - `PostToolUse` -- extracts facts from tool output, stores as auto-extracted memories
 - `PreCompact` -- saves important context before context window compression
-- `UserPromptSubmit` -- injects recalled memories into the prompt as `<supermemory-context>`
+- `UserPromptSubmit` -- injects recalled memories into the prompt as `<rein-context>`
+- `Stop` -- extracts session summary with signal-based context windows on conversation end
 
 ### Remote Access via HTTP/SSE
 
@@ -472,6 +482,7 @@ rein serve
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
 | `hook prompt` | 将召回的记忆注入提示词 | `rein hook prompt` |
+| `hook stop` | 会话结束时保存会话摘要 | `rein hook stop` |
 
 ### MCP 工具
 
@@ -617,16 +628,25 @@ sse_bind = "127.0.0.1"
           { "type": "command", "command": "rein hook prompt", "timeout": 10 }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "rein hook stop", "timeout": 30 }
+        ]
+      }
     ]
   }
 }
 ```
 
-**Hook 行为说明：**
+**Hook 行为说明（4 个 Hook）：**
 
 - `PostToolUse` -- 从工具输出中提取事实，作为自动提取的记忆存储
 - `PreCompact` -- 在上下文窗口压缩前保存重要上下文
-- `UserPromptSubmit` -- 将召回的记忆以 `<supermemory-context>` 形式注入提示词
+- `UserPromptSubmit` -- 将召回的记忆以 `<rein-context>` 形式注入提示词
+- `Stop` -- 会话结束时通过信号关键词上下文窗口提取会话摘要
 
 ### 通过 HTTP/SSE 远程访问
 
