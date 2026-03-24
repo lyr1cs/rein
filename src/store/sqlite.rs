@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::extract::{check_dedup, DedupAction};
@@ -12,9 +12,10 @@ use super::{fts, schema, vec};
 ///
 /// Wraps `rusqlite::Connection` which is `!Send`. All database access should
 /// happen on the thread that created the connection. The MCP server uses
-/// `Mutex<SqliteStore>` with `SQLITE_OPEN_FULL_MUTEX` to allow safe cross-thread access.
+/// per-request connections with `SQLITE_OPEN_FULL_MUTEX` (serialized mode).
 pub struct SqliteStore {
     conn: Connection,
+    db_path: PathBuf,
 }
 
 impl SqliteStore {
@@ -39,7 +40,7 @@ impl SqliteStore {
             eprintln!("rein: FTS search still works. Vector search may return incorrect results.");
         }
 
-        Ok(Self { conn })
+        Ok(Self { conn, db_path: path.to_path_buf() })
     }
 
     /// Create an in-memory database for testing (default 3072 dims).
@@ -48,11 +49,16 @@ impl SqliteStore {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::init_schema(&conn, 3072)?;
-        Ok(Self { conn })
+        Ok(Self { conn, db_path: PathBuf::from(":memory:") })
     }
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The path to the database file (or ":memory:" for in-memory databases).
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Get all memories in a topic (for dedup scanning).
