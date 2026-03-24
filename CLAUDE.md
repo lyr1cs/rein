@@ -6,7 +6,7 @@
 
 ```bash
 cargo build
-cargo test            # 75+ tests, all must pass
+cargo test            # 83+ tests, all must pass
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
 

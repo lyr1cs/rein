@@ -16,6 +16,7 @@ use super::{fts, schema, vec};
 pub struct SqliteStore {
     conn: Connection,
     db_path: PathBuf,
+    dims: usize,
 }
 
 impl SqliteStore {
@@ -40,7 +41,7 @@ impl SqliteStore {
             eprintln!("rein: FTS search still works. Vector search may return incorrect results.");
         }
 
-        Ok(Self { conn, db_path: path.to_path_buf() })
+        Ok(Self { conn, db_path: path.to_path_buf(), dims })
     }
 
     /// Create an in-memory database for testing (default 3072 dims).
@@ -49,7 +50,7 @@ impl SqliteStore {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::init_schema(&conn, 3072)?;
-        Ok(Self { conn, db_path: PathBuf::from(":memory:") })
+        Ok(Self { conn, db_path: PathBuf::from(":memory:"), dims: 3072 })
     }
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
@@ -111,17 +112,18 @@ impl SqliteStore {
         Ok(old_memories)
     }
 
-    /// Get all memory (id, topic, summary, content) tuples for cache warmup.
-    pub fn get_all_for_warmup(&self) -> ReinResult<Vec<(String, String, String, String)>> {
+    /// Get all memory (id, topic, summary, content, keywords) tuples for cache warmup.
+    pub fn get_all_for_warmup(&self) -> ReinResult<Vec<(String, String, String, String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, topic, summary, content FROM memories")?;
+            .prepare("SELECT id, topic, summary, content, keywords FROM memories")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -783,7 +785,7 @@ impl SqliteStore {
 
     /// Fire-and-forget: remove from HNSW index after a delete.
     fn remove_from_hnsw(&self, id: &str) {
-        self.with_hnsw_lock(3072, |index| {
+        self.with_hnsw_lock(self.dims, |index| {
             let _ = index.delete(id);
         });
     }
