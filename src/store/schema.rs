@@ -49,6 +49,10 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
         CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength);
 
+        -- NOTE: `id` is included as a searchable FTS column for join convenience
+        -- (JOIN memories m ON m.id = f.id). Ideally id would not be indexed for
+        -- search, but removing it requires switching to rowid-based joins and
+        -- updating all triggers. Low impact; leaving as-is.
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             id, topic, summary, content, keywords,
             tokenize='porter unicode61'

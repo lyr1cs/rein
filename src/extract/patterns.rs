@@ -76,29 +76,22 @@ pub fn score_sentence(sentence: &str) -> u32 {
 }
 
 /// Split text into sentences by `.` `!` `?` followed by whitespace or end-of-string.
+/// Uses pre-collected char_indices for O(n) performance instead of repeated nth() calls.
 fn split_sentences(text: &str) -> Vec<&str> {
     let mut sentences = Vec::new();
+    let indices: Vec<(usize, char)> = text.char_indices().collect();
+    let len = indices.len();
     let mut start = 0;
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
 
     for i in 0..len {
-        let ch = chars[i];
+        let ch = indices[i].1;
         if ch == '.' || ch == '!' || ch == '?' {
             // Check if followed by whitespace or end-of-string
             let at_end = i + 1 >= len;
-            let followed_by_space = !at_end && chars[i + 1].is_whitespace();
+            let followed_by_space = !at_end && indices[i + 1].1.is_whitespace();
             if at_end || followed_by_space {
-                let byte_end = text
-                    .char_indices()
-                    .nth(i + 1)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(text.len());
-                let byte_start = text
-                    .char_indices()
-                    .nth(start)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(text.len());
+                let byte_start = indices[start].0;
+                let byte_end = if i + 1 < len { indices[i + 1].0 } else { text.len() };
                 let sentence = text[byte_start..byte_end].trim();
                 if !sentence.is_empty() {
                     sentences.push(sentence);
@@ -110,11 +103,7 @@ fn split_sentences(text: &str) -> Vec<&str> {
 
     // Handle trailing text without sentence-ending punctuation
     if start < len {
-        let byte_start = text
-            .char_indices()
-            .nth(start)
-            .map(|(idx, _)| idx)
-            .unwrap_or(text.len());
+        let byte_start = indices[start].0;
         let trailing = text[byte_start..].trim();
         if !trailing.is_empty() {
             sentences.push(trailing);
