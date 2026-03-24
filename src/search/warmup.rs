@@ -39,9 +39,9 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
     }
 
     // Filter out already-cached ones
-    let uncached: Vec<(String, String, String, String)> = memories
+    let uncached: Vec<(String, String, String, String, String)> = memories
         .into_iter()
-        .filter(|(_, topic, summary, content)| {
+        .filter(|(_, topic, summary, content, _)| {
             let text = prepend_metadata(topic, summary, content);
             EmbedCache::get(store.conn(), &text, &model)
                 .ok()
@@ -64,7 +64,7 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
     for chunk in uncached.chunks(100) {
         let texts: Vec<String> = chunk
             .iter()
-            .map(|(_, topic, summary, content)| prepend_metadata(topic, summary, content))
+            .map(|(_, topic, summary, content, _)| prepend_metadata(topic, summary, content))
             .collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
@@ -128,7 +128,7 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
     };
 
     let mut inserted = 0usize;
-    for (id, topic, summary, content) in &memories {
+    for (id, topic, summary, content, _keywords) in &memories {
         let text = prepend_metadata(topic, summary, content);
         if let Ok(Some(emb)) = EmbedCache::get(store.conn(), &text, &model) {
             if emb.len() == dims {
@@ -177,9 +177,8 @@ pub fn populate_tantivy(store: &SqliteStore) {
     };
 
     let mut indexed = 0usize;
-    for (id, topic, summary, content) in &memories {
-        // Use summary as keywords placeholder (keywords aren't returned by get_all_for_warmup)
-        if tantivy.insert(id, topic, summary, content, "").is_ok() {
+    for (id, topic, summary, content, keywords) in &memories {
+        if tantivy.insert(id, topic, summary, content, keywords).is_ok() {
             indexed += 1;
         }
     }

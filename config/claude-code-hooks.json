@@ -35,6 +35,18 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rein hook stop",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }
