@@ -23,6 +23,7 @@ impl EmbedCache {
     }
 
     /// Store an embedding in the cache, keyed by query text.
+    /// Evicts oldest entries when cache exceeds 10,000 entries.
     pub fn put(conn: &Connection, query: &str, embedding: &[f32]) -> ReinResult<()> {
         let hash = Self::hash_query(query);
         let blob = Self::f32_to_bytes(embedding);
@@ -31,6 +32,19 @@ impl EmbedCache {
             "INSERT OR REPLACE INTO embed_cache (query_hash, embedding, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![hash, blob, now],
         )?;
+        // Evict oldest entries if cache exceeds limit
+        const MAX_CACHE_ENTRIES: usize = 10_000;
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0)
+        ).unwrap_or(0);
+        if count > MAX_CACHE_ENTRIES {
+            conn.execute(
+                "DELETE FROM embed_cache WHERE query_hash IN (
+                    SELECT query_hash FROM embed_cache ORDER BY created_at ASC LIMIT ?1
+                )",
+                rusqlite::params![count - MAX_CACHE_ENTRIES],
+            )?;
+        }
         Ok(())
     }
 

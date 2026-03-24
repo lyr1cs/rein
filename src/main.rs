@@ -174,11 +174,23 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Recall {
             query,
             topic,
-            keyword: _,
+            keyword,
             limit,
         }) => {
             let store = store::SqliteStore::new(&config.resolve_db_path())?;
-            let results = store.search_fts(&query, topic.as_deref(), limit).await?;
+            let mut results = store.search_fts(&query, topic.as_deref(), limit).await?;
+            // Filter by keyword if specified
+            if let Some(ref kw) = keyword {
+                let kw_lower = kw.to_lowercase();
+                results.retain(|m| {
+                    m.keywords.iter().any(|k| k.to_lowercase().contains(&kw_lower))
+                        || m.content.to_lowercase().contains(&kw_lower)
+                });
+            }
+            // Record access for returned memories
+            for m in &results {
+                let _ = store.record_access(&m.id);
+            }
             let scored: Vec<(types::Memory, f32)> =
                 results.into_iter().map(|m| (m, 1.0)).collect();
             println!(
@@ -311,10 +323,32 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Dedup { dry_run }) => {
+            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let threshold = config.search.dedup_similarity as f32;
+            let topics = store.list_topics().await?;
+            let mut dups_found = 0u32;
+            let mut dups_removed = 0u32;
+            for topic in &topics {
+                let mems = store.get_by_topic(topic)?;
+                for i in 0..mems.len() {
+                    for j in (i + 1)..mems.len() {
+                        let sim = extract::similarity(&mems[i].content, &mems[j].content);
+                        if sim >= threshold {
+                            dups_found += 1;
+                            if dry_run {
+                                println!("  dup: '{}' ~ '{}' (sim={sim:.2})", &mems[i].summary.chars().take(40).collect::<String>(), &mems[j].summary.chars().take(40).collect::<String>());
+                            } else {
+                                store.delete(&mems[i].id).await?;
+                                dups_removed += 1;
+                            }
+                        }
+                    }
+                }
+            }
             if dry_run {
-                println!("Dedup dry-run: would scan for duplicates");
+                println!("Found {dups_found} duplicates (dry-run, nothing removed)");
             } else {
-                println!("Dedup: not yet implemented");
+                println!("Removed {dups_removed} of {dups_found} duplicates");
             }
         }
     }
