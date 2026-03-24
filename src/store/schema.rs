@@ -55,7 +55,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         -- updating all triggers. Low impact; leaving as-is.
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             id, topic, summary, content, keywords,
-            tokenize='porter unicode61'
+            tokenize='unicode61'
         );
 
         -- Triggers to keep FTS in sync
@@ -110,7 +110,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
 
         CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts USING fts5(
             id, name, definition, labels,
-            tokenize='porter unicode61'
+            tokenize='unicode61'
         );
 
         CREATE TRIGGER IF NOT EXISTS concepts_ai AFTER INSERT ON concepts BEGIN
@@ -151,6 +151,72 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         );"
     );
     conn.execute_batch(&vec_sql)?;
+
+    // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
+    migrate_fts_tokenizer(conn)?;
+
+    Ok(())
+}
+
+/// Check if FTS tables use the old porter tokenizer and rebuild with unicode61.
+fn migrate_fts_tokenizer(conn: &Connection) -> ReinResult<()> {
+    // Check current tokenizer by querying FTS config
+    let needs_rebuild: bool = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'memories_fts'",
+            [],
+            |row| {
+                let sql: String = row.get(0)?;
+                Ok(sql.contains("porter"))
+            },
+        )
+        .unwrap_or(false);
+
+    if needs_rebuild {
+        tracing::info!("rebuilding FTS index with unicode61 tokenizer (CJK support)");
+
+        // Rebuild memories_fts
+        conn.execute_batch("DROP TABLE IF EXISTS memories_fts;")?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE memories_fts USING fts5(
+                id, topic, summary, content, keywords,
+                tokenize='unicode61'
+            );"
+        )?;
+        // Re-populate from memories table
+        conn.execute_batch(
+            "INSERT INTO memories_fts(id, topic, summary, content, keywords)
+             SELECT id, topic, summary, content, keywords FROM memories;"
+        )?;
+
+        // Rebuild concepts_fts if it exists with porter
+        let concepts_needs_rebuild: bool = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'concepts_fts'",
+                [],
+                |row| {
+                    let sql: String = row.get(0)?;
+                    Ok(sql.contains("porter"))
+                },
+            )
+            .unwrap_or(false);
+
+        if concepts_needs_rebuild {
+            conn.execute_batch("DROP TABLE IF EXISTS concepts_fts;")?;
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE concepts_fts USING fts5(
+                    id, name, definition, labels,
+                    tokenize='unicode61'
+                );"
+            )?;
+            conn.execute_batch(
+                "INSERT INTO concepts_fts(id, name, definition, labels)
+                 SELECT id, name, definition, labels FROM concepts;"
+            )?;
+        }
+
+        tracing::info!("FTS index rebuilt with unicode61");
+    }
 
     Ok(())
 }
