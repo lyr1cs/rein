@@ -85,6 +85,9 @@ impl ReinServer {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let limit = params.limit.unwrap_or(10);
 
+        // NOTE: This holds the Mutex during the full recall pipeline including network I/O.
+        // In HTTP/SSE mode with concurrent clients, this serializes all recall requests.
+        // Future optimization: use a connection pool or release the lock before network calls.
         let result = self.with_store(|store| {
             crate::search::recall::recall(
                 store,
@@ -794,8 +797,14 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 
     let bind = format!("{}:{}", config.server.sse_bind, config.server.sse_port);
-    let db_path = config.resolve_db_path();
+    let _db_path = config.resolve_db_path();
     let config_clone = config.clone();
+
+    if config.server.sse_bind != "127.0.0.1" && config.server.sse_bind != "::1" {
+        eprintln!("rein: WARNING — HTTP server bound to {} with NO authentication!", config.server.sse_bind);
+        eprintln!("rein: Only use this on trusted networks (e.g., Tailscale).");
+    }
+    eprintln!("rein: NOTE — concurrent recall requests are serialized (single DB connection)");
     let cancel = CancellationToken::new();
 
     let session_manager = Arc::new(LocalSessionManager::default());
