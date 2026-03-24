@@ -83,6 +83,9 @@ enum Commands {
     Migrate {
         #[arg(long)]
         from_qmd: Option<String>,
+        /// Re-embed all memories with the current embedding model
+        #[arg(long)]
+        reindex: bool,
     },
     /// Auto-configure MCP clients
     Init {
@@ -261,23 +264,29 @@ async fn main() -> anyhow::Result<()> {
                 HookAction::Prompt => extract::hooks::hook_prompt(&config).await?,
             }
         }
-        Some(Commands::Migrate { from_qmd }) => {
-            let qmd_path = from_qmd
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
-                });
-            let store = config.open_store()?;
-            let embedder = embed::create_embedder(&config);
-            let report = store::migrate::migrate_from_qmd(
-                &qmd_path,
-                &store,
-                &config,
-                embedder.as_ref(),
-            )
-            .await?;
-            println!("{report}");
+        Some(Commands::Migrate { from_qmd, reindex }) => {
+            if reindex {
+                let store = config.open_store()?;
+                let report = store::migrate::reindex(&store, &config).await?;
+                println!("{report}");
+            } else {
+                let qmd_path = from_qmd
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
+                    });
+                let store = config.open_store()?;
+                let embedder = embed::create_embedder(&config);
+                let report = store::migrate::migrate_from_qmd(
+                    &qmd_path,
+                    &store,
+                    &config,
+                    embedder.as_ref(),
+                )
+                .await?;
+                println!("{report}");
+            }
         }
         Some(Commands::Init { dry_run }) => {
             auto_configure(dry_run)?;
