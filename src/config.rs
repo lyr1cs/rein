@@ -242,6 +242,20 @@ impl ReinConfig {
         merge_toml(config, toml_str)
     }
 
+    /// The embedding model name (for cache keying and model-change detection).
+    pub fn embedding_model(&self) -> String {
+        format!("{}:{}", self.embedding.provider, self.embedding.google.model)
+    }
+
+    /// Open a SqliteStore with the current config's model and dimensions.
+    pub fn open_store(&self) -> crate::types::ReinResult<crate::store::SqliteStore> {
+        crate::store::SqliteStore::new(
+            &self.resolve_db_path(),
+            &self.embedding_model(),
+            self.embedding.dimensions,
+        )
+    }
+
     /// Resolve the database path. `"auto"` → `~/.local/share/rein/memories.db`
     pub fn resolve_db_path(&self) -> PathBuf {
         if self.database.path == "auto" {
