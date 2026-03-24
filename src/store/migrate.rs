@@ -181,10 +181,20 @@ pub async fn reindex(
 ) -> anyhow::Result<ReindexReport> {
     use crate::store::schema;
 
-    // 1. Rebuild vector index (drops old vec_memories, creates new with current dims)
+    // 1. Validate embedder is available BEFORE touching the vector index
+    let embedder = crate::embed::create_embedder(config)
+        .ok_or_else(|| anyhow::anyhow!("no embedding provider configured (set provider and API key)"))?;
+
+    // 2. Health check: test embed one string to verify the API works
+    let test_result = embedder.embed("health check").await;
+    if let Err(e) = test_result {
+        return Err(anyhow::anyhow!("embedding health check failed: {e}. Vector index NOT modified."));
+    }
+
+    // 3. Now safe to rebuild vector index
     schema::rebuild_vector_index(store.conn(), config.embedding.dimensions)?;
 
-    // 2. Get all memories
+    // 4. Get all memories
     let mut stmt = store
         .conn()
         .prepare("SELECT id, topic, summary, content FROM memories")?;
@@ -202,14 +212,7 @@ pub async fn reindex(
         });
     }
 
-    // 3. Create embedder
-    let embedder = crate::embed::create_embedder(config);
-    let embedder = match embedder {
-        Some(e) => e,
-        None => return Err(anyhow::anyhow!("no embedding provider configured")),
-    };
-
-    // 4. Batch embed and insert vectors
+    // 5. Batch embed and insert vectors
     let mut embedded = 0usize;
     let mut errors = 0usize;
 
@@ -224,6 +227,11 @@ pub async fn reindex(
 
         match embedder.embed_batch(&text_refs).await {
             Ok(embs) => {
+                if embs.len() != chunk.len() {
+                    tracing::warn!("batch returned {} embeddings for {} inputs, skipping batch", embs.len(), chunk.len());
+                    errors += chunk.len();
+                    continue;
+                }
                 for (i, emb) in embs.iter().enumerate() {
                     let id = &chunk[i].0;
                     if let Err(e) = crate::store::vec::insert_embedding(store.conn(), id, emb) {
