@@ -3,16 +3,42 @@ use std::collections::HashSet;
 use crate::store::SqliteStore;
 use crate::types::{MemoryStore, ReinResult};
 
-/// Jaccard similarity between two texts (token-level).
+/// Normalize text for similarity comparison: lowercase + strip punctuation.
+fn normalize_tokens(text: &str) -> HashSet<String> {
+    text.split_whitespace()
+        .map(|t| t.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Jaccard similarity between two texts (token-level, punctuation-stripped).
 pub fn jaccard_similarity(a: &str, b: &str) -> f32 {
-    let set_a: HashSet<&str> = a.split_whitespace().collect();
-    let set_b: HashSet<&str> = b.split_whitespace().collect();
+    let set_a = normalize_tokens(a);
+    let set_b = normalize_tokens(b);
     let intersection = set_a.intersection(&set_b).count();
     let union = set_a.union(&set_b).count();
     if union == 0 {
         return 0.0;
     }
     intersection as f32 / union as f32
+}
+
+/// Containment similarity: what fraction of the shorter text is covered by the longer.
+/// Better than Jaccard for dedup — a short summary of a longer text scores high.
+pub fn containment_similarity(a: &str, b: &str) -> f32 {
+    let set_a = normalize_tokens(a);
+    let set_b = normalize_tokens(b);
+    let smaller = set_a.len().min(set_b.len());
+    if smaller == 0 {
+        return 0.0;
+    }
+    set_a.intersection(&set_b).count() as f32 / smaller as f32
+}
+
+/// Combined similarity: max of Jaccard and Containment.
+/// Use this for dedup decisions — catches both paraphrases and subsets.
+pub fn similarity(a: &str, b: &str) -> f32 {
+    jaccard_similarity(a, b).max(containment_similarity(a, b))
 }
 
 /// What to do when storing a potentially duplicate memory.
@@ -58,7 +84,7 @@ pub async fn check_dedup(
     let mut best_memory = None;
 
     for candidate in &candidates {
-        let sim = jaccard_similarity(content, &candidate.content);
+        let sim = similarity(content, &candidate.content);
         if sim > best_sim {
             best_sim = sim;
             best_memory = Some(candidate);
@@ -112,5 +138,38 @@ mod tests {
         assert!((jaccard_similarity("", "") - 0.0).abs() < f32::EPSILON);
         assert!((jaccard_similarity("hello", "") - 0.0).abs() < f32::EPSILON);
         assert!((jaccard_similarity("", "world") - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_jaccard_strips_punctuation() {
+        // "pool" vs "pool." should match after stripping punctuation
+        let a = "database connection pool";
+        let b = "database connection pool.";
+        assert!((jaccard_similarity(a, b) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_containment_subset() {
+        // Short text is fully contained in longer text
+        let long = "Fixed OOM bug by closing database connection pool properly";
+        let short = "Fixed OOM bug by closing database connection pool";
+        let sim = containment_similarity(long, short);
+        assert!(sim > 0.95, "containment should be ~1.0, got {sim}");
+    }
+
+    #[test]
+    fn test_containment_disjoint() {
+        let a = "alpha beta gamma";
+        let b = "one two three";
+        assert!((containment_similarity(a, b) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_similarity_picks_best() {
+        // Jaccard is low (0.65) but containment is high (1.0)
+        let a = "Fixed OOM bug by closing database connection pool properly. The issue was that connections were not being released back to the pool after query execution.";
+        let b = "Fixed OOM bug by closing database connection pool. Connections were not released back after query.";
+        let sim = similarity(a, b);
+        assert!(sim > 0.70, "similarity should be > 0.70 (containment dominates), got {sim}");
     }
 }
