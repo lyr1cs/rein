@@ -30,15 +30,10 @@ pub fn recall(
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
 
-    // === Level 1: FTS5 (<1ms) ===
+    // === Level 1: FTS (Tantivy BM25 → FTS5 fallback) ===
     let fts_start = std::time::Instant::now();
-    let fts_results = store.search_fts(query, topic, limit * 2)?;
+    let (fts_results, fts_ranked) = try_tantivy_then_fts5(store, query, topic, limit * 2)?;
     tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = fts_results.len(), "fts search");
-    let fts_ranked: Vec<(String, f32)> = fts_results
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.id.clone(), -(i as f32)))
-        .collect();
 
     // === Level 2+3: Vector search (cached → API) ===
     let vec_start = std::time::Instant::now();
@@ -260,4 +255,46 @@ fn vec_search_direct(
     }
 }
 
+/// Try Tantivy BM25 search first, fall back to FTS5.
+/// Returns (memories, ranked_ids) for use in the recall pipeline.
+fn try_tantivy_then_fts5(
+    store: &SqliteStore,
+    query: &str,
+    topic: Option<&str>,
+    limit: usize,
+) -> ReinResult<(Vec<Memory>, Vec<(String, f32)>)> {
+    use std::path::Path;
 
+    let db_path = store.db_path();
+    if db_path.to_str() != Some(":memory:") {
+        let parent = db_path.parent().unwrap_or(Path::new("."));
+        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(parent) {
+            if let Ok(results) = tantivy.search(query, topic, limit) {
+                if !results.is_empty() {
+                    // Convert tantivy results to Memory objects
+                    let mut memories = Vec::new();
+                    let mut ranked = Vec::new();
+                    for (i, (id, _score)) in results.into_iter().enumerate() {
+                        if let Ok(m) = store.get(&id) {
+                            ranked.push((m.id.clone(), -(i as f32)));
+                            memories.push(m);
+                        }
+                    }
+                    if !memories.is_empty() {
+                        tracing::debug!(hits = memories.len(), "tantivy search");
+                        return Ok((memories, ranked));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to FTS5
+    let fts_results = store.search_fts(query, topic, limit)?;
+    let fts_ranked: Vec<(String, f32)> = fts_results
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.clone(), -(i as f32)))
+        .collect();
+    Ok((fts_results, fts_ranked))
+}
