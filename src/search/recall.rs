@@ -27,8 +27,13 @@ pub fn recall(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
+    let _span = tracing::info_span!("recall", query = query).entered();
+    let total_start = std::time::Instant::now();
+
     // === Level 1: FTS5 (<1ms) ===
+    let fts_start = std::time::Instant::now();
     let fts_results = store.search_fts(query, topic, limit * 2)?;
+    tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = fts_results.len(), "fts search");
     let fts_ranked: Vec<(String, f32)> = fts_results
         .iter()
         .enumerate()
@@ -36,7 +41,9 @@ pub fn recall(
         .collect();
 
     // === Level 2+3: Vector search (cached → API) ===
+    let vec_start = std::time::Instant::now();
     let vec_ranked = try_vector_search(store, config, query, topic, limit);
+    tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = vec_ranked.len(), "vector search");
 
     // Collect vector-only IDs before moving vec_ranked into RRF
     let vec_ids: Vec<String> = vec_ranked.iter().map(|(id, _)| id.clone()).collect();
@@ -90,6 +97,7 @@ pub fn recall(
     let local_memories: Vec<Memory> = local_results.iter().map(|(m, _)| m.clone()).collect();
     let local_scores: std::collections::HashMap<String, f32> = local_results.iter().map(|(m, s)| (m.id.clone(), *s)).collect();
 
+    let sm_start = std::time::Instant::now();
     let supermemory_results = if config.sync.supermemory_enabled {
         if let Some(ref api_key) = config.sync.api_key {
             let client = SupermemoryClient::new(api_key.clone());
@@ -103,6 +111,7 @@ pub fn recall(
     } else {
         vec![]
     };
+    tracing::debug!(elapsed_ms = sm_start.elapsed().as_millis() as u64, hits = supermemory_results.len(), "supermemory search");
 
     let auto_memory_results = if config.sync.auto_memory_enabled {
         let scanner = AutoMemoryScanner::new(config.sync.auto_memory_glob.clone());
@@ -137,6 +146,7 @@ pub fn recall(
         }
     }
 
+    tracing::debug!(elapsed_ms = total_start.elapsed().as_millis() as u64, results = results.len(), "recall complete");
     Ok(results)
 }
 
