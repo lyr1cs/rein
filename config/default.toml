@@ -10,6 +10,7 @@ model = "gemini-embedding-001"
 
 [embedding.omlx]
 endpoint = "http://localhost:8000/v1"
+model = "default"
 
 [search]
 rrf_k = 60.0
