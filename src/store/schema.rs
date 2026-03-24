@@ -21,7 +21,8 @@ pub fn init_sqlite_vec() {
 }
 
 /// Create all tables, indexes, triggers, and virtual tables.
-pub fn init_schema(conn: &Connection) -> ReinResult<()> {
+/// `dims` is the embedding dimension (e.g., 3072 for gemini-embedding-001).
+pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
@@ -82,15 +83,76 @@ pub fn init_schema(conn: &Connection) -> ReinResult<()> {
         ",
     )?;
 
-    // Vector table needs sqlite-vec loaded
-    conn.execute_batch(
-        "
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+    // Vector table needs sqlite-vec loaded; dimension is dynamic
+    let vec_sql = format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
             id TEXT PRIMARY KEY,
-            embedding float[3072] distance_metric=cosine
-        );
-        ",
+            embedding float[{dims}] distance_metric=cosine
+        );"
+    );
+    conn.execute_batch(&vec_sql)?;
+
+    Ok(())
+}
+
+/// Check if the embedding model has changed since last run.
+/// Returns true if model changed (requiring re-embedding).
+/// Stores current model info in metadata for next startup.
+pub fn check_embedding_model(
+    conn: &Connection,
+    model: &str,
+    dims: usize,
+) -> ReinResult<bool> {
+    let stored_model: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'embedding_model'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let stored_dims: Option<usize> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'embedding_dims'",
+            [],
+            |row| {
+                let s: String = row.get(0)?;
+                Ok(s.parse::<usize>().unwrap_or(0))
+            },
+        )
+        .ok();
+
+    let changed = match (&stored_model, stored_dims) {
+        (Some(m), Some(d)) => m != model || d != dims,
+        (None, None) => false, // First run, no change
+        _ => true,             // Partial info, treat as changed
+    };
+
+    // Store current model info
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_model', ?1)",
+        rusqlite::params![model],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_dims', ?1)",
+        rusqlite::params![dims.to_string()],
     )?;
 
+    Ok(changed)
+}
+
+/// Rebuild vector index when embedding model changes.
+/// Drops vec_memories and embed_cache, recreates with new dimensions.
+pub fn rebuild_vector_index(conn: &Connection, dims: usize) -> ReinResult<()> {
+    tracing::warn!("embedding model changed — rebuilding vector index (dims={dims})");
+    conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
+    conn.execute_batch("DELETE FROM embed_cache;")?;
+    let vec_sql = format!(
+        "CREATE VIRTUAL TABLE vec_memories USING vec0(
+            id TEXT PRIMARY KEY,
+            embedding float[{dims}] distance_metric=cosine
+        );"
+    );
+    conn.execute_batch(&vec_sql)?;
     Ok(())
 }

@@ -474,7 +474,7 @@ impl ServerHandler for ReinServer {
 
 /// Start the MCP server over stdio.
 pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
-    let store = SqliteStore::new(&config.resolve_db_path())?;
+    let store = config.open_store()?;
     let server = ReinServer::new(store, config);
 
     let transport = rmcp::transport::io::stdio();
@@ -513,7 +513,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
 
     let service = StreamableHttpService::new(
         move || {
-            let store = SqliteStore::new(&db_path)
+            let store = config_clone.open_store()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             let server = ReinServer::new(store, config_clone.clone());
             Ok(server)
