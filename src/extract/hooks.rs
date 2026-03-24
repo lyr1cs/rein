@@ -25,11 +25,18 @@ fn extract_hook_text(input: &str) -> String {
         if let Some(output) = json.get("tool_output").and_then(|v| v.as_str()) {
             return output.to_string();
         }
-        // PreCompact: { "transcript": "..." }
+        // Stop hook: { "transcript_path": "/path/to/transcript.jsonl", ... }
+        // Read the actual transcript file and extract human/assistant turns
+        if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
+            if let Ok(transcript_content) = std::fs::read_to_string(path) {
+                return extract_transcript_text(&transcript_content);
+            }
+        }
+        // PreCompact / Stop fallback: { "transcript": "..." }
         if let Some(transcript) = json.get("transcript").and_then(|v| v.as_str()) {
             return transcript.to_string();
         }
-        // Stop: { "transcript": "...", "summary": "..." }
+        // Stop: { "summary": "..." }
         if let Some(summary) = json.get("summary").and_then(|v| v.as_str()) {
             return summary.to_string();
         }
@@ -38,6 +45,60 @@ fn extract_hook_text(input: &str) -> String {
     }
     // Not JSON, use as-is
     input.to_string()
+}
+
+/// Extract readable text from a Claude Code JSONL transcript file.
+/// Each line is a JSON object with type="human"|"assistant" and message.content.
+fn extract_transcript_text(jsonl: &str) -> String {
+    let mut turns = Vec::new();
+    for line in jsonl.lines() {
+        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+            let msg_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if msg_type != "human" && msg_type != "assistant" {
+                continue;
+            }
+
+            // Extract text content from message.content (can be string or array)
+            let content = if let Some(msg) = entry.get("message") {
+                extract_message_content(msg.get("content"))
+            } else {
+                extract_message_content(entry.get("content"))
+            };
+
+            if !content.is_empty() {
+                let prefix = if msg_type == "human" { "User" } else { "Assistant" };
+                // Truncate very long turns
+                let truncated: String = content.chars().take(500).collect();
+                turns.push(format!("{}: {}", prefix, truncated));
+            }
+        }
+    }
+
+    // Keep last 20 turns to limit size
+    let start = if turns.len() > 20 { turns.len() - 20 } else { 0 };
+    turns[start..].join("\n\n")
+}
+
+/// Extract text from a message content field (handles string and array formats).
+fn extract_message_content(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter()
+                .filter_map(|item| {
+                    if let Some(s) = item.as_str() {
+                        Some(s.to_string())
+                    } else if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Layer 0: PostToolUse -- extract facts from tool output.
