@@ -8,7 +8,7 @@ rein — Multi-source cross-validated memory MCP server for AI agents. Rust sing
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (80+)
+cargo test            # All tests must pass (83+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
@@ -44,7 +44,7 @@ src/
 │   └── chunker.rs   # Semantic text chunking
 ├── extract/
 │   ├── patterns.rs  # Rule-based keyword scoring
-│   ├── hooks.rs     # Three-layer hook commands
+│   ├── hooks.rs     # Four-layer hook commands (post, compact, prompt, stop)
 │   └── dedup.rs     # Similarity (Jaccard + containment)
 ├── sync/
 │   ├── supermemory.rs # Supermemory v4 API client
