@@ -1,0 +1,44 @@
+[database]
+path = "auto"
+
+[embedding]
+provider = "google"
+dimensions = 3072
+
+[embedding.google]
+model = "gemini-embedding-001"
+
+[embedding.omlx]
+endpoint = "http://localhost:8000/v1"
+
+[search]
+rrf_k = 60.0
+rrf_fts_weight = 0.3
+rrf_vec_weight = 0.7
+waterfall_fts_threshold = 0.5
+dedup_similarity = 0.85
+dedup_time_window_days = 7
+
+[chunking]
+max_tokens = 512
+overlap_percent = 10
+metadata_prefix = true
+
+[sync]
+supermemory_enabled = true
+auto_memory_enabled = true
+auto_memory_glob = "~/.claude/projects/*/memory/**/*.md"
+
+[decay]
+base_lambda = 0.06
+ltm_beta = 0.8
+stm_beta = 1.2
+interval_hours = 24
+prune_threshold = 0.05
+stm_to_ltm_access_count = 5
+
+[server]
+compact = false
+sse_enabled = false
+sse_port = 8680
+sse_bind = "0.0.0.0"

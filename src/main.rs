@@ -1,3 +1,4 @@
+mod config;
 mod embed;
 mod extract;
 mod search;
