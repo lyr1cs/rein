@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod recall;
 pub mod rrf;
 pub mod scoring;
+pub mod warmup;
 pub mod waterfall;
 
 pub use chunker::semantic_chunk;
