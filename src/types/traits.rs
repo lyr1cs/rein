@@ -22,20 +22,19 @@ pub struct HealthReport {
 }
 
 /// Core storage backend for memories.
-#[allow(async_fn_in_trait)]
 pub trait MemoryStore {
-    async fn store(&self, memory: Memory) -> ReinResult<String>;
-    async fn get(&self, id: &str) -> ReinResult<Memory>;
-    async fn update(&self, memory: &Memory) -> ReinResult<()>;
-    async fn delete(&self, id: &str) -> ReinResult<()>;
-    async fn search_fts(&self, query: &str, topic: Option<&str>, limit: usize) -> ReinResult<Vec<Memory>>;
-    async fn search_vec(&self, embedding: &[f32], topic: Option<&str>, limit: usize) -> ReinResult<Vec<Memory>>;
-    async fn apply_decay(&self) -> ReinResult<u64>;
-    async fn prune(&self, threshold: f64) -> ReinResult<u64>;
-    async fn list_topics(&self) -> ReinResult<Vec<String>>;
-    async fn consolidate(&self, topic: &str) -> ReinResult<Vec<Memory>>;
-    async fn stats(&self) -> ReinResult<StoreStats>;
-    async fn health(&self, topic: Option<&str>) -> ReinResult<Vec<HealthReport>>;
+    fn store(&self, memory: Memory) -> ReinResult<String>;
+    fn get(&self, id: &str) -> ReinResult<Memory>;
+    fn update(&self, memory: &Memory) -> ReinResult<()>;
+    fn delete(&self, id: &str) -> ReinResult<()>;
+    fn search_fts(&self, query: &str, topic: Option<&str>, limit: usize) -> ReinResult<Vec<Memory>>;
+    fn search_vec(&self, embedding: &[f32], topic: Option<&str>, limit: usize) -> ReinResult<Vec<Memory>>;
+    fn apply_decay(&self) -> ReinResult<u64>;
+    fn prune(&self, threshold: f64) -> ReinResult<u64>;
+    fn list_topics(&self) -> ReinResult<Vec<String>>;
+    fn consolidate(&self, topic: &str) -> ReinResult<Vec<Memory>>;
+    fn stats(&self) -> ReinResult<StoreStats>;
+    fn health(&self, topic: Option<&str>) -> ReinResult<Vec<HealthReport>>;
 }
 
 /// Embedding provider for vector search.

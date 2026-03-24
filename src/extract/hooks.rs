@@ -40,8 +40,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                 memory,
                 config.search.dedup_similarity as f32,
                 config.search.dedup_time_window_days,
-            )
-            .await;
+            );
     }
     Ok(())
 }
@@ -84,8 +83,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
                 memory,
                 config.search.dedup_similarity as f32,
                 config.search.dedup_time_window_days,
-            )
-            .await;
+            );
     }
     Ok(())
 }
@@ -100,7 +98,7 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     }
 
     let store = config.open_store()?;
-    let results = store.search_fts(query, None, 5).await?;
+    let results = store.search_fts(query, None, 5)?;
 
     if results.is_empty() {
         return Ok(());
