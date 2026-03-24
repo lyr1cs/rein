@@ -361,7 +361,7 @@ impl MemoryStore for SqliteStore {
 
         // Fetch all non-critical memories
         let mut stmt = self.conn.prepare(
-            "SELECT id, layer, decay_lambda, access_count, created_at, strength
+            "SELECT id, layer, decay_lambda, access_count, last_accessed, strength
              FROM memories WHERE importance != 'critical'",
         )?;
 
@@ -376,15 +376,15 @@ impl MemoryStore for SqliteStore {
                 let layer_str: String = row.get(1)?;
                 let decay_lambda: f64 = row.get(2)?;
                 let access_count: u32 = row.get(3)?;
-                let created_at_str: String = row.get(4)?;
+                let last_accessed_str: String = row.get(4)?;
                 let _strength: f64 = row.get(5)?;
 
-                Ok((id, layer_str, decay_lambda, access_count, created_at_str))
+                Ok((id, layer_str, decay_lambda, access_count, last_accessed_str))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id, layer_str, decay_lambda, access_count, created_at_str)| {
-                let created_at = DateTime::parse_from_rfc3339(&created_at_str).ok()?;
-                let days = (now - created_at.with_timezone(&Utc)).num_seconds() as f64 / 86400.0;
+            .filter_map(|(id, layer_str, decay_lambda, access_count, last_accessed_str)| {
+                let last_accessed = DateTime::parse_from_rfc3339(&last_accessed_str).ok()?;
+                let days = (now - last_accessed.with_timezone(&Utc)).num_seconds() as f64 / 86400.0;
                 if days <= 0.0 {
                     return None;
                 }
@@ -747,14 +747,11 @@ mod tests {
         low.created_at = Utc::now() - chrono::Duration::days(30);
         let low_id = store.store(low).unwrap();
 
-        // Manually set created_at in the past so decay has effect
+        // Manually set created_at and last_accessed in the past so decay has effect
+        let past = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         store.conn.execute(
-            "UPDATE memories SET created_at = ?1 WHERE id IN (?2, ?3)",
-            rusqlite::params![
-                (Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
-                med_id,
-                low_id
-            ],
+            "UPDATE memories SET created_at = ?1, last_accessed = ?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![past, med_id, low_id],
         ).unwrap();
 
         let count = store.apply_decay().unwrap();
