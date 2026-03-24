@@ -152,7 +152,13 @@ fn try_vector_search(
         None => return vec![],
     };
 
-    match embed_blocking(&api_key, &config.embedding.google.model, config.embedding.dimensions, query) {
+    // Create client once for the embedding API call
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    match embed_blocking(&client, &api_key, &config.embedding.google.model, config.embedding.dimensions, query) {
         Ok(embedding) => {
             // Cache for next time
             let _ = EmbedCache::put(store.conn(), query, &model, &embedding);
@@ -203,27 +209,23 @@ fn vec_search_direct(
 
 /// Embedding call that works within a tokio async runtime.
 /// Uses `block_in_place` + async reqwest (not reqwest::blocking which panics inside tokio).
-fn embed_blocking(api_key: &str, model: &str, dims: usize, text: &str) -> Result<Vec<f32>, String> {
+fn embed_blocking(client: &reqwest::Client, api_key: &str, model: &str, dims: usize, text: &str) -> Result<Vec<f32>, String> {
     let api_key = api_key.to_string();
     let model = model.to_string();
     let text = text.to_string();
+    let client = client.clone();
 
     tokio::task::block_in_place(move || {
         tokio::runtime::Handle::current().block_on(async {
-            embed_async(&api_key, &model, dims, &text).await
+            embed_async(&client, &api_key, &model, dims, &text).await
         })
     })
 }
 
-async fn embed_async(api_key: &str, model: &str, dims: usize, text: &str) -> Result<Vec<f32>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("client error: {e}"))?;
-
+async fn embed_async(client: &reqwest::Client, api_key: &str, model: &str, dims: usize, text: &str) -> Result<Vec<f32>, String> {
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={}",
-        model, api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
+        model
     );
     let body = serde_json::json!({
         "model": format!("models/{}", model),
@@ -231,7 +233,9 @@ async fn embed_async(api_key: &str, model: &str, dims: usize, text: &str) -> Res
         "outputDimensionality": dims
     });
 
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| format!("request error: {e}"))?;
+    let resp = client.post(&url)
+        .header("x-goog-api-key", api_key)
+        .json(&body).send().await.map_err(|e| format!("request error: {e}"))?;
     let status = resp.status();
     let text_body = resp.text().await.map_err(|e| format!("read error: {e}"))?;
 
