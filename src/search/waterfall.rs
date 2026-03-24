@@ -32,7 +32,7 @@ pub async fn waterfall_search<S: MemoryStore, E: Embedder>(
     vec_weight: f32,
 ) -> ReinResult<Vec<SearchResult>> {
     // 1. FTS5 search
-    let fts_results = store.search_fts(query, None, limit).await?;
+    let fts_results = store.search_fts(query, None, limit)?;
     let fts_ranked: Vec<(String, f32)> = fts_results
         .iter()
         .enumerate()
@@ -42,7 +42,7 @@ pub async fn waterfall_search<S: MemoryStore, E: Embedder>(
     // 2. Vector search (cached or API)
     let vec_results = if let Some(emb) = embedder {
         let embedding = emb.embed(query).await?;
-        store.search_vec(&embedding, None, limit).await?
+        store.search_vec(&embedding, None, limit)?
     } else {
         vec![]
     };

@@ -58,7 +58,7 @@ pub enum DedupAction {
 /// - If > threshold and time diff < time_window_days -> MergeInto(id)
 /// - If > threshold and time diff >= time_window_days -> Supersede(id)
 /// - Otherwise -> CreateNew
-pub async fn check_dedup(
+pub fn check_dedup(
     store: &SqliteStore,
     topic: &str,
     content: &str,
@@ -73,7 +73,7 @@ pub async fn check_dedup(
     let query = query_tokens.join(" ");
 
     // Search existing memories in this topic
-    let candidates = store.search_fts(&query, Some(topic), 10).await?;
+    let candidates = store.search_fts(&query, Some(topic), 10)?;
 
     if candidates.is_empty() {
         return Ok(DedupAction::CreateNew);

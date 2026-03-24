@@ -68,7 +68,7 @@ impl SqliteStore {
 
     /// Atomically consolidate a topic: delete all old memories and insert replacement in one transaction.
     /// Returns the old memories for reference. If insertion fails, everything rolls back.
-    pub async fn consolidate_atomic(&self, topic: &str, replacement: Memory) -> ReinResult<Vec<Memory>> {
+    pub fn consolidate_atomic(&self, topic: &str, replacement: Memory) -> ReinResult<Vec<Memory>> {
         self.conn.execute_batch("BEGIN TRANSACTION")?;
 
         // Collect old memories
@@ -84,7 +84,7 @@ impl SqliteStore {
         }
 
         // Insert replacement within same transaction
-        if let Err(e) = self.store(replacement).await {
+        if let Err(e) = self.store(replacement) {
             let _ = self.conn.execute_batch("ROLLBACK");
             return Err(e);
         }
@@ -171,7 +171,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
 }
 
 impl MemoryStore for SqliteStore {
-    async fn store(&self, mut memory: Memory) -> ReinResult<String> {
+    fn store(&self, mut memory: Memory) -> ReinResult<String> {
         let id = ulid::Ulid::new().to_string();
         memory.id = id.clone();
         let now = Utc::now();
@@ -220,7 +220,7 @@ impl MemoryStore for SqliteStore {
         Ok(id)
     }
 
-    async fn get(&self, id: &str) -> ReinResult<Memory> {
+    fn get(&self, id: &str) -> ReinResult<Memory> {
         let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
         let memory = stmt
             .query_row(rusqlite::params![id], |row| {
@@ -242,7 +242,7 @@ impl MemoryStore for SqliteStore {
         Ok(memory)
     }
 
-    async fn update(&self, memory: &Memory) -> ReinResult<()> {
+    fn update(&self, memory: &Memory) -> ReinResult<()> {
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_ids_json = serde_json::to_string(&memory.related_ids)?;
         let now = Utc::now();
@@ -289,7 +289,7 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    async fn delete(&self, id: &str) -> ReinResult<()> {
+    fn delete(&self, id: &str) -> ReinResult<()> {
         let rows = self
             .conn
             .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
@@ -301,7 +301,7 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    async fn search_fts(
+    fn search_fts(
         &self,
         query: &str,
         topic: Option<&str>,
@@ -311,7 +311,7 @@ impl MemoryStore for SqliteStore {
         Ok(results.into_iter().map(|(m, _)| m).collect())
     }
 
-    async fn search_vec(
+    fn search_vec(
         &self,
         embedding: &[f32],
         topic: Option<&str>,
@@ -320,7 +320,7 @@ impl MemoryStore for SqliteStore {
         let results = vec::search_vec(&self.conn, embedding, limit)?;
         let mut memories = Vec::new();
         for (id, _distance) in results {
-            match self.get(&id).await {
+            match self.get(&id) {
                 Ok(m) => {
                     if let Some(t) = topic {
                         if m.topic == t {
@@ -337,7 +337,7 @@ impl MemoryStore for SqliteStore {
         Ok(memories)
     }
 
-    async fn apply_decay(&self) -> ReinResult<u64> {
+    fn apply_decay(&self) -> ReinResult<u64> {
         // Check if decay was run recently
         let last_decay: Option<String> = self
             .conn
@@ -417,7 +417,7 @@ impl MemoryStore for SqliteStore {
         Ok(count)
     }
 
-    async fn prune(&self, threshold: f64) -> ReinResult<u64> {
+    fn prune(&self, threshold: f64) -> ReinResult<u64> {
         let rows = self.conn.execute(
             "DELETE FROM memories WHERE layer = 'STM' AND strength < ?1
              AND importance NOT IN ('critical', 'high')",
@@ -426,7 +426,7 @@ impl MemoryStore for SqliteStore {
         Ok(rows as u64)
     }
 
-    async fn list_topics(&self) -> ReinResult<Vec<String>> {
+    fn list_topics(&self) -> ReinResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT topic FROM memories GROUP BY topic ORDER BY COUNT(*) DESC",
         )?;
@@ -434,7 +434,7 @@ impl MemoryStore for SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    async fn consolidate(&self, topic: &str) -> ReinResult<Vec<Memory>> {
+    fn consolidate(&self, topic: &str) -> ReinResult<Vec<Memory>> {
         // Use a transaction to ensure atomicity: either all delete or nothing
         self.conn.execute_batch("BEGIN TRANSACTION")?;
 
@@ -468,7 +468,7 @@ impl MemoryStore for SqliteStore {
         Ok(memories)
     }
 
-    async fn stats(&self) -> ReinResult<StoreStats> {
+    fn stats(&self) -> ReinResult<StoreStats> {
         let total_memories: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
@@ -504,7 +504,7 @@ impl MemoryStore for SqliteStore {
         })
     }
 
-    async fn health(&self, topic: Option<&str>) -> ReinResult<Vec<HealthReport>> {
+    fn health(&self, topic: Option<&str>) -> ReinResult<Vec<HealthReport>> {
         fn parse_health_row(row: &rusqlite::Row) -> rusqlite::Result<HealthReport> {
             let topic: String = row.get(0)?;
             let count: usize = row.get(1)?;
@@ -551,19 +551,19 @@ impl SqliteStore {
     /// - If a similar memory exists within the time window, merges content into it.
     /// - If a similar memory exists but is older, supersedes it with the new memory.
     /// - Otherwise, creates a new memory.
-    pub async fn store_with_dedup(
+    pub fn store_with_dedup(
         &self,
         memory: Memory,
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
-        match check_dedup(self, &memory.topic, &memory.content, similarity_threshold, time_window_days).await? {
+        match check_dedup(self, &memory.topic, &memory.content, similarity_threshold, time_window_days)? {
             DedupAction::CreateNew => {
-                self.store(memory).await
+                self.store(memory)
             }
             DedupAction::MergeInto(existing_id) => {
                 // Update existing memory: append content, refresh summary/keywords, boost strength
-                if let Ok(mut existing) = self.get(&existing_id).await {
+                if let Ok(mut existing) = self.get(&existing_id) {
                     existing.content = format!("{}\n\n{}", existing.content, memory.content);
                     existing.summary = existing.content.chars().take(100).collect();
                     // Merge keywords (deduplicated)
@@ -578,23 +578,23 @@ impl SqliteStore {
                     }
                     existing.strength = (existing.strength + 0.2).min(1.0);
                     existing.updated_at = chrono::Utc::now();
-                    self.update(&existing).await?;
+                    self.update(&existing)?;
                     Ok(existing_id)
                 } else {
-                    self.store(memory).await
+                    self.store(memory)
                 }
             }
             DedupAction::Supersede(old_id) => {
-                let new_id = self.store(memory).await?;
+                let new_id = self.store(memory)?;
                 // Mark old memory as superseded
-                self.mark_superseded(&old_id, &new_id).await?;
+                self.mark_superseded(&old_id, &new_id)?;
                 Ok(new_id)
             }
         }
     }
 
     /// Mark an old memory as superseded by a new one.
-    pub async fn mark_superseded(&self, old_id: &str, new_id: &str) -> ReinResult<()> {
+    pub fn mark_superseded(&self, old_id: &str, new_id: &str) -> ReinResult<()> {
         let rows = self.conn.execute(
             "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
             rusqlite::params![new_id, old_id],
@@ -633,15 +633,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_store_and_get() {
+    #[test]
+    fn test_store_and_get() {
         let store = SqliteStore::in_memory().unwrap();
         let mem = test_memory("rust", "ownership rules", Importance::High);
         let original_summary = mem.summary.clone();
         let original_topic = mem.topic.clone();
 
-        let id = store.store(mem).await.unwrap();
-        let fetched = store.get(&id).await.unwrap();
+        let id = store.store(mem).unwrap();
+        let fetched = store.get(&id).unwrap();
 
         assert_eq!(fetched.id, id);
         assert_eq!(fetched.summary, original_summary);
@@ -651,78 +651,60 @@ mod tests {
         assert_eq!(fetched.access_count, 0); // get() is now read-only, no side effects
     }
 
-    #[tokio::test]
-    async fn test_delete() {
+    #[test]
+    fn test_delete() {
         let store = SqliteStore::in_memory().unwrap();
         let mem = test_memory("rust", "borrow checker", Importance::Medium);
-        let id = store.store(mem).await.unwrap();
+        let id = store.store(mem).unwrap();
 
-        store.delete(&id).await.unwrap();
-        let result = store.get(&id).await;
+        store.delete(&id).unwrap();
+        let result = store.get(&id);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ReinError::NotFound(_)));
     }
 
-    #[tokio::test]
-    async fn test_update() {
+    #[test]
+    fn test_update() {
         let store = SqliteStore::in_memory().unwrap();
         let mem = test_memory("rust", "lifetimes", Importance::Medium);
-        let id = store.store(mem).await.unwrap();
+        let id = store.store(mem).unwrap();
 
-        let mut fetched = store.get(&id).await.unwrap();
+        let mut fetched = store.get(&id).unwrap();
         fetched.content = "Updated content about lifetimes".to_string();
-        store.update(&fetched).await.unwrap();
+        store.update(&fetched).unwrap();
 
-        let updated = store.get(&id).await.unwrap();
+        let updated = store.get(&id).unwrap();
         assert_eq!(updated.content, "Updated content about lifetimes");
     }
 
-    #[tokio::test]
-    async fn test_list_topics() {
+    #[test]
+    fn test_list_topics() {
         let store = SqliteStore::in_memory().unwrap();
-        store
-            .store(test_memory("rust", "ownership", Importance::High))
-            .await
-            .unwrap();
-        store
-            .store(test_memory("rust", "borrowing", Importance::Medium))
-            .await
-            .unwrap();
-        store
-            .store(test_memory("python", "decorators", Importance::Low))
-            .await
-            .unwrap();
+        store.store(test_memory("rust", "ownership", Importance::High)).unwrap();
+        store.store(test_memory("rust", "borrowing", Importance::Medium)).unwrap();
+        store.store(test_memory("python", "decorators", Importance::Low)).unwrap();
 
-        let topics = store.list_topics().await.unwrap();
+        let topics = store.list_topics().unwrap();
         assert_eq!(topics.len(), 2);
         // rust has 2 entries, should come first
         assert_eq!(topics[0], "rust");
         assert_eq!(topics[1], "python");
     }
 
-    #[tokio::test]
-    async fn test_fts_search() {
+    #[test]
+    fn test_fts_search() {
         let store = SqliteStore::in_memory().unwrap();
-        store
-            .store(test_memory("rust", "ownership rules", Importance::High))
-            .await
-            .unwrap();
-        store
-            .store(test_memory("rust", "borrow checker", Importance::Medium))
-            .await
-            .unwrap();
-        store
-            .store(test_memory("python", "decorators", Importance::Low))
-            .await
-            .unwrap();
+        store.store(test_memory("rust", "ownership rules", Importance::High)).unwrap();
+        store.store(test_memory("rust", "borrow checker", Importance::Medium)).unwrap();
+        store.store(test_memory("python", "decorators", Importance::Low)).unwrap();
 
-        let results = store.search_fts("ownership", None, 10).await.unwrap();
+        let results = store.search_fts("ownership", None, 10).unwrap();
         assert!(!results.is_empty());
         assert!(results.iter().any(|m| m.summary.contains("ownership")));
     }
 
-    #[tokio::test]
-    async fn test_fts_sanitize() {
+    #[test]
+    fn test_fts_sanitize() {
         use crate::store::fts::sanitize_fts_query;
         let result = sanitize_fts_query("hello* -world (test)");
         assert!(!result.contains('*'));
@@ -735,42 +717,35 @@ mod tests {
         assert!(result.contains("\"test\""));
     }
 
-    #[tokio::test]
-    async fn test_fts_injection() {
+    #[test]
+    fn test_fts_injection() {
         let store = SqliteStore::in_memory().unwrap();
-        store
-            .store(test_memory("test", "normal memory", Importance::Low))
-            .await
-            .unwrap();
+        store.store(test_memory("test", "normal memory", Importance::Low)).unwrap();
 
         // Should not crash on malicious input
-        let result = store
-            .search_fts("\" OR 1=1; DROP TABLE memories; --", None, 10)
-            .await;
+        let result = store.search_fts("\" OR 1=1; DROP TABLE memories; --", None, 10);
         assert!(result.is_ok());
 
-        let result = store
-            .search_fts("***^^^\"\"\"", None, 10)
-            .await;
+        let result = store.search_fts("***^^^\"\"\"", None, 10);
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_apply_decay() {
+    #[test]
+    fn test_apply_decay() {
         let store = SqliteStore::in_memory().unwrap();
 
         // Store memories with different importance
         let mut critical = test_memory("test", "critical info", Importance::Critical);
         critical.created_at = Utc::now() - chrono::Duration::days(30);
-        store.store(critical).await.unwrap();
+        store.store(critical).unwrap();
 
         let mut medium = test_memory("test", "medium info", Importance::Medium);
         medium.created_at = Utc::now() - chrono::Duration::days(30);
-        let med_id = store.store(medium).await.unwrap();
+        let med_id = store.store(medium).unwrap();
 
         let mut low = test_memory("test", "low info", Importance::Low);
         low.created_at = Utc::now() - chrono::Duration::days(30);
-        let low_id = store.store(low).await.unwrap();
+        let low_id = store.store(low).unwrap();
 
         // Manually set created_at in the past so decay has effect
         store.conn.execute(
@@ -782,71 +757,59 @@ mod tests {
             ],
         ).unwrap();
 
-        let count = store.apply_decay().await.unwrap();
+        let count = store.apply_decay().unwrap();
         assert!(count > 0);
 
         // Verify strength was reduced for non-critical
-        let med = store.get(&med_id).await.unwrap();
+        let med = store.get(&med_id).unwrap();
         assert!(med.strength < 1.0, "Medium memory strength should decay");
 
-        let low_mem = store.get(&low_id).await.unwrap();
+        let low_mem = store.get(&low_id).unwrap();
         assert!(low_mem.strength < 1.0, "Low memory strength should decay");
     }
 
-    #[tokio::test]
-    async fn test_prune() {
+    #[test]
+    fn test_prune() {
         let store = SqliteStore::in_memory().unwrap();
 
         // STM + Low importance + low strength -> should be pruned
-        let id_low = store
-            .store(test_memory("test", "forgettable", Importance::Low))
-            .await
-            .unwrap();
+        let id_low = store.store(test_memory("test", "forgettable", Importance::Low)).unwrap();
         store.conn.execute(
             "UPDATE memories SET strength = 0.05 WHERE id = ?1",
             rusqlite::params![id_low],
         ).unwrap();
 
         // STM + Medium importance + low strength -> should be pruned
-        let id_med = store
-            .store(test_memory("test", "somewhat forgettable", Importance::Medium))
-            .await
-            .unwrap();
+        let id_med = store.store(test_memory("test", "somewhat forgettable", Importance::Medium)).unwrap();
         store.conn.execute(
             "UPDATE memories SET strength = 0.05 WHERE id = ?1",
             rusqlite::params![id_med],
         ).unwrap();
 
         // LTM + Critical importance + low strength -> should NOT be pruned
-        let id_crit = store
-            .store(test_memory("test", "critical never forget", Importance::Critical))
-            .await
-            .unwrap();
+        let id_crit = store.store(test_memory("test", "critical never forget", Importance::Critical)).unwrap();
         store.conn.execute(
             "UPDATE memories SET strength = 0.05 WHERE id = ?1",
             rusqlite::params![id_crit],
         ).unwrap();
 
         // LTM + High importance + low strength -> should NOT be pruned (importance=high)
-        let id_high = store
-            .store(test_memory("test", "important stuff", Importance::High))
-            .await
-            .unwrap();
+        let id_high = store.store(test_memory("test", "important stuff", Importance::High)).unwrap();
         store.conn.execute(
             "UPDATE memories SET strength = 0.05 WHERE id = ?1",
             rusqlite::params![id_high],
         ).unwrap();
 
-        let pruned = store.prune(0.1).await.unwrap();
+        let pruned = store.prune(0.1).unwrap();
         assert_eq!(pruned, 2); // low and medium STM
 
         // Critical and High should still exist
-        assert!(store.get(&id_crit).await.is_ok());
-        assert!(store.get(&id_high).await.is_ok());
+        assert!(store.get(&id_crit).is_ok());
+        assert!(store.get(&id_high).is_ok());
 
         // Low and Medium should be gone
-        assert!(store.get(&id_low).await.is_err());
-        assert!(store.get(&id_med).await.is_err());
+        assert!(store.get(&id_low).is_err());
+        assert!(store.get(&id_med).is_err());
     }
 
     fn test_memory_with_content(topic: &str, summary: &str, content: &str, importance: Importance) -> Memory {
@@ -871,8 +834,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_store_with_dedup_create() {
+    #[test]
+    fn test_store_with_dedup_create() {
         let store = SqliteStore::in_memory().unwrap();
         let mem1 = test_memory_with_content(
             "rust",
@@ -880,7 +843,7 @@ mod tests {
             "Rust ownership rules are fundamental to memory safety",
             Importance::High,
         );
-        let id1 = store.store_with_dedup(mem1, 0.85, 7).await.unwrap();
+        let id1 = store.store_with_dedup(mem1, 0.85, 7).unwrap();
 
         let mem2 = test_memory_with_content(
             "rust",
@@ -888,16 +851,16 @@ mod tests {
             "Async programming in Rust uses futures and tokio runtime",
             Importance::Medium,
         );
-        let id2 = store.store_with_dedup(mem2, 0.85, 7).await.unwrap();
+        let id2 = store.store_with_dedup(mem2, 0.85, 7).unwrap();
 
         // Both should exist as separate memories (different content)
         assert_ne!(id1, id2);
-        let stats = store.stats().await.unwrap();
+        let stats = store.stats().unwrap();
         assert_eq!(stats.total_memories, 2);
     }
 
-    #[tokio::test]
-    async fn test_store_with_dedup_merge() {
+    #[test]
+    fn test_store_with_dedup_merge() {
         let store = SqliteStore::in_memory().unwrap();
 
         let mem1 = test_memory_with_content(
@@ -906,7 +869,7 @@ mod tests {
             "Rust ownership rules are fundamental to memory safety in systems programming",
             Importance::High,
         );
-        let id1 = store.store_with_dedup(mem1, 0.85, 7).await.unwrap();
+        let id1 = store.store_with_dedup(mem1, 0.85, 7).unwrap();
 
         // Store very similar content (same words, minor addition)
         let mem2 = test_memory_with_content(
@@ -915,22 +878,22 @@ mod tests {
             "Rust ownership rules are fundamental to memory safety in systems programming today",
             Importance::High,
         );
-        let id2 = store.store_with_dedup(mem2, 0.85, 7).await.unwrap();
+        let id2 = store.store_with_dedup(mem2, 0.85, 7).unwrap();
 
         // Should merge into existing (same id returned)
         assert_eq!(id1, id2);
 
         // Only one memory should exist
-        let stats = store.stats().await.unwrap();
+        let stats = store.stats().unwrap();
         assert_eq!(stats.total_memories, 1);
 
         // Content should be merged
-        let merged = store.get(&id1).await.unwrap();
+        let merged = store.get(&id1).unwrap();
         assert!(merged.content.contains("\n\n"));
     }
 
-    #[tokio::test]
-    async fn test_store_with_dedup_supersede() {
+    #[test]
+    fn test_store_with_dedup_supersede() {
         let store = SqliteStore::in_memory().unwrap();
 
         let mem1 = test_memory_with_content(
@@ -939,7 +902,7 @@ mod tests {
             "Rust ownership rules are fundamental to memory safety in systems programming",
             Importance::High,
         );
-        let id1 = store.store_with_dedup(mem1, 0.85, 7).await.unwrap();
+        let id1 = store.store_with_dedup(mem1, 0.85, 7).unwrap();
 
         // Manually set created_at to 10 days ago
         let old_date = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
@@ -955,17 +918,17 @@ mod tests {
             "Rust ownership rules are fundamental to memory safety in systems programming today",
             Importance::High,
         );
-        let id2 = store.store_with_dedup(mem2, 0.85, 7).await.unwrap();
+        let id2 = store.store_with_dedup(mem2, 0.85, 7).unwrap();
 
         // Should supersede (different id)
         assert_ne!(id1, id2);
 
         // Two memories should exist
-        let stats = store.stats().await.unwrap();
+        let stats = store.stats().unwrap();
         assert_eq!(stats.total_memories, 2);
 
         // Old memory should have superseded_by set
-        let old = store.get(&id1).await.unwrap();
+        let old = store.get(&id1).unwrap();
         assert_eq!(old.superseded_by, Some(id2.clone()));
     }
 }

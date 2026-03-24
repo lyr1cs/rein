@@ -132,7 +132,7 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
                 last_accessed: now,
             };
 
-            match store.store(memory).await {
+            match store.store(memory) {
                 Ok(_) => report.chunks_created += 1,
                 Err(e) => {
                     tracing::warn!("Failed to store chunk: {e}");
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(report.errors, 0);
 
         // Verify memories exist in the store
-        let topics = store.list_topics().await.unwrap();
+        let topics = store.list_topics().unwrap();
         assert!(
             topics.contains(&"notes".to_string()),
             "Expected 'notes' topic"
