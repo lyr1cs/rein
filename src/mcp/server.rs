@@ -388,7 +388,7 @@ impl ReinServer {
 
                 for i in 0..mems.len() {
                     for j in (i + 1)..mems.len() {
-                        let sim = crate::extract::jaccard_similarity(
+                        let sim = crate::extract::similarity(
                             &mems[i].content,
                             &mems[j].content,
                         );
