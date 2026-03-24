@@ -169,6 +169,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
     let access_count: u32 = row.get("access_count").map_err(ReinError::Database)?;
     let superseded_by: Option<String> = row.get("superseded_by").map_err(ReinError::Database)?;
     let related_ids_json: String = row.get("related_ids").map_err(ReinError::Database)?;
+    let status_str: String = row.get::<_, String>("status").unwrap_or_else(|_| "active".to_string());
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
     let updated_at_str: String = row.get("updated_at").map_err(ReinError::Database)?;
     let last_accessed_str: String = row.get("last_accessed").map_err(ReinError::Database)?;
@@ -179,6 +180,8 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
         .map_err(|e| ReinError::Config(e))?;
     let source = Source::from_str(&source_str)
         .map_err(|e| ReinError::Config(e))?;
+    let status = MemoryStatus::from_str(&status_str)
+        .unwrap_or_default();
 
     let keywords: Vec<String> = serde_json::from_str(&keywords_json)?;
     let related_ids: Vec<String> = serde_json::from_str(&related_ids_json)?;
@@ -207,6 +210,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
         access_count,
         superseded_by,
         related_ids,
+        status,
         embedding: None,
         created_at,
         updated_at,
@@ -238,9 +242,9 @@ impl MemoryStore for SqliteStore {
 
         self.conn.execute(
             "INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source,
-             strength, decay_lambda, access_count, superseded_by, related_ids,
+             strength, decay_lambda, access_count, superseded_by, related_ids, status,
              created_at, updated_at, last_accessed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
                 id,
                 layer_db,
@@ -255,6 +259,7 @@ impl MemoryStore for SqliteStore {
                 memory.access_count,
                 memory.superseded_by,
                 related_ids_json,
+                memory.status.to_string(),
                 memory.created_at.to_rfc3339(),
                 memory.updated_at.to_rfc3339(),
                 memory.last_accessed.to_rfc3339(),
@@ -305,11 +310,18 @@ impl MemoryStore for SqliteStore {
             MemoryLayer::STM => "STM",
         };
 
+        // Auto-set status to "updated" when content changes
+        let status = if memory.status == MemoryStatus::Active {
+            MemoryStatus::Updated
+        } else {
+            memory.status
+        };
+
         let rows = self.conn.execute(
             "UPDATE memories SET layer=?1, topic=?2, summary=?3, content=?4, keywords=?5,
              importance=?6, source=?7, strength=?8, decay_lambda=?9, access_count=?10,
-             superseded_by=?11, related_ids=?12, updated_at=?13
-             WHERE id=?14",
+             superseded_by=?11, related_ids=?12, status=?13, updated_at=?14
+             WHERE id=?15",
             rusqlite::params![
                 layer_db,
                 memory.topic,
@@ -323,6 +335,7 @@ impl MemoryStore for SqliteStore {
                 memory.access_count,
                 memory.superseded_by,
                 related_ids_json,
+                status.to_string(),
                 now.to_rfc3339(),
                 memory.id,
             ],
@@ -823,6 +836,7 @@ mod tests {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            status: MemoryStatus::default(),
             embedding: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1021,6 +1035,7 @@ mod tests {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            status: MemoryStatus::default(),
             embedding: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
