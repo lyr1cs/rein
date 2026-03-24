@@ -15,11 +15,12 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 | **Three-level waterfall search** | FTS5 (<1ms) -> cached vectors (<1ms) -> Google API (~255ms) *(vector/cross-validation wiring in progress)* |
 | **Weighted RRF fusion** | Reciprocal Rank Fusion with configurable per-source weights (not fixed) |
 | **Semantic chunking** | Heading/paragraph/sentence splitting with metadata-prefixed embeddings |
-| **Zero local models** | No GPU, no ONNX runtime -- all embeddings via API |
+| **Zero local models** | Zero local models by default (optional OMLX local backend) |
 | **~2-5 MB memory footprint** | Single SQLite file with FTS5 + sqlite-vec |
 | **gemini-embedding-001** | MTEB #1 model (68.32), 3072 dimensions |
-| **9 MCP tools** | Full CRUD + search + health + consolidation + dedup |
-| **14 CLI commands** | Everything the MCP tools do, plus init, config, migrate, hooks |
+| **Knowledge graph** | Memoir/Concept/Link with 9 relation types, BFS traversal, export (json/ascii/dot) |
+| **19 MCP tools** | 9 core + 10 knowledge graph |
+| **15 CLI commands** | Everything the MCP tools do, plus init, config, migrate, hooks |
 | **Auto-configure** | `rein init` detects and configures 8 MCP clients automatically |
 
 ## Installation
@@ -70,14 +71,14 @@ rein serve
 | `health` | Check topic health | `rein health [topic]` |
 | `consolidate` | Merge topic into one memory | `rein consolidate debug -s "summary"` |
 | `dedup` | Scan/remove duplicates | `rein dedup [--dry-run]` |
-| `migrate` | Import from QMD | `rein migrate [--from-qmd path]` |
+| `migrate` | Import from QMD / reindex | `rein migrate [--from-qmd path] [--reindex]` |
 | `init` | Auto-configure MCP clients | `rein init [--dry-run]` |
 | `config` | Show current configuration | `rein config` |
 | `hook` | Run hook subcommands | `rein hook post\|compact\|prompt` |
 
 ## MCP Tools
 
-When running as an MCP server (`rein serve`), the following 9 tools are exposed:
+When running as an MCP server (`rein serve`), the following 19 tools are exposed:
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
@@ -90,6 +91,22 @@ When running as an MCP server (`rein serve`), the following 9 tools are exposed:
 | `rein_health` | `topic?` | Stale count, avg strength, consolidation hints |
 | `rein_consolidate` | `topic`, `summary` | Merge all memories in a topic into one |
 | `rein_dedup` | `dry_run?` | Scan for and remove duplicate memories |
+| `rein_memoir_create` | `name`, `description?` | Create a knowledge container |
+| `rein_memoir_list` | *(none)* | List all memoirs |
+| `rein_memoir_show` | `name` | Show memoir details + concepts |
+| `rein_memoir_add_concept` | `memoir`, `name`, `definition`, `labels?` | Add knowledge node |
+| `rein_memoir_refine` | `memoir`, `name`, `definition` | Update concept, boost confidence |
+| `rein_memoir_search` | `memoir`, `query`, `limit?` | FTS search within memoir |
+| `rein_memoir_search_all` | `query`, `limit?` | Search across all memoirs |
+| `rein_memoir_link` | `memoir`, `from`, `to`, `relation` | Link two concepts |
+| `rein_memoir_inspect` | `memoir`, `name`, `depth?` | BFS neighborhood traversal |
+| `rein_memoir_export` | `memoir`, `format?` | Export graph (json/ascii/dot) |
+
+### Knowledge Graph Relation Types
+
+The following 9 relation types are available for linking concepts in memoirs:
+
+`part_of`, `depends_on`, `related_to`, `contradicts`, `refines`, `alternative_to`, `caused_by`, `instance_of`, `superseded_by`
 
 ## Configuration
 
@@ -116,11 +133,15 @@ rein loads configuration with the following priority (highest wins):
 path = "auto"                          # "auto" = ~/.local/share/rein/memories.db
 
 [embedding]
-provider = "google"
+provider = "google"    # or "omlx" or "none"
 dimensions = 3072
 
 [embedding.google]
 model = "gemini-embedding-001"
+
+[embedding.omlx]
+endpoint = "http://localhost:8000/v1"
+model = "default"
 
 [search]
 rrf_k = 60.0
@@ -202,7 +223,7 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
                              |
                     +--------+--------+
                     |                 |
-                CLI (14 cmds)   MCP Server (9 tools)
+                CLI (15 cmds)   MCP Server (19 tools)
                     |                 |
                     +--------+--------+
                              |
@@ -303,10 +324,11 @@ rein 是一个轻量级的持久化记忆系统,专为 AI 编程智能体设计�
 - **三级瀑布搜索** -- FTS5 (<1ms) -> 缓存向量 (<1ms) -> Google API (~255ms)
 - **加权 RRF 融合** -- 可配置权重的倒数排名融合(非固定权重)
 - **语义分块** -- 按标题/段落/句子分割,嵌入时附加元数据前缀
-- **零本地模型** -- 无需 GPU,无需 ONNX 运行时
+- **零本地模型** -- 默认无需 GPU(可选 OMLX 本地后端)
 - **~2-5 MB 内存占用** -- 单个 SQLite 文件 + FTS5 + sqlite-vec
 - **gemini-embedding-001** -- MTEB 排名第一(68.32),3072 维
-- **9 个 MCP 工具 + 14 个 CLI 命令**
+- **知识图谱** -- Memoir/Concept/Link,9 种关系类型,BFS 遍历,导出(json/ascii/dot)
+- **19 个 MCP 工具 + 15 个 CLI 命令**
 
 ## 快速开始
 
