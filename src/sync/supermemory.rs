@@ -53,7 +53,8 @@ impl SupermemoryClient {
 
         let memories = results
             .into_iter()
-            .filter_map(|item| {
+            .enumerate()
+            .filter_map(|(idx, item)| {
                 // v4 hybrid results can have either:
                 // - "memory" field (from memory entries, saved by Claude Code plugin)
                 // - "chunk" field (from document chunks, Notion sync etc.)
@@ -106,14 +107,14 @@ impl SupermemoryClient {
                     return None;
                 }
 
-                let id = item.get("id")
+                let base_id = item.get("id")
                     .or_else(|| item.get("documentId"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                    .unwrap_or("unknown");
+                let id = format!("sm:{base_id}:{idx}");
 
                 Some(Memory {
-                    id: format!("sm:{id}"),
+                    id,
                     layer: MemoryLayer::LTM,
                     topic: "supermemory".to_string(),
                     summary,
