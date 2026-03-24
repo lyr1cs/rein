@@ -1,3 +1,4 @@
+mod embed;
 mod store;
 mod types;
 
