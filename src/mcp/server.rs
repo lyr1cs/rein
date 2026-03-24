@@ -86,7 +86,12 @@ impl ReinServer {
 
         let result = self.with_store(|store| {
             // MemoryStore::search_fts is async but actually synchronous inside
-            futures_lite_block(store.search_fts(&params.query, params.topic.as_deref(), limit))
+            let results = futures_lite_block(store.search_fts(&params.query, params.topic.as_deref(), limit))?;
+            // Record access for returned memories
+            for m in &results {
+                let _ = store.record_access(&m.id);
+            }
+            Ok(results)
         });
 
         match result {
@@ -170,7 +175,8 @@ impl ReinServer {
     /// Update an existing memory by ID.
     #[tool(name = "rein_update", description = "Update the content of an existing memory by its ID.")]
     fn rein_update(&self, Parameters(params): Parameters<UpdateParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        // Don't count update as non-store (it's a mutation, not a read)
+        self.non_store_count.store(0, Ordering::Relaxed);
 
         let base_lambda = self.config.decay.base_lambda;
         let compact = self.compact();
@@ -212,7 +218,8 @@ impl ReinServer {
     /// Delete a memory by ID.
     #[tool(name = "rein_forget", description = "Delete a memory by its ID.")]
     fn rein_forget(&self, Parameters(params): Parameters<ForgetParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        // Don't count forget as non-store (it's a mutation, not a read)
+        self.non_store_count.store(0, Ordering::Relaxed);
         let compact = self.compact();
         let id = params.id.clone();
 
@@ -381,11 +388,11 @@ impl ReinServer {
             let mut dups_removed = 0u32;
 
             for topic in &topics {
-                let mems: Vec<Memory> =
-                    match futures_lite_block(store.search_fts(topic, Some(topic), 100)) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+                // List ALL memories in this topic using direct SQL (not FTS with topic as query)
+                let mems: Vec<Memory> = match store.get_by_topic(topic) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
 
                 for i in 0..mems.len() {
                     for j in (i + 1)..mems.len() {
