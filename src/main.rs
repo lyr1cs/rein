@@ -250,6 +250,13 @@ async fn main() -> anyhow::Result<()> {
             println!("rein v{}", env!("CARGO_PKG_VERSION"));
             println!("Run 'rein --help' for usage");
         }
+        Some(Commands::Hook { action }) => {
+            match action {
+                HookAction::Post => extract::hooks::hook_post(&config).await?,
+                HookAction::Compact => extract::hooks::hook_compact(&config).await?,
+                HookAction::Prompt => extract::hooks::hook_prompt(&config).await?,
+            }
+        }
         _ => {
             println!("Not yet implemented");
         }
