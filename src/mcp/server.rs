@@ -531,7 +531,7 @@ impl ReinServer {
     fn rein_memoir_search(&self, Parameters(params): Parameters<ConceptSearchParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
-        let limit = params.limit.unwrap_or(10);
+        let limit = params.limit.unwrap_or(10).min(100);
 
         let result = self.with_store(|store| {
             store.search_concepts(&params.memoir, &params.query, limit)
@@ -561,7 +561,7 @@ impl ReinServer {
     fn rein_memoir_search_all(&self, Parameters(params): Parameters<ConceptSearchAllParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
-        let limit = params.limit.unwrap_or(10);
+        let limit = params.limit.unwrap_or(10).min(100);
 
         let result = self.with_store(|store| {
             store.search_all_concepts(&params.query, limit)
@@ -631,7 +631,7 @@ impl ReinServer {
     fn rein_memoir_inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
-        let depth = params.depth.unwrap_or(1);
+        let depth = params.depth.unwrap_or(1).min(5);
 
         let result = self.with_store(|store| {
             store.inspect_concept(&params.memoir, &params.name, depth)

@@ -61,10 +61,18 @@ impl Embedder for OmlxEmbedder {
             .as_array()
             .ok_or_else(|| ReinError::Embedding("missing data[0].embedding".into()))?;
 
-        Ok(values
+        let embedding: Vec<f32> = values
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect())
+            .collect();
+
+        if embedding.len() != self.dimensions {
+            return Err(ReinError::Embedding(format!(
+                "dimension mismatch: expected {}, got {}", self.dimensions, embedding.len()
+            )));
+        }
+
+        Ok(embedding)
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
@@ -97,12 +105,18 @@ impl Embedder for OmlxEmbedder {
             let values = item["embedding"]
                 .as_array()
                 .ok_or_else(|| ReinError::Embedding("missing embedding in data item".into()))?;
-            result.push(
-                values
-                    .iter()
-                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                    .collect(),
-            );
+            let embedding: Vec<f32> = values
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+
+            if embedding.len() != self.dimensions {
+                return Err(ReinError::Embedding(format!(
+                    "dimension mismatch: expected {}, got {}", self.dimensions, embedding.len()
+                )));
+            }
+
+            result.push(embedding);
         }
 
         Ok(result)
