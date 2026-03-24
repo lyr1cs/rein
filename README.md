@@ -20,7 +20,7 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 | **Knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, BFS traversal, export (json / ascii / dot) |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
 | **Dual-layer Ebbinghaus decay** | LTM / STM layers with configurable lambda, beta, and access-boosted retention |
-| **Three-level waterfall search** | FTS5 (<1 ms) → cached vectors (<1 ms) → Google API (~255 ms) |
+| **Four-level waterfall search** | Tantivy BM25 → HNSW ANN → cached vectors → Google API |
 | **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring |
 | **Weighted RRF fusion** | Reciprocal Rank Fusion with configurable per-source weights |
 | **Semantic chunking** | Heading / paragraph / sentence splitting with metadata-prefixed embeddings |
@@ -284,36 +284,36 @@ sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
                   Waterfall      Hooks
                   Search       (extract)
                       |
-            +---------+---------+
-            |         |         |
-          FTS5    Cached Vec  API Vec
-         (<1ms)   (<1ms)     (~255ms)
-            |         |         |
-            +----+----+---------+
-                 |
-            RRF Fusion (weighted)
-                 |
-          Ebbinghaus Scoring
-          (strength * access)
-                 |
-            +----+----+
-            |         |
-          SQLite   sqlite-vec
-          (FTS5)   (embeddings)
-            |         |
-            +----+----+
-                 |
-           memories.db
-            (~2-5 MB)
+         +------+-----+------+------+
+         |      |             |      |
+      Tantivy  HNSW     Cached Vec  API Vec
+      (BM25)  (ANN)      (<1ms)   (~255ms)
+         |      |             |      |
+         +------+------+------+------+
+                       |
+                  RRF Fusion (weighted)
+                       |
+                Ebbinghaus Scoring
+                (strength * access)
+                       |
+            +-----+----+----+-----+
+            |     |         |     |
+          SQLite sqlite-vec HNSW Tantivy
+          (FTS5) (vectors)  (ann) (bm25)
+            |     |         |     |
+            +-----+----+----+-----+
+                       |
+                 memories.db + side indexes
 ```
 
 #### Search Pipeline
 
-1. **FTS5** -- full-text search with SQLite FTS5 (unicode61 tokenizer, CJK support), sub-millisecond
-2. **Cached vectors** -- pre-computed embeddings in sqlite-vec
-3. **API vectors** -- on-demand embedding via gemini-embedding-001 (or OMLX local backend)
-4. **RRF fusion** -- weighted Reciprocal Rank Fusion merges all result lists
-5. **Ebbinghaus scoring** -- `strength(t) = exp(-lambda_eff * days^beta)` weights final ranking
+1. **Tantivy BM25** -- full-text search with Tantivy (falls back to FTS5), sub-millisecond
+2. **HNSW ANN** -- O(log n) approximate nearest neighbor via usearch (falls back to sqlite-vec brute-force)
+3. **Cached vectors** -- pre-computed embeddings in sqlite-vec
+4. **API vectors** -- on-demand embedding via gemini-embedding-001 (or OMLX local backend)
+5. **RRF fusion** -- weighted Reciprocal Rank Fusion merges all result lists
+6. **Ebbinghaus scoring** -- `strength(t) = exp(-lambda_eff * days^beta)` weights final ranking
 
 #### Embedding Backends
 
@@ -348,7 +348,9 @@ Set `[embedding] provider` to `"google"`, `"omlx"`, or `"none"` in config.
 
 | Metric | Target |
 |--------|--------|
-| FTS5 search | < 1 ms |
+| Tantivy BM25 search | < 1 ms |
+| HNSW ANN search | < 1 ms |
+| FTS5 fallback search | < 1 ms |
 | Vector search (cached) | < 1 ms |
 | Vector search (API) | < 300 ms |
 | Store (with dedup) | < 5 ms |
@@ -385,7 +387,7 @@ rein 是一个轻量级的持久化记忆系统，专为 AI 编程智能体设�
 | **知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，BFS 遍历，导出（json / ascii / dot） |
 | **OMLX 本地嵌入** | 可选本地嵌入后端，通过 EmbedderKind 枚举分发（Google / OMLX） |
 | **双层艾宾浩斯衰减** | LTM / STM 层，可配置 lambda、beta，访问次数越多衰减越慢 |
-| **三级瀑布搜索** | FTS5 (<1 ms) → 缓存向量 (<1 ms) → Google API (~255 ms) |
+| **四级瀑布搜索** | Tantivy BM25 → HNSW ANN → 缓存向量 → Google API |
 | **多源交叉验证** | 3 个来源（本地、Hook 提取、Supermemory）+ 置信度评分 |
 | **加权 RRF 融合** | 可配置权重的倒数排名融合 |
 | **语义分块** | 按标题/段落/句子分割，嵌入时附加元数据前缀 |
@@ -649,36 +651,36 @@ sse_bind = "0.0.0.0"    # 需要设置 REIN_HTTP_TOKEN
                    瀑布搜索      Hooks
                                 (提取)
                       |
-            +---------+---------+
-            |         |         |
-          FTS5    缓存向量    API 向量
-         (<1ms)   (<1ms)     (~255ms)
-            |         |         |
-            +----+----+---------+
-                 |
-           RRF 融合（加权）
-                 |
-          艾宾浩斯评分
-         （强度 * 访问次数）
-                 |
-            +----+----+
-            |         |
-          SQLite   sqlite-vec
-          (FTS5)   (嵌入向量)
-            |         |
-            +----+----+
-                 |
-           memories.db
-            (~2-5 MB)
+         +------+-----+------+------+
+         |      |             |      |
+      Tantivy  HNSW      缓存向量  API 向量
+      (BM25)  (ANN)      (<1ms)   (~255ms)
+         |      |             |      |
+         +------+------+------+------+
+                       |
+                 RRF 融合（加权）
+                       |
+                 艾宾浩斯评分
+               （强度 * 访问次数）
+                       |
+            +-----+----+----+-----+
+            |     |         |     |
+          SQLite sqlite-vec HNSW Tantivy
+          (FTS5) (嵌入向量) (ann) (bm25)
+            |     |         |     |
+            +-----+----+----+-----+
+                       |
+                memories.db + 侧索引
 ```
 
 #### 搜索管线
 
-1. **FTS5** -- SQLite FTS5 全文搜索（unicode61 分词器，支持 CJK），亚毫秒级
-2. **缓存向量** -- sqlite-vec 中预计算的嵌入向量
-3. **API 向量** -- 通过 gemini-embedding-001（或 OMLX 本地后端）按需嵌入
-4. **RRF 融合** -- 加权倒数排名融合合并所有结果列表
-5. **艾宾浩斯评分** -- `strength(t) = exp(-lambda_eff * days^beta)` 加权最终排序
+1. **Tantivy BM25** -- Tantivy 全文搜索（回退到 FTS5），亚毫秒级
+2. **HNSW ANN** -- O(log n) 近似最近邻（usearch），回退到 sqlite-vec 暴力搜索
+3. **缓存向量** -- sqlite-vec 中预计算的嵌入向量
+4. **API 向量** -- 通过 gemini-embedding-001（或 OMLX 本地后端）按需嵌入
+5. **RRF 融合** -- 加权倒数排名融合合并所有结果列表
+6. **艾宾浩斯评分** -- `strength(t) = exp(-lambda_eff * days^beta)` 加权最终排序
 
 #### 嵌入后端
 
@@ -713,7 +715,9 @@ rein 使用 `EmbedderKind` 枚举分发支持多种嵌入后端：
 
 | 指标 | 目标 |
 |------|------|
-| FTS5 搜索 | < 1 ms |
+| Tantivy BM25 搜索 | < 1 ms |
+| HNSW ANN 搜索 | < 1 ms |
+| FTS5 回退搜索 | < 1 ms |
 | 向量搜索（缓存） | < 1 ms |
 | 向量搜索（API） | < 300 ms |
 | 存储（含去重） | < 5 ms |

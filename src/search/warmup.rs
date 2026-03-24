@@ -10,6 +10,10 @@ use crate::types::Embedder as _;
 /// Warm up the embedding cache by pre-computing embeddings for uncached memories.
 /// Returns (cached_count, error_count).
 pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) {
+    // Always rebuild side indexes from existing data, even if all embeddings are cached
+    populate_tantivy(store);
+    populate_hnsw(store, config);
+
     let embedder = match create_embedder(config) {
         Some(e) => e,
         None => {
@@ -85,11 +89,8 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
 
     tracing::info!("warmup complete: {cached} cached, {errors} errors");
 
-    // Populate HNSW index from all cached embeddings
+    // Rebuild side indexes again to include newly-cached embeddings
     populate_hnsw(store, config);
-
-    // Populate Tantivy FTS index
-    populate_tantivy(store);
 
     (cached, errors)
 }
@@ -148,9 +149,9 @@ fn populate_tantivy(store: &SqliteStore) {
     if db_path.to_str() == Some(":memory:") {
         return;
     }
-    let parent = db_path.parent().unwrap_or(std::path::Path::new("."));
+    let tantivy_path = db_path.with_extension("tantivy");
 
-    let tantivy = match crate::store::tantivy_fts::TantivyFts::open(parent) {
+    let tantivy = match crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("tantivy: failed to open index: {e}");
