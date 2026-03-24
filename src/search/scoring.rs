@@ -7,7 +7,7 @@ pub fn calculate_strength(memory: &Memory) -> f64 {
     if memory.importance == crate::types::Importance::Critical {
         return 1.0; // Critical never decays
     }
-    let days = (chrono::Utc::now() - memory.created_at).num_seconds() as f64 / 86400.0;
+    let days = (chrono::Utc::now() - memory.last_accessed).num_seconds() as f64 / 86400.0;
     if days <= 0.0 {
         return 1.0;
     }
@@ -47,7 +47,7 @@ mod tests {
             embedding: None,
             created_at: Utc::now() - Duration::days(days_ago),
             updated_at: Utc::now(),
-            last_accessed: Utc::now(),
+            last_accessed: Utc::now() - Duration::days(days_ago),
         }
     }
 
