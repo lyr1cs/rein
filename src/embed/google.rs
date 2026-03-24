@@ -15,7 +15,7 @@ impl GeminiEmbedder {
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .expect("failed to build reqwest client");
+            .unwrap_or_default();
         Self {
             client,
             api_key,

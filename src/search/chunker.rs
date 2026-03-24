@@ -187,7 +187,12 @@ fn apply_overlap(chunks: Vec<String>, overlap_chars: usize) -> Vec<String> {
         let prev = &chunks[i - 1];
         if overlap_chars > 0 && prev.len() > overlap_chars {
             // Take the last overlap_chars from the previous chunk
-            let overlap_start = prev.len() - overlap_chars;
+            // Find a valid UTF-8 char boundary near the overlap start
+            let target_start = prev.len().saturating_sub(overlap_chars);
+            let mut overlap_start = target_start;
+            while overlap_start < prev.len() && !prev.is_char_boundary(overlap_start) {
+                overlap_start += 1;
+            }
             // Find a word boundary near the overlap start
             let boundary = prev[overlap_start..]
                 .find(' ')
