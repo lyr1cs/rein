@@ -1,4 +1,5 @@
 pub mod fts;
+pub mod hnsw;
 pub mod memoir;
 pub mod migrate;
 pub mod schema;

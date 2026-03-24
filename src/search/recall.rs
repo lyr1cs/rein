@@ -191,21 +191,55 @@ fn try_vector_search(
     }
 }
 
-/// Direct vector search using store.conn() — avoids async trait methods.
+/// Direct vector search using HNSW index first, falling back to sqlite-vec.
 fn vec_search_direct(
     store: &SqliteStore,
     embedding: &[f32],
     topic: Option<&str>,
     limit: usize,
 ) -> Vec<(String, f32)> {
+    // Try HNSW first (O(log n) approximate nearest neighbor)
+    let hnsw_path = store.db_path().with_extension("");
+    if let Ok(index) = crate::store::hnsw::HnswIndex::open(&hnsw_path, embedding.len()) {
+        if !index.is_empty() {
+            if let Ok(results) = index.search(embedding, limit * 2) {
+                let filtered: Vec<(String, f32)> = results
+                    .into_iter()
+                    .filter(|(id, _)| {
+                        if let Some(t) = topic {
+                            store
+                                .conn()
+                                .query_row(
+                                    "SELECT topic FROM memories WHERE id = ?1",
+                                    rusqlite::params![id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .map(|mem_topic| mem_topic == t)
+                                .unwrap_or(false)
+                        } else {
+                            true
+                        }
+                    })
+                    .take(limit)
+                    .enumerate()
+                    .map(|(i, (id, _))| (id, -(i as f32)))
+                    .collect();
+                if !filtered.is_empty() {
+                    return filtered;
+                }
+            }
+        }
+    }
+
+    // Fall back to sqlite-vec (brute-force O(n))
     match crate::store::vec::search_vec(store.conn(), embedding, limit) {
         Ok(results) => {
             let ranked: Vec<(String, f32)> = results
                 .into_iter()
                 .filter(|(id, _)| {
                     if let Some(t) = topic {
-                        // Quick topic check via direct SQL
-                        store.conn()
+                        store
+                            .conn()
                             .query_row(
                                 "SELECT topic FROM memories WHERE id = ?1",
                                 rusqlite::params![id],
