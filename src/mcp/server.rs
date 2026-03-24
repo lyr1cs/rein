@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Mutex,
-};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -16,21 +13,15 @@ use crate::types::*;
 
 /// MCP server for rein memory system.
 ///
-/// Uses a std::sync::Mutex for the store because all SqliteStore operations
-/// are actually synchronous (the async trait methods don't contain real await
-/// points), so we never hold the mutex guard across an actual await.
+/// Creates a new SqliteStore (SQLite connection) per request instead of sharing
+/// a single Mutex<SqliteStore>. This eliminates the Mutex bottleneck and enables
+/// concurrent read operations. SQLite with WAL mode + FULL_MUTEX handles write
+/// serialization internally.
 pub struct ReinServer {
-    store: Mutex<SqliteStore>,
     config: ReinConfig,
     non_store_count: AtomicU32,
     tool_router: ToolRouter<Self>,
 }
-
-// Safety: SqliteStore uses SQLITE_OPEN_FULL_MUTEX (serialized mode), which makes
-// the SQLite connection thread-safe. The Mutex<SqliteStore> provides exclusive access,
-// and all MemoryStore trait methods are synchronous (no real await points).
-unsafe impl Send for ReinServer {}
-unsafe impl Sync for ReinServer {}
 
 impl std::fmt::Debug for ReinServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,9 +33,11 @@ impl std::fmt::Debug for ReinServer {
 
 impl ReinServer {
     /// Create a new ReinServer.
-    pub fn new(store: SqliteStore, config: ReinConfig) -> Self {
+    ///
+    /// Stores the config so each request can open its own connection via
+    /// `config.open_store()`, eliminating the Mutex bottleneck.
+    pub fn new(config: ReinConfig) -> Self {
         Self {
-            store: Mutex::new(store),
             config,
             non_store_count: AtomicU32::new(0),
             tool_router: Self::tool_router(),
@@ -66,12 +59,14 @@ impl ReinServer {
         self.config.server.compact
     }
 
-    /// Lock the store, run a synchronous closure, return the result.
+    /// Open a per-request SqliteStore, run a synchronous closure, return the result.
+    /// Each call gets its own SQLite connection — no Mutex needed.
+    /// SQLite WAL mode handles concurrent readers and serializes writers.
     fn with_store<F, R>(&self, f: F) -> Result<R, String>
     where
         F: FnOnce(&SqliteStore) -> Result<R, ReinError>,
     {
-        let store = self.store.lock().map_err(|e| format!("Lock poisoned: {e}"))?;
+        let store = self.config.open_store().map_err(|e| format!("{e}"))?;
         f(&store).map_err(|e| format!("{e}"))
     }
 }
@@ -779,8 +774,7 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
         });
     }
 
-    let store = config.open_store()?;
-    let server = ReinServer::new(store, config);
+    let server = ReinServer::new(config);
 
     let transport = rmcp::transport::io::stdio();
     let service = server
@@ -817,7 +811,6 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 
     let bind = format!("{}:{}", config.server.sse_bind, config.server.sse_port);
-    let _db_path = config.resolve_db_path();
     let config_clone = config.clone();
 
     // Bearer token authentication
@@ -844,9 +837,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     // Cross-session concurrency is handled by having independent connections.
     let service = StreamableHttpService::new(
         move || {
-            let store = config_clone.open_store()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            let server = ReinServer::new(store, config_clone.clone());
+            let server = ReinServer::new(config_clone.clone());
             Ok(server)
         },
         session_manager,

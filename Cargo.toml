@@ -30,6 +30,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "ht
 http-body-util = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["full"] }
+usearch = "2.24.0"
 
 [dev-dependencies]
 tempfile = "3"
