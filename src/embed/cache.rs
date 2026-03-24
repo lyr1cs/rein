@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_metadata_prefix() {
-        use crate::embed::google::prepend_metadata;
+        use crate::embed::prepend_metadata;
         let result = prepend_metadata("debug", "OOM fix", "connection pool leak");
         assert_eq!(result, "topic:debug | OOM fix | connection pool leak");
     }

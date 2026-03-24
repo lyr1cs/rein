@@ -278,9 +278,7 @@ async fn main() -> anyhow::Result<()> {
                     std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
                 });
             let store = config.open_store()?;
-            let embedder = config.embedding.google.api_key.as_ref().map(|key| {
-                embed::GeminiEmbedder::new(key.clone(), config.embedding.google.model.clone(), config.embedding.dimensions)
-            });
+            let embedder = embed::create_embedder(&config);
             let report = store::migrate::migrate_from_qmd(
                 &qmd_path,
                 &store,
