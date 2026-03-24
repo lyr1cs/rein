@@ -89,8 +89,8 @@ pub fn recall(
     }
 
     // === Cross-validation (if enabled) ===
-    let local_memories: Vec<Memory> = local_results.iter().map(|(m, _)| m.clone()).collect();
-    let local_scores: std::collections::HashMap<String, f32> = local_results.iter().map(|(m, s)| (m.id.clone(), *s)).collect();
+    // Pass scored results directly — cross_validate will preserve local scores
+    // and rank external results below local ones
 
     let sm_start = std::time::Instant::now();
     let supermemory_results = if config.sync.supermemory_enabled {
@@ -115,16 +115,15 @@ pub fn recall(
         vec![]
     };
 
-    let validated = validate::cross_validate(&local_memories, &supermemory_results, &auto_memory_results);
+    let validated = validate::cross_validate(&local_results, &supermemory_results, &auto_memory_results);
 
-    // Build final results
+    // Build final results — scores already assigned by cross_validate
     let mut results: Vec<RecallResult> = validated
         .into_iter()
         .map(|v| {
-            let score = local_scores.get(&v.memory.id).copied().unwrap_or(v.score);
             RecallResult {
                 memory: v.memory,
-                score,
+                score: v.score,
                 confidence: v.confidence,
                 sources_hit: v.sources_hit,
             }
