@@ -380,6 +380,309 @@ impl ReinServer {
         }
     }
 
+    // ===== Knowledge Graph (Memoir/Concept/Link) tools =====
+
+    /// Create a new memoir (knowledge graph container).
+    #[tool(name = "rein_memoir_create", description = "Create a new memoir (named knowledge graph). Use to organize concepts and their relationships.")]
+    fn rein_memoir_create(&self, Parameters(params): Parameters<MemoirCreateParams>) -> String {
+        self.non_store_count.store(0, Ordering::Relaxed);
+        let compact = self.compact();
+
+        let memoir = crate::types::Memoir {
+            id: String::new(),
+            name: params.name.clone(),
+            description: params.description.unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let result = self.with_store(|store| store.create_memoir(memoir));
+
+        match result {
+            Ok(id) => {
+                if compact {
+                    format!("ok:{id}")
+                } else {
+                    format!("Created memoir '{}': {id}", params.name)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// List all memoirs.
+    #[tool(name = "rein_memoir_list", description = "List all memoirs (knowledge graphs).")]
+    fn rein_memoir_list(&self) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let compact = self.compact();
+
+        let result = self.with_store(|store| store.list_memoirs());
+
+        match result {
+            Ok(memoirs) => {
+                if memoirs.is_empty() {
+                    return if compact { "none".to_string() } else { "No memoirs found.".to_string() };
+                }
+                let mut text = String::new();
+                for m in &memoirs {
+                    if compact {
+                        text.push_str(&format!("{}:{}\n", m.name, m.description));
+                    } else {
+                        text.push_str(&format!("- {} — {}\n", m.name, m.description));
+                    }
+                }
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Show a memoir and all its concepts.
+    #[tool(name = "rein_memoir_show", description = "Show memoir details and list all concepts within it.")]
+    fn rein_memoir_show(&self, Parameters(params): Parameters<MemoirShowParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let compact = self.compact();
+
+        let result = self.with_store(|store| {
+            let memoir = store.get_memoir(&params.name)?
+                .ok_or_else(|| ReinError::NotFound(format!("memoir '{}' not found", params.name)))?;
+            let export = store.export_memoir(&params.name, "ascii")?;
+            Ok((memoir, export))
+        });
+
+        match result {
+            Ok((memoir, export)) => {
+                if compact {
+                    export
+                } else {
+                    format!("Memoir: {} — {}\n\n{}", memoir.name, memoir.description, export)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Add a concept to a memoir.
+    #[tool(name = "rein_memoir_add_concept", description = "Add a concept (knowledge node) to a memoir with name, definition, and optional labels.")]
+    fn rein_memoir_add_concept(&self, Parameters(params): Parameters<ConceptAddParams>) -> String {
+        self.non_store_count.store(0, Ordering::Relaxed);
+        let compact = self.compact();
+
+        let labels: Vec<String> = params
+            .labels
+            .map(|l| {
+                l.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let concept = crate::types::Concept {
+            id: String::new(),
+            memoir_id: params.memoir.clone(),
+            name: params.name.clone(),
+            definition: params.definition,
+            labels,
+            confidence: 0.5,
+            revision: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let result = self.with_store(|store| store.add_concept(concept));
+
+        match result {
+            Ok(id) => {
+                if compact {
+                    format!("ok:{id}")
+                } else {
+                    format!("Added concept '{}' to memoir '{}': {id}", params.name, params.memoir)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Refine a concept's definition.
+    #[tool(name = "rein_memoir_refine", description = "Refine a concept: update definition, increment revision, boost confidence.")]
+    fn rein_memoir_refine(&self, Parameters(params): Parameters<ConceptRefineParams>) -> String {
+        self.non_store_count.store(0, Ordering::Relaxed);
+        let compact = self.compact();
+
+        let result = self.with_store(|store| {
+            store.refine_concept(&params.memoir, &params.name, &params.definition)
+        });
+
+        match result {
+            Ok(()) => {
+                if compact {
+                    format!("ok:{}", params.name)
+                } else {
+                    format!("Refined concept '{}' in memoir '{}'", params.name, params.memoir)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Search concepts within a memoir.
+    #[tool(name = "rein_memoir_search", description = "Full-text search for concepts within a memoir.")]
+    fn rein_memoir_search(&self, Parameters(params): Parameters<ConceptSearchParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let compact = self.compact();
+        let limit = params.limit.unwrap_or(10);
+
+        let result = self.with_store(|store| {
+            store.search_concepts(&params.memoir, &params.query, limit)
+        });
+
+        match result {
+            Ok(concepts) => {
+                if concepts.is_empty() {
+                    return if compact { "none".to_string() } else { "No concepts found.".to_string() };
+                }
+                let mut text = String::new();
+                for c in &concepts {
+                    if compact {
+                        text.push_str(&format!("{}:{}:r{}:c{:.1}\n", c.name, c.definition, c.revision, c.confidence));
+                    } else {
+                        text.push_str(&format!("- {} (rev:{}, conf:{:.1}) — {}\n", c.name, c.revision, c.confidence, c.definition));
+                    }
+                }
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Search concepts across all memoirs.
+    #[tool(name = "rein_memoir_search_all", description = "Full-text search for concepts across all memoirs.")]
+    fn rein_memoir_search_all(&self, Parameters(params): Parameters<ConceptSearchAllParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let compact = self.compact();
+        let limit = params.limit.unwrap_or(10);
+
+        let result = self.with_store(|store| {
+            store.search_all_concepts(&params.query, limit)
+        });
+
+        match result {
+            Ok(concepts) => {
+                if concepts.is_empty() {
+                    return if compact { "none".to_string() } else { "No concepts found.".to_string() };
+                }
+                let mut text = String::new();
+                for c in &concepts {
+                    if compact {
+                        text.push_str(&format!("{}:{}:r{}:c{:.1}\n", c.name, c.definition, c.revision, c.confidence));
+                    } else {
+                        text.push_str(&format!("- {} (rev:{}, conf:{:.1}) — {}\n", c.name, c.revision, c.confidence, c.definition));
+                    }
+                }
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Create a typed relation between two concepts.
+    #[tool(name = "rein_memoir_link", description = "Create a typed relation (edge) between two concepts in a memoir. Relations: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by.")]
+    fn rein_memoir_link(&self, Parameters(params): Parameters<LinkParams>) -> String {
+        self.non_store_count.store(0, Ordering::Relaxed);
+        let compact = self.compact();
+
+        let relation = match params.relation.parse::<crate::types::Relation>() {
+            Ok(r) => r,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let result = self.with_store(|store| {
+            let from = store.get_concept(&params.memoir, &params.from)?
+                .ok_or_else(|| ReinError::NotFound(format!("concept '{}' not found in memoir '{}'", params.from, params.memoir)))?;
+            let to = store.get_concept(&params.memoir, &params.to)?
+                .ok_or_else(|| ReinError::NotFound(format!("concept '{}' not found in memoir '{}'", params.to, params.memoir)))?;
+
+            let link = crate::types::ConceptLink {
+                id: String::new(),
+                source_id: from.id,
+                target_id: to.id,
+                relation,
+                weight: 1.0,
+                created_at: chrono::Utc::now(),
+            };
+            store.add_link(link)
+        });
+
+        match result {
+            Ok(id) => {
+                if compact {
+                    format!("ok:{id}")
+                } else {
+                    format!("Linked '{}' --{}-> '{}': {id}", params.from, params.relation, params.to)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Inspect a concept's neighborhood via BFS.
+    #[tool(name = "rein_memoir_inspect", description = "Inspect a concept's neighborhood via BFS traversal. Returns the concept, its neighbors, and connecting links up to the specified depth.")]
+    fn rein_memoir_inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let compact = self.compact();
+        let depth = params.depth.unwrap_or(1);
+
+        let result = self.with_store(|store| {
+            store.inspect_concept(&params.memoir, &params.name, depth)
+        });
+
+        match result {
+            Ok((center, neighbors, links)) => {
+                let mut text = String::new();
+                if compact {
+                    text.push_str(&format!("center:{}:c{:.1}:r{}\n", center.name, center.confidence, center.revision));
+                    for n in &neighbors {
+                        text.push_str(&format!("neighbor:{}:c{:.1}:r{}\n", n.name, n.confidence, n.revision));
+                    }
+                    for l in &links {
+                        text.push_str(&format!("link:{}->{}:{}\n", l.source_id, l.target_id, l.relation));
+                    }
+                } else {
+                    text.push_str(&format!("Center: {} (conf:{:.1}, rev:{})\n  {}\n\n", center.name, center.confidence, center.revision, center.definition));
+                    if !neighbors.is_empty() {
+                        text.push_str("Neighbors:\n");
+                        for n in &neighbors {
+                            text.push_str(&format!("  - {} (conf:{:.1}, rev:{}) — {}\n", n.name, n.confidence, n.revision, n.definition));
+                        }
+                    }
+                    if !links.is_empty() {
+                        text.push_str("\nLinks:\n");
+                        for l in &links {
+                            text.push_str(&format!("  {} --{}-> {}\n", l.source_id, l.relation, l.target_id));
+                        }
+                    }
+                }
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Export a memoir graph.
+    #[tool(name = "rein_memoir_export", description = "Export a memoir's knowledge graph. Formats: json (structured), ascii (human-readable), dot (Graphviz).")]
+    fn rein_memoir_export(&self, Parameters(params): Parameters<ExportParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let format = params.format.as_deref().unwrap_or("json");
+
+        let result = self.with_store(|store| store.export_memoir(&params.memoir, format));
+
+        match result {
+            Ok(output) => output,
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
     /// Scan for and optionally remove duplicate memories.
     #[tool(name = "rein_dedup", description = "Scan for duplicate memories using content similarity. Use dry_run=true to preview without deleting.")]
     fn rein_dedup(&self, Parameters(params): Parameters<DedupParams>) -> String {
