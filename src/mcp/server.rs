@@ -790,6 +790,7 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
 /// Accessible via Tailscale or LAN for remote memory queries.
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     use std::sync::Arc;
+    use http_body_util::BodyExt;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpService, StreamableHttpServerConfig,
         session::local::LocalSessionManager,
@@ -800,10 +801,16 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     let _db_path = config.resolve_db_path();
     let config_clone = config.clone();
 
-    if config.server.sse_bind != "127.0.0.1" && config.server.sse_bind != "::1" {
-        eprintln!("rein: WARNING — HTTP server bound to {} with NO authentication!", config.server.sse_bind);
-        eprintln!("rein: Only use this on trusted networks (e.g., Tailscale).");
+    // Bearer token authentication
+    let auth_token = std::env::var("REIN_HTTP_TOKEN").ok();
+    if auth_token.is_none() && config.server.sse_bind != "127.0.0.1" && config.server.sse_bind != "::1" {
+        return Err(anyhow::anyhow!(
+            "REIN_HTTP_TOKEN must be set when binding to non-localhost ({}). \
+             Set REIN_HTTP_TOKEN=<secret> or use sse_bind=127.0.0.1",
+            config.server.sse_bind
+        ));
     }
+
     eprintln!("rein: NOTE — concurrent recall requests are serialized (single DB connection)");
     let cancel = CancellationToken::new();
 
@@ -829,9 +836,27 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     tracing::info!("rein HTTP server listening on {bind}");
     eprintln!("rein HTTP server listening on http://{bind}/mcp");
 
-    let service = hyper::service::service_fn(move |req| {
+    let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
         let svc = service.clone();
-        async move { Ok::<_, std::convert::Infallible>(svc.handle(req).await) }
+        let token = auth_token.clone();
+        async move {
+            // Check bearer token if configured
+            if let Some(ref expected) = token {
+                let auth_header = req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if auth_header != format!("Bearer {expected}") {
+                    return Ok::<_, std::convert::Infallible>(hyper::Response::builder()
+                        .status(401)
+                        .body(http_body_util::Full::new(bytes::Bytes::from("Unauthorized"))
+                            .map_err(|never: std::convert::Infallible| match never {})
+                            .boxed())
+                        .unwrap());
+                }
+            }
+            Ok::<_, std::convert::Infallible>(svc.handle(req).await)
+        }
     });
 
     loop {

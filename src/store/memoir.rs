@@ -7,6 +7,14 @@ use crate::types::*;
 
 use super::sqlite::SqliteStore;
 
+/// Escape a string for use in DOT (Graphviz) quoted strings.
+fn escape_dot(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+     .replace('\r', "\\r")
+}
+
 /// Map a rusqlite Row to a Memoir struct.
 fn row_to_memoir(row: &rusqlite::Row) -> ReinResult<Memoir> {
     let id: String = row.get("id").map_err(ReinError::Database)?;
@@ -566,7 +574,7 @@ impl SqliteStore {
             }
             "dot" => {
                 let mut dot = String::new();
-                dot.push_str(&format!("digraph \"{}\" {{\n", memoir.name));
+                dot.push_str(&format!("digraph \"{}\" {{\n", escape_dot(&memoir.name)));
                 dot.push_str("  rankdir=LR;\n");
                 dot.push_str("  node [shape=box, style=rounded];\n\n");
 
@@ -577,13 +585,13 @@ impl SqliteStore {
                     .collect();
 
                 for c in &concepts {
-                    let escaped_def = c.definition.replace('"', "\\\"");
+                    let escaped_def = escape_dot(&c.definition);
                     let label = if escaped_def.chars().count() > 60 {
                         format!("{}...", escaped_def.chars().take(60).collect::<String>())
                     } else {
                         escaped_def
                     };
-                    let escaped_name = c.name.replace('"', "\\\"");
+                    let escaped_name = escape_dot(&c.name);
                     dot.push_str(&format!(
                         "  \"{}\" [label=\"{}\\n---\\n{}\"];\n",
                         c.id, escaped_name, label
@@ -594,9 +602,10 @@ impl SqliteStore {
                 for l in &links {
                     let src = id_to_name.get(l.source_id.as_str()).unwrap_or(&"?");
                     let tgt = id_to_name.get(l.target_id.as_str()).unwrap_or(&"?");
+                    let escaped_relation = escape_dot(&l.relation.to_string());
                     dot.push_str(&format!(
                         "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
-                        l.source_id, l.target_id, l.relation
+                        l.source_id, l.target_id, escaped_relation
                     ));
                     let _ = (src, tgt); // used for readable comments if needed
                 }
