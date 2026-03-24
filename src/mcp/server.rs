@@ -123,6 +123,10 @@ impl ReinServer {
     fn rein_store(&self, Parameters(params): Parameters<StoreParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed);
 
+        if params.content.len() > 100_000 {
+            return "Error: content too large (max 100KB)".to_string();
+        }
+
         let importance: Importance = params
             .importance
             .as_deref()
@@ -318,14 +322,15 @@ impl ReinServer {
         let compact = self.compact();
 
         let result = self.with_store(|store| {
-            let old_memories = store.consolidate(&params.topic)?;
-
-            if old_memories.is_empty() {
+            // Check if topic has any memories first
+            let existing = store.get_by_topic(&params.topic)?;
+            if existing.is_empty() {
                 return Ok((0, String::new()));
             }
 
+            let new_id = ulid::Ulid::new().to_string();
             let consolidated = Memory {
-                id: ulid::Ulid::new().to_string(),
+                id: new_id.clone(),
                 layer: MemoryLayer::LTM,
                 topic: params.topic.clone(),
                 summary: params.summary.chars().take(100).collect(),
@@ -337,16 +342,15 @@ impl ReinServer {
                 decay_lambda: base_lambda * Importance::High.decay_factor(),
                 access_count: 0,
                 superseded_by: None,
-                related_ids: old_memories.iter().map(|m| m.id.clone()).collect(),
+                related_ids: existing.iter().map(|m| m.id.clone()).collect(),
                 embedding: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 last_accessed: chrono::Utc::now(),
             };
 
-            let count = old_memories.len();
-            let id = store.store(consolidated)?;
-            Ok((count, id))
+            let old = store.consolidate_atomic(&params.topic, consolidated)?;
+            Ok((old.len(), new_id))
         });
 
         match result {

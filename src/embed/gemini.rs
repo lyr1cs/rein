@@ -40,8 +40,8 @@ impl Embedder for GeminiEmbedder {
 
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={}",
-            self.model, self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
+            self.model
         );
         let body = json!({
             "model": format!("models/{}", self.model),
@@ -49,7 +49,9 @@ impl Embedder for GeminiEmbedder {
             "outputDimensionality": self.dimensions
         });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body).send().await?;
         let status = resp.status();
         let text_body = resp.text().await?;
 
@@ -77,8 +79,8 @@ impl Embedder for GeminiEmbedder {
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents?key={}",
-            self.model, self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents",
+            self.model
         );
 
         let requests: Vec<Value> = texts
@@ -94,7 +96,9 @@ impl Embedder for GeminiEmbedder {
 
         let body = json!({ "requests": requests });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body).send().await?;
         let status = resp.status();
         let text_body = resp.text().await?;
 
