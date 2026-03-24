@@ -71,11 +71,13 @@ pub fn search_fts(
     }
 
     // Fallback to LIKE search on topic and summary
-    let like_pattern = format!("%{}%", query);
+    // Escape LIKE wildcards in user input to prevent wildcard injection
+    let escaped = query.replace('%', "\\%").replace('_', "\\_");
+    let like_pattern = format!("%{escaped}%");
     let fallback = if let Some(topic) = topic {
         let mut stmt = conn.prepare(
             "SELECT * FROM memories
-             WHERE (topic LIKE ?1 OR summary LIKE ?1)
+             WHERE (topic LIKE ?1 ESCAPE '\\' OR summary LIKE ?1 ESCAPE '\\')
              AND topic = ?2
              ORDER BY strength DESC
              LIMIT ?3",
@@ -92,7 +94,7 @@ pub fn search_fts(
     } else {
         let mut stmt = conn.prepare(
             "SELECT * FROM memories
-             WHERE topic LIKE ?1 OR summary LIKE ?1
+             WHERE topic LIKE ?1 ESCAPE '\\' OR summary LIKE ?1 ESCAPE '\\'
              ORDER BY strength DESC
              LIMIT ?2",
         )?;
