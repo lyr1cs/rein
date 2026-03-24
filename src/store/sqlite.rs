@@ -41,6 +41,32 @@ impl SqliteStore {
         schema::init_schema(&conn)?;
         Ok(Self { conn })
     }
+    /// Access the underlying SQLite connection (for direct queries).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Get all memories in a topic (for dedup scanning).
+    pub fn get_by_topic(&self, topic: &str) -> ReinResult<Vec<Memory>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE topic = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![topic], |row| {
+            row_to_memory(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Record an access to a memory (bumps access_count and last_accessed).
+    /// Call this only when memories are returned to the user via recall, NOT on internal lookups.
+    pub fn record_access(&self, id: &str) -> ReinResult<()> {
+        let now = Utc::now();
+        self.conn.execute(
+            "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
+            rusqlite::params![now.to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
 }
 
 /// Map a rusqlite Row to a Memory struct.
@@ -160,7 +186,7 @@ impl MemoryStore for SqliteStore {
 
     async fn get(&self, id: &str) -> ReinResult<Memory> {
         let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
-        let mut memory = stmt
+        let memory = stmt
             .query_row(rusqlite::params![id], |row| {
                 row_to_memory(row).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -176,15 +202,6 @@ impl MemoryStore for SqliteStore {
                 }
                 other => ReinError::Database(other),
             })?;
-
-        // Update last_accessed
-        let now = Utc::now();
-        self.conn.execute(
-            "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
-            rusqlite::params![now.to_rfc3339(), id],
-        )?;
-        memory.last_accessed = now;
-        memory.access_count += 1;
 
         Ok(memory)
     }
@@ -268,15 +285,12 @@ impl MemoryStore for SqliteStore {
         let mut memories = Vec::new();
         for (id, _distance) in results {
             match self.get(&id).await {
-                Ok(mut m) => {
+                Ok(m) => {
                     if let Some(t) = topic {
                         if m.topic == t {
-                            // Undo the access_count bump from get()
-                            m.access_count = m.access_count.saturating_sub(1);
                             memories.push(m);
                         }
                     } else {
-                        m.access_count = m.access_count.saturating_sub(1);
                         memories.push(m);
                     }
                 }
@@ -385,27 +399,36 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn consolidate(&self, topic: &str) -> ReinResult<Vec<Memory>> {
+        // Use a transaction to ensure atomicity: either all delete or nothing
+        self.conn.execute_batch("BEGIN TRANSACTION")?;
+
         // Collect all memories for the topic
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM memories WHERE topic = ?1")?;
-        let rows = stmt.query_map(rusqlite::params![topic], |row| {
-            row_to_memory(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })
-        })?;
-        let memories: Vec<Memory> = rows.collect::<Result<Vec<_>, _>>()?;
+        let memories: Vec<Memory> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT * FROM memories WHERE topic = ?1")?;
+            let rows = stmt.query_map(rusqlite::params![topic], |row| {
+                row_to_memory(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
 
         // Delete all memories for the topic
-        self.conn.execute(
+        if let Err(e) = self.conn.execute(
             "DELETE FROM memories WHERE topic = ?1",
             rusqlite::params![topic],
-        )?;
+        ) {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e.into());
+        }
 
+        self.conn.execute_batch("COMMIT")?;
         Ok(memories)
     }
 
@@ -589,7 +612,7 @@ mod tests {
         assert_eq!(fetched.topic, original_topic);
         assert_eq!(fetched.layer, MemoryLayer::LTM);
         assert_eq!(fetched.importance, Importance::High);
-        assert_eq!(fetched.access_count, 1); // get() increments
+        assert_eq!(fetched.access_count, 0); // get() is now read-only, no side effects
     }
 
     #[tokio::test]
