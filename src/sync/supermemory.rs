@@ -3,16 +3,18 @@ use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, Source};
 pub struct SupermemoryClient {
     client: reqwest::Client,
     api_key: String,
+    endpoint: String,
 }
 
 impl SupermemoryClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, endpoint: String) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
             api_key,
+            endpoint,
         }
     }
 
@@ -32,7 +34,7 @@ impl SupermemoryClient {
         // Use v4/search with hybrid mode: searches both memory entries AND documents
         let resp = self
             .client
-            .post("https://api.supermemory.ai/v4/search")
+            .post(format!("{}/v4/search", self.endpoint))
             .bearer_auth(&self.api_key)
             .json(&serde_json::json!({
                 "q": query,

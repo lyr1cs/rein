@@ -7,12 +7,13 @@ use std::time::Duration;
 pub struct GeminiEmbedder {
     client: Client,
     api_key: String,
+    endpoint: String,
     model: String,
     dimensions: usize,
 }
 
 impl GeminiEmbedder {
-    pub fn new(api_key: String, model: String, dimensions: usize) -> Self {
+    pub fn new(api_key: String, endpoint: String, model: String, dimensions: usize) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -23,6 +24,7 @@ impl GeminiEmbedder {
         Self {
             client,
             api_key,
+            endpoint,
             model,
             dimensions,
         }
@@ -40,7 +42,8 @@ impl Embedder for GeminiEmbedder {
 
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
+            "{}/v1beta/models/{}:embedContent",
+            self.endpoint,
             self.model
         );
         let body = json!({
@@ -79,8 +82,8 @@ impl Embedder for GeminiEmbedder {
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents",
-            self.model
+            "{}/v1beta/models/{}:batchEmbedContents",
+            self.endpoint, self.model
         );
 
         let requests: Vec<Value> = texts
@@ -140,7 +143,7 @@ mod tests {
     #[ignore] // requires live API key in GEMINI_API_KEY env var
     async fn test_google_embed_live() {
         let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY not set");
-        let embedder = GeminiEmbedder::new(api_key, "gemini-embedding-001".to_string(), 3072);
+        let embedder = GeminiEmbedder::new(api_key, "https://generativelanguage.googleapis.com".to_string(), "gemini-embedding-001".to_string(), 3072);
         let result = embedder.embed("hello world").await.unwrap();
         assert_eq!(result.len(), 3072);
     }

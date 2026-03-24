@@ -95,7 +95,7 @@ pub fn recall(
     let sm_start = std::time::Instant::now();
     let supermemory_results = if config.sync.supermemory_enabled {
         if let Some(ref api_key) = config.sync.api_key {
-            let client = SupermemoryClient::new(api_key.clone());
+            let client = SupermemoryClient::new(api_key.clone(), config.sync.endpoint.clone());
             let q = query.to_string();
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(client.search(&q, limit))
