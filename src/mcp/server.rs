@@ -85,9 +85,6 @@ impl ReinServer {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let limit = params.limit.unwrap_or(10);
 
-        // NOTE: This holds the Mutex during the full recall pipeline including network I/O.
-        // In HTTP/SSE mode with concurrent clients, this serializes all recall requests.
-        // Future optimization: use a connection pool or release the lock before network calls.
         let result = self.with_store(|store| {
             crate::search::recall::recall(
                 store,
@@ -811,7 +808,6 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         ));
     }
 
-    eprintln!("rein: NOTE — concurrent recall requests are serialized (single DB connection)");
     let cancel = CancellationToken::new();
 
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -821,6 +817,9 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    // NOTE: Each HTTP session creates its own ReinServer with a separate SqliteStore.
+    // The Mutex only serializes within a single session (MCP handles one request at a time).
+    // Cross-session concurrency is handled by having independent connections.
     let service = StreamableHttpService::new(
         move || {
             let store = config_clone.open_store()
