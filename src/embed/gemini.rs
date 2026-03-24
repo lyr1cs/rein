@@ -56,9 +56,9 @@ impl Embedder for GeminiEmbedder {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
+            let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "Gemini API returned {}: {}",
-                status, text_body
+                "Gemini API returned {}: {truncated}", status
             )));
         }
 
@@ -103,9 +103,9 @@ impl Embedder for GeminiEmbedder {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
+            let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "Gemini batch API returned {}: {}",
-                status, text_body
+                "Gemini batch API returned {}: {truncated}", status
             )));
         }
 

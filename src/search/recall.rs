@@ -38,6 +38,9 @@ pub fn recall(
     // === Level 2+3: Vector search (cached → API) ===
     let vec_ranked = try_vector_search(store, config, query, topic, limit);
 
+    // Collect vector-only IDs before moving vec_ranked into RRF
+    let vec_ids: Vec<String> = vec_ranked.iter().map(|(id, _)| id.clone()).collect();
+
     // === RRF fusion ===
     let rrf_k = config.search.rrf_k as f32;
     let fts_weight = config.search.rrf_fts_weight as f32;
@@ -53,6 +56,15 @@ pub fn recall(
     let mut memory_map: std::collections::HashMap<String, Memory> = std::collections::HashMap::new();
     for m in fts_results {
         memory_map.entry(m.id.clone()).or_insert(m);
+    }
+
+    // Add vector-search memories not already in FTS results
+    for id in &vec_ids {
+        if !memory_map.contains_key(id) {
+            if let Ok(m) = store.get(id) {
+                memory_map.insert(id.clone(), m);
+            }
+        }
     }
 
     // Apply Ebbinghaus weighting

@@ -48,9 +48,9 @@ impl Embedder for OmlxEmbedder {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
+            let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "OMLX API returned {}: {}",
-                status, text_body
+                "OMLX API returned {}: {truncated}", status
             )));
         }
 
@@ -87,9 +87,9 @@ impl Embedder for OmlxEmbedder {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
+            let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "OMLX batch API returned {}: {}",
-                status, text_body
+                "OMLX batch API returned {}: {truncated}", status
             )));
         }
 
