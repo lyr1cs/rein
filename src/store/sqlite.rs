@@ -101,6 +101,12 @@ impl SqliteStore {
             return Err(e);
         }
 
+        // Clean side indexes for deleted memories
+        for m in &old_memories {
+            self.remove_from_tantivy(&m.id);
+            self.remove_from_hnsw(&m.id);
+        }
+
         self.conn.execute_batch("COMMIT")?;
         Ok(old_memories)
     }
@@ -486,11 +492,28 @@ impl MemoryStore for SqliteStore {
     }
 
     fn prune(&self, threshold: f64) -> ReinResult<u64> {
+        // Collect IDs before deleting so we can clean side indexes
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories WHERE layer = 'STM' AND strength < ?1
+             AND importance NOT IN ('critical', 'high')",
+        )?;
+        let ids: Vec<String> = stmt.query_map(rusqlite::params![threshold], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
         let rows = self.conn.execute(
             "DELETE FROM memories WHERE layer = 'STM' AND strength < ?1
              AND importance NOT IN ('critical', 'high')",
             rusqlite::params![threshold],
         )?;
+
+        // Clean side indexes for pruned memories
+        for id in &ids {
+            self.remove_from_tantivy(id);
+            self.remove_from_hnsw(id);
+        }
+
         Ok(rows as u64)
     }
 
@@ -530,6 +553,12 @@ impl MemoryStore for SqliteStore {
         ) {
             let _ = self.conn.execute_batch("ROLLBACK");
             return Err(e.into());
+        }
+
+        // Clean side indexes for deleted memories
+        for m in &memories {
+            self.remove_from_tantivy(&m.id);
+            self.remove_from_hnsw(&m.id);
         }
 
         self.conn.execute_batch("COMMIT")?;
@@ -700,16 +729,45 @@ impl SqliteStore {
         }
     }
 
+    /// Acquire an exclusive file lock on the HNSW index, open it, run `f`, then save.
+    /// Prevents concurrent HNSW writes from overwriting each other.
+    fn with_hnsw_lock<F, R>(&self, dims: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut crate::store::hnsw::HnswIndex) -> R,
+    {
+        let hnsw_path = self.hnsw_path();
+        if self.db_path.to_str() == Some(":memory:") {
+            return None;
+        }
+
+        let lock_path = hnsw_path.with_extension("usearch.lock");
+        let lock_file = std::fs::File::create(&lock_path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX); }
+        }
+
+        let mut index = crate::store::hnsw::HnswIndex::open(&hnsw_path, dims).ok()?;
+        let result = f(&mut index);
+        let _ = index.save();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN); }
+        }
+        drop(lock_file);
+
+        Some(result)
+    }
+
     /// Fire-and-forget: update HNSW index after a write (if embedding available).
     fn update_hnsw(&self, id: &str, embedding: Option<&[f32]>) {
-        if self.db_path.to_str() == Some(":memory:") {
-            return;
-        }
         if let Some(emb) = embedding {
-            if let Ok(mut hnsw) = crate::store::hnsw::HnswIndex::open(&self.hnsw_path(), emb.len()) {
-                let _ = hnsw.insert(id, emb);
-                let _ = hnsw.save();
-            }
+            self.with_hnsw_lock(emb.len(), |index| {
+                let _ = index.insert(id, emb);
+            });
         }
     }
 
@@ -725,13 +783,9 @@ impl SqliteStore {
 
     /// Fire-and-forget: remove from HNSW index after a delete.
     fn remove_from_hnsw(&self, id: &str) {
-        if self.db_path.to_str() == Some(":memory:") {
-            return;
-        }
-        if let Ok(mut hnsw) = crate::store::hnsw::HnswIndex::open(&self.hnsw_path(), 3072) {
-            let _ = hnsw.delete(id);
-            let _ = hnsw.save();
-        }
+        self.with_hnsw_lock(3072, |index| {
+            let _ = index.delete(id);
+        });
     }
 
     /// Mark an old memory as superseded by a new one.
