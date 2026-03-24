@@ -59,7 +59,13 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
                 content: row.get(2)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!("failed to deserialize memory row: {e}");
+                None
+            }
+        })
         .collect();
 
     let total = documents.len();

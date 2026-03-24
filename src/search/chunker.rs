@@ -42,11 +42,6 @@ pub fn semantic_chunk(text: &str, max_tokens: usize, overlap_percent: usize) -> 
     apply_overlap(raw_chunks, overlap_chars)
 }
 
-/// Prepend metadata to chunk for better embedding quality.
-pub fn prepend_metadata(topic: &str, summary: &str, text: &str) -> String {
-    format!("topic:{} | {} | {}", topic, summary, text)
-}
-
 /// Split text at Markdown heading boundaries (## or ###).
 fn split_by_headings(text: &str) -> Vec<String> {
     let mut sections = Vec::new();
@@ -282,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_metadata_prefix() {
-        let result = prepend_metadata("debug", "OOM fix", "connection pool leak");
+        let result = crate::embed::prepend_metadata("debug", "OOM fix", "connection pool leak");
         assert_eq!(result, "topic:debug | OOM fix | connection pool leak");
     }
 }

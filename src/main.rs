@@ -412,6 +412,9 @@ fn configure_client(path: &std::path::Path, format: &str) -> anyhow::Result<()> 
 
 fn configure_json_client(path: &std::path::Path) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
+    // Create a backup before modifying
+    let backup = path.with_extension("json.bak");
+    std::fs::copy(path, &backup).ok();
     let mut root: serde_json::Value = serde_json::from_str(&content)?;
 
     let servers = root
