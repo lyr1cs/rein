@@ -20,6 +20,7 @@ src/
 ├── main.rs          # CLI entry point (clap subcommands)
 ├── lib.rs           # Public API re-exports
 ├── config.rs        # Configuration loading (TOML + env)
+├── init.rs          # Auto-configure MCP clients (JSON + TOML)
 ├── types/           # Memory, Importance, Embedder trait, errors
 ├── store/
 │   ├── sqlite.rs    # Core CRUD, FTS, vector search, decay
@@ -36,6 +37,8 @@ src/
 │   ├── recall.rs    # Unified recall pipeline (waterfall + cross-validation)
 │   ├── rrf.rs       # Reciprocal Rank Fusion
 │   ├── scoring.rs   # Ebbinghaus decay formula
+│   ├── waterfall.rs # Waterfall search strategy
+│   ├── warmup.rs    # Background embedding cache warmup
 │   └── chunker.rs   # Semantic text chunking
 ├── extract/
 │   ├── patterns.rs  # Rule-based keyword scoring
