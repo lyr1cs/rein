@@ -1,4 +1,5 @@
 mod embed;
+mod extract;
 mod search;
 mod store;
 mod types;

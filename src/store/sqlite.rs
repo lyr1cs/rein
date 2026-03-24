@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::extract::{check_dedup, DedupAction};
 use crate::types::*;
 
 use super::{fts, schema, vec};
@@ -480,6 +481,57 @@ impl MemoryStore for SqliteStore {
     }
 }
 
+impl SqliteStore {
+    /// Store a memory with deduplication logic.
+    ///
+    /// Checks for existing similar memories using FTS and Jaccard similarity.
+    /// - If a similar memory exists within the time window, merges content into it.
+    /// - If a similar memory exists but is older, supersedes it with the new memory.
+    /// - Otherwise, creates a new memory.
+    pub async fn store_with_dedup(
+        &self,
+        mut memory: Memory,
+        similarity_threshold: f32,
+        time_window_days: i64,
+    ) -> ReinResult<String> {
+        match check_dedup(self, &memory.topic, &memory.content, similarity_threshold, time_window_days).await? {
+            DedupAction::CreateNew => {
+                self.store(memory).await
+            }
+            DedupAction::MergeInto(existing_id) => {
+                // Update existing memory: append new content, boost strength
+                if let Ok(mut existing) = self.get(&existing_id).await {
+                    existing.content = format!("{}\n\n{}", existing.content, memory.content);
+                    existing.strength = (existing.strength + 0.2).min(1.0);
+                    existing.updated_at = chrono::Utc::now();
+                    self.update(&existing).await?;
+                    Ok(existing_id)
+                } else {
+                    self.store(memory).await
+                }
+            }
+            DedupAction::Supersede(old_id) => {
+                let new_id = self.store(memory).await?;
+                // Mark old memory as superseded
+                self.mark_superseded(&old_id, &new_id).await?;
+                Ok(new_id)
+            }
+        }
+    }
+
+    /// Mark an old memory as superseded by a new one.
+    pub async fn mark_superseded(&self, old_id: &str, new_id: &str) -> ReinResult<()> {
+        let rows = self.conn.execute(
+            "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+            rusqlite::params![new_id, old_id],
+        )?;
+        if rows == 0 {
+            return Err(ReinError::NotFound(format!("memory {old_id} not found")));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +773,125 @@ mod tests {
         // Low and Medium should be gone
         assert!(store.get(&id_low).await.is_err());
         assert!(store.get(&id_med).await.is_err());
+    }
+
+    fn test_memory_with_content(topic: &str, summary: &str, content: &str, importance: Importance) -> Memory {
+        Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: importance.auto_layer(),
+            topic: topic.to_string(),
+            summary: summary.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06 * importance.decay_factor(),
+            access_count: 0,
+            superseded_by: None,
+            related_ids: vec![],
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_with_dedup_create() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem1 = test_memory_with_content(
+            "rust",
+            "ownership rules",
+            "Rust ownership rules are fundamental to memory safety",
+            Importance::High,
+        );
+        let id1 = store.store_with_dedup(mem1, 0.85, 7).await.unwrap();
+
+        let mem2 = test_memory_with_content(
+            "rust",
+            "async programming",
+            "Async programming in Rust uses futures and tokio runtime",
+            Importance::Medium,
+        );
+        let id2 = store.store_with_dedup(mem2, 0.85, 7).await.unwrap();
+
+        // Both should exist as separate memories (different content)
+        assert_ne!(id1, id2);
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 2);
+    }
+
+    #[tokio::test]
+    async fn test_store_with_dedup_merge() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mem1 = test_memory_with_content(
+            "rust",
+            "ownership rules",
+            "Rust ownership rules are fundamental to memory safety in systems programming",
+            Importance::High,
+        );
+        let id1 = store.store_with_dedup(mem1, 0.85, 7).await.unwrap();
+
+        // Store very similar content (same words, minor addition)
+        let mem2 = test_memory_with_content(
+            "rust",
+            "ownership rules updated",
+            "Rust ownership rules are fundamental to memory safety in systems programming today",
+            Importance::High,
+        );
+        let id2 = store.store_with_dedup(mem2, 0.85, 7).await.unwrap();
+
+        // Should merge into existing (same id returned)
+        assert_eq!(id1, id2);
+
+        // Only one memory should exist
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 1);
+
+        // Content should be merged
+        let merged = store.get(&id1).await.unwrap();
+        assert!(merged.content.contains("\n\n"));
+    }
+
+    #[tokio::test]
+    async fn test_store_with_dedup_supersede() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mem1 = test_memory_with_content(
+            "rust",
+            "ownership rules",
+            "Rust ownership rules are fundamental to memory safety in systems programming",
+            Importance::High,
+        );
+        let id1 = store.store_with_dedup(mem1, 0.85, 7).await.unwrap();
+
+        // Manually set created_at to 10 days ago
+        let old_date = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        store.conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![old_date, id1],
+        ).unwrap();
+
+        // Store very similar content
+        let mem2 = test_memory_with_content(
+            "rust",
+            "ownership rules updated",
+            "Rust ownership rules are fundamental to memory safety in systems programming today",
+            Importance::High,
+        );
+        let id2 = store.store_with_dedup(mem2, 0.85, 7).await.unwrap();
+
+        // Should supersede (different id)
+        assert_ne!(id1, id2);
+
+        // Two memories should exist
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 2);
+
+        // Old memory should have superseded_by set
+        let old = store.get(&id1).await.unwrap();
+        assert_eq!(old.superseded_by, Some(id2.clone()));
     }
 }
