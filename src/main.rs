@@ -279,10 +279,36 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Init { dry_run }) => {
             auto_configure(dry_run)?;
         }
-        Some(Commands::Consolidate { topic, summary: _ }) => {
+        Some(Commands::Consolidate { topic, summary }) => {
             let store = store::SqliteStore::new(&config.resolve_db_path())?;
-            let memories = store.consolidate(&topic).await?;
-            println!("Consolidated {} memories in topic '{}'", memories.len(), topic);
+            let old_memories = store.consolidate(&topic).await?;
+            if old_memories.is_empty() {
+                println!("No memories found in topic '{topic}'");
+            } else {
+                // Create the consolidated summary memory
+                let imp = types::Importance::High;
+                let consolidated = types::Memory {
+                    id: ulid::Ulid::new().to_string(),
+                    layer: imp.auto_layer(),
+                    topic: topic.clone(),
+                    summary: summary.chars().take(100).collect(),
+                    content: summary,
+                    keywords: vec![],
+                    importance: imp,
+                    source: types::Source::Manual,
+                    strength: 1.0,
+                    decay_lambda: config.decay.base_lambda * imp.decay_factor(),
+                    access_count: 0,
+                    superseded_by: None,
+                    related_ids: old_memories.iter().map(|m| m.id.clone()).collect(),
+                    embedding: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    last_accessed: chrono::Utc::now(),
+                };
+                let id = store.store(consolidated).await?;
+                println!("Consolidated {} memories in topic '{}' → {id}", old_memories.len(), topic);
+            }
         }
         Some(Commands::Dedup { dry_run }) => {
             if dry_run {

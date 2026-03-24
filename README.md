@@ -10,9 +10,9 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring |
+| **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring *(wiring in progress)* |
 | **Dual-layer Ebbinghaus decay** | LTM/STM layers with configurable lambda, beta, and access-boosted retention |
-| **Three-level waterfall search** | FTS5 (<1ms) -> cached vectors (<1ms) -> Google API (~255ms) |
+| **Three-level waterfall search** | FTS5 (<1ms) -> cached vectors (<1ms) -> Google API (~255ms) *(vector/cross-validation wiring in progress)* |
 | **Weighted RRF fusion** | Reciprocal Rank Fusion with configurable per-source weights (not fixed) |
 | **Semantic chunking** | Heading/paragraph/sentence splitting with metadata-prefixed embeddings |
 | **Zero local models** | No GPU, no ONNX runtime -- all embeddings via API |
@@ -127,7 +127,7 @@ rrf_k = 60.0
 rrf_fts_weight = 0.3
 rrf_vec_weight = 0.7
 waterfall_fts_threshold = 0.5
-dedup_similarity = 0.85
+dedup_similarity = 0.70    # uses max(jaccard, containment) similarity
 dedup_time_window_days = 7
 
 [chunking]
