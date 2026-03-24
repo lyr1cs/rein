@@ -59,6 +59,7 @@ pub fn create_embedder(config: &crate::config::ReinConfig) -> Option<EmbedderKin
             let api_key = config.embedding.google.api_key.as_ref()?;
             Some(EmbedderKind::Gemini(GeminiEmbedder::new(
                 api_key.clone(),
+                config.embedding.google.endpoint.clone(),
                 config.embedding.google.model.clone(),
                 config.embedding.dimensions,
             )))

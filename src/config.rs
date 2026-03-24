@@ -36,6 +36,14 @@ pub struct GoogleEmbeddingConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// API endpoint override (for proxies in China, etc.)
+    /// Default: "https://generativelanguage.googleapis.com"
+    #[serde(default = "default_google_endpoint")]
+    pub endpoint: String,
+}
+
+fn default_google_endpoint() -> String {
+    "https://generativelanguage.googleapis.com".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +81,13 @@ pub struct SyncConfig {
     pub auto_memory_glob: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Supermemory API endpoint override
+    #[serde(default = "default_supermemory_endpoint")]
+    pub endpoint: String,
+}
+
+fn default_supermemory_endpoint() -> String {
+    "https://api.supermemory.ai".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +159,7 @@ impl Default for GoogleEmbeddingConfig {
         Self {
             model: "gemini-embedding-001".to_string(),
             api_key: None,
+            endpoint: default_google_endpoint(),
         }
     }
 }
@@ -187,6 +203,7 @@ impl Default for SyncConfig {
             auto_memory_enabled: true,
             auto_memory_glob: "~/.claude/projects/*/memory/**/*.md".to_string(),
             api_key: None,
+            endpoint: default_supermemory_endpoint(),
         }
     }
 }
