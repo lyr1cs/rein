@@ -177,3 +177,104 @@ fn test_health_report() {
     assert!(!reports.is_empty());
     assert_eq!(reports[0].count, 10);
 }
+
+/// Store a memory with an embedding vector, verify it can be found via
+/// vector search even when FTS returns nothing useful.
+#[test]
+fn test_vector_only_recall() {
+    let store = SqliteStore::in_memory().unwrap();
+
+    // Create a memory whose content won't match the FTS query at all
+    let mut m = make_memory(
+        "science",
+        "Photosynthesis overview",
+        "Plants convert light energy into chemical energy via chloroplasts",
+        Importance::High,
+    );
+    // Attach a fake 3072-dim embedding so it ends up in the vec table
+    m.embedding = Some(vec![0.1_f32; 3072]);
+    let id = store.store(m).unwrap();
+
+    // FTS search for a completely unrelated term should find nothing
+    let fts = store.search_fts("zzz_nonexistent_token_xyz", None, 10).unwrap();
+    assert!(fts.is_empty(), "FTS should return nothing for gibberish query");
+
+    // Vector search directly should still find the memory
+    let query_vec = vec![0.1_f32; 3072];
+    let vec_results =
+        rein::store::vec::search_vec(store.conn(), &query_vec, 10).unwrap();
+    assert!(
+        !vec_results.is_empty(),
+        "Vector search should return the stored memory"
+    );
+    assert_eq!(vec_results[0].0, id, "Vector result should match stored ID");
+}
+
+/// Create a memoir with Chinese concept names and definitions containing
+/// quotes and newlines. Export as DOT format. Verify no panic (UTF-8 safety)
+/// and output contains escaped characters.
+#[test]
+fn test_dot_export_cjk() {
+    use rein::types::{Concept, Memoir};
+
+    let store = SqliteStore::in_memory().unwrap();
+
+    let memoir = Memoir {
+        id: String::new(),
+        name: "中文知识图谱".to_string(),
+        description: "测试\"引号\"和\n换行".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let _mid = store.create_memoir(memoir).unwrap();
+
+    let c1 = Concept {
+        id: String::new(),
+        memoir_id: "中文知识图谱".to_string(),
+        name: "概念一\"引号\"".to_string(),
+        definition: "这是定义\n含有换行\r和回车".to_string(),
+        labels: vec!["标签".to_string()],
+        confidence: 0.9,
+        revision: 1,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store.add_concept(c1).unwrap();
+
+    let c2 = Concept {
+        id: String::new(),
+        memoir_id: "中文知识图谱".to_string(),
+        name: "概念二\\反斜杠".to_string(),
+        definition: "包含反斜杠\\和\"双引号\"".to_string(),
+        labels: vec![],
+        confidence: 0.8,
+        revision: 1,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store.add_concept(c2).unwrap();
+
+    // Export as DOT — should not panic
+    let dot = store.export_memoir("中文知识图谱", "dot").unwrap();
+
+    // Basic structural checks
+    assert!(dot.contains("digraph"), "DOT output must contain digraph");
+    assert!(dot.starts_with("digraph"), "DOT output must start with digraph");
+    assert!(dot.contains("rankdir=LR"), "DOT output must set rankdir");
+
+    // Escaped characters must be present (quotes escaped as \")
+    assert!(
+        dot.contains(r#"\""#),
+        "DOT output must contain escaped quotes"
+    );
+    assert!(
+        dot.contains(r#"\n"#),
+        "DOT output must contain escaped newlines"
+    );
+
+    // Chinese text should survive round-trip
+    assert!(
+        dot.contains("概念一"),
+        "DOT output must contain Chinese concept name"
+    );
+}

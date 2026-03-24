@@ -422,4 +422,31 @@ rrf_k = 30.0
             "Expected path containing 'rein/memories.db', got: {path_str}"
         );
     }
+
+    /// Test that resolve_db_path returns ~/.rein/memories.db for "auto" path.
+    #[test]
+    fn test_db_path_migration() {
+        let cfg = ReinConfig::default();
+        assert_eq!(cfg.database.path, "auto");
+
+        let path = cfg.resolve_db_path();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let expected = PathBuf::from(&home).join(".rein").join("memories.db");
+
+        assert_eq!(
+            path, expected,
+            "resolve_db_path('auto') should return ~/.rein/memories.db, got: {}",
+            path.display()
+        );
+
+        // Also verify a non-"auto" path is returned verbatim
+        let mut cfg2 = ReinConfig::default();
+        cfg2.database.path = "/custom/path/my.db".to_string();
+        let path2 = cfg2.resolve_db_path();
+        assert_eq!(
+            path2,
+            PathBuf::from("/custom/path/my.db"),
+            "Non-auto path should be returned verbatim"
+        );
+    }
 }
