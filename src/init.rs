@@ -63,7 +63,7 @@ fn configure_client(path: &Path, format: &str) -> anyhow::Result<()> {
 }
 
 fn configure_json_client(path: &Path) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
+    let content = std::fs::read_to_string(path)?;
     // Create a backup before modifying
     let backup = path.with_extension("json.bak");
     std::fs::copy(path, &backup).ok();
@@ -98,7 +98,10 @@ fn configure_json_client(path: &Path) -> anyhow::Result<()> {
 }
 
 fn configure_toml_client(path: &Path) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(path).unwrap_or_else(|_| String::new());
+    let content = std::fs::read_to_string(path)?;
+    // Create a backup before modifying
+    let backup = path.with_extension("toml.bak");
+    std::fs::copy(path, &backup).ok();
     let mut root: toml::Value = if content.is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {

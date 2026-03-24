@@ -27,7 +27,7 @@ pub fn recall(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
-    let _span = tracing::info_span!("recall", query = query).entered();
+    let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
 
     // === Level 1: FTS5 (<1ms) ===
