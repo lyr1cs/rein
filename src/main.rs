@@ -4,6 +4,7 @@ use rein::config;
 use rein::embed;
 use rein::extract;
 use rein::mcp;
+use rein::search;
 use rein::store;
 use rein::types;
 use rein::types::MemoryStore;
@@ -180,21 +181,12 @@ async fn main() -> anyhow::Result<()> {
             limit,
         }) => {
             let store = config.open_store()?;
-            let mut results = store.search_fts(&query, topic.as_deref(), limit).await?;
-            // Filter by keyword if specified
-            if let Some(ref kw) = keyword {
-                let kw_lower = kw.to_lowercase();
-                results.retain(|m| {
-                    m.keywords.iter().any(|k| k.to_lowercase().contains(&kw_lower))
-                        || m.content.to_lowercase().contains(&kw_lower)
-                });
-            }
-            // Record access for returned memories
-            for m in &results {
-                let _ = store.record_access(&m.id);
-            }
+            let results = search::recall::recall(
+                &store, &config, &query,
+                topic.as_deref(), keyword.as_deref(), limit,
+            )?;
             let scored: Vec<(types::Memory, f32)> =
-                results.into_iter().map(|m| (m, 1.0)).collect();
+                results.into_iter().map(|r| (r.memory, r.score)).collect();
             println!(
                 "{}",
                 mcp::compact::format_recall_results(&scored, config.server.compact)
