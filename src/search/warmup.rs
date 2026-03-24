@@ -84,5 +84,57 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
     }
 
     tracing::info!("warmup complete: {cached} cached, {errors} errors");
+
+    // Populate HNSW index from all cached embeddings
+    populate_hnsw(store, config);
+
     (cached, errors)
+}
+
+/// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
+fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
+    let db_path = store.db_path();
+    if db_path.to_str() == Some(":memory:") {
+        return; // skip for in-memory test databases
+    }
+    let hnsw_path = db_path.with_extension("");
+    let dims = config.embedding.dimensions;
+    let model = config.embedding_model();
+
+    let mut index = match crate::store::hnsw::HnswIndex::open(&hnsw_path, dims) {
+        Ok(idx) => idx,
+        Err(e) => {
+            tracing::warn!("hnsw: failed to open index: {e}");
+            return;
+        }
+    };
+
+    // Get all memories and their cached embeddings
+    let memories = match store.get_all_for_warmup() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("hnsw: failed to list memories: {e}");
+            return;
+        }
+    };
+
+    let mut inserted = 0usize;
+    for (id, topic, summary, content) in &memories {
+        let text = prepend_metadata(topic, summary, content);
+        if let Ok(Some(emb)) = EmbedCache::get(store.conn(), &text, &model) {
+            if emb.len() == dims {
+                if index.insert(id, &emb).is_ok() {
+                    inserted += 1;
+                }
+            }
+        }
+    }
+
+    if inserted > 0 {
+        if let Err(e) = index.save() {
+            tracing::warn!("hnsw: failed to save index: {e}");
+        } else {
+            tracing::info!("hnsw: indexed {inserted} vectors");
+        }
+    }
 }
