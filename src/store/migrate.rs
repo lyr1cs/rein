@@ -194,6 +194,13 @@ pub async fn reindex(
     // 3. Now safe to rebuild vector index
     schema::rebuild_vector_index(store.conn(), config.embedding.dimensions)?;
 
+    // Delete stale HNSW and Tantivy side indexes (will be rebuilt after re-embedding)
+    let hnsw_path = store.db_path().with_extension("");
+    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
+    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));
+    let tantivy_path = store.db_path().with_extension("tantivy");
+    let _ = std::fs::remove_dir_all(&tantivy_path);
+
     // 4. Get all memories
     let mut stmt = store
         .conn()
@@ -253,6 +260,10 @@ pub async fn reindex(
 
     // 5. Clear embed_cache (old model's cache)
     store.conn().execute("DELETE FROM embed_cache", [])?;
+
+    // 6. Rebuild HNSW and Tantivy side indexes from fresh data
+    crate::search::warmup::populate_hnsw(store, config);
+    crate::search::warmup::populate_tantivy(store);
 
     Ok(ReindexReport {
         total,
