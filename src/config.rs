@@ -146,7 +146,7 @@ impl Default for SearchConfig {
             rrf_fts_weight: 0.3,
             rrf_vec_weight: 0.7,
             waterfall_fts_threshold: 0.5,
-            dedup_similarity: 0.85,
+            dedup_similarity: 0.70,
             dedup_time_window_days: 7,
         }
     }
