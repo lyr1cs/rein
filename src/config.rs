@@ -39,6 +39,12 @@ pub struct GoogleEmbeddingConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OmlxEmbeddingConfig {
     pub endpoint: String,
+    #[serde(default = "default_omlx_model")]
+    pub model: String,
+}
+
+fn default_omlx_model() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +141,7 @@ impl Default for OmlxEmbeddingConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://localhost:8000/v1".to_string(),
+            model: "default".to_string(),
         }
     }
 }
@@ -244,7 +251,10 @@ impl ReinConfig {
 
     /// The embedding model name (for cache keying and model-change detection).
     pub fn embedding_model(&self) -> String {
-        format!("{}:{}", self.embedding.provider, self.embedding.google.model)
+        match self.embedding.provider.as_str() {
+            "omlx" => format!("omlx:{}", self.embedding.omlx.model),
+            _ => format!("{}:{}", self.embedding.provider, self.embedding.google.model),
+        }
     }
 
     /// Open a SqliteStore with the current config's model and dimensions.
