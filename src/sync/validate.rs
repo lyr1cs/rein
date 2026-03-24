@@ -15,15 +15,17 @@ pub struct ValidatedResult {
 /// Cross-validate results from multiple sources.
 /// Matches results by keyword/content overlap (Jaccard > 0.3).
 /// Confidence is based on how many sources agree.
+/// `local_results` are (Memory, score) pairs from RRF fusion.
+/// External-only results are always ranked below local results.
 pub fn cross_validate(
-    local_results: &[Memory],
+    local_results: &[(Memory, f32)],
     supermemory_results: &[Memory],
     auto_memory_results: &[Memory],
 ) -> Vec<ValidatedResult> {
     let mut validated = Vec::new();
 
-    // Start with local results as base
-    for local in local_results {
+    // Start with local results as base (already scored by RRF + Ebbinghaus)
+    for (local, local_score) in local_results {
         let mut sources_hit = 1; // local always counts
 
         if has_matching_result(local, supermemory_results) {
@@ -38,22 +40,33 @@ pub fn cross_validate(
 
         validated.push(ValidatedResult {
             memory: local.clone(),
-            score: 1.0, // will be set by caller
+            score: *local_score, // preserve RRF score
             confidence,
             sources_hit,
         });
     }
 
-    // Add unique results from supermemory not in local
+    // Extract just the memories for matching
+    let local_memories: Vec<&Memory> = local_results.iter().map(|(m, _)| m).collect();
+
+    // Add unique results from supermemory not in local.
+    // Score them LOWER than local results so they supplement, not replace.
+    let local_min_score = local_results.iter()
+        .map(|(_, s)| *s)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0);
+    // External results get half the minimum local score (always ranked below local)
+    let external_score = (local_min_score * 0.5).max(0.001);
+
     for sm in supermemory_results {
-        if !has_matching_result(sm, local_results) {
+        if !has_matching_result_refs(sm, &local_memories) {
             let mut sources_hit = 1;
             if has_matching_result(sm, auto_memory_results) {
                 sources_hit += 1;
             }
             validated.push(ValidatedResult {
                 memory: sm.clone(),
-                score: 0.5,
+                score: external_score,
                 confidence: confidence_from_sources(sources_hit),
                 sources_hit,
             });
@@ -62,12 +75,12 @@ pub fn cross_validate(
 
     // Add unique results from auto-memory not in local or supermemory
     for am in auto_memory_results {
-        if !has_matching_result(am, local_results)
+        if !has_matching_result_refs(am, &local_memories)
             && !has_matching_result(am, supermemory_results)
         {
             validated.push(ValidatedResult {
                 memory: am.clone(),
-                score: 0.5,
+                score: external_score,
                 confidence: confidence_from_sources(1),
                 sources_hit: 1,
             });
@@ -89,6 +102,13 @@ fn confidence_from_sources(sources_hit: usize) -> f32 {
 /// Check if a memory has a matching result in another source.
 /// Matching = Jaccard similarity on content words > 0.3.
 fn has_matching_result(memory: &Memory, candidates: &[Memory]) -> bool {
+    candidates
+        .iter()
+        .any(|c| jaccard_similarity(&memory.content, &c.content) > 0.3)
+}
+
+/// Same as has_matching_result but for a slice of references.
+fn has_matching_result_refs(memory: &Memory, candidates: &[&Memory]) -> bool {
     candidates
         .iter()
         .any(|c| jaccard_similarity(&memory.content, &c.content) > 0.3)
@@ -125,7 +145,7 @@ mod tests {
     fn test_confidence_three_sources() {
         // Same content in all three sources -> high confidence
         let content = "rust pattern matching error handling options results";
-        let local = vec![make_memory("local-1", content)];
+        let local = vec![(make_memory("local-1", content), 0.5)];
         let supermemory = vec![make_memory("sm-1", content)];
         let auto = vec![make_memory("auto-1", content)];
 
@@ -138,7 +158,7 @@ mod tests {
     #[test]
     fn test_confidence_two_sources() {
         let content = "rust pattern matching error handling options results";
-        let local = vec![make_memory("local-1", content)];
+        let local = vec![(make_memory("local-1", content), 0.5)];
         let supermemory = vec![make_memory("sm-1", content)];
         let auto: Vec<Memory> = vec![];
 
@@ -150,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_confidence_one_source() {
-        let local = vec![make_memory("local-1", "unique local content only here")];
+        let local = vec![(make_memory("local-1", "unique local content only here"), 0.5)];
         let supermemory: Vec<Memory> = vec![];
         let auto: Vec<Memory> = vec![];
 
@@ -163,7 +183,8 @@ mod tests {
     #[test]
     fn test_no_match_across_sources() {
         // Completely different content in each source -> each gets 0.62
-        let local = vec![make_memory("local-1", "alpha beta gamma delta epsilon")];
+        // External-only results should have lower score than local
+        let local = vec![(make_memory("local-1", "alpha beta gamma delta epsilon"), 0.5)];
         let supermemory = vec![make_memory("sm-1", "one two three four five six")];
         let auto = vec![make_memory("auto-1", "rouge bleu vert jaune orange")];
 
@@ -173,5 +194,8 @@ mod tests {
             assert!((r.confidence - 0.62).abs() < f32::EPSILON);
             assert_eq!(r.sources_hit, 1);
         }
+        // Local result should have higher score than external results
+        assert!(results[0].score > results[1].score, "local should rank above supermemory");
+        assert!(results[0].score > results[2].score, "local should rank above auto-memory");
     }
 }
