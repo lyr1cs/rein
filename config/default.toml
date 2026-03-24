@@ -7,6 +7,9 @@ dimensions = 3072
 
 [embedding.google]
 model = "gemini-embedding-001"
+# endpoint override for proxies (China, etc.)
+# default: "https://generativelanguage.googleapis.com"
+# endpoint = "https://your-proxy.example.com"
 
 [embedding.omlx]
 endpoint = "http://localhost:8000/v1"
@@ -29,6 +32,9 @@ metadata_prefix = true
 supermemory_enabled = true
 auto_memory_enabled = true
 auto_memory_glob = "~/.claude/projects/*/memory/**/*.md"
+# endpoint override for Supermemory API proxy
+# default: "https://api.supermemory.ai"
+# endpoint = "https://your-proxy.example.com"
 
 [decay]
 base_lambda = 0.06
