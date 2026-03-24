@@ -127,8 +127,10 @@ async fn main() -> anyhow::Result<()> {
             }
             if sse {
                 config.server.sse_enabled = true;
+                mcp::server::run_http(config).await?;
+            } else {
+                mcp::server::run_stdio(config).await?;
             }
-            mcp::server::run_stdio(config).await?;
         }
         Some(Commands::Store {
             topic,
