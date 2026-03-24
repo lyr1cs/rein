@@ -130,7 +130,7 @@ rein loads configuration with the following priority (highest wins):
 
 ```toml
 [database]
-path = "auto"                          # "auto" = ~/.local/share/rein/memories.db
+path = "auto"                          # "auto" = ~/.rein/memories.db
 
 [embedding]
 provider = "google"    # or "omlx" or "none"
