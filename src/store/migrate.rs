@@ -1,5 +1,5 @@
 use crate::config::ReinConfig;
-use crate::embed::GeminiEmbedder;
+use crate::types::Embedder;
 use crate::search::chunker::semantic_chunk;
 use crate::store::SqliteStore;
 use crate::types::{Importance, Memory, MemoryLayer, MemoryStore, Source};
@@ -34,11 +34,11 @@ struct QmdDocument {
 /// QMD schema:
 ///   documents: id, collection, path, title, hash, active
 ///   content: hash PK, doc TEXT
-pub async fn migrate_from_qmd(
+pub async fn migrate_from_qmd<E: crate::types::Embedder>(
     qmd_path: &std::path::Path,
     store: &SqliteStore,
     config: &ReinConfig,
-    embedder: Option<&GeminiEmbedder>,
+    embedder: Option<&E>,
 ) -> anyhow::Result<MigrationReport> {
     // 1. Open QMD SQLite (read-only)
     let qmd_conn = rusqlite::Connection::open_with_flags(
@@ -210,7 +210,7 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
 
-        let report = migrate_from_qmd(qmd_path, &store, &config, None)
+        let report = migrate_from_qmd(qmd_path, &store, &config, None::<&crate::embed::GeminiEmbedder>)
             .await
             .unwrap();
 
