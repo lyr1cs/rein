@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = config::ReinConfig::load()?;
+    config.validate();
 
     match cli.command {
         Some(Commands::Serve { compact, sse }) => {

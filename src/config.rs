@@ -257,6 +257,28 @@ impl ReinConfig {
         }
     }
 
+    /// Validate configuration and print warnings for common misconfigurations.
+    pub fn validate(&self) {
+        match self.embedding.provider.as_str() {
+            "google" => {
+                if self.embedding.google.api_key.is_none() {
+                    eprintln!("rein: WARNING — embedding provider is 'google' but GEMINI_API_KEY is not set");
+                    eprintln!("rein: Vector search and embedding will be disabled. FTS search still works.");
+                }
+            }
+            "omlx" => {
+                eprintln!("rein: using OMLX embedding backend at {}", self.embedding.omlx.endpoint);
+            }
+            "none" => {}
+            other => {
+                eprintln!("rein: WARNING — unknown embedding provider '{other}', falling back to none");
+            }
+        }
+        if self.sync.supermemory_enabled && self.sync.api_key.is_none() {
+            eprintln!("rein: NOTE — supermemory is enabled but SUPERMEMORY_CC_API_KEY is not set");
+        }
+    }
+
     /// Open a SqliteStore with the current config's model and dimensions.
     pub fn open_store(&self) -> crate::types::ReinResult<crate::store::SqliteStore> {
         crate::store::SqliteStore::new(
