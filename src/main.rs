@@ -105,12 +105,14 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum HookAction {
-    /// Post-conversation hook
+    /// Extract facts from tool output (PostToolUse)
     Post,
-    /// Compact output hook
+    /// Extract context before compaction (PreCompact)
     Compact,
-    /// Prompt generation hook
+    /// Inject recalled memories into prompt (UserPromptSubmit)
     Prompt,
+    /// Save session summary on conversation end (Stop)
+    Stop,
 }
 
 #[tokio::main]
@@ -270,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
                 HookAction::Post => extract::hooks::hook_post(&config).await?,
                 HookAction::Compact => extract::hooks::hook_compact(&config).await?,
                 HookAction::Prompt => extract::hooks::hook_prompt(&config).await?,
+                HookAction::Stop => extract::hooks::hook_stop(&config).await?,
             }
         }
         Some(Commands::Migrate { from_qmd, reindex }) => {
