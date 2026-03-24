@@ -263,12 +263,10 @@ fn try_tantivy_then_fts5(
     topic: Option<&str>,
     limit: usize,
 ) -> ReinResult<(Vec<Memory>, Vec<(String, f32)>)> {
-    use std::path::Path;
-
     let db_path = store.db_path();
     if db_path.to_str() != Some(":memory:") {
-        let parent = db_path.parent().unwrap_or(Path::new("."));
-        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(parent) {
+        let tantivy_path = db_path.with_extension("tantivy");
+        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
             if let Ok(results) = tantivy.search(query, topic, limit) {
                 if !results.is_empty() {
                     // Convert tantivy results to Memory objects
