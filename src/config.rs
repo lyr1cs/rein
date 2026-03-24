@@ -250,7 +250,9 @@ impl ReinConfig {
                 None => {
                     // Fallback to ~/.local/share/rein if ProjectDirs fails
                     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    return PathBuf::from(home).join(".local/share/rein/memories.db");
+                    let fallback = PathBuf::from(home).join(".local/share/rein");
+                    std::fs::create_dir_all(&fallback).ok();
+                    return fallback.join("memories.db");
                 }
             };
             let data_dir = dirs.data_dir();

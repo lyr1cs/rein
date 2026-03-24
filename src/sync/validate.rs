@@ -1,4 +1,7 @@
-use crate::extract::dedup::similarity;
+// Use jaccard (symmetric) for cross-source validation, not containment (asymmetric).
+// Containment is good for dedup (short text subset of long), but bad for corroboration
+// where we need genuine independent confirmation, not subset overlap.
+use crate::extract::dedup::jaccard_similarity;
 use crate::types::Memory;
 
 /// Cross-validation result wrapping a memory with confidence score.
@@ -88,7 +91,7 @@ fn confidence_from_sources(sources_hit: usize) -> f32 {
 fn has_matching_result(memory: &Memory, candidates: &[Memory]) -> bool {
     candidates
         .iter()
-        .any(|c| similarity(&memory.content, &c.content) > 0.3)
+        .any(|c| jaccard_similarity(&memory.content, &c.content) > 0.3)
 }
 
 #[cfg(test)]
