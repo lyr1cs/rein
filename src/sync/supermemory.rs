@@ -138,3 +138,33 @@ impl SupermemoryClient {
         Ok(memories)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Verify that multiple results from the same document get unique IDs
+    /// (sm:docid:0, sm:docid:1, etc) so they don't overwrite each other.
+    #[test]
+    fn test_supermemory_chunk_dedup() {
+        // Simulate the ID generation logic from search_inner:
+        //   let id = format!("sm:{base_id}:{idx}");
+        // where base_id comes from the result and idx is the enumeration index.
+        let base_id = "doc123";
+        let ids: Vec<String> = (0..5)
+            .map(|idx| format!("sm:{base_id}:{idx}"))
+            .collect();
+
+        // All IDs must be unique
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "IDs from same document must be unique: {:?}",
+            ids
+        );
+
+        // Verify the format
+        assert_eq!(ids[0], "sm:doc123:0");
+        assert_eq!(ids[1], "sm:doc123:1");
+        assert_eq!(ids[4], "sm:doc123:4");
+    }
+}

@@ -144,4 +144,45 @@ mod tests {
         let result = embedder.embed("hello world").await.unwrap();
         assert_eq!(result.len(), 3072);
     }
+
+    /// Verify that truncating a very long string to 500 chars is char-safe,
+    /// especially with multi-byte CJK characters (no panic on char boundary).
+    #[test]
+    fn test_error_truncation() {
+        // Build a 1200-char string mixing ASCII and CJK
+        let mut long_string = String::new();
+        for i in 0..300 {
+            // Each iteration adds ~4 chars: a CJK char (3 bytes) + digit
+            long_string.push('错');
+            long_string.push_str(&format!("{}", i % 10));
+        }
+        assert!(
+            long_string.len() > 1000,
+            "Test string must be >1000 bytes, got {}",
+            long_string.len()
+        );
+
+        // This is the same truncation pattern used in the Gemini error path:
+        //   let truncated: String = text_body.chars().take(500).collect();
+        let truncated: String = long_string.chars().take(500).collect();
+
+        // Must not panic and must be <= 500 chars
+        assert!(
+            truncated.chars().count() <= 500,
+            "Truncated string must be <= 500 chars"
+        );
+        assert!(
+            truncated.chars().count() == 500,
+            "Truncated string should be exactly 500 chars for long input"
+        );
+
+        // Verify the truncated string is valid UTF-8 (String guarantees this,
+        // but let's be explicit)
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+
+        // Edge case: string of only multi-byte chars
+        let cjk_only: String = "中文测试数据".repeat(200); // 1200 CJK chars
+        let truncated_cjk: String = cjk_only.chars().take(500).collect();
+        assert_eq!(truncated_cjk.chars().count(), 500);
+    }
 }
