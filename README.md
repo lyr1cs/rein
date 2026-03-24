@@ -10,7 +10,7 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring *(wiring in progress)* |
+| **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring |
 | **Dual-layer Ebbinghaus decay** | LTM/STM layers with configurable lambda, beta, and access-boosted retention |
 | **Three-level waterfall search** | FTS5 (<1ms) -> cached vectors (<1ms) -> Google API (~255ms) *(vector/cross-validation wiring in progress)* |
 | **Weighted RRF fusion** | Reciprocal Rank Fusion with configurable per-source weights (not fixed) |
