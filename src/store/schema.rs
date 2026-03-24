@@ -84,6 +84,62 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS memoirs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS concepts (
+            id TEXT PRIMARY KEY,
+            memoir_id TEXT NOT NULL REFERENCES memoirs(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            definition TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0.5,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(memoir_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_concepts_memoir ON concepts(memoir_id);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts USING fts5(
+            id, name, definition, labels,
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS concepts_ai AFTER INSERT ON concepts BEGIN
+            INSERT INTO concepts_fts(id, name, definition, labels)
+            VALUES (new.id, new.name, new.definition, new.labels);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS concepts_au AFTER UPDATE ON concepts BEGIN
+            DELETE FROM concepts_fts WHERE id = old.id;
+            INSERT INTO concepts_fts(id, name, definition, labels)
+            VALUES (new.id, new.name, new.definition, new.labels);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS concepts_ad AFTER DELETE ON concepts BEGIN
+            DELETE FROM concepts_fts WHERE id = old.id;
+        END;
+
+        CREATE TABLE IF NOT EXISTS concept_links (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+            target_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL,
+            CHECK(source_id != target_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_links_source ON concept_links(source_id);
+        CREATE INDEX IF NOT EXISTS idx_links_target ON concept_links(target_id);
         ",
     )?;
 
