@@ -488,3 +488,62 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
     Ok(())
 }
+
+/// Start the MCP server over HTTP (Streamable HTTP / SSE).
+/// Accessible via Tailscale or LAN for remote memory queries.
+pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpService, StreamableHttpServerConfig,
+        session::local::LocalSessionManager,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let bind = format!("{}:{}", config.server.sse_bind, config.server.sse_port);
+    let db_path = config.resolve_db_path();
+    let config_clone = config.clone();
+    let cancel = CancellationToken::new();
+
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let http_config = StreamableHttpServerConfig {
+        stateful_mode: true,
+        cancellation_token: cancel.clone(),
+        ..Default::default()
+    };
+
+    let service = StreamableHttpService::new(
+        move || {
+            let store = SqliteStore::new(&db_path)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let server = ReinServer::new(store, config_clone.clone());
+            Ok(server)
+        },
+        session_manager,
+        http_config,
+    );
+
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("rein HTTP server listening on {bind}");
+    eprintln!("rein HTTP server listening on http://{bind}/mcp");
+
+    let service = hyper::service::service_fn(move |req| {
+        let svc = service.clone();
+        async move { Ok::<_, std::convert::Infallible>(svc.handle(req).await) }
+    });
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        tracing::debug!("connection from {addr}");
+        let svc = service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+            .await
+            {
+                tracing::warn!("connection error: {e}");
+            }
+        });
+    }
+}
