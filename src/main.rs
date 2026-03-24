@@ -4,6 +4,7 @@ mod extract;
 mod mcp;
 mod search;
 mod store;
+mod sync;
 mod types;
 
 use clap::{Parser, Subcommand};
