@@ -40,8 +40,8 @@ fn extract_hook_text(input: &str) -> String {
         if let Some(summary) = json.get("summary").and_then(|v| v.as_str()) {
             return summary.to_string();
         }
-        // Fallback: stringify the whole JSON
-        return json.to_string();
+        // Don't store unrecognized JSON payloads (may contain secrets)
+        return String::new();
     }
     // Not JSON, use as-is
     input.to_string()
@@ -107,6 +107,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
     let text = extract_hook_text(&input);
     let facts = crate::extract::patterns::extract_facts(&text, 3);
+    let facts: Vec<String> = facts.into_iter().filter(|f| !looks_like_secret(f)).collect();
 
     if facts.is_empty() {
         return Ok(());
@@ -152,6 +153,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
     let text = extract_hook_text(&input);
     let facts = crate::extract::patterns::extract_facts(&text, 2);
+    let facts: Vec<String> = facts.into_iter().filter(|f| !looks_like_secret(f)).collect();
 
     if facts.is_empty() {
         return Ok(());
@@ -215,9 +217,10 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     println!();
     for memory in &results {
         // Escape any XML-like tags in content to prevent injection
+        let safe_topic = memory.topic.replace('<', "&lt;").replace('>', "&gt;");
         let safe_summary = memory.summary.replace('<', "&lt;").replace('>', "&gt;");
         let safe_content = memory.content.replace('<', "&lt;").replace('>', "&gt;");
-        println!("## [{}] {}", memory.topic, safe_summary);
+        println!("## [{}] {}", safe_topic, safe_summary);
         println!("{}", safe_content);
         println!();
     }
@@ -295,6 +298,25 @@ fn classify_memory_type(content: &str) -> &'static str {
     }
 }
 
+/// Count actual conversation turns from a hook payload.
+fn count_transcript_turns(input: &str) -> usize {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                return content.lines()
+                    .filter(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|e| e.get("type").and_then(|t| t.as_str()).map(|t| t == "human" || t == "assistant"))
+                            .unwrap_or(false)
+                    })
+                    .count();
+            }
+        }
+    }
+    0 // Can't determine turn count
+}
+
 /// Layer 3: Stop -- extract session summary and save to memory on conversation end.
 /// Uses signal-based context window extraction: scans for signal keywords in the
 /// transcript, captures N lines before and M lines after each hit, and stores the
@@ -305,12 +327,17 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Count actual turns from JSONL if available
+    let turn_count = count_transcript_turns(&input);
+    let min_turns = config.hooks.min_turns;
+    if turn_count > 0 && turn_count < min_turns {
+        return Ok(()); // Too few actual turns
+    }
+
     let text = extract_hook_text(&input);
 
-    // Check minimum conversation length (configurable, default 20 lines)
-    let min_turns = config.hooks.min_turns;
-    let line_count = text.lines().count();
-    if line_count < min_turns {
+    // Fall back to line count if we couldn't count turns
+    if turn_count == 0 && text.lines().count() < min_turns {
         return Ok(()); // Too short, not worth capturing
     }
 
