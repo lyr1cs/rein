@@ -37,7 +37,7 @@ impl SupermemoryClient {
             .post("https://api.supermemory.ai/v3/search")
             .bearer_auth(&self.api_key)
             .json(&serde_json::json!({
-                "query": query,
+                "q": query,
                 "limit": limit,
             }))
             .send()
@@ -46,8 +46,7 @@ impl SupermemoryClient {
 
         let body: serde_json::Value = resp.json().await?;
 
-        // Parse response — expect { "results": [ { "content": "...", "id": "...", ... } ] }
-        // TODO: Adjust parsing once Supermemory API docs are confirmed
+        // Parse response: { "results": [ { "documentId", "title", "chunks": [{ "content", "score" }] } ] }
         let results = body
             .get("results")
             .and_then(|r| r.as_array())
@@ -57,28 +56,38 @@ impl SupermemoryClient {
         let memories = results
             .into_iter()
             .filter_map(|item| {
-                let content = item
-                    .get("content")
-                    .or_else(|| item.get("text"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                // Concatenate all chunk contents for this document
+                let content = item.get("chunks")
+                    .and_then(|c| c.as_array())
+                    .map(|chunks| {
+                        chunks.iter()
+                            .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    })
+                    .unwrap_or_default();
 
                 if content.is_empty() {
                     return None;
                 }
 
                 let id = item
-                    .get("id")
+                    .get("documentId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
+                    .to_string();
+
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
                     .to_string();
 
                 Some(Memory {
                     id: format!("sm:{id}"),
                     layer: MemoryLayer::LTM,
                     topic: "supermemory".to_string(),
-                    summary: content.chars().take(100).collect(),
+                    summary: if title.is_empty() { content.chars().take(100).collect() } else { title },
                     content,
                     keywords: vec![],
                     importance: Importance::Medium,
