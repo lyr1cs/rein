@@ -128,11 +128,6 @@ impl Embedder for GeminiEmbedder {
     }
 }
 
-/// Prepend topic and summary metadata to text before embedding.
-pub fn prepend_metadata(topic: &str, summary: &str, text: &str) -> String {
-    format!("topic:{} | {} | {}", topic, summary, text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
