@@ -167,8 +167,7 @@ async fn main() -> anyhow::Result<()> {
                     memory,
                     config.search.dedup_similarity as f32,
                     config.search.dedup_time_window_days,
-                )
-                .await?;
+                )?;
             println!(
                 "{}",
                 mcp::compact::format_store_result(&id, config.server.compact)
@@ -194,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Topics) => {
             let store = config.open_store()?;
-            let topics = store.list_topics().await?;
+            let topics = store.list_topics()?;
             println!(
                 "{}",
                 mcp::compact::format_topics(&topics, config.server.compact)
@@ -202,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Stats) => {
             let store = config.open_store()?;
-            let stats = store.stats().await?;
+            let stats = store.stats()?;
             println!(
                 "{}",
                 mcp::compact::format_stats(&stats, config.server.compact)
@@ -210,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Health { topic }) => {
             let store = config.open_store()?;
-            let reports = store.health(topic.as_deref()).await?;
+            let reports = store.health(topic.as_deref())?;
             println!(
                 "{}",
                 mcp::compact::format_health(&reports, config.server.compact)
@@ -218,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Forget { id }) => {
             let store = config.open_store()?;
-            store.delete(&id).await?;
+            store.delete(&id)?;
             println!("Deleted memory: {id}");
         }
         Some(Commands::Update {
@@ -227,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
             importance,
         }) => {
             let store = config.open_store()?;
-            let mut mem = store.get(&id).await?;
+            let mut mem = store.get(&id)?;
             mem.content = content.clone();
             mem.summary = content.chars().take(100).collect();
             if let Some(imp_str) = importance {
@@ -239,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
                 mem.decay_lambda = config.decay.base_lambda * imp.decay_factor();
             }
             mem.updated_at = chrono::Utc::now();
-            store.update(&mem).await?;
+            store.update(&mem)?;
             println!("Updated memory: {id}");
         }
         Some(Commands::Config) => {
@@ -305,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
                 updated_at: chrono::Utc::now(),
                 last_accessed: chrono::Utc::now(),
             };
-            let old = store.consolidate_atomic(&topic, consolidated).await?;
+            let old = store.consolidate_atomic(&topic, consolidated)?;
             if old.is_empty() {
                 println!("No memories found in topic '{topic}'");
             } else {
@@ -315,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Dedup { dry_run }) => {
             let store = config.open_store()?;
             let threshold = config.search.dedup_similarity as f32;
-            let topics = store.list_topics().await?;
+            let topics = store.list_topics()?;
             let mut dups_found = 0u32;
             let mut dups_removed = 0u32;
             for topic in &topics {
@@ -340,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if !dry_run {
                     for id in &to_delete {
-                        store.delete(id).await?;
+                        store.delete(id)?;
                         dups_removed += 1;
                     }
                 }

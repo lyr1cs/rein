@@ -27,7 +27,7 @@ pub fn recall(
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
     // === Level 1: FTS5 (<1ms) ===
-    let fts_results = futures_block(store.search_fts(query, topic, limit * 2))?;
+    let fts_results = store.search_fts(query, topic, limit * 2)?;
     let fts_ranked: Vec<(String, f32)> = fts_results
         .iter()
         .enumerate()
@@ -247,21 +247,3 @@ async fn embed_async(api_key: &str, model: &str, dims: usize, text: &str) -> Res
     Ok(values.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
 }
 
-/// Poll an async future that is expected to resolve immediately (sync SQLite ops).
-fn futures_block<T>(f: impl std::future::Future<Output = T>) -> T {
-    use std::pin::pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn vtable_noop() -> &'static RawWakerVTable {
-        &RawWakerVTable::new(|p| RawWaker::new(p, vtable_noop()), |_| {}, |_| {}, |_| {})
-    }
-    let raw = RawWaker::new(std::ptr::null(), vtable_noop());
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-
-    let mut fut = pin!(f);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(val) => val,
-        Poll::Pending => unreachable!("rein MemoryStore futures are always immediately ready"),
-    }
-}
