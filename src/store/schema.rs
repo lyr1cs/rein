@@ -39,6 +39,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             access_count INTEGER NOT NULL DEFAULT 0,
             superseded_by TEXT,
             related_ids TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'updated', 'deprecated')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_accessed TEXT NOT NULL
@@ -151,6 +152,16 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         );"
     );
     conn.execute_batch(&vec_sql)?;
+
+    // Migrate: add status column if missing (for existing databases)
+    let has_status: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='status'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_status {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")?;
+    }
 
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;

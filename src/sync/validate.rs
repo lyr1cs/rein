@@ -117,7 +117,7 @@ fn has_matching_result_refs(memory: &Memory, candidates: &[&Memory]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Importance, MemoryLayer, Source};
+    use crate::types::{Importance, MemoryLayer, MemoryStatus, Source};
 
     fn make_memory(id: &str, content: &str) -> Memory {
         Memory {
@@ -134,6 +134,7 @@ mod tests {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            status: MemoryStatus::default(),
             embedding: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
