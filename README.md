@@ -20,7 +20,7 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 | **Knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, BFS traversal, export (json / ascii / dot) |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
 | **Dual-layer Ebbinghaus decay** | LTM / STM layers with configurable lambda, beta, and access-boosted retention |
-| **Four-level waterfall search** | Tantivy BM25 → HNSW ANN → cached vectors → Google API |
+| **Dual-path search** | FTS (Tantivy BM25 → FTS5 fallback) + Vector (HNSW cache → API embed) → RRF fusion |
 | **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring |
 | **Weighted RRF fusion** | Reciprocal Rank Fusion with configurable per-source weights |
 | **Semantic chunking** | Heading / paragraph / sentence splitting with metadata-prefixed embeddings |
@@ -271,49 +271,67 @@ sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
 ### Architecture
 
 ```
-                        User / AI Agent
-                             |
-                    +--------+--------+
-                    |                 |
-                CLI (15 cmds)   MCP Server (19 tools)
-                    |                 |
-                    +--------+--------+
-                             |
-                      +------+------+
-                      |             |
-                  Waterfall      Hooks
-                  Search       (extract)
-                      |
-         +------+-----+------+------+
-         |      |             |      |
-      Tantivy  HNSW     Cached Vec  API Vec
-      (BM25)  (ANN)      (<1ms)   (~255ms)
-         |      |             |      |
-         +------+------+------+------+
-                       |
-                  RRF Fusion (weighted)
-                       |
-                Ebbinghaus Scoring
-                (strength * access)
-                       |
-            +-----+----+----+-----+
-            |     |         |     |
-          SQLite sqlite-vec HNSW Tantivy
-          (FTS5) (vectors)  (ann) (bm25)
-            |     |         |     |
-            +-----+----+----+-----+
-                       |
-                 memories.db + side indexes
+                      User / AI Agent
+                            |
+                   +--------+--------+
+                   |                 |
+               CLI (16 cmds)  MCP Server (19 tools)
+                   |                 |
+                   +--------+--------+
+                            |
+                     +------+------+
+                     |             |
+                  Recall        Hooks
+                  Pipeline    (extract + stop)
+                     |
+              +------+------+
+              |             |
+          FTS Search    Vec Search
+              |             |
+              |        +----+----+
+              |        |         |
+           Tantivy  Cache hit  Embed API
+           (BM25)   (HNSW)    (Google/OMLX)
+          fallback:  fallback:     |
+            FTS5    sqlite-vec    HNSW
+              |        |          |
+              +---+----+----+-----+
+                  |
+             RRF Fusion (weighted)
+                  |
+           Ebbinghaus Scoring
+                  |
+           Cross-Validation
+        (local + supermemory + auto-memory)
+                  |
+              Results
+
+Storage (source of truth):
+  SQLite memories.db
+    ├── memories table (CRUD)
+    ├── FTS5 (built-in text index)
+    └── sqlite-vec (vector fallback)
+Side Indexes (derived, auto-rebuilt):
+    ├── memories.tantivy/ (BM25 FTS)
+    └── memories.usearch (HNSW ANN)
 ```
 
 #### Search Pipeline
 
-1. **Tantivy BM25** -- full-text search with Tantivy (falls back to FTS5), sub-millisecond
-2. **HNSW ANN** -- O(log n) approximate nearest neighbor via usearch (falls back to sqlite-vec brute-force)
-3. **Cached vectors** -- pre-computed embeddings in sqlite-vec
-4. **API vectors** -- on-demand embedding via gemini-embedding-001 (or OMLX local backend)
-5. **RRF fusion** -- weighted Reciprocal Rank Fusion merges all result lists
+Two independent search paths run in parallel, then merge:
+
+**Text path:**
+1. **Tantivy BM25** -- full-text search with BM25 ranking (falls back to FTS5 if Tantivy unavailable)
+
+**Vector path:**
+2. **Cache check** -- look up query embedding in local cache (keyed by model + query)
+3. **HNSW search** -- O(log n) approximate nearest neighbor via usearch (falls back to sqlite-vec)
+4. If cache miss: **Embed API** -- call Google gemini-embedding-001 or OMLX, cache result, then HNSW search
+
+**Merge:**
+5. **RRF fusion** -- weighted Reciprocal Rank Fusion merges text + vector results
 6. **Ebbinghaus scoring** -- `strength(t) = exp(-lambda_eff * days^beta)` weights final ranking
+7. **Cross-validation** -- compare with Supermemory + auto-memory results, assign confidence
 
 #### Embedding Backends
 
@@ -638,39 +656,49 @@ sse_bind = "0.0.0.0"    # 需要设置 REIN_HTTP_TOKEN
 ### 架构
 
 ```
-                        用户 / AI 智能体
-                             |
-                    +--------+--------+
-                    |                 |
-               CLI (15 命令)   MCP 服务 (19 工具)
-                    |                 |
-                    +--------+--------+
-                             |
-                      +------+------+
-                      |             |
-                   瀑布搜索      Hooks
-                                (提取)
-                      |
-         +------+-----+------+------+
-         |      |             |      |
-      Tantivy  HNSW      缓存向量  API 向量
-      (BM25)  (ANN)      (<1ms)   (~255ms)
-         |      |             |      |
-         +------+------+------+------+
-                       |
-                 RRF 融合（加权）
-                       |
-                 艾宾浩斯评分
-               （强度 * 访问次数）
-                       |
-            +-----+----+----+-----+
-            |     |         |     |
-          SQLite sqlite-vec HNSW Tantivy
-          (FTS5) (嵌入向量) (ann) (bm25)
-            |     |         |     |
-            +-----+----+----+-----+
-                       |
-                memories.db + 侧索引
+                      用户 / AI 智能体
+                            |
+                   +--------+--------+
+                   |                 |
+              CLI (16 命令)   MCP 服务 (19 工具)
+                   |                 |
+                   +--------+--------+
+                            |
+                     +------+------+
+                     |             |
+                   召回          Hooks
+                   管线      (提取 + 会话保存)
+                     |
+              +------+------+
+              |             |
+           全文搜索      向量搜索
+              |             |
+              |        +----+----+
+              |        |         |
+           Tantivy   缓存命中  Embed API
+           (BM25)    (HNSW)   (Google/OMLX)
+          回退:      回退:        |
+            FTS5   sqlite-vec   HNSW
+              |        |         |
+              +---+----+----+----+
+                  |
+             RRF 融合（加权）
+                  |
+             艾宾浩斯评分
+                  |
+             交叉验证
+        (本地 + Supermemory + auto-memory)
+                  |
+               结果
+
+存储（唯一真实来源）:
+  SQLite memories.db
+    ├── memories 表（CRUD）
+    ├── FTS5（内置全文索引）
+    └── sqlite-vec（向量回退）
+旁路索引（派生，可自动重建）:
+    ├── memories.tantivy/（BM25 全文搜索）
+    └── memories.usearch（HNSW 近似最近邻）
 ```
 
 #### 搜索管线
