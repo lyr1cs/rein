@@ -490,7 +490,7 @@ impl SqliteStore {
     /// - Otherwise, creates a new memory.
     pub async fn store_with_dedup(
         &self,
-        mut memory: Memory,
+        memory: Memory,
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
