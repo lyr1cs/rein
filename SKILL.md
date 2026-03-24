@@ -26,7 +26,7 @@ Search memories by semantic query. Supports optional topic filter and result lim
 rein store -t <topic> -c <content> -I <importance> [-k keyword1,keyword2]
 ```
 Importance levels: `low`, `medium`, `high`, `critical`. Critical memories never decay.
-Automatically deduplicates against existing memories (cosine similarity > 0.85).
+Automatically deduplicates against existing memories (token similarity > 0.70, using max of Jaccard and containment).
 
 ### Update a memory
 ```bash

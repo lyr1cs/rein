@@ -32,10 +32,11 @@ impl SqliteStore {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::init_schema(&conn, dims)?;
 
-        // Check if embedding model changed since last run
+        // Check if embedding model changed since last run (warn only, don't auto-rebuild)
         if schema::check_embedding_model(&conn, model, dims)? {
-            schema::rebuild_vector_index(&conn, dims)?;
-            eprintln!("rein: embedding model changed to '{model}' ({dims}d). Run 'rein migrate' to re-embed existing memories.");
+            eprintln!("rein: WARNING — embedding model changed to '{model}' ({dims}d).");
+            eprintln!("rein: Existing vectors are incompatible. Run 'rein migrate --reindex' to rebuild.");
+            eprintln!("rein: FTS search still works. Vector search may return incorrect results.");
         }
 
         Ok(Self { conn })
@@ -63,6 +64,33 @@ impl SqliteStore {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Atomically consolidate a topic: delete all old memories and insert replacement in one transaction.
+    /// Returns the old memories for reference. If insertion fails, everything rolls back.
+    pub async fn consolidate_atomic(&self, topic: &str, replacement: Memory) -> ReinResult<Vec<Memory>> {
+        self.conn.execute_batch("BEGIN TRANSACTION")?;
+
+        // Collect old memories
+        let old_memories = self.get_by_topic(topic)?;
+
+        // Delete all in topic
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM memories WHERE topic = ?1",
+            rusqlite::params![topic],
+        ) {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e.into());
+        }
+
+        // Insert replacement within same transaction
+        if let Err(e) = self.store(replacement).await {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+
+        self.conn.execute_batch("COMMIT")?;
+        Ok(old_memories)
     }
 
     /// Record an access to a memory (bumps access_count and last_accessed).
