@@ -9,15 +9,25 @@ use crate::types::*;
 use super::{fts, schema, vec};
 
 /// SQLite-backed memory store with FTS5 and vector search.
+///
+/// Wraps `rusqlite::Connection` which is `!Send`. All database access should
+/// happen on the thread that created the connection. The MCP server uses
+/// `Mutex<SqliteStore>` with `SQLITE_OPEN_FULL_MUTEX` to allow safe cross-thread access.
 pub struct SqliteStore {
     conn: Connection,
 }
 
 impl SqliteStore {
     /// Open or create a database at the given path.
+    /// Uses SQLITE_OPEN_FULL_MUTEX for thread-safe access via serialized mode.
     pub fn new(path: &Path) -> ReinResult<Self> {
         schema::init_sqlite_vec();
-        let conn = Connection::open(path)?;
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::init_schema(&conn)?;
         Ok(Self { conn })
@@ -166,12 +176,6 @@ impl MemoryStore for SqliteStore {
                 }
                 other => ReinError::Database(other),
             })?;
-
-        // Try to load embedding
-        if let Ok(results) = vec::search_vec(&self.conn, &vec![0.0f32; 3072], 1) {
-            // Instead of a dummy search, just try to get the embedding directly
-            let _ = results; // ignore
-        }
 
         // Update last_accessed
         let now = Utc::now();

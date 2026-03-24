@@ -5,6 +5,13 @@ use std::sync::Once;
 static SQLITE_VEC_INIT: Once = Once::new();
 
 /// Initialize sqlite-vec extension. Must be called before creating any connection.
+///
+/// # Safety
+/// `sqlite3_vec_init` has the signature expected by `sqlite3_auto_extension`:
+///   `fn(*mut sqlite3, *mut *mut c_char, *const sqlite3_api_routines) -> c_int`
+/// The transmute converts the typed function pointer to the `Option<unsafe extern "C" fn()>`
+/// that `sqlite3_auto_extension` accepts. This is the standard pattern for loading
+/// SQLite extensions and is used by the sqlite-vec and ICM projects.
 pub fn init_sqlite_vec() {
     SQLITE_VEC_INIT.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
