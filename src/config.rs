@@ -14,6 +14,8 @@ pub struct ReinConfig {
     pub sync: SyncConfig,
     pub decay: DecayConfig,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +93,14 @@ pub struct ServerConfig {
     pub sse_bind: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HooksConfig {
+    pub min_turns: usize,
+    pub context_before: usize,
+    pub context_after: usize,
+    pub max_items_per_session: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Default implementations
 // ---------------------------------------------------------------------------
@@ -105,6 +115,7 @@ impl Default for ReinConfig {
             sync: SyncConfig::default(),
             decay: DecayConfig::default(),
             server: ServerConfig::default(),
+            hooks: HooksConfig::default(),
         }
     }
 }
@@ -200,6 +211,17 @@ impl Default for ServerConfig {
             sse_enabled: false,
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
+        }
+    }
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            min_turns: 20,
+            context_before: 3,
+            context_after: 1,
+            max_items_per_session: 10,
         }
     }
 }

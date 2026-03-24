@@ -19,11 +19,50 @@ pub struct Memory {
     pub access_count: u32,
     pub superseded_by: Option<String>,
     pub related_ids: Vec<String>,
+    #[serde(default)]
+    pub status: MemoryStatus,
     #[serde(skip)]
     pub embedding: Option<Vec<f32>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
+}
+
+/// Lifecycle status of a memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryStatus {
+    Active,
+    Updated,
+    Deprecated,
+}
+
+impl Default for MemoryStatus {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+impl fmt::Display for MemoryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Updated => write!(f, "updated"),
+            Self::Deprecated => write!(f, "deprecated"),
+        }
+    }
+}
+
+impl FromStr for MemoryStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "active" => Ok(Self::Active),
+            "updated" => Ok(Self::Updated),
+            "deprecated" => Ok(Self::Deprecated),
+            _ => Ok(Self::Active), // default to active for unknown
+        }
+    }
 }
 
 /// Dual-layer memory system inspired by Ebbinghaus.

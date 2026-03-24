@@ -19,6 +19,7 @@ fn make_memory(topic: &str, summary: &str, content: &str, importance: Importance
         access_count: 0,
         superseded_by: None,
         related_ids: vec![],
+        status: MemoryStatus::default(),
         embedding: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
