@@ -26,8 +26,9 @@ pub struct ReinServer {
     tool_router: ToolRouter<Self>,
 }
 
-// Safety: SqliteStore ops are synchronous; the Mutex<SqliteStore> guard is
-// never held across a real await point.
+// Safety: SqliteStore uses SQLITE_OPEN_FULL_MUTEX (serialized mode), which makes
+// the SQLite connection thread-safe. The Mutex<SqliteStore> provides exclusive access,
+// and all MemoryStore trait methods are synchronous (no real await points).
 unsafe impl Send for ReinServer {}
 unsafe impl Sync for ReinServer {}
 
@@ -452,7 +453,7 @@ fn futures_lite_block<F: std::future::Future<Output = T>, T>(f: F) -> T {
     let mut fut = pin!(f);
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(val) => val,
-        Poll::Pending => panic!("futures_lite_block: future was not immediately ready"),
+        Poll::Pending => unreachable!("rein MemoryStore futures are always immediately ready (synchronous)"),
     }
 }
 

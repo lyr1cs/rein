@@ -42,11 +42,13 @@ impl MemoryLayer {
         }
     }
 
-    /// Retrieval boost factor: LTM memories are more stable.
+    /// Decay shape parameter from Ebbinghaus model.
+    /// LTM: β=0.8 (sub-linear, gradual decay, half-life ~11 days)
+    /// STM: β=1.2 (super-linear, rapid decay, half-life ~5 days)
     pub fn beta(&self) -> f64 {
         match self {
-            MemoryLayer::LTM => 0.85,
-            MemoryLayer::STM => 1.0,
+            MemoryLayer::LTM => 0.8,
+            MemoryLayer::STM => 1.2,
         }
     }
 }

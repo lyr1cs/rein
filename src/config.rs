@@ -245,8 +245,14 @@ impl ReinConfig {
     /// Resolve the database path. `"auto"` → `~/.local/share/rein/memories.db`
     pub fn resolve_db_path(&self) -> PathBuf {
         if self.database.path == "auto" {
-            let dirs = directories::ProjectDirs::from("", "", "rein")
-                .expect("could not determine data directory");
+            let dirs = match directories::ProjectDirs::from("", "", "rein") {
+                Some(d) => d,
+                None => {
+                    // Fallback to ~/.local/share/rein if ProjectDirs fails
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                    return PathBuf::from(home).join(".local/share/rein/memories.db");
+                }
+            };
             let data_dir = dirs.data_dir();
             std::fs::create_dir_all(data_dir).ok();
             data_dir.join("memories.db")
