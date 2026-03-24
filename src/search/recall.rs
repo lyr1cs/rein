@@ -2,8 +2,9 @@
 //! Implements the full pipeline: waterfall search + cross-validation.
 
 use crate::config::ReinConfig;
-use crate::embed::{self, EmbedCache};
+use crate::embed::EmbedCache;
 use crate::store::SqliteStore;
+use crate::types::Embedder as _;
 use crate::sync::{auto_memory::AutoMemoryScanner, supermemory::SupermemoryClient, validate};
 use crate::types::{Memory, MemoryStore, ReinResult};
 
@@ -146,27 +147,23 @@ fn try_vector_search(
         }
     }
 
-    // Level 3: Call Google API
-    let api_key = match &config.embedding.google.api_key {
-        Some(k) => k.clone(),
+    // Level 3: Use configured embedder (Google or OMLX)
+    let embedder = match crate::embed::create_embedder(config) {
+        Some(e) => e,
         None => return vec![],
     };
 
-    // Create client once for the embedding API call
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let embedding = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(embedder.embed(query))
+    });
 
-    match embed_blocking(&client, &api_key, &config.embedding.google.model, config.embedding.dimensions, query) {
-        Ok(embedding) => {
-            // Cache for next time
-            let _ = EmbedCache::put(store.conn(), query, &model, &embedding);
-            // Search using direct SQL (not async trait method)
-            vec_search_direct(store, &embedding, topic, limit)
+    match embedding {
+        Ok(emb) => {
+            let _ = EmbedCache::put(store.conn(), query, &model, &emb);
+            vec_search_direct(store, &emb, topic, limit)
         }
         Err(e) => {
-            tracing::warn!("embedding API failed, falling back to FTS-only: {e}");
+            tracing::warn!("embedding failed, falling back to FTS-only: {e}");
             vec![]
         }
     }
@@ -207,47 +204,4 @@ fn vec_search_direct(
     }
 }
 
-/// Embedding call that works within a tokio async runtime.
-/// Uses `block_in_place` + async reqwest (not reqwest::blocking which panics inside tokio).
-fn embed_blocking(client: &reqwest::Client, api_key: &str, model: &str, dims: usize, text: &str) -> Result<Vec<f32>, String> {
-    let api_key = api_key.to_string();
-    let model = model.to_string();
-    let text = text.to_string();
-    let client = client.clone();
-
-    tokio::task::block_in_place(move || {
-        tokio::runtime::Handle::current().block_on(async {
-            embed_async(&client, &api_key, &model, dims, &text).await
-        })
-    })
-}
-
-async fn embed_async(client: &reqwest::Client, api_key: &str, model: &str, dims: usize, text: &str) -> Result<Vec<f32>, String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
-        model
-    );
-    let body = serde_json::json!({
-        "model": format!("models/{}", model),
-        "content": {"parts": [{"text": text}]},
-        "outputDimensionality": dims
-    });
-
-    let resp = client.post(&url)
-        .header("x-goog-api-key", api_key)
-        .json(&body).send().await.map_err(|e| format!("request error: {e}"))?;
-    let status = resp.status();
-    let text_body = resp.text().await.map_err(|e| format!("read error: {e}"))?;
-
-    if !status.is_success() {
-        return Err(format!("API returned {}: {}", status, text_body));
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&text_body).map_err(|e| format!("parse error: {e}"))?;
-    let values = parsed["embedding"]["values"]
-        .as_array()
-        .ok_or_else(|| "missing embedding.values".to_string())?;
-
-    Ok(values.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
-}
 

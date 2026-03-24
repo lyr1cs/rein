@@ -371,6 +371,26 @@ impl SqliteStore {
 
     /// Add a link between two concepts. Returns the generated link ID.
     pub fn add_link(&self, link: ConceptLink) -> ReinResult<String> {
+        // Validate both concepts exist and belong to the same memoir
+        let source_memoir: String = self.conn().query_row(
+            "SELECT memoir_id FROM concepts WHERE id = ?1",
+            rusqlite::params![&link.source_id],
+            |row| row.get(0),
+        ).map_err(|_| ReinError::NotFound(format!("source concept {} not found", link.source_id)))?;
+
+        let target_memoir: String = self.conn().query_row(
+            "SELECT memoir_id FROM concepts WHERE id = ?1",
+            rusqlite::params![&link.target_id],
+            |row| row.get(0),
+        ).map_err(|_| ReinError::NotFound(format!("target concept {} not found", link.target_id)))?;
+
+        if source_memoir != target_memoir {
+            return Err(ReinError::Config(format!(
+                "cross-memoir links not allowed: source in memoir {}, target in memoir {}",
+                source_memoir, target_memoir
+            )));
+        }
+
         let id = if link.id.is_empty() {
             ulid::Ulid::new().to_string()
         } else {
