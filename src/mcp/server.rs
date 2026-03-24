@@ -79,24 +79,26 @@ impl ReinServer {
 #[tool_router]
 impl ReinServer {
     /// Search memories by query, topic, or keyword.
-    #[tool(name = "rein_recall", description = "Search and recall memories by semantic query. Supports optional topic and keyword filters.")]
+    /// Uses full pipeline: FTS5 → cached vectors → Google API → RRF fusion → Ebbinghaus weighting → cross-validation.
+    #[tool(name = "rein_recall", description = "Search and recall memories by semantic query. Uses three-level waterfall search with cross-validation. Supports optional topic and keyword filters.")]
     fn rein_recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let limit = params.limit.unwrap_or(10);
 
         let result = self.with_store(|store| {
-            // MemoryStore::search_fts is async but actually synchronous inside
-            let results = futures_lite_block(store.search_fts(&params.query, params.topic.as_deref(), limit))?;
-            // Record access for returned memories
-            for m in &results {
-                let _ = store.record_access(&m.id);
-            }
-            Ok(results)
+            crate::search::recall::recall(
+                store,
+                &self.config,
+                &params.query,
+                params.topic.as_deref(),
+                params.keyword.as_deref(),
+                limit,
+            ).map_err(|e| ReinError::Config(format!("{e}")))
         });
 
         match result {
             Ok(results) => {
-                let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
+                let scored: Vec<(Memory, f32)> = results.into_iter().map(|r| (r.memory, r.score)).collect();
                 let mut text = compact::format_recall_results(&scored, self.compact());
                 if text.is_empty() {
                     text = if self.compact() {
