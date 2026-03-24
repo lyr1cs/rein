@@ -394,19 +394,26 @@ impl ReinServer {
                     Err(_) => continue,
                 };
 
+                let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for i in 0..mems.len() {
+                    if to_delete.contains(&mems[i].id) { continue; }
                     for j in (i + 1)..mems.len() {
+                        if to_delete.contains(&mems[j].id) { continue; }
                         let sim = crate::extract::similarity(
                             &mems[i].content,
                             &mems[j].content,
                         );
                         if sim >= threshold {
+                            to_delete.insert(mems[i].id.clone());
                             dups_found += 1;
-                            if !dry_run {
-                                if futures_lite_block(store.delete(&mems[i].id)).is_ok() {
-                                    dups_removed += 1;
-                                }
-                            }
+                            break;
+                        }
+                    }
+                }
+                if !dry_run {
+                    for id in &to_delete {
+                        if futures_lite_block(store.delete(id)).is_ok() {
+                            dups_removed += 1;
                         }
                     }
                 }

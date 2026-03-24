@@ -192,7 +192,7 @@ impl Default for ServerConfig {
             compact: false,
             sse_enabled: false,
             sse_port: 8680,
-            sse_bind: "0.0.0.0".to_string(),
+            sse_bind: "127.0.0.1".to_string(),
         }
     }
 }
