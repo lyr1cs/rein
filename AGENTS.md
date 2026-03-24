@@ -8,7 +8,7 @@ rein — Multi-source cross-validated memory MCP server for AI agents. Rust sing
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (70+)
+cargo test            # All tests must pass (80+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
@@ -23,12 +23,14 @@ src/
 ├── init.rs          # Auto-configure MCP clients (JSON + TOML)
 ├── types/           # Memory, Importance, Embedder trait, errors
 ├── store/
-│   ├── sqlite.rs    # Core CRUD, FTS, vector search, decay
+│   ├── sqlite.rs    # Core CRUD, FTS, vector search, decay (per-request connection model)
 │   ├── memoir.rs    # Knowledge graph CRUD, traversal, export
 │   ├── schema.rs    # DDL, migrations, model-change detection
 │   ├── migrate.rs   # QMD import, reindex
 │   ├── fts.rs       # FTS5 search with sanitization
-│   └── vec.rs       # sqlite-vec operations
+│   ├── vec.rs       # sqlite-vec operations
+│   ├── hnsw.rs      # HNSW approximate nearest neighbor (usearch)
+│   └── tantivy_fts.rs # Tantivy BM25 full-text search
 ├── embed/
 │   ├── gemini.rs    # Google Gemini embedding API
 │   ├── omlx.rs      # OMLX local embedding (OpenAI-compatible)
@@ -38,7 +40,7 @@ src/
 │   ├── rrf.rs       # Reciprocal Rank Fusion
 │   ├── scoring.rs   # Ebbinghaus decay formula
 │   ├── waterfall.rs # Waterfall search strategy
-│   ├── warmup.rs    # Background embedding cache warmup
+│   ├── warmup.rs    # Background warmup: embeddings + HNSW/Tantivy rebuild
 │   └── chunker.rs   # Semantic text chunking
 ├── extract/
 │   ├── patterns.rs  # Rule-based keyword scoring
@@ -63,7 +65,10 @@ src/
 - Dedup threshold: 0.70 using max(jaccard, containment)
 - Vector dimensions: configurable (default 3072)
 - FTS5 tokenizer: unicode61 (CJK support)
-- `unsafe impl Send/Sync` justified by SQLITE_OPEN_FULL_MUTEX
+- Per-request connection model: each MCP request opens its own `SqliteStore` with `SQLITE_OPEN_FULL_MUTEX`
+- `store_with_dedup` uses `BEGIN IMMEDIATE` to prevent concurrent dedup races
+- HNSW and Tantivy side indexes are updated on every store/update/delete (fire-and-forget)
+- Warmup always rebuilds HNSW and Tantivy indexes before processing new embeddings
 
 ## Common Pitfalls
 

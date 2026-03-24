@@ -19,8 +19,9 @@ pub struct TantivyFts {
 
 impl TantivyFts {
     /// Open or create a Tantivy index at the given directory.
+    /// The path is used directly as the index directory (e.g. `~/.rein/memories.tantivy/`).
     pub fn open(path: &Path) -> Result<Self, tantivy::TantivyError> {
-        let index_path = path.join("tantivy_index");
+        let index_path = path.to_path_buf();
         std::fs::create_dir_all(&index_path)
             .map_err(|e| tantivy::TantivyError::SystemError(format!("mkdir: {e}")))?;
 
