@@ -1,14 +1,12 @@
-mod config;
-mod embed;
-mod extract;
-mod mcp;
-mod search;
-mod store;
-mod sync;
-mod types;
-
 use clap::{Parser, Subcommand};
-use types::MemoryStore;
+
+use rein::config;
+use rein::embed;
+use rein::extract;
+use rein::mcp;
+use rein::store;
+use rein::types;
+use rein::types::MemoryStore;
 
 #[derive(Parser)]
 #[command(name = "rein", version, about = "Multi-source cross-validated memory for AI agents")]
