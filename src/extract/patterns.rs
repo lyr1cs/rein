@@ -1,4 +1,4 @@
-use crate::extract::dedup::jaccard_similarity;
+use crate::extract::dedup::similarity;
 
 /// Signal categories with associated keywords and scores.
 struct Signal {
@@ -136,7 +136,7 @@ pub fn extract_facts(text: &str, threshold: u32) -> Vec<String> {
             // Dedup: skip sentences with Jaccard > 0.6 vs already-selected sentences
             let is_dup = results
                 .iter()
-                .any(|existing| jaccard_similarity(existing, sentence) > 0.6);
+                .any(|existing| similarity(existing, sentence) > 0.6);
             if !is_dup {
                 results.push(sentence.to_string());
             }
