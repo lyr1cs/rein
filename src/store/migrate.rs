@@ -153,6 +153,106 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
     Ok(report)
 }
 
+/// Report summarizing a reindex run.
+pub struct ReindexReport {
+    pub total: usize,
+    pub embedded: usize,
+    pub errors: usize,
+}
+
+impl std::fmt::Display for ReindexReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Reindex complete: {}/{} memories embedded, {} errors",
+            self.embedded, self.total, self.errors
+        )
+    }
+}
+
+/// Re-embed all existing memories with the current embedding model.
+///
+/// 1. Rebuilds the vector index (drops old vec_memories, creates new with current dims)
+/// 2. Fetches all memories and batch-embeds them
+/// 3. Clears the embed_cache (old model's cache)
+pub async fn reindex(
+    store: &SqliteStore,
+    config: &ReinConfig,
+) -> anyhow::Result<ReindexReport> {
+    use crate::store::schema;
+
+    // 1. Rebuild vector index (drops old vec_memories, creates new with current dims)
+    schema::rebuild_vector_index(store.conn(), config.embedding.dimensions)?;
+
+    // 2. Get all memories
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT id, topic, summary, content FROM memories")?;
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total = rows.len();
+    if total == 0 {
+        return Ok(ReindexReport {
+            total: 0,
+            embedded: 0,
+            errors: 0,
+        });
+    }
+
+    // 3. Create embedder
+    let embedder = crate::embed::create_embedder(config);
+    let embedder = match embedder {
+        Some(e) => e,
+        None => return Err(anyhow::anyhow!("no embedding provider configured")),
+    };
+
+    // 4. Batch embed and insert vectors
+    let mut embedded = 0usize;
+    let mut errors = 0usize;
+
+    for chunk in rows.chunks(50) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|(_, topic, summary, content)| {
+                crate::embed::prepend_metadata(topic, summary, content)
+            })
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+        match embedder.embed_batch(&text_refs).await {
+            Ok(embs) => {
+                for (i, emb) in embs.iter().enumerate() {
+                    let id = &chunk[i].0;
+                    if let Err(e) = crate::store::vec::insert_embedding(store.conn(), id, emb) {
+                        tracing::warn!("failed to insert embedding for {id}: {e}");
+                        errors += 1;
+                    } else {
+                        embedded += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("batch embed failed: {e}");
+                errors += chunk.len();
+            }
+        }
+
+        eprintln!("[{}/{}] Reindexing...", embedded + errors, total);
+    }
+
+    // 5. Clear embed_cache (old model's cache)
+    store.conn().execute("DELETE FROM embed_cache", [])?;
+
+    Ok(ReindexReport {
+        total,
+        embedded,
+        errors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,7 +316,7 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
 
-        let report = migrate_from_qmd(qmd_path, &store, &config, None::<&crate::embed::GeminiEmbedder>)
+        let report = migrate_from_qmd(qmd_path, &store, &config, None::<&crate::embed::EmbedderKind>)
             .await
             .unwrap();
 
