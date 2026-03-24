@@ -88,6 +88,9 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
     // Populate HNSW index from all cached embeddings
     populate_hnsw(store, config);
 
+    // Populate Tantivy FTS index
+    populate_tantivy(store);
+
     (cached, errors)
 }
 
@@ -136,5 +139,42 @@ fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         } else {
             tracing::info!("hnsw: indexed {inserted} vectors");
         }
+    }
+}
+
+/// Populate the Tantivy FTS index from all memories in SQLite.
+fn populate_tantivy(store: &SqliteStore) {
+    let db_path = store.db_path();
+    if db_path.to_str() == Some(":memory:") {
+        return;
+    }
+    let parent = db_path.parent().unwrap_or(std::path::Path::new("."));
+
+    let tantivy = match crate::store::tantivy_fts::TantivyFts::open(parent) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("tantivy: failed to open index: {e}");
+            return;
+        }
+    };
+
+    let memories = match store.get_all_for_warmup() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("tantivy: failed to list memories: {e}");
+            return;
+        }
+    };
+
+    let mut indexed = 0usize;
+    for (id, topic, summary, content) in &memories {
+        // Use summary as keywords placeholder (keywords aren't returned by get_all_for_warmup)
+        if tantivy.insert(id, topic, summary, content, "").is_ok() {
+            indexed += 1;
+        }
+    }
+
+    if indexed > 0 {
+        tracing::info!("tantivy: indexed {indexed} documents");
     }
 }
