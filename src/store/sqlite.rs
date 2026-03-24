@@ -107,6 +107,14 @@ impl SqliteStore {
             "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
             rusqlite::params![now.to_rfc3339(), id],
         )?;
+
+        // STM→LTM promotion: if access_count > 5 and layer is STM, promote to LTM
+        self.conn.execute(
+            "UPDATE memories SET layer = 'LTM', decay_lambda = decay_lambda * 0.33
+             WHERE id = ?1 AND layer = 'STM' AND access_count > 5",
+            rusqlite::params![id],
+        )?;
+
         Ok(())
     }
 }
@@ -950,5 +958,24 @@ mod tests {
         // Old memory should have superseded_by set
         let old = store.get(&id1).unwrap();
         assert_eq!(old.superseded_by, Some(id2.clone()));
+    }
+
+    #[test]
+    fn test_stm_to_ltm_promotion() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = test_memory("test", "frequently accessed", Importance::Medium);
+        // Medium → STM
+        assert_eq!(mem.layer, MemoryLayer::STM);
+        let id = store.store(mem).unwrap();
+
+        // Access 6 times
+        for _ in 0..6 {
+            store.record_access(&id).unwrap();
+        }
+
+        // Should be promoted to LTM
+        let fetched = store.get(&id).unwrap();
+        assert_eq!(fetched.layer, MemoryLayer::LTM);
+        assert_eq!(fetched.access_count, 6);
     }
 }
