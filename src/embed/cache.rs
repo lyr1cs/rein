@@ -6,8 +6,9 @@ pub struct EmbedCache;
 
 impl EmbedCache {
     /// Look up a cached embedding by query text.
-    pub fn get(conn: &Connection, query: &str) -> ReinResult<Option<Vec<f32>>> {
-        let hash = Self::hash_query(query);
+    /// `model` is included in the hash so different models don't share cache entries.
+    pub fn get(conn: &Connection, query: &str, model: &str) -> ReinResult<Option<Vec<f32>>> {
+        let hash = Self::hash_query(model, query);
         let mut stmt =
             conn.prepare("SELECT embedding FROM embed_cache WHERE query_hash = ?1")?;
         let result = stmt.query_row([&hash], |row| {
@@ -22,10 +23,10 @@ impl EmbedCache {
         }
     }
 
-    /// Store an embedding in the cache, keyed by query text.
+    /// Store an embedding in the cache, keyed by model + query text.
     /// Evicts oldest entries when cache exceeds 10,000 entries.
-    pub fn put(conn: &Connection, query: &str, embedding: &[f32]) -> ReinResult<()> {
-        let hash = Self::hash_query(query);
+    pub fn put(conn: &Connection, query: &str, model: &str, embedding: &[f32]) -> ReinResult<()> {
+        let hash = Self::hash_query(model, query);
         let blob = Self::f32_to_bytes(embedding);
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -48,8 +49,10 @@ impl EmbedCache {
         Ok(())
     }
 
-    fn hash_query(query: &str) -> String {
+    fn hash_query(model: &str, query: &str) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(model.as_bytes());
+        hasher.update(b":");
         hasher.update(query.as_bytes());
         format!("{:x}", hasher.finalize())
     }
@@ -78,7 +81,7 @@ mod tests {
     fn setup_db() -> Connection {
         init_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+        init_schema(&conn, 3072).unwrap();
         conn
     }
 
@@ -90,8 +93,8 @@ mod tests {
             vec.push(i as f32 * 0.001);
         }
 
-        EmbedCache::put(&conn, "test query", &vec).unwrap();
-        let result = EmbedCache::get(&conn, "test query").unwrap().unwrap();
+        EmbedCache::put(&conn, "test query", "test-model", &vec).unwrap();
+        let result = EmbedCache::get(&conn, "test query", "test-model").unwrap().unwrap();
 
         assert_eq!(result.len(), 3072);
         for (a, b) in vec.iter().zip(result.iter()) {
@@ -102,8 +105,21 @@ mod tests {
     #[test]
     fn test_cache_miss() {
         let conn = setup_db();
-        let result = EmbedCache::get(&conn, "nonexistent query").unwrap();
+        let result = EmbedCache::get(&conn, "nonexistent query", "test-model").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_cache_model_isolation() {
+        let conn = setup_db();
+        let vec: Vec<f32> = (0..3072).map(|i| i as f32 * 0.001).collect();
+        EmbedCache::put(&conn, "same query", "model-a", &vec).unwrap();
+        // Different model should not find the cache entry
+        let result = EmbedCache::get(&conn, "same query", "model-b").unwrap();
+        assert!(result.is_none(), "different model should not share cache");
+        // Same model finds it
+        let result = EmbedCache::get(&conn, "same query", "model-a").unwrap();
+        assert!(result.is_some());
     }
 
     #[test]

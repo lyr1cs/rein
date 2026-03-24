@@ -20,7 +20,8 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Open or create a database at the given path.
     /// Uses SQLITE_OPEN_FULL_MUTEX for thread-safe access via serialized mode.
-    pub fn new(path: &Path) -> ReinResult<Self> {
+    /// `model` and `dims` track the embedding model; if changed, vector index is rebuilt.
+    pub fn new(path: &Path, model: &str, dims: usize) -> ReinResult<Self> {
         schema::init_sqlite_vec();
         let conn = Connection::open_with_flags(
             path,
@@ -29,16 +30,23 @@ impl SqliteStore {
                 | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        schema::init_schema(&conn)?;
+        schema::init_schema(&conn, dims)?;
+
+        // Check if embedding model changed since last run
+        if schema::check_embedding_model(&conn, model, dims)? {
+            schema::rebuild_vector_index(&conn, dims)?;
+            eprintln!("rein: embedding model changed to '{model}' ({dims}d). Run 'rein migrate' to re-embed existing memories.");
+        }
+
         Ok(Self { conn })
     }
 
-    /// Create an in-memory database for testing.
+    /// Create an in-memory database for testing (default 3072 dims).
     pub fn in_memory() -> ReinResult<Self> {
         schema::init_sqlite_vec();
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        schema::init_schema(&conn)?;
+        schema::init_schema(&conn, 3072)?;
         Ok(Self { conn })
     }
     /// Access the underlying SQLite connection (for direct queries).
