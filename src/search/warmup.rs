@@ -96,7 +96,8 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
 }
 
 /// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
-fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
+/// Clears the existing index first to remove stale entries.
+pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
     let db_path = store.db_path();
     if db_path.to_str() == Some(":memory:") {
         return; // skip for in-memory test databases
@@ -104,6 +105,10 @@ fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
     let hnsw_path = db_path.with_extension("");
     let dims = config.embedding.dimensions;
     let model = config.embedding_model();
+
+    // Clear stale index before rebuilding
+    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
+    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));
 
     let mut index = match crate::store::hnsw::HnswIndex::open(&hnsw_path, dims) {
         Ok(idx) => idx,
@@ -144,12 +149,16 @@ fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
 }
 
 /// Populate the Tantivy FTS index from all memories in SQLite.
-fn populate_tantivy(store: &SqliteStore) {
+/// Clears the existing index first to remove stale entries.
+pub fn populate_tantivy(store: &SqliteStore) {
     let db_path = store.db_path();
     if db_path.to_str() == Some(":memory:") {
         return;
     }
     let tantivy_path = db_path.with_extension("tantivy");
+
+    // Clear stale index before rebuilding
+    let _ = std::fs::remove_dir_all(&tantivy_path);
 
     let tantivy = match crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
         Ok(t) => t,
