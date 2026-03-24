@@ -130,6 +130,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            status: crate::types::MemoryStatus::default(),
             embedding: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -174,6 +175,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            status: crate::types::MemoryStatus::default(),
             embedding: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -223,8 +225,80 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Extract context windows around signal keywords from transcript text.
+/// Returns chunks of text: lines around each keyword hit.
+fn extract_signal_windows(text: &str, context_before: usize, context_after: usize) -> Vec<String> {
+    let signal_keywords = [
+        // English
+        "decided", "chose", "architecture", "design", "pattern",
+        "bug", "fix", "fixed", "resolved", "error", "crash",
+        "configured", "installed", "deployed", "migrated",
+        "important", "remember", "solution", "tradeoff",
+        "upgrade", "deprecated", "workflow", "released",
+        // Chinese
+        "决策", "选型", "架构", "设计", "模式",
+        "修复", "解决", "配置", "安装", "部署", "迁移",
+        "重要", "记住", "记录", "方案", "权衡",
+        "升级", "废弃", "流程", "发布",
+    ];
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hit_ranges: Vec<(usize, usize)> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        if signal_keywords.iter().any(|kw| lower.contains(kw)) && line.len() > 15 {
+            let start = i.saturating_sub(context_before);
+            let end = (i + context_after + 1).min(lines.len());
+            hit_ranges.push((start, end));
+        }
+    }
+
+    // Merge overlapping ranges
+    let merged = merge_ranges(&hit_ranges);
+
+    // Extract text for each range
+    merged.iter()
+        .map(|(start, end)| lines[*start..*end].join("\n"))
+        .collect()
+}
+
+fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if ranges.is_empty() { return vec![]; }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|r| r.0);
+    let mut merged = vec![sorted[0]];
+    for &(start, end) in &sorted[1..] {
+        let last = merged.last_mut().unwrap();
+        if start <= last.1 {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+/// Auto-classify memory type based on content keywords.
+fn classify_memory_type(content: &str) -> &'static str {
+    let lower = content.to_lowercase();
+    if ["architecture", "架构", "design", "设计", "component", "组件"].iter().any(|k| lower.contains(k)) {
+        "architecture"
+    } else if ["decided", "chose", "决策", "选型", "tradeoff", "权衡"].iter().any(|k| lower.contains(k)) {
+        "decision"
+    } else if ["bug", "fix", "error", "crash", "修复", "解决"].iter().any(|k| lower.contains(k)) {
+        "debug"
+    } else if ["deploy", "install", "config", "部署", "安装", "配置", "migrate", "迁移"].iter().any(|k| lower.contains(k)) {
+        "workflow"
+    } else {
+        "session-summary"
+    }
+}
+
 /// Layer 3: Stop -- extract session summary and save to memory on conversation end.
-/// Reads conversation transcript from stdin, extracts key facts and decisions, stores them.
+/// Uses signal-based context window extraction: scans for signal keywords in the
+/// transcript, captures N lines before and M lines after each hit, and stores the
+/// context windows rather than isolated sentences.
 pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
     if input.trim().is_empty() {
@@ -233,48 +307,37 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
 
     let text = extract_hook_text(&input);
 
-    // Extract important facts with low threshold to capture more from session end
-    let facts = crate::extract::patterns::extract_facts(&text, 2);
-
-    // Also extract any lines that look like decisions or outcomes
-    let decision_keywords = ["decided", "chose", "will use", "switched to", "completed",
-        "deployed", "installed", "configured", "created", "fixed", "resolved",
-        "stored", "migrated", "released", "published", "committed"];
-    let mut decisions: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if looks_like_secret(line) {
-            continue; // Skip lines with potential secrets
-        }
-        let lower = line.to_lowercase();
-        if decision_keywords.iter().any(|kw| lower.contains(kw)) && line.len() > 20 && line.len() < 500 {
-            // Dedup against already-extracted facts
-            let is_dup = facts.iter().any(|f| crate::extract::similarity(f, line) > 0.6);
-            if !is_dup {
-                decisions.push(line.trim().to_string());
-            }
-        }
+    // Check minimum conversation length (configurable, default 20 lines)
+    let min_turns = config.hooks.min_turns;
+    let line_count = text.lines().count();
+    if line_count < min_turns {
+        return Ok(()); // Too short, not worth capturing
     }
 
-    let all_items: Vec<String> = facts.into_iter()
-        .chain(decisions.into_iter())
-        .filter(|item| !looks_like_secret(item))
-        .collect();
-    if all_items.is_empty() {
+    // Extract context windows around signal keywords
+    let context_before = config.hooks.context_before;
+    let context_after = config.hooks.context_after;
+    let windows = extract_signal_windows(&text, context_before, context_after);
+    if windows.is_empty() {
         return Ok(());
     }
 
     let store = config.open_store()?;
     let mut stored = 0;
+    let max_items = config.hooks.max_items_per_session;
 
-    for item in all_items.iter().take(10) {
-        // Cap at 10 items per session
+    for window in windows.iter().take(max_items) {
+        if looks_like_secret(window) { continue; }
+
+        // Determine topic from content
+        let topic = classify_memory_type(window);
         let importance = crate::types::Importance::Medium;
         let memory = crate::types::Memory {
-            id: String::new(), // will be generated by store()
+            id: String::new(),
             layer: importance.auto_layer(),
-            topic: "session-summary".to_string(),
-            summary: item.chars().take(100).collect(),
-            content: item.clone(),
+            topic: topic.to_string(),
+            summary: window.lines().next().unwrap_or("").chars().take(100).collect(),
+            content: window.clone(),
             keywords: vec![],
             importance,
             source: crate::types::Source::Hook,
@@ -283,6 +346,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            status: crate::types::MemoryStatus::default(),
             embedding: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

@@ -43,3 +43,9 @@ compact = false
 sse_enabled = false
 sse_port = 8680
 sse_bind = "127.0.0.1"    # use 0.0.0.0 for Tailscale/LAN access
+
+[hooks]
+min_turns = 20
+context_before = 3
+context_after = 1
+max_items_per_session = 10

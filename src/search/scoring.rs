@@ -44,6 +44,7 @@ mod tests {
             access_count,
             superseded_by: None,
             related_ids: vec![],
+            status: MemoryStatus::default(),
             embedding: None,
             created_at: Utc::now() - Duration::days(days_ago),
             updated_at: Utc::now(),
