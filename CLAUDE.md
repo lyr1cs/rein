@@ -14,13 +14,15 @@ cargo build --release   # 6.5MB optimized binary
 
 ## Architecture
 
-Single crate, module-based: `types/`, `store/`, `embed/`, `search/`, `extract/`, `sync/`, `mcp/`, `config.rs`.
+Single crate, module-based: `types/`, `store/`, `embed/`, `search/`, `extract/`, `sync/`, `mcp/`, `config.rs`. 19 MCP tools total (9 core + 10 knowledge graph).
 
 - `store/sqlite.rs` — Core CRUD, uses `SQLITE_OPEN_FULL_MUTEX` for thread safety
 - `mcp/server.rs` — MCP tools over stdio, wraps SqliteStore in `Mutex`
 - `search/rrf.rs` — Reciprocal Rank Fusion, pure function
 - `search/scoring.rs` — Ebbinghaus decay formula
 - `extract/dedup.rs` — `similarity()` = max(jaccard, containment) for dedup; `jaccard_similarity()` only for cross-source validation
+- `store/memoir.rs` — Knowledge graph CRUD, traversal, export
+- Memoir tools: 10 additional MCP tools for graph operations (create, list, show, add_concept, refine, search, search_all, link, inspect, export)
 
 ## Key Invariants
 
