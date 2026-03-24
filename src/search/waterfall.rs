@@ -22,6 +22,8 @@ pub enum SearchSource {
 /// Level 3: API embedding + vector search (~255ms)
 ///
 /// Results are fused with RRF and weighted by Ebbinghaus strength.
+// Kept for future async pipeline use; current recall path uses sync recall.rs
+#[allow(dead_code)]
 pub async fn waterfall_search<S: MemoryStore, E: Embedder>(
     store: &S,
     query: &str,
