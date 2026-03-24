@@ -40,11 +40,11 @@ impl Embedder for GeminiEmbedder {
 
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={}",
-            self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={}",
+            self.model, self.api_key
         );
         let body = json!({
-            "model": "models/gemini-embedding-001",
+            "model": format!("models/{}", self.model),
             "content": {"parts": [{"text": text}]},
             "outputDimensionality": self.dimensions
         });
@@ -77,15 +77,15 @@ impl Embedder for GeminiEmbedder {
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key={}",
-            self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents?key={}",
+            self.model, self.api_key
         );
 
         let requests: Vec<Value> = texts
             .iter()
             .map(|t| {
                 json!({
-                    "model": "models/gemini-embedding-001",
+                    "model": format!("models/{}", self.model),
                     "content": {"parts": [{"text": t}]},
                     "outputDimensionality": self.dimensions
                 })

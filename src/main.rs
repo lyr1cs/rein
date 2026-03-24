@@ -293,33 +293,31 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Consolidate { topic, summary }) => {
             let store = config.open_store()?;
-            let old_memories = store.consolidate(&topic).await?;
-            if old_memories.is_empty() {
+            let imp = types::Importance::High;
+            let consolidated = types::Memory {
+                id: ulid::Ulid::new().to_string(),
+                layer: imp.auto_layer(),
+                topic: topic.clone(),
+                summary: summary.chars().take(100).collect(),
+                content: summary,
+                keywords: vec![],
+                importance: imp,
+                source: types::Source::Manual,
+                strength: 1.0,
+                decay_lambda: config.decay.base_lambda * imp.decay_factor(),
+                access_count: 0,
+                superseded_by: None,
+                related_ids: vec![],
+                embedding: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_accessed: chrono::Utc::now(),
+            };
+            let old = store.consolidate_atomic(&topic, consolidated).await?;
+            if old.is_empty() {
                 println!("No memories found in topic '{topic}'");
             } else {
-                // Create the consolidated summary memory
-                let imp = types::Importance::High;
-                let consolidated = types::Memory {
-                    id: ulid::Ulid::new().to_string(),
-                    layer: imp.auto_layer(),
-                    topic: topic.clone(),
-                    summary: summary.chars().take(100).collect(),
-                    content: summary,
-                    keywords: vec![],
-                    importance: imp,
-                    source: types::Source::Manual,
-                    strength: 1.0,
-                    decay_lambda: config.decay.base_lambda * imp.decay_factor(),
-                    access_count: 0,
-                    superseded_by: None,
-                    related_ids: old_memories.iter().map(|m| m.id.clone()).collect(),
-                    embedding: None,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                    last_accessed: chrono::Utc::now(),
-                };
-                let id = store.store(consolidated).await?;
-                println!("Consolidated {} memories in topic '{}' → {id}", old_memories.len(), topic);
+                println!("Consolidated {} memories in topic '{topic}'", old.len());
             }
         }
         Some(Commands::Dedup { dry_run }) => {
@@ -330,18 +328,28 @@ async fn main() -> anyhow::Result<()> {
             let mut dups_removed = 0u32;
             for topic in &topics {
                 let mems = store.get_by_topic(topic)?;
+                // Build set of IDs to delete (losers). Keep the last one (newest) as winner.
+                let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for i in 0..mems.len() {
+                    if to_delete.contains(&mems[i].id) { continue; }
                     for j in (i + 1)..mems.len() {
+                        if to_delete.contains(&mems[j].id) { continue; }
                         let sim = extract::similarity(&mems[i].content, &mems[j].content);
                         if sim >= threshold {
+                            // Keep the newer one (higher index = later ULID = newer)
+                            to_delete.insert(mems[i].id.clone());
                             dups_found += 1;
                             if dry_run {
                                 println!("  dup: '{}' ~ '{}' (sim={sim:.2})", &mems[i].summary.chars().take(40).collect::<String>(), &mems[j].summary.chars().take(40).collect::<String>());
-                            } else {
-                                store.delete(&mems[i].id).await?;
-                                dups_removed += 1;
                             }
+                            break; // mems[i] is already marked, move to next i
                         }
+                    }
+                }
+                if !dry_run {
+                    for id in &to_delete {
+                        store.delete(id).await?;
+                        dups_removed += 1;
                     }
                 }
             }
