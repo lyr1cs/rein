@@ -92,6 +92,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Pre-compute embeddings for uncached memories
+    Warmup,
     /// Show configuration
     Config,
     /// Hook commands
@@ -253,6 +255,11 @@ async fn main() -> anyhow::Result<()> {
             println!("SSE enabled: {}", config.server.sse_enabled);
             println!("Decay base_lambda: {}", config.decay.base_lambda);
             println!("Dedup similarity: {}", config.search.dedup_similarity);
+        }
+        Some(Commands::Warmup) => {
+            let store = config.open_store()?;
+            let (cached, errors) = search::warmup::warmup(&store, &config).await;
+            println!("Warmup complete: {cached} embeddings cached, {errors} errors");
         }
         None => {
             println!("rein v{}", env!("CARGO_PKG_VERSION"));
