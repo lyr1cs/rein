@@ -12,7 +12,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = SqliteStore::new(&config.resolve_db_path())?;
+    let store = config.open_store()?;
 
     for fact in facts {
         let importance = crate::types::Importance::Medium;
@@ -56,7 +56,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = SqliteStore::new(&config.resolve_db_path())?;
+    let store = config.open_store()?;
 
     for fact in facts {
         let importance = crate::types::Importance::Medium;
@@ -99,7 +99,7 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = SqliteStore::new(&config.resolve_db_path())?;
+    let store = config.open_store()?;
     let results = store.search_fts(query, None, 5).await?;
 
     if results.is_empty() {

@@ -39,11 +39,15 @@ pub trait MemoryStore {
 }
 
 /// Embedding provider for vector search.
+/// Implementors must provide a stable model_name() for cache keying and model-change detection.
 #[allow(async_fn_in_trait)]
 pub trait Embedder {
+    /// Unique identifier for this model (e.g., "gemini-embedding-001", "text-embedding-3-large").
+    /// Used for cache keying and model-change detection.
+    fn model_name(&self) -> &str;
+    fn dimensions(&self) -> usize;
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>>;
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>>;
-    fn dimensions(&self) -> usize;
 }
 
 /// Cloud synchronization for cross-validation.

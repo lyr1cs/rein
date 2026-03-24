@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
             importance,
             keywords,
         }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let imp: types::Importance = importance
                 .parse()
                 .map_err(|e: String| anyhow::anyhow!(e))?;
@@ -179,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
             keyword,
             limit,
         }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let mut results = store.search_fts(&query, topic.as_deref(), limit).await?;
             // Filter by keyword if specified
             if let Some(ref kw) = keyword {
@@ -201,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(Commands::Topics) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let topics = store.list_topics().await?;
             println!(
                 "{}",
@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(Commands::Stats) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let stats = store.stats().await?;
             println!(
                 "{}",
@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(Commands::Health { topic }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let reports = store.health(topic.as_deref()).await?;
             println!(
                 "{}",
@@ -225,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(Commands::Forget { id }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             store.delete(&id).await?;
             println!("Deleted memory: {id}");
         }
@@ -234,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
             content,
             importance,
         }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let mut mem = store.get(&id).await?;
             mem.content = content.clone();
             mem.summary = content.chars().take(100).collect();
@@ -277,9 +277,9 @@ async fn main() -> anyhow::Result<()> {
                     let home = std::env::var("HOME").unwrap_or_default();
                     std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
                 });
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let embedder = config.embedding.google.api_key.as_ref().map(|key| {
-                embed::GeminiEmbedder::new(key.clone(), config.embedding.dimensions)
+                embed::GeminiEmbedder::new(key.clone(), config.embedding.google.model.clone(), config.embedding.dimensions)
             });
             let report = store::migrate::migrate_from_qmd(
                 &qmd_path,
@@ -294,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
             auto_configure(dry_run)?;
         }
         Some(Commands::Consolidate { topic, summary }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let old_memories = store.consolidate(&topic).await?;
             if old_memories.is_empty() {
                 println!("No memories found in topic '{topic}'");
@@ -325,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Dedup { dry_run }) => {
-            let store = store::SqliteStore::new(&config.resolve_db_path())?;
+            let store = config.open_store()?;
             let threshold = config.search.dedup_similarity as f32;
             let topics = store.list_topics().await?;
             let mut dups_found = 0u32;
