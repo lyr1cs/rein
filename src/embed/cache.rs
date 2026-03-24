@@ -25,6 +25,7 @@ impl EmbedCache {
 
     /// Store an embedding in the cache, keyed by model + query text.
     /// Evicts oldest entries when cache exceeds 10,000 entries.
+    /// When count exceeds 5,000, also runs TTL cleanup (entries older than 30 days).
     pub fn put(conn: &Connection, query: &str, model: &str, embedding: &[f32]) -> ReinResult<()> {
         let hash = Self::hash_query(model, query);
         let blob = Self::f32_to_bytes(embedding);
@@ -33,11 +34,15 @@ impl EmbedCache {
             "INSERT OR REPLACE INTO embed_cache (query_hash, embedding, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![hash, blob, now],
         )?;
-        // Evict oldest entries if cache exceeds limit
-        const MAX_CACHE_ENTRIES: usize = 10_000;
         let count: usize = conn.query_row(
             "SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0)
         ).unwrap_or(0);
+        // TTL cleanup: when cache is moderately full, remove stale entries
+        if count > 5_000 {
+            let _ = Self::cleanup(conn, 30);
+        }
+        // Evict oldest entries if cache still exceeds hard limit
+        const MAX_CACHE_ENTRIES: usize = 10_000;
         if count > MAX_CACHE_ENTRIES {
             conn.execute(
                 "DELETE FROM embed_cache WHERE query_hash IN (
@@ -47,6 +52,18 @@ impl EmbedCache {
             )?;
         }
         Ok(())
+    }
+
+    /// Delete cache entries older than `max_age_days`.
+    /// Returns the number of entries removed.
+    pub fn cleanup(conn: &Connection, max_age_days: u64) -> ReinResult<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let deleted = conn.execute(
+            "DELETE FROM embed_cache WHERE created_at < ?1",
+            rusqlite::params![cutoff_str],
+        )?;
+        Ok(deleted)
     }
 
     fn hash_query(model: &str, query: &str) -> String {
