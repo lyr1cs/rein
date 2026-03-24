@@ -29,16 +29,15 @@ impl SupermemoryClient {
     }
 
     async fn search_inner(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Memory>> {
-        // POST https://api.supermemory.ai/v3/search
-        // Headers: Authorization: Bearer {api_key}
-        // Body: { "query": "...", "limit": N }
+        // Use v4/search with hybrid mode: searches both memory entries AND documents
         let resp = self
             .client
-            .post("https://api.supermemory.ai/v3/search")
+            .post("https://api.supermemory.ai/v4/search")
             .bearer_auth(&self.api_key)
             .json(&serde_json::json!({
                 "q": query,
                 "limit": limit,
+                "searchMode": "hybrid",
             }))
             .send()
             .await?
@@ -46,7 +45,6 @@ impl SupermemoryClient {
 
         let body: serde_json::Value = resp.json().await?;
 
-        // Parse response: { "results": [ { "documentId", "title", "chunks": [{ "content", "score" }] } ] }
         let results = body
             .get("results")
             .and_then(|r| r.as_array())
@@ -56,38 +54,69 @@ impl SupermemoryClient {
         let memories = results
             .into_iter()
             .filter_map(|item| {
-                // Concatenate all chunk contents for this document
-                let content = item.get("chunks")
-                    .and_then(|c| c.as_array())
-                    .map(|chunks| {
-                        chunks.iter()
-                            .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n\n")
-                    })
-                    .unwrap_or_default();
+                // v4 hybrid results can have either:
+                // - "memory" field (from memory entries, saved by Claude Code plugin)
+                // - "chunk" field (from document chunks, Notion sync etc.)
+                // - both in some cases
+
+                let (content, summary) = if let Some(memory_text) = item.get("memory").and_then(|v| v.as_str()) {
+                    // Memory entry (from Claude Code plugin conversations)
+                    (memory_text.to_string(), memory_text.chars().take(100).collect::<String>())
+                } else if let Some(chunk_text) = item.get("chunk").and_then(|v| v.as_str()) {
+                    // Document chunk (from Notion sync / uploaded files)
+                    let title = item.get("documents")
+                        .and_then(|d| d.as_array())
+                        .and_then(|docs| docs.first())
+                        .and_then(|doc| doc.get("title"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let summary = if title.is_empty() {
+                        chunk_text.chars().take(100).collect()
+                    } else {
+                        title.to_string()
+                    };
+                    (chunk_text.to_string(), summary)
+                } else {
+                    // Try legacy format: chunks array
+                    let chunk_content = item.get("chunks")
+                        .and_then(|c| c.as_array())
+                        .map(|chunks| {
+                            chunks.iter()
+                                .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        })
+                        .unwrap_or_default();
+                    if chunk_content.is_empty() {
+                        return None;
+                    }
+                    let title = item.get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let summary = if title.is_empty() {
+                        chunk_content.chars().take(100).collect()
+                    } else {
+                        title
+                    };
+                    (chunk_content, summary)
+                };
 
                 if content.is_empty() {
                     return None;
                 }
 
-                let id = item
-                    .get("documentId")
+                let id = item.get("id")
+                    .or_else(|| item.get("documentId"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
-                    .to_string();
-
-                let title = item
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
                     .to_string();
 
                 Some(Memory {
                     id: format!("sm:{id}"),
                     layer: MemoryLayer::LTM,
                     topic: "supermemory".to_string(),
-                    summary: if title.is_empty() { content.chars().take(100).collect() } else { title },
+                    summary,
                     content,
                     keywords: vec![],
                     importance: Importance::Medium,
