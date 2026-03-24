@@ -503,9 +503,20 @@ impl SqliteStore {
                 self.store(memory).await
             }
             DedupAction::MergeInto(existing_id) => {
-                // Update existing memory: append new content, boost strength
+                // Update existing memory: append content, refresh summary/keywords, boost strength
                 if let Ok(mut existing) = self.get(&existing_id).await {
                     existing.content = format!("{}\n\n{}", existing.content, memory.content);
+                    existing.summary = existing.content.chars().take(100).collect();
+                    // Merge keywords (deduplicated)
+                    for kw in &memory.keywords {
+                        if !existing.keywords.contains(kw) {
+                            existing.keywords.push(kw.clone());
+                        }
+                    }
+                    // Upgrade importance if new memory is more important
+                    if memory.importance > existing.importance {
+                        existing.importance = memory.importance;
+                    }
                     existing.strength = (existing.strength + 0.2).min(1.0);
                     existing.updated_at = chrono::Utc::now();
                     self.update(&existing).await?;
