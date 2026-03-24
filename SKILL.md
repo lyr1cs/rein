@@ -84,6 +84,12 @@ rein init [--dry-run]
 rein migrate [--from-qmd path] [--reindex]
 ```
 
+### Warmup embedding cache and side indexes
+```bash
+rein warmup
+```
+Pre-computes embeddings for uncached memories and rebuilds HNSW/Tantivy side indexes.
+
 ### Hook commands (used by Claude Code hooks)
 ```bash
 rein hook post      # Extract facts from tool output (stdin)

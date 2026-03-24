@@ -257,6 +257,11 @@ impl MemoryStore for SqliteStore {
             vec::insert_embedding(&self.conn, &id, emb)?;
         }
 
+        // Update side indexes (fire-and-forget)
+        let kw_str = serde_json::to_string(&memory.keywords).unwrap_or_default();
+        self.update_tantivy(&id, &memory.topic, &memory.summary, &memory.content, &kw_str);
+        self.update_hnsw(&id, memory.embedding.as_deref());
+
         Ok(id)
     }
 
@@ -326,6 +331,11 @@ impl MemoryStore for SqliteStore {
             vec::insert_embedding(&self.conn, &memory.id, emb)?;
         }
 
+        // Update side indexes (fire-and-forget)
+        let kw_str = serde_json::to_string(&memory.keywords).unwrap_or_default();
+        self.update_tantivy(&memory.id, &memory.topic, &memory.summary, &memory.content, &kw_str);
+        self.update_hnsw(&memory.id, memory.embedding.as_deref());
+
         Ok(())
     }
 
@@ -338,6 +348,11 @@ impl MemoryStore for SqliteStore {
         }
         // FTS cleanup handled by trigger; clean up vector table
         let _ = vec::delete_embedding(&self.conn, id);
+
+        // Remove from side indexes (fire-and-forget)
+        self.remove_from_tantivy(id);
+        self.remove_from_hnsw(id);
+
         Ok(())
     }
 
@@ -601,10 +616,28 @@ impl SqliteStore {
     /// Store a memory with deduplication logic.
     ///
     /// Checks for existing similar memories using FTS and Jaccard similarity.
+    /// Uses `BEGIN IMMEDIATE` to acquire a write lock upfront, preventing concurrent
+    /// requests from both seeing stale state and double-inserting.
     /// - If a similar memory exists within the time window, merges content into it.
     /// - If a similar memory exists but is older, supersedes it with the new memory.
     /// - Otherwise, creates a new memory.
     pub fn store_with_dedup(
+        &self,
+        memory: Memory,
+        similarity_threshold: f32,
+        time_window_days: i64,
+    ) -> ReinResult<String> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.store_with_dedup_inner(memory, similarity_threshold, time_window_days);
+        match &result {
+            Ok(_) => { self.conn.execute_batch("COMMIT")?; }
+            Err(_) => { let _ = self.conn.execute_batch("ROLLBACK"); }
+        }
+        result
+    }
+
+    /// Inner dedup logic, called within a BEGIN IMMEDIATE transaction.
+    fn store_with_dedup_inner(
         &self,
         memory: Memory,
         similarity_threshold: f32,
@@ -643,6 +676,61 @@ impl SqliteStore {
                 self.mark_superseded(&old_id, &new_id)?;
                 Ok(new_id)
             }
+        }
+    }
+
+    /// Path for the Tantivy FTS index directory (scoped to DB file).
+    /// e.g., `~/.rein/memories.db` → `~/.rein/memories.tantivy`
+    fn tantivy_path(&self) -> PathBuf {
+        self.db_path.with_extension("tantivy")
+    }
+
+    /// Path for the HNSW index directory.
+    fn hnsw_path(&self) -> PathBuf {
+        self.db_path.with_extension("")
+    }
+
+    /// Fire-and-forget: update Tantivy index after a write.
+    fn update_tantivy(&self, id: &str, topic: &str, summary: &str, content: &str, keywords: &str) {
+        if self.db_path.to_str() == Some(":memory:") {
+            return;
+        }
+        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&self.tantivy_path()) {
+            let _ = tantivy.insert(id, topic, summary, content, keywords);
+        }
+    }
+
+    /// Fire-and-forget: update HNSW index after a write (if embedding available).
+    fn update_hnsw(&self, id: &str, embedding: Option<&[f32]>) {
+        if self.db_path.to_str() == Some(":memory:") {
+            return;
+        }
+        if let Some(emb) = embedding {
+            if let Ok(mut hnsw) = crate::store::hnsw::HnswIndex::open(&self.hnsw_path(), emb.len()) {
+                let _ = hnsw.insert(id, emb);
+                let _ = hnsw.save();
+            }
+        }
+    }
+
+    /// Fire-and-forget: remove from Tantivy index after a delete.
+    fn remove_from_tantivy(&self, id: &str) {
+        if self.db_path.to_str() == Some(":memory:") {
+            return;
+        }
+        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&self.tantivy_path()) {
+            let _ = tantivy.delete(id);
+        }
+    }
+
+    /// Fire-and-forget: remove from HNSW index after a delete.
+    fn remove_from_hnsw(&self, id: &str) {
+        if self.db_path.to_str() == Some(":memory:") {
+            return;
+        }
+        if let Ok(mut hnsw) = crate::store::hnsw::HnswIndex::open(&self.hnsw_path(), 3072) {
+            let _ = hnsw.delete(id);
+            let _ = hnsw.save();
         }
     }
 
