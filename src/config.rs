@@ -266,21 +266,12 @@ impl ReinConfig {
         )
     }
 
-    /// Resolve the database path. `"auto"` → `~/.local/share/rein/memories.db`
+    /// Resolve the database path. `"auto"` → `~/.rein/memories.db`
     pub fn resolve_db_path(&self) -> PathBuf {
         if self.database.path == "auto" {
-            let dirs = match directories::ProjectDirs::from("", "", "rein") {
-                Some(d) => d,
-                None => {
-                    // Fallback to ~/.local/share/rein if ProjectDirs fails
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    let fallback = PathBuf::from(home).join(".local/share/rein");
-                    std::fs::create_dir_all(&fallback).ok();
-                    return fallback.join("memories.db");
-                }
-            };
-            let data_dir = dirs.data_dir();
-            std::fs::create_dir_all(data_dir).ok();
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            let data_dir = PathBuf::from(home).join(".rein");
+            std::fs::create_dir_all(&data_dir).ok();
             data_dir.join("memories.db")
         } else {
             PathBuf::from(&self.database.path)
