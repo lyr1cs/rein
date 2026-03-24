@@ -171,3 +171,87 @@ impl FromStr for Source {
         }
     }
 }
+
+/// A named knowledge container (like a structured topic).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Memoir {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A knowledge node within a memoir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Concept {
+    pub id: String,
+    pub memoir_id: String,
+    pub name: String,
+    pub definition: String,
+    pub labels: Vec<String>,
+    pub confidence: f32,
+    pub revision: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A typed relation between two concepts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptLink {
+    pub id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub relation: Relation,
+    pub weight: f32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Relation types between concepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Relation {
+    PartOf,
+    DependsOn,
+    RelatedTo,
+    Contradicts,
+    Refines,
+    AlternativeTo,
+    CausedBy,
+    InstanceOf,
+    SupersededBy,
+}
+
+impl fmt::Display for Relation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PartOf => write!(f, "part_of"),
+            Self::DependsOn => write!(f, "depends_on"),
+            Self::RelatedTo => write!(f, "related_to"),
+            Self::Contradicts => write!(f, "contradicts"),
+            Self::Refines => write!(f, "refines"),
+            Self::AlternativeTo => write!(f, "alternative_to"),
+            Self::CausedBy => write!(f, "caused_by"),
+            Self::InstanceOf => write!(f, "instance_of"),
+            Self::SupersededBy => write!(f, "superseded_by"),
+        }
+    }
+}
+
+impl FromStr for Relation {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "part_of" | "partof" => Ok(Self::PartOf),
+            "depends_on" | "dependson" => Ok(Self::DependsOn),
+            "related_to" | "relatedto" => Ok(Self::RelatedTo),
+            "contradicts" => Ok(Self::Contradicts),
+            "refines" => Ok(Self::Refines),
+            "alternative_to" | "alternativeto" => Ok(Self::AlternativeTo),
+            "caused_by" | "causedby" => Ok(Self::CausedBy),
+            "instance_of" | "instanceof" => Ok(Self::InstanceOf),
+            "superseded_by" | "supersededby" => Ok(Self::SupersededBy),
+            _ => Err(format!("unknown relation: {s}")),
+        }
+    }
+}
