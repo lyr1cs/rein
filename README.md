@@ -352,6 +352,32 @@ rein uses an `EmbedderKind` enum dispatch to support multiple embedding backends
 
 Set `[embedding] provider` to `"google"`, `"omlx"`, or `"none"` in config.
 
+#### Proxy / Endpoint Override
+
+For users in China or behind firewalls, all API endpoints are configurable:
+
+**Direct proxy (Cloudflare Worker, Nginx reverse proxy):**
+```toml
+[embedding.google]
+endpoint = "https://your-gemini-proxy.com"
+# Requests: {endpoint}/v1beta/models/gemini-embedding-001:embedContent
+
+[sync]
+endpoint = "https://your-supermemory-proxy.com"
+```
+
+**OpenRouter or other OpenAI-compatible aggregators:**
+```toml
+[embedding]
+provider = "omlx"
+
+[embedding.omlx]
+endpoint = "https://openrouter.ai/api/v1"
+model = "google/gemini-embedding-001"
+```
+
+This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, which is compatible with OpenRouter, LiteLLM, and similar services.
+
 #### Memory Decay Model
 
 - **Critical** memories never decay (strength = 1.0 forever)
@@ -738,6 +764,32 @@ rein 使用 `EmbedderKind` 枚举分发支持多种嵌入后端：
 - **OMLX** -- 通过 OpenAI 兼容 API 端点进行本地嵌入
 
 在配置中设置 `[embedding] provider` 为 `"google"`、`"omlx"` 或 `"none"`。
+
+#### 代理 / Endpoint 覆盖
+
+国内用户或防火墙环境，所有 API 端点均可配置：
+
+**直接代理（Cloudflare Worker、Nginx 反代）：**
+```toml
+[embedding.google]
+endpoint = "https://your-gemini-proxy.com"
+# 请求路径: {endpoint}/v1beta/models/gemini-embedding-001:embedContent
+
+[sync]
+endpoint = "https://your-supermemory-proxy.com"
+```
+
+**OpenRouter 等 OpenAI 兼容聚合商：**
+```toml
+[embedding]
+provider = "omlx"
+
+[embedding.omlx]
+endpoint = "https://openrouter.ai/api/v1"
+model = "google/gemini-embedding-001"
+```
+
+OMLX 后端使用 OpenAI `/v1/embeddings` 格式，兼容 OpenRouter、LiteLLM 等服务。
 
 #### 记忆衰减模型
 
