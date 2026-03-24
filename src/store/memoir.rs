@@ -578,14 +578,15 @@ impl SqliteStore {
 
                 for c in &concepts {
                     let escaped_def = c.definition.replace('"', "\\\"");
-                    let label = if escaped_def.len() > 60 {
-                        format!("{}...", &escaped_def[..60])
+                    let label = if escaped_def.chars().count() > 60 {
+                        format!("{}...", escaped_def.chars().take(60).collect::<String>())
                     } else {
                         escaped_def
                     };
+                    let escaped_name = c.name.replace('"', "\\\"");
                     dot.push_str(&format!(
                         "  \"{}\" [label=\"{}\\n---\\n{}\"];\n",
-                        c.id, c.name, label
+                        c.id, escaped_name, label
                     ));
                 }
                 dot.push('\n');
