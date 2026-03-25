@@ -1071,8 +1071,41 @@ impl SqliteStore {
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
+        // Pre-check: resolve gray zone BEFORE opening write transaction
+        // so LLM call doesn't hold the write lock
+        let dedup_action = crate::extract::check_dedup(
+            self, &memory.topic, &memory.content, similarity_threshold, time_window_days,
+        )?;
+        let resolved_action = match dedup_action {
+            DedupAction::GrayZone(ref candidate_id, sim) => {
+                // LLM semantic check outside transaction
+                let is_dup = if let Ok(existing) = self.get(candidate_id) {
+                    let new_content = memory.content.clone();
+                    let old_content = existing.content.clone();
+                    std::panic::catch_unwind(|| {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                let config = crate::config::ReinConfig::load().unwrap_or_default();
+                                crate::extract::llm::llm_is_duplicate(&config, &new_content, &old_content).await
+                            })
+                        })
+                    }).unwrap_or(false)
+                } else {
+                    false
+                };
+                if is_dup {
+                    tracing::info!("LLM confirmed duplicate (sim={sim:.2}), merging into {candidate_id}");
+                    DedupAction::MergeInto(candidate_id.clone())
+                } else {
+                    tracing::info!("LLM says not duplicate (sim={sim:.2}), creating new");
+                    DedupAction::CreateNew
+                }
+            }
+            other => other,
+        };
+
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = self.store_with_dedup_inner(memory, similarity_threshold, time_window_days);
+        let result = self.store_with_dedup_resolved(memory, resolved_action);
         match &result {
             Ok(_) => { self.conn.execute_batch("COMMIT")?; }
             Err(_) => { let _ = self.conn.execute_batch("ROLLBACK"); }
@@ -1080,15 +1113,14 @@ impl SqliteStore {
         result
     }
 
-    /// Inner dedup logic, called within a BEGIN IMMEDIATE transaction.
-    fn store_with_dedup_inner(
+    /// Execute a pre-resolved dedup action within a BEGIN IMMEDIATE transaction.
+    fn store_with_dedup_resolved(
         &self,
         memory: Memory,
-        similarity_threshold: f32,
-        time_window_days: i64,
+        action: DedupAction,
     ) -> ReinResult<String> {
-        match check_dedup(self, &memory.topic, &memory.content, similarity_threshold, time_window_days)? {
-            DedupAction::CreateNew => {
+        match action {
+            DedupAction::CreateNew | DedupAction::GrayZone(_, _) => {
                 self.store(memory)
             }
             DedupAction::MergeInto(existing_id) => {
@@ -1105,6 +1137,8 @@ impl SqliteStore {
                     // Upgrade importance if new memory is more important
                     if memory.importance > existing.importance {
                         existing.importance = memory.importance;
+                        existing.layer = existing.importance.auto_layer();
+                        existing.decay_lambda = 0.06 * existing.importance.decay_factor();
                     }
                     existing.strength = (existing.strength + 0.2).min(1.0);
                     existing.updated_at = chrono::Utc::now();
@@ -1121,13 +1155,49 @@ impl SqliteStore {
                 Ok(new_id)
             }
             DedupAction::GrayZone(candidate_id, sim) => {
-                // Gray zone: similarity between 0.5 and threshold.
-                // TODO: LLM semantic dedup when async context available.
-                // For now, log and create new (conservative — don't merge uncertain matches).
-                tracing::info!(
-                    "gray zone dedup: sim={sim:.2} with memory {candidate_id}, creating new (LLM dedup pending)"
-                );
-                self.store(memory)
+                // Gray zone: use LLM to judge if truly duplicate
+                let is_dup = if let Ok(existing) = self.get(&candidate_id) {
+                    let new_content = memory.content.clone();
+                    let old_content = existing.content.clone();
+                    // Try LLM semantic dedup (async call from sync context)
+                    let llm_says_dup = std::panic::catch_unwind(|| {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                let config = crate::config::ReinConfig::load().unwrap_or_default();
+                                crate::extract::llm::llm_is_duplicate(&config, &new_content, &old_content).await
+                            })
+                        })
+                    }).unwrap_or(false);
+                    llm_says_dup
+                } else {
+                    false
+                };
+
+                if is_dup {
+                    tracing::info!("LLM confirmed duplicate (sim={sim:.2}), merging into {candidate_id}");
+                    // Merge like MergeInto
+                    if let Ok(mut existing) = self.get(&candidate_id) {
+                        existing.content = format!("{}\n\n{}", existing.content, memory.content);
+                        existing.summary = existing.content.chars().take(100).collect();
+                        for kw in &memory.keywords {
+                            if !existing.keywords.contains(kw) {
+                                existing.keywords.push(kw.clone());
+                            }
+                        }
+                        if memory.importance > existing.importance {
+                            existing.importance = memory.importance;
+                        }
+                        existing.strength = (existing.strength + 0.2).min(1.0);
+                        existing.updated_at = chrono::Utc::now();
+                        self.update(&existing)?;
+                        Ok(candidate_id)
+                    } else {
+                        self.store(memory)
+                    }
+                } else {
+                    tracing::info!("LLM says not duplicate (sim={sim:.2}), creating new");
+                    self.store(memory)
+                }
             }
         }
     }
