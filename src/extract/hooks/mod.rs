@@ -70,7 +70,7 @@ fn store_extracted(
             keywords: item.keywords,
             importance,
             source: crate::types::Source::Hook,
-            strength: 1.0,
+            strength: item.quality_confidence.max(0.3), // Use LLM quality as initial strength
             decay_lambda: config.decay.base_lambda * importance.decay_factor(),
             access_count: 0,
             superseded_by: None,
