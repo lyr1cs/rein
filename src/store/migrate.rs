@@ -1,5 +1,4 @@
 use crate::config::ReinConfig;
-use crate::types::Embedder;
 use crate::search::chunker::semantic_chunk;
 use crate::store::SqliteStore;
 use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
@@ -86,7 +85,6 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
 
         // Optionally batch-embed the chunks
         let embeddings: Option<Vec<Vec<f32>>> = if let Some(emb) = embedder {
-            use crate::types::Embedder as _;
             let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
             let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
             for batch in chunk_refs.chunks(100) {
@@ -181,6 +179,7 @@ pub async fn reindex(
     config: &ReinConfig,
 ) -> anyhow::Result<ReindexReport> {
     use crate::store::schema;
+    use crate::types::Embedder as _;
 
     // 1. Validate embedder is available BEFORE touching the vector index
     let embedder = crate::embed::create_embedder(config)

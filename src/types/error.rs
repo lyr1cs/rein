@@ -17,6 +17,9 @@ pub enum ReinError {
     #[error("embedding error: {0}")]
     Embedding(String),
 
+    #[error("extraction error: {0}")]
+    Extract(String),
+
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
