@@ -120,10 +120,22 @@ pub struct HooksConfig {
     pub signal_keywords: Vec<String>,
     #[serde(default = "default_buffer_dir")]
     pub buffer_dir: String,
+    /// Buffer size (in characters) that triggers a mid-session LLM extraction.
+    /// When accumulated buffer content exceeds this threshold, hook_post triggers
+    /// an incremental extraction and clears the buffer.
+    /// Higher = less frequent extraction (good for 1M+ context models).
+    /// Lower = more frequent extraction (good for smaller context models).
+    /// 0 = never trigger mid-session extraction (only at session end).
+    #[serde(default = "default_buffer_flush_threshold")]
+    pub buffer_flush_threshold: usize,
 }
 
 fn default_buffer_dir() -> String {
     "auto".to_string()
+}
+
+fn default_buffer_flush_threshold() -> usize {
+    50000 // ~12K-25K tokens, triggers ~2-4 times in a long session
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +301,7 @@ impl Default for HooksConfig {
             max_items_per_session: 10,
             signal_keywords: default_signal_keywords(),
             buffer_dir: default_buffer_dir(),
+            buffer_flush_threshold: default_buffer_flush_threshold(),
         }
     }
 }

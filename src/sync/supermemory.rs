@@ -129,6 +129,7 @@ impl SupermemoryClient {
                     access_count: 0,
                     superseded_by: None,
                     related_ids: vec![],
+                    concept_ids: vec![],
                     status: MemoryStatus::default(),
                     embedding: None,
                     created_at: chrono::Utc::now(),
