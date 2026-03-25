@@ -327,8 +327,9 @@ impl ExtractorKind {
 
 /// Create an extractor from config. Returns None if provider is "none" or API key is missing.
 pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
-    match config.extract.provider.as_str() {
-        "google" => {
+    use crate::config::Provider;
+    match config.extract_provider() {
+        Provider::Google => {
             let api_key = config.extract.google.api_key.as_ref()?;
             Some(ExtractorKind::Gemini(GeminiExtractor::new(
                 api_key.clone(),
@@ -336,15 +337,11 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
                 config.extract.google.model.clone(),
             )))
         }
-        "omlx" => Some(ExtractorKind::Omlx(OmlxExtractor::new(
+        Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
             config.extract.omlx.endpoint.clone(),
             config.extract.omlx.model.clone(),
         ))),
-        "none" => None,
-        other => {
-            tracing::warn!("unknown extract provider: {other}, falling back to none");
-            None
-        }
+        Provider::None => None,
     }
 }
 
@@ -520,12 +517,13 @@ fn is_large_context_model(model: &str) -> bool {
 /// - If max_input_chars is 0 (no truncation), only allow it for known large-context Gemini models.
 /// - For any other model with 0, apply a safe default to prevent API errors and memory loss.
 fn resolve_max_input_chars(config: &ReinConfig) -> usize {
-    match config.extract.provider.as_str() {
-        "omlx" => {
+    use crate::config::Provider;
+    match config.extract_provider() {
+        Provider::Omlx => {
             let configured = config.extract.omlx.max_input_chars;
             if configured > 0 { configured } else { SAFE_DEFAULT_MAX_CHARS }
         }
-        _ => {
+        Provider::Google | Provider::None => {
             let configured = config.extract.google.max_input_chars;
             if configured > 0 {
                 return configured;
