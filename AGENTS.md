@@ -8,7 +8,7 @@ rein — Multi-source cross-validated memory MCP server for AI agents. Rust sing
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (91+)
+cargo test            # All tests must pass (96+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
