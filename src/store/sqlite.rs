@@ -1093,7 +1093,13 @@ impl MemoryStore for SqliteStore {
             self.remove_from_hnsw(id);
         }
 
-        Ok(rows as u64)
+        // Also prune low-quality concepts
+        let concept_pruned = self.prune_low_quality_concepts().unwrap_or(0);
+        if concept_pruned > 0 {
+            tracing::info!("pruned {concept_pruned} low-quality concepts");
+        }
+
+        Ok(rows as u64 + concept_pruned)
     }
 
     fn list_topics(&self) -> ReinResult<Vec<String>> {
@@ -1234,6 +1240,69 @@ impl MemoryStore for SqliteStore {
 }
 
 impl SqliteStore {
+    /// Prune low-quality concepts and cascade-clean orphaned memories.
+    /// Called during gc. Removes concepts with quality < 0.2 whose source memories
+    /// were recalled 5+ times but never accessed.
+    pub fn prune_low_quality_concepts(&self) -> ReinResult<u64> {
+        let all_memoirs = self.list_memoirs()?;
+        let mut pruned = 0u64;
+
+        for memoir in &all_memoirs {
+            // Get concepts for this memoir
+            let memoir_obj = match self.get_memoir(&memoir.name)? {
+                Some(m) => m,
+                None => continue,
+            };
+            let mut stmt = self.conn.prepare("SELECT * FROM concepts WHERE memoir_id = ?1")?;
+            let concepts: Vec<Concept> = stmt.query_map(rusqlite::params![memoir_obj.id], |row| {
+                super::memoir::row_to_concept(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })
+            })?.filter_map(|r| r.ok()).collect();
+            drop(stmt);
+
+            for concept in &concepts {
+                let score = self.concept_quality_score(concept);
+
+                let has_unused_sources = !concept.source_memory_ids.is_empty() &&
+                    concept.source_memory_ids.iter().any(|mid| {
+                        let recall: u64 = self.conn
+                            .query_row(
+                                "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM metadata WHERE key = ?1",
+                                rusqlite::params![format!("recall_hit:{}", mid)],
+                                |r| r.get(0),
+                            ).unwrap_or(0);
+                        let access: u32 = self.get(mid).map(|m| m.access_count).unwrap_or(0);
+                        recall >= 5 && access == 0
+                    });
+
+                if score < 0.2 && has_unused_sources {
+                    let _ = self.conn.execute(
+                        "DELETE FROM concept_links WHERE source_id = ?1 OR target_id = ?1",
+                        rusqlite::params![concept.id],
+                    );
+                    let _ = self.conn.execute(
+                        "DELETE FROM concepts WHERE id = ?1",
+                        rusqlite::params![concept.id],
+                    );
+                    pruned += 1;
+
+                    for mid in &concept.source_memory_ids {
+                        if let Ok(mut mem) = self.get(mid) {
+                            mem.concept_ids.retain(|cid| cid != &concept.id);
+                            let json = serde_json::to_string(&mem.concept_ids).unwrap_or_default();
+                            let _ = self.conn.execute(
+                                "UPDATE memories SET concept_ids = ?1 WHERE id = ?2",
+                                rusqlite::params![json, mid],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(pruned)
+    }
+
     /// Store a memory with deduplication logic.
     ///
     /// Checks for existing similar memories using FTS and Jaccard similarity.
