@@ -607,9 +607,53 @@ rein serve
 
 #### 知识图谱关系类型
 
-可用于链接概念的 9 种关系类型：
-
 `part_of`, `depends_on`, `related_to`, `contradicts`, `refines`, `alternative_to`, `caused_by`, `instance_of`, `superseded_by`
+
+### LLM 提取层 (v0.3)
+
+rein 使用 LLM（Gemini 3.1 Flash Lite 或本地模型）进行结构化记忆提取，自动构建知识图谱。
+
+**架构：**
+- `hook_post` — 本地模式提取（崩溃安全网）+ 缓冲到 session 文件
+- `hook_compact` — LLM 提取 + 缓冲
+- `hook_stop` — 完整知识提取：记忆 + 概念 + 关系 + 会话摘要
+- `hook_prompt` — 注入记忆 + 知识图谱概念（按相关度混排）
+
+**升级旧记忆：**
+```bash
+rein upgrade --dry-run    # 预览
+rein upgrade              # 将旧记忆转为知识图谱
+```
+
+**配置：**
+```toml
+[extract]
+provider = "google"    # 或 "omlx" 或 "none"
+
+[extract.google]
+model = "gemini-3.1-flash-lite-preview"
+max_input_chars = 0    # 0 = 不截断（1M token 模型）
+
+[extract.omlx]
+endpoint = "http://localhost:11434/v1"  # Ollama, LM Studio, vLLM 等
+model = "default"
+max_input_chars = 16000
+```
+
+### 自学习质量系统 (v0.3.0)
+
+rein 自动学习哪些记忆有用、哪些是噪声，无需人工调参。
+
+**工作原理：**
+1. LLM 在提取时给出 `quality_confidence` (0-1) — 零额外 API 成本
+2. 系统追踪 recall → access 模式，分类"好记忆"（被使用）和"差记忆"（被召回但未使用）
+3. 特征权重自动从数据学习：使用率、新颖度、连通度、时效性
+4. 自适应入口阈值：近期质量低 → 收紧，高 → 放松
+5. GC 清理质量低且被召回 5+ 次但从未使用的概念
+
+**无需手动调参** — 冷启动用 LLM 判断，数据逐渐接管。
+
+基于：ICLR 2026 Admission Control, PropMem (Prosus), FActScore, MACLA。
 
 ### 配置
 
