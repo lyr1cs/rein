@@ -3,6 +3,7 @@ pub mod embed;
 pub mod extract;
 pub mod init;
 pub mod mcp;
+pub mod ops;
 pub mod search;
 pub mod store;
 pub mod sync;

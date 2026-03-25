@@ -553,6 +553,37 @@ impl SqliteStore {
 
         Ok(())
     }
+
+    /// Record that memories were returned in a recall result.
+    /// Increments a recall_count in metadata for tracking quality.
+    pub fn record_recall_hit(&self, ids: &[String]) {
+        for id in ids {
+            let _ = self.conn.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                rusqlite::params![format!("recall_hit:{}", id)],
+            );
+        }
+    }
+
+    /// Compute quality score for the memory store.
+    /// Returns (avg_access_per_recall, total_recalls, total_accesses).
+    /// High access/recall ratio = memories are useful. Low = noisy.
+    pub fn quality_metrics(&self) -> ReinResult<(f64, u64, u64)> {
+        let total_accesses: u64 = self.conn
+            .query_row("SELECT COALESCE(SUM(access_count), 0) FROM memories", [], |r| r.get(0))?;
+        let total_recalls: u64 = self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) FROM metadata WHERE key LIKE 'recall_hit:%'",
+                [], |r| r.get(0),
+            ).unwrap_or(0);
+        let ratio = if total_recalls > 0 {
+            total_accesses as f64 / total_recalls as f64
+        } else {
+            1.0
+        };
+        Ok((ratio, total_recalls, total_accesses))
+    }
 }
 
 /// Map a rusqlite Row to a Memory struct.
@@ -1146,7 +1177,7 @@ impl SqliteStore {
         action: DedupAction,
     ) -> ReinResult<String> {
         match action {
-            DedupAction::CreateNew | DedupAction::GrayZone(..) => {
+            DedupAction::CreateNew => {
                 self.store(memory)
             }
             DedupAction::MergeInto(existing_id) => {
