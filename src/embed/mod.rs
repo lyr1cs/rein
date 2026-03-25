@@ -54,8 +54,9 @@ impl Embedder for EmbedderKind {
 
 /// Create an embedder from config. Returns None if provider is "none" or API key is missing.
 pub fn create_embedder(config: &crate::config::ReinConfig) -> Option<EmbedderKind> {
-    match config.embedding.provider.as_str() {
-        "google" => {
+    use crate::config::Provider;
+    match config.embedding_provider() {
+        Provider::Google => {
             let api_key = config.embedding.google.api_key.as_ref()?;
             Some(EmbedderKind::Gemini(GeminiEmbedder::new(
                 api_key.clone(),
@@ -64,15 +65,11 @@ pub fn create_embedder(config: &crate::config::ReinConfig) -> Option<EmbedderKin
                 config.embedding.dimensions,
             )))
         }
-        "omlx" => Some(EmbedderKind::Omlx(OmlxEmbedder::new(
+        Provider::Omlx => Some(EmbedderKind::Omlx(OmlxEmbedder::new(
             config.embedding.omlx.endpoint.clone(),
             config.embedding.omlx.model.clone(),
             config.embedding.dimensions,
         ))),
-        "none" => None,
-        other => {
-            tracing::warn!("unknown embedding provider: {other}, falling back to none");
-            None
-        }
+        Provider::None => None,
     }
 }
