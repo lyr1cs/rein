@@ -115,6 +115,17 @@ impl SqliteStore {
         concepts: &[crate::extract::ExtractedConcept],
         links: &[crate::extract::ExtractedLink],
     ) -> ReinResult<KnowledgeStoreReport> {
+        self.store_knowledge_units_with_sources(concepts, links, &[])
+    }
+
+    /// Store knowledge units with bidirectional Memory ↔ Concept links.
+    /// `source_memory_ids` are the memories that produced these concepts.
+    pub fn store_knowledge_units_with_sources(
+        &self,
+        concepts: &[crate::extract::ExtractedConcept],
+        links: &[crate::extract::ExtractedLink],
+        source_memory_ids: &[String],
+    ) -> ReinResult<KnowledgeStoreReport> {
         let mut report = KnowledgeStoreReport::default();
 
         // Group concepts by memoir
@@ -151,13 +162,14 @@ impl SqliteStore {
                         }
                     }
                     None => {
-                        // New concept
+                        // New concept with source memory references
                         let concept = Concept {
                             id: String::new(),
-                            memoir_id: memoir_name.clone(), // resolve_memoir_id handles name→id
+                            memoir_id: memoir_name.clone(),
                             name: c.name.clone(),
                             definition: c.definition.clone(),
                             labels: c.labels.clone(),
+                            source_memory_ids: source_memory_ids.to_vec(),
                             confidence: 0.5,
                             revision: 1,
                             created_at: chrono::Utc::now(),
@@ -211,7 +223,121 @@ impl SqliteStore {
             }
         }
 
+        // Bidirectional link: update source memories with concept_ids
+        if !source_memory_ids.is_empty() {
+            // Collect all concept IDs we just created/refined
+            let mut all_concept_ids: Vec<String> = Vec::new();
+            for c in concepts {
+                if let Ok(Some(concept)) = self.get_concept(&c.memoir, &c.name) {
+                    all_concept_ids.push(concept.id);
+                }
+            }
+            if !all_concept_ids.is_empty() {
+                for mem_id in source_memory_ids {
+                    if let Ok(mut mem) = self.get(mem_id) {
+                        let mut updated = false;
+                        for cid in &all_concept_ids {
+                            if !mem.concept_ids.contains(cid) {
+                                mem.concept_ids.push(cid.clone());
+                                updated = true;
+                            }
+                        }
+                        if updated {
+                            // Use direct SQL to avoid status change
+                            let json = serde_json::to_string(&mem.concept_ids).unwrap_or_default();
+                            let _ = self.conn.execute(
+                                "UPDATE memories SET concept_ids = ?1 WHERE id = ?2",
+                                rusqlite::params![json, mem_id],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cross-session linking: connect new concepts to existing related concepts
+        for c in concepts {
+            if let Err(e) = self.auto_link_concept(&c.memoir, &c.name) {
+                tracing::debug!("auto_link_concept failed for '{}': {e}", c.name);
+            }
+        }
+
         Ok(report)
+    }
+
+    /// Activate related memories: bump strength + last_accessed for memories similar to new content.
+    /// This keeps old relevant memories alive instead of letting them decay.
+    pub fn activate_related_memories(&self, content: &str, max_activate: usize) -> ReinResult<usize> {
+        let similar = self.search_fts(content, None, max_activate)?;
+        let mut activated = 0usize;
+        for mem in &similar {
+            let sim = crate::extract::similarity(content, &mem.content);
+            if sim > 0.3 {
+                self.record_access(&mem.id)?;
+                activated += 1;
+            }
+        }
+        Ok(activated)
+    }
+
+    /// Activate related concepts: boost confidence for concepts matching new content.
+    pub fn activate_related_concepts(&self, content: &str) -> ReinResult<usize> {
+        let similar_concepts = self.search_all_concepts(content, 5)?;
+        let mut activated = 0usize;
+        for concept in &similar_concepts {
+            let sim = crate::extract::similarity(content, &concept.definition);
+            if sim > 0.2 {
+                // Boost confidence by re-refining with same definition (increments revision, boosts confidence)
+                // Find which memoir this concept belongs to
+                let memoirs = self.list_memoirs()?;
+                for memoir in &memoirs {
+                    if self.get_concept(&memoir.name, &concept.name)?.is_some() {
+                        let _ = self.refine_concept(&memoir.name, &concept.name, &concept.definition);
+                        activated += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(activated)
+    }
+
+    /// Auto-link a newly added concept to existing related concepts in the same memoir.
+    /// Searches for similar concepts by FTS and creates `related_to` links.
+    fn auto_link_concept(&self, memoir_name: &str, concept_name: &str) -> ReinResult<usize> {
+        let concept = match self.get_concept(memoir_name, concept_name)? {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+
+        // Search for similar concepts in the same memoir
+        let similar = self.search_concepts(memoir_name, &concept.definition, 5)?;
+        let mut linked = 0usize;
+
+        for candidate in &similar {
+            if candidate.id == concept.id { continue; }
+
+            let sim = crate::extract::similarity(&concept.definition, &candidate.definition);
+            if sim > 0.2 {
+                // Skip if link already exists (prevent duplicates)
+                let existing = self.get_links_from(&concept.id)?;
+                if existing.iter().any(|l| l.target_id == candidate.id) { continue; }
+
+                let link = ConceptLink {
+                    id: String::new(),
+                    source_id: concept.id.clone(),
+                    target_id: candidate.id.clone(),
+                    relation: Relation::RelatedTo,
+                    weight: sim,
+                    created_at: chrono::Utc::now(),
+                };
+                if self.add_link(link).is_ok() {
+                    linked += 1;
+                }
+            }
+        }
+
+        Ok(linked)
     }
 
     /// Update only the related_ids field without touching status or updated_at.
@@ -394,6 +520,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
     let access_count: u32 = row.get("access_count").map_err(ReinError::Database)?;
     let superseded_by: Option<String> = row.get("superseded_by").map_err(ReinError::Database)?;
     let related_ids_json: String = row.get("related_ids").map_err(ReinError::Database)?;
+    let concept_ids_json: String = row.get("concept_ids").unwrap_or_else(|_| "[]".to_string());
     let status_str: String = row.get::<_, String>("status").unwrap_or_else(|_| "active".to_string());
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
     let updated_at_str: String = row.get("updated_at").map_err(ReinError::Database)?;
@@ -410,6 +537,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
 
     let keywords: Vec<String> = serde_json::from_str(&keywords_json)?;
     let related_ids: Vec<String> = serde_json::from_str(&related_ids_json)?;
+    let concept_ids: Vec<String> = serde_json::from_str(&concept_ids_json).unwrap_or_default();
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
@@ -435,6 +563,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
         access_count,
         superseded_by,
         related_ids,
+        concept_ids,
         status,
         embedding: None,
         created_at,
@@ -458,6 +587,7 @@ impl MemoryStore for SqliteStore {
 
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_ids_json = serde_json::to_string(&memory.related_ids)?;
+        let concept_ids_json = serde_json::to_string(&memory.concept_ids)?;
 
         // Store layer as uppercase for SQL CHECK constraint
         let layer_db = match memory.layer {
@@ -467,9 +597,9 @@ impl MemoryStore for SqliteStore {
 
         self.conn.execute(
             "INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source,
-             strength, decay_lambda, access_count, superseded_by, related_ids, status,
+             strength, decay_lambda, access_count, superseded_by, related_ids, concept_ids, status,
              created_at, updated_at, last_accessed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 id,
                 layer_db,
@@ -484,6 +614,7 @@ impl MemoryStore for SqliteStore {
                 memory.access_count,
                 memory.superseded_by,
                 related_ids_json,
+                concept_ids_json,
                 memory.status.to_string(),
                 memory.created_at.to_rfc3339(),
                 memory.updated_at.to_rfc3339(),
@@ -528,6 +659,7 @@ impl MemoryStore for SqliteStore {
     fn update(&self, memory: &Memory) -> ReinResult<()> {
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_ids_json = serde_json::to_string(&memory.related_ids)?;
+        let concept_ids_json = serde_json::to_string(&memory.concept_ids)?;
         let now = Utc::now();
 
         let layer_db = match memory.layer {
@@ -545,8 +677,8 @@ impl MemoryStore for SqliteStore {
         let rows = self.conn.execute(
             "UPDATE memories SET layer=?1, topic=?2, summary=?3, content=?4, keywords=?5,
              importance=?6, source=?7, strength=?8, decay_lambda=?9, access_count=?10,
-             superseded_by=?11, related_ids=?12, status=?13, updated_at=?14
-             WHERE id=?15",
+             superseded_by=?11, related_ids=?12, concept_ids=?13, status=?14, updated_at=?15
+             WHERE id=?16",
             rusqlite::params![
                 layer_db,
                 memory.topic,
@@ -560,6 +692,7 @@ impl MemoryStore for SqliteStore {
                 memory.access_count,
                 memory.superseded_by,
                 related_ids_json,
+                concept_ids_json,
                 status.to_string(),
                 now.to_rfc3339(),
                 memory.id,
@@ -1061,6 +1194,7 @@ mod tests {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
             created_at: Utc::now(),
@@ -1260,6 +1394,7 @@ mod tests {
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
             created_at: Utc::now(),

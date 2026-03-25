@@ -52,6 +52,8 @@ fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
     let updated_at_str: String = row.get("updated_at").map_err(ReinError::Database)?;
 
     let labels: Vec<String> = serde_json::from_str(&labels_json)?;
+    let source_memory_ids_json: String = row.get("source_memory_ids").unwrap_or_else(|_| "[]".to_string());
+    let source_memory_ids: Vec<String> = serde_json::from_str(&source_memory_ids_json).unwrap_or_default();
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
@@ -66,6 +68,7 @@ fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
         name,
         definition,
         labels,
+        source_memory_ids,
         confidence,
         revision,
         created_at,
@@ -197,19 +200,21 @@ impl SqliteStore {
         };
         let now = Utc::now();
         let labels_json = serde_json::to_string(&concept.labels)?;
+        let source_memory_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
 
         // Look up memoir_id from memoir name if memoir_id looks like a name
         let memoir_id = self.resolve_memoir_id(&concept.memoir_id)?;
 
         self.conn().execute(
-            "INSERT INTO concepts (id, memoir_id, name, definition, labels, confidence, revision, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO concepts (id, memoir_id, name, definition, labels, source_memory_ids, confidence, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 id,
                 memoir_id,
                 concept.name,
                 concept.definition,
                 labels_json,
+                source_memory_ids_json,
                 concept.confidence,
                 concept.revision,
                 now.to_rfc3339(),
@@ -787,6 +792,7 @@ mod tests {
             name: name.to_string(),
             definition: definition.to_string(),
             labels: vec!["test".to_string()],
+            source_memory_ids: vec![],
             confidence: 0.5,
             revision: 1,
             created_at: Utc::now(),

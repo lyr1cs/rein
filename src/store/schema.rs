@@ -39,6 +39,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             access_count INTEGER NOT NULL DEFAULT 0,
             superseded_by TEXT,
             related_ids TEXT NOT NULL DEFAULT '[]',
+            concept_ids TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'updated', 'deprecated')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -100,6 +101,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             name TEXT NOT NULL,
             definition TEXT NOT NULL,
             labels TEXT NOT NULL DEFAULT '[]',
+            source_memory_ids TEXT NOT NULL DEFAULT '[]',
             confidence REAL NOT NULL DEFAULT 0.5,
             revision INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
@@ -161,6 +163,26 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     ).unwrap_or(0) > 0;
     if !has_status {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")?;
+    }
+
+    // Migrate: add concept_ids to memories if missing
+    let has_concept_ids: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='concept_ids'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_concept_ids {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN concept_ids TEXT NOT NULL DEFAULT '[]'").ok();
+    }
+
+    // Migrate: add source_memory_ids to concepts if missing
+    let has_source_memory_ids: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='source_memory_ids'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_source_memory_ids {
+        conn.execute_batch("ALTER TABLE concepts ADD COLUMN source_memory_ids TEXT NOT NULL DEFAULT '[]'").ok();
     }
 
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)

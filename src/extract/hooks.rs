@@ -133,15 +133,17 @@ fn extract_message_content(content: Option<&serde_json::Value>) -> String {
 }
 
 /// Store a list of ExtractedMemory items into the database.
-/// Filters secrets and deduplicates. Returns count of successfully stored items.
+/// Filters secrets and deduplicates. Returns (count, stored_ids).
 fn store_extracted(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
     items: Vec<ExtractedMemory>,
-) -> u32 {
+) -> (u32, Vec<String>) {
     let mut stored = 0u32;
+    let mut stored_ids = Vec::new();
     for item in items {
         if looks_like_secret(&item.content) { continue; }
+        let content_for_activation = item.content.clone();
         let importance = item.importance.parse::<crate::types::Importance>()
             .unwrap_or(crate::types::Importance::Medium);
         let memory = crate::types::Memory {
@@ -158,6 +160,7 @@ fn store_extracted(
             access_count: 0,
             superseded_by: None,
             related_ids: vec![],
+            concept_ids: vec![],
             status: crate::types::MemoryStatus::default(),
             embedding: None,
             created_at: chrono::Utc::now(),
@@ -169,12 +172,17 @@ fn store_extracted(
             config.search.dedup_similarity as f32,
             config.search.dedup_time_window_days,
         ) {
-            // Auto-link to related memories (best-effort, don't fail on link errors)
+            // Auto-link to related memories
             let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
+            // Activate related old memories (bump strength so they don't decay away)
+            let _ = store.activate_related_memories(&content_for_activation, 3);
+            // Activate related concepts (boost confidence)
+            let _ = store.activate_related_concepts(&content_for_activation);
+            stored_ids.push(id);
             stored += 1;
         }
     }
-    stored
+    (stored, stored_ids)
 }
 
 /// Quick local check: does this text likely contain anything worth storing?
@@ -306,6 +314,7 @@ fn store_episode_concept(
         name: format!("session-{}", date),
         definition,
         labels: vec!["episode".to_string()],
+        source_memory_ids: vec![],
         confidence: 0.8,
         revision: 1,
         created_at: chrono::Utc::now(),
@@ -319,54 +328,62 @@ fn store_episode_concept(
 // Hook implementations
 // ---------------------------------------------------------------------------
 
-/// Layer 0: PostToolUse -- pattern-based local extraction + buffer for hook_stop.
-/// No LLM calls (zero cost, zero latency). Stores basic memories as crash safety net.
-/// Appends to session buffer for hook_stop's richer batch extraction.
+/// Layer 0: PostToolUse -- buffer + content-triggered mid-session extraction.
+///
+/// Always appends to session buffer. When buffer content exceeds
+/// `buffer_flush_threshold`, triggers an incremental LLM extraction
+/// (same as hook_stop but mid-session), then clears the buffer.
+/// This keeps the memory store fresh during long sessions without
+/// waiting until session end.
 pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
     let text = extract_hook_text(&input);
     if text.is_empty() { return Ok(()); }
-    if !worth_extracting(&text) { return Ok(()); }
 
-    // 1. Pattern-based local extraction (crash safety net, zero LLM cost)
-    // Threshold 5 = high confidence only (decisions + architecture/error signals combined)
-    let facts = crate::extract::patterns::extract_facts(&text, 5);
-    let facts: Vec<String> = facts.into_iter().filter(|f| !looks_like_secret(f)).collect();
-    if !facts.is_empty() {
-        let store = config.open_store()?;
-        for fact in &facts {
-            let importance = crate::types::Importance::Medium;
-            let memory = crate::types::Memory {
-                id: ulid::Ulid::new().to_string(),
-                layer: importance.auto_layer(),
-                topic: "auto-extracted".to_string(),
-                summary: fact.chars().take(100).collect(),
-                content: fact.clone(),
-                keywords: vec![],
-                importance,
-                source: crate::types::Source::Hook,
-                strength: 1.0,
-                decay_lambda: config.decay.base_lambda * importance.decay_factor(),
-                access_count: 0,
-                superseded_by: None,
-                related_ids: vec![],
-                status: crate::types::MemoryStatus::default(),
-                embedding: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                last_accessed: chrono::Utc::now(),
-            };
-            let _ = store.store_with_dedup(
-                memory,
-                config.search.dedup_similarity as f32,
-                config.search.dedup_time_window_days,
-            );
-        }
-    }
-
-    // 2. Append to session buffer for hook_stop enrichment
+    // 1. Always append to session buffer (even low-signal content — hook_stop needs full context)
     let buf_path = session_buffer_path(config, &input);
     let _ = append_to_buffer(&buf_path, &text, "post");
+
+    // 2. Gate extraction on signal score (only high-signal triggers mid-session extraction)
+    if !worth_extracting(&text) { return Ok(()); }
+
+    // 3. Check if buffer has accumulated enough content for mid-session extraction
+    let threshold = config.hooks.buffer_flush_threshold;
+    if threshold > 0 {
+        let buf_size = std::fs::metadata(&buf_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+
+        if buf_size >= threshold {
+            tracing::info!("buffer reached {}B (threshold {}B), triggering mid-session extraction", buf_size, threshold);
+
+            // Read buffer content, extract, and clear
+            let buffered = read_and_clear_buffer(&buf_path);
+            if !buffered.is_empty() {
+                let combined = buffered.iter()
+                    .filter(|t| !looks_like_secret(t))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+
+                if !combined.is_empty() {
+                    let result = crate::extract::llm::extract_full_with_fallback(config, &combined).await;
+
+                    let store = config.open_store()?;
+
+                    // Store memories
+                    if !result.memories.is_empty() {
+                        let _ = store_extracted(&store, config, result.memories);
+                    }
+
+                    // Store concepts + links
+                    if !result.concepts.is_empty() || !result.links.is_empty() {
+                        let _ = store.store_knowledge_units(&result.concepts, &result.links);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -382,7 +399,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
     let extracted = crate::extract::llm::extract_with_fallback(config, &text, 2).await;
     if !extracted.is_empty() {
         let store = config.open_store()?;
-        store_extracted(&store, config, extracted);
+        let _ = store_extracted(&store, config, extracted);
     }
 
     // Also buffer for hook_stop
@@ -565,10 +582,10 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         let store = config.open_store()?;
 
         // Store memories (each goes through store_with_dedup's own transaction)
-        let mem_count = store_extracted(&store, config, result.memories);
+        let (mem_count, memory_ids) = store_extracted(&store, config, result.memories);
 
-        // Store concepts + links (individual inserts, best-effort)
-        let kg_report = store.store_knowledge_units(&result.concepts, &result.links)
+        // Store concepts + links with bidirectional Memory ↔ Concept links
+        let kg_report = store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
             .unwrap_or_default();
 
         // Store episode as concept in "sessions" memoir
@@ -602,7 +619,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
 
         if !extracted.is_empty() {
             let store = config.open_store()?;
-            let stored = store_extracted(&store, config, extracted);
+            let (stored, _) = store_extracted(&store, config, extracted);
             if stored > 0 {
                 eprintln!("rein: saved {stored} memories from session");
             }
