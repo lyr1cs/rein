@@ -414,10 +414,13 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Store concepts + links in knowledge graph
+                        // Collect memory IDs from this topic for bidirectional linking
+                        let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+
+                        // Store concepts + links with bidirectional Memory ↔ Concept links
                         let (mut tc, mut tl) = (0usize, 0usize);
                         if !result.concepts.is_empty() || !result.links.is_empty() {
-                            match store.store_knowledge_units(&result.concepts, &result.links) {
+                            match store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids) {
                                 Ok(report) => {
                                     total_memoirs += report.memoirs_created;
                                     tc = report.concepts_added + report.concepts_refined;
@@ -428,7 +431,20 @@ async fn main() -> anyhow::Result<()> {
                                 Err(e) => println!("  → error: {e}"),
                             }
                         }
-                        println!("  → {tc} concepts, {tl} links");
+
+                        // Build all 4 link types:
+                        // 1. Memory ↔ Memory (auto_link related_ids)
+                        for mem in &memories {
+                            let _ = store.auto_link(&mem.id, config.search.dedup_similarity as f32, 5);
+                        }
+                        // 2. Activate related memories (bump strength)
+                        // 3. Activate related concepts (boost confidence)
+                        for mem in &memories {
+                            let _ = store.activate_related_memories(&mem.content, 3);
+                            let _ = store.activate_related_concepts(&mem.content);
+                        }
+
+                        println!("  → {tc} concepts, {tl} links, {} memories activated", memories.len());
                     }
                 } else {
                     // === No-LLM path: local rule-based enrichment ===
