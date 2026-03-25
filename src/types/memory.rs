@@ -19,6 +19,9 @@ pub struct Memory {
     pub access_count: u32,
     pub superseded_by: Option<String>,
     pub related_ids: Vec<String>,
+    /// IDs of concepts derived from this memory (Memory → Concept link)
+    #[serde(default)]
+    pub concept_ids: Vec<String>,
     #[serde(default)]
     pub status: MemoryStatus,
     #[serde(skip)]
@@ -229,6 +232,9 @@ pub struct Concept {
     pub name: String,
     pub definition: String,
     pub labels: Vec<String>,
+    /// IDs of memories that contributed to this concept (Concept → Memory link)
+    #[serde(default)]
+    pub source_memory_ids: Vec<String>,
     pub confidence: f32,
     pub revision: u32,
     pub created_at: DateTime<Utc>,

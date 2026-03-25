@@ -56,6 +56,10 @@ context_before = 3
 context_after = 1
 max_items_per_session = 10
 buffer_dir = "auto"  # auto = ~/.rein/  (session buffers stored here)
+buffer_flush_threshold = 50000  # chars accumulated before mid-session extraction
+                                # 50000 (~12K-25K tokens) for 1M models
+                                # 10000 (~2.5K-5K tokens) for smaller models
+                                # 0 = only extract at session end
 signal_keywords = [
     # English
     "decided", "chose", "architecture", "design", "pattern",
