@@ -45,7 +45,7 @@ src/
 ├── extract/
 │   ├── llm.rs       # LLM extraction (Gemini + OMLX/Ollama), fallback to patterns
 │   ├── patterns.rs  # Rule-based keyword scoring (fallback when LLM unavailable)
-│   ├── hooks.rs     # Four-layer hook commands (post, compact, prompt, stop)
+│   ├── hooks/       # Four-layer hook commands (parsing, buffer, scoring, mod)
 │   └── dedup.rs     # Similarity (Jaccard + containment)
 ├── sync/
 │   ├── supermemory.rs # Supermemory v4 API client
