@@ -554,6 +554,126 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Compute quality score for a concept based on multiple features.
+    /// Uses self-learned weights when enough data is available, falls back to llm_confidence.
+    pub fn concept_quality_score(&self, concept: &Concept) -> f64 {
+        // Feature 1: LLM confidence (from extraction)
+        let llm_conf = concept.confidence as f64;
+
+        // Feature 2: Utility — source memories' access/recall ratio
+        let utility = {
+            let mut total_access = 0u64;
+            let mut total_recall = 0u64;
+            for mem_id in &concept.source_memory_ids {
+                if let Ok(mem) = self.get(mem_id) {
+                    total_access += mem.access_count as u64;
+                }
+                // Get recall count from metadata
+                let recall: u64 = self.conn
+                    .query_row(
+                        "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM metadata WHERE key = ?1",
+                        rusqlite::params![format!("recall_hit:{}", mem_id)],
+                        |r| r.get(0),
+                    ).unwrap_or(0);
+                total_recall += recall;
+            }
+            if total_recall > 0 { total_access as f64 / total_recall as f64 } else { 0.5 }
+        };
+
+        // Feature 3: Connectivity — link count as graph structure signal
+        let link_count = self.get_links_from(&concept.id).map(|l| l.len()).unwrap_or(0)
+            + self.get_links_to(&concept.id).map(|l| l.len()).unwrap_or(0);
+        let connectivity = (link_count as f64 / 3.0).min(1.0);
+
+        // Feature 4: Recency — boost for recent concepts
+        let hours = (chrono::Utc::now() - concept.created_at).num_hours() as f64;
+        let recency = if hours <= 24.0 { 1.0 }
+            else if hours <= 168.0 { 0.5 + 0.5 * (1.0 - (hours - 24.0) / 144.0) }
+            else { 0.5 };
+
+        // Check if we have enough data for learned weights
+        let good_count: u64 = self.conn
+            .query_row("SELECT COALESCE(CAST(value AS INTEGER), 0) FROM metadata WHERE key = 'quality:good_count'",
+                [], |r| r.get(0)).unwrap_or(0);
+        let bad_count: u64 = self.conn
+            .query_row("SELECT COALESCE(CAST(value AS INTEGER), 0) FROM metadata WHERE key = 'quality:bad_count'",
+                [], |r| r.get(0)).unwrap_or(0);
+
+        if good_count + bad_count < 50 {
+            // Cold start: use LLM confidence directly
+            return llm_conf;
+        }
+
+        // Learned weights from data
+        let get_weight = |good_key: &str, bad_key: &str| -> f64 {
+            let good_sum: f64 = self.conn
+                .query_row(&format!("SELECT COALESCE(CAST(value AS REAL), 0) FROM metadata WHERE key = '{}'", good_key),
+                    [], |r| r.get(0)).unwrap_or(0.0);
+            let bad_sum: f64 = self.conn
+                .query_row(&format!("SELECT COALESCE(CAST(value AS REAL), 0) FROM metadata WHERE key = '{}'", bad_key),
+                    [], |r| r.get(0)).unwrap_or(0.0);
+            let avg_good = if good_count > 0 { good_sum / good_count as f64 } else { 0.5 };
+            let avg_bad = if bad_count > 0 { bad_sum / bad_count as f64 } else { 0.5 };
+            avg_good / (avg_good + avg_bad + 0.001)
+        };
+
+        let w_llm = get_weight("quality:good_llm_sum", "quality:bad_llm_sum");
+        let w_utility = get_weight("quality:good_utility_sum", "quality:bad_utility_sum");
+        let w_connectivity = get_weight("quality:good_connectivity_sum", "quality:bad_connectivity_sum");
+        let w_recency = get_weight("quality:good_recency_sum", "quality:bad_recency_sum");
+
+        // Normalize weights
+        let total_w = w_llm + w_utility + w_connectivity + w_recency + 0.001;
+        (w_llm * llm_conf + w_utility * utility + w_connectivity * connectivity + w_recency * recency) / total_w
+    }
+
+    /// Update quality weight tracker based on observed good/bad memories.
+    /// Call periodically (e.g., at gc or hook_stop).
+    pub fn update_quality_weights(&self) {
+        // Find "good" memories: recall_count > 0 AND access_count > 0
+        let good_mems: Vec<(String, u32)> = self.conn.prepare(
+            "SELECT m.id, m.access_count FROM memories m
+             INNER JOIN metadata md ON md.key = 'recall_hit:' || m.id
+             WHERE CAST(md.value AS INTEGER) > 0 AND m.access_count > 0"
+        ).and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        }).unwrap_or_default();
+
+        // Find "bad" memories: recall_count >= 3 AND access_count == 0
+        let bad_mems: Vec<String> = self.conn.prepare(
+            "SELECT m.id FROM memories m
+             INNER JOIN metadata md ON md.key = 'recall_hit:' || m.id
+             WHERE CAST(md.value AS INTEGER) >= 3 AND m.access_count = 0"
+        ).and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        }).unwrap_or_default();
+
+        if good_mems.is_empty() && bad_mems.is_empty() { return; }
+
+        // Update running sums
+        let upsert = |key: &str, val: f64| {
+            let _ = self.conn.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                rusqlite::params![key, val.to_string()],
+            );
+        };
+
+        upsert("quality:good_count", good_mems.len() as f64);
+        upsert("quality:bad_count", bad_mems.len() as f64);
+
+        // For simplicity, compute average utility for good/bad
+        let avg_good_utility = if !good_mems.is_empty() {
+            good_mems.iter().map(|(_, ac)| *ac as f64).sum::<f64>() / good_mems.len() as f64
+        } else { 0.0 };
+        let avg_bad_utility = 0.0; // bad mems have access_count == 0 by definition
+
+        upsert("quality:good_utility_sum", avg_good_utility);
+        upsert("quality:bad_utility_sum", avg_bad_utility);
+    }
+
     /// Record that memories were returned in a recall result.
     /// Increments a recall_count in metadata for tracking quality.
     pub fn record_recall_hit(&self, ids: &[String]) {

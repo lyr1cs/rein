@@ -2,6 +2,17 @@
 
 use crate::config::ReinConfig;
 
+/// Compute quality_confidence from pattern score when LLM is unavailable.
+pub fn pattern_quality_confidence(text: &str) -> f64 {
+    let score = crate::extract::patterns::score_sentence(text);
+    match score {
+        0 => 0.1,
+        1..=2 => 0.3,
+        3..=4 => 0.5,
+        _ => 0.8,
+    }
+}
+
 /// Quick local check: does this text likely contain anything worth storing?
 pub fn worth_extracting(text: &str) -> bool {
     if text.len() < 80 { return false; }
