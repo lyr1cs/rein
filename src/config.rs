@@ -1,6 +1,29 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Typed provider enum for compile-time safety.
+/// Parsed from String in config, prevents typo-driven misconfiguration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Google,
+    Omlx,
+    None,
+}
+
+impl Provider {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "google" => Provider::Google,
+            "omlx" => Provider::Omlx,
+            "none" => Provider::None,
+            other => {
+                tracing::warn!("unknown provider '{other}', falling back to None");
+                Provider::None
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config structs
 // ---------------------------------------------------------------------------
@@ -406,47 +429,52 @@ impl ReinConfig {
         merge_toml(config, toml_str)
     }
 
+    /// Get typed embedding provider (prevents typo misconfiguration).
+    pub fn embedding_provider(&self) -> Provider {
+        Provider::from_str(&self.embedding.provider)
+    }
+
+    /// Get typed extract provider.
+    pub fn extract_provider(&self) -> Provider {
+        Provider::from_str(&self.extract.provider)
+    }
+
     /// The embedding model name (for cache keying and model-change detection).
     pub fn embedding_model(&self) -> String {
-        match self.embedding.provider.as_str() {
-            "omlx" => format!("omlx:{}", self.embedding.omlx.model),
-            _ => format!("{}:{}", self.embedding.provider, self.embedding.google.model),
+        match self.embedding_provider() {
+            Provider::Omlx => format!("omlx:{}", self.embedding.omlx.model),
+            Provider::Google => format!("google:{}", self.embedding.google.model),
+            Provider::None => "none".to_string(),
         }
     }
 
     /// Validate configuration and print warnings for common misconfigurations.
     pub fn validate(&self) {
-        match self.embedding.provider.as_str() {
-            "google" => {
+        match self.embedding_provider() {
+            Provider::Google => {
                 if self.embedding.google.api_key.is_none() {
                     eprintln!("rein: WARNING — embedding provider is 'google' but GEMINI_API_KEY is not set");
                     eprintln!("rein: Vector search and embedding will be disabled. FTS search still works.");
                 }
             }
-            "omlx" => {
+            Provider::Omlx => {
                 eprintln!("rein: using OMLX embedding backend at {}", self.embedding.omlx.endpoint);
             }
-            "none" => {}
-            other => {
-                eprintln!("rein: WARNING — unknown embedding provider '{other}', falling back to none");
-            }
+            Provider::None => {}
         }
         if self.sync.supermemory_enabled && self.sync.api_key.is_none() {
             eprintln!("rein: NOTE — supermemory is enabled but SUPERMEMORY_CC_API_KEY is not set");
         }
-        match self.extract.provider.as_str() {
-            "google" => {
+        match self.extract_provider() {
+            Provider::Google => {
                 if self.extract.google.api_key.is_none() {
                     eprintln!("rein: NOTE — extract provider is 'google' but GEMINI_API_KEY is not set, LLM extraction disabled");
                 }
             }
-            "omlx" => {
+            Provider::Omlx => {
                 eprintln!("rein: using OMLX extract backend at {}", self.extract.omlx.endpoint);
             }
-            "none" => {}
-            other => {
-                eprintln!("rein: WARNING — unknown extract provider '{other}', LLM extraction disabled");
-            }
+            Provider::None => {}
         }
     }
 
