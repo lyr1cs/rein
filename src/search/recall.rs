@@ -143,6 +143,12 @@ pub fn recall(
     }
     store.record_recall_hit(&recall_ids);
 
+    // Periodically update quality weights (every ~50 recalls)
+    let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
+    if total_recalls % 50 == 0 && total_recalls > 0 {
+        store.update_quality_weights();
+    }
+
     tracing::debug!(elapsed_ms = total_start.elapsed().as_millis() as u64, results = results.len(), "recall complete");
     Ok(results)
 }

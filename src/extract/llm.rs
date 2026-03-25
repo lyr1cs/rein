@@ -14,6 +14,7 @@ Output a JSON array of objects. Each object has:
 - "keywords": array of 2-5 relevant keywords
 - "importance": one of "low", "medium", "high", "critical"
 - "should_store": boolean — false if trivial/noisy/not worth remembering
+- "quality_confidence": float 0-1, your confidence this is worth remembering long-term (0.9+ critical, 0.7-0.9 useful, 0.4-0.7 maybe, <0.4 probably not)
 
 Rules:
 - Skip greetings, acknowledgments, and trivial chatter
@@ -35,6 +36,8 @@ pub struct ExtractedMemory {
     pub importance: String,
     #[serde(default = "default_should_store")]
     pub should_store: bool,
+    #[serde(default = "default_quality_confidence")]
+    pub quality_confidence: f64,
 }
 
 fn default_importance() -> String {
@@ -43,6 +46,10 @@ fn default_importance() -> String {
 
 fn default_should_store() -> bool {
     true
+}
+
+fn default_quality_confidence() -> f64 {
+    0.5
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +80,8 @@ pub struct ExtractedConcept {
     pub memoir: String,
     #[serde(default = "default_concept_type")]
     pub concept_type: String,
+    #[serde(default = "default_quality_confidence")]
+    pub quality_confidence: f64,
 }
 
 fn default_memoir() -> String {
@@ -109,9 +118,9 @@ Output a JSON object with these fields:
 - "links": array of relationships between concepts
 - "episode": session summary object, or null if session is too short
 
-Each memory: {"topic", "summary" (under 100 chars), "content" (1-3 sentences), "keywords" (2-5), "importance" ("low"|"medium"|"high"|"critical"), "should_store" (bool)}
+Each memory: {"topic", "summary" (under 100 chars), "content" (1-3 sentences), "keywords" (2-5), "importance" ("low"|"medium"|"high"|"critical"), "should_store" (bool), "quality_confidence" (float 0-1)}
 
-Each concept: {"name" (short identifier), "definition" (1-2 sentences), "labels" (tags), "memoir" (category: "architecture", "debugging", "workflow", "config", "learning", "tooling"), "concept_type" ("fact" or "skill")}
+Each concept: {"name" (short identifier), "definition" (1-2 sentences), "labels" (tags), "memoir" (category: "architecture", "debugging", "workflow", "config", "learning", "tooling"), "concept_type" ("fact" or "skill"), "quality_confidence" (float 0-1)}
 
 Each link: {"from" (concept name), "to" (concept name), "relation" (one of: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by)}
 Links must connect concepts within the SAME memoir category.
@@ -379,13 +388,17 @@ pub async fn extract_with_fallback(
     // Fallback: convert pattern-based facts to ExtractedMemory structs
     crate::extract::patterns::extract_facts(text, pattern_threshold)
         .into_iter()
-        .map(|fact| ExtractedMemory {
-            topic: "auto-extracted".to_string(),
-            summary: fact.chars().take(100).collect(),
-            content: fact,
-            keywords: vec![],
-            importance: "medium".to_string(),
-            should_store: true,
+        .map(|fact| {
+            let qc = crate::extract::hooks::scoring::pattern_quality_confidence(&fact);
+            ExtractedMemory {
+                topic: "auto-extracted".to_string(),
+                summary: fact.chars().take(100).collect(),
+                content: fact,
+                keywords: vec![],
+                importance: "medium".to_string(),
+                should_store: true,
+                quality_confidence: qc,
+            }
         })
         .collect()
 }
@@ -480,13 +493,17 @@ pub async fn extract_full_with_fallback(
     // Fallback: pattern-based extraction (memories only)
     let memories = crate::extract::patterns::extract_facts(text, 2)
         .into_iter()
-        .map(|fact| ExtractedMemory {
-            topic: "auto-extracted".to_string(),
-            summary: fact.chars().take(100).collect(),
-            content: fact,
-            keywords: vec![],
-            importance: "medium".to_string(),
-            should_store: true,
+        .map(|fact| {
+            let qc = crate::extract::hooks::scoring::pattern_quality_confidence(&fact);
+            ExtractedMemory {
+                topic: "auto-extracted".to_string(),
+                summary: fact.chars().take(100).collect(),
+                content: fact,
+                keywords: vec![],
+                importance: "medium".to_string(),
+                should_store: true,
+                quality_confidence: qc,
+            }
         })
         .collect();
 
