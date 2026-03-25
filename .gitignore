@@ -3,3 +3,4 @@ target/
 .claude/*.local.md
 .claude/*.log
 reviews/
+reviews
