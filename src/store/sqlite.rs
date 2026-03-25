@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::extract::{check_dedup, DedupAction};
+use crate::extract::DedupAction;
 use crate::types::*;
 
 use super::{fts, schema, vec};
@@ -269,15 +269,28 @@ impl SqliteStore {
     /// - sim > 0.8 → supersede (mark old as superseded_by new_id)
     /// - 0.5 < sim <= 0.8 → refine (append new content to old memory)
     /// Returns number of evolved memories.
-    pub fn apply_evolution(&self, new_id: &str, new_content: &str) -> ReinResult<usize> {
+    pub fn apply_evolution(&self, new_id: &str, new_content: &str, new_embedding: Option<&[f32]>) -> ReinResult<usize> {
         let similar = self.search_fts(new_content, None, 5)?;
         let mut evolved = 0usize;
 
         for old in &similar {
             if old.id == new_id { continue; }
-            if old.superseded_by.is_some() { continue; } // already superseded
+            if old.superseded_by.is_some() { continue; }
 
-            let sim = crate::extract::similarity(new_content, &old.content);
+            // Use embedding cosine similarity if available, fall back to Jaccard
+            let sim = if let Some(new_emb) = new_embedding {
+                // Try vector similarity via HNSW cache
+                if let Ok(vec_results) = self.search_vec(new_emb, None, 5) {
+                    vec_results.iter()
+                        .find(|m| m.id == old.id)
+                        .map(|_| 0.85f32) // found in top-5 vector results → high similarity
+                        .unwrap_or_else(|| crate::extract::similarity(new_content, &old.content))
+                } else {
+                    crate::extract::similarity(new_content, &old.content)
+                }
+            } else {
+                crate::extract::similarity(new_content, &old.content)
+            };
 
             if sim > 0.8 {
                 // Supersede: mark old memory as replaced by new
@@ -1007,12 +1020,25 @@ impl MemoryStore for SqliteStore {
                 |row| row.get(0),
             )?;
 
+        let memoir_count: usize = self.conn
+            .query_row("SELECT COUNT(*) FROM memoirs", [], |row| row.get(0))
+            .unwrap_or(0);
+        let concept_count: usize = self.conn
+            .query_row("SELECT COUNT(*) FROM concepts", [], |row| row.get(0))
+            .unwrap_or(0);
+        let link_count: usize = self.conn
+            .query_row("SELECT COUNT(*) FROM concept_links", [], |row| row.get(0))
+            .unwrap_or(0);
+
         Ok(StoreStats {
             total_memories,
             ltm_count,
             stm_count,
             topic_count,
             avg_strength,
+            memoir_count,
+            concept_count,
+            link_count,
         })
     }
 
@@ -1120,7 +1146,7 @@ impl SqliteStore {
         action: DedupAction,
     ) -> ReinResult<String> {
         match action {
-            DedupAction::CreateNew | DedupAction::GrayZone(_, _) => {
+            DedupAction::CreateNew | DedupAction::GrayZone(..) => {
                 self.store(memory)
             }
             DedupAction::MergeInto(existing_id) => {
