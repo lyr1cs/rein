@@ -8,7 +8,7 @@ description: >
   memoir, concepts, export, or wants to save/search important context.
 ---
 
-# rein Memory System (v0.2.2)
+# rein Memory System (v0.3.0)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (22 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
@@ -96,6 +96,9 @@ rein hook stop      # Full knowledge extraction: memories + concepts + links + e
 - **Recency Boost**: 24h memories +50% search score, 7-day linear decay
 - **Bidirectional Links**: Memory ↔ Concept, Memory ↔ Memory, Concept ↔ Concept
 - **Buffer Architecture**: hook_post buffers, hook_stop does batch LLM extraction
+- **Self-Learning Quality**: Concept-level scoring with auto-learned weights (PropMem/FActScore inspired)
+- **Admission Control**: Adaptive threshold gates low-quality content from entering storage
+- **Quality Pruning**: Auto-removes low-quality concepts that are recalled but never used
 - **Adaptive Threshold**: Buffer flush adjusts by content signal density
 
 ## When to Use

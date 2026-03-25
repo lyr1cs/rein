@@ -165,6 +165,21 @@ model = "default"
 max_input_chars = 16000
 ```
 
+### Self-Learning Quality System (v0.3.0)
+
+rein automatically learns which memories are useful and which are noise, without human parameter tuning.
+
+**How it works:**
+1. LLM assigns `quality_confidence` (0-1) at extraction time — zero extra API cost
+2. System tracks recall-then-access patterns to classify memories as "good" (used) or "bad" (recalled but unused)
+3. Feature weights auto-adjust from data: utility, novelty, connectivity, recency
+4. Adaptive admission threshold rises when recent quality is low, relaxes when high
+5. GC prunes low-quality concepts whose source memories are recalled 5+ times but never accessed
+
+**No manual tuning needed** — cold-starts with LLM judgment, data gradually takes over.
+
+Based on: ICLR 2026 Admission Control, PropMem (Prosus), FActScore, MACLA Bayesian posteriors.
+
 ### Configuration
 
 rein loads configuration with the following priority (highest wins):
