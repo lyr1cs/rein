@@ -214,6 +214,7 @@ fn worth_extracting(text: &str) -> bool {
     let value_signals = [
         "because", "reason", "instead of", "switched to",
         "root cause", "workaround", "decided",
+        "chose", "selected", "prefer",
         "因为", "原因", "切换到", "决定",
     ];
     value_signals.iter().any(|s| lower.contains(s))
