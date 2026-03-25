@@ -49,6 +49,9 @@ pub enum DedupAction {
     MergeInto(String),
     /// Similar content but older than time window, supersede old memory.
     Supersede(String),
+    /// Gray zone (0.5 <= sim < threshold): needs LLM judgment.
+    /// Falls back to CreateNew if LLM unavailable.
+    GrayZone(String, f32),
 }
 
 /// Check for duplicate memories using FTS search and Jaccard similarity.
@@ -99,6 +102,13 @@ pub fn check_dedup(
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
             }
+        }
+    }
+
+    // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
+    if best_sim >= 0.5 {
+        if let Some(memory) = best_memory {
+            return Ok(DedupAction::GrayZone(memory.id.clone(), best_sim));
         }
     }
 

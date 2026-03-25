@@ -178,6 +178,8 @@ fn store_extracted(
             let _ = store.activate_related_memories(&content_for_activation, 3);
             // Activate related concepts (boost confidence)
             let _ = store.activate_related_concepts(&content_for_activation);
+            // Memory evolution: refine/supersede similar old memories
+            let _ = store.apply_evolution(&id, &content_for_activation);
             stored_ids.push(id);
             stored += 1;
         }
@@ -324,6 +326,38 @@ fn store_episode_concept(
     Ok(())
 }
 
+/// Adaptive flush threshold: adjusts based on signal density in the buffer.
+/// High signal density (many worth_extracting lines) → lower threshold (extract sooner).
+/// Low signal density (mostly noise) → higher threshold (wait longer).
+fn adaptive_flush_threshold(base: usize, buf_path: &std::path::Path) -> usize {
+    let content = match std::fs::read_to_string(buf_path) {
+        Ok(c) => c,
+        Err(_) => return base,
+    };
+
+    let total_lines = content.lines().count();
+    if total_lines < 5 { return base; } // not enough data to adapt
+
+    // Count how many buffer entries have high signal
+    let high_signal = content.lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+        })
+        .filter(|text| worth_extracting(text))
+        .count();
+
+    let density = high_signal as f64 / total_lines as f64;
+
+    if density > 0.5 {
+        base / 2 // lots of signal → extract sooner
+    } else if density < 0.1 {
+        base * 2 // mostly noise → wait longer
+    } else {
+        base
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hook implementations
 // ---------------------------------------------------------------------------
@@ -348,7 +382,13 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
     if !worth_extracting(&text) { return Ok(()); }
 
     // 3. Check if buffer has accumulated enough content for mid-session extraction
-    let threshold = config.hooks.buffer_flush_threshold;
+    // Adaptive threshold: adjust based on signal density in the buffer
+    let base_threshold = config.hooks.buffer_flush_threshold;
+    let threshold = if base_threshold > 0 {
+        adaptive_flush_threshold(base_threshold, &buf_path)
+    } else {
+        0
+    };
     if threshold > 0 {
         let buf_size = std::fs::metadata(&buf_path)
             .map(|m| m.len() as usize)

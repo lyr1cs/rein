@@ -104,6 +104,18 @@ enum Commands {
     },
     /// Auto-link related memories based on content similarity
     Organize,
+    /// Export memories to file
+    Export {
+        /// Output format: md, json, or csv (default json)
+        #[arg(short, long, default_value = "json")]
+        format: String,
+        /// Only export memories in this topic
+        #[arg(short, long)]
+        topic: Option<String>,
+        /// Output file (default stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Upgrade old memories into knowledge graph (concepts + links)
     Upgrade {
         /// Only process memories in this topic
@@ -333,6 +345,62 @@ async fn main() -> anyhow::Result<()> {
             let threshold = config.search.dedup_similarity as f32;
             let links = store.organize(threshold, 5)?;
             println!("Organized: created {links} new links between related memories");
+        }
+        Some(Commands::Export { format, topic, output }) => {
+            let store = config.open_store()?;
+            let topics = if let Some(ref t) = topic {
+                vec![t.clone()]
+            } else {
+                store.list_topics()?
+            };
+
+            let mut all_memories: Vec<types::Memory> = Vec::new();
+            for t in &topics {
+                all_memories.extend(store.get_by_topic(t)?);
+            }
+            all_memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+            let content = match format.as_str() {
+                "json" => serde_json::to_string_pretty(&all_memories)?,
+                "csv" => {
+                    let mut lines = vec!["id,topic,summary,content,importance,keywords,strength,created_at".to_string()];
+                    for m in &all_memories {
+                        let kw = m.keywords.join(";");
+                        // Escape CSV fields
+                        let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+                        lines.push(format!("{},{},{},{},{},{},{:.3},{}",
+                            m.id, esc(&m.topic), esc(&m.summary), esc(&m.content),
+                            m.importance, esc(&kw), m.strength, m.created_at.to_rfc3339(),
+                        ));
+                    }
+                    lines.join("\n")
+                }
+                "md" => {
+                    let mut parts = vec![format!("# rein Memory Export\n\n{} memories, {} topics\n", all_memories.len(), topics.len())];
+                    let mut current_topic = String::new();
+                    // Group by topic
+                    all_memories.sort_by(|a, b| a.topic.cmp(&b.topic).then(b.created_at.cmp(&a.created_at)));
+                    for m in &all_memories {
+                        if m.topic != current_topic {
+                            current_topic = m.topic.clone();
+                            parts.push(format!("\n## {}\n", current_topic));
+                        }
+                        parts.push(format!("### {} ({})\n{}\n", m.summary, m.importance, m.content));
+                    }
+                    parts.join("\n")
+                }
+                _ => {
+                    eprintln!("Unknown format '{}', use json, csv, or md", format);
+                    return Ok(());
+                }
+            };
+
+            if let Some(ref path) = output {
+                std::fs::write(path, &content)?;
+                println!("Exported {} memories to {}", all_memories.len(), path);
+            } else {
+                println!("{content}");
+            }
         }
         Some(Commands::Upgrade { topic, dry_run }) => {
             let has_llm = extract::llm::create_extractor(&config).is_some();
