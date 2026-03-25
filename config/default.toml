@@ -55,3 +55,34 @@ min_turns = 20
 context_before = 3
 context_after = 1
 max_items_per_session = 10
+buffer_dir = "auto"  # auto = ~/.rein/  (session buffers stored here)
+signal_keywords = [
+    # English
+    "decided", "chose", "architecture", "design", "pattern",
+    "bug", "fix", "fixed", "resolved", "error", "crash",
+    "installed", "deployed", "migrated",
+    "important", "remember", "solution", "tradeoff",
+    "upgrade", "deprecated", "workflow", "released",
+    # Chinese
+    "决策", "选型", "架构", "设计", "模式",
+    "修复", "解决", "安装", "部署", "迁移",
+    "重要", "记住", "记录", "方案", "权衡",
+    "升级", "废弃", "流程", "发布",
+]
+
+[extract]
+provider = "google"
+
+[extract.google]
+model = "gemini-3.1-flash-lite-preview"
+max_input_chars = 0   # 0 = no truncation (1M token model). Set a limit if using a smaller model.
+# endpoint defaults to "https://generativelanguage.googleapis.com"
+# endpoint = "https://your-proxy.example.com"
+
+[extract.omlx]
+endpoint = "http://localhost:11434/v1"
+model = "default"
+max_input_chars = 16000  # ~4K-8K tokens, suitable for 7B-13B local models. Increase for larger models.
+# Works with any OpenAI-compatible server:
+# Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
+# vLLM, LocalAI, text-generation-webui, etc.

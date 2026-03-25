@@ -16,6 +16,8 @@ pub struct ReinConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub extract: ExtractConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +116,51 @@ pub struct HooksConfig {
     pub context_before: usize,
     pub context_after: usize,
     pub max_items_per_session: usize,
+    #[serde(default = "default_signal_keywords")]
+    pub signal_keywords: Vec<String>,
+    #[serde(default = "default_buffer_dir")]
+    pub buffer_dir: String,
+}
+
+fn default_buffer_dir() -> String {
+    "auto".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtractConfig {
+    pub provider: String,
+    pub google: GoogleExtractConfig,
+    pub omlx: OmlxExtractConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoogleExtractConfig {
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_google_endpoint")]
+    pub endpoint: String,
+    /// Max input characters. 0 = no truncation (default for gemini-3.1-flash-lite-preview which supports 1M tokens).
+    #[serde(default)]
+    pub max_input_chars: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OmlxExtractConfig {
+    pub endpoint: String,
+    #[serde(default = "default_omlx_extract_model")]
+    pub model: String,
+    /// Max input characters for local models (default 16000, suitable for 7B-13B models).
+    #[serde(default = "default_omlx_max_input_chars")]
+    pub max_input_chars: usize,
+}
+
+fn default_omlx_max_input_chars() -> usize {
+    16000
+}
+
+fn default_omlx_extract_model() -> String {
+    "default".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +178,7 @@ impl Default for ReinConfig {
             decay: DecayConfig::default(),
             server: ServerConfig::default(),
             hooks: HooksConfig::default(),
+            extract: ExtractConfig::default(),
         }
     }
 }
@@ -239,6 +287,55 @@ impl Default for HooksConfig {
             context_before: 3,
             context_after: 1,
             max_items_per_session: 10,
+            signal_keywords: default_signal_keywords(),
+            buffer_dir: default_buffer_dir(),
+        }
+    }
+}
+
+fn default_signal_keywords() -> Vec<String> {
+    vec![
+        // English
+        "decided", "chose", "architecture", "design", "pattern",
+        "bug", "fix", "fixed", "resolved", "error", "crash",
+        "installed", "deployed", "migrated",
+        "important", "remember", "solution", "tradeoff",
+        "upgrade", "deprecated", "workflow", "released",
+        // Chinese
+        "决策", "选型", "架构", "设计", "模式",
+        "修复", "解决", "安装", "部署", "迁移",
+        "重要", "记住", "记录", "方案", "权衡",
+        "升级", "废弃", "流程", "发布",
+    ].into_iter().map(String::from).collect()
+}
+
+impl Default for ExtractConfig {
+    fn default() -> Self {
+        Self {
+            provider: "google".to_string(),
+            google: GoogleExtractConfig::default(),
+            omlx: OmlxExtractConfig::default(),
+        }
+    }
+}
+
+impl Default for GoogleExtractConfig {
+    fn default() -> Self {
+        Self {
+            model: "gemini-3.1-flash-lite-preview".to_string(),
+            api_key: None,
+            endpoint: default_google_endpoint(),
+            max_input_chars: 0, // 0 = no truncation (1M token model)
+        }
+    }
+}
+
+impl Default for OmlxExtractConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            model: "default".to_string(),
+            max_input_chars: default_omlx_max_input_chars(),
         }
     }
 }
@@ -278,6 +375,12 @@ impl ReinConfig {
         if let Ok(key) = std::env::var("SUPERMEMORY_CC_API_KEY") {
             config.sync.api_key = Some(key);
         }
+        // Reuse GEMINI_API_KEY for extract if not set separately
+        if config.extract.google.api_key.is_none() {
+            if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+                config.extract.google.api_key = Some(key);
+            }
+        }
 
         Ok(config)
     }
@@ -315,6 +418,20 @@ impl ReinConfig {
         }
         if self.sync.supermemory_enabled && self.sync.api_key.is_none() {
             eprintln!("rein: NOTE — supermemory is enabled but SUPERMEMORY_CC_API_KEY is not set");
+        }
+        match self.extract.provider.as_str() {
+            "google" => {
+                if self.extract.google.api_key.is_none() {
+                    eprintln!("rein: NOTE — extract provider is 'google' but GEMINI_API_KEY is not set, LLM extraction disabled");
+                }
+            }
+            "omlx" => {
+                eprintln!("rein: using OMLX extract backend at {}", self.extract.omlx.endpoint);
+            }
+            "none" => {}
+            other => {
+                eprintln!("rein: WARNING — unknown extract provider '{other}', LLM extraction disabled");
+            }
         }
     }
 
@@ -401,6 +518,14 @@ fn serde_to_value(config: &ReinConfig) -> anyhow::Result<toml::Value> {
     }
     if let Some(tbl) = val.get_mut("sync").and_then(|v| v.as_table_mut()) {
         if let Some(ref key) = config.sync.api_key {
+            tbl.insert("api_key".to_string(), toml::Value::String(key.clone()));
+        }
+    }
+    if let Some(tbl) = val.get_mut("extract")
+        .and_then(|v| v.get_mut("google"))
+        .and_then(|v| v.as_table_mut())
+    {
+        if let Some(ref key) = config.extract.google.api_key {
             tbl.insert("api_key".to_string(), toml::Value::String(key.clone()));
         }
     }
