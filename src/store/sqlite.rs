@@ -265,6 +265,48 @@ impl SqliteStore {
         Ok(report)
     }
 
+    /// Memory Evolution: new memory can refine or supersede similar old memories.
+    /// - sim > 0.8 → supersede (mark old as superseded_by new_id)
+    /// - 0.5 < sim <= 0.8 → refine (append new content to old memory)
+    /// Returns number of evolved memories.
+    pub fn apply_evolution(&self, new_id: &str, new_content: &str) -> ReinResult<usize> {
+        let similar = self.search_fts(new_content, None, 5)?;
+        let mut evolved = 0usize;
+
+        for old in &similar {
+            if old.id == new_id { continue; }
+            if old.superseded_by.is_some() { continue; } // already superseded
+
+            let sim = crate::extract::similarity(new_content, &old.content);
+
+            if sim > 0.8 {
+                // Supersede: mark old memory as replaced by new
+                self.conn.execute(
+                    "UPDATE memories SET superseded_by = ?1, status = 'deprecated' WHERE id = ?2",
+                    rusqlite::params![new_id, old.id],
+                )?;
+                evolved += 1;
+                tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
+            } else if sim > 0.5 {
+                // Refine: append new info to old memory's content
+                let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
+                let refined_summary: String = refined_content.chars().take(100).collect();
+                self.conn.execute(
+                    "UPDATE memories SET content = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
+                    rusqlite::params![
+                        refined_content,
+                        refined_summary,
+                        chrono::Utc::now().to_rfc3339(),
+                        old.id,
+                    ],
+                )?;
+                evolved += 1;
+                tracing::debug!("refined memory '{}' with new content", old.id);
+            }
+        }
+        Ok(evolved)
+    }
+
     /// Activate related memories: bump strength + last_accessed for memories similar to new content.
     /// This keeps old relevant memories alive instead of letting them decay.
     pub fn activate_related_memories(&self, content: &str, max_activate: usize) -> ReinResult<usize> {
@@ -1077,6 +1119,15 @@ impl SqliteStore {
                 // Mark old memory as superseded
                 self.mark_superseded(&old_id, &new_id)?;
                 Ok(new_id)
+            }
+            DedupAction::GrayZone(candidate_id, sim) => {
+                // Gray zone: similarity between 0.5 and threshold.
+                // TODO: LLM semantic dedup when async context available.
+                // For now, log and create new (conservative — don't merge uncertain matches).
+                tracing::info!(
+                    "gray zone dedup: sim={sim:.2} with memory {candidate_id}, creating new (LLM dedup pending)"
+                );
+                self.store(memory)
             }
         }
     }
