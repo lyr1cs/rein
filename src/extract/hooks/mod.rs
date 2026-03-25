@@ -28,6 +28,14 @@ fn store_extracted(
     let mut stored_ids = Vec::new();
     for item in items {
         if looks_like_secret(&item.content) { continue; }
+
+        // Admission control: skip low-quality items
+        // Use LLM quality_confidence directly (self-learned weights apply at concept level)
+        if item.quality_confidence < 0.2 {
+            tracing::debug!("skipping low-quality memory (confidence={:.2}): {}", item.quality_confidence, item.summary);
+            continue;
+        }
+
         let content_for_activation = item.content.clone();
         let importance = item.importance.parse::<crate::types::Importance>()
             .unwrap_or(crate::types::Importance::Medium);

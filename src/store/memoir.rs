@@ -40,7 +40,7 @@ fn row_to_memoir(row: &rusqlite::Row) -> ReinResult<Memoir> {
 }
 
 /// Map a rusqlite Row to a Concept struct.
-fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
+pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
     let id: String = row.get("id").map_err(ReinError::Database)?;
     let memoir_id: String = row.get("memoir_id").map_err(ReinError::Database)?;
     let name: String = row.get("name").map_err(ReinError::Database)?;
