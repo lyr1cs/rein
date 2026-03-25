@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, TantivyDocument};
 
@@ -12,6 +12,7 @@ pub struct TantivyFts {
     reader: IndexReader,
     id_field: Field,
     topic_field: Field,
+    topic_exact_field: Field,
     summary_field: Field,
     content_field: Field,
     keywords_field: Field,
@@ -28,6 +29,7 @@ impl TantivyFts {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("id", STRING | STORED);
         schema_builder.add_text_field("topic", TEXT | STORED);
+        schema_builder.add_text_field("topic_exact", STRING);
         schema_builder.add_text_field("summary", TEXT);
         schema_builder.add_text_field("content", TEXT);
         schema_builder.add_text_field("keywords", TEXT);
@@ -47,6 +49,9 @@ impl TantivyFts {
         let topic_field = opened_schema
             .get_field("topic")
             .map_err(|e| tantivy::TantivyError::SchemaError(format!("{e}")))?;
+        let topic_exact_field = opened_schema
+            .get_field("topic_exact")
+            .unwrap_or(topic_field); // fallback for old indexes without topic_exact
         let summary_field = opened_schema
             .get_field("summary")
             .map_err(|e| tantivy::TantivyError::SchemaError(format!("{e}")))?;
@@ -64,6 +69,7 @@ impl TantivyFts {
             reader,
             id_field,
             topic_field,
+            topic_exact_field,
             summary_field,
             content_field,
             keywords_field,
@@ -86,6 +92,7 @@ impl TantivyFts {
         writer.add_document(doc!(
             self.id_field => id,
             self.topic_field => topic,
+            self.topic_exact_field => topic,
             self.summary_field => summary,
             self.content_field => content,
             self.keywords_field => keywords,
@@ -95,6 +102,8 @@ impl TantivyFts {
     }
 
     /// Search for documents matching the query string.
+    /// When a topic filter is provided, uses BooleanQuery to filter at the index level
+    /// instead of post-filtering in memory.
     /// Returns pairs of (memory_id, BM25_score).
     pub fn search(
         &self,
@@ -116,7 +125,7 @@ impl TantivyFts {
         );
 
         // Try to parse; on failure, escape special chars and retry
-        let query = match query_parser.parse_query(query_str) {
+        let text_query = match query_parser.parse_query(query_str) {
             Ok(q) => q,
             Err(_) => {
                 let escaped = query_str
@@ -133,27 +142,26 @@ impl TantivyFts {
             }
         };
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 2))?;
+        // Combine text query with topic filter at index level
+        let final_query: Box<dyn tantivy::query::Query> = if let Some(t) = topic {
+            let topic_term = tantivy::Term::from_field_text(self.topic_exact_field, t);
+            let topic_query = TermQuery::new(topic_term, IndexRecordOption::Basic);
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, text_query),
+                (Occur::Must, Box::new(topic_query)),
+            ]))
+        } else {
+            text_query
+        };
+
+        let top_docs = searcher.search(&final_query, &TopDocs::with_limit(limit))?;
 
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
             if let Some(id_val) = retrieved_doc.get_first(self.id_field) {
                 if let OwnedValue::Str(ref id_str) = id_val {
-                    // Filter by topic if provided
-                    if let Some(t) = topic {
-                        if let Some(topic_val) = retrieved_doc.get_first(self.topic_field) {
-                            if let OwnedValue::Str(ref topic_str) = topic_val {
-                                if topic_str != t {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
                     results.push((id_str.clone(), score));
-                    if results.len() >= limit {
-                        break;
-                    }
                 }
             }
         }

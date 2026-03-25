@@ -68,6 +68,27 @@ pub struct DedupParams {
     pub dry_run: Option<bool>,
 }
 
+/// Parameters for rein_recent tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecentParams {
+    /// Maximum number of recent memories to return (default 10).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for rein_gc tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GcParams {
+    /// If true, only report how many would be pruned without removing them.
+    pub dry_run: Option<bool>,
+}
+
+/// Parameters for rein_organize tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OrganizeParams {
+    /// Maximum links per memory (default 5).
+    pub max_links: Option<usize>,
+}
+
 /// Parameters for rein_memoir_create tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemoirCreateParams {

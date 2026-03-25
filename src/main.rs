@@ -92,6 +92,27 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show most recently created memories
+    Recent {
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Garbage collect weak/stale STM memories below strength threshold
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Auto-link related memories based on content similarity
+    Organize,
+    /// Upgrade old memories into knowledge graph (concepts + links)
+    Upgrade {
+        /// Only process memories in this topic
+        #[arg(short, long)]
+        topic: Option<String>,
+        /// Preview what would be extracted without storing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Pre-compute embeddings for uncached memories
     Warmup,
     /// Show configuration
@@ -254,10 +275,224 @@ async fn main() -> anyhow::Result<()> {
             println!("Database path: {}", config.resolve_db_path().display());
             println!("Embedding provider: {}", config.embedding.provider);
             println!("Embedding dimensions: {}", config.embedding.dimensions);
+            println!("Extract provider: {}", config.extract.provider);
+            println!("Extract model: {}", match config.extract.provider.as_str() {
+                "omlx" => &config.extract.omlx.model,
+                _ => &config.extract.google.model,
+            });
             println!("Compact mode: {}", config.server.compact);
             println!("SSE enabled: {}", config.server.sse_enabled);
             println!("Decay base_lambda: {}", config.decay.base_lambda);
             println!("Dedup similarity: {}", config.search.dedup_similarity);
+        }
+        Some(Commands::Recent { limit }) => {
+            let store = config.open_store()?;
+            let memories = store.recent(limit)?;
+            if memories.is_empty() {
+                println!("No memories found.");
+            } else {
+                for m in &memories {
+                    let age = chrono::Utc::now().signed_duration_since(m.created_at);
+                    let age_str = if age.num_days() > 0 {
+                        format!("{}d ago", age.num_days())
+                    } else if age.num_hours() > 0 {
+                        format!("{}h ago", age.num_hours())
+                    } else {
+                        format!("{}m ago", age.num_minutes())
+                    };
+                    println!("[{}] {} ({}, {})", m.topic, m.summary, m.importance, age_str);
+                }
+            }
+        }
+        Some(Commands::Gc { dry_run }) => {
+            let store = config.open_store()?;
+            let threshold = config.decay.prune_threshold;
+            if dry_run {
+                // Simulate: apply decay inside a savepoint, count what would be pruned, then rollback
+                store.conn().execute_batch("SAVEPOINT gc_preview")?;
+                let decayed = store.apply_decay()?;
+                let mut stmt = store.conn().prepare(
+                    "SELECT COUNT(*) FROM memories WHERE layer = 'STM' AND strength < ?1
+                     AND importance NOT IN ('critical', 'high')"
+                )?;
+                let count: u64 = stmt.query_row(rusqlite::params![threshold], |row| row.get(0))?;
+                drop(stmt);
+                store.conn().execute_batch("ROLLBACK TO gc_preview")?;
+                store.conn().execute_batch("RELEASE gc_preview")?;
+                println!("Would decay {decayed} and prune {count} weak STM memories (threshold: {threshold})");
+            } else {
+                // First apply decay to update strengths, then prune
+                let decayed = store.apply_decay()?;
+                let pruned = store.prune(threshold)?;
+                println!("Decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
+            }
+        }
+        Some(Commands::Organize) => {
+            let store = config.open_store()?;
+            let threshold = config.search.dedup_similarity as f32;
+            let links = store.organize(threshold, 5)?;
+            println!("Organized: created {links} new links between related memories");
+        }
+        Some(Commands::Upgrade { topic, dry_run }) => {
+            let has_llm = extract::llm::create_extractor(&config).is_some();
+            if !has_llm {
+                eprintln!("rein: WARNING — no LLM configured. Upgrade will use local rules only.");
+                eprintln!("  Topic classification and keyword extraction will be basic.");
+                eprintln!("  Knowledge graph (concepts/links) requires LLM — set GEMINI_API_KEY for full upgrade.");
+            }
+
+            let store = config.open_store()?;
+
+            // Get memories to process
+            let topics = if let Some(ref t) = topic {
+                vec![t.clone()]
+            } else {
+                store.list_topics()?
+            };
+
+            let mut total_concepts = 0usize;
+            let mut total_links = 0usize;
+            let mut total_memoirs = 0usize;
+            let mut total_enriched = 0usize;
+
+            for topic_name in &topics {
+                let memories = store.get_by_topic(topic_name)?;
+                if memories.is_empty() { continue; }
+
+                // Combine all memories in this topic into one text block
+                let combined: String = memories.iter()
+                    .map(|m| format!("[{}] {}\n{}", m.topic, m.summary, m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+
+                println!("Processing topic '{}' ({} memories)...", topic_name, memories.len());
+
+                // Run full LLM extraction
+                let result = extract::llm::extract_full_with_fallback(&config, &combined).await;
+
+                if has_llm {
+                    // === LLM path: full enrichment + knowledge graph ===
+                    if dry_run {
+                        let enrichable = result.memories.len().min(memories.len());
+                        println!("  → would enrich {} memories, create {} concepts, {} links",
+                                 enrichable, result.concepts.len(), result.links.len());
+                        for c in &result.concepts {
+                            println!("    concept: [{}] {} ({})", c.memoir, c.name, c.concept_type);
+                        }
+                        for l in &result.links {
+                            println!("    link: {} --{}-> {}", l.from, l.relation, l.to);
+                        }
+                        total_concepts += result.concepts.len();
+                        total_links += result.links.len();
+                        total_enriched += enrichable;
+                    } else {
+                        // Enrich old memories with LLM-generated metadata
+                        for new_mem in &result.memories {
+                            let best_match = memories.iter()
+                                .max_by(|a, b| {
+                                    let sim_a = extract::similarity(&a.content, &new_mem.content);
+                                    let sim_b = extract::similarity(&b.content, &new_mem.content);
+                                    sim_a.partial_cmp(&sim_b).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            if let Some(old) = best_match {
+                                let sim = extract::similarity(&old.content, &new_mem.content);
+                                if sim > 0.3 {
+                                    let mut enriched = old.clone();
+                                    enriched.topic = new_mem.topic.clone();
+                                    enriched.summary = new_mem.summary.clone();
+                                    enriched.keywords = new_mem.keywords.clone();
+                                    if let Ok(imp) = new_mem.importance.parse::<types::Importance>() {
+                                        enriched.importance = imp;
+                                        enriched.layer = imp.auto_layer();
+                                        enriched.decay_lambda = config.decay.base_lambda * imp.decay_factor();
+                                    }
+                                    if store.update(&enriched).is_ok() {
+                                        total_enriched += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Store concepts + links in knowledge graph
+                        let (mut tc, mut tl) = (0usize, 0usize);
+                        if !result.concepts.is_empty() || !result.links.is_empty() {
+                            match store.store_knowledge_units(&result.concepts, &result.links) {
+                                Ok(report) => {
+                                    total_memoirs += report.memoirs_created;
+                                    tc = report.concepts_added + report.concepts_refined;
+                                    tl = report.links_added;
+                                    total_concepts += tc;
+                                    total_links += tl;
+                                }
+                                Err(e) => println!("  → error: {e}"),
+                            }
+                        }
+                        println!("  → {tc} concepts, {tl} links");
+                    }
+                } else {
+                    // === No-LLM path: local rule-based enrichment ===
+                    // Can't produce concepts/links, but can fix topic + extract basic keywords
+                    for old in &memories {
+                        if old.topic != "auto-extracted" { continue; } // already enriched
+
+                        let lower = old.content.to_lowercase();
+                        // Classify topic by keywords
+                        let new_topic = if ["architecture", "design", "component", "架构", "设计"].iter().any(|k| lower.contains(k)) {
+                            "architecture"
+                        } else if ["decided", "chose", "选型", "决策", "tradeoff"].iter().any(|k| lower.contains(k)) {
+                            "decision"
+                        } else if ["bug", "fix", "error", "crash", "修复", "解决"].iter().any(|k| lower.contains(k)) {
+                            "debug"
+                        } else if ["deploy", "install", "config", "migrate", "部署", "安装", "迁移"].iter().any(|k| lower.contains(k)) {
+                            "workflow"
+                        } else {
+                            "general"
+                        };
+
+                        // Extract basic keywords from content (top scoring words)
+                        let keywords: Vec<String> = old.content
+                            .split_whitespace()
+                            .filter(|w| w.len() > 3)
+                            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                            .filter(|w| !w.is_empty() && !["the", "this", "that", "with", "from", "have", "been", "into", "will"].contains(&w.as_str()))
+                            .take(5)
+                            .collect();
+
+                        if dry_run {
+                            if new_topic != "auto-extracted" || !keywords.is_empty() {
+                                println!("  → would reclassify '{}' → topic='{}', keywords={:?}",
+                                         old.summary.chars().take(40).collect::<String>(), new_topic, keywords);
+                                total_enriched += 1;
+                            }
+                        } else {
+                            let mut enriched = old.clone();
+                            enriched.topic = new_topic.to_string();
+                            if !keywords.is_empty() {
+                                enriched.keywords = keywords;
+                            }
+                            // Score-based importance upgrade
+                            let score = extract::score_sentence(&old.content);
+                            if score >= 4 {
+                                enriched.importance = types::Importance::High;
+                                enriched.layer = enriched.importance.auto_layer();
+                                enriched.decay_lambda = config.decay.base_lambda * enriched.importance.decay_factor();
+                            }
+                            if store.update(&enriched).is_ok() {
+                                total_enriched += 1;
+                            }
+                        }
+                    }
+                    if !dry_run {
+                        println!("  → enriched {} memories (local rules, no concepts/links)", total_enriched);
+                    }
+                }
+            }
+
+            if dry_run {
+                println!("\nDry run: would enrich {total_enriched} memories, create {total_concepts} concepts, {total_links} links across {} topics", topics.len());
+            } else {
+                println!("\nUpgrade complete: {total_enriched} memories enriched, {total_memoirs} memoirs created, {total_concepts} concepts, {total_links} links");
+            }
         }
         Some(Commands::Warmup) => {
             let store = config.open_store()?;
