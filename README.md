@@ -16,7 +16,7 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 
 | Feature | Description |
 |---------|-------------|
-| **19 MCP tools** | 9 core memory tools + 10 knowledge graph tools |
+| **22 MCP tools** | 12 core memory tools + 10 knowledge graph tools |
 | **Knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, BFS traversal, export (json / ascii / dot) |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
 | **Dual-layer Ebbinghaus decay** | LTM / STM layers with configurable lambda, beta, and access-boosted retention |
@@ -29,7 +29,7 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 | **Zero local models** | No GPU required by default; optional OMLX local backend |
 | **~2-5 MB footprint** | Single SQLite file with FTS5 + sqlite-vec |
 | **gemini-embedding-001** | MTEB #1 model (68.32), 3072 dimensions |
-| **15+ CLI commands** | Everything the MCP tools do, plus init, config, migrate, hooks |
+| **20+ CLI commands** | Everything the MCP tools do, plus init, config, migrate, hooks, recent, gc, organize, upgrade |
 | **Auto-configure** | `rein init` detects and configures 8 MCP clients automatically |
 | **Remote access** | HTTP / SSE transport with bearer token authentication |
 
@@ -84,16 +84,20 @@ rein serve
 | `migrate` | Import from QMD / reindex | `rein migrate [--from-qmd path] [--reindex]` |
 | `init` | Auto-configure MCP clients | `rein init [--dry-run]` |
 | `config` | Show current configuration | `rein config` |
+| `recent` | Show most recent memories | `rein recent [-l 20]` |
+| `gc` | Garbage collect weak STM memories | `rein gc [--dry-run]` |
+| `organize` | Auto-link related memories | `rein organize` |
+| `upgrade` | Upgrade old memories to knowledge graph | `rein upgrade [--topic X] [--dry-run]` |
 | `hook post` | Extract facts from tool output | `rein hook post` |
 | `hook compact` | Save context before compaction | `rein hook compact` |
-| `hook prompt` | Inject recalled memories into prompt | `rein hook prompt` |
-| `hook stop` | Save session summary on conversation end | `rein hook stop` |
+| `hook prompt` | Inject recalled memories + concepts into prompt | `rein hook prompt` |
+| `hook stop` | Full knowledge extraction on session end | `rein hook stop` |
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 19 tools are exposed.
+When running as an MCP server (`rein serve`), 22 tools are exposed.
 
-#### Core Tools (9)
+#### Core Tools (12)
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
@@ -106,6 +110,9 @@ When running as an MCP server (`rein serve`), 19 tools are exposed.
 | `rein_health` | `topic?` | Stale count, avg strength, consolidation hints |
 | `rein_consolidate` | `topic`, `summary` | Merge all memories in a topic into one |
 | `rein_dedup` | `dry_run?` | Scan for and remove duplicate memories |
+| `rein_recent` | `limit?` | List most recently created memories |
+| `rein_gc` | `dry_run?` | Garbage collect weak STM memories |
+| `rein_organize` | `max_links?` | Auto-link related memories |
 
 #### Knowledge Graph Tools (10)
 
@@ -124,9 +131,39 @@ When running as an MCP server (`rein serve`), 19 tools are exposed.
 
 #### Knowledge Graph Relation Types
 
-The following 9 relation types are available for linking concepts:
-
 `part_of`, `depends_on`, `related_to`, `contradicts`, `refines`, `alternative_to`, `caused_by`, `instance_of`, `superseded_by`
+
+### LLM Extraction (v0.3)
+
+rein uses LLM (Gemini 3.1 Flash Lite or local models via OMLX) for structured memory extraction. The hook system automatically builds a knowledge graph from coding sessions.
+
+**Architecture:**
+- `hook_post` — local pattern extraction (crash safety net) + buffer to session file
+- `hook_compact` — LLM extraction + buffer
+- `hook_stop` — full knowledge extraction: memories + concepts + links + episode summary
+- `hook_prompt` — injects recalled memories AND knowledge graph concepts
+
+**Upgrade old memories:**
+```bash
+rein upgrade --dry-run    # preview
+rein upgrade              # convert all old memories to knowledge graph
+rein upgrade --topic debug  # convert specific topic only
+```
+
+**Configuration:**
+```toml
+[extract]
+provider = "google"    # or "omlx" or "none"
+
+[extract.google]
+model = "gemini-3.1-flash-lite-preview"
+max_input_chars = 0    # 0 = no truncation (1M token model)
+
+[extract.omlx]
+endpoint = "http://localhost:11434/v1"  # Ollama, LM Studio, vLLM, etc.
+model = "default"
+max_input_chars = 16000
+```
 
 ### Configuration
 
@@ -248,10 +285,10 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
 
 **Hook behavior (4 hooks):**
 
-- `PostToolUse` -- extracts facts from tool output, stores as auto-extracted memories
-- `PreCompact` -- saves important context before context window compression
-- `UserPromptSubmit` -- injects recalled memories into the prompt as `<rein-context>`
-- `Stop` -- extracts session summary with signal-based context windows on conversation end
+- `PostToolUse` -- local pattern extraction (crash safety net) + buffers for session-end batch processing
+- `PreCompact` -- LLM extraction + buffers important context
+- `UserPromptSubmit` -- injects recalled memories AND knowledge graph concepts as `<rein-context>`
+- `Stop` -- full knowledge extraction: memories + concepts + links + episode summary via LLM
 
 ### Remote Access via HTTP/SSE
 
@@ -285,7 +322,7 @@ sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
                             |
                    +--------+--------+
                    |                 |
-               CLI (16 cmds)  MCP Server (19 tools)
+               CLI (20 cmds)  MCP Server (22 tools)
                    |                 |
                    +--------+--------+
                             |
@@ -437,7 +474,7 @@ rein 是一个轻量级的持久化记忆系统，专为 AI 编程智能体设�
 
 | 特性 | 说明 |
 |------|------|
-| **19 个 MCP 工具** | 9 个核心记忆工具 + 10 个知识图谱工具 |
+| **22 个 MCP 工具** | 12 个核心记忆工具 + 10 个知识图谱工具 |
 | **知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，BFS 遍历，导出（json / ascii / dot） |
 | **OMLX 本地嵌入** | 可选本地嵌入后端，通过 EmbedderKind 枚举分发（Google / OMLX） |
 | **双层艾宾浩斯衰减** | LTM / STM 层，可配置 lambda、beta，访问次数越多衰减越慢 |
@@ -450,7 +487,7 @@ rein 是一个轻量级的持久化记忆系统，专为 AI 编程智能体设�
 | **零本地模型** | 默认无需 GPU（可选 OMLX 本地后端） |
 | **~2-5 MB 占用** | 单个 SQLite 文件 + FTS5 + sqlite-vec |
 | **gemini-embedding-001** | MTEB 排名第一（68.32），3072 维 |
-| **15+ CLI 命令** | MCP 工具的全部功能，另加 init、config、migrate、hooks |
+| **20+ CLI 命令** | MCP 工具的全部功能，另加 init、config、migrate、hooks、recent、gc、organize、upgrade |
 | **自动配置** | `rein init` 自动检测并配置 8 个 MCP 客户端 |
 | **远程访问** | HTTP / SSE 传输，支持 bearer token 认证 |
 
@@ -508,13 +545,20 @@ rein serve
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
 | `hook prompt` | 将召回的记忆注入提示词 | `rein hook prompt` |
-| `hook stop` | 会话结束时保存会话摘要 | `rein hook stop` |
+| `recent` | 显示最近记忆 | `rein recent [-l 20]` |
+| `gc` | 垃圾回收弱 STM 记忆 | `rein gc [--dry-run]` |
+| `organize` | 自动关联记忆 | `rein organize` |
+| `upgrade` | 将旧记忆升级为知识图谱 | `rein upgrade [--topic X] [--dry-run]` |
+| `hook post` | 从工具输出提取事实 | `rein hook post` |
+| `hook compact` | 压缩前保存上下文 | `rein hook compact` |
+| `hook prompt` | 将记忆 + 知识概念注入提示词 | `rein hook prompt` |
+| `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
 
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），共暴露 19 个工具。
+以 MCP 服务运行时（`rein serve`），共暴露 22 个工具。
 
-#### 核心工具（9 个）
+#### 核心工具（12 个）
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
@@ -527,6 +571,9 @@ rein serve
 | `rein_health` | `topic?` | 陈旧计数、平均强度、合并建议 |
 | `rein_consolidate` | `topic`, `summary` | 将主题内所有记忆合并为一条 |
 | `rein_dedup` | `dry_run?` | 扫描并移除重复记忆 |
+| `rein_recent` | `limit?` | 查看最近创建的记忆 |
+| `rein_gc` | `dry_run?` | 垃圾回收弱 STM 记忆 |
+| `rein_organize` | `max_links?` | 自动关联记忆 |
 
 #### 知识图谱工具（10 个）
 
@@ -669,10 +716,10 @@ sse_bind = "127.0.0.1"
 
 **Hook 行为说明（4 个 Hook）：**
 
-- `PostToolUse` -- 从工具输出中提取事实，作为自动提取的记忆存储
-- `PreCompact` -- 在上下文窗口压缩前保存重要上下文
-- `UserPromptSubmit` -- 将召回的记忆以 `<rein-context>` 形式注入提示词
-- `Stop` -- 会话结束时通过信号关键词上下文窗口提取会话摘要
+- `PostToolUse` -- 本地模式提取（崩溃安全网）+ 缓冲到 session 文件
+- `PreCompact` -- LLM 提取 + 缓冲重要上下文
+- `UserPromptSubmit` -- 将记忆 + 知识图谱概念以 `<rein-context>` 形式注入提示词
+- `Stop` -- 完整知识提取：记忆 + 概念 + 关系 + 会话摘要（通过 LLM）
 
 ### 通过 HTTP/SSE 远程访问
 
@@ -706,7 +753,7 @@ sse_bind = "0.0.0.0"    # 需要设置 REIN_HTTP_TOKEN
                             |
                    +--------+--------+
                    |                 |
-              CLI (16 命令)   MCP 服务 (19 工具)
+              CLI (20 命令)   MCP 服务 (22 工具)
                    |                 |
                    +--------+--------+
                             |

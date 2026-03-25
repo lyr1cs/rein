@@ -752,6 +752,129 @@ impl ReinServer {
             }
         }
     }
+
+    /// Show the most recently created memories.
+    #[tool(name = "rein_recent", description = "List the most recently created memories, ordered by creation time.")]
+    fn rein_recent(&self, Parameters(params): Parameters<RecentParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let limit = params.limit.unwrap_or(10);
+        let compact = self.compact();
+
+        let result = self.with_store(|store| {
+            store.recent(limit)
+        });
+
+        match result {
+            Ok(memories) => {
+                if memories.is_empty() {
+                    return "No memories found.".to_string();
+                }
+                let mut text = if compact {
+                    memories.iter()
+                        .map(|m| format!("[{}] {}", m.topic, m.summary))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    memories.iter()
+                        .map(|m| {
+                            let age = chrono::Utc::now().signed_duration_since(m.created_at);
+                            let age_str = if age.num_days() > 0 {
+                                format!("{}d ago", age.num_days())
+                            } else if age.num_hours() > 0 {
+                                format!("{}h ago", age.num_hours())
+                            } else {
+                                format!("{}m ago", age.num_minutes())
+                            };
+                            format!(
+                                "[{}] {} ({}, {}, str:{:.2})\n  id: {}",
+                                m.topic, m.summary, m.importance, age_str, m.strength, m.id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.maybe_nudge(&mut text);
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Garbage collect weak STM memories below the configured strength threshold.
+    #[tool(name = "rein_gc", description = "Run garbage collection: apply decay to all memories, then prune weak STM memories below the configured strength threshold. Use dry_run=true to preview.")]
+    fn rein_gc(&self, Parameters(params): Parameters<GcParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let dry_run = params.dry_run.unwrap_or(false);
+        let threshold = self.config.decay.prune_threshold;
+        let compact = self.compact();
+
+        let result = self.with_store(|store| {
+            if dry_run {
+                // Simulate inside a savepoint for accurate preview (avoids nested transaction)
+                store.conn().execute_batch("SAVEPOINT gc_preview").map_err(ReinError::Database)?;
+                let decayed = store.apply_decay()?;
+                let mut stmt = store.conn().prepare(
+                    "SELECT COUNT(*) FROM memories WHERE layer = 'STM' AND strength < ?1
+                     AND importance NOT IN ('critical', 'high')"
+                ).map_err(ReinError::Database)?;
+                let count: u64 = stmt.query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .map_err(ReinError::Database)?;
+                drop(stmt);
+                store.conn().execute_batch("ROLLBACK TO gc_preview").map_err(ReinError::Database)?;
+                store.conn().execute_batch("RELEASE gc_preview").map_err(ReinError::Database)?;
+                Ok((decayed, count))
+            } else {
+                let decayed = store.apply_decay()?;
+                let pruned = store.prune(threshold)?;
+                Ok((decayed, pruned))
+            }
+        });
+
+        match result {
+            Ok((decayed, count)) => {
+                let mut text = if compact {
+                    if dry_run {
+                        format!("would_prune:{count}")
+                    } else {
+                        format!("decayed:{decayed} pruned:{count}")
+                    }
+                } else if dry_run {
+                    format!("GC dry run: {count} weak STM memories would be pruned (threshold: {threshold})")
+                } else {
+                    format!("GC complete: decayed {decayed} memories, pruned {count} weak STM memories (threshold: {threshold})")
+                };
+                self.maybe_nudge(&mut text);
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Auto-link all memories based on content similarity. Creates bidirectional related_ids links.
+    #[tool(name = "rein_organize", description = "Scan all memories and create bidirectional links between related ones based on content similarity. Returns the number of new links created.")]
+    fn rein_organize(&self, Parameters(params): Parameters<OrganizeParams>) -> String {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let max_links = params.max_links.unwrap_or(5);
+        let threshold = self.config.search.dedup_similarity as f32;
+        let compact = self.compact();
+
+        let result = self.with_store(|store| {
+            store.organize(threshold, max_links)
+        });
+
+        match result {
+            Ok(links) => {
+                let mut text = if compact {
+                    format!("links:{links}")
+                } else {
+                    format!("Organized: created {links} new links between related memories")
+                };
+                self.maybe_nudge(&mut text);
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
 }
 
 
