@@ -9,6 +9,9 @@ pub struct StoreStats {
     pub stm_count: usize,
     pub topic_count: usize,
     pub avg_strength: f64,
+    pub memoir_count: usize,
+    pub concept_count: usize,
+    pub link_count: usize,
 }
 
 /// Health report for a single topic.
