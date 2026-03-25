@@ -170,7 +170,7 @@ impl SqliteStore {
                             definition: c.definition.clone(),
                             labels: c.labels.clone(),
                             source_memory_ids: source_memory_ids.to_vec(),
-                            confidence: 0.5,
+                            confidence: c.quality_confidence as f32,
                             revision: 1,
                             created_at: chrono::Utc::now(),
                             updated_at: chrono::Utc::now(),
@@ -652,7 +652,6 @@ impl SqliteStore {
 
         if good_mems.is_empty() && bad_mems.is_empty() { return; }
 
-        // Update running sums
         let upsert = |key: &str, val: f64| {
             let _ = self.conn.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, ?2)
@@ -661,17 +660,52 @@ impl SqliteStore {
             );
         };
 
-        upsert("quality:good_count", good_mems.len() as f64);
-        upsert("quality:bad_count", bad_mems.len() as f64);
+        let good_count = good_mems.len() as f64;
+        let bad_count = bad_mems.len() as f64;
+        upsert("quality:good_count", good_count);
+        upsert("quality:bad_count", bad_count);
 
-        // For simplicity, compute average utility for good/bad
-        let avg_good_utility = if !good_mems.is_empty() {
-            good_mems.iter().map(|(_, ac)| *ac as f64).sum::<f64>() / good_mems.len() as f64
-        } else { 0.0 };
-        let avg_bad_utility = 0.0; // bad mems have access_count == 0 by definition
+        // Compute averages for ALL 4 features for good memories
+        let (mut sum_llm, mut sum_util, mut sum_conn, mut sum_rec) = (0.0, 0.0, 0.0, 0.0);
+        for (id, ac) in &good_mems {
+            sum_util += *ac as f64;
+            // LLM confidence: stored as memory strength initially (approximation)
+            if let Ok(mem) = self.get(id) {
+                sum_llm += mem.strength; // strength correlates with quality
+                let hours = (chrono::Utc::now() - mem.created_at).num_hours() as f64;
+                sum_rec += if hours <= 24.0 { 1.0 } else if hours <= 168.0 { 0.5 } else { 0.2 };
+            }
+            // Connectivity: count concept_ids
+            if let Ok(mem) = self.get(id) {
+                sum_conn += (mem.concept_ids.len() as f64 / 3.0).min(1.0);
+            }
+        }
 
-        upsert("quality:good_utility_sum", avg_good_utility);
-        upsert("quality:bad_utility_sum", avg_bad_utility);
+        // Same for bad memories
+        let (mut bad_llm, mut bad_util, mut bad_conn, mut bad_rec) = (0.0, 0.0, 0.0, 0.0);
+        for id in &bad_mems {
+            bad_util += 0.0; // access_count == 0 by definition
+            if let Ok(mem) = self.get(id) {
+                bad_llm += mem.strength;
+                let hours = (chrono::Utc::now() - mem.created_at).num_hours() as f64;
+                bad_rec += if hours <= 24.0 { 1.0 } else if hours <= 168.0 { 0.5 } else { 0.2 };
+                bad_conn += (mem.concept_ids.len() as f64 / 3.0).min(1.0);
+            }
+        }
+
+        // Store averages for all features
+        if good_count > 0.0 {
+            upsert("quality:good_llm_sum", sum_llm / good_count);
+            upsert("quality:good_utility_sum", sum_util / good_count);
+            upsert("quality:good_connectivity_sum", sum_conn / good_count);
+            upsert("quality:good_recency_sum", sum_rec / good_count);
+        }
+        if bad_count > 0.0 {
+            upsert("quality:bad_llm_sum", bad_llm / bad_count);
+            upsert("quality:bad_utility_sum", bad_util / bad_count);
+            upsert("quality:bad_connectivity_sum", bad_conn / bad_count);
+            upsert("quality:bad_recency_sum", bad_rec / bad_count);
+        }
     }
 
     /// Record that memories were returned in a recall result.
@@ -1264,8 +1298,8 @@ impl SqliteStore {
             for concept in &concepts {
                 let score = self.concept_quality_score(concept);
 
-                let has_unused_sources = !concept.source_memory_ids.is_empty() &&
-                    concept.source_memory_ids.iter().any(|mid| {
+                // Require majority of source memories to be weak (not just any one)
+                let weak_count = concept.source_memory_ids.iter().filter(|mid| {
                         let recall: u64 = self.conn
                             .query_row(
                                 "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM metadata WHERE key = ?1",
@@ -1274,9 +1308,11 @@ impl SqliteStore {
                             ).unwrap_or(0);
                         let access: u32 = self.get(mid).map(|m| m.access_count).unwrap_or(0);
                         recall >= 5 && access == 0
-                    });
+                    }).count();
+                let majority_weak = !concept.source_memory_ids.is_empty()
+                    && weak_count > concept.source_memory_ids.len() / 2;
 
-                if score < 0.2 && has_unused_sources {
+                if score < 0.2 && majority_weak {
                     let _ = self.conn.execute(
                         "DELETE FROM concept_links WHERE source_id = ?1 OR target_id = ?1",
                         rusqlite::params![concept.id],
