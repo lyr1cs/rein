@@ -1,184 +1,107 @@
 ---
 name: rein
 description: >
-  Multi-source cross-validated memory system with knowledge graph. Use for storing, recalling,
-  and managing persistent memories across sessions, plus building knowledge graphs via memoirs.
-  Provides recall, store, update, forget, topics, stats, health, consolidate, dedup, and 10
-  memoir commands. Triggers when user mentions memory, recall, remember, past sessions,
-  previous work, knowledge graph, memoir, concepts, or wants to save important context.
+  Multi-source cross-validated memory system with knowledge graph and LLM extraction.
+  22 MCP tools, 20+ CLI commands. Stores, recalls, and manages persistent memories with
+  automatic knowledge graph generation, memory evolution, recency boost, and Ebbinghaus decay.
+  Triggers when user mentions memory, recall, remember, past sessions, knowledge graph,
+  memoir, concepts, export, or wants to save/search important context.
 ---
 
-# rein Memory System
+# rein Memory System (v0.2.2)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
-(19 tools) or via CLI (15 commands). Memories have topics, importance levels (low/medium/high/critical),
-and automatically decay over time using an Ebbinghaus forgetting curve. Memoirs provide a
-knowledge graph layer with concepts, typed links, BFS traversal, and export.
+(22 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
+or local models), automatic knowledge graph generation, memory evolution (refine/supersede),
+recency-boosted search, and Ebbinghaus forgetting curve decay.
 
-## Available Commands
+## CLI Commands
 
-### Recall memories
+### Core Memory
 ```bash
-rein recall "query" [-t topic] [-l limit]
-```
-Search memories by semantic query. Supports optional topic filter and result limit (default 10).
-
-### Store a memory
-```bash
-rein store -t <topic> -c <content> -I <importance> [-k keyword1,keyword2]
-```
-Importance levels: `low`, `medium`, `high`, `critical`. Critical memories never decay.
-Automatically deduplicates against existing memories (token similarity > 0.70, using max of Jaccard and containment).
-
-### Update a memory
-```bash
+rein recall "query" [-t topic] [-l limit]   # Search memories
+rein store -t <topic> -c <content> -I <importance> [-k kw1,kw2]
 rein update <id> -c <new_content> [-I <importance>]
+rein forget <id>                             # Delete a memory
+rein topics                                  # List all topics
+rein stats                                   # Store statistics
+rein health [topic]                          # Health check
+rein recent [-l 20]                          # Most recent memories
 ```
 
-### Delete a memory
+### Maintenance
 ```bash
-rein forget <id>
+rein consolidate <topic> -s "summary"        # Merge topic into one memory
+rein dedup [--dry-run]                       # Scan/remove duplicates
+rein gc [--dry-run]                          # Garbage collect weak STM
+rein organize                                # Auto-link related memories
+rein upgrade [--topic X] [--dry-run]         # Upgrade old memories to knowledge graph
+rein export [--format json|md|csv] [--topic X] [--output file]
 ```
 
-### List topics
+### System
 ```bash
-rein topics
+rein serve [--compact] [--sse]               # Start MCP server
+rein init [--dry-run]                        # Auto-configure MCP clients
+rein config                                  # Show configuration
+rein warmup                                  # Pre-compute embeddings
+rein migrate [--from-qmd path] [--reindex]   # Import/reindex
 ```
 
-### Show statistics
+### Hooks (used by Claude Code)
 ```bash
-rein stats
-```
-Returns total count, LTM/STM breakdown, average strength.
-
-### Health check
-```bash
-rein health [topic]
-```
-Shows stale count, average strength, and consolidation recommendations.
-
-### Consolidate a topic
-```bash
-rein consolidate <topic> -s "summary of all memories in this topic"
-```
-Merges all memories in a topic into a single summary memory.
-
-### Deduplicate
-```bash
-rein dedup [--dry-run]
-```
-Scans for duplicate memories using content similarity. Use `--dry-run` to preview.
-
-### Show configuration
-```bash
-rein config
+rein hook post      # Buffer tool output + pattern extraction (crash safety net)
+rein hook compact   # LLM extraction + buffer for hook_stop
+rein hook prompt    # Inject recalled memories + concepts into prompt
+rein hook stop      # Full knowledge extraction: memories + concepts + links + episode
 ```
 
-### Auto-configure MCP clients
-```bash
-rein init [--dry-run]
-```
+## MCP Tools (22)
 
-### Migrate / Reindex
-```bash
-rein migrate [--from-qmd path] [--reindex]
-```
+### Core (12)
+| Tool | Description |
+|------|-------------|
+| `rein_recall` | Semantic search with recency boost |
+| `rein_store` | Store with auto-dedup + evolution + knowledge graph |
+| `rein_update` | Update memory content/importance |
+| `rein_forget` | Delete by ID |
+| `rein_list_topics` | List all topics |
+| `rein_stats` | Store statistics |
+| `rein_health` | Topic health check |
+| `rein_consolidate` | Merge topic memories |
+| `rein_dedup` | Scan/remove duplicates |
+| `rein_recent` | Most recent memories |
+| `rein_gc` | Garbage collect weak STM |
+| `rein_organize` | Auto-link related memories |
 
-### Warmup embedding cache and side indexes
-```bash
-rein warmup
-```
-Pre-computes embeddings for uncached memories and rebuilds HNSW/Tantivy side indexes.
+### Knowledge Graph (10)
+| Tool | Description |
+|------|-------------|
+| `rein_memoir_create` | Create knowledge container |
+| `rein_memoir_list` | List all memoirs |
+| `rein_memoir_show` | Show memoir + concepts |
+| `rein_memoir_add_concept` | Add knowledge node |
+| `rein_memoir_refine` | Update concept, boost confidence |
+| `rein_memoir_search` | FTS search within memoir |
+| `rein_memoir_search_all` | Search across all memoirs |
+| `rein_memoir_link` | Link concepts (9 relation types) |
+| `rein_memoir_inspect` | BFS neighborhood traversal |
+| `rein_memoir_export` | Export graph (json/ascii/dot) |
 
-### Hook commands (used by Claude Code hooks)
-```bash
-rein hook post      # Extract facts from tool output (stdin)
-rein hook compact   # Extract context before compaction (stdin)
-rein hook prompt    # Inject recalled memories into prompt (stdin/stdout)
-```
+## Key Features
 
-### Create a memoir
-```bash
-rein_memoir_create name="my-project" description="Project knowledge"
-```
-Creates a knowledge graph container.
-
-### List memoirs
-```bash
-rein_memoir_list
-```
-
-### Show memoir details
-```bash
-rein_memoir_show name="my-project"
-```
-
-### Add a concept
-```bash
-rein_memoir_add_concept memoir="my-project" name="caching" definition="In-memory LRU cache layer" labels="performance,infra"
-```
-
-### Refine a concept
-```bash
-rein_memoir_refine memoir="my-project" name="caching" definition="Updated definition with Redis backend"
-```
-Updates the concept definition and boosts its confidence.
-
-### Search within a memoir
-```bash
-rein_memoir_search memoir="my-project" query="cache" limit=5
-```
-
-### Search across all memoirs
-```bash
-rein_memoir_search_all query="cache" limit=5
-```
-
-### Link two concepts
-```bash
-rein_memoir_link memoir="my-project" from="caching" to="redis" relation="depends_on"
-```
-Relation types: `part_of`, `depends_on`, `related_to`, `contradicts`, `refines`, `alternative_to`, `caused_by`, `instance_of`, `superseded_by`
-
-### Inspect concept neighborhood
-```bash
-rein_memoir_inspect memoir="my-project" name="caching" depth=2
-```
-BFS traversal showing linked concepts up to the given depth.
-
-### Export memoir graph
-```bash
-rein_memoir_export memoir="my-project" format="dot"
-```
-Formats: `json`, `ascii`, `dot`
+- **LLM Extraction**: Gemini 3.1 Flash Lite or local models (Ollama/LM Studio/vLLM)
+- **Knowledge Graph**: Auto-creates concepts + typed links from session transcripts
+- **Memory Evolution**: New memories automatically refine or supersede similar old ones
+- **Recency Boost**: 24h memories +50% search score, 7-day linear decay
+- **Bidirectional Links**: Memory ↔ Concept, Memory ↔ Memory, Concept ↔ Concept
+- **Buffer Architecture**: hook_post buffers, hook_stop does batch LLM extraction
+- **Adaptive Threshold**: Buffer flush adjusts by content signal density
 
 ## When to Use
 
-- **Store**: After solving a complex bug, learning a project pattern, or discovering important configuration
-- **Recall**: At the start of a session, when context seems relevant, or when the user asks about past work
-- **Consolidate**: When a topic has many small memories that should be summarized
-- **Health**: Periodically check for stale or redundant memories
-- **Dedup**: When the store grows large, scan for duplicates
-
-## MCP Tool Names
-
-When rein runs as an MCP server, use these tool names:
-- `rein_recall` - search memories
-- `rein_store` - store a memory
-- `rein_update` - update a memory
-- `rein_forget` - delete a memory
-- `rein_list_topics` - list topics
-- `rein_stats` - show statistics
-- `rein_health` - health check
-- `rein_consolidate` - consolidate a topic
-- `rein_dedup` - deduplicate memories
-- `rein_memoir_create` - create a knowledge container
-- `rein_memoir_list` - list all memoirs
-- `rein_memoir_show` - show memoir details + concepts
-- `rein_memoir_add_concept` - add knowledge node
-- `rein_memoir_refine` - update concept, boost confidence
-- `rein_memoir_search` - FTS search within memoir
-- `rein_memoir_search_all` - search across all memoirs
-- `rein_memoir_link` - link two concepts
-- `rein_memoir_inspect` - BFS neighborhood traversal
-- `rein_memoir_export` - export graph (json/ascii/dot)
+- **Store**: After solving bugs, learning patterns, making architecture decisions
+- **Recall**: Start of session, when context seems relevant, user asks about past work
+- **Upgrade**: Convert old memories to knowledge graph format
+- **Export**: Backup, migration, or sharing memory data
+- **GC**: Periodically clean up weak memories
