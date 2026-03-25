@@ -289,8 +289,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Embedding provider: {}", config.embedding.provider);
             println!("Embedding dimensions: {}", config.embedding.dimensions);
             println!("Extract provider: {}", config.extract.provider);
-            println!("Extract model: {}", match config.extract.provider.as_str() {
-                "omlx" => &config.extract.omlx.model,
+            println!("Extract model: {}", match config.extract_provider() {
+                config::Provider::Omlx => &config.extract.omlx.model,
                 _ => &config.extract.google.model,
             });
             println!("Compact mode: {}", config.server.compact);
