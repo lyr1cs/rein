@@ -245,10 +245,10 @@ fn session_buffer_path(config: &ReinConfig, input: &str) -> std::path::PathBuf {
             format!("{:x}", hash).chars().take(12).collect()
         } else {
             // Fallback: PID + timestamp for uniqueness across concurrent hooks
-            format!("pid{}_{}", std::process::id(), chrono::Utc::now().timestamp_millis())
+            format!("pid{}", std::process::id())
         }
     } else {
-        format!("pid{}_{}", std::process::id(), chrono::Utc::now().timestamp_millis())
+        format!("pid{}", std::process::id())
     };
 
     resolve_buffer_dir(config).join(format!("buffer_{session_id}.jsonl"))
@@ -303,7 +303,7 @@ fn store_episode_concept(
         store.create_memoir(memoir)?;
     }
 
-    let date = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+    let date = format!("{}-{}", chrono::Utc::now().format("%Y-%m-%d-%H%M"), ulid::Ulid::new().to_string().chars().take(6).collect::<String>());
     let definition = if episode.decisions.is_empty() {
         format!("{}\nOutcome: {}", episode.title, episode.outcome)
     } else {
