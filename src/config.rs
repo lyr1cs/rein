@@ -314,7 +314,9 @@ fn default_signal_keywords() -> Vec<String> {
         "installed", "deployed", "migrated",
         "important", "remember", "solution", "tradeoff",
         "upgrade", "deprecated", "workflow", "released",
-        // Chinese
+        "because", "reason", "switched", "selected", "prefer",
+        "root cause", "workaround", "conclusion",
+        // Chinese (for matching Chinese conversation content)
         "决策", "选型", "架构", "设计", "模式",
         "修复", "解决", "安装", "部署", "迁移",
         "重要", "记住", "记录", "方案", "权衡",
