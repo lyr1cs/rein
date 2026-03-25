@@ -130,10 +130,10 @@ Rules:
 // ---------------------------------------------------------------------------
 
 pub struct GeminiExtractor {
-    client: Client,
-    api_key: String,
-    endpoint: String,
-    model: String,
+    pub(crate) client: Client,
+    pub(crate) api_key: String,
+    pub(crate) endpoint: String,
+    pub(crate) model: String,
 }
 
 impl GeminiExtractor {
@@ -233,9 +233,9 @@ impl GeminiExtractor {
 // ---------------------------------------------------------------------------
 
 pub struct OmlxExtractor {
-    client: Client,
-    endpoint: String,
-    model: String,
+    pub(crate) client: Client,
+    pub(crate) endpoint: String,
+    pub(crate) model: String,
 }
 
 impl OmlxExtractor {
@@ -391,6 +391,61 @@ pub async fn extract_with_fallback(
             should_store: true,
         })
         .collect()
+}
+
+/// LLM semantic dedup: ask the model if two texts are about the same thing.
+/// Returns true if the LLM judges them as duplicates.
+pub async fn llm_is_duplicate(config: &ReinConfig, text_a: &str, text_b: &str) -> bool {
+    let Some(extractor) = create_extractor(config) else {
+        return false; // no LLM available, can't judge
+    };
+
+    let prompt = format!(
+        "Are these two texts saying essentially the same thing? Answer ONLY \"yes\" or \"no\".\n\nText A: {}\n\nText B: {}",
+        text_a.chars().take(500).collect::<String>(),
+        text_b.chars().take(500).collect::<String>(),
+    );
+
+    let result = match &extractor {
+        ExtractorKind::Gemini(e) => {
+            let url = format!("{}/v1beta/models/{}:generateContent", e.endpoint, e.model);
+            let body = json!({
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.0, "maxOutputTokens": 5}
+            });
+            e.client.post(&url)
+                .header("x-goog-api-key", &e.api_key)
+                .json(&body)
+                .send().await
+                .ok()
+                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+        }
+        ExtractorKind::Omlx(e) => {
+            let url = format!("{}/chat/completions", e.endpoint);
+            let body = json!({
+                "model": &e.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0, "max_tokens": 5
+            });
+            e.client.post(&url)
+                .json(&body)
+                .send().await
+                .ok()
+                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+        }
+    };
+
+    if let Some(resp) = result {
+        if let Ok(body) = resp.text().await {
+            let lower = body.to_lowercase();
+            // Check for "yes" in various response formats
+            // Gemini: candidates[0].content.parts[0].text
+            // OMLX: choices[0].message.content
+            // Also handle raw "yes"
+            return lower.contains("yes");
+        }
+    }
+    false // default: not duplicate (conservative)
 }
 
 /// Full extraction (memories + concepts + links + episode) with fallback.
