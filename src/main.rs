@@ -184,27 +184,14 @@ async fn main() -> anyhow::Result<()> {
             let imp: types::Importance = importance
                 .parse()
                 .map_err(|e: String| anyhow::anyhow!(e))?;
-            let memory = types::Memory {
-                id: ulid::Ulid::new().to_string(),
-                layer: imp.auto_layer(),
+            let memory = rein::ops::build_memory(
+                &config,
                 topic,
-                summary: content.chars().take(100).collect(),
-                content: content.clone(),
-                keywords: keywords.unwrap_or_default(),
-                importance: imp,
-                source: types::Source::Manual,
-                strength: 1.0,
-                decay_lambda: config.decay.base_lambda * imp.decay_factor(),
-                access_count: 0,
-                superseded_by: None,
-                related_ids: vec![],
-                concept_ids: vec![],
-                status: types::MemoryStatus::default(),
-                embedding: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                last_accessed: chrono::Utc::now(),
-            };
+                content.clone(),
+                imp,
+                keywords.unwrap_or_default(),
+                types::Source::Manual,
+            );
             let id = store
                 .store_with_dedup(
                     memory,
@@ -455,7 +442,8 @@ async fn main() -> anyhow::Result<()> {
                         total_links += result.links.len();
                         total_enriched += enrichable;
                     } else {
-                        // Enrich old memories with LLM-generated metadata
+                        // LLM quality audit + enrichment
+                        let mut deprecated_count = 0usize;
                         for new_mem in &result.memories {
                             let best_match = memories.iter()
                                 .max_by(|a, b| {
@@ -466,6 +454,16 @@ async fn main() -> anyhow::Result<()> {
                             if let Some(old) = best_match {
                                 let sim = extract::similarity(&old.content, &new_mem.content);
                                 if sim > 0.3 {
+                                    // Quality audit: LLM says this is junk → deprecate
+                                    if new_mem.quality_confidence < 0.2 {
+                                        let _ = store.conn().execute(
+                                            "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                                            rusqlite::params![old.id],
+                                        );
+                                        deprecated_count += 1;
+                                        continue;
+                                    }
+
                                     let mut enriched = old.clone();
                                     enriched.topic = new_mem.topic.clone();
                                     enriched.summary = new_mem.summary.clone();
@@ -480,6 +478,9 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                        }
+                        if deprecated_count > 0 {
+                            println!("  → deprecated {deprecated_count} low-quality memories");
                         }
 
                         // Collect memory IDs from this topic for bidirectional linking
