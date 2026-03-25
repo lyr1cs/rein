@@ -139,28 +139,14 @@ impl ReinServer {
             })
             .unwrap_or_default();
 
-        let content = params.content.clone();
-        let memory = Memory {
-            id: ulid::Ulid::new().to_string(),
-            layer: importance.auto_layer(),
-            topic: params.topic,
-            summary: content.chars().take(100).collect(),
-            content,
-            keywords,
+        let memory = crate::ops::build_memory(
+            &self.config,
+            params.topic,
+            params.content.clone(),
             importance,
-            source: Source::Manual,
-            strength: 1.0,
-            decay_lambda: self.config.decay.base_lambda * importance.decay_factor(),
-            access_count: 0,
-            superseded_by: None,
-            related_ids: vec![],
-            concept_ids: vec![],
-            status: MemoryStatus::default(),
-            embedding: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_accessed: chrono::Utc::now(),
-        };
+            keywords,
+            Source::Manual,
+        );
 
         let dedup_sim = self.config.search.dedup_similarity as f32;
         let dedup_days = self.config.search.dedup_time_window_days;
@@ -315,7 +301,6 @@ impl ReinServer {
     #[tool(name = "rein_consolidate", description = "Consolidate all memories in a topic into a single summary memory, removing the originals.")]
     fn rein_consolidate(&self, Parameters(params): Parameters<ConsolidateParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let base_lambda = self.config.decay.base_lambda;
         let compact = self.compact();
 
         let result = self.with_store(|store| {
@@ -325,28 +310,14 @@ impl ReinServer {
                 return Ok((0, String::new()));
             }
 
-            let new_id = ulid::Ulid::new().to_string();
-            let consolidated = Memory {
-                id: new_id.clone(),
-                layer: MemoryLayer::LTM,
-                topic: params.topic.clone(),
-                summary: params.summary.chars().take(100).collect(),
-                content: params.summary.clone(),
-                keywords: vec![],
-                importance: Importance::High,
-                source: Source::Manual,
-                strength: 1.0,
-                decay_lambda: base_lambda * Importance::High.decay_factor(),
-                access_count: 0,
-                superseded_by: None,
-                related_ids: existing.iter().map(|m| m.id.clone()).collect(),
-                concept_ids: vec![],
-                status: MemoryStatus::default(),
-                embedding: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                last_accessed: chrono::Utc::now(),
-            };
+            let related_ids = existing.iter().map(|m| m.id.clone()).collect();
+            let consolidated = crate::ops::build_consolidated(
+                &self.config,
+                params.topic.clone(),
+                params.summary.clone(),
+                related_ids,
+            );
+            let new_id = consolidated.id.clone();
 
             let old = store.consolidate_atomic(&params.topic, consolidated)?;
             Ok((old.len(), new_id))

@@ -17,6 +17,27 @@ use self::buffer::*;
 use self::parsing::*;
 use self::scoring::*;
 
+/// Compute adaptive admission threshold from recent quality data.
+/// Base = 0.2. Adjusts up if recent quality is low, down if high.
+fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
+    let base = 0.2;
+    // Read recent average quality from metadata
+    let recent_avg: f64 = store.conn()
+        .query_row(
+            "SELECT COALESCE(AVG(strength), 0.5) FROM memories ORDER BY created_at DESC LIMIT 100",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0.5);
+
+    if recent_avg < 0.4 {
+        (base * 1.1_f64).min(0.60) // quality low → raise bar
+    } else if recent_avg > 0.7 {
+        (base * 0.9_f64).max(0.15) // quality high → relax
+    } else {
+        base
+    }
+}
+
 /// Store a list of ExtractedMemory items into the database.
 /// Filters secrets and deduplicates. Returns (count, stored_ids).
 fn store_extracted(
@@ -29,10 +50,11 @@ fn store_extracted(
     for item in items {
         if looks_like_secret(&item.content) { continue; }
 
-        // Admission control: skip low-quality items
-        // Use LLM quality_confidence directly (self-learned weights apply at concept level)
-        if item.quality_confidence < 0.2 {
-            tracing::debug!("skipping low-quality memory (confidence={:.2}): {}", item.quality_confidence, item.summary);
+        // Admission control: adaptive threshold based on recent quality
+        let threshold = adaptive_admission_threshold(store);
+        if item.quality_confidence < threshold {
+            tracing::debug!("skipping low-quality memory (confidence={:.2} < threshold={:.2}): {}",
+                item.quality_confidence, threshold, item.summary);
             continue;
         }
 
