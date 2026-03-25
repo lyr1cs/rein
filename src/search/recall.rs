@@ -133,14 +133,14 @@ pub fn recall(
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
 
-    // Record access and recall hit for returned memories
+    // Record recall hit (NOT access — access should only be counted when
+    // the agent/user actually uses the memory, not just when it's returned).
+    // This separation is critical for the quality feedback loop:
+    // "bad" = recalled many times but never accessed = low quality.
     let recall_ids: Vec<String> = results.iter()
         .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
         .map(|r| r.memory.id.clone())
         .collect();
-    for id in &recall_ids {
-        let _ = store.record_access(id);
-    }
     store.record_recall_hit(&recall_ids);
 
     // Periodically update quality weights (every ~50 recalls)
