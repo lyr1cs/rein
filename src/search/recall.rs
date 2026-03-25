@@ -133,12 +133,15 @@ pub fn recall(
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
 
-    // Record access for returned memories
-    for r in &results {
-        if !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:") {
-            let _ = store.record_access(&r.memory.id);
-        }
+    // Record access and recall hit for returned memories
+    let recall_ids: Vec<String> = results.iter()
+        .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
+        .map(|r| r.memory.id.clone())
+        .collect();
+    for id in &recall_ids {
+        let _ = store.record_access(id);
     }
+    store.record_recall_hit(&recall_ids);
 
     tracing::debug!(elapsed_ms = total_start.elapsed().as_millis() as u64, results = results.len(), "recall complete");
     Ok(results)
