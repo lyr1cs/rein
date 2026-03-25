@@ -16,11 +16,26 @@ pub fn calculate_strength(memory: &Memory) -> f64 {
     (-lambda_eff * days.powf(beta)).exp()
 }
 
-/// Apply strength weighting to RRF score.
-/// final_score = rrf_score * strength * (1 + access_count * 0.2)
+/// Recency boost: recent memories get higher scores.
+/// 24h → +50%, 7 days → linearly decays to +0%, older → no boost.
+pub fn recency_boost(memory: &Memory) -> f32 {
+    let hours = (chrono::Utc::now() - memory.created_at).num_hours() as f64;
+    if hours <= 24.0 {
+        1.5
+    } else if hours <= 168.0 {
+        // Linear decay from 1.5 to 1.0 over 7 days
+        1.0 + 0.5 * (1.0 - (hours - 24.0) / 144.0) as f32
+    } else {
+        1.0
+    }
+}
+
+/// Apply strength weighting to RRF score with recency boost.
+/// final_score = rrf_score * strength * (1 + access_count * 0.2) * recency_boost
 pub fn apply_strength_weighting(rrf_score: f32, memory: &Memory) -> f32 {
     let strength = calculate_strength(memory);
-    rrf_score * strength as f32 * (1.0 + memory.access_count as f32 * 0.2)
+    let recency = recency_boost(memory);
+    rrf_score * strength as f32 * (1.0 + memory.access_count as f32 * 0.2) * recency
 }
 
 #[cfg(test)]
