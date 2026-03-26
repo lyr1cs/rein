@@ -386,194 +386,23 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Upgrade { topic, dry_run }) => {
-            let has_llm = extract::llm::create_extractor(&config).is_some();
-            if !has_llm {
+            if extract::llm::create_extractor(&config).is_none() {
                 eprintln!("rein: WARNING — no LLM configured. Upgrade will use local rules only.");
-                eprintln!("  Topic classification and keyword extraction will be basic.");
-                eprintln!("  Knowledge graph (concepts/links) requires LLM — set GEMINI_API_KEY for full upgrade.");
             }
-
             let store = config.open_store()?;
-
-            // Get memories to process
-            let topics = if let Some(ref t) = topic {
-                vec![t.clone()]
-            } else {
-                store.list_topics()?
-            };
-
-            let mut total_concepts = 0usize;
-            let mut total_links = 0usize;
-            let mut total_memoirs = 0usize;
-            let mut total_enriched = 0usize;
-
-            for topic_name in &topics {
-                let memories = store.get_by_topic(topic_name)?;
-                if memories.is_empty() { continue; }
-
-                // Combine all memories in this topic into one text block
-                let combined: String = memories.iter()
-                    .map(|m| format!("[{}] {}\n{}", m.topic, m.summary, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n---\n");
-
-                println!("Processing topic '{}' ({} memories)...", topic_name, memories.len());
-
-                // Run full LLM extraction
-                let result = extract::llm::extract_full_with_fallback(&config, &combined).await;
-
-                if has_llm {
-                    // === LLM path: full enrichment + knowledge graph ===
-                    if dry_run {
-                        let enrichable = result.memories.len().min(memories.len());
-                        println!("  → would enrich {} memories, create {} concepts, {} links",
-                                 enrichable, result.concepts.len(), result.links.len());
-                        for c in &result.concepts {
-                            println!("    concept: [{}] {} ({})", c.memoir, c.name, c.concept_type);
-                        }
-                        for l in &result.links {
-                            println!("    link: {} --{}-> {}", l.from, l.relation, l.to);
-                        }
-                        total_concepts += result.concepts.len();
-                        total_links += result.links.len();
-                        total_enriched += enrichable;
-                    } else {
-                        // LLM quality audit + enrichment
-                        let mut deprecated_count = 0usize;
-                        for new_mem in &result.memories {
-                            let best_match = memories.iter()
-                                .max_by(|a, b| {
-                                    let sim_a = extract::similarity(&a.content, &new_mem.content);
-                                    let sim_b = extract::similarity(&b.content, &new_mem.content);
-                                    sim_a.partial_cmp(&sim_b).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                            if let Some(old) = best_match {
-                                let sim = extract::similarity(&old.content, &new_mem.content);
-                                if sim > 0.3 {
-                                    // Quality audit: LLM says this is junk → deprecate
-                                    if new_mem.quality_confidence < 0.2 {
-                                        let _ = store.conn().execute(
-                                            "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
-                                            rusqlite::params![old.id],
-                                        );
-                                        deprecated_count += 1;
-                                        continue;
-                                    }
-
-                                    let mut enriched = old.clone();
-                                    enriched.topic = new_mem.topic.clone();
-                                    enriched.summary = new_mem.summary.clone();
-                                    enriched.keywords = new_mem.keywords.clone();
-                                    if let Ok(imp) = new_mem.importance.parse::<types::Importance>() {
-                                        enriched.importance = imp;
-                                        enriched.layer = imp.auto_layer();
-                                        enriched.decay_lambda = config.decay.base_lambda * imp.decay_factor();
-                                    }
-                                    if store.update(&enriched).is_ok() {
-                                        total_enriched += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if deprecated_count > 0 {
-                            println!("  → deprecated {deprecated_count} low-quality memories");
-                        }
-
-                        // Collect memory IDs from this topic for bidirectional linking
-                        let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
-
-                        // Store concepts + links with bidirectional Memory ↔ Concept links
-                        let (mut tc, mut tl) = (0usize, 0usize);
-                        if !result.concepts.is_empty() || !result.links.is_empty() {
-                            match store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids) {
-                                Ok(report) => {
-                                    total_memoirs += report.memoirs_created;
-                                    tc = report.concepts_added + report.concepts_refined;
-                                    tl = report.links_added;
-                                    total_concepts += tc;
-                                    total_links += tl;
-                                }
-                                Err(e) => println!("  → error: {e}"),
-                            }
-                        }
-
-                        // Build all 4 link types:
-                        // 1. Memory ↔ Memory (auto_link related_ids)
-                        for mem in &memories {
-                            let _ = store.auto_link(&mem.id, config.search.dedup_similarity as f32, 5);
-                        }
-                        // 2. Activate related memories (bump strength)
-                        // 3. Activate related concepts (boost confidence)
-                        for mem in &memories {
-                            let _ = store.activate_related_memories(&mem.content, 3);
-                            let _ = store.activate_related_concepts(&mem.content);
-                        }
-
-                        println!("  → {tc} concepts, {tl} links, {} memories activated", memories.len());
-                    }
-                } else {
-                    // === No-LLM path: local rule-based enrichment ===
-                    // Can't produce concepts/links, but can fix topic + extract basic keywords
-                    for old in &memories {
-                        if old.topic != "auto-extracted" { continue; } // already enriched
-
-                        let lower = old.content.to_lowercase();
-                        // Classify topic by keywords
-                        let new_topic = if ["architecture", "design", "component", "架构", "设计"].iter().any(|k| lower.contains(k)) {
-                            "architecture"
-                        } else if ["decided", "chose", "选型", "决策", "tradeoff"].iter().any(|k| lower.contains(k)) {
-                            "decision"
-                        } else if ["bug", "fix", "error", "crash", "修复", "解决"].iter().any(|k| lower.contains(k)) {
-                            "debug"
-                        } else if ["deploy", "install", "config", "migrate", "部署", "安装", "迁移"].iter().any(|k| lower.contains(k)) {
-                            "workflow"
-                        } else {
-                            "general"
-                        };
-
-                        // Extract basic keywords from content (top scoring words)
-                        let keywords: Vec<String> = old.content
-                            .split_whitespace()
-                            .filter(|w| w.len() > 3)
-                            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-                            .filter(|w| !w.is_empty() && !["the", "this", "that", "with", "from", "have", "been", "into", "will"].contains(&w.as_str()))
-                            .take(5)
-                            .collect();
-
-                        if dry_run {
-                            if new_topic != "auto-extracted" || !keywords.is_empty() {
-                                println!("  → would reclassify '{}' → topic='{}', keywords={:?}",
-                                         old.summary.chars().take(40).collect::<String>(), new_topic, keywords);
-                                total_enriched += 1;
-                            }
-                        } else {
-                            let mut enriched = old.clone();
-                            enriched.topic = new_topic.to_string();
-                            if !keywords.is_empty() {
-                                enriched.keywords = keywords;
-                            }
-                            // Score-based importance upgrade
-                            let score = extract::score_sentence(&old.content);
-                            if score >= 4 {
-                                enriched.importance = types::Importance::High;
-                                enriched.layer = enriched.importance.auto_layer();
-                                enriched.decay_lambda = config.decay.base_lambda * enriched.importance.decay_factor();
-                            }
-                            if store.update(&enriched).is_ok() {
-                                total_enriched += 1;
-                            }
-                        }
-                    }
-                    if !dry_run {
-                        println!("  → enriched {} memories (local rules, no concepts/links)", total_enriched);
-                    }
-                }
+            let report = ops::run_upgrade(&store, &config, topic.as_deref(), dry_run).await?;
+            for line in &report.preview_lines {
+                println!("{line}");
             }
-
             if dry_run {
-                println!("\nDry run: would enrich {total_enriched} memories, create {total_concepts} concepts, {total_links} links across {} topics", topics.len());
+                println!("\nDry run: would enrich {} memories, create {} concepts, {} links across {} topics",
+                    report.enriched, report.concepts, report.links, report.topics_processed);
             } else {
-                println!("\nUpgrade complete: {total_enriched} memories enriched, {total_memoirs} memoirs created, {total_concepts} concepts, {total_links} links");
+                if report.deprecated > 0 {
+                    println!("Deprecated {} low-quality memories", report.deprecated);
+                }
+                println!("Upgrade complete: {} memories enriched, {} memoirs created, {} concepts, {} links",
+                    report.enriched, report.memoirs, report.concepts, report.links);
             }
         }
         Some(Commands::Warmup) => {
@@ -622,28 +451,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Consolidate { topic, summary }) => {
             let store = config.open_store()?;
-            let imp = types::Importance::High;
-            let consolidated = types::Memory {
-                id: ulid::Ulid::new().to_string(),
-                layer: imp.auto_layer(),
-                topic: topic.clone(),
-                summary: summary.chars().take(100).collect(),
-                content: summary,
-                keywords: vec![],
-                importance: imp,
-                source: types::Source::Manual,
-                strength: 1.0,
-                decay_lambda: config.decay.base_lambda * imp.decay_factor(),
-                access_count: 0,
-                superseded_by: None,
-                related_ids: vec![],
-                concept_ids: vec![],
-                status: types::MemoryStatus::default(),
-                embedding: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                last_accessed: chrono::Utc::now(),
-            };
+            let consolidated = ops::build_consolidated(&config, topic.clone(), summary, vec![]);
             let old = store.consolidate_atomic(&topic, consolidated)?;
             if old.is_empty() {
                 println!("No memories found in topic '{topic}'");
@@ -654,36 +462,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Dedup { dry_run }) => {
             let store = config.open_store()?;
             let threshold = config.search.dedup_similarity as f32;
-            let topics = store.list_topics()?;
-            let mut dups_found = 0u32;
-            let mut dups_removed = 0u32;
-            for topic in &topics {
-                let mems = store.get_by_topic(topic)?;
-                // Build set of IDs to delete (losers). Keep the last one (newest) as winner.
-                let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for i in 0..mems.len() {
-                    if to_delete.contains(&mems[i].id) { continue; }
-                    for j in (i + 1)..mems.len() {
-                        if to_delete.contains(&mems[j].id) { continue; }
-                        let sim = extract::similarity(&mems[i].content, &mems[j].content);
-                        if sim >= threshold {
-                            // Keep the newer one (higher index = later ULID = newer)
-                            to_delete.insert(mems[i].id.clone());
-                            dups_found += 1;
-                            if dry_run {
-                                println!("  dup: '{}' ~ '{}' (sim={sim:.2})", &mems[i].summary.chars().take(40).collect::<String>(), &mems[j].summary.chars().take(40).collect::<String>());
-                            }
-                            break; // mems[i] is already marked, move to next i
-                        }
-                    }
-                }
-                if !dry_run {
-                    for id in &to_delete {
-                        store.delete(id)?;
-                        dups_removed += 1;
-                    }
-                }
-            }
+            let (dups_found, dups_removed) = ops::run_dedup(&store, threshold, dry_run)?;
             if dry_run {
                 println!("Found {dups_found} duplicates (dry-run, nothing removed)");
             } else {

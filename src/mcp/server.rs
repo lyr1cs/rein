@@ -848,18 +848,20 @@ impl ServerHandler for ReinServer {
     }
 }
 
+/// Spawn background warmup task for embedding cache pre-computation.
+fn spawn_background_warmup(config: &ReinConfig) {
+    let warmup_config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        if let Ok(store) = warmup_config.open_store() {
+            rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
+        }
+    });
+}
+
 /// Start the MCP server over stdio.
 pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
-    // Background warmup: pre-compute embeddings for uncached memories
-    {
-        let warmup_config = config.clone();
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            if let Ok(store) = warmup_config.open_store() {
-                rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
-            }
-        });
-    }
+    spawn_background_warmup(&config);
 
     let server = ReinServer::new(config);
 
@@ -878,16 +880,7 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
 /// Start the MCP server over HTTP (Streamable HTTP / SSE).
 /// Accessible via Tailscale or LAN for remote memory queries.
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
-    // Background warmup: pre-compute embeddings for uncached memories
-    {
-        let warmup_config = config.clone();
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            if let Ok(store) = warmup_config.open_store() {
-                rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
-            }
-        });
-    }
+    spawn_background_warmup(&config);
 
     use std::sync::Arc;
     use http_body_util::BodyExt;

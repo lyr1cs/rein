@@ -19,6 +19,44 @@ pub fn reciprocal_rank_fusion(
     merged
 }
 
+/// Convex Combination fusion — normalizes scores to [0,1] and blends with alpha.
+/// score = alpha * sparse_norm + (1-alpha) * dense_norm
+/// Based on Bruch et al. 2023: CC outperforms RRF with better sample efficiency.
+pub fn convex_combination(
+    fts_results: &[(String, f32)],
+    vec_results: &[(String, f32)],
+    alpha: f32,
+) -> Vec<(String, f32)> {
+    // Normalize each list to [0,1] using min-max normalization.
+    // Singleton lists get score 1.0 (not 0.0) to preserve their contribution.
+    fn normalize(results: &[(String, f32)]) -> Vec<(String, f32)> {
+        if results.is_empty() { return vec![]; }
+        let max = results.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+        let min = results.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+        let range = max - min;
+        if range < 1e-6 {
+            // All scores equal (including singleton) → assign 1.0 to all
+            return results.iter().map(|(id, _)| (id.clone(), 1.0)).collect();
+        }
+        results.iter().map(|(id, s)| (id.clone(), (s - min) / range)).collect()
+    }
+
+    let fts_norm = normalize(fts_results);
+    let vec_norm = normalize(vec_results);
+
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    for (id, s) in &fts_norm {
+        *scores.entry(id.clone()).or_default() += alpha * s;
+    }
+    for (id, s) in &vec_norm {
+        *scores.entry(id.clone()).or_default() += (1.0 - alpha) * s;
+    }
+
+    let mut merged: Vec<_> = scores.into_iter().collect();
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +119,42 @@ mod tests {
     #[test]
     fn test_rrf_empty() {
         let result = reciprocal_rank_fusion(&[], 60.0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cc_basic() {
+        let fts = vec![
+            ("a".to_string(), 10.0),
+            ("b".to_string(), 5.0),
+        ];
+        let vec = vec![
+            ("a".to_string(), 8.0),
+            ("c".to_string(), 6.0),
+        ];
+        let result = convex_combination(&fts, &vec, 0.5);
+
+        // "a" appears in both with high scores → should be #1
+        assert_eq!(result[0].0, "a");
+        // "a" gets: 0.5 * 1.0 (max in fts) + 0.5 * 1.0 (max in vec) = 1.0
+        assert!((result[0].1 - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_cc_alpha_bias() {
+        // Multiple items needed so normalization produces non-trivial scores
+        let fts = vec![("x".to_string(), 10.0), ("z".to_string(), 2.0)];
+        let vec = vec![("y".to_string(), 10.0), ("z".to_string(), 2.0)];
+        // alpha=0.9 heavily favors FTS
+        let result = convex_combination(&fts, &vec, 0.9);
+        let x_score = result.iter().find(|(id, _)| id == "x").unwrap().1;
+        let y_score = result.iter().find(|(id, _)| id == "y").unwrap().1;
+        assert!(x_score > y_score, "alpha=0.9 should favor FTS (x={x_score}) over vec (y={y_score})");
+    }
+
+    #[test]
+    fn test_cc_empty() {
+        let result = convex_combination(&[], &[], 0.5);
         assert!(result.is_empty());
     }
 }

@@ -2,6 +2,7 @@
 //! Extracted to prevent logic drift between the two entrypoints.
 
 use crate::config::ReinConfig;
+use crate::extract;
 use crate::store::SqliteStore;
 use crate::types::*;
 
@@ -133,4 +134,172 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
         }
     }
     Ok((dups_found, dups_removed))
+}
+
+/// Upgrade report returned by run_upgrade.
+#[derive(Debug, Default)]
+pub struct UpgradeReport {
+    pub topics_processed: usize,
+    pub enriched: usize,
+    pub deprecated: usize,
+    pub concepts: usize,
+    pub links: usize,
+    pub memoirs: usize,
+    /// Per-topic dry-run preview messages
+    pub preview_lines: Vec<String>,
+}
+
+/// Run memory upgrade: LLM enrichment + knowledge graph extraction, or local rules fallback.
+/// Used by both `rein upgrade` CLI and potential MCP tool.
+pub async fn run_upgrade(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    topic_filter: Option<&str>,
+    dry_run: bool,
+) -> ReinResult<UpgradeReport> {
+    let has_llm = extract::llm::create_extractor(config).is_some();
+    let mut report = UpgradeReport::default();
+
+    let topics = if let Some(t) = topic_filter {
+        vec![t.to_string()]
+    } else {
+        store.list_topics()?
+    };
+
+    for topic_name in &topics {
+        let memories = store.get_by_topic(topic_name)?;
+        if memories.is_empty() { continue; }
+        report.topics_processed += 1;
+
+        let combined: String = memories.iter()
+            .map(|m| format!("[{}] {}\n{}", m.topic, m.summary, m.content))
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+
+        let result = extract::llm::extract_full_with_fallback(config, &combined).await;
+
+        if has_llm {
+            if dry_run {
+                let enrichable = result.memories.len().min(memories.len());
+                report.preview_lines.push(format!(
+                    "  topic '{}': would enrich {} memories, create {} concepts, {} links",
+                    topic_name, enrichable, result.concepts.len(), result.links.len()
+                ));
+                for c in &result.concepts {
+                    report.preview_lines.push(format!("    concept: [{}] {} ({})", c.memoir, c.name, c.concept_type));
+                }
+                for l in &result.links {
+                    report.preview_lines.push(format!("    link: {} --{}-> {}", l.from, l.relation, l.to));
+                }
+                report.concepts += result.concepts.len();
+                report.links += result.links.len();
+                report.enriched += enrichable;
+            } else {
+                // LLM quality audit + enrichment
+                for new_mem in &result.memories {
+                    let best_match = memories.iter()
+                        .max_by(|a, b| {
+                            let sim_a = extract::similarity(&a.content, &new_mem.content);
+                            let sim_b = extract::similarity(&b.content, &new_mem.content);
+                            sim_a.partial_cmp(&sim_b).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    if let Some(old) = best_match {
+                        let sim = extract::similarity(&old.content, &new_mem.content);
+                        if sim > 0.3 {
+                            if new_mem.quality_confidence < 0.2 {
+                                let _ = store.conn().execute(
+                                    "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                                    rusqlite::params![old.id],
+                                );
+                                report.deprecated += 1;
+                                continue;
+                            }
+                            let mut enriched = old.clone();
+                            enriched.topic = new_mem.topic.clone();
+                            enriched.summary = new_mem.summary.clone();
+                            enriched.keywords = new_mem.keywords.clone();
+                            if let Ok(imp) = new_mem.importance.parse::<Importance>() {
+                                enriched.importance = imp;
+                                enriched.layer = imp.auto_layer();
+                                enriched.decay_lambda = config.decay.base_lambda * imp.decay_factor();
+                            }
+                            if store.update(&enriched).is_ok() {
+                                report.enriched += 1;
+                            }
+                        }
+                    }
+                }
+
+                let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+                if !result.concepts.is_empty() || !result.links.is_empty() {
+                    match store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids) {
+                        Ok(r) => {
+                            report.memoirs += r.memoirs_created;
+                            report.concepts += r.concepts_added + r.concepts_refined;
+                            report.links += r.links_added;
+                        }
+                        Err(e) => tracing::warn!("knowledge_units error for topic '{}': {e}", topic_name),
+                    }
+                }
+
+                for mem in &memories {
+                    let _ = store.auto_link(&mem.id, config.search.dedup_similarity as f32, 5);
+                    let _ = store.activate_related_memories(&mem.content, 3);
+                    let _ = store.activate_related_concepts(&mem.content);
+                }
+            }
+        } else {
+            // No-LLM path: local rule-based enrichment
+            for old in &memories {
+                if old.topic != "auto-extracted" { continue; }
+                let lower = old.content.to_lowercase();
+                let new_topic = if ["architecture", "design", "component", "架构", "设计"].iter().any(|k| lower.contains(k)) {
+                    "architecture"
+                } else if ["decided", "chose", "选型", "决策", "tradeoff"].iter().any(|k| lower.contains(k)) {
+                    "decision"
+                } else if ["bug", "fix", "error", "crash", "修复", "解决"].iter().any(|k| lower.contains(k)) {
+                    "debug"
+                } else if ["deploy", "install", "config", "migrate", "部署", "安装", "迁移"].iter().any(|k| lower.contains(k)) {
+                    "workflow"
+                } else {
+                    "general"
+                };
+
+                let keywords: Vec<String> = old.content
+                    .split_whitespace()
+                    .filter(|w| w.len() > 3)
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                    .filter(|w| !w.is_empty() && !["the", "this", "that", "with", "from", "have", "been", "into", "will"].contains(&w.as_str()))
+                    .take(5)
+                    .collect();
+
+                if dry_run {
+                    if new_topic != "auto-extracted" || !keywords.is_empty() {
+                        report.preview_lines.push(format!(
+                            "  → would reclassify '{}' → topic='{}', keywords={:?}",
+                            old.summary.chars().take(40).collect::<String>(), new_topic, keywords
+                        ));
+                        report.enriched += 1;
+                    }
+                } else {
+                    let mut enriched = old.clone();
+                    enriched.topic = new_topic.to_string();
+                    if !keywords.is_empty() {
+                        enriched.keywords = keywords;
+                    }
+                    let score = extract::score_sentence(&old.content);
+                    if score >= 4 {
+                        enriched.importance = Importance::High;
+                        enriched.layer = enriched.importance.auto_layer();
+                        enriched.decay_lambda = config.decay.base_lambda * enriched.importance.decay_factor();
+                    }
+                    if store.update(&enriched).is_ok() {
+                        report.enriched += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(report)
 }

@@ -50,6 +50,8 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         CREATE INDEX IF NOT EXISTS idx_memories_layer ON memories(layer);
         CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
         CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength);
+        CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+        CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed);
 
         -- NOTE: `id` is included as a searchable FTS column for join convenience
         -- (JOIN memories m ON m.id = f.id). Ideally id would not be indexed for
@@ -66,7 +68,10 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             VALUES (new.id, new.topic, new.summary, new.content, new.keywords);
         END;
 
-        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
+        WHEN old.content != new.content OR old.topic != new.topic
+          OR old.summary != new.summary OR old.keywords != new.keywords
+        BEGIN
             DELETE FROM memories_fts WHERE id = old.id;
             INSERT INTO memories_fts(id, topic, summary, content, keywords)
             VALUES (new.id, new.topic, new.summary, new.content, new.keywords);
@@ -208,44 +213,45 @@ fn migrate_fts_tokenizer(conn: &Connection) -> ReinResult<()> {
     if needs_rebuild {
         tracing::info!("rebuilding FTS index with unicode61 tokenizer (CJK support)");
 
-        // Rebuild memories_fts
-        conn.execute_batch("DROP TABLE IF EXISTS memories_fts;")?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE memories_fts USING fts5(
-                id, topic, summary, content, keywords,
-                tokenize='unicode61'
-            );"
-        )?;
-        // Re-populate from memories table
-        conn.execute_batch(
-            "INSERT INTO memories_fts(id, topic, summary, content, keywords)
-             SELECT id, topic, summary, content, keywords FROM memories;"
-        )?;
-
-        // Rebuild concepts_fts if it exists with porter
-        let concepts_needs_rebuild: bool = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name = 'concepts_fts'",
-                [],
-                |row| {
-                    let sql: String = row.get(0)?;
-                    Ok(sql.contains("porter"))
-                },
-            )
-            .unwrap_or(false);
-
-        if concepts_needs_rebuild {
-            conn.execute_batch("DROP TABLE IF EXISTS concepts_fts;")?;
+        // Wrap in transaction — DROP+CREATE+INSERT should be atomic
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> ReinResult<()> {
+            conn.execute_batch("DROP TABLE IF EXISTS memories_fts;")?;
             conn.execute_batch(
-                "CREATE VIRTUAL TABLE concepts_fts USING fts5(
-                    id, name, definition, labels,
+                "CREATE VIRTUAL TABLE memories_fts USING fts5(
+                    id, topic, summary, content, keywords,
                     tokenize='unicode61'
                 );"
             )?;
             conn.execute_batch(
-                "INSERT INTO concepts_fts(id, name, definition, labels)
-                 SELECT id, name, definition, labels FROM concepts;"
+                "INSERT INTO memories_fts(id, topic, summary, content, keywords)
+                 SELECT id, topic, summary, content, keywords FROM memories;"
             )?;
+
+            let concepts_needs_rebuild: bool = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'concepts_fts'",
+                    [], |row| { let sql: String = row.get(0)?; Ok(sql.contains("porter")) },
+                ).unwrap_or(false);
+
+            if concepts_needs_rebuild {
+                conn.execute_batch("DROP TABLE IF EXISTS concepts_fts;")?;
+                conn.execute_batch(
+                    "CREATE VIRTUAL TABLE concepts_fts USING fts5(
+                        id, name, definition, labels,
+                        tokenize='unicode61'
+                    );"
+                )?;
+                conn.execute_batch(
+                    "INSERT INTO concepts_fts(id, name, definition, labels)
+                     SELECT id, name, definition, labels FROM concepts;"
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => { conn.execute_batch("COMMIT")?; }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
         }
 
         tracing::info!("FTS index rebuilt with unicode61");
@@ -287,15 +293,18 @@ pub fn check_embedding_model(
         _ => true,             // Partial info, treat as changed
     };
 
-    // Store current model info
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_model', ?1)",
-        rusqlite::params![model],
-    )?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_dims', ?1)",
-        rusqlite::params![dims.to_string()],
-    )?;
+    // Only write if first run or values changed — avoids unnecessary WAL writes on every startup
+    let needs_write = stored_model.is_none() || changed;
+    if needs_write {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_model', ?1)",
+            rusqlite::params![model],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_dims', ?1)",
+            rusqlite::params![dims.to_string()],
+        )?;
+    }
 
     Ok(changed)
 }
