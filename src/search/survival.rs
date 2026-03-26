@@ -93,7 +93,7 @@ impl SurvivalCurve {
 
         // S(days) = S(t_last) * exp(-hazard * (days - t_last))
         let extrapolated = p_last * (-hazard * (days - last_time)).exp();
-        extrapolated.max(0.0).min(1.0)
+        extrapolated.clamp(0.0, 1.0)
     }
 }
 

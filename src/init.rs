@@ -3,7 +3,6 @@
 /// Scans well-known config paths (Claude Code, Claude Desktop, Cursor, Windsurf,
 /// VS Code, Gemini, Codex, OpenCode) and injects a `rein` MCP server entry when
 /// the config file already exists but rein is not yet configured.
-
 use std::path::Path;
 
 pub fn auto_configure(dry_run: bool) -> anyhow::Result<()> {

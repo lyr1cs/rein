@@ -556,7 +556,7 @@ fn eombst_select(clusters: &[CondensedCluster]) -> Vec<bool> {
             if effective_stability[i] > children_stab {
                 selected[i] = true;
                 for &c in &clusters[i].children {
-                    deselect_all(&clusters, c, &mut selected);
+                    deselect_all(clusters, c, &mut selected);
                 }
             } else {
                 effective_stability[i] = children_stab;
@@ -1246,7 +1246,7 @@ mod tests {
         let result = hdbscan(&emb, 3);
 
         if result.clusters.len() >= 2 {
-            let test_point = vec![3.0, 0.01, 0.0, 0.0];
+            let test_point = [3.0, 0.01, 0.0, 0.0];
             let norm: f32 = test_point.iter().map(|x| x * x).sum::<f32>().sqrt();
             let test_point: Vec<f32> = test_point.iter().map(|x| x / norm).collect();
 

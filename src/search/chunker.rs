@@ -116,7 +116,7 @@ fn split_by_sentences(text: &str, max_chars: usize) -> Vec<String> {
     for sentence in &sentences {
         if current.is_empty() {
             current = sentence.clone();
-        } else if current.len() + sentence.len() + 1 <= max_chars {
+        } else if current.len() + sentence.len() < max_chars {
             current.push(' ');
             current.push_str(sentence);
         } else {
