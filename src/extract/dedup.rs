@@ -94,9 +94,17 @@ pub fn check_dedup(
         }
     }
 
-    if best_sim > similarity_threshold {
+    // M6: Randomized threshold exploration (5% of the time, offset threshold by ±0.1)
+    // This creates A/B test data for causal inference on optimal thresholds.
+    let (effective_threshold, is_exploration) = m6_explore_threshold(similarity_threshold);
+
+    if best_sim > effective_threshold {
         if let Some(memory) = best_memory {
             let age_days = (chrono::Utc::now() - memory.created_at).num_days();
+            // Log exploration outcome for M6 learning
+            if is_exploration {
+                m6_log_outcome(store, best_sim, effective_threshold, similarity_threshold, true);
+            }
             if age_days < time_window_days {
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
@@ -108,11 +116,62 @@ pub fn check_dedup(
     // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
     if best_sim >= 0.5 {
         if let Some(memory) = best_memory {
+            if is_exploration {
+                m6_log_outcome(store, best_sim, effective_threshold, similarity_threshold, false);
+            }
             return Ok(DedupAction::GrayZone(memory.id.clone(), best_sim));
         }
     }
 
+    // Log exploration non-match for control group
+    if is_exploration && best_sim > 0.3 {
+        m6_log_outcome(store, best_sim, effective_threshold, similarity_threshold, false);
+    }
+
     Ok(DedupAction::CreateNew)
+}
+
+/// M6: Randomized threshold exploration.
+/// With 5% probability, offset the threshold by a random amount in [-0.1, +0.1].
+/// Returns (effective_threshold, is_exploration).
+fn m6_explore_threshold(base_threshold: f32) -> (f32, bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Deterministic pseudo-random: explore on ~5% of calls
+    let hash = count.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(0x517cc1b727220a95);
+    let explore = (hash % 20) == 0; // 5% probability
+
+    if !explore {
+        return (base_threshold, false);
+    }
+
+    // Random offset in [-0.1, +0.1]
+    let offset_bits = ((hash >> 16) % 201) as f32 / 1000.0 - 0.1; // [-0.100, +0.100]
+    let effective = (base_threshold + offset_bits).clamp(0.30, 0.95);
+    (effective, true)
+}
+
+/// M6: Log threshold exploration outcome as feedback event.
+fn m6_log_outcome(store: &SqliteStore, sim: f32, used_threshold: f32, base_threshold: f32, was_dedup: bool) {
+    let payload = serde_json::json!({
+        "similarity": sim,
+        "threshold_used": used_threshold,
+        "threshold_base": base_threshold,
+        "offset": used_threshold - base_threshold,
+        "was_dedup": was_dedup,
+    });
+    let _ = crate::store::adaptive::emit_event(store.conn(), crate::store::adaptive::FeedbackEvent {
+        event_type: crate::store::adaptive::EventType::ParamUpdate,
+        request_id: None,
+        memory_id: None,
+        concept_id: None,
+        query: Some(format!("m6_explore:{sim:.3}")),
+        query_type: Some("threshold_exploration".to_string()),
+        topic: None,
+        payload: Some(payload),
+    });
 }
 
 #[cfg(test)]
