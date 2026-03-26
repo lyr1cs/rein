@@ -261,7 +261,7 @@ rrf_fts_weight = 0.3
 rrf_vec_weight = 0.7
 fusion_method = "rrf"      # or "cc" (Convex Combination, Bruch 2023)
 cc_alpha = 0.5             # CC blend: alpha * sparse + (1-alpha) * dense
-waterfall_fts_threshold = 0.5
+
 dedup_similarity = 0.70    # uses max(jaccard, containment) similarity
 dedup_time_window_days = 7
 
@@ -738,7 +738,7 @@ model = "default"
 rrf_k = 60.0
 rrf_fts_weight = 0.3
 rrf_vec_weight = 0.7
-waterfall_fts_threshold = 0.5
+
 dedup_similarity = 0.70    # 使用 max(jaccard, containment) 相似度
 dedup_time_window_days = 7
 

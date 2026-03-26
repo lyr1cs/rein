@@ -799,8 +799,9 @@ impl ReinServer {
         let threshold = self.config.decay.prune_threshold;
         let compact = self.compact();
 
+        let config = self.config.clone();
         let result = self.with_store(|store| {
-            crate::ops::run_gc(store, threshold, dry_run)
+            crate::ops::run_gc_adaptive(store, &config, threshold, dry_run)
         });
 
         match result {
@@ -862,14 +863,25 @@ impl ReinServer {
         let from = params.from.as_deref().and_then(|s| parse_datetime(s));
         let to = params.to.as_deref().and_then(|s| parse_datetime_end(s));
 
+        // Warn on malformed dates (return error instead of silently ignoring)
+        if params.from.is_some() && from.is_none() {
+            return format!("Error: invalid 'from' date format: {:?}", params.from);
+        }
+        if params.to.is_some() && to.is_none() {
+            return format!("Error: invalid 'to' date format: {:?}", params.to);
+        }
+
         let result = self.with_store(|store| {
             let mut events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
 
-            // Collect episodes
-            let episodes = if let (Some(f), Some(t)) = (from, to) {
-                store.get_episodes_in_range(f, t)?
-            } else {
-                store.list_episodes(limit)?
+            // Collect episodes (support one-sided ranges via sentinel dates)
+            let episodes = match (from, to) {
+                (Some(f), Some(t)) => store.get_episodes_in_range(f, t)?,
+                (Some(f), None) => store.get_episodes_in_range(f, chrono::Utc::now() + chrono::Duration::days(1))?,
+                (None, Some(t)) => store.get_episodes_in_range(
+                    chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z").unwrap().with_timezone(&chrono::Utc), t
+                )?,
+                (None, None) => store.list_episodes(limit)?,
             };
             for ep in &episodes {
                 let decisions = if ep.decisions.is_empty() { String::new() }
@@ -882,20 +894,24 @@ impl ReinServer {
 
             // Collect concept revisions in the window
             {
-                let rev_sql = match (from, to) {
-                    (Some(f), Some(t)) => format!(
-                        "SELECT r.revision, r.definition, r.created_at, c.name, c.memoir_id \
-                         FROM concept_revisions r JOIN concepts c ON r.concept_id = c.id \
-                         WHERE r.created_at >= '{}' AND r.created_at <= '{}' \
-                         ORDER BY r.created_at DESC LIMIT {}",
-                        f.to_rfc3339(), t.to_rfc3339(), limit
-                    ),
-                    _ => format!(
-                        "SELECT r.revision, r.definition, r.created_at, c.name, c.memoir_id \
-                         FROM concept_revisions r JOIN concepts c ON r.concept_id = c.id \
-                         ORDER BY r.created_at DESC LIMIT {}", limit
-                    ),
+                let mut where_clauses = Vec::new();
+                if let Some(f) = from {
+                    where_clauses.push(format!("r.created_at >= '{}'", f.to_rfc3339()));
+                }
+                if let Some(t) = to {
+                    where_clauses.push(format!("r.created_at <= '{}'", t.to_rfc3339()));
+                }
+                let where_str = if where_clauses.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", where_clauses.join(" AND "))
                 };
+                let rev_sql = format!(
+                    "SELECT r.revision, r.definition, r.created_at, c.name, c.memoir_id \
+                     FROM concept_revisions r JOIN concepts c ON r.concept_id = c.id{} \
+                     ORDER BY r.created_at DESC LIMIT {}",
+                    where_str, limit
+                );
                 if let Ok(mut stmt) = store.conn().prepare(&rev_sql) {
                     let rows = stmt.query_map([], |row| {
                         Ok((
@@ -919,21 +935,35 @@ impl ReinServer {
                 }
             }
 
-            // Collect memories in the requested window via SQL (not post-filter)
-            let mem_sql = match (from, to) {
-                (Some(f), Some(t)) => {
-                    let mut stmt = store.conn().prepare(
-                        "SELECT id, topic, summary, created_at FROM memories WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC LIMIT ?3"
-                    ).map_err(ReinError::Database)?;
-                    let rows: Vec<_> = stmt.query_map(
-                        rusqlite::params![f.to_rfc3339(), t.to_rfc3339(), limit],
-                        |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
-                    ).map_err(ReinError::Database)?.filter_map(|r| r.ok()).collect();
-                    rows
+            // Collect memories in the requested window via SQL (supports one-sided ranges)
+            let mem_sql = if from.is_some() || to.is_some() {
+                let mut where_parts = Vec::new();
+                let mut param_values: Vec<String> = Vec::new();
+                if let Some(f) = from {
+                    where_parts.push(format!("created_at >= ?{}", param_values.len() + 1));
+                    param_values.push(f.to_rfc3339());
                 }
-                _ => {
-                    store.recent(limit)?.iter().map(|m| (m.topic.clone(), m.summary.clone(), m.created_at.to_rfc3339())).collect()
+                if let Some(t) = to {
+                    where_parts.push(format!("created_at <= ?{}", param_values.len() + 1));
+                    param_values.push(t.to_rfc3339());
                 }
+                let sql = format!(
+                    "SELECT id, topic, summary, created_at FROM memories WHERE {} ORDER BY created_at DESC LIMIT {}",
+                    where_parts.join(" AND "), limit
+                );
+                let mut stmt = store.conn().prepare(&sql).map_err(ReinError::Database)?;
+                let rows: Vec<_> = match param_values.len() {
+                    1 => stmt.query_map(rusqlite::params![param_values[0]], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                    }).map_err(ReinError::Database)?.filter_map(|r| r.ok()).collect(),
+                    2 => stmt.query_map(rusqlite::params![param_values[0], param_values[1]], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                    }).map_err(ReinError::Database)?.filter_map(|r| r.ok()).collect(),
+                    _ => Vec::new(),
+                };
+                rows
+            } else {
+                store.recent(limit)?.iter().map(|m| (m.topic.clone(), m.summary.clone(), m.created_at.to_rfc3339())).collect()
             };
             for (topic, summary, created_str) in &mem_sql {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_str) {

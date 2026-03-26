@@ -554,11 +554,14 @@ impl SqliteStore {
 
             let now = Utc::now();
 
-            // Get outgoing links (skip temporally expired links)
+            // Get outgoing links (skip temporally invalid links)
             let outgoing = self.get_links_from(&current_id)?;
             for link in outgoing {
                 if let Some(until) = link.valid_until {
                     if until < now { continue; } // expired link
+                }
+                if let Some(from) = link.valid_from {
+                    if from > now { continue; } // not yet active
                 }
                 links.push(link.clone());
                 if !visited.contains(&link.target_id) {
@@ -570,11 +573,14 @@ impl SqliteStore {
                 }
             }
 
-            // Get incoming links (skip temporally expired links)
+            // Get incoming links (skip temporally invalid links)
             let incoming = self.get_links_to(&current_id)?;
             for link in incoming {
                 if let Some(until) = link.valid_until {
                     if until < now { continue; }
+                }
+                if let Some(from) = link.valid_from {
+                    if from > now { continue; }
                 }
                 links.push(link.clone());
                 if !visited.contains(&link.source_id) {
@@ -977,9 +983,38 @@ impl SqliteStore {
                 })
             },
         );
+        // Helper to synthesize a revision from the live concept row
+        let live_revision = || ConceptRevision {
+            id: format!("live-{}", concept.id),
+            concept_id: concept.id.clone(),
+            revision: concept.revision as u32,
+            definition: concept.definition.clone(),
+            confidence: concept.confidence,
+            labels: concept.labels.clone(),
+            source_memory_ids: concept.source_memory_ids.clone(),
+            episode_id: concept.last_episode_id.clone(),
+            created_at: concept.updated_at,
+        };
+
         match result {
-            Ok(rev) => Ok(Some(rev)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Ok(rev) => {
+                // If the live concept has been updated after this revision AND the
+                // requested time is after that update, return the live state instead.
+                // This handles "after the latest refine" correctly.
+                if concept.updated_at > rev.created_at && concept.updated_at <= at {
+                    Ok(Some(live_revision()))
+                } else {
+                    Ok(Some(rev))
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // No revision found — use live row if concept existed at requested time
+                if concept.created_at <= at {
+                    Ok(Some(live_revision()))
+                } else {
+                    Ok(None)
+                }
+            }
             Err(e) => Err(ReinError::Database(e)),
         }
     }
@@ -1246,11 +1281,11 @@ mod tests {
         store.add_concept(make_concept(&memoir_id, "api", "REST API v1")).unwrap();
         store.refine_concept("test", "api", "GraphQL API v2").unwrap();
 
-        // get_concept_at with future time should return the latest revision
+        // get_concept_at with future time should return the live (current) definition
         let future = Utc::now() + chrono::Duration::hours(1);
         let rev = store.get_concept_at("test", "api", future).unwrap();
         assert!(rev.is_some());
-        assert!(rev.unwrap().definition.contains("REST")); // revision 1 (the snapshot)
+        assert!(rev.unwrap().definition.contains("GraphQL"), "should return live definition after latest refine");
     }
 
     #[test]

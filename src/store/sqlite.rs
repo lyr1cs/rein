@@ -200,6 +200,8 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
         concept_ids,
         status,
         embedding: None,
+        tier: row.get::<_, String>("tier").unwrap_or_else(|_| "warm".to_string()),
+        cluster_id: row.get::<_, Option<u32>>("cluster_id").unwrap_or(None),
         created_at,
         updated_at,
         last_accessed,
@@ -499,7 +501,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn prune(&self, threshold: f64) -> ReinResult<u64> {
-        let mem_pruned = self.prune_memories_only(threshold)?;
+        let mem_pruned = self.prune_memories_only(threshold, false)?;
         let concept_pruned = self.prune_low_quality_concepts().unwrap_or(0);
         if concept_pruned > 0 {
             tracing::info!("pruned {concept_pruned} low-quality concepts");
@@ -645,9 +647,32 @@ impl MemoryStore for SqliteStore {
 }
 
 impl SqliteStore {
+    /// SQL-only DELETE for dry-run preview: removes from SQLite but does NOT
+    /// touch Tantivy/HNSW side indexes. Intended to run inside a SAVEPOINT
+    /// that will be rolled back, so concept evaluation sees the correct state.
+    pub(crate) fn prune_memories_sql_only(&self, threshold: f64) -> ReinResult<u64> {
+        let rows = self.conn.execute(
+            "DELETE FROM memories WHERE layer = 'STM' AND strength < ?1
+             AND importance NOT IN ('critical', 'high')",
+            rusqlite::params![threshold],
+        )?;
+        Ok(rows as u64)
+    }
+
     /// Prune weak STM memories only (without concept pruning).
     /// Used by ops::run_gc() to separate memory and concept pruning counts.
-    pub(crate) fn prune_memories_only(&self, threshold: f64) -> ReinResult<u64> {
+    /// When `preview` is true, only counts candidates without deleting or touching side indexes.
+    pub(crate) fn prune_memories_only(&self, threshold: f64, preview: bool) -> ReinResult<u64> {
+        if preview {
+            let count: u64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE layer = 'STM' AND strength < ?1
+                 AND importance NOT IN ('critical', 'high')",
+                rusqlite::params![threshold],
+                |row| row.get(0),
+            )?;
+            return Ok(count);
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT id FROM memories WHERE layer = 'STM' AND strength < ?1
              AND importance NOT IN ('critical', 'high')",
@@ -902,6 +927,8 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
+            tier: "warm".to_string(),
+            cluster_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
@@ -1102,6 +1129,8 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
+            tier: "warm".to_string(),
+            cluster_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),

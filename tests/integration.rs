@@ -22,6 +22,8 @@ fn make_memory(topic: &str, summary: &str, content: &str, importance: Importance
         concept_ids: vec![],
         status: MemoryStatus::default(),
         embedding: None,
+        tier: "warm".to_string(),
+        cluster_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed: chrono::Utc::now(),
