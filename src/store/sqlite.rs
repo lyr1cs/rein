@@ -760,7 +760,13 @@ impl SqliteStore {
     ) -> ReinResult<String> {
         match action {
             DedupAction::CreateNew => {
-                self.store(memory)
+                let id = self.store(memory)?;
+                // Mark for deferred embedding-based dedup in GC slow channel
+                let _ = self.conn.execute(
+                    "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                    rusqlite::params![&id],
+                );
+                Ok(id)
             }
             DedupAction::MergeInto(existing_id) => {
                 // Update existing memory: append content, refresh summary/keywords, boost strength
@@ -791,6 +797,11 @@ impl SqliteStore {
                 let new_id = self.store(memory)?;
                 // Mark old memory as superseded
                 self.mark_superseded(&old_id, &new_id)?;
+                // Mark new memory for deferred embedding-based dedup
+                let _ = self.conn.execute(
+                    "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                    rusqlite::params![&new_id],
+                );
                 Ok(new_id)
             }
             DedupAction::GrayZone(_, _) => {
@@ -1233,6 +1244,42 @@ mod tests {
         // Old memory should have superseded_by set
         let old = store.get(&id1).unwrap();
         assert_eq!(old.superseded_by, Some(id2.clone()));
+    }
+
+    #[test]
+    fn test_store_with_dedup_sets_needs_vec_dedup() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = test_memory_with_content(
+            "test",
+            "unique content",
+            "This is completely unique content that has no duplicates anywhere",
+            Importance::Medium,
+        );
+        let id = store.store_with_dedup(mem, 0.85, 7).unwrap();
+
+        // New memories created via dedup should be flagged for vec dedup
+        let flag: i32 = store.conn.query_row(
+            "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(flag, 1, "new memory should have needs_vec_dedup = 1");
+    }
+
+    #[test]
+    fn test_needs_vec_dedup_schema() {
+        // Verify the needs_vec_dedup column exists and defaults to 0 for direct store
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = test_memory("test", "direct store", Importance::Medium);
+        let id = store.store(mem).unwrap();
+
+        let flag: i32 = store.conn.query_row(
+            "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |row| row.get(0),
+        ).unwrap();
+        // Direct store (not via dedup) defaults to 0
+        assert_eq!(flag, 0, "direct store should have needs_vec_dedup = 0");
     }
 
     #[test]
