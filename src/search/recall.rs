@@ -220,8 +220,7 @@ pub fn recall_temporal(
 
     // Spawn Supermemory search in a thread (it's async + network I/O)
     let sm_handle = if sm_enabled {
-        if let Some(api_key) = sm_api_key {
-            Some(std::thread::spawn(move || {
+        sm_api_key.map(|api_key| std::thread::spawn(move || {
                 let client = SupermemoryClient::new(api_key, sm_endpoint);
                 // Build a small runtime for this thread since we can't share the main one
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -231,9 +230,6 @@ pub fn recall_temporal(
                 rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
                     .unwrap_or_default()
             }))
-        } else {
-            None
-        }
     } else {
         None
     };
@@ -318,7 +314,7 @@ pub fn recall_temporal(
 
     // Periodically update quality weights (every ~50 recalls)
     let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
-    if total_recalls % 50 == 0 && total_recalls > 0 {
+    if total_recalls.is_multiple_of(50) && total_recalls > 0 {
         store.update_quality_weights();
     }
 

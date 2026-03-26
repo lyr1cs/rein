@@ -19,20 +19,17 @@ use std::collections::HashMap;
 /// Memory storage tier based on access frequency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MemoryTier {
     /// Top 25% by access rate — always in recall, highest priority.
     Hot,
     /// Middle 50% — normal recall participation.
+    #[default]
     Warm,
     /// Bottom 25% — only in Exploratory queries, compressed storage.
     Cold,
 }
 
-impl Default for MemoryTier {
-    fn default() -> Self {
-        Self::Warm
-    }
-}
 
 impl std::fmt::Display for MemoryTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
