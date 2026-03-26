@@ -87,10 +87,20 @@ pub struct SearchConfig {
     pub rrf_k: f64,
     pub rrf_fts_weight: f64,
     pub rrf_vec_weight: f64,
+    /// Fusion method: "rrf" (Reciprocal Rank Fusion) or "cc" (Convex Combination).
+    /// CC normalizes scores to [0,1] and blends with alpha; often more accurate (Bruch 2023).
+    #[serde(default = "default_fusion_method")]
+    pub fusion_method: String,
+    /// Alpha for CC fusion: score = alpha * sparse + (1-alpha) * dense. Default 0.5.
+    #[serde(default = "default_cc_alpha")]
+    pub cc_alpha: f64,
     pub waterfall_fts_threshold: f64,
     pub dedup_similarity: f64,
     pub dedup_time_window_days: i64,
 }
+
+fn default_fusion_method() -> String { "rrf".to_string() }
+fn default_cc_alpha() -> f64 { 0.5 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChunkingConfig {
@@ -262,6 +272,8 @@ impl Default for SearchConfig {
             rrf_k: 60.0,
             rrf_fts_weight: 0.3,
             rrf_vec_weight: 0.7,
+            fusion_method: "rrf".to_string(),
+            cc_alpha: 0.5,
             waterfall_fts_threshold: 0.5,
             dedup_similarity: 0.70,
             dedup_time_window_days: 7,

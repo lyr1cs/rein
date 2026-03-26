@@ -55,14 +55,14 @@ impl SqliteStore {
             return llm_conf;
         }
 
-        // Learned weights from data
+        // Learned weights from data (parameterized queries to prevent SQL injection)
         let get_weight = |good_key: &str, bad_key: &str| -> f64 {
             let good_sum: f64 = self.conn
-                .query_row(&format!("SELECT COALESCE(CAST(value AS REAL), 0) FROM metadata WHERE key = '{}'", good_key),
-                    [], |r| r.get(0)).unwrap_or(0.0);
+                .query_row("SELECT COALESCE(CAST(value AS REAL), 0) FROM metadata WHERE key = ?1",
+                    rusqlite::params![good_key], |r| r.get(0)).unwrap_or(0.0);
             let bad_sum: f64 = self.conn
-                .query_row(&format!("SELECT COALESCE(CAST(value AS REAL), 0) FROM metadata WHERE key = '{}'", bad_key),
-                    [], |r| r.get(0)).unwrap_or(0.0);
+                .query_row("SELECT COALESCE(CAST(value AS REAL), 0) FROM metadata WHERE key = ?1",
+                    rusqlite::params![bad_key], |r| r.get(0)).unwrap_or(0.0);
             let avg_good = if good_count > 0 { good_sum / good_count as f64 } else { 0.5 };
             let avg_bad = if bad_count > 0 { bad_sum / bad_count as f64 } else { 0.5 };
             avg_good / (avg_good + avg_bad + 0.001)
@@ -120,14 +120,10 @@ impl SqliteStore {
         let (mut sum_llm, mut sum_util, mut sum_conn, mut sum_rec) = (0.0, 0.0, 0.0, 0.0);
         for (id, ac) in &good_mems {
             sum_util += *ac as f64;
-            // LLM confidence: stored as memory strength initially (approximation)
             if let Ok(mem) = self.get(id) {
-                sum_llm += mem.strength; // strength correlates with quality
+                sum_llm += mem.strength;
                 let hours = (chrono::Utc::now() - mem.created_at).num_hours() as f64;
                 sum_rec += if hours <= 24.0 { 1.0 } else if hours <= 168.0 { 0.5 } else { 0.2 };
-            }
-            // Connectivity: count concept_ids
-            if let Ok(mem) = self.get(id) {
                 sum_conn += (mem.concept_ids.len() as f64 / 3.0).min(1.0);
             }
         }
@@ -162,6 +158,8 @@ impl SqliteStore {
     /// Record that memories were returned in a recall result.
     /// Increments a recall_count in metadata for tracking quality.
     pub fn record_recall_hit(&self, ids: &[String]) {
+        if ids.is_empty() { return; }
+        let _ = self.conn.execute_batch("BEGIN");
         for id in ids {
             let _ = self.conn.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, '1')
@@ -169,6 +167,7 @@ impl SqliteStore {
                 rusqlite::params![format!("recall_hit:{}", id)],
             );
         }
+        let _ = self.conn.execute_batch("COMMIT");
     }
 
     /// Compute quality score for the memory store.
@@ -198,13 +197,9 @@ impl SqliteStore {
         let mut pruned = 0u64;
 
         for memoir in &all_memoirs {
-            // Get concepts for this memoir
-            let memoir_obj = match self.get_memoir(&memoir.name)? {
-                Some(m) => m,
-                None => continue,
-            };
+            // Use memoir.id directly — already have full Memoir from list_memoirs()
             let mut stmt = self.conn.prepare("SELECT * FROM concepts WHERE memoir_id = ?1")?;
-            let concepts: Vec<Concept> = stmt.query_map(rusqlite::params![memoir_obj.id], |row| {
+            let concepts: Vec<Concept> = stmt.query_map(rusqlite::params![memoir.id], |row| {
                 super::memoir::row_to_concept(row).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
                 })

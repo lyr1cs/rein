@@ -26,6 +26,8 @@ pub struct SqliteStore {
     pub(crate) conn: Connection,
     db_path: PathBuf,
     pub(crate) dims: usize,
+    /// Cached Tantivy index — avoids reopening + allocating 15MB IndexWriter per operation.
+    tantivy_cache: std::cell::RefCell<Option<super::tantivy_fts::TantivyFts>>,
 }
 
 impl SqliteStore {
@@ -50,7 +52,7 @@ impl SqliteStore {
             eprintln!("rein: FTS search still works. Vector search may return incorrect results.");
         }
 
-        Ok(Self { conn, db_path: path.to_path_buf(), dims })
+        Ok(Self { conn, db_path: path.to_path_buf(), dims, tantivy_cache: std::cell::RefCell::new(None) })
     }
 
     /// Create an in-memory database for testing (default 3072 dims).
@@ -59,7 +61,7 @@ impl SqliteStore {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::init_schema(&conn, 3072)?;
-        Ok(Self { conn, db_path: PathBuf::from(":memory:"), dims: 3072 })
+        Ok(Self { conn, db_path: PathBuf::from(":memory:"), dims: 3072, tantivy_cache: std::cell::RefCell::new(None) })
     }
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
@@ -86,6 +88,29 @@ impl SqliteStore {
                 None
             }
         }).collect())
+    }
+
+    /// Batch-get memories by IDs. Returns found memories (skips missing ones).
+    /// More efficient than calling get() in a loop — single query with WHERE id IN (...).
+    pub fn get_batch(&self, ids: &[String]) -> Vec<Memory> {
+        if ids.is_empty() { return vec![]; }
+        // SQLite doesn't support array parameters, so build a parameterized IN clause
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!("SELECT * FROM memories WHERE id IN ({})", placeholders.join(","));
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = match stmt.query_map(params.as_slice(), |row| {
+            row_to_memory(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     /// Get the most recently created memories.
@@ -235,9 +260,8 @@ impl MemoryStore for SqliteStore {
             vec::insert_embedding(&self.conn, &id, emb)?;
         }
 
-        // Update side indexes (fire-and-forget)
-        let kw_str = serde_json::to_string(&memory.keywords).unwrap_or_default();
-        self.update_tantivy(&id, &memory.topic, &memory.summary, &memory.content, &kw_str);
+        // Update side indexes (reuse keywords_json from above)
+        self.update_tantivy(&id, &memory.topic, &memory.summary, &memory.content, &keywords_json);
         self.update_hnsw(&id, memory.embedding.as_deref());
 
         Ok(id)
@@ -319,9 +343,8 @@ impl MemoryStore for SqliteStore {
             vec::insert_embedding(&self.conn, &memory.id, emb)?;
         }
 
-        // Update side indexes (fire-and-forget)
-        let kw_str = serde_json::to_string(&memory.keywords).unwrap_or_default();
-        self.update_tantivy(&memory.id, &memory.topic, &memory.summary, &memory.content, &kw_str);
+        // Update side indexes (reuse keywords_json from above)
+        self.update_tantivy(&memory.id, &memory.topic, &memory.summary, &memory.content, &keywords_json);
         self.update_hnsw(&memory.id, memory.embedding.as_deref());
 
         Ok(())
@@ -335,7 +358,9 @@ impl MemoryStore for SqliteStore {
             return Err(ReinError::NotFound(format!("memory {id} not found")));
         }
         // FTS cleanup handled by trigger; clean up vector table
-        let _ = vec::delete_embedding(&self.conn, id);
+        if let Err(e) = vec::delete_embedding(&self.conn, id) {
+            tracing::warn!("failed to delete embedding for {id}: {e}");
+        }
 
         // Remove from side indexes (fire-and-forget)
         self.remove_from_tantivy(id);
@@ -743,50 +768,12 @@ impl SqliteStore {
                 self.mark_superseded(&old_id, &new_id)?;
                 Ok(new_id)
             }
-            DedupAction::GrayZone(candidate_id, sim) => {
-                // Gray zone: use LLM to judge if truly duplicate
-                let is_dup = if let Ok(existing) = self.get(&candidate_id) {
-                    let new_content = memory.content.clone();
-                    let old_content = existing.content.clone();
-                    // Try LLM semantic dedup (async call from sync context)
-                    let llm_says_dup = std::panic::catch_unwind(|| {
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let config = crate::config::ReinConfig::load().unwrap_or_default();
-                                crate::extract::llm::llm_is_duplicate(&config, &new_content, &old_content).await
-                            })
-                        })
-                    }).unwrap_or(false);
-                    llm_says_dup
-                } else {
-                    false
-                };
-
-                if is_dup {
-                    tracing::info!("LLM confirmed duplicate (sim={sim:.2}), merging into {candidate_id}");
-                    // Merge like MergeInto
-                    if let Ok(mut existing) = self.get(&candidate_id) {
-                        existing.content = format!("{}\n\n{}", existing.content, memory.content);
-                        existing.summary = existing.content.chars().take(100).collect();
-                        for kw in &memory.keywords {
-                            if !existing.keywords.contains(kw) {
-                                existing.keywords.push(kw.clone());
-                            }
-                        }
-                        if memory.importance > existing.importance {
-                            existing.importance = memory.importance;
-                        }
-                        existing.strength = (existing.strength + 0.2).min(1.0);
-                        existing.updated_at = chrono::Utc::now();
-                        self.update(&existing)?;
-                        Ok(candidate_id)
-                    } else {
-                        self.store(memory)
-                    }
-                } else {
-                    tracing::info!("LLM says not duplicate (sim={sim:.2}), creating new");
-                    self.store(memory)
-                }
+            DedupAction::GrayZone(_, _) => {
+                // GrayZone is always resolved before calling this function
+                // (see store_with_dedup which pre-resolves via LLM outside the transaction).
+                // Treat as CreateNew as a safe fallback.
+                tracing::warn!("unexpected GrayZone in store_with_dedup_resolved, creating new");
+                self.store(memory)
             }
         }
     }
@@ -802,14 +789,21 @@ impl SqliteStore {
         self.db_path.with_extension("")
     }
 
+    /// Get or lazily initialize cached Tantivy instance (avoids 15MB IndexWriter alloc per op).
+    fn with_tantivy<F>(&self, f: F) where F: FnOnce(&super::tantivy_fts::TantivyFts) {
+        if self.db_path.to_str() == Some(":memory:") { return; }
+        let mut cache = self.tantivy_cache.borrow_mut();
+        if cache.is_none() {
+            *cache = super::tantivy_fts::TantivyFts::open(&self.tantivy_path()).ok();
+        }
+        if let Some(ref tantivy) = *cache {
+            f(tantivy);
+        }
+    }
+
     /// Fire-and-forget: update Tantivy index after a write.
     fn update_tantivy(&self, id: &str, topic: &str, summary: &str, content: &str, keywords: &str) {
-        if self.db_path.to_str() == Some(":memory:") {
-            return;
-        }
-        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&self.tantivy_path()) {
-            let _ = tantivy.insert(id, topic, summary, content, keywords);
-        }
+        self.with_tantivy(|t| { let _ = t.insert(id, topic, summary, content, keywords); });
     }
 
     /// Acquire an exclusive file lock on the HNSW index, open it, run `f`, then save.
@@ -828,17 +822,23 @@ impl SqliteStore {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX); }
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                tracing::warn!("HNSW flock(LOCK_EX) failed: {}", std::io::Error::last_os_error());
+                return None;
+            }
         }
 
         let mut index = crate::store::hnsw::HnswIndex::open(&hnsw_path, dims).ok()?;
         let result = f(&mut index);
-        let _ = index.save();
+        if let Err(e) = index.save() {
+            tracing::warn!("HNSW index save failed: {e}");
+        }
 
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN); }
+            let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
         }
         drop(lock_file);
 
@@ -856,12 +856,7 @@ impl SqliteStore {
 
     /// Fire-and-forget: remove from Tantivy index after a delete.
     pub(crate) fn remove_from_tantivy(&self, id: &str) {
-        if self.db_path.to_str() == Some(":memory:") {
-            return;
-        }
-        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&self.tantivy_path()) {
-            let _ = tantivy.delete(id);
-        }
+        self.with_tantivy(|t| { let _ = t.delete(id); });
     }
 
     /// Fire-and-forget: remove from HNSW index after a delete.
