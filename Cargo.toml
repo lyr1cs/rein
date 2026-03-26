@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
 license = "MIT"

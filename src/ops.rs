@@ -197,12 +197,13 @@ fn run_hdbscan_clustering(
 ) {
     tracing::debug!("M4: running HDBSCAN on {count} embeddings");
 
-    // Read embeddings from vec_memories (id, embedding_blob)
+    // Read embeddings from vec_memories (cap to sampling limit to avoid OOM)
+    let load_limit = count.min(crate::store::hdbscan::HDBSCAN_FULL_MATRIX_LIMIT);
     let embeddings: Vec<(String, Vec<f32>)> = match store.conn().prepare(
-        "SELECT id, embedding FROM vec_memories LIMIT ?1"
+        "SELECT id, embedding FROM vec_memories ORDER BY RANDOM() LIMIT ?1"
     ) {
         Ok(mut stmt) => stmt.query_map(
-            rusqlite::params![count as i64],
+            rusqlite::params![load_limit as i64],
             |row| {
                 let id: String = row.get(0)?;
                 let blob: Vec<u8> = row.get(1)?;
@@ -401,16 +402,26 @@ fn run_tiering(
         Err(_) => 0,
     };
 
-    // Strip archived memories to summary-only (save space)
+    // Strip archived memories to summary-only via store.update() to keep Tantivy in sync
     if migrated > 0 {
-        let _ = store.conn().execute(
-            "UPDATE memories SET content = summary
-             WHERE tier = 'cold' AND strength < 0.3 AND access_count = 0
-             AND id IN (SELECT memory_id FROM cold_archive)",
-            [],
-        );
-        tracing::info!("M5: migrated {migrated} cold memories to archive, hot={:.4} cold={:.4}",
-            state.hot_threshold, state.cold_threshold);
+        // Fetch archived memory IDs and update through the proper API
+        let archived_ids: Vec<String> = store.conn().prepare(
+            "SELECT memory_id FROM cold_archive WHERE memory_id IN (
+                SELECT id FROM memories WHERE tier = 'cold' AND strength < 0.3 AND access_count = 0
+            )"
+        ).ok().and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0)).ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        }).unwrap_or_default();
+
+        for aid in &archived_ids {
+            if let Ok(mut mem) = store.get(aid) {
+                mem.content = mem.summary.clone();
+                let _ = store.update(&mem); // Triggers Tantivy + FTS update
+            }
+        }
+        tracing::info!("M5: migrated {migrated} cold memories to archive ({} stripped), hot={:.4} cold={:.4}",
+            archived_ids.len(), state.hot_threshold, state.cold_threshold);
     } else {
         tracing::debug!("M5: hot={:.4}, cold={:.4}, no migrations needed",
             state.hot_threshold, state.cold_threshold);
@@ -457,7 +468,12 @@ fn run_alpha_learning(
             Some(p) => p,
             None => continue,
         };
-        let candidates_json: Vec<serde_json::Value> = serde_json::from_str(payload).unwrap_or_default();
+        // Payload is {"candidates": [...], "alpha_used": ..., ...}
+        let payload_obj: serde_json::Value = serde_json::from_str(payload).unwrap_or_default();
+        let candidates_json: Vec<serde_json::Value> = payload_obj.get("candidates")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
         if candidates_json.is_empty() { continue; }
 
         let candidates: Vec<crate::search::alpha_optimizer::CandidateLog> = candidates_json.iter()
@@ -472,11 +488,17 @@ fn run_alpha_learning(
 
         if candidates.is_empty() { continue; }
 
-        // Find which memories from this request were accessed
+        // Find which candidate memories were actually accessed (injected by hook_prompt).
+        // Note: recall_access events use a different request_id than recall_complete,
+        // so we match by memory_id presence instead of request_id join.
+        let candidate_ids: std::collections::HashSet<&str> = candidates.iter()
+            .map(|c| c.memory_id.as_str()).collect();
         let accessed_ids: Vec<String> = access_events.iter()
-            .filter(|a| a.request_id.as_deref() == Some(&request_id))
-            .filter_map(|a| a.memory_id.clone())
-            .collect();
+            .filter_map(|a| a.memory_id.as_deref())
+            .filter(|mid| candidate_ids.contains(mid))
+            .map(|s| s.to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter().collect();
 
         let ts = chrono::DateTime::parse_from_rfc3339(&event.ts)
             .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -648,7 +670,9 @@ fn run_m6_threshold_learning(
                 .and_then(|p| serde_json::from_str(p).ok())
                 .unwrap_or_default();
 
-            let ids: Vec<String> = payload.as_array()
+            // Payload is {"candidates": [...], ...} — extract candidate IDs
+            let ids: Vec<String> = payload.get("candidates")
+                .and_then(|c| c.as_array())
                 .map(|arr| arr.iter()
                     .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
                     .take(10) // Only top-10 results
