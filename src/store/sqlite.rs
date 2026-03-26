@@ -710,10 +710,17 @@ impl SqliteStore {
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
+        // Use per-cluster adaptive threshold if available (A1), falling back to caller's threshold
+        let effective_threshold = if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn) {
+            state.get_dedup_threshold(memory.cluster_id)
+        } else {
+            similarity_threshold
+        };
+
         // Pre-check: resolve gray zone BEFORE opening write transaction
         // so LLM call doesn't hold the write lock
         let dedup_action = crate::extract::check_dedup(
-            self, &memory.topic, &memory.content, similarity_threshold, time_window_days,
+            self, &memory.topic, &memory.content, effective_threshold, time_window_days,
         )?;
         let resolved_action = match dedup_action {
             DedupAction::GrayZone(ref candidate_id, sim) => {

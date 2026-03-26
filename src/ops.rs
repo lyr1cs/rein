@@ -151,6 +151,11 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         tracing::debug!("M4: cluster_version incremented to {}", state.cluster_version);
     }
 
+    // Step 1b: A1 — Compute per-cluster dedup thresholds from intra-cluster similarity distribution
+    if !state.memory_clusters.is_empty() {
+        compute_per_cluster_dedup_thresholds(store, &mut state);
+    }
+
     // Step 2: M3 — Survival curves (per-cluster, needs cluster assignments)
     // Skipped until M4 produces actual cluster assignments.
     // The Kaplan-Meier module is ready but needs access_time data per cluster.
@@ -213,6 +218,66 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     ).unwrap_or(0);
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
+    }
+}
+
+/// Compute per-cluster dedup thresholds from intra-cluster content similarity.
+/// For each cluster with >= 5 members, compute pairwise Jaccard/Containment similarity
+/// and use P90 as that cluster's dedup threshold (SemDeDup-inspired approach).
+fn compute_per_cluster_dedup_thresholds(
+    store: &SqliteStore,
+    state: &mut crate::store::adaptive::AdaptiveState,
+) {
+    use std::collections::HashMap;
+
+    // Group memory IDs by cluster
+    let mut clusters: HashMap<u32, Vec<String>> = HashMap::new();
+    for (mem_id, &cluster_id) in &state.memory_clusters {
+        clusters.entry(cluster_id).or_default().push(mem_id.clone());
+    }
+
+    let mut all_sims: Vec<f32> = Vec::new();
+
+    for (cluster_id, mem_ids) in &clusters {
+        if mem_ids.len() < 5 { continue; }
+
+        // Sample up to 20 members to keep computation bounded
+        let sample: Vec<&str> = mem_ids.iter().take(20).map(|s| s.as_str()).collect();
+        let mut sims: Vec<f32> = Vec::new();
+
+        // Fetch content for sampled members
+        let contents: Vec<String> = sample.iter()
+            .filter_map(|id| store.get(id).ok().map(|m| m.content))
+            .collect();
+
+        // Compute pairwise similarities
+        for i in 0..contents.len() {
+            for j in (i + 1)..contents.len() {
+                let sim = crate::extract::similarity(&contents[i], &contents[j]);
+                sims.push(sim);
+                all_sims.push(sim);
+            }
+        }
+
+        if sims.len() >= 3 {
+            sims.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // P90: the threshold where 90% of intra-cluster pairs are below
+            let p90_idx = (sims.len() as f64 * 0.90).floor() as usize;
+            let p90_idx = p90_idx.min(sims.len() - 1);
+            let threshold = sims[p90_idx].max(0.40).min(0.90); // Clamp to sane range
+            state.dedup_thresholds.insert(*cluster_id, threshold);
+            tracing::debug!("A1: cluster {cluster_id} dedup threshold = {threshold:.3} (from {} pairs)", sims.len());
+        }
+    }
+
+    // Update global threshold from all-clusters distribution
+    if all_sims.len() >= 10 {
+        all_sims.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p90_idx = (all_sims.len() as f64 * 0.90).floor() as usize;
+        let p90_idx = p90_idx.min(all_sims.len() - 1);
+        let global = all_sims[p90_idx].max(0.40).min(0.90);
+        state.global_dedup_threshold = global;
+        tracing::debug!("A1: global dedup threshold = {global:.3} (from {} total pairs)", all_sims.len());
     }
 }
 

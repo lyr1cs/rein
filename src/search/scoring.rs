@@ -1,9 +1,17 @@
+use crate::search::survival::SurvivalCurve;
 use crate::types::Memory;
 
 /// Calculate current memory strength using Ebbinghaus forgetting curve.
 /// strength(t) = exp(-lambda_eff * days^beta)
 /// lambda_eff = decay_lambda / (1 + access_count * 0.2)
 pub fn calculate_strength(memory: &Memory) -> f64 {
+    calculate_strength_with_curve(memory, None)
+}
+
+/// Calculate memory strength with optional Kaplan-Meier survival curve.
+/// When a per-cluster survival curve is available and has sufficient data,
+/// it replaces the fixed Ebbinghaus formula for data-driven decay.
+pub fn calculate_strength_with_curve(memory: &Memory, curve: Option<&SurvivalCurve>) -> f64 {
     if memory.importance == crate::types::Importance::Critical {
         return 1.0; // Critical never decays
     }
@@ -13,7 +21,10 @@ pub fn calculate_strength(memory: &Memory) -> f64 {
     }
     let lambda_eff = memory.decay_lambda / (1.0 + memory.access_count as f64 * 0.2);
     let beta = memory.layer.beta();
-    (-lambda_eff * days.powf(beta)).exp()
+    let ebbinghaus = (-lambda_eff * days.powf(beta)).exp();
+
+    // Use adaptive_strength for KM curve blending (cold-start safe)
+    crate::search::survival::adaptive_strength(days, curve, ebbinghaus, 20, 50)
 }
 
 /// Recency boost: recent memories get higher scores.
@@ -33,7 +44,12 @@ pub fn recency_boost(memory: &Memory) -> f32 {
 /// Apply strength weighting to RRF score with recency boost.
 /// final_score = rrf_score * strength * (1 + access_count * 0.2) * recency_boost
 pub fn apply_strength_weighting(rrf_score: f32, memory: &Memory) -> f32 {
-    let strength = calculate_strength(memory);
+    apply_strength_weighting_with_curve(rrf_score, memory, None)
+}
+
+/// Apply strength weighting with optional per-cluster survival curve.
+pub fn apply_strength_weighting_with_curve(rrf_score: f32, memory: &Memory, curve: Option<&SurvivalCurve>) -> f32 {
+    let strength = calculate_strength_with_curve(memory, curve);
     let recency = recency_boost(memory);
     rrf_score * strength as f32 * (1.0 + memory.access_count as f32 * 0.2) * recency
 }
