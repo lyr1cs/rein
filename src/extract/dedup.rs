@@ -115,7 +115,12 @@ pub fn check_dedup(
 
     // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
     // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
-    let gray_floor = if m6_has_llm_budget() { 0.35 } else { 0.50 };
+    // Check sim range first to avoid wasting budget on non-candidates
+    let gray_floor = if best_sim >= 0.35 && best_sim < 0.50 && m6_has_llm_budget() {
+        0.35 // Budget available and sim is in extended range
+    } else {
+        0.50 // Standard gray zone floor
+    };
     if best_sim >= gray_floor {
         if let Some(memory) = best_memory {
             if is_exploration {
