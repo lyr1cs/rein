@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod classify;
 pub mod recall;
 pub mod rrf;
 pub mod scoring;
