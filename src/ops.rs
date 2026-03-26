@@ -141,64 +141,26 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         .unwrap_or(0);
 
     if embeddings_count >= 50 {
-        tracing::debug!("M4: running HDBSCAN on {} embeddings", embeddings_count);
-        // Get all embeddings from vec_memories
-        // Note: full HDBSCAN on embeddings is computationally expensive for large sets.
-        // For now, we just increment cluster_version and log.
-        // Full HDBSCAN integration requires reading embeddings from vec table which
-        // needs sqlite-vec specific queries — deferred to integration phase.
-        state.cluster_version += 1;
-        tracing::debug!("M4: cluster_version incremented to {}", state.cluster_version);
+        run_hdbscan_clustering(store, &mut state, embeddings_count as usize);
     }
 
-    // Step 1b: A1 — Compute per-cluster dedup thresholds from intra-cluster similarity distribution
+    // Step 1b: A1 — Compute per-cluster dedup thresholds
     if !state.memory_clusters.is_empty() {
         compute_per_cluster_dedup_thresholds(store, &mut state);
     }
 
-    // Step 2: M3 — Survival curves (per-cluster, needs cluster assignments)
-    // Skipped until M4 produces actual cluster assignments.
-    // The Kaplan-Meier module is ready but needs access_time data per cluster.
+    // Step 2: M3 — Build per-cluster survival curves from access data
+    if !state.memory_clusters.is_empty() {
+        build_survival_curves(store, &state);
+    }
 
-    // Step 3: M5 — Tier migration (needs >= tier_cold_start memories)
+    // Step 3: M5 — Tier boundaries + cold_archive migration
     if mem_count >= config.adaptive.tier_cold_start as u64 {
-        tracing::debug!("M5: computing tier boundaries for {} memories", mem_count);
-        let mut boundaries = crate::store::tiering::TierBoundaries::new();
-
-        // Compute access rates for all memories
-        if let Ok(mut stmt) = store.conn().prepare(
-            "SELECT access_count, created_at FROM memories WHERE status = 'active'"
-        ) {
-            let rates: Vec<f64> = stmt.query_map([], |row| {
-                let ac: u32 = row.get(0)?;
-                let created_str: String = row.get(1)?;
-                let created = chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now());
-                Ok(crate::store::tiering::compute_access_rate(ac, created))
-            }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
-
-            if !rates.is_empty() {
-                boundaries.update(&rates);
-                state.hot_threshold = boundaries.hot_threshold;
-                state.cold_threshold = boundaries.cold_threshold;
-                tracing::debug!("M5: hot={:.4}, cold={:.4}", boundaries.hot_threshold, boundaries.cold_threshold);
-            }
-        }
+        run_tiering(store, &mut state, config);
     }
 
-    // Step 4: M2 — Counterfactual alpha optimization
-    // NOTE: Do NOT consume_events here — that would advance offsets and lose data
-    // before the learner is fully wired. Only peek at event count for diagnostics.
-    let recall_event_count: u64 = store.conn()
-        .query_row(
-            "SELECT COUNT(*) FROM feedback_events WHERE event_type = 'recall_complete'",
-            [], |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if recall_event_count > 0 {
-        tracing::debug!("M2: {} recall_complete events available (alpha learning pending full integration)", recall_event_count);
-    }
+    // Step 4: M2 — Counterfactual alpha optimization (consume events, learn alphas)
+    run_alpha_learning(store, &mut state, config);
 
     // Step 5: Embedding-based dedup for memories marked needs_vec_dedup
     run_vec_dedup(store, config);
@@ -218,6 +180,378 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     ).unwrap_or(0);
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
+    }
+}
+
+// ===========================================================================
+// M4: HDBSCAN clustering — read embeddings, cluster, store assignments
+// ===========================================================================
+
+fn run_hdbscan_clustering(
+    store: &SqliteStore,
+    state: &mut crate::store::adaptive::AdaptiveState,
+    count: usize,
+) {
+    tracing::debug!("M4: running HDBSCAN on {count} embeddings");
+
+    // Read embeddings from vec_memories (id, embedding_blob)
+    let embeddings: Vec<(String, Vec<f32>)> = match store.conn().prepare(
+        "SELECT id, embedding FROM vec_memories LIMIT ?1"
+    ) {
+        Ok(mut stmt) => stmt.query_map(
+            rusqlite::params![count as i64],
+            |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                let floats: Vec<f32> = blob.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                Ok((id, floats))
+            },
+        ).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default(),
+        Err(_) => return,
+    };
+
+    if embeddings.len() < 50 { return; }
+
+    let min_cluster_size = 5.max(embeddings.len() / 50); // adaptive: ~2% of dataset
+    let result = crate::store::hdbscan::hdbscan(&embeddings, min_cluster_size);
+
+    // Store cluster assignments in state + update memories table
+    state.memory_clusters.clear();
+    for (i, label) in result.labels.iter().enumerate() {
+        if let Some(cluster_id) = label {
+            let mem_id = &embeddings[i].0;
+            state.memory_clusters.insert(mem_id.clone(), *cluster_id);
+            let _ = store.conn().execute(
+                "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
+                rusqlite::params![*cluster_id, mem_id],
+            );
+        }
+    }
+
+    state.cluster_version += 1;
+    tracing::info!(
+        "M4: {} clusters, {} noise points, {} assigned (v{})",
+        result.clusters.len(), result.noise_indices.len(),
+        state.memory_clusters.len(), state.cluster_version,
+    );
+}
+
+// ===========================================================================
+// M3: Build per-cluster survival curves from access timestamps
+// ===========================================================================
+
+fn build_survival_curves(
+    store: &SqliteStore,
+    state: &crate::store::adaptive::AdaptiveState,
+) {
+    use std::collections::HashMap;
+
+    // Group memories by cluster, collect access timestamps
+    let mut cluster_intervals: HashMap<u32, Vec<crate::search::survival::SurvivalInterval>> = HashMap::new();
+    let now = chrono::Utc::now();
+
+    for (mem_id, &cluster_id) in &state.memory_clusters {
+        // Get created_at, last_accessed, access_count for this memory
+        let row: Option<(String, String, u32)> = store.conn().query_row(
+            "SELECT created_at, last_accessed, access_count FROM memories WHERE id = ?1",
+            rusqlite::params![mem_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).ok();
+
+        let (created_str, last_str, access_count) = match row {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let created = chrono::DateTime::parse_from_rfc3339(&created_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+        let last_accessed = chrono::DateTime::parse_from_rfc3339(&last_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+
+        let intervals = cluster_intervals.entry(cluster_id).or_default();
+
+        if access_count > 0 {
+            // Approximate access intervals: spread access_count evenly between created_at and last_accessed
+            let total_days = (last_accessed - created).num_seconds() as f64 / 86400.0;
+            if total_days > 0.0 && access_count > 1 {
+                let interval = total_days / access_count as f64;
+                for _ in 0..access_count.min(20) {
+                    intervals.push(crate::search::survival::SurvivalInterval {
+                        duration_days: interval,
+                        is_event: true,
+                    });
+                }
+            }
+            // Censored: time since last access
+            let censored = (now - last_accessed).num_seconds() as f64 / 86400.0;
+            intervals.push(crate::search::survival::SurvivalInterval {
+                duration_days: censored.max(0.0),
+                is_event: false,
+            });
+        } else {
+            // Never accessed after creation — single censored observation
+            let age = (now - created).num_seconds() as f64 / 86400.0;
+            intervals.push(crate::search::survival::SurvivalInterval {
+                duration_days: age.max(0.0),
+                is_event: false,
+            });
+        }
+    }
+
+    // Build curves and store as metadata (one per cluster)
+    let mut curves_built = 0u32;
+    for (cluster_id, intervals) in &cluster_intervals {
+        if intervals.len() < 10 { continue; } // Need minimum data for meaningful curve
+
+        if let Some(curve) = crate::search::survival::kaplan_meier(intervals) {
+            // Store curve as JSON in metadata table for scoring to pick up
+            let key = format!("survival_curve:{cluster_id}");
+            if let Ok(json) = serde_json::to_string(&curve) {
+                let _ = store.conn().execute(
+                    "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = ?2",
+                    rusqlite::params![key, json],
+                );
+                curves_built += 1;
+            }
+        }
+    }
+
+    if curves_built > 0 {
+        tracing::info!("M3: built {curves_built} per-cluster survival curves");
+    }
+}
+
+// ===========================================================================
+// M5: Tier boundaries + cold_archive migration
+// ===========================================================================
+
+fn run_tiering(
+    store: &SqliteStore,
+    state: &mut crate::store::adaptive::AdaptiveState,
+    _config: &ReinConfig,
+) {
+    tracing::debug!("M5: computing tier boundaries");
+    let mut boundaries = crate::store::tiering::TierBoundaries::new();
+
+    // Compute access rates for all memories
+    if let Ok(mut stmt) = store.conn().prepare(
+        "SELECT access_count, created_at FROM memories WHERE status = 'active'"
+    ) {
+        let rates: Vec<f64> = stmt.query_map([], |row| {
+            let ac: u32 = row.get(0)?;
+            let created_str: String = row.get(1)?;
+            let created = chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            Ok(crate::store::tiering::compute_access_rate(ac, created))
+        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+
+        if !rates.is_empty() {
+            boundaries.update(&rates);
+            state.hot_threshold = boundaries.hot_threshold;
+            state.cold_threshold = boundaries.cold_threshold;
+        }
+    }
+
+    // Update tier labels on memories
+    if state.hot_threshold > 0.0 && state.cold_threshold > 0.0 {
+        let _ = store.conn().execute(
+            "UPDATE memories SET tier = 'hot'
+             WHERE status = 'active' AND tier != 'hot'
+             AND CAST(access_count AS REAL) / MAX(1, CAST(
+               (julianday('now') - julianday(created_at)) AS REAL)) >= ?1",
+            rusqlite::params![state.hot_threshold],
+        );
+        let _ = store.conn().execute(
+            "UPDATE memories SET tier = 'cold'
+             WHERE status = 'active' AND tier != 'cold'
+             AND CAST(access_count AS REAL) / MAX(1, CAST(
+               (julianday('now') - julianday(created_at)) AS REAL)) <= ?1",
+            rusqlite::params![state.cold_threshold],
+        );
+        let _ = store.conn().execute(
+            "UPDATE memories SET tier = 'warm'
+             WHERE status = 'active' AND tier NOT IN ('hot', 'cold')
+             OR (tier = 'hot' AND CAST(access_count AS REAL) / MAX(1, CAST(
+               (julianday('now') - julianday(created_at)) AS REAL)) < ?1)
+             OR (tier = 'cold' AND CAST(access_count AS REAL) / MAX(1, CAST(
+               (julianday('now') - julianday(created_at)) AS REAL)) > ?2)",
+            rusqlite::params![state.hot_threshold, state.cold_threshold],
+        );
+    }
+
+    // Migrate cold memories to cold_archive (content → summary, original in archive)
+    let migrated: u64 = match store.conn().execute(
+        "INSERT OR IGNORE INTO cold_archive (memory_id, content, archived_at)
+         SELECT id, content, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         FROM memories
+         WHERE tier = 'cold' AND strength < 0.3 AND access_count = 0
+         AND id NOT IN (SELECT memory_id FROM cold_archive)",
+        [],
+    ) {
+        Ok(n) => n as u64,
+        Err(_) => 0,
+    };
+
+    // Strip archived memories to summary-only (save space)
+    if migrated > 0 {
+        let _ = store.conn().execute(
+            "UPDATE memories SET content = summary
+             WHERE tier = 'cold' AND strength < 0.3 AND access_count = 0
+             AND id IN (SELECT memory_id FROM cold_archive)",
+            [],
+        );
+        tracing::info!("M5: migrated {migrated} cold memories to archive, hot={:.4} cold={:.4}",
+            state.hot_threshold, state.cold_threshold);
+    } else {
+        tracing::debug!("M5: hot={:.4}, cold={:.4}, no migrations needed",
+            state.hot_threshold, state.cold_threshold);
+    }
+}
+
+// ===========================================================================
+// M2: Counterfactual alpha optimization — consume events, learn alphas
+// ===========================================================================
+
+fn run_alpha_learning(
+    store: &SqliteStore,
+    state: &mut crate::store::adaptive::AdaptiveState,
+    config: &ReinConfig,
+) {
+    let conn = store.conn();
+
+    // Consume recall_complete events (advances offset)
+    let events = match crate::store::adaptive::consume_events(
+        conn, "alpha_optimizer", &["recall_complete"], 100,
+    ) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    if events.is_empty() { return; }
+
+    // Also fetch recall_access events to know which memories were actually used
+    let access_events = crate::store::adaptive::consume_events(
+        conn, "alpha_optimizer_access", &["recall_access"], 500,
+    ).unwrap_or_default();
+
+    // Build RecallEvent structs from stored events
+    let mut recall_events: Vec<crate::search::alpha_optimizer::RecallEvent> = Vec::new();
+
+    for event in &events {
+        let request_id = match &event.request_id {
+            Some(r) => r.clone(),
+            None => continue,
+        };
+
+        // Parse payload for candidate logs
+        let payload = match &event.payload {
+            Some(p) => p,
+            None => continue,
+        };
+        let candidates_json: Vec<serde_json::Value> = serde_json::from_str(payload).unwrap_or_default();
+        if candidates_json.is_empty() { continue; }
+
+        let candidates: Vec<crate::search::alpha_optimizer::CandidateLog> = candidates_json.iter()
+            .filter_map(|c| {
+                Some(crate::search::alpha_optimizer::CandidateLog {
+                    memory_id: c.get("id")?.as_str()?.to_string(),
+                    bm25_norm: c.get("bm25_norm")?.as_f64()? as f32,
+                    vec_norm: c.get("vec_norm")?.as_f64()? as f32,
+                })
+            })
+            .collect();
+
+        if candidates.is_empty() { continue; }
+
+        // Find which memories from this request were accessed
+        let accessed_ids: Vec<String> = access_events.iter()
+            .filter(|a| a.request_id.as_deref() == Some(&request_id))
+            .filter_map(|a| a.memory_id.clone())
+            .collect();
+
+        let ts = chrono::DateTime::parse_from_rfc3339(&event.ts)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+
+        recall_events.push(crate::search::alpha_optimizer::RecallEvent {
+            request_id,
+            candidates,
+            accessed_ids,
+            timestamp: ts,
+        });
+    }
+
+    // Only learn from events that have actual access data
+    let events_with_access: Vec<_> = recall_events.iter()
+        .filter(|e| !e.accessed_ids.is_empty())
+        .cloned()
+        .collect();
+
+    if events_with_access.is_empty() {
+        tracing::debug!("M2: consumed {} events but none had access data", events.len());
+        return;
+    }
+
+    // Compute global alpha
+    let decay_lambda = 0.06; // ~11 day half-life for event weighting
+    if let Some(learned) = crate::search::alpha_optimizer::optimize_alpha(&events_with_access, decay_lambda) {
+        let key = "global".to_string();
+        let current = state.learned_alpha.get(&key).map(|e| e.value).unwrap_or(0.5);
+        let stepped = crate::search::alpha_optimizer::apply_max_step(
+            current, learned.value, config.adaptive.alpha_max_step,
+        );
+        let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
+            stepped, 0.5, learned.sample_count, config.adaptive.shrinkage_prior,
+        );
+
+        state.learned_alpha.insert(key, crate::store::adaptive::LearnedAlphaEntry {
+            value: shrunk,
+            sample_count: learned.sample_count,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+        });
+
+        tracing::info!(
+            "M2: learned global alpha = {shrunk:.3} (from {} events, raw={:.3})",
+            learned.sample_count, learned.value
+        );
+    }
+
+    // Per-query-type alphas
+    for qt in &["Temporal", "ExactKeyword", "Semantic", "Exploratory"] {
+        let qt_events: Vec<_> = events_with_access.iter()
+            .filter(|e| {
+                // Match by looking at event's query_type in the original stored events
+                events.iter().any(|se| {
+                    se.request_id.as_deref() == Some(&e.request_id)
+                    && se.query_type.as_deref() == Some(qt)
+                })
+            })
+            .cloned()
+            .collect();
+
+        if qt_events.len() < config.adaptive.min_samples_alpha as usize { continue; }
+
+        if let Some(learned) = crate::search::alpha_optimizer::optimize_alpha(&qt_events, decay_lambda) {
+            let global_alpha = state.learned_alpha.get("global")
+                .map(|e| e.value).unwrap_or(0.5);
+            let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
+                learned.value, global_alpha, learned.sample_count, config.adaptive.shrinkage_prior,
+            );
+
+            state.learned_alpha.insert(qt.to_string(), crate::store::adaptive::LearnedAlphaEntry {
+                value: shrunk,
+                sample_count: learned.sample_count,
+                last_updated: chrono::Utc::now().to_rfc3339(),
+            });
+
+            tracing::info!("M2: learned {qt} alpha = {shrunk:.3} ({} events)", learned.sample_count);
+        }
     }
 }
 
