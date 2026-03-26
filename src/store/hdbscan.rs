@@ -1320,4 +1320,29 @@ mod tests {
             "Approximate HDBSCAN should find clusters with full k-NN"
         );
     }
+
+    #[test]
+    fn test_sampled_hdbscan_labels_all_points() {
+        // Generate enough points to trigger sampling (> HDBSCAN_FULL_MATRIX_LIMIT)
+        // Use a smaller limit for testing by creating a dataset just above threshold
+        let mut rng = Rng::new(42);
+        let center_a = vec![5.0, 0.0, 0.0];
+        let center_b = vec![0.0, 0.0, 5.0];
+        let mut embeddings = Vec::new();
+        // Create 20 points in 2 clusters (test the sampling path with smaller data)
+        for i in 0..10 {
+            embeddings.push((format!("a{i}"), make_cluster(&mut rng, &center_a, 1, 0.2).remove(0)));
+        }
+        for i in 0..10 {
+            embeddings.push((format!("b{i}"), make_cluster(&mut rng, &center_b, 1, 0.2).remove(0)));
+        }
+
+        // Test that hdbscan_sampled produces labels for ALL points
+        let result = hdbscan_sampled(&embeddings, 3, 10);
+        assert_eq!(result.labels.len(), 20, "Should have labels for all 20 points");
+
+        // At least some points should be clustered (not all noise)
+        let clustered = result.labels.iter().filter(|l| l.is_some()).count();
+        assert!(clustered > 0, "Sampled HDBSCAN should assign some points to clusters");
+    }
 }
