@@ -222,7 +222,15 @@ fn run_hdbscan_clustering(
     let min_cluster_size = 5.max(embeddings.len() / 50); // adaptive: ~2% of dataset
     let result = crate::store::hdbscan::hdbscan(&embeddings, min_cluster_size);
 
-    // Store cluster assignments in state + update memories table
+    // Clear all stale cluster assignments before writing new ones.
+    // This prevents memories that became noise from keeping old cluster_id.
+    let _ = store.conn().execute("UPDATE memories SET cluster_id = NULL WHERE cluster_id IS NOT NULL", []);
+    // Clear stale per-cluster survival curves (will be rebuilt by M3)
+    let _ = store.conn().execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", []);
+    // Clear stale per-cluster dedup thresholds
+    state.dedup_thresholds.clear();
+
+    // Store new cluster assignments in state + update memories table
     state.memory_clusters.clear();
     for (i, label) in result.labels.iter().enumerate() {
         if let Some(cluster_id) = label {
@@ -442,17 +450,32 @@ fn run_alpha_learning(
 ) {
     let conn = store.conn();
 
-    // Consume recall_complete events (advances offset)
-    let events = match crate::store::adaptive::consume_events(
-        conn, "alpha_optimizer", &["recall_complete"], 100,
+    // Peek at recall_complete events WITHOUT consuming (don't advance offset yet).
+    // We only advance the offset for events that successfully match access data.
+    let last_offset: i64 = conn.query_row(
+        "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'alpha_optimizer'",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let events: Vec<crate::store::adaptive::StoredEvent> = match conn.prepare(
+        "SELECT id, ts, event_type, request_id, memory_id, concept_id, query, query_type, topic, payload
+         FROM feedback_events WHERE id > ?1 AND event_type = 'recall_complete'
+         ORDER BY id ASC LIMIT 100"
     ) {
-        Ok(e) => e,
+        Ok(mut stmt) => stmt.query_map(rusqlite::params![last_offset], |row| {
+            Ok(crate::store::adaptive::StoredEvent {
+                id: row.get(0)?, ts: row.get(1)?, event_type: row.get(2)?,
+                request_id: row.get(3)?, memory_id: row.get(4)?, concept_id: row.get(5)?,
+                query: row.get(6)?, query_type: row.get(7)?, topic: row.get(8)?,
+                payload: row.get(9)?,
+            })
+        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default(),
         Err(_) => return,
     };
 
     if events.is_empty() { return; }
 
-    // Also fetch recall_access events to know which memories were actually used
+    // Consume recall_access events (these are fire-and-forget, safe to advance)
     let access_events = crate::store::adaptive::consume_events(
         conn, "alpha_optimizer_access", &["recall_access"], 500,
     ).unwrap_or_default();
@@ -531,8 +554,40 @@ fn run_alpha_learning(
         .cloned()
         .collect();
 
+    // Advance offset only up to the last event that had access data.
+    // Unmatched events stay unconsumed so they can be retried next cycle
+    // (their access events may arrive between GC runs).
+    let max_matched_id = events.iter()
+        .filter(|e| {
+            let rid = e.request_id.as_deref().unwrap_or("");
+            recall_events.iter().any(|re| re.request_id == rid && !re.accessed_ids.is_empty())
+        })
+        .map(|e| e.id)
+        .max();
+
+    // Also advance past old unmatched events (>24h) to prevent unbounded backlog
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let max_expired_id = events.iter()
+        .filter(|e| {
+            chrono::DateTime::parse_from_rfc3339(&e.ts)
+                .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
+                .unwrap_or(false)
+        })
+        .map(|e| e.id)
+        .max();
+
+    let advance_to = max_matched_id.max(max_expired_id);
+    if let Some(new_offset) = advance_to {
+        let _ = conn.execute(
+            "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
+             VALUES ('alpha_optimizer', ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(consumer) DO UPDATE SET last_event_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            rusqlite::params![new_offset],
+        );
+    }
+
     if events_with_access.is_empty() {
-        tracing::debug!("M2: consumed {} events but none had access data", events.len());
+        tracing::debug!("M2: peeked {} events but none had access data yet (will retry)", events.len());
         return;
     }
 
@@ -1006,21 +1061,20 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                 let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
                 if sim >= threshold {
                     dups_found += 1;
+                    // Determine winner (longer/newer) and loser
+                    let (winner_idx, loser_idx) = if mems[j].content.len() >= mems[i].content.len() {
+                        (j, i)
+                    } else {
+                        (i, j)
+                    };
                     if dry_run {
                         tracing::debug!("dup: '{}' ~ '{}'",
-                            &mems[i].summary.chars().take(40).collect::<String>(),
-                            &mems[j].summary.chars().take(40).collect::<String>());
+                            &mems[loser_idx].summary.chars().take(40).collect::<String>(),
+                            &mems[winner_idx].summary.chars().take(40).collect::<String>());
                     } else {
-                        // Provenance-preserving merge: keep the newer/longer one,
-                        // extract unique content from the other
-                        let (winner_idx, loser_idx) = if mems[j].content.len() >= mems[i].content.len() {
-                            (j, i)
-                        } else {
-                            (i, j)
-                        };
+                        // Provenance-preserving merge
                         let unique = extract_unique_lines(&mems[loser_idx].content, &mems[winner_idx].content);
                         if !unique.is_empty() {
-                            // Append unique provenance to the winner
                             let provenance = format!(
                                 "\n\n[merged from {} on {}]\n{}",
                                 mems[loser_idx].id,
@@ -1029,7 +1083,6 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                             );
                             if let Ok(mut winner) = store.get(&mems[winner_idx].id) {
                                 winner.content.push_str(&provenance);
-                                // Merge keywords
                                 for kw in &mems[loser_idx].keywords {
                                     if !winner.keywords.contains(kw) {
                                         winner.keywords.push(kw.clone());
@@ -1039,12 +1092,12 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                                 let _ = store.update(&winner);
                             }
                         }
-                        // Supersede the loser (preserves it in DB, just marks as replaced)
                         let _ = store.mark_superseded(&mems[loser_idx].id, &mems[winner_idx].id);
                         dups_merged += 1;
                     }
-                    processed.insert(mems[i].id.clone());
-                    break;
+                    // Mark only the loser as processed; winner continues scanning
+                    // so chains like A≈B≈C get fully merged
+                    processed.insert(mems[loser_idx].id.clone());
                 }
             }
         }
