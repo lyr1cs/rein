@@ -40,19 +40,36 @@ pub fn recall(
     let vec_ranked = try_vector_search(store, config, query, topic, limit);
     tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = vec_ranked.len(), "vector search");
 
-    // Collect vector-only IDs before moving vec_ranked into RRF
-    let vec_ids: Vec<String> = vec_ranked.iter().map(|(id, _)| id.clone()).collect();
+    // === Path quality gating (Wang 2025: weakest-link phenomenon) ===
+    // Skip a path if it returned no results — avoids empty/broken paths degrading fusion.
+    // Note: scores are rank-encoded (0, -1, -2...) so we gate on result count, not score value.
+    let use_fts = !fts_ranked.is_empty();
+    let use_vec = !vec_ranked.is_empty();
 
-    // === RRF fusion ===
-    let rrf_k = config.search.rrf_k as f32;
-    let fts_weight = config.search.rrf_fts_weight as f32;
-    let vec_weight = config.search.rrf_vec_weight as f32;
+    // Collect vector-only IDs before moving vec_ranked into fusion
+    let vec_ids: Vec<String> = if use_vec {
+        vec_ranked.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        vec![]
+    };
 
-    let mut lists = vec![(fts_ranked, fts_weight)];
-    if !vec_ranked.is_empty() {
-        lists.push((vec_ranked, vec_weight));
-    }
-    let fused = crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k);
+    // === Score fusion (RRF or Convex Combination) ===
+    // Only include paths that passed quality gating
+    let fts_for_fusion = if use_fts { fts_ranked } else { vec![] };
+    let vec_for_fusion = if use_vec { vec_ranked } else { vec![] };
+
+    let fused = if config.search.fusion_method == "cc" {
+        let alpha = config.search.cc_alpha as f32;
+        crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha)
+    } else {
+        let rrf_k = config.search.rrf_k as f32;
+        let fts_weight = config.search.rrf_fts_weight as f32;
+        let vec_weight = config.search.rrf_vec_weight as f32;
+        let mut lists = Vec::new();
+        if !fts_for_fusion.is_empty() { lists.push((fts_for_fusion, fts_weight)); }
+        if !vec_for_fusion.is_empty() { lists.push((vec_for_fusion, vec_weight)); }
+        crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k)
+    };
 
     // Build memory lookup from already-fetched results
     let mut memory_map: std::collections::HashMap<String, Memory> = std::collections::HashMap::new();
@@ -60,12 +77,14 @@ pub fn recall(
         memory_map.entry(m.id.clone()).or_insert(m);
     }
 
-    // Add vector-search memories not already in FTS results
-    for id in &vec_ids {
-        if !memory_map.contains_key(id) {
-            if let Ok(m) = store.get(id) {
-                memory_map.insert(id.clone(), m);
-            }
+    // Batch-fetch vector-search memories not already in FTS results (avoids N+1 queries)
+    let missing_ids: Vec<String> = vec_ids.iter()
+        .filter(|id| !memory_map.contains_key(*id))
+        .cloned()
+        .collect();
+    if !missing_ids.is_empty() {
+        for m in store.get_batch(&missing_ids) {
+            memory_map.entry(m.id.clone()).or_insert(m);
         }
     }
 
@@ -89,31 +108,52 @@ pub fn recall(
     }
 
     // === Cross-validation (if enabled) ===
-    // Pass scored results directly — cross_validate will preserve local scores
-    // and rank external results below local ones
+    // Run Supermemory + AutoMemory in parallel to reduce total latency.
+    // Supermemory is 200-500ms network; AutoMemory is local file scan.
+
+    let sm_enabled = config.sync.supermemory_enabled;
+    let sm_api_key = config.sync.api_key.clone();
+    let sm_endpoint = config.sync.endpoint.clone();
+    let am_enabled = config.sync.auto_memory_enabled;
+    let am_glob = config.sync.auto_memory_glob.clone();
+    let q_sm = query.to_string();
+    let q_am = query.to_string();
 
     let sm_start = std::time::Instant::now();
-    let supermemory_results = if config.sync.supermemory_enabled {
-        if let Some(ref api_key) = config.sync.api_key {
-            let client = SupermemoryClient::new(api_key.clone(), config.sync.endpoint.clone());
-            let q = query.to_string();
-            tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current().block_on(client.search(&q, limit))
-            })
+
+    // Spawn Supermemory search in a thread (it's async + network I/O)
+    let sm_handle = if sm_enabled {
+        if let Some(api_key) = sm_api_key {
+            Some(std::thread::spawn(move || {
+                let client = SupermemoryClient::new(api_key, sm_endpoint);
+                // Build a small runtime for this thread since we can't share the main one
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
+                    .unwrap_or_default()
+            }))
         } else {
-            vec![]
+            None
         }
     } else {
-        vec![]
+        None
     };
-    tracing::debug!(elapsed_ms = sm_start.elapsed().as_millis() as u64, hits = supermemory_results.len(), "supermemory search");
 
-    let auto_memory_results = if config.sync.auto_memory_enabled {
-        let scanner = AutoMemoryScanner::new(config.sync.auto_memory_glob.clone());
-        scanner.scan(query)
+    // AutoMemory runs on current thread (fast local scan)
+    let auto_memory_results = if am_enabled {
+        let scanner = AutoMemoryScanner::new(am_glob);
+        scanner.scan(&q_am)
     } else {
         vec![]
     };
+
+    // Join Supermemory thread
+    let supermemory_results = sm_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    tracing::debug!(elapsed_ms = sm_start.elapsed().as_millis() as u64, hits = supermemory_results.len(), "supermemory search");
 
     let validated = validate::cross_validate(&local_results, &supermemory_results, &auto_memory_results);
 
@@ -194,6 +234,27 @@ fn try_vector_search(
     }
 }
 
+/// Check if a memory matches the requested topic filter.
+fn matches_topic(store: &SqliteStore, id: &str, topic: Option<&str>) -> bool {
+    match topic {
+        None => true,
+        Some(t) => store.conn()
+            .query_row("SELECT topic FROM memories WHERE id = ?1", rusqlite::params![id], |row| row.get::<_, String>(0))
+            .map(|mem_topic| mem_topic == t)
+            .unwrap_or(false),
+    }
+}
+
+/// Rank results by position and filter by topic.
+fn rank_and_filter(results: Vec<(String, f32)>, store: &SqliteStore, topic: Option<&str>, limit: usize) -> Vec<(String, f32)> {
+    results.into_iter()
+        .filter(|(id, _)| matches_topic(store, id, topic))
+        .take(limit)
+        .enumerate()
+        .map(|(i, (id, _))| (id, -(i as f32)))
+        .collect()
+}
+
 /// Direct vector search using HNSW index first, falling back to sqlite-vec.
 fn vec_search_direct(
     store: &SqliteStore,
@@ -206,27 +267,7 @@ fn vec_search_direct(
     if let Ok(index) = crate::store::hnsw::HnswIndex::open(&hnsw_path, embedding.len()) {
         if !index.is_empty() {
             if let Ok(results) = index.search(embedding, limit * 2) {
-                let filtered: Vec<(String, f32)> = results
-                    .into_iter()
-                    .filter(|(id, _)| {
-                        if let Some(t) = topic {
-                            store
-                                .conn()
-                                .query_row(
-                                    "SELECT topic FROM memories WHERE id = ?1",
-                                    rusqlite::params![id],
-                                    |row| row.get::<_, String>(0),
-                                )
-                                .map(|mem_topic| mem_topic == t)
-                                .unwrap_or(false)
-                        } else {
-                            true
-                        }
-                    })
-                    .take(limit)
-                    .enumerate()
-                    .map(|(i, (id, _))| (id, -(i as f32)))
-                    .collect();
+                let filtered = rank_and_filter(results, store, topic, limit);
                 if !filtered.is_empty() {
                     return filtered;
                 }
@@ -236,29 +277,7 @@ fn vec_search_direct(
 
     // Fall back to sqlite-vec (brute-force O(n))
     match crate::store::vec::search_vec(store.conn(), embedding, limit) {
-        Ok(results) => {
-            let ranked: Vec<(String, f32)> = results
-                .into_iter()
-                .filter(|(id, _)| {
-                    if let Some(t) = topic {
-                        store
-                            .conn()
-                            .query_row(
-                                "SELECT topic FROM memories WHERE id = ?1",
-                                rusqlite::params![id],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .map(|mem_topic| mem_topic == t)
-                            .unwrap_or(false)
-                    } else {
-                        true
-                    }
-                })
-                .enumerate()
-                .map(|(i, (id, _))| (id, -(i as f32)))
-                .collect();
-            ranked
-        }
+        Ok(results) => rank_and_filter(results, store, topic, limit),
         Err(_) => vec![],
     }
 }
@@ -280,9 +299,11 @@ fn try_tantivy_then_fts5(
                     // Convert tantivy results to Memory objects
                     let mut memories = Vec::new();
                     let mut ranked = Vec::new();
-                    for (i, (id, _score)) in results.into_iter().enumerate() {
+                    for (i, (id, score)) in results.into_iter().enumerate() {
                         if let Ok(m) = store.get(&id) {
-                            ranked.push((m.id.clone(), -(i as f32)));
+                            // Preserve original score for CC fusion; use rank for RRF
+                            // Score is Tantivy BM25 relevance (positive float)
+                            ranked.push((m.id.clone(), if score > 0.0 { score } else { -(i as f32) }));
                             memories.push(m);
                         }
                     }
