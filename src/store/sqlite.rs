@@ -710,9 +710,19 @@ impl SqliteStore {
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
-        // Use per-cluster adaptive threshold if available (A1), falling back to caller's threshold
+        // Use per-cluster adaptive threshold if available (A1), falling back to caller's threshold.
+        // When the new memory has no cluster_id, infer from the most similar existing memory
+        // in the same topic (which likely shares the same semantic cluster).
         let effective_threshold = if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn) {
-            state.get_dedup_threshold(memory.cluster_id)
+            let cluster = memory.cluster_id.or_else(|| {
+                // Infer cluster from topic neighbors
+                self.conn.query_row(
+                    "SELECT cluster_id FROM memories WHERE topic = ?1 AND cluster_id IS NOT NULL LIMIT 1",
+                    rusqlite::params![&memory.topic],
+                    |row| row.get::<_, Option<u32>>(0),
+                ).ok().flatten()
+            });
+            state.get_dedup_threshold(cluster)
         } else {
             similarity_threshold
         };
