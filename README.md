@@ -10,19 +10,28 @@
 
 ## English
 
-rein is a lightweight, persistent memory system designed for AI coding agents. It stores, recalls, and manages memories across sessions with automatic deduplication, Ebbinghaus-inspired decay, and multi-source cross-validation.
+rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
 ### Features
 
 | Feature | Description |
 |---------|-------------|
 | **24 MCP tools** | 12 core memory tools + 10 knowledge graph tools + 2 temporal tools |
+| **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
+| **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights per query type (M2) |
+| **Per-cluster survival decay** | Kaplan-Meier curves replace fixed Ebbinghaus when sufficient data exists (M3) |
+| **HDBSCAN clustering** | Pure Rust semantic clustering with sampling for large datasets (M4) |
+| **Hot/Warm/Cold tiering** | Streaming quantile estimator + cold_archive migration (M5) |
+| **Adaptive dedup thresholds** | Per-cluster P90 similarity thresholds (SemDeDup-inspired, M6/A1) |
+| **Provenance-preserving dedup** | Merges preserve temporal anchors and unique details instead of hard-deleting |
+| **Embedding semantic dedup** | Catches paraphrases Jaccard misses, runs in GC slow channel (zero hot-path cost) |
 | **Temporal knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, revision history, episode nodes, temporal validity windows, BFS traversal (skips expired links) |
+| **Autonomous retrieval routing** | Query classifier routes to Temporal/ExactKeyword/Semantic/Exploratory strategy |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
-| **Dual-layer Ebbinghaus decay** | LTM / STM layers with configurable lambda, beta, and access-boosted retention |
+| **Dual-layer decay** | LTM / STM layers with KM survival curves (data-driven) or Ebbinghaus (cold-start) |
 | **Dual-path search** | FTS (Tantivy BM25 → FTS5 fallback) + Vector (HNSW cache → API embed) → RRF/CC fusion |
 | **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring |
-| **RRF / CC fusion** | Reciprocal Rank Fusion or Convex Combination (Bruch 2023), configurable per-source weights + path quality gating |
+| **RRF / CC fusion** | Reciprocal Rank Fusion or Convex Combination (Bruch 2023), with learned alpha weights |
 | **Multi-factor admission** | A-MAC 2026 inspired: llm_conf + novelty + type_prior + recency scoring |
 | **Semantic chunking** | Heading / paragraph / sentence splitting with metadata-prefixed embeddings |
 | **FTS5 unicode61 tokenizer** | Full-text search with CJK support, sub-millisecond latency |
@@ -218,6 +227,26 @@ rein automatically classifies queries and routes them to the optimal search stra
 | **Exploratory** | "what do I know about rein?" | Balanced (alpha=0.5), 2x result limit |
 
 Classification is rule-based (zero LLM calls, sub-microsecond). MCP responses include `[route: type]` prefix for transparency. Based on TA-Mem 2026 and MemR3 2025.
+
+### Adaptive Engine (v0.6.0+)
+
+rein's core philosophy: **zero subjective parameters** — all parameters are data-driven and self-adaptive. The adaptive engine runs during GC in a slow channel (zero recall latency impact).
+
+**Pipeline: M4 → M3 → M5 → M2 → M6**
+
+| Module | What it learns | How |
+|--------|---------------|-----|
+| **M1** Event Sourcing | *(foundation)* | Append-only feedback log + per-consumer offsets |
+| **M2** Alpha Optimizer | CC fusion weights | Counterfactual replay of past recalls with coarse-fine grid search |
+| **M3** Survival Analysis | Per-cluster decay curves | Kaplan-Meier estimator from access interval data |
+| **M4** HDBSCAN Clustering | Semantic neighborhoods | Pure Rust HDBSCAN (dendrogram → condensed tree → EOMBST) |
+| **M5** Tiering | Hot/Warm/Cold boundaries | Streaming quantile estimator (P25/P75) + cold_archive migration |
+| **M6** Threshold Explorer | Dedup thresholds | Randomized A/B exploration + causal inference + co-recall signal |
+
+**Also:**
+- **A1** Per-cluster adaptive dedup thresholds from intra-cluster similarity P90
+- **Embedding-based semantic dedup** in GC slow channel (catches paraphrases)
+- **Provenance-preserving merge** — temporal anchors and unique details never lost
 
 ### Configuration
 
@@ -433,7 +462,7 @@ Two independent search paths run in parallel, then merge:
 
 **Merge:**
 5. **RRF/CC fusion** -- Reciprocal Rank Fusion or Convex Combination merges text + vector results (path quality gating excludes empty paths)
-6. **Ebbinghaus scoring** -- `strength(t) = exp(-lambda_eff * days^beta)` weights final ranking + temporal filtering
+6. **Adaptive scoring** -- Per-cluster Kaplan-Meier survival curves (or Ebbinghaus cold-start fallback) weight final ranking + temporal filtering
 7. **Cross-validation** -- compare with Supermemory + auto-memory results, assign confidence
 
 #### Embedding Backends
@@ -524,20 +553,26 @@ This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, whi
 
 ### 项目简介
 
-rein 是一个轻量级的持久化记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，具备自动去重、基于艾宾浩斯遗忘曲线的衰减机制，以及多源交叉验证能力。
+rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，核心理念是**零主观参数** — 所有参数由数据驱动、自动学习，不需要人工调参。
 
 ### 核心特性
 
 | 特性 | 说明 |
 |------|------|
 | **24 个 MCP 工具** | 12 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 |
-| **时序知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，修订历史，Episode 节点，时间窗口，BFS 遍历（跳过过期链接） |
-| **OMLX 本地嵌入** | 可选本地嵌入后端，通过 EmbedderKind 枚举分发（Google / OMLX） |
-| **双层艾宾浩斯衰减** | LTM / STM 层，可配置 lambda、beta，访问次数越多衰减越慢 |
-| **四级瀑布搜索** | Tantivy BM25 → HNSW ANN → 缓存向量 → Google API |
+| **自适应引擎** | M1-M6 六模块：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
+| **反事实 Alpha 优化** | 回放历史 recall，粗细网格搜索最优 CC 融合权重（M2） |
+| **Per-cluster KM 衰减** | Kaplan-Meier 生存曲线替代固定遗忘曲线（数据足够时自动切换，M3） |
+| **HDBSCAN 语义聚类** | 纯 Rust 实现，dendrogram → 凝聚树 → EOMBST，大数据自动采样（M4） |
+| **Hot/Warm/Cold 分层** | 流式分位数估计器 + cold_archive 迁移（M5） |
+| **自适应去重阈值** | 基于簇内相似度 P90 计算（SemDeDup 风格，M6/A1） |
+| **保留来源的去重** | 合并时保留时间锚点和独特细节，不丢失信息 |
+| **嵌入语义去重** | 向量相似度捕捉文本相似度遗漏的改写，GC 慢通道执行 |
+| **时序知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，修订历史，Episode 节点，时间窗口 |
+| **自主检索路由** | 查询自动分类（时序/精确/语义/探索），自适应融合权重（TA-Mem 2026） |
+| **OMLX 本地嵌入** | 可选本地嵌入后端（Google / OMLX） |
+| **双路搜索** | Tantivy BM25 + HNSW ANN → RRF/CC 融合（学到的权重） |
 | **多源交叉验证** | 3 个来源（本地、Hook 提取、Supermemory）+ 置信度评分 |
-| **RRF / CC 融合** | 倒数排名融合或凸组合融合（Bruch 2023），路径质量门控 |
-| **自主检索路由** | 查询自动分类（时序/精确/语义/探索），自适应融合权重 + 搜索路径（TA-Mem 2026） |
 | **多因子准入控制** | A-MAC 2026：llm_conf + novelty + type_prior + recency 评分 |
 | **语义分块** | 按标题/段落/句子分割，嵌入时附加元数据前缀 |
 | **FTS5 unicode61 分词器** | 全文搜索，支持 CJK，亚毫秒级延迟 |
