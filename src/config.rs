@@ -41,6 +41,8 @@ pub struct ReinConfig {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub extract: ExtractConfig,
+    #[serde(default)]
+    pub adaptive: AdaptiveConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,7 +96,6 @@ pub struct SearchConfig {
     /// Alpha for CC fusion: score = alpha * sparse + (1-alpha) * dense. Default 0.5.
     #[serde(default = "default_cc_alpha")]
     pub cc_alpha: f64,
-    pub waterfall_fts_threshold: f64,
     pub dedup_similarity: f64,
     pub dedup_time_window_days: i64,
 }
@@ -123,6 +124,56 @@ pub struct SyncConfig {
 
 fn default_supermemory_endpoint() -> String {
     "https://api.supermemory.ai".to_string()
+}
+
+/// Configuration for the adaptive engine (M1-M5).
+/// All parameters here are operational settings, not model parameters —
+/// model parameters are learned from data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdaptiveConfig {
+    /// Enable the adaptive engine. Default true.
+    #[serde(default = "default_adaptive_enabled")]
+    pub enabled: bool,
+    /// Minimum accessed events per bucket before learning alpha. Default 10.
+    #[serde(default = "default_min_samples_alpha")]
+    pub min_samples_alpha: usize,
+    /// Minimum cluster sample count for survival curve. Default 20.
+    #[serde(default = "default_survival_cold_start")]
+    pub survival_cold_start: usize,
+    /// Minimum memories before enabling tiering. Default 100.
+    #[serde(default = "default_tier_cold_start")]
+    pub tier_cold_start: usize,
+    /// Event retention in days. Default 90.
+    #[serde(default = "default_event_retention_days")]
+    pub event_retention_days: u64,
+    /// Max alpha change per GC cycle. Default 0.15.
+    #[serde(default = "default_alpha_max_step")]
+    pub alpha_max_step: f64,
+    /// Bayesian shrinkage prior strength. Default 5.0.
+    #[serde(default = "default_shrinkage_prior")]
+    pub shrinkage_prior: f64,
+}
+
+fn default_adaptive_enabled() -> bool { true }
+fn default_min_samples_alpha() -> usize { 10 }
+fn default_survival_cold_start() -> usize { 20 }
+fn default_tier_cold_start() -> usize { 100 }
+fn default_event_retention_days() -> u64 { 90 }
+fn default_alpha_max_step() -> f64 { 0.15 }
+fn default_shrinkage_prior() -> f64 { 5.0 }
+
+impl Default for AdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_adaptive_enabled(),
+            min_samples_alpha: default_min_samples_alpha(),
+            survival_cold_start: default_survival_cold_start(),
+            tier_cold_start: default_tier_cold_start(),
+            event_retention_days: default_event_retention_days(),
+            alpha_max_step: default_alpha_max_step(),
+            shrinkage_prior: default_shrinkage_prior(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,6 +275,7 @@ impl Default for ReinConfig {
             server: ServerConfig::default(),
             hooks: HooksConfig::default(),
             extract: ExtractConfig::default(),
+            adaptive: AdaptiveConfig::default(),
         }
     }
 }
@@ -274,7 +326,6 @@ impl Default for SearchConfig {
             rrf_vec_weight: 0.7,
             fusion_method: "rrf".to_string(),
             cc_alpha: 0.5,
-            waterfall_fts_threshold: 0.5,
             dedup_similarity: 0.70,
             dedup_time_window_days: 7,
         }

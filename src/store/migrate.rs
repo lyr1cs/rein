@@ -133,6 +133,8 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
                 concept_ids: vec![],
                 status: MemoryStatus::default(),
                 embedding,
+                tier: "warm".to_string(),
+                cluster_id: None,
                 created_at: now,
                 updated_at: now,
                 last_accessed: now,

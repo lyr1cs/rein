@@ -101,8 +101,25 @@ pub fn recall_temporal(
     let fts_for_fusion = if use_fts { fts_ranked } else { vec![] };
     let vec_for_fusion = if use_vec { vec_ranked } else { vec![] };
 
+    // === Adaptive alpha (M2): read from AdaptiveState if available ===
+    let adaptive_alpha = if config.adaptive.enabled {
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+            .and_then(|s| {
+                let qt = format!("{}", strategy.query_type);
+                s.get_alpha(&qt, None) // cluster_id: None until M4 integration
+            })
+    } else {
+        None
+    };
+
+    // Capture normalized scores for M2 counterfactual logging (before fusion consumes them)
+    let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion.iter().cloned().collect();
+    let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion.iter().cloned().collect();
+
     let fused = if config.search.fusion_method == "cc" {
-        let alpha = strategy.cc_alpha.unwrap_or(config.search.cc_alpha as f32);
+        let alpha = adaptive_alpha
+            .or(strategy.cc_alpha)
+            .unwrap_or(config.search.cc_alpha as f32);
         crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha)
     } else {
         let rrf_k = config.search.rrf_k as f32;
@@ -228,14 +245,48 @@ pub fn recall_temporal(
         .collect();
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
+    if config.adaptive.enabled {
+        let request_id = ulid::Ulid::new().to_string();
+        let candidates: Vec<serde_json::Value> = results.iter()
+            .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
+            .map(|r| {
+                let bm25 = fts_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
+                let vec = vec_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
+                serde_json::json!({
+                    "id": r.memory.id,
+                    "bm25_norm": bm25,
+                    "vec_norm": vec,
+                    "final_score": r.score,
+                })
+            })
+            .collect();
+        let alpha_used = adaptive_alpha
+            .or(strategy.cc_alpha)
+            .unwrap_or(config.search.cc_alpha as f32);
+        let _ = crate::store::adaptive::emit_event(store.conn(), crate::store::adaptive::FeedbackEvent {
+            event_type: crate::store::adaptive::EventType::RecallComplete,
+            request_id: Some(request_id),
+            memory_id: None,
+            concept_id: None,
+            query: Some(query.chars().take(200).collect()),
+            query_type: Some(format!("{}", strategy.query_type)),
+            topic: topic.map(|t| t.to_string()),
+            payload: Some(serde_json::json!({
+                "candidates": candidates,
+                "alpha_used": alpha_used,
+                "fusion_method": &config.search.fusion_method,
+                "result_count": results.len(),
+            })),
+        });
+    }
+
     // Truncate to the caller's requested limit (not effective_limit).
-    // limit_multiplier only expands internal candidate pools, not the public response.
     results.truncate(limit);
 
     // Record recall hit (NOT access — access should only be counted when
     // the agent/user actually uses the memory, not just when it's returned).
-    // This separation is critical for the quality feedback loop:
-    // "bad" = recalled many times but never accessed = low quality.
     let recall_ids: Vec<String> = results.iter()
         .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
         .map(|r| r.memory.id.clone())

@@ -26,10 +26,18 @@ pub struct Memory {
     pub status: MemoryStatus,
     #[serde(skip)]
     pub embedding: Option<Vec<f32>>,
+    /// Memory tier: hot, warm, cold (M5 adaptive tiering)
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    /// Cluster assignment from HDBSCAN (M4)
+    #[serde(default)]
+    pub cluster_id: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
 }
+
+fn default_tier() -> String { "warm".to_string() }
 
 /// Lifecycle status of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
