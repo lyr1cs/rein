@@ -239,6 +239,7 @@ fn test_dot_export_cjk() {
         source_memory_ids: vec![],
         confidence: 0.9,
         revision: 1,
+        last_episode_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -253,6 +254,7 @@ fn test_dot_export_cjk() {
         source_memory_ids: vec![],
         confidence: 0.8,
         revision: 1,
+        last_episode_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

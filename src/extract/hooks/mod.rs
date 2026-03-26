@@ -300,9 +300,48 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         let kg_report = store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
             .unwrap_or_default();
 
+        // Collect concept IDs from this session's knowledge graph
+        let session_concept_ids: Vec<String> = result.concepts.iter()
+            .filter_map(|c| {
+                store.get_concept(&c.memoir, &c.name).ok().flatten().map(|con| con.id)
+            })
+            .collect();
+
         if let Some(ref ep) = result.episode {
+            // Create proper Episode node in temporal graph
+            let episode = crate::types::Episode {
+                id: String::new(),
+                title: ep.title.clone(),
+                outcome: ep.outcome.clone(),
+                decisions: ep.decisions.clone(),
+                concept_ids: session_concept_ids.clone(),
+                memory_ids: memory_ids.clone(),
+                created_at: chrono::Utc::now(),
+            };
+            match store.create_episode(episode) {
+                Ok(episode_id) => {
+                    // Update concepts with episode reference
+                    for cid in &session_concept_ids {
+                        let _ = store.conn().execute(
+                            "UPDATE concepts SET last_episode_id = ?1 WHERE id = ?2",
+                            rusqlite::params![episode_id, cid],
+                        );
+                        // Also update any revision snapshots created in this session
+                        // (they were recorded with the old episode_id; fix to reference this episode)
+                        let _ = store.conn().execute(
+                            "UPDATE concept_revisions SET episode_id = ?1 WHERE concept_id = ?2 AND episode_id IS NULL",
+                            rusqlite::params![episode_id, cid],
+                        );
+                    }
+                    tracing::debug!("created episode {episode_id} with {} concepts, {} memories",
+                        session_concept_ids.len(), memory_ids.len());
+                }
+                Err(e) => tracing::warn!("failed to create episode: {e}"),
+            }
+
+            // Also store as concept in "sessions" memoir for backward compatibility
             if let Err(e) = store_episode_concept(&store, ep) {
-                tracing::warn!("failed to store episode: {e}");
+                tracing::warn!("failed to store episode concept: {e}");
             }
         }
 
@@ -328,8 +367,19 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
 
         if !extracted.is_empty() {
             let store = config.open_store()?;
-            let (stored, _) = store_extracted(&store, config, extracted);
+            let (stored, memory_ids) = store_extracted(&store, config, extracted);
             if stored > 0 {
+                // Create Episode for non-LLM path too
+                let episode = crate::types::Episode {
+                    id: String::new(),
+                    title: format!("Session (rule-based, {} memories)", stored),
+                    outcome: String::new(),
+                    decisions: vec![],
+                    concept_ids: vec![],
+                    memory_ids,
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = store.create_episode(episode);
                 eprintln!("rein: saved {stored} memories from session");
             }
         }

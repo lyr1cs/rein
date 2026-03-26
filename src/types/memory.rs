@@ -240,11 +240,14 @@ pub struct Concept {
     pub source_memory_ids: Vec<String>,
     pub confidence: f32,
     pub revision: u32,
+    /// Last episode that modified this concept.
+    #[serde(default)]
+    pub last_episode_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// A typed relation between two concepts.
+/// A typed relation between two concepts, with optional temporal validity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConceptLink {
     pub id: String,
@@ -252,6 +255,40 @@ pub struct ConceptLink {
     pub target_id: String,
     pub relation: Relation,
     pub weight: f32,
+    pub created_at: DateTime<Utc>,
+    /// When this relationship became valid (None = since creation).
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// When this relationship was invalidated (None = still active).
+    #[serde(default)]
+    pub valid_until: Option<DateTime<Utc>>,
+}
+
+/// A historical snapshot of a concept's state at a given revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptRevision {
+    pub id: String,
+    pub concept_id: String,
+    pub revision: u32,
+    pub definition: String,
+    pub confidence: f32,
+    pub labels: Vec<String>,
+    pub source_memory_ids: Vec<String>,
+    pub episode_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A session episode node in the temporal knowledge graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Episode {
+    pub id: String,
+    pub title: String,
+    pub outcome: String,
+    pub decisions: Vec<String>,
+    /// Concept IDs touched in this session.
+    pub concept_ids: Vec<String>,
+    /// Memory IDs created in this session.
+    pub memory_ids: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 

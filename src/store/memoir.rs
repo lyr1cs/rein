@@ -62,6 +62,8 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| ReinError::Config(format!("invalid updated_at: {e}")))?;
 
+    let last_episode_id: Option<String> = row.get("last_episode_id").unwrap_or(None);
+
     Ok(Concept {
         id,
         memoir_id,
@@ -71,6 +73,7 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
         source_memory_ids,
         confidence,
         revision,
+        last_episode_id,
         created_at,
         updated_at,
     })
@@ -92,6 +95,13 @@ fn row_to_link(row: &rusqlite::Row) -> ReinResult<ConceptLink> {
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| ReinError::Config(format!("invalid created_at: {e}")))?;
 
+    let valid_from: Option<DateTime<Utc>> = row.get::<_, Option<String>>("valid_from")
+        .unwrap_or(None)
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+    let valid_until: Option<DateTime<Utc>> = row.get::<_, Option<String>>("valid_until")
+        .unwrap_or(None)
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+
     Ok(ConceptLink {
         id,
         source_id,
@@ -99,6 +109,8 @@ fn row_to_link(row: &rusqlite::Row) -> ReinResult<ConceptLink> {
         relation,
         weight,
         created_at,
+        valid_from,
+        valid_until,
     })
 }
 
@@ -268,6 +280,24 @@ impl SqliteStore {
             .get_memoir(memoir_name)?
             .ok_or_else(|| ReinError::NotFound(format!("memoir '{memoir_name}' not found")))?;
 
+        // Snapshot current state as a revision before overwriting
+        if let Some(old) = self.get_concept(memoir_name, concept_name)? {
+            let rev_id = ulid::Ulid::new().to_string();
+            let labels_json = serde_json::to_string(&old.labels).unwrap_or_default();
+            let source_json = serde_json::to_string(&old.source_memory_ids).unwrap_or_default();
+            if let Err(e) = self.conn().execute(
+                "INSERT INTO concept_revisions (id, concept_id, revision, definition, confidence, labels, source_memory_ids, episode_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    rev_id, old.id, old.revision, old.definition, old.confidence,
+                    labels_json, source_json, old.last_episode_id,
+                    old.updated_at.to_rfc3339(),
+                ],
+            ) {
+                tracing::warn!("failed to snapshot concept revision for '{}': {e}", concept_name);
+            }
+        }
+
         let now = Utc::now();
         let rows = self.conn().execute(
             "UPDATE concepts
@@ -411,9 +441,12 @@ impl SqliteStore {
         };
         let now = Utc::now();
 
+        let valid_from = link.valid_from.unwrap_or(now).to_rfc3339();
+        let valid_until = link.valid_until.map(|dt| dt.to_rfc3339());
+
         self.conn().execute(
-            "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at, valid_from, valid_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 id,
                 link.source_id,
@@ -421,10 +454,21 @@ impl SqliteStore {
                 link.relation.to_string(),
                 link.weight,
                 now.to_rfc3339(),
+                valid_from,
+                valid_until,
             ],
         )?;
 
         Ok(id)
+    }
+
+    /// Expire a link by setting its valid_until timestamp.
+    pub fn expire_link(&self, link_id: &str, valid_until: DateTime<Utc>) -> ReinResult<()> {
+        self.conn().execute(
+            "UPDATE concept_links SET valid_until = ?1 WHERE id = ?2",
+            rusqlite::params![valid_until.to_rfc3339(), link_id],
+        )?;
+        Ok(())
     }
 
     /// Get all links originating from a concept.
@@ -508,9 +552,14 @@ impl SqliteStore {
                 continue;
             }
 
-            // Get outgoing links
+            let now = Utc::now();
+
+            // Get outgoing links (skip temporally expired links)
             let outgoing = self.get_links_from(&current_id)?;
             for link in outgoing {
+                if let Some(until) = link.valid_until {
+                    if until < now { continue; } // expired link
+                }
                 links.push(link.clone());
                 if !visited.contains(&link.target_id) {
                     visited.insert(link.target_id.clone());
@@ -521,9 +570,12 @@ impl SqliteStore {
                 }
             }
 
-            // Get incoming links
+            // Get incoming links (skip temporally expired links)
             let incoming = self.get_links_to(&current_id)?;
             for link in incoming {
+                if let Some(until) = link.valid_until {
+                    if until < now { continue; }
+                }
                 links.push(link.clone());
                 if !visited.contains(&link.source_id) {
                     visited.insert(link.source_id.clone());
@@ -769,6 +821,168 @@ impl SqliteStore {
             })
             .collect())
     }
+    // --- Episode CRUD ---
+
+    /// Create a new episode node. Returns the generated ID.
+    pub fn create_episode(&self, episode: Episode) -> ReinResult<String> {
+        let id = if episode.id.is_empty() { ulid::Ulid::new().to_string() } else { episode.id };
+        let decisions_json = serde_json::to_string(&episode.decisions).unwrap_or_default();
+        let concept_ids_json = serde_json::to_string(&episode.concept_ids).unwrap_or_default();
+        let memory_ids_json = serde_json::to_string(&episode.memory_ids).unwrap_or_default();
+        let now = Utc::now();
+
+        self.conn().execute(
+            "INSERT INTO episodes (id, title, outcome, decisions, concept_ids, memory_ids, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, episode.title, episode.outcome, decisions_json, concept_ids_json, memory_ids_json, now.to_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
+    /// Get an episode by ID.
+    pub fn get_episode(&self, id: &str) -> ReinResult<Option<Episode>> {
+        let result = self.conn().query_row(
+            "SELECT * FROM episodes WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                let decisions_json: String = row.get("decisions")?;
+                let concept_ids_json: String = row.get("concept_ids")?;
+                let memory_ids_json: String = row.get("memory_ids")?;
+                let created_at_str: String = row.get("created_at")?;
+                Ok(Episode {
+                    id: row.get("id")?,
+                    title: row.get("title")?,
+                    outcome: row.get("outcome")?,
+                    decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
+                    concept_ids: serde_json::from_str(&concept_ids_json).unwrap_or_default(),
+                    memory_ids: serde_json::from_str(&memory_ids_json).unwrap_or_default(),
+                    created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            },
+        );
+        match result {
+            Ok(ep) => Ok(Some(ep)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(ReinError::Database(e)),
+        }
+    }
+
+    /// List recent episodes.
+    pub fn list_episodes(&self, limit: usize) -> ReinResult<Vec<Episode>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT * FROM episodes ORDER BY created_at DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit], |row| {
+            let decisions_json: String = row.get("decisions")?;
+            let concept_ids_json: String = row.get("concept_ids")?;
+            let memory_ids_json: String = row.get("memory_ids")?;
+            let created_at_str: String = row.get("created_at")?;
+            Ok(Episode {
+                id: row.get("id")?,
+                title: row.get("title")?,
+                outcome: row.get("outcome")?,
+                decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
+                concept_ids: serde_json::from_str(&concept_ids_json).unwrap_or_default(),
+                memory_ids: serde_json::from_str(&memory_ids_json).unwrap_or_default(),
+                created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get episodes in a time range.
+    pub fn get_episodes_in_range(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> ReinResult<Vec<Episode>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT * FROM episodes WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![from.to_rfc3339(), to.to_rfc3339()], |row| {
+            let decisions_json: String = row.get("decisions")?;
+            let concept_ids_json: String = row.get("concept_ids")?;
+            let memory_ids_json: String = row.get("memory_ids")?;
+            let created_at_str: String = row.get("created_at")?;
+            Ok(Episode {
+                id: row.get("id")?,
+                title: row.get("title")?,
+                outcome: row.get("outcome")?,
+                decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
+                concept_ids: serde_json::from_str(&concept_ids_json).unwrap_or_default(),
+                memory_ids: serde_json::from_str(&memory_ids_json).unwrap_or_default(),
+                created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // --- Concept Revision History ---
+
+    /// Get revision history for a concept.
+    pub fn get_concept_history(&self, memoir_name: &str, concept_name: &str, limit: usize) -> ReinResult<Vec<ConceptRevision>> {
+        let concept = self.get_concept(memoir_name, concept_name)?
+            .ok_or_else(|| ReinError::NotFound(format!("concept '{concept_name}' not found")))?;
+
+        let mut stmt = self.conn().prepare(
+            "SELECT * FROM concept_revisions WHERE concept_id = ?1 ORDER BY revision DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![concept.id, limit], |row| {
+            let labels_json: String = row.get("labels")?;
+            let source_json: String = row.get("source_memory_ids")?;
+            let created_at_str: String = row.get("created_at")?;
+            Ok(ConceptRevision {
+                id: row.get("id")?,
+                concept_id: row.get("concept_id")?,
+                revision: row.get("revision")?,
+                definition: row.get("definition")?,
+                confidence: row.get("confidence")?,
+                labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                source_memory_ids: serde_json::from_str(&source_json).unwrap_or_default(),
+                episode_id: row.get("episode_id").unwrap_or(None),
+                created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get the concept state at a specific point in time.
+    pub fn get_concept_at(&self, memoir_name: &str, concept_name: &str, at: DateTime<Utc>) -> ReinResult<Option<ConceptRevision>> {
+        let concept = self.get_concept(memoir_name, concept_name)?
+            .ok_or_else(|| ReinError::NotFound(format!("concept '{concept_name}' not found")))?;
+
+        let result = self.conn().query_row(
+            "SELECT * FROM concept_revisions WHERE concept_id = ?1 AND created_at <= ?2 ORDER BY revision DESC LIMIT 1",
+            rusqlite::params![concept.id, at.to_rfc3339()],
+            |row| {
+                let labels_json: String = row.get("labels")?;
+                let source_json: String = row.get("source_memory_ids")?;
+                let created_at_str: String = row.get("created_at")?;
+                Ok(ConceptRevision {
+                    id: row.get("id")?,
+                    concept_id: row.get("concept_id")?,
+                    revision: row.get("revision")?,
+                    definition: row.get("definition")?,
+                    confidence: row.get("confidence")?,
+                    labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                    source_memory_ids: serde_json::from_str(&source_json).unwrap_or_default(),
+                    episode_id: row.get("episode_id").unwrap_or(None),
+                    created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            },
+        );
+        match result {
+            Ok(rev) => Ok(Some(rev)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(ReinError::Database(e)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +1009,7 @@ mod tests {
             source_memory_ids: vec![],
             confidence: 0.5,
             revision: 1,
+            last_episode_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -861,6 +1076,8 @@ mod tests {
             relation: Relation::RelatedTo,
             weight: 1.0,
             created_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
         };
         store.add_link(link).unwrap();
 
@@ -890,6 +1107,8 @@ mod tests {
             relation: Relation::RelatedTo,
             weight: 1.0,
             created_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
         }).unwrap();
         store.add_link(ConceptLink {
             id: String::new(),
@@ -898,6 +1117,8 @@ mod tests {
             relation: Relation::DependsOn,
             weight: 1.0,
             created_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
         }).unwrap();
 
         // depth=1 from ownership should find borrowing but not lifetimes
@@ -929,6 +1150,8 @@ mod tests {
             relation: Relation::RelatedTo,
             weight: 1.0,
             created_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
         }).unwrap();
 
         let json = store.export_memoir("rust-lang", "json").unwrap();
@@ -952,6 +1175,8 @@ mod tests {
             relation: Relation::RelatedTo,
             weight: 1.0,
             created_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
         }).unwrap();
 
         // Delete memoir
@@ -990,5 +1215,125 @@ mod tests {
         assert!(!results.is_empty());
         // "ownership" appears in both concepts, but the one named "ownership" should be there
         assert!(results.iter().any(|c| c.name == "ownership"));
+    }
+
+    #[test]
+    fn test_concept_revision_history() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memoir_id = store.create_memoir(make_memoir("test", "Test")).unwrap();
+        store.add_concept(make_concept(&memoir_id, "ownership", "Original definition")).unwrap();
+
+        // Refine twice — should create 2 revision snapshots
+        store.refine_concept("test", "ownership", "Refined definition v2").unwrap();
+        store.refine_concept("test", "ownership", "Refined definition v3").unwrap();
+
+        let history = store.get_concept_history("test", "ownership", 10).unwrap();
+        assert_eq!(history.len(), 2, "Should have 2 revisions");
+        assert_eq!(history[0].revision, 2); // most recent first
+        assert_eq!(history[1].revision, 1);
+        assert!(history[1].definition.contains("Original"));
+
+        // Current concept should be at r3
+        let current = store.get_concept("test", "ownership").unwrap().unwrap();
+        assert_eq!(current.revision, 3);
+        assert!(current.definition.contains("v3"));
+    }
+
+    #[test]
+    fn test_concept_at_point_in_time() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memoir_id = store.create_memoir(make_memoir("test", "Test")).unwrap();
+        store.add_concept(make_concept(&memoir_id, "api", "REST API v1")).unwrap();
+        store.refine_concept("test", "api", "GraphQL API v2").unwrap();
+
+        // get_concept_at with future time should return the latest revision
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let rev = store.get_concept_at("test", "api", future).unwrap();
+        assert!(rev.is_some());
+        assert!(rev.unwrap().definition.contains("REST")); // revision 1 (the snapshot)
+    }
+
+    #[test]
+    fn test_episode_crud() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let episode = Episode {
+            id: String::new(),
+            title: "Test session".to_string(),
+            outcome: "Built FT-2".to_string(),
+            decisions: vec!["Use SAVEPOINT".to_string()],
+            concept_ids: vec!["c1".to_string()],
+            memory_ids: vec!["m1".to_string(), "m2".to_string()],
+            created_at: Utc::now(),
+        };
+        let ep_id = store.create_episode(episode).unwrap();
+        assert!(!ep_id.is_empty());
+
+        // Get by ID
+        let fetched = store.get_episode(&ep_id).unwrap().unwrap();
+        assert_eq!(fetched.title, "Test session");
+        assert_eq!(fetched.decisions.len(), 1);
+        assert_eq!(fetched.memory_ids.len(), 2);
+
+        // List
+        let episodes = store.list_episodes(10).unwrap();
+        assert_eq!(episodes.len(), 1);
+    }
+
+    #[test]
+    fn test_episodes_in_range() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Create episode
+        let episode = Episode {
+            id: String::new(),
+            title: "Today's session".to_string(),
+            outcome: String::new(),
+            decisions: vec![],
+            concept_ids: vec![],
+            memory_ids: vec![],
+            created_at: Utc::now(),
+        };
+        store.create_episode(episode).unwrap();
+
+        // Range query: last 24 hours should find it
+        let from = Utc::now() - chrono::Duration::hours(1);
+        let to = Utc::now() + chrono::Duration::hours(1);
+        let results = store.get_episodes_in_range(from, to).unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Range query: yesterday should find nothing
+        let old_from = Utc::now() - chrono::Duration::days(2);
+        let old_to = Utc::now() - chrono::Duration::days(1);
+        let results = store.get_episodes_in_range(old_from, old_to).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_temporal_link_expiry() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memoir_id = store.create_memoir(make_memoir("test", "Test")).unwrap();
+
+        let c1_id = store.add_concept(make_concept(&memoir_id, "a", "Concept A")).unwrap();
+        let c2_id = store.add_concept(make_concept(&memoir_id, "b", "Concept B")).unwrap();
+
+        let link_id = store.add_link(ConceptLink {
+            id: String::new(),
+            source_id: c1_id.clone(),
+            target_id: c2_id.clone(),
+            relation: Relation::RelatedTo,
+            weight: 1.0,
+            created_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
+        }).unwrap();
+
+        // Expire the link
+        store.expire_link(&link_id, Utc::now()).unwrap();
+
+        // BFS should skip expired link
+        let (_, neighbors, links) = store.inspect_concept("test", "a", 1).unwrap();
+        assert!(neighbors.is_empty(), "Expired link should be skipped in BFS");
+        assert!(links.is_empty(), "Expired link should not appear in results");
     }
 }

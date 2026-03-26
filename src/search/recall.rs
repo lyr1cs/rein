@@ -27,6 +27,20 @@ pub fn recall(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
+    recall_temporal(store, config, query, topic, keyword, limit, None, None)
+}
+
+/// Full recall pipeline with optional temporal filtering.
+pub fn recall_temporal(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    query: &str,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    limit: usize,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ReinResult<Vec<RecallResult>> {
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
 
@@ -88,10 +102,20 @@ pub fn recall(
         }
     }
 
-    // Apply Ebbinghaus weighting
+    // Apply Ebbinghaus weighting + temporal filter
+    // When temporal filters are active, don't truncate early — need to scan all fused results
+    let has_temporal = time_from.is_some() || time_to.is_some();
+    let take_count = if has_temporal { usize::MAX } else { limit * 2 };
     let mut local_results: Vec<(Memory, f32)> = Vec::new();
-    for (id, rrf_score) in fused.into_iter().take(limit * 2) {
+    for (id, rrf_score) in fused.into_iter().take(take_count) {
         if let Some(memory) = memory_map.remove(&id) {
+            // Temporal filter: skip memories outside the requested time range
+            if let Some(from) = time_from {
+                if memory.created_at < from { continue; }
+            }
+            if let Some(to) = time_to {
+                if memory.created_at > to { continue; }
+            }
             let final_score = crate::search::scoring::apply_strength_weighting(rrf_score, &memory);
             local_results.push((memory, final_score));
         }
