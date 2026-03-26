@@ -518,8 +518,8 @@ impl MemoryStore for SqliteStore {
     }
 
     fn consolidate(&self, topic: &str) -> ReinResult<Vec<Memory>> {
-        // Use a transaction to ensure atomicity: either all delete or nothing
-        self.conn.execute_batch("BEGIN TRANSACTION")?;
+        // Use SAVEPOINT for nesting safety (may be called within an existing transaction)
+        self.conn.execute_batch("SAVEPOINT consolidate")?;
 
         // Collect all memories for the topic
         let memories: Vec<Memory> = {
@@ -543,7 +543,7 @@ impl MemoryStore for SqliteStore {
             "DELETE FROM memories WHERE topic = ?1",
             rusqlite::params![topic],
         ) {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let _ = self.conn.execute_batch("ROLLBACK TO consolidate; RELEASE consolidate");
             return Err(e.into());
         }
 
@@ -553,7 +553,7 @@ impl MemoryStore for SqliteStore {
             self.remove_from_hnsw(&m.id);
         }
 
-        self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch("RELEASE consolidate")?;
         Ok(memories)
     }
 
