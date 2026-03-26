@@ -3,9 +3,7 @@ pub mod recall;
 pub mod rrf;
 pub mod scoring;
 pub mod warmup;
-pub mod waterfall;
 
 pub use chunker::semantic_chunk;
-pub use rrf::reciprocal_rank_fusion;
+pub use rrf::{convex_combination, reciprocal_rank_fusion};
 pub use scoring::{apply_strength_weighting, calculate_strength};
-pub use waterfall::{waterfall_search, SearchResult, SearchSource};

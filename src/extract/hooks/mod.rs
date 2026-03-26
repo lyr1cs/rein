@@ -17,25 +17,78 @@ use self::buffer::*;
 use self::parsing::*;
 use self::scoring::*;
 
+/// Escape a string for safe XML/HTML embedding.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Compute adaptive admission threshold from recent quality data.
 /// Base = 0.2. Adjusts up if recent quality is low, down if high.
 fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
     let base = 0.2;
-    // Read recent average quality from metadata
     let recent_avg: f64 = store.conn()
         .query_row(
-            "SELECT COALESCE(AVG(strength), 0.5) FROM memories ORDER BY created_at DESC LIMIT 100",
+            "SELECT COALESCE(AVG(strength), 0.5) FROM (SELECT strength FROM memories ORDER BY created_at DESC LIMIT 100)",
             [],
             |r| r.get(0),
         ).unwrap_or(0.5);
 
     if recent_avg < 0.4 {
-        (base * 1.1_f64).min(0.60) // quality low → raise bar
+        (base * 1.1_f64).min(0.60)
     } else if recent_avg > 0.7 {
-        (base * 0.9_f64).max(0.15) // quality high → relax
+        (base * 0.9_f64).max(0.15)
     } else {
         base
     }
+}
+
+/// Multi-factor admission score (A-MAC 2026 inspired).
+/// Decomposes single quality_confidence into interpretable sub-factors:
+///   admission = w1*llm_conf + w2*novelty + w3*type_prior + w4*recency
+/// Returns a score in [0, 1]. Higher = more worth storing.
+fn multi_factor_admission_score(
+    store: &crate::store::SqliteStore,
+    item: &ExtractedMemory,
+) -> f64 {
+    // Factor 1: LLM confidence (already provided by extraction)
+    let llm_conf = item.quality_confidence;
+
+    // Factor 2: Novelty — how different is this from existing memories in the same topic?
+    // High similarity to existing = low novelty = less worth storing
+    let novelty = {
+        let existing = store.get_by_topic(&item.topic).unwrap_or_default();
+        if existing.is_empty() {
+            1.0 // first memory in topic → fully novel
+        } else {
+            let max_sim = existing.iter()
+                .map(|m| crate::extract::similarity(&item.content, &m.content))
+                .fold(0.0_f32, f32::max);
+            (1.0 - max_sim as f64).max(0.0) // invert: high sim → low novelty
+        }
+    };
+
+    // Factor 3: Content-type prior — some topics are inherently more valuable
+    let type_prior = {
+        let t = item.topic.to_lowercase();
+        if ["architecture", "decision", "design"].iter().any(|k| t.contains(k)) {
+            0.9
+        } else if ["workflow", "deployment", "config"].iter().any(|k| t.contains(k)) {
+            0.7
+        } else if ["debug", "error", "fix"].iter().any(|k| t.contains(k)) {
+            0.5
+        } else {
+            0.6 // default
+        }
+    };
+
+    // Factor 4: Recency boost (recent extractions slightly favored)
+    let recency = 0.7; // constant for now — all new extractions are "recent"
+
+    // Hard floor: if LLM explicitly rates confidence near zero, don't override
+    if llm_conf < 0.05 { return 0.0; }
+
+    // Weighted combination (weights sum to 1.0)
+    0.45 * llm_conf + 0.25 * novelty + 0.15 * type_prior + 0.15 * recency
 }
 
 /// Store a list of ExtractedMemory items into the database.
@@ -50,11 +103,12 @@ fn store_extracted(
     for item in items {
         if looks_like_secret(&item.content) { continue; }
 
-        // Admission control: adaptive threshold based on recent quality
+        // Multi-factor admission control (A-MAC 2026)
         let threshold = adaptive_admission_threshold(store);
-        if item.quality_confidence < threshold {
-            tracing::debug!("skipping low-quality memory (confidence={:.2} < threshold={:.2}): {}",
-                item.quality_confidence, threshold, item.summary);
+        let admission = multi_factor_admission_score(store, &item);
+        if admission < threshold {
+            tracing::debug!("skipping low-quality memory (admission={:.2} < threshold={:.2}): {}",
+                admission, threshold, item.summary);
             continue;
         }
 
@@ -87,6 +141,9 @@ fn store_extracted(
             config.search.dedup_similarity as f32,
             config.search.dedup_time_window_days,
         ) {
+            // Post-processing: sync on same connection.
+            // Hooks run as short-lived CLI processes — detached threads would be
+            // killed on exit. Keep sync to ensure completion within hook timeout.
             let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
             let _ = store.activate_related_memories(&content_for_activation, 3);
             let _ = store.activate_related_concepts(&content_for_activation);
@@ -180,16 +237,11 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     let mut ranked: Vec<(f32, String, String)> = Vec::new();
     for m in &memories {
         let sim = crate::extract::similarity(query, &m.content);
-        let safe_topic = m.topic.replace('<', "&lt;").replace('>', "&gt;");
-        let safe_summary = m.summary.replace('<', "&lt;").replace('>', "&gt;");
-        let safe_content = m.content.replace('<', "&lt;").replace('>', "&gt;");
-        ranked.push((sim, format!("[{}] {}", safe_topic, safe_summary), safe_content));
+        ranked.push((sim, format!("[{}] {}", xml_escape(&m.topic), xml_escape(&m.summary)), xml_escape(&m.content)));
     }
     for c in &concepts {
         let sim = crate::extract::similarity(query, &c.definition);
-        let safe_name = c.name.replace('<', "&lt;").replace('>', "&gt;");
-        let safe_def = c.definition.replace('<', "&lt;").replace('>', "&gt;");
-        ranked.push((sim, format!("[concept] {}", safe_name), safe_def));
+        ranked.push((sim, format!("[concept] {}", xml_escape(&c.name)), xml_escape(&c.definition)));
     }
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(8);

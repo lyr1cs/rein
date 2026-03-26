@@ -26,6 +26,27 @@ impl SqliteStore {
         links: &[crate::extract::ExtractedLink],
         source_memory_ids: &[String],
     ) -> ReinResult<super::KnowledgeStoreReport> {
+        // Wrap in savepoint for atomicity — many DB writes follow
+        self.conn.execute_batch("SAVEPOINT knowledge_units")
+            .map_err(crate::types::ReinError::Database)?;
+        let result = self.store_knowledge_units_inner(concepts, links, source_memory_ids);
+        match &result {
+            Ok(_) => { self.conn.execute_batch("RELEASE knowledge_units")
+                .map_err(crate::types::ReinError::Database)?; }
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO knowledge_units");
+                let _ = self.conn.execute_batch("RELEASE knowledge_units");
+            }
+        }
+        result
+    }
+
+    fn store_knowledge_units_inner(
+        &self,
+        concepts: &[crate::extract::ExtractedConcept],
+        links: &[crate::extract::ExtractedLink],
+        source_memory_ids: &[String],
+    ) -> ReinResult<super::KnowledgeStoreReport> {
         let mut report = super::KnowledgeStoreReport::default();
 
         // Group concepts by memoir
@@ -173,51 +194,58 @@ impl SqliteStore {
         let similar = self.search_fts(new_content, None, 5)?;
         let mut evolved = 0usize;
 
-        for old in &similar {
-            if old.id == new_id { continue; }
-            if old.superseded_by.is_some() { continue; }
+        // Wrap in savepoint — multiple UPDATEs should be atomic
+        self.conn.execute_batch("SAVEPOINT evolution")
+            .map_err(crate::types::ReinError::Database)?;
 
-            // Use embedding cosine similarity if available, fall back to Jaccard
-            let sim = if let Some(new_emb) = new_embedding {
-                // Try vector similarity via HNSW cache
-                if let Ok(vec_results) = self.search_vec(new_emb, None, 5) {
-                    vec_results.iter()
-                        .find(|m| m.id == old.id)
-                        .map(|_| 0.85f32) // found in top-5 vector results → high similarity
-                        .unwrap_or_else(|| crate::extract::similarity(new_content, &old.content))
+        let result = (|| -> ReinResult<usize> {
+            for old in &similar {
+                if old.id == new_id { continue; }
+                if old.superseded_by.is_some() { continue; }
+
+                let sim = if let Some(new_emb) = new_embedding {
+                    if let Ok(vec_results) = self.search_vec(new_emb, None, 5) {
+                        vec_results.iter()
+                            .find(|m| m.id == old.id)
+                            .map(|_| 0.85f32)
+                            .unwrap_or_else(|| crate::extract::similarity(new_content, &old.content))
+                    } else {
+                        crate::extract::similarity(new_content, &old.content)
+                    }
                 } else {
                     crate::extract::similarity(new_content, &old.content)
-                }
-            } else {
-                crate::extract::similarity(new_content, &old.content)
-            };
+                };
 
-            if sim > 0.8 {
-                // Supersede: mark old memory as replaced by new
-                self.conn.execute(
-                    "UPDATE memories SET superseded_by = ?1, status = 'deprecated' WHERE id = ?2",
-                    rusqlite::params![new_id, old.id],
-                )?;
-                evolved += 1;
-                tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
-            } else if sim > 0.5 {
-                // Refine: append new info to old memory's content
-                let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
-                let refined_summary: String = refined_content.chars().take(100).collect();
-                self.conn.execute(
-                    "UPDATE memories SET content = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
-                    rusqlite::params![
-                        refined_content,
-                        refined_summary,
-                        Utc::now().to_rfc3339(),
-                        old.id,
-                    ],
-                )?;
-                evolved += 1;
-                tracing::debug!("refined memory '{}' with new content", old.id);
+                if sim > 0.8 {
+                    self.conn.execute(
+                        "UPDATE memories SET superseded_by = ?1, status = 'deprecated' WHERE id = ?2",
+                        rusqlite::params![new_id, old.id],
+                    )?;
+                    evolved += 1;
+                    tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
+                } else if sim > 0.5 {
+                    let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
+                    let refined_summary: String = refined_content.chars().take(100).collect();
+                    self.conn.execute(
+                        "UPDATE memories SET content = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
+                        rusqlite::params![refined_content, refined_summary, Utc::now().to_rfc3339(), old.id],
+                    )?;
+                    evolved += 1;
+                    tracing::debug!("refined memory '{}' with new content", old.id);
+                }
+            }
+            Ok(evolved)
+        })();
+
+        match &result {
+            Ok(_) => { self.conn.execute_batch("RELEASE evolution")
+                .map_err(crate::types::ReinError::Database)?; }
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO evolution");
+                let _ = self.conn.execute_batch("RELEASE evolution");
             }
         }
-        Ok(evolved)
+        result
     }
 
     /// Activate related memories: bump strength + last_accessed for memories similar to new content.
@@ -239,18 +267,22 @@ impl SqliteStore {
     pub fn activate_related_concepts(&self, content: &str) -> ReinResult<usize> {
         let similar_concepts = self.search_all_concepts(content, 5)?;
         let mut activated = 0usize;
+        // Cache memoir_id → name mapping to avoid O(N*M) lookups
+        let mut memoir_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for concept in &similar_concepts {
             let sim = crate::extract::similarity(content, &concept.definition);
             if sim > 0.2 {
-                // Boost confidence by re-refining with same definition (increments revision, boosts confidence)
-                // Find which memoir this concept belongs to
-                let memoirs = self.list_memoirs()?;
-                for memoir in &memoirs {
-                    if self.get_concept(&memoir.name, &concept.name)?.is_some() {
-                        let _ = self.refine_concept(&memoir.name, &concept.name, &concept.definition);
-                        activated += 1;
-                        break;
-                    }
+                // Look up memoir name from concept's memoir_id (cached)
+                let memoir_name = memoir_names.entry(concept.memoir_id.clone()).or_insert_with(|| {
+                    self.conn.query_row(
+                        "SELECT name FROM memoirs WHERE id = ?1",
+                        rusqlite::params![concept.memoir_id],
+                        |r| r.get::<_, String>(0),
+                    ).unwrap_or_default()
+                });
+                if !memoir_name.is_empty() {
+                    let _ = self.refine_concept(memoir_name, &concept.name, &concept.definition);
+                    activated += 1;
                 }
             }
         }
@@ -269,14 +301,17 @@ impl SqliteStore {
         let similar = self.search_concepts(memoir_name, &concept.definition, 5)?;
         let mut linked = 0usize;
 
+        // Hoist link lookup outside loop to avoid repeated DB queries
+        let existing_links = self.get_links_from(&concept.id)?;
+        let existing_targets: std::collections::HashSet<&str> = existing_links.iter()
+            .map(|l| l.target_id.as_str()).collect();
+
         for candidate in &similar {
             if candidate.id == concept.id { continue; }
 
             let sim = crate::extract::similarity(&concept.definition, &candidate.definition);
             if sim > 0.2 {
-                // Skip if link already exists (prevent duplicates)
-                let existing = self.get_links_from(&concept.id)?;
-                if existing.iter().any(|l| l.target_id == candidate.id) { continue; }
+                if existing_targets.contains(candidate.id.as_str()) { continue; }
 
                 let link = ConceptLink {
                     id: String::new(),
@@ -403,18 +438,22 @@ impl SqliteStore {
         }
 
         // Insert replacement within same transaction
+        // Note: store() internally fires update_tantivy/update_hnsw which is
+        // fire-and-forget. This is acceptable since Tantivy is append-only and
+        // worst case we have a stale entry on rollback.
         if let Err(e) = self.store(replacement) {
             let _ = self.conn.execute_batch("ROLLBACK");
             return Err(e);
         }
 
-        // Clean side indexes for deleted memories
+        self.conn.execute_batch("COMMIT")?;
+
+        // Clean side indexes AFTER commit to avoid inconsistency on rollback
         for m in &old_memories {
             self.remove_from_tantivy(&m.id);
             self.remove_from_hnsw(&m.id);
         }
 
-        self.conn.execute_batch("COMMIT")?;
         Ok(old_memories)
     }
 

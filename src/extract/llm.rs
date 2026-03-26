@@ -154,14 +154,15 @@ impl GeminiExtractor {
         Self { client, api_key, endpoint, model }
     }
 
-    pub async fn extract(&self, text: &str) -> ReinResult<Vec<ExtractedMemory>> {
+    /// Common Gemini API call: send prompt + text, return raw content text from response.
+    async fn call_api(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.endpoint, self.model
         );
         let body = json!({
             "contents": [{
-                "parts": [{"text": format!("{}\n\n---\n\n{}", EXTRACT_SYSTEM_PROMPT, text)}]
+                "parts": [{"text": format!("{}\n\n---\n\n{}", system_prompt, text)}]
             }],
             "generationConfig": {
                 "responseMimeType": "application/json",
@@ -178,61 +179,28 @@ impl GeminiExtractor {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
-            let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Extract(format!(
-                "Gemini API returned {}: {truncated}", status
+                "Gemini API returned {}: {}", status, crate::types::truncate_for_error(&text_body, 500)
             )));
         }
 
         let parsed: Value = serde_json::from_str(&text_body)
             .map_err(|e| ReinError::Extract(e.to_string()))?;
 
-        // Extract the text content from Gemini response
-        let content_text = parsed["candidates"][0]["content"]["parts"][0]["text"]
+        parsed["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
-            .ok_or_else(|| ReinError::Extract("missing candidates[0].content.parts[0].text".into()))?;
+            .map(|s| s.to_string())
+            .ok_or_else(|| ReinError::Extract("missing candidates[0].content.parts[0].text".into()))
+    }
 
-        parse_llm_json(content_text)
+    pub async fn extract(&self, text: &str) -> ReinResult<Vec<ExtractedMemory>> {
+        let content = self.call_api(EXTRACT_SYSTEM_PROMPT, text).await?;
+        parse_llm_json(&content)
     }
 
     pub async fn extract_full(&self, text: &str) -> ReinResult<ExtractionResult> {
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent",
-            self.endpoint, self.model
-        );
-        let body = json!({
-            "contents": [{
-                "parts": [{"text": format!("{}\n\n---\n\n{}", EXTRACT_FULL_PROMPT, text)}]
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.1
-            }
-        });
-
-        let resp = self.client.post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let text_body = resp.text().await?;
-
-        if !status.is_success() {
-            let truncated: String = text_body.chars().take(500).collect();
-            return Err(ReinError::Extract(format!(
-                "Gemini API returned {}: {truncated}", status
-            )));
-        }
-
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
-
-        let content_text = parsed["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .ok_or_else(|| ReinError::Extract("missing candidates[0].content.parts[0].text".into()))?;
-
-        parse_extraction_result(content_text)
+        let content = self.call_api(EXTRACT_FULL_PROMPT, text).await?;
+        parse_extraction_result(&content)
     }
 }
 
@@ -358,35 +326,15 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
 // Fallback: LLM extraction with pattern-based fallback
 // ---------------------------------------------------------------------------
 
-/// Extract memories using LLM if available, falling back to pattern-based extraction.
-pub async fn extract_with_fallback(
-    config: &ReinConfig,
-    text: &str,
-    pattern_threshold: u32,
-) -> Vec<ExtractedMemory> {
-    if let Some(extractor) = create_extractor(config) {
-        // Determine truncation limit.
-        // Only the recommended 1M-token models get unlimited input (max_input_chars=0).
-        // For any other model where the user hasn't explicitly set max_input_chars,
-        // apply a safe default to prevent API errors and memory loss.
-        let max_chars = resolve_max_input_chars(config);
-        let input = if max_chars > 0 {
-            text.chars().take(max_chars).collect::<String>()
-        } else {
-            text.to_string()
-        };
+/// Truncate input text based on config (safe default for unknown models).
+fn prepare_input(config: &ReinConfig, text: &str) -> String {
+    let max_chars = resolve_max_input_chars(config);
+    if max_chars > 0 { text.chars().take(max_chars).collect() } else { text.to_string() }
+}
 
-        match extractor.extract(&input).await {
-            Ok(memories) if !memories.is_empty() => return memories,
-            Ok(_) => {} // Empty result, fall through to patterns
-            Err(e) => {
-                tracing::warn!("LLM extraction failed, falling back to patterns: {e}");
-            }
-        }
-    }
-
-    // Fallback: convert pattern-based facts to ExtractedMemory structs
-    crate::extract::patterns::extract_facts(text, pattern_threshold)
+/// Convert pattern-based facts to ExtractedMemory structs (common fallback path).
+fn facts_to_memories(text: &str, threshold: u32) -> Vec<ExtractedMemory> {
+    crate::extract::patterns::extract_facts(text, threshold)
         .into_iter()
         .map(|fact| {
             let qc = crate::extract::hooks::scoring::pattern_quality_confidence(&fact);
@@ -401,6 +349,23 @@ pub async fn extract_with_fallback(
             }
         })
         .collect()
+}
+
+/// Extract memories using LLM if available, falling back to pattern-based extraction.
+pub async fn extract_with_fallback(
+    config: &ReinConfig,
+    text: &str,
+    pattern_threshold: u32,
+) -> Vec<ExtractedMemory> {
+    if let Some(extractor) = create_extractor(config) {
+        let input = prepare_input(config, text);
+        match extractor.extract(&input).await {
+            Ok(memories) if !memories.is_empty() => return memories,
+            Ok(_) => {}
+            Err(e) => tracing::warn!("LLM extraction failed, falling back to patterns: {e}"),
+        }
+    }
+    facts_to_memories(text, pattern_threshold)
 }
 
 /// LLM semantic dedup: ask the model if two texts are about the same thing.
@@ -465,24 +430,15 @@ pub async fn extract_full_with_fallback(
     text: &str,
 ) -> ExtractionResult {
     if let Some(extractor) = create_extractor(config) {
-        let max_chars = resolve_max_input_chars(config);
-        let input = if max_chars > 0 {
-            text.chars().take(max_chars).collect::<String>()
-        } else {
-            text.to_string()
-        };
+        let input = prepare_input(config, text);
 
         match extractor.extract_full(&input).await {
             Ok(result) => return result,
             Err(e) => {
-                tracing::warn!("LLM full extraction failed, falling back to simple extraction: {e}");
-                // Try simple extraction as fallback
+                tracing::warn!("LLM full extraction failed, falling back to simple: {e}");
                 if let Ok(memories) = extractor.extract(&input).await {
                     if !memories.is_empty() {
-                        return ExtractionResult {
-                            memories,
-                            ..Default::default()
-                        };
+                        return ExtractionResult { memories, ..Default::default() };
                     }
                 }
                 tracing::warn!("LLM simple extraction also failed, falling back to patterns");
@@ -490,25 +446,8 @@ pub async fn extract_full_with_fallback(
         }
     }
 
-    // Fallback: pattern-based extraction (memories only)
-    let memories = crate::extract::patterns::extract_facts(text, 2)
-        .into_iter()
-        .map(|fact| {
-            let qc = crate::extract::hooks::scoring::pattern_quality_confidence(&fact);
-            ExtractedMemory {
-                topic: "auto-extracted".to_string(),
-                summary: fact.chars().take(100).collect(),
-                content: fact,
-                keywords: vec![],
-                importance: "medium".to_string(),
-                should_store: true,
-                quality_confidence: qc,
-            }
-        })
-        .collect();
-
     ExtractionResult {
-        memories,
+        memories: facts_to_memories(text, 2),
         ..Default::default()
     }
 }

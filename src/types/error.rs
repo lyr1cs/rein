@@ -28,3 +28,8 @@ pub enum ReinError {
 }
 
 pub type ReinResult<T> = Result<T, ReinError>;
+
+/// Truncate a string for error messages (avoids dumping huge API responses into logs).
+pub fn truncate_for_error(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
