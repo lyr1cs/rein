@@ -69,6 +69,38 @@ pub fn build_consolidated(
     }
 }
 
+/// Run GC: apply decay + prune weak memories + prune low-quality concepts.
+/// In dry-run mode, wraps operations in a savepoint to preview without committing.
+/// Returns (decayed_count, memory_pruned_count, concept_pruned_count).
+pub fn run_gc(store: &SqliteStore, threshold: f64, dry_run: bool) -> ReinResult<(u64, u64, u64)> {
+    if dry_run {
+        store.conn().execute_batch("SAVEPOINT gc_preview")
+            .map_err(crate::types::ReinError::Database)?;
+
+        let decayed = store.apply_decay()?;
+
+        // Actually execute prune within savepoint so concept evaluation sees
+        // the same DB state as a real GC (memories deleted first, then concepts).
+        let mem_pruned = store.prune_memories_only(threshold)?;
+        let concept_pruned = store.prune_low_quality_concepts().unwrap_or(0);
+
+        store.conn().execute_batch("ROLLBACK TO gc_preview")
+            .map_err(crate::types::ReinError::Database)?;
+        store.conn().execute_batch("RELEASE gc_preview")
+            .map_err(crate::types::ReinError::Database)?;
+
+        Ok((decayed, mem_pruned, concept_pruned))
+    } else {
+        let decayed = store.apply_decay()?;
+        let mem_pruned = store.prune_memories_only(threshold)?;
+        let concept_pruned = store.prune_low_quality_concepts().unwrap_or(0);
+        if concept_pruned > 0 {
+            tracing::info!("pruned {concept_pruned} low-quality concepts");
+        }
+        Ok((decayed, mem_pruned, concept_pruned))
+    }
+}
+
 /// Run dedup scan across all topics.
 /// Returns (duplicates_found, duplicates_removed).
 pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResult<(u32, u32)> {

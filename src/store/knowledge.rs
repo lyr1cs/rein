@@ -1,0 +1,456 @@
+//! Knowledge graph operations: knowledge units, evolution, linking, and organizing.
+
+use chrono::Utc;
+
+use crate::types::*;
+
+use super::SqliteStore;
+
+impl SqliteStore {
+    /// Store knowledge units (concepts + links) into the Memoir system.
+    /// Auto-creates memoirs as needed. Refines existing concepts, adds new ones.
+    /// Returns a report of what was created/refined.
+    pub fn store_knowledge_units(
+        &self,
+        concepts: &[crate::extract::ExtractedConcept],
+        links: &[crate::extract::ExtractedLink],
+    ) -> ReinResult<super::KnowledgeStoreReport> {
+        self.store_knowledge_units_with_sources(concepts, links, &[])
+    }
+
+    /// Store knowledge units with bidirectional Memory ↔ Concept links.
+    /// `source_memory_ids` are the memories that produced these concepts.
+    pub fn store_knowledge_units_with_sources(
+        &self,
+        concepts: &[crate::extract::ExtractedConcept],
+        links: &[crate::extract::ExtractedLink],
+        source_memory_ids: &[String],
+    ) -> ReinResult<super::KnowledgeStoreReport> {
+        let mut report = super::KnowledgeStoreReport::default();
+
+        // Group concepts by memoir
+        let mut by_memoir: std::collections::HashMap<String, Vec<&crate::extract::ExtractedConcept>> =
+            std::collections::HashMap::new();
+        for c in concepts {
+            by_memoir.entry(c.memoir.clone()).or_default().push(c);
+        }
+
+        // Process each memoir group
+        for (memoir_name, memoir_concepts) in &by_memoir {
+            // Ensure memoir exists
+            if self.get_memoir(memoir_name)?.is_none() {
+                let memoir = Memoir {
+                    id: String::new(),
+                    name: memoir_name.clone(),
+                    description: "auto-created by LLM extraction".to_string(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+                self.create_memoir(memoir)?;
+                report.memoirs_created += 1;
+            }
+
+            // Add/refine concepts
+            for c in memoir_concepts {
+                match self.get_concept(memoir_name, &c.name)? {
+                    Some(_) => {
+                        // Concept exists — refine it
+                        if let Err(e) = self.refine_concept(memoir_name, &c.name, &c.definition) {
+                            tracing::warn!("failed to refine concept '{}': {e}", c.name);
+                        } else {
+                            report.concepts_refined += 1;
+                        }
+                    }
+                    None => {
+                        // New concept with source memory references
+                        let concept = Concept {
+                            id: String::new(),
+                            memoir_id: memoir_name.clone(),
+                            name: c.name.clone(),
+                            definition: c.definition.clone(),
+                            labels: c.labels.clone(),
+                            source_memory_ids: source_memory_ids.to_vec(),
+                            confidence: c.quality_confidence as f32,
+                            revision: 1,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        };
+                        if let Err(e) = self.add_concept(concept) {
+                            tracing::warn!("failed to add concept '{}': {e}", c.name);
+                        } else {
+                            report.concepts_added += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process links (both concepts must exist and be in same memoir)
+        // Search ALL memoirs, not just those in the current batch
+        let all_memoirs = self.list_memoirs()?;
+        for link in links {
+            let mut resolved = None;
+            for memoir in &all_memoirs {
+                let from = self.get_concept(&memoir.name, &link.from)?;
+                let to = self.get_concept(&memoir.name, &link.to)?;
+                if let (Some(f), Some(t)) = (from, to) {
+                    resolved = Some((f.id, t.id));
+                    break;
+                }
+            }
+
+            if let Some((source_id, target_id)) = resolved {
+                let relation = match std::str::FromStr::from_str(&link.relation) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!("unknown relation '{}', defaulting to related_to", link.relation);
+                        Relation::RelatedTo
+                    }
+                };
+                let concept_link = ConceptLink {
+                    id: String::new(),
+                    source_id,
+                    target_id,
+                    relation,
+                    weight: 1.0,
+                    created_at: Utc::now(),
+                };
+                if let Err(e) = self.add_link(concept_link) {
+                    tracing::warn!("failed to add link {} -> {}: {e}", link.from, link.to);
+                } else {
+                    report.links_added += 1;
+                }
+            }
+        }
+
+        // Bidirectional link: update source memories with concept_ids
+        if !source_memory_ids.is_empty() {
+            // Collect all concept IDs we just created/refined
+            let mut all_concept_ids: Vec<String> = Vec::new();
+            for c in concepts {
+                if let Ok(Some(concept)) = self.get_concept(&c.memoir, &c.name) {
+                    all_concept_ids.push(concept.id);
+                }
+            }
+            if !all_concept_ids.is_empty() {
+                for mem_id in source_memory_ids {
+                    if let Ok(mut mem) = self.get(mem_id) {
+                        let mut updated = false;
+                        for cid in &all_concept_ids {
+                            if !mem.concept_ids.contains(cid) {
+                                mem.concept_ids.push(cid.clone());
+                                updated = true;
+                            }
+                        }
+                        if updated {
+                            // Use direct SQL to avoid status change
+                            let json = serde_json::to_string(&mem.concept_ids).unwrap_or_default();
+                            let _ = self.conn.execute(
+                                "UPDATE memories SET concept_ids = ?1 WHERE id = ?2",
+                                rusqlite::params![json, mem_id],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cross-session linking: connect new concepts to existing related concepts
+        for c in concepts {
+            if let Err(e) = self.auto_link_concept(&c.memoir, &c.name) {
+                tracing::debug!("auto_link_concept failed for '{}': {e}", c.name);
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Memory Evolution: new memory can refine or supersede similar old memories.
+    /// - sim > 0.8 → supersede (mark old as superseded_by new_id)
+    /// - 0.5 < sim <= 0.8 → refine (append new content to old memory)
+    /// Returns number of evolved memories.
+    pub fn apply_evolution(&self, new_id: &str, new_content: &str, new_embedding: Option<&[f32]>) -> ReinResult<usize> {
+        let similar = self.search_fts(new_content, None, 5)?;
+        let mut evolved = 0usize;
+
+        for old in &similar {
+            if old.id == new_id { continue; }
+            if old.superseded_by.is_some() { continue; }
+
+            // Use embedding cosine similarity if available, fall back to Jaccard
+            let sim = if let Some(new_emb) = new_embedding {
+                // Try vector similarity via HNSW cache
+                if let Ok(vec_results) = self.search_vec(new_emb, None, 5) {
+                    vec_results.iter()
+                        .find(|m| m.id == old.id)
+                        .map(|_| 0.85f32) // found in top-5 vector results → high similarity
+                        .unwrap_or_else(|| crate::extract::similarity(new_content, &old.content))
+                } else {
+                    crate::extract::similarity(new_content, &old.content)
+                }
+            } else {
+                crate::extract::similarity(new_content, &old.content)
+            };
+
+            if sim > 0.8 {
+                // Supersede: mark old memory as replaced by new
+                self.conn.execute(
+                    "UPDATE memories SET superseded_by = ?1, status = 'deprecated' WHERE id = ?2",
+                    rusqlite::params![new_id, old.id],
+                )?;
+                evolved += 1;
+                tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
+            } else if sim > 0.5 {
+                // Refine: append new info to old memory's content
+                let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
+                let refined_summary: String = refined_content.chars().take(100).collect();
+                self.conn.execute(
+                    "UPDATE memories SET content = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
+                    rusqlite::params![
+                        refined_content,
+                        refined_summary,
+                        Utc::now().to_rfc3339(),
+                        old.id,
+                    ],
+                )?;
+                evolved += 1;
+                tracing::debug!("refined memory '{}' with new content", old.id);
+            }
+        }
+        Ok(evolved)
+    }
+
+    /// Activate related memories: bump strength + last_accessed for memories similar to new content.
+    /// This keeps old relevant memories alive instead of letting them decay.
+    pub fn activate_related_memories(&self, content: &str, max_activate: usize) -> ReinResult<usize> {
+        let similar = self.search_fts(content, None, max_activate)?;
+        let mut activated = 0usize;
+        for mem in &similar {
+            let sim = crate::extract::similarity(content, &mem.content);
+            if sim > 0.3 {
+                self.record_access(&mem.id)?;
+                activated += 1;
+            }
+        }
+        Ok(activated)
+    }
+
+    /// Activate related concepts: boost confidence for concepts matching new content.
+    pub fn activate_related_concepts(&self, content: &str) -> ReinResult<usize> {
+        let similar_concepts = self.search_all_concepts(content, 5)?;
+        let mut activated = 0usize;
+        for concept in &similar_concepts {
+            let sim = crate::extract::similarity(content, &concept.definition);
+            if sim > 0.2 {
+                // Boost confidence by re-refining with same definition (increments revision, boosts confidence)
+                // Find which memoir this concept belongs to
+                let memoirs = self.list_memoirs()?;
+                for memoir in &memoirs {
+                    if self.get_concept(&memoir.name, &concept.name)?.is_some() {
+                        let _ = self.refine_concept(&memoir.name, &concept.name, &concept.definition);
+                        activated += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(activated)
+    }
+
+    /// Auto-link a newly added concept to existing related concepts in the same memoir.
+    /// Searches for similar concepts by FTS and creates `related_to` links.
+    fn auto_link_concept(&self, memoir_name: &str, concept_name: &str) -> ReinResult<usize> {
+        let concept = match self.get_concept(memoir_name, concept_name)? {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+
+        // Search for similar concepts in the same memoir
+        let similar = self.search_concepts(memoir_name, &concept.definition, 5)?;
+        let mut linked = 0usize;
+
+        for candidate in &similar {
+            if candidate.id == concept.id { continue; }
+
+            let sim = crate::extract::similarity(&concept.definition, &candidate.definition);
+            if sim > 0.2 {
+                // Skip if link already exists (prevent duplicates)
+                let existing = self.get_links_from(&concept.id)?;
+                if existing.iter().any(|l| l.target_id == candidate.id) { continue; }
+
+                let link = ConceptLink {
+                    id: String::new(),
+                    source_id: concept.id.clone(),
+                    target_id: candidate.id.clone(),
+                    relation: Relation::RelatedTo,
+                    weight: sim,
+                    created_at: Utc::now(),
+                };
+                if self.add_link(link).is_ok() {
+                    linked += 1;
+                }
+            }
+        }
+
+        Ok(linked)
+    }
+
+    /// Update only the related_ids field without touching status or updated_at.
+    fn update_related_ids(&self, id: &str, related_ids: &[String]) -> ReinResult<()> {
+        let json = serde_json::to_string(related_ids)?;
+        self.conn.execute(
+            "UPDATE memories SET related_ids = ?1 WHERE id = ?2",
+            rusqlite::params![json, id],
+        )?;
+        Ok(())
+    }
+
+    /// Find related memories for a given memory and update related_ids bidirectionally.
+    /// Uses FTS to find similar content, then checks Jaccard similarity.
+    /// Both sides of each link are written in a single transaction.
+    /// Returns the number of new links created.
+    pub fn auto_link(&self, id: &str, similarity_threshold: f32, max_links: usize) -> ReinResult<usize> {
+        let memory = self.get(id)?;
+        // Search for similar memories by content
+        let candidates = self.search_fts(&memory.content, Some(&memory.topic), max_links * 2)?;
+        // Also search across topics
+        let cross_topic = self.search_fts(&memory.summary, None, max_links)?;
+
+        let mut all_candidates = candidates;
+        for c in cross_topic {
+            if !all_candidates.iter().any(|m| m.id == c.id) {
+                all_candidates.push(c);
+            }
+        }
+
+        // Collect link pairs first, then write atomically
+        let mut updated_related = memory.related_ids.clone();
+        let mut peer_updates: Vec<(String, Vec<String>)> = Vec::new();
+
+        for candidate in &all_candidates {
+            if candidate.id == id { continue; }
+            if updated_related.contains(&candidate.id) { continue; }
+            if updated_related.len() >= max_links { break; }
+
+            let sim = crate::extract::similarity(&memory.content, &candidate.content);
+            if sim < similarity_threshold { continue; }
+
+            updated_related.push(candidate.id.clone());
+
+            // Prepare peer update
+            if !candidate.related_ids.contains(&memory.id) && candidate.related_ids.len() < max_links {
+                let mut peer_related = candidate.related_ids.clone();
+                peer_related.push(memory.id.clone());
+                peer_updates.push((candidate.id.clone(), peer_related));
+            }
+        }
+
+        let new_links = updated_related.len() - memory.related_ids.len();
+        if new_links == 0 {
+            return Ok(0);
+        }
+
+        // Write all link updates atomically
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        if let Err(e) = (|| -> ReinResult<()> {
+            self.update_related_ids(id, &updated_related)?;
+            for (peer_id, peer_related) in &peer_updates {
+                self.update_related_ids(peer_id, peer_related)?;
+            }
+            Ok(())
+        })() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        self.conn.execute_batch("COMMIT")?;
+
+        Ok(new_links)
+    }
+
+    /// Organize all memories: scan for related pairs and create bidirectional links.
+    /// Returns total number of new links created.
+    pub fn organize(&self, similarity_threshold: f32, max_links_per_memory: usize) -> ReinResult<usize> {
+        let mut stmt = self.conn.prepare("SELECT id FROM memories")?;
+        let ids: Vec<String> = stmt.query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut total_links = 0usize;
+        for id in &ids {
+            match self.auto_link(id, similarity_threshold, max_links_per_memory) {
+                Ok(n) => total_links += n,
+                Err(e) => tracing::warn!("auto_link failed for {id}: {e}"),
+            }
+        }
+        Ok(total_links)
+    }
+
+    /// Atomically consolidate a topic: delete all old memories and insert replacement in one transaction.
+    /// Returns the old memories for reference. If insertion fails, everything rolls back.
+    pub fn consolidate_atomic(&self, topic: &str, replacement: Memory) -> ReinResult<Vec<Memory>> {
+        self.conn.execute_batch("BEGIN TRANSACTION")?;
+
+        // Collect old memories
+        let old_memories = self.get_by_topic(topic)?;
+
+        // Delete all in topic
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM memories WHERE topic = ?1",
+            rusqlite::params![topic],
+        ) {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e.into());
+        }
+
+        // Insert replacement within same transaction
+        if let Err(e) = self.store(replacement) {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+
+        // Clean side indexes for deleted memories
+        for m in &old_memories {
+            self.remove_from_tantivy(&m.id);
+            self.remove_from_hnsw(&m.id);
+        }
+
+        self.conn.execute_batch("COMMIT")?;
+        Ok(old_memories)
+    }
+
+    /// Get all memory (id, topic, summary, content, keywords) tuples for cache warmup.
+    pub fn get_all_for_warmup(&self) -> ReinResult<Vec<(String, String, String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, topic, summary, content, keywords FROM memories")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Record an access to a memory (bumps access_count and last_accessed).
+    /// Call this only when memories are returned to the user via recall, NOT on internal lookups.
+    pub fn record_access(&self, id: &str) -> ReinResult<()> {
+        let now = Utc::now();
+        self.conn.execute(
+            "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
+            rusqlite::params![now.to_rfc3339(), id],
+        )?;
+
+        // STM→LTM promotion: if access_count > 5 and layer is STM, promote to LTM
+        self.conn.execute(
+            "UPDATE memories SET layer = 'LTM', decay_lambda = decay_lambda * 0.33
+             WHERE id = ?1 AND layer = 'STM' AND access_count > 5",
+            rusqlite::params![id],
+        )?;
+
+        Ok(())
+    }
+}
