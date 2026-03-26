@@ -206,6 +206,19 @@ rein now tracks **when** knowledge changes, not just what the current state is. 
 - "When did concept X change?" → `rein_concept_history --memoir rust --name ownership`
 - "What did I know about Y before March?" → `rein_recall "Y" --to 2026-03-01`
 
+### Autonomous Retrieval Routing (v0.4.0)
+
+rein automatically classifies queries and routes them to the optimal search strategy — no configuration needed.
+
+| Query Type | Example | Strategy |
+|------------|---------|----------|
+| **Temporal** | "when did the API change?" | BM25 bias (alpha=0.7), auto-inject time bounds |
+| **ExactKeyword** | "SqliteStore", "fn recall" | Heavy BM25 (alpha=0.85) |
+| **Semantic** | "memory management strategies" | Vector dominant (alpha=0.3) |
+| **Exploratory** | "what do I know about rein?" | Balanced (alpha=0.5), 2x result limit |
+
+Classification is rule-based (zero LLM calls, sub-microsecond). MCP responses include `[route: type]` prefix for transparency. Based on TA-Mem 2026 and MemR3 2025.
+
 ### Configuration
 
 rein loads configuration with the following priority (highest wins):
@@ -524,6 +537,7 @@ rein 是一个轻量级的持久化记忆系统，专为 AI 编程智能体设�
 | **四级瀑布搜索** | Tantivy BM25 → HNSW ANN → 缓存向量 → Google API |
 | **多源交叉验证** | 3 个来源（本地、Hook 提取、Supermemory）+ 置信度评分 |
 | **RRF / CC 融合** | 倒数排名融合或凸组合融合（Bruch 2023），路径质量门控 |
+| **自主检索路由** | 查询自动分类（时序/精确/语义/探索），自适应融合权重 + 搜索路径（TA-Mem 2026） |
 | **多因子准入控制** | A-MAC 2026：llm_conf + novelty + type_prior + recency 评分 |
 | **语义分块** | 按标题/段落/句子分割，嵌入时附加元数据前缀 |
 | **FTS5 unicode61 分词器** | 全文搜索，支持 CJK，亚毫秒级延迟 |

@@ -44,15 +44,44 @@ pub fn recall_temporal(
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
 
+    // === Query classification (FT-3: autonomous retrieval routing) ===
+    let strategy = crate::search::classify::classify(query, time_from.is_some(), time_to.is_some());
+    tracing::debug!(query_type = %strategy.query_type, "query classified");
+
+    // Auto-inject temporal bounds for temporal queries
+    let (time_from, time_to) = if strategy.force_temporal && time_from.is_none() && time_to.is_none() {
+        if let Some(days) = strategy.temporal_days_back {
+            let from = chrono::Utc::now() - chrono::Duration::days(days);
+            (Some(from), Some(chrono::Utc::now()))
+        } else {
+            (time_from, time_to)
+        }
+    } else {
+        (time_from, time_to)
+    };
+
+    // Apply limit multiplier from strategy
+    let effective_limit = (limit as f32 * strategy.limit_multiplier) as usize;
+
     // === Level 1: FTS (Tantivy BM25 → FTS5 fallback) ===
-    let fts_start = std::time::Instant::now();
-    let (fts_results, fts_ranked) = try_tantivy_then_fts5(store, query, topic, limit * 2)?;
-    tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = fts_results.len(), "fts search");
+    let (fts_results, fts_ranked) = if strategy.skip_fts {
+        (vec![], vec![])
+    } else {
+        let fts_start = std::time::Instant::now();
+        let r = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
+        tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = r.0.len(), "fts search");
+        r
+    };
 
     // === Level 2+3: Vector search (cached → API) ===
-    let vec_start = std::time::Instant::now();
-    let vec_ranked = try_vector_search(store, config, query, topic, limit);
-    tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = vec_ranked.len(), "vector search");
+    let vec_ranked = if strategy.skip_vec {
+        vec![]
+    } else {
+        let vec_start = std::time::Instant::now();
+        let r = try_vector_search(store, config, query, topic, effective_limit);
+        tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = r.len(), "vector search");
+        r
+    };
 
     // === Path quality gating (Wang 2025: weakest-link phenomenon) ===
     // Skip a path if it returned no results — avoids empty/broken paths degrading fusion.
@@ -73,12 +102,16 @@ pub fn recall_temporal(
     let vec_for_fusion = if use_vec { vec_ranked } else { vec![] };
 
     let fused = if config.search.fusion_method == "cc" {
-        let alpha = config.search.cc_alpha as f32;
+        let alpha = strategy.cc_alpha.unwrap_or(config.search.cc_alpha as f32);
         crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha)
     } else {
         let rrf_k = config.search.rrf_k as f32;
-        let fts_weight = config.search.rrf_fts_weight as f32;
-        let vec_weight = config.search.rrf_vec_weight as f32;
+        // Map strategy alpha to RRF weights (alpha=high → FTS dominant)
+        let (fts_weight, vec_weight) = if let Some(alpha) = strategy.cc_alpha {
+            (alpha, 1.0 - alpha)
+        } else {
+            (config.search.rrf_fts_weight as f32, config.search.rrf_vec_weight as f32)
+        };
         let mut lists = Vec::new();
         if !fts_for_fusion.is_empty() { lists.push((fts_for_fusion, fts_weight)); }
         if !vec_for_fusion.is_empty() { lists.push((vec_for_fusion, vec_weight)); }
@@ -195,6 +228,8 @@ pub fn recall_temporal(
         .collect();
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    // Truncate to the caller's requested limit (not effective_limit).
+    // limit_multiplier only expands internal candidate pools, not the public response.
     results.truncate(limit);
 
     // Record recall hit (NOT access — access should only be counted when

@@ -97,6 +97,11 @@ impl ReinServer {
             ).map_err(|e| ReinError::Config(format!("{e}")))
         });
 
+        // Re-classify for transparency (sub-microsecond, no overhead)
+        let route = crate::search::classify::classify(
+            &params.query, time_from.is_some(), time_to.is_some(),
+        );
+
         match result {
             Ok(results) => {
                 let scored: Vec<(Memory, f32)> = results.into_iter().map(|r| (r.memory, r.score)).collect();
@@ -107,6 +112,9 @@ impl ReinServer {
                     } else {
                         "No memories found.".to_string()
                     };
+                }
+                if !self.compact() && !scored.is_empty() {
+                    text = format!("[route: {}] {}", route.query_type, text);
                 }
                 self.maybe_nudge(&mut text);
                 text
