@@ -115,6 +115,22 @@ impl SupermemoryClient {
                     .unwrap_or("unknown");
                 let id = format!("sm:{base_id}:{idx}");
 
+                // Extract original timestamps from API response (preserve temporal accuracy)
+                let now = chrono::Utc::now();
+                let created_at = item.get("createdAt")
+                    .or_else(|| item.get("created_at"))
+                    .or_else(|| item.get("timestamp"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(now);
+                let updated_at = item.get("updatedAt")
+                    .or_else(|| item.get("updated_at"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(created_at);
+
                 Some(Memory {
                     id,
                     layer: MemoryLayer::LTM,
@@ -134,9 +150,9 @@ impl SupermemoryClient {
                     embedding: None,
                     tier: "warm".to_string(),
                     cluster_id: None,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                    last_accessed: chrono::Utc::now(),
+                    created_at,
+                    updated_at,
+                    last_accessed: created_at,
                 })
             })
             .collect();

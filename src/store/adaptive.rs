@@ -213,9 +213,21 @@ pub struct AdaptiveState {
     pub hot_threshold: f64,
     pub cold_threshold: f64,
 
+    /// A1: Per-cluster dedup thresholds (replaces fixed 0.70).
+    /// Key = cluster_id, Value = similarity threshold for that cluster.
+    /// Computed from intra-cluster pairwise similarity distribution (P90).
+    #[serde(default)]
+    pub dedup_thresholds: HashMap<u32, f32>,
+
+    /// A1: Global (fallback) dedup threshold when no cluster-specific value exists.
+    #[serde(default = "default_global_dedup_threshold")]
+    pub global_dedup_threshold: f32,
+
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
 }
+
+fn default_global_dedup_threshold() -> f32 { 0.70 }
 
 /// A learned alpha entry with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +265,20 @@ impl AdaptiveState {
             }
         }
         None
+    }
+
+    /// Get dedup threshold for a cluster, with fallback to global threshold.
+    pub fn get_dedup_threshold(&self, cluster_id: Option<u32>) -> f32 {
+        if let Some(cid) = cluster_id {
+            if let Some(&threshold) = self.dedup_thresholds.get(&cid) {
+                return threshold;
+            }
+        }
+        if self.global_dedup_threshold > 0.0 {
+            self.global_dedup_threshold
+        } else {
+            0.70 // ultimate fallback
+        }
     }
 
     /// Save state snapshot to metadata table with optimistic concurrency control.
