@@ -80,14 +80,20 @@ impl ReinServer {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let limit = params.limit.unwrap_or(10);
 
+        // Parse optional temporal filters
+        let time_from = params.from.as_deref().and_then(|s| parse_datetime(s));
+        let time_to = params.to.as_deref().and_then(|s| parse_datetime_end(s));
+
         let result = self.with_store(|store| {
-            crate::search::recall::recall(
+            crate::search::recall::recall_temporal(
                 store,
                 &self.config,
                 &params.query,
                 params.topic.as_deref(),
                 params.keyword.as_deref(),
                 limit,
+                time_from,
+                time_to,
             ).map_err(|e| ReinError::Config(format!("{e}")))
         });
 
@@ -457,6 +463,7 @@ impl ReinServer {
             source_memory_ids: vec![],
             confidence: 0.5,
             revision: 1,
+            last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -581,6 +588,8 @@ impl ReinServer {
                 relation,
                 weight: 1.0,
                 created_at: chrono::Utc::now(),
+                valid_from: None,
+                valid_until: None,
             };
             store.add_link(link)
         });
@@ -837,8 +846,177 @@ impl ReinServer {
             Err(e) => format!("Error: {e}"),
         }
     }
+
+    /// View a timeline of events (episodes, concept changes, memory creation) in a date range.
+    #[tool(name = "rein_timeline", description = "Show a chronological timeline of knowledge events: episodes, concept revisions, and memory creation. Supports date range filtering.")]
+    fn rein_timeline(&self, Parameters(params): Parameters<TimelineParams>) -> String {
+        let limit = params.limit.unwrap_or(20);
+        let from = params.from.as_deref().and_then(|s| parse_datetime(s));
+        let to = params.to.as_deref().and_then(|s| parse_datetime_end(s));
+
+        let result = self.with_store(|store| {
+            let mut events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+
+            // Collect episodes
+            let episodes = if let (Some(f), Some(t)) = (from, to) {
+                store.get_episodes_in_range(f, t)?
+            } else {
+                store.list_episodes(limit)?
+            };
+            for ep in &episodes {
+                let decisions = if ep.decisions.is_empty() { String::new() }
+                    else { format!(" | decisions: {}", ep.decisions.join(", ")) };
+                events.push((ep.created_at, format!(
+                    "[episode] {} — {} concepts, {} memories{}",
+                    ep.title, ep.concept_ids.len(), ep.memory_ids.len(), decisions
+                )));
+            }
+
+            // Collect concept revisions in the window
+            {
+                let rev_sql = match (from, to) {
+                    (Some(f), Some(t)) => format!(
+                        "SELECT r.revision, r.definition, r.created_at, c.name, c.memoir_id \
+                         FROM concept_revisions r JOIN concepts c ON r.concept_id = c.id \
+                         WHERE r.created_at >= '{}' AND r.created_at <= '{}' \
+                         ORDER BY r.created_at DESC LIMIT {}",
+                        f.to_rfc3339(), t.to_rfc3339(), limit
+                    ),
+                    _ => format!(
+                        "SELECT r.revision, r.definition, r.created_at, c.name, c.memoir_id \
+                         FROM concept_revisions r JOIN concepts c ON r.concept_id = c.id \
+                         ORDER BY r.created_at DESC LIMIT {}", limit
+                    ),
+                };
+                if let Ok(mut stmt) = store.conn().prepare(&rev_sql) {
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    });
+                    if let Ok(rows) = rows {
+                        for row in rows.flatten() {
+                            let (rev, def, created_str, name) = row;
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&created_str) {
+                                let short_def: String = def.chars().take(80).collect();
+                                events.push((dt.with_timezone(&chrono::Utc), format!(
+                                    "[revision] {} r{}: {}", name, rev, short_def
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Collect memories in the requested window via SQL (not post-filter)
+            let mem_sql = match (from, to) {
+                (Some(f), Some(t)) => {
+                    let mut stmt = store.conn().prepare(
+                        "SELECT id, topic, summary, created_at FROM memories WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC LIMIT ?3"
+                    ).map_err(ReinError::Database)?;
+                    let rows: Vec<_> = stmt.query_map(
+                        rusqlite::params![f.to_rfc3339(), t.to_rfc3339(), limit],
+                        |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                    ).map_err(ReinError::Database)?.filter_map(|r| r.ok()).collect();
+                    rows
+                }
+                _ => {
+                    store.recent(limit)?.iter().map(|m| (m.topic.clone(), m.summary.clone(), m.created_at.to_rfc3339())).collect()
+                }
+            };
+            for (topic, summary, created_str) in &mem_sql {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_str) {
+                    events.push((dt.with_timezone(&chrono::Utc), format!("[memory] [{}] {}", topic, summary)));
+                }
+            }
+
+            events.sort_by(|a, b| b.0.cmp(&a.0));
+            events.truncate(limit);
+            Ok(events)
+        });
+
+        match result {
+            Ok(events) => {
+                if events.is_empty() {
+                    "No events found in the specified range.".to_string()
+                } else {
+                    events.iter()
+                        .map(|(dt, desc)| format!("{} {}", dt.format("%Y-%m-%d %H:%M"), desc))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Show revision history of a concept — when and how its definition changed over time.
+    #[tool(name = "rein_concept_history", description = "Show the revision history of a concept: when it changed, what the old definitions were, and which episode triggered each change.")]
+    fn rein_concept_history(&self, Parameters(params): Parameters<ConceptHistoryParams>) -> String {
+        let limit = params.limit.unwrap_or(10);
+
+        let result = self.with_store(|store| {
+            let current = store.get_concept(&params.memoir, &params.name)?
+                .ok_or_else(|| ReinError::NotFound(format!("concept '{}' not found", params.name)))?;
+            let history = store.get_concept_history(&params.memoir, &params.name, limit)?;
+            Ok((current, history))
+        });
+
+        match result {
+            Ok((current, history)) => {
+                let mut lines = vec![format!(
+                    "## {} (current: r{}, confidence: {:.2})\n{}\n",
+                    current.name, current.revision, current.confidence, current.definition
+                )];
+                if history.is_empty() {
+                    lines.push("No revision history (concept has not been refined yet).".to_string());
+                } else {
+                    lines.push(format!("### Revision History ({} entries)\n", history.len()));
+                    for rev in &history {
+                        let ep = rev.episode_id.as_deref().unwrap_or("none");
+                        lines.push(format!(
+                            "- **r{}** ({}) [episode: {}]\n  {}\n",
+                            rev.revision,
+                            rev.created_at.format("%Y-%m-%d %H:%M"),
+                            ep,
+                            rev.definition.chars().take(200).collect::<String>()
+                        ));
+                    }
+                }
+                lines.join("\n")
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
 }
 
+/// Parse a date string as start-of-day (for `from` bounds).
+fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = date.and_hms_opt(0, 0, 0)?;
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+    }
+    None
+}
+
+/// Parse a date string as end-of-day (for `to` bounds).
+/// YYYY-MM-DD becomes 23:59:59 so the entire day is included.
+fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = date.and_hms_opt(23, 59, 59)?;
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+    }
+    None
+}
 
 #[tool_handler]
 impl ServerHandler for ReinServer {
