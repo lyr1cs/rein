@@ -237,7 +237,7 @@ fn run_hdbscan_clustering(
     // Clear stale per-cluster dedup thresholds
     state.dedup_thresholds.clear();
 
-    // Store new cluster assignments
+    // Store new cluster assignments from this run
     state.memory_clusters.clear();
     for (i, label) in result.labels.iter().enumerate() {
         let mem_id = &embeddings[i].0;
@@ -248,6 +248,22 @@ fn run_hdbscan_clustering(
                 rusqlite::params![*cluster_id, mem_id],
             );
         }
+    }
+
+    // Load persisted cluster assignments for memories NOT in this clustering input
+    // (keeps DB and in-memory state synchronized for capped/sampled runs)
+    if let Ok(mut stmt) = store.conn().prepare(
+        "SELECT id, cluster_id FROM memories WHERE cluster_id IS NOT NULL"
+    ) {
+        let _ = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let cid: u32 = row.get(1)?;
+            Ok((id, cid))
+        }).ok().map(|rows| {
+            for row in rows.flatten() {
+                state.memory_clusters.entry(row.0).or_insert(row.1);
+            }
+        });
     }
 
     state.cluster_version += 1;
@@ -561,15 +577,19 @@ fn run_alpha_learning(
         .cloned()
         .collect();
 
-    // Advance offset through the longest contiguous prefix of matched or expired events.
-    // Stop at the first still-live unmatched event so it can be retried next cycle.
+    // Advance offset: consume matched and expired events, skip live unmatched ones.
+    // Unlike a strict contiguous prefix, this allows later matched events to be consumed
+    // even if an earlier unmatched event exists (prevents one stale event from blocking
+    // the entire learning pipeline).
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
     let matched_request_ids: std::collections::HashSet<&str> = recall_events.iter()
         .filter(|re| !re.accessed_ids.is_empty())
         .map(|re| re.request_id.as_str())
         .collect();
 
+    // Find the highest event ID that is either matched or expired
     let mut advance_to: Option<i64> = None;
+    let mut pending_unmatched = 0u32;
     for event in &events {
         let rid = event.request_id.as_deref().unwrap_or("");
         let is_matched = matched_request_ids.contains(rid);
@@ -580,8 +600,11 @@ fn run_alpha_learning(
         if is_matched || is_expired {
             advance_to = Some(event.id);
         } else {
-            break; // Stop at first live unmatched event
+            pending_unmatched += 1;
         }
+    }
+    if pending_unmatched > 0 {
+        tracing::debug!("M2: {pending_unmatched} unmatched events waiting for access data");
     }
 
     if let Some(new_offset) = advance_to {
