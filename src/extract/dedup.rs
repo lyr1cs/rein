@@ -75,8 +75,11 @@ pub fn check_dedup(
     }
     let query = query_tokens.join(" ");
 
-    // Search existing memories in this topic
-    let candidates = store.search_fts(&query, Some(topic), 10)?;
+    // Search existing memories in this topic (exclude superseded)
+    let candidates: Vec<_> = store.search_fts(&query, Some(topic), 10)?
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .collect();
 
     if candidates.is_empty() {
         return Ok(DedupAction::CreateNew);
