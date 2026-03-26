@@ -6,7 +6,7 @@
 
 ```bash
 cargo build
-cargo test            # 118+ tests, all must pass
+cargo test            # 182+ tests, all must pass
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
 
@@ -22,6 +22,11 @@ rein is a multi-source cross-validated memory MCP server (24 tools). Key modules
 - `store/knowledge.rs` — Knowledge units, evolution, linking, organizing
 - `store/quality.rs` — Self-learning quality scoring, pruning, recall tracking
 - `store/memoir.rs` — Knowledge graph CRUD, temporal revisions, episodes, BFS traversal
+- `store/adaptive.rs` — Feedback event sourcing, AdaptiveState cache, per-consumer offsets
+- `store/hdbscan.rs` — Pure Rust HDBSCAN clustering (dendrogram → condensed tree → EOMBST)
+- `store/tiering.rs` — Three-tier memory (Hot/Warm/Cold) with streaming quantile estimator
+- `search/alpha_optimizer.rs` — Counterfactual offline alpha optimization for CC fusion
+- `search/survival.rs` — Kaplan-Meier non-parametric survival analysis for adaptive decay
 
 ## Temporal Knowledge Graph (v0.4.0)
 
@@ -40,6 +45,16 @@ Query classifier routes to optimal search strategy:
 - **Exploratory** ("what do I know about...") → balanced (alpha=0.5), 2x limit
 
 MCP response includes `[route: type]` prefix for transparency.
+
+## Adaptive Engine (v0.5.0)
+
+Self-learning engine that replaces fixed parameters with data-driven adaptation:
+
+- **M1 Event Sourcing**: `feedback_events` table captures all recall/store/click signals; AdaptiveState cache with per-consumer offsets enables replay
+- **M2 Counterfactual Alpha Optimization**: Learns optimal `cc_alpha` from candidate logs — replays past searches with alternative weights to find the alpha that would have maximized relevance
+- **M3 Per-Cluster Kaplan-Meier Decay**: Replaces fixed Ebbinghaus half-lives with non-parametric survival curves estimated per semantic cluster; activates when sufficient data is available
+- **M4 HDBSCAN Clustering**: Groups memories into semantic neighborhoods (dendrogram → condensed tree → EOMBST extraction) for per-cluster learning in M2/M3
+- **M5 Hot/Warm/Cold Tiering**: Three-tier memory with t-digest streaming quantile estimator for adaptive tier boundaries; hot memories get priority in search, cold memories are candidates for archival
 
 ## Environment Variables
 

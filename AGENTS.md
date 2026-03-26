@@ -2,13 +2,13 @@
 
 ## Overview
 
-rein — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 22 MCP tools.
+rein — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 24 MCP tools.
 
 ## Build & Test
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (118+)
+cargo test            # All tests must pass (182+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
@@ -30,7 +30,10 @@ src/
 │   ├── fts.rs       # FTS5 search with sanitization
 │   ├── vec.rs       # sqlite-vec operations
 │   ├── hnsw.rs      # HNSW approximate nearest neighbor (usearch)
-│   └── tantivy_fts.rs # Tantivy BM25 full-text search (BooleanQuery topic filter)
+│   ├── tantivy_fts.rs # Tantivy BM25 full-text search (BooleanQuery topic filter)
+│   ├── adaptive.rs  # Feedback event sourcing, AdaptiveState cache, per-consumer offsets
+│   ├── hdbscan.rs   # Pure Rust HDBSCAN clustering (dendrogram → condensed tree → EOMBST)
+│   └── tiering.rs   # Three-tier memory (Hot/Warm/Cold) with streaming quantile estimator
 ├── embed/
 │   ├── gemini.rs    # Google Gemini embedding API
 │   ├── omlx.rs      # OMLX local embedding (OpenAI-compatible)
@@ -41,7 +44,9 @@ src/
 │   ├── rrf.rs       # Reciprocal Rank Fusion + Convex Combination
 │   ├── scoring.rs   # Ebbinghaus decay formula
 │   ├── warmup.rs    # Background warmup: embeddings + HNSW/Tantivy rebuild
-│   └── chunker.rs   # Semantic text chunking
+│   ├── chunker.rs   # Semantic text chunking
+│   ├── alpha_optimizer.rs # Counterfactual offline alpha optimization for CC fusion
+│   └── survival.rs  # Kaplan-Meier non-parametric survival analysis for adaptive decay
 ├── extract/
 │   ├── llm.rs       # LLM extraction (Gemini + OMLX/Ollama), fallback to patterns
 │   ├── patterns.rs  # Rule-based keyword scoring (fallback when LLM unavailable)
