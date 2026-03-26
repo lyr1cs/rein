@@ -197,10 +197,11 @@ fn run_hdbscan_clustering(
 ) {
     tracing::debug!("M4: running HDBSCAN on {count} embeddings");
 
-    // Read embeddings from vec_memories (cap to sampling limit to avoid OOM)
-    let load_limit = count.min(crate::store::hdbscan::HDBSCAN_FULL_MATRIX_LIMIT);
+    // Read all embeddings — hdbscan() internally handles sampling for n > 3000
+    // Cap at 10000 to avoid excessive memory use even with sampling
+    let load_limit = count.min(10_000);
     let embeddings: Vec<(String, Vec<f32>)> = match store.conn().prepare(
-        "SELECT id, embedding FROM vec_memories ORDER BY RANDOM() LIMIT ?1"
+        "SELECT id, embedding FROM vec_memories LIMIT ?1"
     ) {
         Ok(mut stmt) => stmt.query_map(
             rusqlite::params![load_limit as i64],
@@ -380,11 +381,13 @@ fn run_tiering(
         );
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'warm'
-             WHERE status = 'active' AND tier NOT IN ('hot', 'cold')
-             OR (tier = 'hot' AND CAST(access_count AS REAL) / MAX(1, CAST(
-               (julianday('now') - julianday(created_at)) AS REAL)) < ?1)
-             OR (tier = 'cold' AND CAST(access_count AS REAL) / MAX(1, CAST(
-               (julianday('now') - julianday(created_at)) AS REAL)) > ?2)",
+             WHERE status = 'active' AND (
+               tier NOT IN ('hot', 'cold')
+               OR (tier = 'hot' AND CAST(access_count AS REAL) / MAX(1, CAST(
+                 (julianday('now') - julianday(created_at)) AS REAL)) < ?1)
+               OR (tier = 'cold' AND CAST(access_count AS REAL) / MAX(1, CAST(
+                 (julianday('now') - julianday(created_at)) AS REAL)) > ?2)
+             )",
             rusqlite::params![state.hot_threshold, state.cold_threshold],
         );
     }
@@ -488,21 +491,31 @@ fn run_alpha_learning(
 
         if candidates.is_empty() { continue; }
 
+        let ts = chrono::DateTime::parse_from_rfc3339(&event.ts)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+
         // Find which candidate memories were actually accessed (injected by hook_prompt).
-        // Note: recall_access events use a different request_id than recall_complete,
-        // so we match by memory_id presence instead of request_id join.
+        // Match by: (a) memory_id appears in this recall's candidate set, AND
+        // (b) access event timestamp is within 10 minutes of the recall event.
+        // The time window reduces false attribution when the same memory appears
+        // in multiple unrelated recalls.
         let candidate_ids: std::collections::HashSet<&str> = candidates.iter()
             .map(|c| c.memory_id.as_str()).collect();
         let accessed_ids: Vec<String> = access_events.iter()
+            .filter(|a| {
+                // Time-window filter: access must be within 10 min of recall
+                let access_ts = chrono::DateTime::parse_from_rfc3339(&a.ts)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(ts);
+                let diff = (access_ts - ts).num_seconds().abs();
+                diff < 600 // 10 minutes
+            })
             .filter_map(|a| a.memory_id.as_deref())
             .filter(|mid| candidate_ids.contains(mid))
             .map(|s| s.to_string())
             .collect::<std::collections::HashSet<_>>()
             .into_iter().collect();
-
-        let ts = chrono::DateTime::parse_from_rfc3339(&event.ts)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now());
 
         recall_events.push(crate::search::alpha_optimizer::RecallEvent {
             request_id,

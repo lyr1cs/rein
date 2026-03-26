@@ -152,8 +152,29 @@ pub fn recall_temporal(
         }
     }
 
-    // Apply Ebbinghaus weighting + temporal filter
-    // When temporal filters are active, don't truncate early — need to scan all fused results
+    // Apply strength weighting (Ebbinghaus or KM survival curve) + temporal filter
+    // Load cached per-cluster survival curves from M3 (if available)
+    let mut survival_cache: std::collections::HashMap<u32, crate::search::survival::SurvivalCurve> = std::collections::HashMap::new();
+    if config.adaptive.enabled {
+        if let Ok(mut stmt) = store.conn().prepare(
+            "SELECT key, value FROM metadata WHERE key LIKE 'survival_curve:%'"
+        ) {
+            let _ = stmt.query_map([], |row| {
+                let key: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((key, json))
+            }).ok().map(|rows| {
+                for row in rows.flatten() {
+                    if let Some(id_str) = row.0.strip_prefix("survival_curve:") {
+                        if let (Ok(cid), Ok(curve)) = (id_str.parse::<u32>(), serde_json::from_str(&row.1)) {
+                            survival_cache.insert(cid, curve);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     let has_temporal = time_from.is_some() || time_to.is_some();
     let take_count = if has_temporal { usize::MAX } else { limit * 2 };
     let mut local_results: Vec<(Memory, f32)> = Vec::new();
@@ -166,7 +187,9 @@ pub fn recall_temporal(
             if let Some(to) = time_to {
                 if memory.created_at > to { continue; }
             }
-            let final_score = crate::search::scoring::apply_strength_weighting(rrf_score, &memory);
+            // Use per-cluster survival curve if available (M3), else Ebbinghaus
+            let curve = memory.cluster_id.and_then(|cid| survival_cache.get(&cid));
+            let final_score = crate::search::scoring::apply_strength_weighting_with_curve(rrf_score, &memory, curve);
             local_results.push((memory, final_score));
         }
     }
