@@ -131,11 +131,10 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
     for (id, topic, summary, content, _keywords) in &memories {
         let text = prepend_metadata(topic, summary, content);
         if let Ok(Some(emb)) = EmbedCache::get(store.conn(), &text, &model) {
-            if emb.len() == dims {
-                if index.insert(id, &emb).is_ok() {
+            if emb.len() == dims
+                && index.insert(id, &emb).is_ok() {
                     inserted += 1;
                 }
-            }
         }
     }
 

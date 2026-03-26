@@ -628,7 +628,7 @@ fn run_alpha_learning(
             .cloned()
             .collect();
 
-        if qt_events.len() < config.adaptive.min_samples_alpha as usize { continue; }
+        if qt_events.len() < config.adaptive.min_samples_alpha { continue; }
 
         if let Some(learned) = crate::search::alpha_optimizer::optimize_alpha(&qt_events, decay_lambda) {
             let global_alpha = state.learned_alpha.get("global")
@@ -853,7 +853,7 @@ fn compute_per_cluster_dedup_thresholds(
             // P90: the threshold where 90% of intra-cluster pairs are below
             let p90_idx = (sims.len() as f64 * 0.90).floor() as usize;
             let p90_idx = p90_idx.min(sims.len() - 1);
-            let threshold = sims[p90_idx].max(0.40).min(0.90); // Clamp to sane range
+            let threshold = sims[p90_idx].clamp(0.40, 0.90); // Clamp to sane range
             state.dedup_thresholds.insert(*cluster_id, threshold);
             tracing::debug!("A1: cluster {cluster_id} dedup threshold = {threshold:.3} (from {} pairs)", sims.len());
         }
@@ -864,7 +864,7 @@ fn compute_per_cluster_dedup_thresholds(
         all_sims.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p90_idx = (all_sims.len() as f64 * 0.90).floor() as usize;
         let p90_idx = p90_idx.min(all_sims.len() - 1);
-        let global = all_sims[p90_idx].max(0.40).min(0.90);
+        let global = all_sims[p90_idx].clamp(0.40, 0.90);
         state.global_dedup_threshold = global;
         tracing::debug!("A1: global dedup threshold = {global:.3} (from {} total pairs)", all_sims.len());
     }

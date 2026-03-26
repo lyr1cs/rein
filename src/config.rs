@@ -29,6 +29,7 @@ impl Provider {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[derive(Default)]
 pub struct ReinConfig {
     pub database: DatabaseConfig,
     pub embedding: EmbeddingConfig,
@@ -263,22 +264,6 @@ fn default_omlx_extract_model() -> String {
 // Default implementations
 // ---------------------------------------------------------------------------
 
-impl Default for ReinConfig {
-    fn default() -> Self {
-        Self {
-            database: DatabaseConfig::default(),
-            embedding: EmbeddingConfig::default(),
-            search: SearchConfig::default(),
-            chunking: ChunkingConfig::default(),
-            sync: SyncConfig::default(),
-            decay: DecayConfig::default(),
-            server: ServerConfig::default(),
-            hooks: HooksConfig::default(),
-            extract: ExtractConfig::default(),
-            adaptive: AdaptiveConfig::default(),
-        }
-    }
-}
 
 impl Default for DatabaseConfig {
     fn default() -> Self {

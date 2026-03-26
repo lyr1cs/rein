@@ -79,7 +79,7 @@ fn parse_frontmatter(content: &str) -> (Option<String>, String) {
             let title = frontmatter
                 .lines()
                 .find(|l| l.starts_with("name:") || l.starts_with("title:"))
-                .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
+                .map(|l| l.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string());
             return (title, body);
         }
     }
