@@ -308,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Gc { dry_run }) => {
             let store = config.open_store()?;
             let threshold = config.decay.prune_threshold;
-            let (decayed, pruned, concepts) = ops::run_gc(&store, threshold, dry_run)?;
+            let (decayed, pruned, concepts) = ops::run_gc_adaptive(&store, &config, threshold, dry_run)?;
             if dry_run {
                 let mut msg = format!("Would decay {decayed} and prune {pruned} weak STM memories (threshold: {threshold})");
                 if concepts > 0 {

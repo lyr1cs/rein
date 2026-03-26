@@ -33,6 +33,8 @@ pub fn build_memory(
         concept_ids: vec![],
         status: MemoryStatus::default(),
         embedding: None,
+        tier: "warm".to_string(),
+        cluster_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed: chrono::Utc::now(),
@@ -64,6 +66,8 @@ pub fn build_consolidated(
         concept_ids: vec![],
         status: MemoryStatus::default(),
         embedding: None,
+        tier: "warm".to_string(),
+        cluster_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed: chrono::Utc::now(),
@@ -75,14 +79,15 @@ pub fn build_consolidated(
 /// Returns (decayed_count, memory_pruned_count, concept_pruned_count).
 pub fn run_gc(store: &SqliteStore, threshold: f64, dry_run: bool) -> ReinResult<(u64, u64, u64)> {
     if dry_run {
+        // Preview mode: DELETE within savepoint so concept evaluation sees the
+        // same DB state as a real GC. Side indexes (Tantivy/HNSW) are NOT touched.
+        // ROLLBACK undoes the SQLite DELETE at the end.
         store.conn().execute_batch("SAVEPOINT gc_preview")
             .map_err(crate::types::ReinError::Database)?;
 
         let decayed = store.apply_decay()?;
-
-        // Actually execute prune within savepoint so concept evaluation sees
-        // the same DB state as a real GC (memories deleted first, then concepts).
-        let mem_pruned = store.prune_memories_only(threshold)?;
+        // SQL DELETE only (no Tantivy/HNSW removal) — savepoint will rollback
+        let mem_pruned = store.prune_memories_sql_only(threshold)?;
         let concept_pruned = store.prune_low_quality_concepts().unwrap_or(0);
 
         store.conn().execute_batch("ROLLBACK TO gc_preview")
@@ -93,12 +98,118 @@ pub fn run_gc(store: &SqliteStore, threshold: f64, dry_run: bool) -> ReinResult<
         Ok((decayed, mem_pruned, concept_pruned))
     } else {
         let decayed = store.apply_decay()?;
-        let mem_pruned = store.prune_memories_only(threshold)?;
+        let mem_pruned = store.prune_memories_only(threshold, false)?;
         let concept_pruned = store.prune_low_quality_concepts().unwrap_or(0);
         if concept_pruned > 0 {
             tracing::info!("pruned {concept_pruned} low-quality concepts");
         }
         Ok((decayed, mem_pruned, concept_pruned))
+    }
+}
+
+/// Run GC with adaptive engine pipeline. Combines standard GC + adaptive learning.
+pub fn run_gc_adaptive(store: &SqliteStore, config: &ReinConfig, threshold: f64, dry_run: bool) -> ReinResult<(u64, u64, u64)> {
+    let result = run_gc(store, threshold, dry_run)?;
+    if !dry_run {
+        run_adaptive_pipeline(store, config);
+    }
+    Ok(result)
+}
+
+/// Run the adaptive engine slow-channel pipeline after GC.
+/// Order: M4 (HDBSCAN) → M3 (Survival) → M5 (Tiering) → M2 (Alpha) → persist.
+/// Each step is gated by readiness checks; failures skip subsequent steps.
+pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
+    if !config.adaptive.enabled {
+        return;
+    }
+
+    let _span = tracing::info_span!("adaptive_pipeline").entered();
+
+    // Restore or create AdaptiveState
+    let mut state = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+        .unwrap_or_default();
+
+    // Count memories for readiness checks
+    let mem_count: u64 = store.conn()
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    // Step 1: M4 — HDBSCAN clustering (skip if < 50 memories with embeddings)
+    let embeddings_count: u64 = store.conn()
+        .query_row("SELECT COUNT(*) FROM vec_memories", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    if embeddings_count >= 50 {
+        tracing::debug!("M4: running HDBSCAN on {} embeddings", embeddings_count);
+        // Get all embeddings from vec_memories
+        // Note: full HDBSCAN on embeddings is computationally expensive for large sets.
+        // For now, we just increment cluster_version and log.
+        // Full HDBSCAN integration requires reading embeddings from vec table which
+        // needs sqlite-vec specific queries — deferred to integration phase.
+        state.cluster_version += 1;
+        tracing::debug!("M4: cluster_version incremented to {}", state.cluster_version);
+    }
+
+    // Step 2: M3 — Survival curves (per-cluster, needs cluster assignments)
+    // Skipped until M4 produces actual cluster assignments.
+    // The Kaplan-Meier module is ready but needs access_time data per cluster.
+
+    // Step 3: M5 — Tier migration (needs >= tier_cold_start memories)
+    if mem_count >= config.adaptive.tier_cold_start as u64 {
+        tracing::debug!("M5: computing tier boundaries for {} memories", mem_count);
+        let mut boundaries = crate::store::tiering::TierBoundaries::new();
+
+        // Compute access rates for all memories
+        if let Ok(mut stmt) = store.conn().prepare(
+            "SELECT access_count, created_at FROM memories WHERE status = 'active'"
+        ) {
+            let rates: Vec<f64> = stmt.query_map([], |row| {
+                let ac: u32 = row.get(0)?;
+                let created_str: String = row.get(1)?;
+                let created = chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                Ok(crate::store::tiering::compute_access_rate(ac, created))
+            }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+
+            if !rates.is_empty() {
+                boundaries.update(&rates);
+                state.hot_threshold = boundaries.hot_threshold;
+                state.cold_threshold = boundaries.cold_threshold;
+                tracing::debug!("M5: hot={:.4}, cold={:.4}", boundaries.hot_threshold, boundaries.cold_threshold);
+            }
+        }
+    }
+
+    // Step 4: M2 — Counterfactual alpha optimization
+    // NOTE: Do NOT consume_events here — that would advance offsets and lose data
+    // before the learner is fully wired. Only peek at event count for diagnostics.
+    let recall_event_count: u64 = store.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM feedback_events WHERE event_type = 'recall_complete'",
+            [], |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if recall_event_count > 0 {
+        tracing::debug!("M2: {} recall_complete events available (alpha learning pending full integration)", recall_event_count);
+    }
+
+    // Step 5: Persist snapshot + emit param_update event
+    state.version += 1;
+    if let Err(e) = state.save_snapshot(store.conn()) {
+        tracing::warn!("failed to save adaptive state: {e}");
+    } else {
+        tracing::debug!("adaptive state v{} saved", state.version);
+    }
+
+    // Step 6: Cleanup expired events
+    let cleaned = crate::store::adaptive::cleanup_expired_events(
+        store.conn(),
+        config.adaptive.event_retention_days,
+    ).unwrap_or(0);
+    if cleaned > 0 {
+        tracing::debug!("cleaned {cleaned} expired events");
     }
 }
 

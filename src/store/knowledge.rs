@@ -98,6 +98,22 @@ impl SqliteStore {
                         } else {
                             report.concepts_refined += 1;
                         }
+                        // Merge new source_memory_ids into existing concept
+                        if !source_memory_ids.is_empty() {
+                            let mut merged = existing.source_memory_ids.clone();
+                            for sid in source_memory_ids {
+                                if !merged.contains(sid) {
+                                    merged.push(sid.clone());
+                                }
+                            }
+                            if merged.len() > existing.source_memory_ids.len() {
+                                let json = serde_json::to_string(&merged).unwrap_or_default();
+                                let _ = self.conn().execute(
+                                    "UPDATE concepts SET source_memory_ids = ?1 WHERE id = ?2",
+                                    rusqlite::params![json, existing.id],
+                                );
+                            }
+                        }
                     }
                     None => {
                         // New concept with source memory references

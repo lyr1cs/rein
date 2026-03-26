@@ -19,7 +19,6 @@ model = "default"
 rrf_k = 60.0
 rrf_fts_weight = 0.3
 rrf_vec_weight = 0.7
-waterfall_fts_threshold = 0.5
 dedup_similarity = 0.70
 dedup_time_window_days = 7
 
@@ -92,3 +91,12 @@ max_input_chars = 16000  # ~4K-8K tokens, suitable for 7B-13B local models. Incr
 # Works with any OpenAI-compatible server:
 # Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
 # vLLM, LocalAI, text-generation-webui, etc.
+
+[adaptive]
+enabled = true                    # Adaptive engine: event logging active, learning loop pending closure
+min_samples_alpha = 10            # Min accessed events per bucket before learning alpha
+survival_cold_start = 20          # Min cluster samples for survival curve
+tier_cold_start = 100             # Min memories before enabling Hot/Warm/Cold tiering
+event_retention_days = 90         # How long to keep feedback events for replay
+alpha_max_step = 0.15             # Max alpha change per GC cycle (prevents instability)
+shrinkage_prior = 5.0             # Bayesian shrinkage strength for sparse buckets

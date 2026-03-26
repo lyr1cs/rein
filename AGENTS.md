@@ -36,10 +36,10 @@ src/
 │   ├── omlx.rs      # OMLX local embedding (OpenAI-compatible)
 │   └── cache.rs     # Embedding cache with TTL
 ├── search/
-│   ├── recall.rs    # Unified recall pipeline (waterfall + cross-validation)
-│   ├── rrf.rs       # Reciprocal Rank Fusion
+│   ├── recall.rs    # Unified recall pipeline (BM25 → HNSW → API + RRF/CC fusion)
+│   ├── classify.rs  # Autonomous retrieval routing (Temporal/ExactKeyword/Semantic/Exploratory)
+│   ├── rrf.rs       # Reciprocal Rank Fusion + Convex Combination
 │   ├── scoring.rs   # Ebbinghaus decay formula
-│   ├── waterfall.rs # Waterfall search strategy
 │   ├── warmup.rs    # Background warmup: embeddings + HNSW/Tantivy rebuild
 │   └── chunker.rs   # Semantic text chunking
 ├── extract/
@@ -52,7 +52,7 @@ src/
 │   ├── auto_memory.rs # ~/.claude/ file scanner
 │   └── validate.rs    # Cross-source validation
 └── mcp/
-    ├── server.rs    # MCP server (22 tools, stdio + HTTP)
+    ├── server.rs    # MCP server (24 tools, stdio + HTTP)
     ├── tools.rs     # Tool parameter structs
     └── compact.rs   # Output formatters
 ```

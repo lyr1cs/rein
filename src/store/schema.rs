@@ -245,6 +245,63 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     // Index for temporal concept queries
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_concepts_updated ON concepts(updated_at)").ok();
 
+    // === Adaptive Engine tables (v0.5.0) ===
+
+    // M1: Feedback event log (append-only event sourcing)
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS feedback_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            event_type TEXT NOT NULL,
+            request_id TEXT,
+            memory_id TEXT,
+            concept_id TEXT,
+            query TEXT,
+            query_type TEXT,
+            topic TEXT,
+            payload TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fe_ts ON feedback_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_fe_type ON feedback_events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_fe_request ON feedback_events(request_id);
+    ")?;
+
+    // M1: Per-consumer offset tracking (each module tracks its own read position)
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS consumer_offsets (
+            consumer TEXT PRIMARY KEY,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+    ")?;
+
+    // M5: Cold archive for compressed cold-tier memories
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS cold_archive (
+            memory_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            archived_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+    ")?;
+
+    // M5: Migrate: add tier column to memories
+    let has_tier: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='tier'",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_tier {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'warm'").ok();
+    }
+
+    // M4: Migrate: add cluster_id column to memories
+    let has_cluster_id: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='cluster_id'",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_cluster_id {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN cluster_id INTEGER").ok();
+    }
+
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;
 

@@ -62,6 +62,8 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
+            tier: "warm".to_string(),
+            cluster_id: None,
             created_at: Utc::now() - Duration::days(days_ago),
             updated_at: Utc::now(),
             last_accessed: Utc::now() - Duration::days(days_ago),
