@@ -4,6 +4,7 @@ use rein::config;
 use rein::embed;
 use rein::extract;
 use rein::mcp;
+use rein::ops;
 use rein::search;
 use rein::store;
 use rein::types;
@@ -307,24 +308,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Gc { dry_run }) => {
             let store = config.open_store()?;
             let threshold = config.decay.prune_threshold;
+            let (decayed, pruned, concepts) = ops::run_gc(&store, threshold, dry_run)?;
             if dry_run {
-                // Simulate: apply decay inside a savepoint, count what would be pruned, then rollback
-                store.conn().execute_batch("SAVEPOINT gc_preview")?;
-                let decayed = store.apply_decay()?;
-                let mut stmt = store.conn().prepare(
-                    "SELECT COUNT(*) FROM memories WHERE layer = 'STM' AND strength < ?1
-                     AND importance NOT IN ('critical', 'high')"
-                )?;
-                let count: u64 = stmt.query_row(rusqlite::params![threshold], |row| row.get(0))?;
-                drop(stmt);
-                store.conn().execute_batch("ROLLBACK TO gc_preview")?;
-                store.conn().execute_batch("RELEASE gc_preview")?;
-                println!("Would decay {decayed} and prune {count} weak STM memories (threshold: {threshold})");
+                let mut msg = format!("Would decay {decayed} and prune {pruned} weak STM memories (threshold: {threshold})");
+                if concepts > 0 {
+                    msg.push_str(&format!(", {concepts} low-quality concepts"));
+                }
+                println!("{msg}");
             } else {
-                // First apply decay to update strengths, then prune
-                let decayed = store.apply_decay()?;
-                let pruned = store.prune(threshold)?;
-                println!("Decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
+                let mut msg = format!("Decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
+                if concepts > 0 {
+                    msg.push_str(&format!(", {concepts} low-quality concepts"));
+                }
+                println!("{msg}");
             }
         }
         Some(Commands::Organize) => {

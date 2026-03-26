@@ -783,39 +783,27 @@ impl ReinServer {
         let compact = self.compact();
 
         let result = self.with_store(|store| {
-            if dry_run {
-                // Simulate inside a savepoint for accurate preview (avoids nested transaction)
-                store.conn().execute_batch("SAVEPOINT gc_preview").map_err(ReinError::Database)?;
-                let decayed = store.apply_decay()?;
-                let mut stmt = store.conn().prepare(
-                    "SELECT COUNT(*) FROM memories WHERE layer = 'STM' AND strength < ?1
-                     AND importance NOT IN ('critical', 'high')"
-                ).map_err(ReinError::Database)?;
-                let count: u64 = stmt.query_row(rusqlite::params![threshold], |row| row.get(0))
-                    .map_err(ReinError::Database)?;
-                drop(stmt);
-                store.conn().execute_batch("ROLLBACK TO gc_preview").map_err(ReinError::Database)?;
-                store.conn().execute_batch("RELEASE gc_preview").map_err(ReinError::Database)?;
-                Ok((decayed, count))
-            } else {
-                let decayed = store.apply_decay()?;
-                let pruned = store.prune(threshold)?;
-                Ok((decayed, pruned))
-            }
+            crate::ops::run_gc(store, threshold, dry_run)
         });
 
         match result {
-            Ok((decayed, count)) => {
+            Ok((decayed, pruned, concepts)) => {
                 let mut text = if compact {
                     if dry_run {
-                        format!("would_prune:{count}")
+                        let mut s = format!("would_prune:{pruned}");
+                        if concepts > 0 { s.push_str(&format!(" concepts:{concepts}")); }
+                        s
                     } else {
-                        format!("decayed:{decayed} pruned:{count}")
+                        format!("decayed:{decayed} pruned:{pruned}")
                     }
                 } else if dry_run {
-                    format!("GC dry run: {count} weak STM memories would be pruned (threshold: {threshold})")
+                    let mut s = format!("GC dry run: {pruned} weak STM memories would be pruned (threshold: {threshold})");
+                    if concepts > 0 { s.push_str(&format!(", {concepts} low-quality concepts")); }
+                    s
                 } else {
-                    format!("GC complete: decayed {decayed} memories, pruned {count} weak STM memories (threshold: {threshold})")
+                    let mut s = format!("GC complete: decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
+                    if concepts > 0 { s.push_str(&format!(", {concepts} low-quality concepts")); }
+                    s
                 };
                 self.maybe_nudge(&mut text);
                 text
