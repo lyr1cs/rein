@@ -918,16 +918,21 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             }
 
             if sim > 0.85 {
-                // Strong semantic match — merge into the older (more established) memory
-                let (keep_id, discard_id, merge_content) = if candidate.access_count >= 1 || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1) {
-                    (&candidate.id, id, content.as_str())
+                // Strong semantic match — provenance-preserving merge
+                let (keep_id, discard_id, discard_content, discard_created) = if candidate.access_count >= 1 || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1) {
+                    (&candidate.id, id, content.to_string(), "recent".to_string())
                 } else {
-                    (id, candidate_id, candidate.content.as_str())
+                    (id, candidate_id, candidate.content.clone(), candidate.created_at.format("%Y-%m-%d").to_string())
                 };
 
-                // Use store.get + store.update to properly trigger FTS/Tantivy/HNSW refresh
+                // Extract unique lines from the loser and append to winner
                 if let Ok(mut kept) = store.get(keep_id) {
-                    kept.content = format!("{}\n\n{}", kept.content, merge_content);
+                    let unique = extract_unique_lines(&discard_content, &kept.content);
+                    if !unique.is_empty() {
+                        kept.content.push_str(&format!(
+                            "\n\n[merged from {discard_id} on {discard_created}]\n{unique}"
+                        ));
+                    }
                     kept.summary = kept.content.chars().take(100).collect();
                     kept.strength = (kept.strength + 0.2).min(1.0);
                     kept.updated_at = chrono::Utc::now();
@@ -980,36 +985,89 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
 
 /// Run dedup scan across all topics.
 /// Returns (duplicates_found, duplicates_removed).
+/// Run dedup scan across all topics with provenance-preserving merge.
+///
+/// Instead of hard-deleting duplicates (which loses temporal anchors and unique
+/// details), this extracts unique lines from the "loser" and appends them to the
+/// "winner" with a provenance marker. The loser is then superseded, not deleted.
+///
+/// Returns (duplicates_found, duplicates_merged).
 pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResult<(u32, u32)> {
     let topics = store.list_topics()?;
     let mut dups_found = 0u32;
-    let mut dups_removed = 0u32;
+    let mut dups_merged = 0u32;
     for topic in &topics {
         let mems = store.get_by_topic(topic)?;
-        let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for i in 0..mems.len() {
-            if to_delete.contains(&mems[i].id) { continue; }
+            if processed.contains(&mems[i].id) { continue; }
             for j in (i + 1)..mems.len() {
-                if to_delete.contains(&mems[j].id) { continue; }
+                if processed.contains(&mems[j].id) { continue; }
                 let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
                 if sim >= threshold {
-                    to_delete.insert(mems[i].id.clone());
                     dups_found += 1;
                     if dry_run {
-                        tracing::debug!("dup: '{}' ~ '{}'", &mems[i].summary.chars().take(40).collect::<String>(), &mems[j].summary.chars().take(40).collect::<String>());
+                        tracing::debug!("dup: '{}' ~ '{}'",
+                            &mems[i].summary.chars().take(40).collect::<String>(),
+                            &mems[j].summary.chars().take(40).collect::<String>());
+                    } else {
+                        // Provenance-preserving merge: keep the newer/longer one,
+                        // extract unique content from the other
+                        let (winner_idx, loser_idx) = if mems[j].content.len() >= mems[i].content.len() {
+                            (j, i)
+                        } else {
+                            (i, j)
+                        };
+                        let unique = extract_unique_lines(&mems[loser_idx].content, &mems[winner_idx].content);
+                        if !unique.is_empty() {
+                            // Append unique provenance to the winner
+                            let provenance = format!(
+                                "\n\n[merged from {} on {}]\n{}",
+                                mems[loser_idx].id,
+                                mems[loser_idx].created_at.format("%Y-%m-%d"),
+                                unique,
+                            );
+                            if let Ok(mut winner) = store.get(&mems[winner_idx].id) {
+                                winner.content.push_str(&provenance);
+                                // Merge keywords
+                                for kw in &mems[loser_idx].keywords {
+                                    if !winner.keywords.contains(kw) {
+                                        winner.keywords.push(kw.clone());
+                                    }
+                                }
+                                winner.strength = (winner.strength + 0.1).min(1.0);
+                                let _ = store.update(&winner);
+                            }
+                        }
+                        // Supersede the loser (preserves it in DB, just marks as replaced)
+                        let _ = store.mark_superseded(&mems[loser_idx].id, &mems[winner_idx].id);
+                        dups_merged += 1;
                     }
+                    processed.insert(mems[i].id.clone());
                     break;
                 }
             }
         }
-        if !dry_run {
-            for id in &to_delete {
-                store.delete(id)?;
-                dups_removed += 1;
-            }
-        }
     }
-    Ok((dups_found, dups_removed))
+    Ok((dups_found, dups_merged))
+}
+
+/// Extract lines from `source` that are not present in `target`.
+/// Used for provenance-preserving merge: keeps unique temporal anchors and details.
+pub fn extract_unique_lines(source: &str, target: &str) -> String {
+    let target_lower = target.to_lowercase();
+    let unique: Vec<&str> = source.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { return false; }
+            // Keep lines that have dates (temporal anchors) or aren't found in target
+            let has_date = trimmed.chars().any(|c| c.is_ascii_digit())
+                && (trimmed.contains("202") || trimmed.contains("20-") || trimmed.contains("月"));
+            let is_unique = !target_lower.contains(&trimmed.to_lowercase());
+            has_date || is_unique
+        })
+        .collect();
+    unique.join("\n")
 }
 
 /// Upgrade report returned by run_upgrade.
@@ -1178,4 +1236,43 @@ pub async fn run_upgrade(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_unique_lines_preserves_dates() {
+        let source = "2026-03-15 direct login failed\n2026-03-17 used jump host\ngeneral note about SSH";
+        let target = "general note about SSH and connection\n2026-03-22 containerTag mismatch";
+
+        let unique = extract_unique_lines(source, target);
+        // Should preserve date-anchored lines even if partially overlapping
+        assert!(unique.contains("2026-03-15"), "should keep date 03-15: {unique}");
+        assert!(unique.contains("2026-03-17"), "should keep date 03-17: {unique}");
+    }
+
+    #[test]
+    fn test_extract_unique_lines_filters_duplicates() {
+        let source = "line A\nline B\nline C";
+        let target = "line A\nline C\nline D";
+
+        let unique = extract_unique_lines(source, target);
+        assert!(unique.contains("line B"), "should keep unique line B");
+        assert!(!unique.contains("line A"), "should not keep duplicate line A");
+        assert!(!unique.contains("line C"), "should not keep duplicate line C");
+    }
+
+    #[test]
+    fn test_extract_unique_lines_empty_source() {
+        assert!(extract_unique_lines("", "anything").is_empty());
+    }
+
+    #[test]
+    fn test_extract_unique_lines_all_unique() {
+        let unique = extract_unique_lines("alpha\nbeta", "gamma\ndelta");
+        assert!(unique.contains("alpha"));
+        assert!(unique.contains("beta"));
+    }
 }
