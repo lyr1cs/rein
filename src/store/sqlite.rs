@@ -710,28 +710,34 @@ impl SqliteStore {
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
-        // Use per-cluster adaptive threshold if available (A1), falling back to caller's threshold.
-        // When the new memory has no cluster_id, infer from the most similar existing memory
-        // in the same topic (which likely shares the same semantic cluster).
-        let effective_threshold = if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn) {
-            let cluster = memory.cluster_id.or_else(|| {
-                // Infer cluster from topic neighbors
-                self.conn.query_row(
-                    "SELECT cluster_id FROM memories WHERE topic = ?1 AND cluster_id IS NOT NULL LIMIT 1",
-                    rusqlite::params![&memory.topic],
-                    |row| row.get::<_, Option<u32>>(0),
-                ).ok().flatten()
-            });
-            state.get_dedup_threshold(cluster)
-        } else {
-            similarity_threshold
+        // First pass: run check_dedup with caller's threshold to find best candidate
+        let dedup_action = crate::extract::check_dedup(
+            self, &memory.topic, &memory.content, similarity_threshold, time_window_days,
+        )?;
+
+        // Derive cluster from the matched candidate (if any) for adaptive threshold.
+        // This is more accurate than picking a random topic neighbor.
+        let candidate_cluster = match &dedup_action {
+            DedupAction::MergeInto(id) | DedupAction::Supersede(id) | DedupAction::GrayZone(id, _) => {
+                self.get(id).ok().and_then(|m| m.cluster_id)
+            }
+            DedupAction::CreateNew => memory.cluster_id,
         };
 
-        // Pre-check: resolve gray zone BEFORE opening write transaction
-        // so LLM call doesn't hold the write lock
-        let dedup_action = crate::extract::check_dedup(
-            self, &memory.topic, &memory.content, effective_threshold, time_window_days,
-        )?;
+        // Re-check with adaptive threshold if it differs from caller's threshold
+        let dedup_action = if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn) {
+            let effective = state.get_dedup_threshold(candidate_cluster);
+            if (effective - similarity_threshold).abs() > 0.01 {
+                // Threshold changed — re-run dedup with adaptive value
+                crate::extract::check_dedup(
+                    self, &memory.topic, &memory.content, effective, time_window_days,
+                )?
+            } else {
+                dedup_action
+            }
+        } else {
+            dedup_action
+        };
         let resolved_action = match dedup_action {
             DedupAction::GrayZone(ref candidate_id, sim) => {
                 // LLM semantic check outside transaction
