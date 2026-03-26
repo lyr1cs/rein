@@ -688,7 +688,7 @@ fn build_condensed_tree_and_extract(
 /// [`hdbscan_approximate`] with pre-computed k-NN lists.
 /// Hard limit for full O(n^2) distance matrix computation.
 /// Above this threshold, auto-fallback to sampling + label propagation.
-const HDBSCAN_FULL_MATRIX_LIMIT: usize = 3000;
+pub const HDBSCAN_FULL_MATRIX_LIMIT: usize = 3000;
 
 pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> HdbscanResult {
     let n = embeddings.len();
