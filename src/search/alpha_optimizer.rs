@@ -44,13 +44,14 @@ pub struct LearnedAlpha {
 // Core algorithm
 // ---------------------------------------------------------------------------
 
-/// Number of grid steps (0.00, 0.01, ..., 1.00 → 101 points).
-const GRID_STEPS: usize = 101;
+/// Coarse grid steps (0.00, 0.05, ..., 1.00 → 21 points).
+const COARSE_STEPS: usize = 21;
+/// Fine grid steps within ±0.05 of coarse best → 11 points at 0.01 resolution.
+const FINE_STEPS: usize = 11;
 
 /// Find the alpha that maximizes the rank of accessed memories.
 ///
-/// For each alpha in `[0.00, 0.01, …, 1.00]`:
-/// 1. Compute `score = alpha * bm25_norm + (1 - alpha) * vec_norm` per candidate.
+/// Uses two-phase coarse-fine grid search (21 + 11 = 32 evaluations instead of 101):
 /// 2. Rank candidates by score descending.
 /// 3. Sum the **reciprocal ranks** of accessed memories: `Σ 1/rank`.
 /// 4. The alpha that maximizes this sum is optimal.
@@ -70,40 +71,46 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
         return None;
     }
 
-    let mut best_alpha = 0.0_f64;
-    let mut best_mrr = f64::NEG_INFINITY;
-
-    // Pre-allocate a score/index buffer.
     let n = event.candidates.len();
     let mut scored: Vec<(f64, usize)> = Vec::with_capacity(n);
 
-    for step in 0..GRID_STEPS {
-        let alpha = step as f64 / (GRID_STEPS - 1) as f64;
-
+    let eval_alpha = |alpha: f64, scored: &mut Vec<(f64, usize)>| -> f64 {
         scored.clear();
         for (i, c) in event.candidates.iter().enumerate() {
             let score = alpha * c.bm25_norm as f64 + (1.0 - alpha) * c.vec_norm as f64;
             scored.push((score, i));
         }
-
-        // Sort descending by score, stable so ties preserve insertion order.
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Sum reciprocal ranks of accessed memories.
         let mut mrr_sum = 0.0_f64;
         for (rank_0, &(_score, idx)) in scored.iter().enumerate() {
-            let rank = rank_0 + 1; // 1-based
-            if event
-                .accessed_ids
-                .iter()
-                .any(|id| *id == event.candidates[idx].memory_id)
-            {
+            let rank = rank_0 + 1;
+            if event.accessed_ids.iter().any(|id| *id == event.candidates[idx].memory_id) {
                 mrr_sum += 1.0 / rank as f64;
             }
         }
+        mrr_sum
+    };
 
-        if mrr_sum > best_mrr {
-            best_mrr = mrr_sum;
+    // Phase 1: Coarse grid (0.00, 0.05, ..., 1.00)
+    let mut best_alpha = 0.0_f64;
+    let mut best_mrr = f64::NEG_INFINITY;
+    for step in 0..COARSE_STEPS {
+        let alpha = step as f64 / (COARSE_STEPS - 1) as f64;
+        let mrr = eval_alpha(alpha, &mut scored);
+        if mrr > best_mrr {
+            best_mrr = mrr;
+            best_alpha = alpha;
+        }
+    }
+
+    // Phase 2: Fine grid around coarse best (±0.05 at 0.01 resolution)
+    let fine_lo = (best_alpha - 0.05).max(0.0);
+    let fine_hi = (best_alpha + 0.05).min(1.0);
+    for step in 0..FINE_STEPS {
+        let alpha = fine_lo + (fine_hi - fine_lo) * step as f64 / (FINE_STEPS - 1) as f64;
+        let mrr = eval_alpha(alpha, &mut scored);
+        if mrr > best_mrr {
+            best_mrr = mrr;
             best_alpha = alpha;
         }
     }
