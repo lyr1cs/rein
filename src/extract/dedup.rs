@@ -114,7 +114,9 @@ pub fn check_dedup(
     }
 
     // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
-    if best_sim >= 0.5 {
+    // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
+    let gray_floor = if m6_has_llm_budget() { 0.35 } else { 0.50 };
+    if best_sim >= gray_floor {
         if let Some(memory) = best_memory {
             if is_exploration {
                 m6_log_outcome(store, best_sim, effective_threshold, similarity_threshold, false);
@@ -129,6 +131,31 @@ pub fn check_dedup(
     }
 
     Ok(DedupAction::CreateNew)
+}
+
+/// M6: LLM judgment budget — allow up to 10 LLM dedup calls per hour.
+/// When budget is available, extend the gray zone to catch more borderline cases.
+fn m6_has_llm_budget() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static LLM_CALLS_THIS_HOUR: AtomicU64 = AtomicU64::new(0);
+    static HOUR_START: AtomicU64 = AtomicU64::new(0);
+
+    const MAX_LLM_CALLS_PER_HOUR: u64 = 10;
+
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let current_hour = now_secs / 3600;
+    let stored_hour = HOUR_START.load(Ordering::Relaxed);
+
+    if current_hour != stored_hour {
+        // New hour — reset counter
+        HOUR_START.store(current_hour, Ordering::Relaxed);
+        LLM_CALLS_THIS_HOUR.store(0, Ordering::Relaxed);
+    }
+
+    let calls = LLM_CALLS_THIS_HOUR.fetch_add(1, Ordering::Relaxed);
+    calls < MAX_LLM_CALLS_PER_HOUR
 }
 
 /// M6: Randomized threshold exploration.
