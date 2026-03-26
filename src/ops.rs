@@ -162,6 +162,9 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // Step 4: M2 — Counterfactual alpha optimization (consume events, learn alphas)
     run_alpha_learning(store, &mut state, config);
 
+    // Step 4b: M6 — Consume threshold exploration data + co-recall signal → update dedup thresholds
+    run_m6_threshold_learning(store, &mut state);
+
     // Step 5: Embedding-based dedup for memories marked needs_vec_dedup
     run_vec_dedup(store, config);
 
@@ -551,6 +554,166 @@ fn run_alpha_learning(
             });
 
             tracing::info!("M2: learned {qt} alpha = {shrunk:.3} ({} events)", learned.sample_count);
+        }
+    }
+}
+
+// ===========================================================================
+// M6: Threshold learning — consume exploration data + co-recall signal
+// ===========================================================================
+
+fn run_m6_threshold_learning(
+    store: &SqliteStore,
+    state: &mut crate::store::adaptive::AdaptiveState,
+) {
+    let conn = store.conn();
+
+    // --- Part 1: Consume threshold_exploration events (from randomized A/B test) ---
+    let events = crate::store::adaptive::consume_events(
+        conn, "m6_threshold", &["param_update"], 200,
+    ).unwrap_or_default();
+
+    // Filter to threshold_exploration events only
+    let explore_events: Vec<_> = events.iter()
+        .filter(|e| e.query_type.as_deref() == Some("threshold_exploration"))
+        .collect();
+
+    if explore_events.len() >= 10 {
+        // Causal inference: compare dedup rates at different thresholds
+        // Group by whether threshold was raised or lowered
+        let mut raised_dedup = 0u32;  // threshold raised (harder to dedup) → was_dedup count
+        let mut raised_total = 0u32;
+        let mut lowered_dedup = 0u32; // threshold lowered (easier to dedup) → was_dedup count
+        let mut lowered_total = 0u32;
+
+        for event in &explore_events {
+            let payload: serde_json::Value = event.payload.as_deref()
+                .and_then(|p| serde_json::from_str(p).ok())
+                .unwrap_or_default();
+
+            let offset = payload.get("offset").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let was_dedup = payload.get("was_dedup").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if offset > 0.01 {
+                raised_total += 1;
+                if was_dedup { raised_dedup += 1; }
+            } else if offset < -0.01 {
+                lowered_total += 1;
+                if was_dedup { lowered_dedup += 1; }
+            }
+        }
+
+        // If lowering the threshold catches significantly more duplicates,
+        // the current threshold is too high → nudge global threshold down
+        if raised_total >= 5 && lowered_total >= 5 {
+            let raised_rate = raised_dedup as f64 / raised_total as f64;
+            let lowered_rate = lowered_dedup as f64 / lowered_total as f64;
+
+            if lowered_rate > raised_rate + 0.15 {
+                // Lowering threshold catches 15%+ more duplicates → threshold too high
+                let adjustment = -0.02;
+                state.global_dedup_threshold = (state.global_dedup_threshold + adjustment as f32).clamp(0.40, 0.90);
+                tracing::info!(
+                    "M6: lowered global threshold to {:.3} (lowered_rate={:.2}, raised_rate={:.2})",
+                    state.global_dedup_threshold, lowered_rate, raised_rate
+                );
+            } else if raised_rate > lowered_rate + 0.15 {
+                // Raising threshold still catches duplicates → threshold too low (too aggressive)
+                let adjustment = 0.02;
+                state.global_dedup_threshold = (state.global_dedup_threshold + adjustment as f32).clamp(0.40, 0.90);
+                tracing::info!(
+                    "M6: raised global threshold to {:.3} (raised_rate={:.2}, lowered_rate={:.2})",
+                    state.global_dedup_threshold, raised_rate, lowered_rate
+                );
+            } else {
+                tracing::debug!("M6: threshold stable (lowered={:.2}, raised={:.2})", lowered_rate, raised_rate);
+            }
+        }
+    }
+
+    // --- Part 2: Co-recall frequency signal ---
+    // If two memories always appear together in recall results, they might be duplicates
+    // that slipped through dedup (threshold was too high).
+    let recall_events = crate::store::adaptive::consume_events(
+        conn, "m6_corecall", &["recall_complete"], 100,
+    ).unwrap_or_default();
+
+    if recall_events.len() >= 5 {
+        // Count pair co-occurrences in recall results
+        let mut pair_counts: std::collections::HashMap<(String, String), u32> = std::collections::HashMap::new();
+        let mut mem_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+        for event in &recall_events {
+            let payload: serde_json::Value = event.payload.as_deref()
+                .and_then(|p| serde_json::from_str(p).ok())
+                .unwrap_or_default();
+
+            let ids: Vec<String> = payload.as_array()
+                .map(|arr| arr.iter()
+                    .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .take(10) // Only top-10 results
+                    .collect())
+                .unwrap_or_default();
+
+            for id in &ids {
+                *mem_counts.entry(id.clone()).or_default() += 1;
+            }
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    let key = if ids[i] < ids[j] {
+                        (ids[i].clone(), ids[j].clone())
+                    } else {
+                        (ids[j].clone(), ids[i].clone())
+                    };
+                    *pair_counts.entry(key).or_default() += 1;
+                }
+            }
+        }
+
+        // Find pairs that co-occur in >80% of their individual appearances
+        let event_count = recall_events.len() as u32;
+        let mut suspicious_pairs = 0u32;
+        for ((id_a, id_b), co_count) in &pair_counts {
+            let count_a = mem_counts.get(id_a).copied().unwrap_or(0);
+            let count_b = mem_counts.get(id_b).copied().unwrap_or(0);
+            let min_count = count_a.min(count_b);
+
+            // Co-recall rate: how often do they appear together relative to individually
+            if min_count >= 3 && *co_count as f64 / min_count as f64 > 0.80 {
+                // These two memories are almost always recalled together → likely duplicates
+                // Check their content similarity
+                if let (Ok(mem_a), Ok(mem_b)) = (store.get(id_a), store.get(id_b)) {
+                    let sim = crate::extract::similarity(&mem_a.content, &mem_b.content);
+                    if sim > 0.30 {
+                        // Moderate+ similarity AND high co-recall → flag for merge
+                        tracing::info!(
+                            "M6 co-recall: '{}'↔'{}' co-recall={}/{}, sim={:.2} — likely duplicate",
+                            &mem_a.summary.chars().take(30).collect::<String>(),
+                            &mem_b.summary.chars().take(30).collect::<String>(),
+                            co_count, min_count, sim,
+                        );
+                        // Mark the newer one for vec dedup (it will be caught in the next sweep)
+                        let newer_id = if mem_a.created_at > mem_b.created_at { id_a } else { id_b };
+                        let _ = conn.execute(
+                            "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                            rusqlite::params![newer_id],
+                        );
+                        suspicious_pairs += 1;
+                    }
+                }
+            }
+        }
+
+        // If many co-recall pairs found, threshold is probably too high
+        if suspicious_pairs > 0 && event_count >= 10 {
+            let pair_ratio = suspicious_pairs as f64 / event_count as f64;
+            if pair_ratio > 0.2 {
+                state.global_dedup_threshold = (state.global_dedup_threshold - 0.02).clamp(0.40, 0.90);
+                tracing::info!(
+                    "M6: co-recall signal lowered threshold to {:.3} ({suspicious_pairs} suspicious pairs in {event_count} events)",
+                    state.global_dedup_threshold
+                );
+            }
         }
     }
 }
