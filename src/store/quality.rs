@@ -159,7 +159,7 @@ impl SqliteStore {
     /// Increments a recall_count in metadata for tracking quality.
     pub fn record_recall_hit(&self, ids: &[String]) {
         if ids.is_empty() { return; }
-        let _ = self.conn.execute_batch("BEGIN");
+        let _ = self.conn.execute_batch("SAVEPOINT recall_hit");
         for id in ids {
             let _ = self.conn.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, '1')
@@ -167,7 +167,7 @@ impl SqliteStore {
                 rusqlite::params![format!("recall_hit:{}", id)],
             );
         }
-        let _ = self.conn.execute_batch("COMMIT");
+        let _ = self.conn.execute_batch("RELEASE recall_hit");
     }
 
     /// Compute quality score for the memory store.

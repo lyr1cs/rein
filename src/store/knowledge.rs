@@ -461,7 +461,7 @@ impl SqliteStore {
     /// Atomically consolidate a topic: delete all old memories and insert replacement in one transaction.
     /// Returns the old memories for reference. If insertion fails, everything rolls back.
     pub fn consolidate_atomic(&self, topic: &str, replacement: Memory) -> ReinResult<Vec<Memory>> {
-        self.conn.execute_batch("BEGIN TRANSACTION")?;
+        self.conn.execute_batch("SAVEPOINT consolidate_atomic")?;
 
         // Collect old memories
         let old_memories = self.get_by_topic(topic)?;
@@ -471,20 +471,17 @@ impl SqliteStore {
             "DELETE FROM memories WHERE topic = ?1",
             rusqlite::params![topic],
         ) {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let _ = self.conn.execute_batch("ROLLBACK TO consolidate_atomic; RELEASE consolidate_atomic");
             return Err(e.into());
         }
 
-        // Insert replacement within same transaction
-        // Note: store() internally fires update_tantivy/update_hnsw which is
-        // fire-and-forget. This is acceptable since Tantivy is append-only and
-        // worst case we have a stale entry on rollback.
+        // Insert replacement within same savepoint
         if let Err(e) = self.store(replacement) {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let _ = self.conn.execute_batch("ROLLBACK TO consolidate_atomic; RELEASE consolidate_atomic");
             return Err(e);
         }
 
-        self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch("RELEASE consolidate_atomic")?;
 
         // Clean side indexes AFTER commit to avoid inconsistency on rollback
         for m in &old_memories {
