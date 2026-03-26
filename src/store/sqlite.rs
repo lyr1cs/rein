@@ -786,9 +786,16 @@ impl SqliteStore {
                 Ok(id)
             }
             DedupAction::MergeInto(existing_id) => {
-                // Update existing memory: append content, refresh summary/keywords, boost strength
+                // Provenance-preserving merge: extract unique lines from new content
+                // and append with temporal marker, rather than blind concatenation
                 if let Ok(mut existing) = self.get(&existing_id) {
-                    existing.content = format!("{}\n\n{}", existing.content, memory.content);
+                    let unique = crate::ops::extract_unique_lines(&memory.content, &existing.content);
+                    if !unique.is_empty() {
+                        existing.content.push_str(&format!(
+                            "\n\n[merged on {}]\n{}",
+                            chrono::Utc::now().format("%Y-%m-%d"), unique
+                        ));
+                    }
                     existing.summary = existing.content.chars().take(100).collect();
                     // Merge keywords (deduplicated)
                     for kw in &memory.keywords {
