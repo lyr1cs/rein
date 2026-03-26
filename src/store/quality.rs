@@ -294,6 +294,7 @@ mod tests {
             source_memory_ids: vec![],
             confidence: 0.75,
             revision: 1,
+            last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -338,6 +339,7 @@ mod tests {
             source_memory_ids: vec![],
             confidence: 0.9,
             revision: 1,
+            last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -467,6 +469,7 @@ mod tests {
             source_memory_ids: vec![mem_id.clone()],
             confidence: 0.1, // Below 0.2 threshold
             revision: 1,
+            last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

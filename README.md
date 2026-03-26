@@ -16,13 +16,14 @@ rein is a lightweight, persistent memory system designed for AI coding agents. I
 
 | Feature | Description |
 |---------|-------------|
-| **22 MCP tools** | 12 core memory tools + 10 knowledge graph tools |
-| **Knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, BFS traversal, export (json / ascii / dot) |
+| **24 MCP tools** | 12 core memory tools + 10 knowledge graph tools + 2 temporal tools |
+| **Temporal knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, revision history, episode nodes, temporal validity windows, BFS traversal (skips expired links) |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
 | **Dual-layer Ebbinghaus decay** | LTM / STM layers with configurable lambda, beta, and access-boosted retention |
-| **Dual-path search** | FTS (Tantivy BM25 → FTS5 fallback) + Vector (HNSW cache → API embed) → RRF fusion |
+| **Dual-path search** | FTS (Tantivy BM25 → FTS5 fallback) + Vector (HNSW cache → API embed) → RRF/CC fusion |
 | **Multi-source cross-validation** | 3 sources (local, hook-extracted, Supermemory) with confidence scoring |
-| **Weighted RRF fusion** | Reciprocal Rank Fusion with configurable per-source weights |
+| **RRF / CC fusion** | Reciprocal Rank Fusion or Convex Combination (Bruch 2023), configurable per-source weights + path quality gating |
+| **Multi-factor admission** | A-MAC 2026 inspired: llm_conf + novelty + type_prior + recency scoring |
 | **Semantic chunking** | Heading / paragraph / sentence splitting with metadata-prefixed embeddings |
 | **FTS5 unicode61 tokenizer** | Full-text search with CJK support, sub-millisecond latency |
 | **Supermemory v4 API** | Hybrid search via `api.supermemory.ai/v4/search` for cross-validation |
@@ -95,13 +96,13 @@ rein serve
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 22 tools are exposed.
+When running as an MCP server (`rein serve`), 24 tools are exposed.
 
 #### Core Tools (12)
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `rein_recall` | `query`, `topic?`, `keyword?`, `limit?` | Semantic search over memories |
+| `rein_recall` | `query`, `topic?`, `keyword?`, `limit?`, `from?`, `to?` | Semantic search with optional time range |
 | `rein_store` | `topic`, `content`, `importance?`, `keywords?` | Store a new memory (auto-dedup) |
 | `rein_update` | `id`, `content`, `importance?` | Update an existing memory |
 | `rein_forget` | `id` | Delete a memory by ID |
@@ -128,6 +129,13 @@ When running as an MCP server (`rein serve`), 22 tools are exposed.
 | `rein_memoir_link` | `memoir`, `from`, `to`, `relation` | Link two concepts |
 | `rein_memoir_inspect` | `memoir`, `name`, `depth?` | BFS neighborhood traversal |
 | `rein_memoir_export` | `memoir`, `format?` | Export graph (json / ascii / dot) |
+
+#### Temporal Tools (2)
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `rein_timeline` | `from?`, `to?`, `limit?` | Chronological timeline of episodes, concept changes, and memory events |
+| `rein_concept_history` | `memoir`, `name`, `limit?` | Revision history of a concept: when/how it changed over time |
 
 #### Knowledge Graph Relation Types
 
@@ -180,6 +188,24 @@ rein automatically learns which memories are useful and which are noise, without
 
 Based on: ICLR 2026 Admission Control, PropMem (Prosus), FActScore, MACLA Bayesian posteriors.
 
+### Temporal Knowledge Graph (v0.4.0)
+
+rein now tracks **when** knowledge changes, not just what the current state is. Inspired by Zep/Graphiti 2025.
+
+**Capabilities:**
+- **Concept revision history** — every `refine_concept` auto-snapshots the old state before overwriting
+- **Episode nodes** — each session creates an Episode linking to concepts and memories touched
+- **Temporal link validity** — ConceptLink has `valid_from`/`valid_until` windows; expired links are skipped in BFS
+- **Contradiction detection** — when a new definition differs significantly (sim < 0.3), old outgoing links are expired
+- **Temporal recall** — `rein_recall` supports `from`/`to` date params for time-range filtering
+- **Timeline view** — `rein_timeline` shows chronological events (episodes, concept changes, memory creation)
+- **Concept history** — `rein_concept_history` shows how a concept's definition evolved over time
+
+**Example queries enabled:**
+- "What changed last week?" → `rein_timeline --from 2026-03-19 --to 2026-03-26`
+- "When did concept X change?" → `rein_concept_history --memoir rust --name ownership`
+- "What did I know about Y before March?" → `rein_recall "Y" --to 2026-03-01`
+
 ### Configuration
 
 rein loads configuration with the following priority (highest wins):
@@ -220,6 +246,8 @@ model = "default"
 rrf_k = 60.0
 rrf_fts_weight = 0.3
 rrf_vec_weight = 0.7
+fusion_method = "rrf"      # or "cc" (Convex Combination, Bruch 2023)
+cc_alpha = 0.5             # CC blend: alpha * sparse + (1-alpha) * dense
 waterfall_fts_threshold = 0.5
 dedup_similarity = 0.70    # uses max(jaccard, containment) similarity
 dedup_time_window_days = 7
@@ -337,7 +365,7 @@ sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
                             |
                    +--------+--------+
                    |                 |
-               CLI (20 cmds)  MCP Server (22 tools)
+               CLI (20 cmds)  MCP Server (24 tools)
                    |                 |
                    +--------+--------+
                             |
@@ -359,7 +387,7 @@ sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
               |        |          |
               +---+----+----+-----+
                   |
-             RRF Fusion (weighted)
+             RRF/CC Fusion (weighted)
                   |
            Ebbinghaus Scoring
                   |
@@ -391,8 +419,8 @@ Two independent search paths run in parallel, then merge:
 4. If cache miss: **Embed API** -- call Google gemini-embedding-001 or OMLX, cache result, then HNSW search
 
 **Merge:**
-5. **RRF fusion** -- weighted Reciprocal Rank Fusion merges text + vector results
-6. **Ebbinghaus scoring** -- `strength(t) = exp(-lambda_eff * days^beta)` weights final ranking
+5. **RRF/CC fusion** -- Reciprocal Rank Fusion or Convex Combination merges text + vector results (path quality gating excludes empty paths)
+6. **Ebbinghaus scoring** -- `strength(t) = exp(-lambda_eff * days^beta)` weights final ranking + temporal filtering
 7. **Cross-validation** -- compare with Supermemory + auto-memory results, assign confidence
 
 #### Embedding Backends
@@ -489,13 +517,14 @@ rein 是一个轻量级的持久化记忆系统，专为 AI 编程智能体设�
 
 | 特性 | 说明 |
 |------|------|
-| **22 个 MCP 工具** | 12 个核心记忆工具 + 10 个知识图谱工具 |
-| **知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，BFS 遍历，导出（json / ascii / dot） |
+| **24 个 MCP 工具** | 12 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 |
+| **时序知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，修订历史，Episode 节点，时间窗口，BFS 遍历（跳过过期链接） |
 | **OMLX 本地嵌入** | 可选本地嵌入后端，通过 EmbedderKind 枚举分发（Google / OMLX） |
 | **双层艾宾浩斯衰减** | LTM / STM 层，可配置 lambda、beta，访问次数越多衰减越慢 |
 | **四级瀑布搜索** | Tantivy BM25 → HNSW ANN → 缓存向量 → Google API |
 | **多源交叉验证** | 3 个来源（本地、Hook 提取、Supermemory）+ 置信度评分 |
-| **加权 RRF 融合** | 可配置权重的倒数排名融合 |
+| **RRF / CC 融合** | 倒数排名融合或凸组合融合（Bruch 2023），路径质量门控 |
+| **多因子准入控制** | A-MAC 2026：llm_conf + novelty + type_prior + recency 评分 |
 | **语义分块** | 按标题/段落/句子分割，嵌入时附加元数据前缀 |
 | **FTS5 unicode61 分词器** | 全文搜索，支持 CJK，亚毫秒级延迟 |
 | **Supermemory v4 API** | 通过 `api.supermemory.ai/v4/search` 进行混合搜索交叉验证 |
