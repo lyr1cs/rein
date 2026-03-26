@@ -302,6 +302,17 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN cluster_id INTEGER").ok();
     }
 
+    // Migrate: add needs_vec_dedup flag for deferred embedding-based dedup
+    let has_nvd: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='needs_vec_dedup'",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_nvd {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN needs_vec_dedup INTEGER NOT NULL DEFAULT 0").ok();
+        // Backfill: mark all existing active memories for vec dedup sweep
+        conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'").ok();
+    }
+
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;
 
