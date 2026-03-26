@@ -1059,7 +1059,10 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
     let mut dups_found = 0u32;
     let mut dups_merged = 0u32;
     for topic in &topics {
-        let mems = store.get_by_topic(topic)?;
+        let mems: Vec<_> = store.get_by_topic(topic)?
+            .into_iter()
+            .filter(|m| m.superseded_by.is_none())
+            .collect();
         let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for i in 0..mems.len() {
             if processed.contains(&mems[i].id) { continue; }
@@ -1122,6 +1125,10 @@ pub fn extract_unique_lines(source: &str, target: &str) -> String {
         .filter(|line| {
             let trimmed = line.trim();
             if trimmed.is_empty() { return false; }
+            // Skip merge markers from previous merges (prevent marker accumulation)
+            if trimmed.starts_with("[merged from ") || trimmed.starts_with("[merged on ") {
+                return false;
+            }
             // Keep lines that have dates (temporal anchors) or aren't found in target
             let has_date = trimmed.chars().any(|c| c.is_ascii_digit())
                 && (trimmed.contains("202") || trimmed.contains("20-") || trimmed.contains("月"));
