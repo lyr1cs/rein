@@ -2,13 +2,13 @@
 
 ## Overview
 
-rein — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 24 MCP tools.
+rein v0.7.1 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 24 MCP tools. Self-adaptive engine (M1-M6).
 
 ## Build & Test
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (182+)
+cargo test            # All tests must pass (189+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```

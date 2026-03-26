@@ -12,7 +12,7 @@ description: >
   memoir, concepts, timeline, history, export, or wants to save/search important context.
 ---
 
-# rein Memory System (v0.5.0)
+# rein Memory System (v0.7.1)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (24 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
