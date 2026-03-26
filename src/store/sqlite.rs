@@ -161,11 +161,11 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
     let last_accessed_str: String = row.get("last_accessed").map_err(ReinError::Database)?;
 
     let layer = MemoryLayer::from_str(&layer_str)
-        .map_err(|e| ReinError::Config(e))?;
+        .map_err(ReinError::Config)?;
     let importance = Importance::from_str(&importance_str)
-        .map_err(|e| ReinError::Config(e))?;
+        .map_err(ReinError::Config)?;
     let source = Source::from_str(&source_str)
-        .map_err(|e| ReinError::Config(e))?;
+        .map_err(ReinError::Config)?;
     let status = MemoryStatus::from_str(&status_str)
         .unwrap_or_default();
 

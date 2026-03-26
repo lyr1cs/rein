@@ -89,7 +89,7 @@ fn row_to_link(row: &rusqlite::Row) -> ReinResult<ConceptLink> {
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
 
     let relation = Relation::from_str(&relation_str)
-        .map_err(|e| ReinError::Config(e))?;
+        .map_err(ReinError::Config)?;
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
@@ -987,7 +987,7 @@ impl SqliteStore {
         let live_revision = || ConceptRevision {
             id: format!("live-{}", concept.id),
             concept_id: concept.id.clone(),
-            revision: concept.revision as u32,
+            revision: concept.revision,
             definition: concept.definition.clone(),
             confidence: concept.confidence,
             labels: concept.labels.clone(),

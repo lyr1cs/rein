@@ -286,7 +286,7 @@ impl AdaptiveState {
     /// when two concurrent GC runs modify the state simultaneously.
     pub fn save_snapshot(&self, conn: &Connection) -> ReinResult<()> {
         let json = serde_json::to_string(self)
-            .map_err(|e| ReinError::Serialization(e))?;
+            .map_err(ReinError::Serialization)?;
 
         // Optimistic concurrency: only update if version hasn't changed since we loaded
         let rows = conn.execute(

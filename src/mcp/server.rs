@@ -81,8 +81,8 @@ impl ReinServer {
         let limit = params.limit.unwrap_or(10);
 
         // Parse optional temporal filters
-        let time_from = params.from.as_deref().and_then(|s| parse_datetime(s));
-        let time_to = params.to.as_deref().and_then(|s| parse_datetime_end(s));
+        let time_from = params.from.as_deref().and_then(parse_datetime);
+        let time_to = params.to.as_deref().and_then(parse_datetime_end);
 
         let result = self.with_store(|store| {
             crate::search::recall::recall_temporal(
@@ -860,8 +860,8 @@ impl ReinServer {
     #[tool(name = "rein_timeline", description = "Show a chronological timeline of knowledge events: episodes, concept revisions, and memory creation. Supports date range filtering.")]
     fn rein_timeline(&self, Parameters(params): Parameters<TimelineParams>) -> String {
         let limit = params.limit.unwrap_or(20);
-        let from = params.from.as_deref().and_then(|s| parse_datetime(s));
-        let to = params.to.as_deref().and_then(|s| parse_datetime_end(s));
+        let from = params.from.as_deref().and_then(parse_datetime);
+        let to = params.to.as_deref().and_then(parse_datetime_end);
 
         // Warn on malformed dates (return error instead of silently ignoring)
         if params.from.is_some() && from.is_none() {

@@ -116,7 +116,7 @@ pub fn check_dedup(
     // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
     // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
     // Check sim range first to avoid wasting budget on non-candidates
-    let gray_floor = if best_sim >= 0.35 && best_sim < 0.50 && m6_has_llm_budget() {
+    let gray_floor = if (0.35..0.50).contains(&best_sim) && m6_has_llm_budget() {
         0.35 // Budget available and sim is in extended range
     } else {
         0.50 // Standard gray zone floor
@@ -173,7 +173,7 @@ fn m6_explore_threshold(base_threshold: f32) -> (f32, bool) {
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
     // Deterministic pseudo-random: explore on ~5% of calls
     let hash = count.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(0x517cc1b727220a95);
-    let explore = (hash % 20) == 0; // 5% probability
+    let explore = hash.is_multiple_of(20); // 5% probability
 
     if !explore {
         return (base_threshold, false);

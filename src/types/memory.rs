@@ -42,17 +42,14 @@ fn default_tier() -> String { "warm".to_string() }
 /// Lifecycle status of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MemoryStatus {
+    #[default]
     Active,
     Updated,
     Deprecated,
 }
 
-impl Default for MemoryStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
 
 impl fmt::Display for MemoryStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
