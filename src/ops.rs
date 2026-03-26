@@ -195,7 +195,10 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         tracing::debug!("M2: {} recall_complete events available (alpha learning pending full integration)", recall_event_count);
     }
 
-    // Step 5: Persist snapshot + emit param_update event
+    // Step 5: Embedding-based dedup for memories marked needs_vec_dedup
+    run_vec_dedup(store, config);
+
+    // Step 6: Persist snapshot + emit param_update event
     state.version += 1;
     if let Err(e) = state.save_snapshot(store.conn()) {
         tracing::warn!("failed to save adaptive state: {e}");
@@ -203,13 +206,176 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         tracing::debug!("adaptive state v{} saved", state.version);
     }
 
-    // Step 6: Cleanup expired events
+    // Step 7: Cleanup expired events
     let cleaned = crate::store::adaptive::cleanup_expired_events(
         store.conn(),
         config.adaptive.event_retention_days,
     ).unwrap_or(0);
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
+    }
+}
+
+/// Embedding-based dedup sweep for memories marked `needs_vec_dedup`.
+/// Computes embeddings (if missing), searches vec_memories for near-duplicates,
+/// and merges/supersedes matches. Runs in the GC slow channel (zero hot-path cost).
+fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
+    let conn = store.conn();
+
+    // Fetch memories needing vec dedup (batch limit to avoid holding resources too long)
+    let pending: Vec<(String, String, String, String)> = match conn.prepare(
+        "SELECT id, topic, summary, content FROM memories
+         WHERE needs_vec_dedup = 1 AND status = 'active' AND superseded_by IS NULL
+         LIMIT 50"
+    ) {
+        Ok(mut stmt) => stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default(),
+        Err(_) => return,
+    };
+
+    if pending.is_empty() {
+        return;
+    }
+
+    tracing::debug!("vec_dedup: processing {} memories", pending.len());
+
+    // Create embedder (needed for computing embeddings of new memories)
+    let embedder = match crate::embed::create_embedder(config) {
+        Some(e) => e,
+        None => {
+            tracing::debug!("vec_dedup: no embedder configured, skipping (flags preserved for later)");
+            return;
+        }
+    };
+
+    let model_name = config.embedding_model();
+    let mut merged = 0u32;
+
+    for (id, topic, summary, content) in &pending {
+        // Step 1: Get or compute embedding for this memory
+        let enriched = crate::embed::prepend_metadata(topic, summary, content);
+        let embedding = match crate::embed::EmbedCache::get(conn, &enriched, &model_name) {
+            Ok(Some(cached)) => {
+                // Ensure this memory is also in vec_memories (cache may exist from warmup
+                // without a corresponding vec_memories row)
+                let _ = crate::store::vec::insert_embedding(conn, id, &cached);
+                cached
+            }
+            _ => {
+                // Compute embedding (async → sync bridge)
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            use crate::types::traits::Embedder;
+                            embedder.embed(&enriched).await
+                        })
+                    })
+                })) {
+                    Ok(Ok(emb)) => {
+                        // Cache + store in vec_memories
+                        let _ = crate::embed::EmbedCache::put(conn, &enriched, &model_name, &emb);
+                        let _ = crate::store::vec::insert_embedding(conn, id, &emb);
+                        emb
+                    }
+                    _ => {
+                        tracing::debug!("vec_dedup: failed to compute embedding for {id}");
+                        let _ = conn.execute(
+                            "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                            rusqlite::params![id],
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // Step 2: Search vec_memories for near-duplicates (excluding self)
+        let vec_results = match crate::store::vec::search_vec(conn, &embedding, 10) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = conn.execute(
+                    "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                    rusqlite::params![id],
+                );
+                continue;
+            }
+        };
+
+        let mut found_dup = false;
+        for (candidate_id, distance) in &vec_results {
+            if candidate_id == id { continue; }
+
+            // cosine distance → similarity
+            let sim = 1.0 - (*distance as f64);
+            if sim < 0.70 { break; } // Results are sorted by distance; no point continuing
+
+            let candidate = match store.get(candidate_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if candidate.superseded_by.is_some() || candidate.status != crate::types::MemoryStatus::Active {
+                continue;
+            }
+
+            if sim > 0.85 {
+                // Strong semantic match — merge into the older (more established) memory
+                let (keep_id, discard_id, merge_content) = if candidate.access_count >= 1 || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1) {
+                    (&candidate.id, id, content.as_str())
+                } else {
+                    (id, candidate_id, candidate.content.as_str())
+                };
+
+                // Use store.get + store.update to properly trigger FTS/Tantivy/HNSW refresh
+                if let Ok(mut kept) = store.get(keep_id) {
+                    kept.content = format!("{}\n\n{}", kept.content, merge_content);
+                    kept.summary = kept.content.chars().take(100).collect();
+                    kept.strength = (kept.strength + 0.2).min(1.0);
+                    kept.updated_at = chrono::Utc::now();
+                    let _ = store.update(&kept);
+                }
+                let _ = store.mark_superseded(discard_id, keep_id);
+
+                tracing::info!("vec_dedup: merged {discard_id} into {keep_id} (cosine_sim={sim:.3})");
+                merged += 1;
+                found_dup = true;
+                break;
+            } else if sim > 0.70 {
+                // Moderate match — use LLM to confirm (if available)
+                let is_dup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            crate::extract::llm::llm_is_duplicate(config, content, &candidate.content).await
+                        })
+                    })
+                })).unwrap_or(false);
+
+                if is_dup {
+                    let _ = conn.execute(
+                        "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                        rusqlite::params![&candidate.id, id],
+                    );
+                    tracing::info!("vec_dedup: LLM confirmed dup, superseded {id} by {} (cosine_sim={sim:.3})", candidate.id);
+                    merged += 1;
+                    found_dup = true;
+                    break;
+                }
+            }
+        }
+
+        // Clear the flag whether or not we found a dup
+        let _ = conn.execute(
+            "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+            rusqlite::params![id],
+        );
+        // If this memory was merged away, also clear the other's flag
+        if found_dup {
+            // Already handled above via superseded_by
+        }
+    }
+
+    if merged > 0 {
+        tracing::info!("vec_dedup: merged {merged} semantic duplicates");
     }
 }
 
