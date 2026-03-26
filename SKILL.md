@@ -1,16 +1,18 @@
 ---
 name: rein
 description: >
-  Multi-source cross-validated memory system with temporal knowledge graph, autonomous
-  retrieval routing, and LLM extraction. 24 MCP tools, 20+ CLI commands. Stores, recalls,
-  and manages persistent memories with temporal knowledge graph (revision history, episodes,
-  temporal links), autonomous query routing (temporal/exact/semantic/exploratory), memory
-  evolution, multi-factor admission control, CC/RRF fusion, and Ebbinghaus decay.
+  Multi-source cross-validated memory system with adaptive engine, temporal knowledge graph,
+  autonomous retrieval routing, and LLM extraction. 24 MCP tools, 20+ CLI commands. Features
+  self-learning fusion weights (counterfactual alpha optimization), survival-based decay
+  (per-cluster Kaplan-Meier replacing fixed Ebbinghaus), HDBSCAN semantic clustering,
+  three-tier memory (Hot/Warm/Cold with t-digest boundaries), temporal knowledge graph
+  (revision history, episodes, temporal links), autonomous query routing, memory evolution,
+  multi-factor admission control, and CC/RRF fusion.
   Triggers when user mentions memory, recall, remember, past sessions, knowledge graph,
   memoir, concepts, timeline, history, export, or wants to save/search important context.
 ---
 
-# rein Memory System (v0.4.0)
+# rein Memory System (v0.5.0)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (24 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
