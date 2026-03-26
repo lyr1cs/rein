@@ -686,6 +686,10 @@ fn build_condensed_tree_and_extract(
 /// # Complexity
 /// O(n^2) time and space for the distance matrix. For n > 2000, prefer
 /// [`hdbscan_approximate`] with pre-computed k-NN lists.
+/// Hard limit for full O(n^2) distance matrix computation.
+/// Above this threshold, auto-fallback to sampling + label propagation.
+const HDBSCAN_FULL_MATRIX_LIMIT: usize = 3000;
+
 pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> HdbscanResult {
     let n = embeddings.len();
     if n == 0 {
@@ -694,6 +698,11 @@ pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> Hd
             labels: Vec::new(),
             noise_indices: Vec::new(),
         };
+    }
+
+    // For large datasets, sample + cluster + propagate labels to avoid O(n^2) OOM
+    if n > HDBSCAN_FULL_MATRIX_LIMIT {
+        return hdbscan_sampled(embeddings, min_cluster_size, HDBSCAN_FULL_MATRIX_LIMIT);
     }
 
     let mcs = min_cluster_size.max(2);
@@ -889,6 +898,107 @@ fn compute_centroid(
         }
     }
     centroid.into_iter().map(|c| c as f32).collect()
+}
+
+/// HDBSCAN with sampling for large datasets (n > HDBSCAN_FULL_MATRIX_LIMIT).
+///
+/// Strategy: randomly sample `sample_size` points, run full HDBSCAN on sample,
+/// then propagate labels to remaining points via nearest-centroid assignment.
+fn hdbscan_sampled(
+    embeddings: &[(String, Vec<f32>)],
+    min_cluster_size: usize,
+    sample_size: usize,
+) -> HdbscanResult {
+    let n = embeddings.len();
+
+    // Deterministic sampling using splitmix
+    let mut sample_indices: Vec<usize> = (0..n).collect();
+    // Fisher-Yates shuffle with deterministic seed
+    for i in (1..n).rev() {
+        let mut x = (i as u64).wrapping_add(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x = x ^ (x >> 31);
+        let j = (x as usize) % (i + 1);
+        sample_indices.swap(i, j);
+    }
+    sample_indices.truncate(sample_size);
+    sample_indices.sort_unstable(); // keep order stable for reproducibility
+
+    // Run full HDBSCAN on sampled subset
+    let sampled_embeddings: Vec<(String, Vec<f32>)> = sample_indices
+        .iter()
+        .map(|&i| embeddings[i].clone())
+        .collect();
+    let sample_result = hdbscan_with_params(&sampled_embeddings, min_cluster_size, None);
+
+    if sample_result.clusters.is_empty() {
+        // No clusters found in sample — treat everything as noise
+        return HdbscanResult {
+            clusters: Vec::new(),
+            labels: vec![None; n],
+            noise_indices: (0..n).collect(),
+        };
+    }
+
+    // Propagate labels to non-sampled points via nearest centroid
+    let mut labels = vec![None; n];
+
+    // First, assign labels for sampled points
+    for (sample_idx, &original_idx) in sample_indices.iter().enumerate() {
+        labels[original_idx] = sample_result.labels[sample_idx];
+    }
+
+    // Then, assign remaining points to nearest cluster centroid
+    let sampled_set: HashSet<usize> = sample_indices.iter().copied().collect();
+    for i in 0..n {
+        if sampled_set.contains(&i) { continue; }
+        labels[i] = assign_to_nearest(
+            &embeddings[i].1,
+            &sample_result.clusters,
+            &sampled_embeddings,
+        );
+    }
+
+    // Rebuild clusters with all points
+    let max_cluster_id = sample_result.clusters.iter().map(|c| c.id).max().unwrap_or(0);
+    let mut cluster_members: Vec<Vec<usize>> = vec![Vec::new(); (max_cluster_id + 1) as usize];
+    let mut noise_indices = Vec::new();
+
+    for (i, label) in labels.iter().enumerate() {
+        match label {
+            Some(cid) => {
+                if (*cid as usize) < cluster_members.len() {
+                    cluster_members[*cid as usize].push(i);
+                }
+            }
+            None => noise_indices.push(i),
+        }
+    }
+
+    let clusters: Vec<Cluster> = cluster_members
+        .into_iter()
+        .enumerate()
+        .filter(|(_, members)| !members.is_empty())
+        .map(|(id, members)| {
+            // Use the sample cluster's stability as a proxy
+            let stability = sample_result.clusters.iter()
+                .find(|c| c.id == id as u32)
+                .map(|c| c.stability)
+                .unwrap_or(0.0);
+            Cluster {
+                id: id as u32,
+                member_indices: members,
+                stability,
+            }
+        })
+        .collect();
+
+    HdbscanResult {
+        clusters,
+        labels,
+        noise_indices,
+    }
 }
 
 // ---------------------------------------------------------------------------

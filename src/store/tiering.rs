@@ -102,10 +102,13 @@ impl QuantileEstimator {
             // Reservoir sampling: accept with probability max_samples / total_seen.
             // Use a simple deterministic-seed LCG seeded from total_seen so that
             // the result is reproducible for a given insertion order.
-            let accept = pseudo_random(self.total_seen) % self.total_seen < self.max_samples;
+            // Use nonce from global counter to avoid identical seeds in concurrent instances
+            static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            let accept = pseudo_random(self.total_seen.wrapping_add(nonce)) % self.total_seen < self.max_samples;
             if accept {
                 // Replace a random existing entry.
-                let idx = pseudo_random(self.total_seen.wrapping_mul(7)) % self.max_samples;
+                let idx = pseudo_random(self.total_seen.wrapping_mul(7).wrapping_add(nonce)) % self.max_samples;
                 self.samples[idx] = value;
                 self.samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             }
