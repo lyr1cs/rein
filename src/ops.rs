@@ -222,19 +222,26 @@ fn run_hdbscan_clustering(
     let min_cluster_size = 5.max(embeddings.len() / 50); // adaptive: ~2% of dataset
     let result = crate::store::hdbscan::hdbscan(&embeddings, min_cluster_size);
 
-    // Clear all stale cluster assignments before writing new ones.
-    // This prevents memories that became noise from keeping old cluster_id.
-    let _ = store.conn().execute("UPDATE memories SET cluster_id = NULL WHERE cluster_id IS NOT NULL", []);
+    // Clear stale cluster assignments ONLY for memories that were part of this clustering input.
+    // Memories outside the input set keep their existing cluster_id (from a previous run).
+    let clustered_ids: std::collections::HashSet<&str> = embeddings.iter()
+        .map(|(id, _)| id.as_str()).collect();
+    for id in &clustered_ids {
+        let _ = store.conn().execute(
+            "UPDATE memories SET cluster_id = NULL WHERE id = ?1",
+            rusqlite::params![id],
+        );
+    }
     // Clear stale per-cluster survival curves (will be rebuilt by M3)
     let _ = store.conn().execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", []);
     // Clear stale per-cluster dedup thresholds
     state.dedup_thresholds.clear();
 
-    // Store new cluster assignments in state + update memories table
+    // Store new cluster assignments
     state.memory_clusters.clear();
     for (i, label) in result.labels.iter().enumerate() {
+        let mem_id = &embeddings[i].0;
         if let Some(cluster_id) = label {
-            let mem_id = &embeddings[i].0;
             state.memory_clusters.insert(mem_id.clone(), *cluster_id);
             let _ = store.conn().execute(
                 "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
@@ -554,29 +561,29 @@ fn run_alpha_learning(
         .cloned()
         .collect();
 
-    // Advance offset only up to the last event that had access data.
-    // Unmatched events stay unconsumed so they can be retried next cycle
-    // (their access events may arrive between GC runs).
-    let max_matched_id = events.iter()
-        .filter(|e| {
-            let rid = e.request_id.as_deref().unwrap_or("");
-            recall_events.iter().any(|re| re.request_id == rid && !re.accessed_ids.is_empty())
-        })
-        .map(|e| e.id)
-        .max();
-
-    // Also advance past old unmatched events (>24h) to prevent unbounded backlog
+    // Advance offset through the longest contiguous prefix of matched or expired events.
+    // Stop at the first still-live unmatched event so it can be retried next cycle.
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
-    let max_expired_id = events.iter()
-        .filter(|e| {
-            chrono::DateTime::parse_from_rfc3339(&e.ts)
-                .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
-                .unwrap_or(false)
-        })
-        .map(|e| e.id)
-        .max();
+    let matched_request_ids: std::collections::HashSet<&str> = recall_events.iter()
+        .filter(|re| !re.accessed_ids.is_empty())
+        .map(|re| re.request_id.as_str())
+        .collect();
 
-    let advance_to = max_matched_id.max(max_expired_id);
+    let mut advance_to: Option<i64> = None;
+    for event in &events {
+        let rid = event.request_id.as_deref().unwrap_or("");
+        let is_matched = matched_request_ids.contains(rid);
+        let is_expired = chrono::DateTime::parse_from_rfc3339(&event.ts)
+            .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
+            .unwrap_or(false);
+
+        if is_matched || is_expired {
+            advance_to = Some(event.id);
+        } else {
+            break; // Stop at first live unmatched event
+        }
+    }
+
     if let Some(new_offset) = advance_to {
         let _ = conn.execute(
             "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
@@ -1095,9 +1102,11 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                         let _ = store.mark_superseded(&mems[loser_idx].id, &mems[winner_idx].id);
                         dups_merged += 1;
                     }
-                    // Mark only the loser as processed; winner continues scanning
-                    // so chains like A≈B≈C get fully merged
+                    // Mark only the loser as processed
                     processed.insert(mems[loser_idx].id.clone());
+                    // If mems[i] was the loser, stop scanning (it's been superseded)
+                    // If mems[i] was the winner, continue scanning for more duplicates
+                    if loser_idx == i { break; }
                 }
             }
         }
