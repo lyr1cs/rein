@@ -190,6 +190,61 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         conn.execute_batch("ALTER TABLE concepts ADD COLUMN source_memory_ids TEXT NOT NULL DEFAULT '[]'").ok();
     }
 
+    // Migrate: add temporal fields to concept_links
+    let has_valid_from: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('concept_links') WHERE name='valid_from'",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_valid_from {
+        conn.execute_batch("ALTER TABLE concept_links ADD COLUMN valid_from TEXT")?;
+        conn.execute_batch("ALTER TABLE concept_links ADD COLUMN valid_until TEXT")?;
+        // Backfill: existing links get valid_from = created_at
+        conn.execute_batch("UPDATE concept_links SET valid_from = created_at WHERE valid_from IS NULL").ok();
+    }
+
+    // Migrate: add last_episode_id to concepts
+    let has_episode_id: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='last_episode_id'",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !has_episode_id {
+        conn.execute_batch("ALTER TABLE concepts ADD COLUMN last_episode_id TEXT").ok();
+    }
+
+    // Create concept_revisions table (revision history)
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS concept_revisions (
+            id TEXT PRIMARY KEY,
+            concept_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            definition TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            labels TEXT NOT NULL DEFAULT '[]',
+            source_memory_ids TEXT NOT NULL DEFAULT '[]',
+            episode_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_revisions_concept ON concept_revisions(concept_id);
+        CREATE INDEX IF NOT EXISTS idx_revisions_created ON concept_revisions(created_at);
+    ")?;
+
+    // Create episodes table (session nodes in temporal graph)
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS episodes (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            outcome TEXT NOT NULL DEFAULT '',
+            decisions TEXT NOT NULL DEFAULT '[]',
+            concept_ids TEXT NOT NULL DEFAULT '[]',
+            memory_ids TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at);
+    ")?;
+
+    // Index for temporal concept queries
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_concepts_updated ON concepts(updated_at)").ok();
+
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;
 

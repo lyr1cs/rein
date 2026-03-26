@@ -74,8 +74,25 @@ impl SqliteStore {
             // Add/refine concepts
             for c in memoir_concepts {
                 match self.get_concept(memoir_name, &c.name)? {
-                    Some(_) => {
-                        // Concept exists — refine it
+                    Some(existing) => {
+                        // Check for contradiction: low similarity = potential conflict
+                        let sim = crate::extract::similarity(&existing.definition, &c.definition);
+                        if sim < 0.3 && c.quality_confidence > 0.5 && !existing.id.is_empty() {
+                            tracing::info!(
+                                "contradiction detected for concept '{}': old def differs significantly (sim={:.2})",
+                                c.name, sim
+                            );
+                            // Expire outgoing links from the old concept version
+                            let now = Utc::now();
+                            if let Ok(old_links) = self.get_links_from(&existing.id) {
+                                for link in &old_links {
+                                    if link.valid_until.is_none() {
+                                        let _ = self.expire_link(&link.id, now);
+                                    }
+                                }
+                            }
+                        }
+                        // Refine (revision history is auto-snapshotted in refine_concept)
                         if let Err(e) = self.refine_concept(memoir_name, &c.name, &c.definition) {
                             tracing::warn!("failed to refine concept '{}': {e}", c.name);
                         } else {
@@ -93,6 +110,7 @@ impl SqliteStore {
                             source_memory_ids: source_memory_ids.to_vec(),
                             confidence: c.quality_confidence as f32,
                             revision: 1,
+                            last_episode_id: None,
                             created_at: Utc::now(),
                             updated_at: Utc::now(),
                         };
@@ -135,6 +153,8 @@ impl SqliteStore {
                     relation,
                     weight: 1.0,
                     created_at: Utc::now(),
+                    valid_from: None,
+                    valid_until: None,
                 };
                 if let Err(e) = self.add_link(concept_link) {
                     tracing::warn!("failed to add link {} -> {}: {e}", link.from, link.to);
@@ -320,6 +340,8 @@ impl SqliteStore {
                     relation: Relation::RelatedTo,
                     weight: sim,
                     created_at: Utc::now(),
+                    valid_from: None,
+                    valid_until: None,
                 };
                 if self.add_link(link).is_ok() {
                     linked += 1;

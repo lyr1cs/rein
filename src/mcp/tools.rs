@@ -12,6 +12,10 @@ pub struct RecallParams {
     pub keyword: Option<String>,
     /// Maximum number of results to return (default 10).
     pub limit: Option<usize>,
+    /// Filter memories created after this date (YYYY-MM-DD or RFC3339).
+    pub from: Option<String>,
+    /// Filter memories created before this date (YYYY-MM-DD or RFC3339).
+    pub to: Option<String>,
 }
 
 /// Parameters for rein_store tool.
@@ -180,4 +184,26 @@ pub struct ExportParams {
     pub memoir: String,
     /// Export format: json, ascii, or dot (default json).
     pub format: Option<String>,
+}
+
+/// Parameters for rein_timeline tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TimelineParams {
+    /// Start date (YYYY-MM-DD or RFC3339).
+    pub from: Option<String>,
+    /// End date (YYYY-MM-DD or RFC3339).
+    pub to: Option<String>,
+    /// Maximum entries (default 20).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for rein_concept_history tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConceptHistoryParams {
+    /// Memoir containing the concept.
+    pub memoir: String,
+    /// Name of the concept.
+    pub name: String,
+    /// Maximum revisions to return (default 10).
+    pub limit: Option<usize>,
 }
