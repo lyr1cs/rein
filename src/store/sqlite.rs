@@ -802,6 +802,14 @@ impl SqliteStore {
                             chrono::Utc::now().format("%Y-%m-%d"), unique
                         ));
                     }
+                    // Cap content length to prevent unbounded growth from repeated merges
+                    if existing.content.len() > 10_000 {
+                        existing.content.truncate(10_000);
+                        // Ensure we don't cut in the middle of a multi-byte char
+                        while !existing.content.is_char_boundary(existing.content.len()) {
+                            existing.content.pop();
+                        }
+                    }
                     existing.summary = existing.content.chars().take(100).collect();
                     // Merge keywords (deduplicated)
                     for kw in &memory.keywords {
