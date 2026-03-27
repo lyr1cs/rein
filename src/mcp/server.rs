@@ -1122,11 +1122,9 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
 
     let session_manager = Arc::new(LocalSessionManager::default());
-    let http_config = StreamableHttpServerConfig {
-        stateful_mode: true,
-        cancellation_token: cancel.clone(),
-        ..Default::default()
-    };
+    let http_config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(true)
+        .with_cancellation_token(cancel.clone());
 
     // NOTE: Each HTTP session creates its own ReinServer with a separate SqliteStore.
     // The Mutex only serializes within a single session (MCP handles one request at a time).
