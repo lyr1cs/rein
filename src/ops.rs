@@ -577,19 +577,16 @@ fn run_alpha_learning(
         .cloned()
         .collect();
 
-    // Advance offset: consume matched and expired events, skip live unmatched ones.
-    // Unlike a strict contiguous prefix, this allows later matched events to be consumed
-    // even if an earlier unmatched event exists (prevents one stale event from blocking
-    // the entire learning pipeline).
+    // Advance offset through contiguous prefix of matched or expired events.
+    // Stop at the first live unmatched event (its access signal may arrive later).
+    // 24h expiry prevents a single stale event from permanently blocking the pipeline.
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
     let matched_request_ids: std::collections::HashSet<&str> = recall_events.iter()
         .filter(|re| !re.accessed_ids.is_empty())
         .map(|re| re.request_id.as_str())
         .collect();
 
-    // Find the highest event ID that is either matched or expired
     let mut advance_to: Option<i64> = None;
-    let mut pending_unmatched = 0u32;
     for event in &events {
         let rid = event.request_id.as_deref().unwrap_or("");
         let is_matched = matched_request_ids.contains(rid);
@@ -600,11 +597,9 @@ fn run_alpha_learning(
         if is_matched || is_expired {
             advance_to = Some(event.id);
         } else {
-            pending_unmatched += 1;
+            // Live unmatched event — stop here, retry next cycle
+            break;
         }
-    }
-    if pending_unmatched > 0 {
-        tracing::debug!("M2: {pending_unmatched} unmatched events waiting for access data");
     }
 
     if let Some(new_offset) = advance_to {
