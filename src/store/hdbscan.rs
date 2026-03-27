@@ -745,6 +745,11 @@ pub fn hdbscan_with_params(
         };
     }
 
+    // OOM protection: route to sampled path for large datasets
+    if n > HDBSCAN_FULL_MATRIX_LIMIT {
+        return hdbscan_sampled(embeddings, min_cluster_size, HDBSCAN_FULL_MATRIX_LIMIT);
+    }
+
     let mcs = min_cluster_size.max(2);
     let ms = min_samples.unwrap_or(mcs);
 
