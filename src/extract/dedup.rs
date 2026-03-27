@@ -119,7 +119,7 @@ pub fn check_dedup(
     // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
     // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
     // Check sim range first to avoid wasting budget on non-candidates
-    let gray_floor = if (0.35..0.50).contains(&best_sim) && m6_has_llm_budget() {
+    let gray_floor = if (0.35..0.50).contains(&best_sim) && m6_has_llm_budget(store) {
         0.35 // Budget available and sim is in extended range
     } else {
         0.50 // Standard gray zone floor
@@ -142,28 +142,39 @@ pub fn check_dedup(
 }
 
 /// M6: LLM judgment budget — allow up to 10 LLM dedup calls per hour.
-/// When budget is available, extend the gray zone to catch more borderline cases.
-fn m6_has_llm_budget() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static LLM_CALLS_THIS_HOUR: AtomicU64 = AtomicU64::new(0);
-    static HOUR_START: AtomicU64 = AtomicU64::new(0);
-
+/// Uses metadata table for cross-process budget sharing (multiple hook processes
+/// may call check_dedup concurrently).
+fn m6_has_llm_budget(store: &SqliteStore) -> bool {
     const MAX_LLM_CALLS_PER_HOUR: u64 = 10;
 
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let current_hour = now_secs / 3600;
-    let stored_hour = HOUR_START.load(Ordering::Relaxed);
 
-    if current_hour != stored_hour {
-        // New hour — reset counter
-        HOUR_START.store(current_hour, Ordering::Relaxed);
-        LLM_CALLS_THIS_HOUR.store(0, Ordering::Relaxed);
-    }
+    let conn = store.conn();
 
-    let calls = LLM_CALLS_THIS_HOUR.fetch_add(1, Ordering::Relaxed);
-    calls < MAX_LLM_CALLS_PER_HOUR
+    // Read current budget state from metadata
+    let (stored_hour, calls): (u64, u64) = conn.query_row(
+        "SELECT COALESCE(
+            CAST(json_extract(value, '$.hour') AS INTEGER), 0),
+            COALESCE(CAST(json_extract(value, '$.calls') AS INTEGER), 0)
+         FROM metadata WHERE key = 'm6_llm_budget'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap_or((0, 0));
+
+    let new_calls = if current_hour != stored_hour { 1 } else { calls + 1 };
+
+    // Update budget counter atomically
+    let _ = conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('m6_llm_budget', json_object('hour', ?1, 'calls', ?2))
+         ON CONFLICT(key) DO UPDATE SET value = json_object('hour', ?1, 'calls', ?2)",
+        rusqlite::params![current_hour, new_calls],
+    );
+
+    new_calls <= MAX_LLM_CALLS_PER_HOUR
 }
 
 /// M6: Randomized threshold exploration.

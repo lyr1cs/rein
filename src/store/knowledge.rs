@@ -423,8 +423,8 @@ impl SqliteStore {
             return Ok(0);
         }
 
-        // Write all link updates atomically
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Write all link updates atomically (SAVEPOINT for nesting safety)
+        self.conn.execute_batch("SAVEPOINT auto_link")?;
         if let Err(e) = (|| -> ReinResult<()> {
             self.update_related_ids(id, &updated_related)?;
             for (peer_id, peer_related) in &peer_updates {
@@ -432,10 +432,10 @@ impl SqliteStore {
             }
             Ok(())
         })() {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let _ = self.conn.execute_batch("ROLLBACK TO auto_link; RELEASE auto_link");
             return Err(e);
         }
-        self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch("RELEASE auto_link")?;
 
         Ok(new_links)
     }
