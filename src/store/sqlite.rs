@@ -802,14 +802,16 @@ impl SqliteStore {
                             chrono::Utc::now().format("%Y-%m-%d"), unique
                         ));
                     }
-                    // Cap content length to prevent unbounded growth from repeated merges
+                    // Cap content length to prevent unbounded growth from repeated merges.
+                    // Trim older content (front) to preserve newly merged tail.
                     if existing.content.len() > 10_000 {
-                        // Find safe UTF-8 boundary at or before 10KB
-                        let mut safe = 10_000;
-                        while safe > 0 && !existing.content.is_char_boundary(safe) {
-                            safe -= 1;
+                        let excess = existing.content.len() - 10_000;
+                        // Find safe UTF-8 boundary at or after the trim point
+                        let mut trim_at = excess;
+                        while trim_at < existing.content.len() && !existing.content.is_char_boundary(trim_at) {
+                            trim_at += 1;
                         }
-                        existing.content.truncate(safe);
+                        existing.content = existing.content[trim_at..].to_string();
                     }
                     existing.summary = existing.content.chars().take(100).collect();
                     // Merge keywords (deduplicated)

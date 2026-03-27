@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.claude/
+reviews/
+scripts/
+*.md
+LICENSE
+.DS_Store
+.gitignore
