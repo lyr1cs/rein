@@ -20,9 +20,10 @@ pub fn format_recall_results(results: &[(Memory, f32)], compact: bool) -> String
             .iter()
             .map(|(m, score)| {
                 format!(
-                    "--- [{topic}] {summary} ---\n  score: {score:.3}\n  importance: {imp}\n  strength: {str:.3}\n  keywords: {kw}\n  id: {id}",
+                    "--- [{topic}] {summary} ---\n{content}\n  score: {score:.3}\n  importance: {imp}\n  strength: {str:.3}\n  keywords: {kw}\n  id: {id}",
                     topic = m.topic,
                     summary = m.summary,
+                    content = m.content,
                     imp = m.importance,
                     str = m.strength,
                     kw = if m.keywords.is_empty() { "(none)".to_string() } else { m.keywords.join(", ") },
