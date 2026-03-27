@@ -4,3 +4,5 @@ target/
 .claude/*.log
 reviews/
 reviews
+bench/results*.jsonl
+bench/results*.jsonl.*
