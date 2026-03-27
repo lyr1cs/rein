@@ -1,0 +1,15 @@
+services:
+  rein:
+    build: .
+    ports:
+      - "8680:8680"
+    volumes:
+      - rein-data:/data
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REIN_HTTP_TOKEN=${REIN_HTTP_TOKEN}
+      - REIN_LOG=info
+    restart: unless-stopped
+
+volumes:
+  rein-data:

@@ -467,6 +467,15 @@ impl ReinConfig {
                 config.extract.google.api_key = Some(key);
             }
         }
+        // Server overrides (useful for Docker: REIN_SSE_BIND=0.0.0.0)
+        if let Ok(bind) = std::env::var("REIN_SSE_BIND") {
+            config.server.sse_bind = bind;
+        }
+        if let Ok(port) = std::env::var("REIN_SSE_PORT") {
+            if let Ok(p) = port.parse::<u16>() {
+                config.server.sse_port = p;
+            }
+        }
 
         Ok(config)
     }

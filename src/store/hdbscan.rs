@@ -702,7 +702,7 @@ pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> Hd
 
     // For large datasets, sample + cluster + propagate labels to avoid O(n^2) OOM
     if n > HDBSCAN_FULL_MATRIX_LIMIT {
-        return hdbscan_sampled(embeddings, min_cluster_size, HDBSCAN_FULL_MATRIX_LIMIT);
+        return hdbscan_sampled(embeddings, min_cluster_size, None, HDBSCAN_FULL_MATRIX_LIMIT);
     }
 
     let mcs = min_cluster_size.max(2);
@@ -747,7 +747,7 @@ pub fn hdbscan_with_params(
 
     // OOM protection: route to sampled path for large datasets
     if n > HDBSCAN_FULL_MATRIX_LIMIT {
-        return hdbscan_sampled(embeddings, min_cluster_size, HDBSCAN_FULL_MATRIX_LIMIT);
+        return hdbscan_sampled(embeddings, min_cluster_size, min_samples, HDBSCAN_FULL_MATRIX_LIMIT);
     }
 
     let mcs = min_cluster_size.max(2);
@@ -912,6 +912,7 @@ fn compute_centroid(
 fn hdbscan_sampled(
     embeddings: &[(String, Vec<f32>)],
     min_cluster_size: usize,
+    min_samples: Option<usize>,
     sample_size: usize,
 ) -> HdbscanResult {
     let n = embeddings.len();
@@ -935,7 +936,7 @@ fn hdbscan_sampled(
         .iter()
         .map(|&i| embeddings[i].clone())
         .collect();
-    let sample_result = hdbscan_with_params(&sampled_embeddings, min_cluster_size, None);
+    let sample_result = hdbscan_with_params(&sampled_embeddings, min_cluster_size, min_samples);
 
     if sample_result.clusters.is_empty() {
         // No clusters found in sample — treat everything as noise
@@ -1343,7 +1344,7 @@ mod tests {
         }
 
         // Test that hdbscan_sampled produces labels for ALL points
-        let result = hdbscan_sampled(&embeddings, 3, 10);
+        let result = hdbscan_sampled(&embeddings, 3, None, 10);
         assert_eq!(result.labels.len(), 20, "Should have labels for all 20 points");
 
         // At least some points should be clustered (not all noise)
