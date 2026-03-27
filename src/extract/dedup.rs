@@ -145,34 +145,30 @@ pub fn check_dedup(
 /// Uses metadata table for cross-process budget sharing (multiple hook processes
 /// may call check_dedup concurrently).
 fn m6_has_llm_budget(store: &SqliteStore) -> bool {
-    const MAX_LLM_CALLS_PER_HOUR: u64 = 10;
+    const MAX_LLM_CALLS_PER_HOUR: i64 = 10;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as i64;
     let current_hour = now_secs / 3600;
 
     let conn = store.conn();
 
-    // Read current budget state from metadata
-    let (stored_hour, calls): (u64, u64) = conn.query_row(
-        "SELECT COALESCE(
-            CAST(json_extract(value, '$.hour') AS INTEGER), 0),
-            COALESCE(CAST(json_extract(value, '$.calls') AS INTEGER), 0)
-         FROM metadata WHERE key = 'm6_llm_budget'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).unwrap_or((0, 0));
-
-    let new_calls = if current_hour != stored_hour { 1 } else { calls + 1 };
-
-    // Update budget counter atomically
-    let _ = conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('m6_llm_budget', json_object('hour', ?1, 'calls', ?2))
-         ON CONFLICT(key) DO UPDATE SET value = json_object('hour', ?1, 'calls', ?2)",
-        rusqlite::params![current_hour, new_calls],
-    );
+    // Atomic increment-and-read in a single SQL statement.
+    // Resets counter when the hour changes. Returns the new call count.
+    let new_calls: i64 = conn.query_row(
+        "INSERT INTO metadata (key, value)
+         VALUES ('m6_llm_budget', json_object('hour', ?1, 'calls', 1))
+         ON CONFLICT(key) DO UPDATE SET value = CASE
+           WHEN CAST(json_extract(value, '$.hour') AS INTEGER) = ?1
+           THEN json_object('hour', ?1, 'calls', CAST(json_extract(value, '$.calls') AS INTEGER) + 1)
+           ELSE json_object('hour', ?1, 'calls', 1)
+         END
+         RETURNING CAST(json_extract(value, '$.calls') AS INTEGER)",
+        rusqlite::params![current_hour],
+        |row| row.get(0),
+    ).unwrap_or(MAX_LLM_CALLS_PER_HOUR + 1);
 
     new_calls <= MAX_LLM_CALLS_PER_HOUR
 }
