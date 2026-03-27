@@ -804,11 +804,12 @@ impl SqliteStore {
                     }
                     // Cap content length to prevent unbounded growth from repeated merges
                     if existing.content.len() > 10_000 {
-                        existing.content.truncate(10_000);
-                        // Ensure we don't cut in the middle of a multi-byte char
-                        while !existing.content.is_char_boundary(existing.content.len()) {
-                            existing.content.pop();
+                        // Find safe UTF-8 boundary at or before 10KB
+                        let mut safe = 10_000;
+                        while safe > 0 && !existing.content.is_char_boundary(safe) {
+                            safe -= 1;
                         }
+                        existing.content.truncate(safe);
                     }
                     existing.summary = existing.content.chars().take(100).collect();
                     // Merge keywords (deduplicated)
