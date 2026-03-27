@@ -1154,7 +1154,13 @@ pub fn extract_unique_lines(source: &str, target: &str) -> String {
             }
             // Keep lines that have dates (temporal anchors) or aren't found in target
             let has_date = trimmed.chars().any(|c| c.is_ascii_digit())
-                && (trimmed.contains("202") || trimmed.contains("20-") || trimmed.contains("月"));
+                && {
+                    // Dynamic date detection: current year ± 10
+                    use chrono::Datelike;
+                    let year = chrono::Utc::now().year();
+                    let has_year = ((year - 10)..=(year + 10)).any(|y: i32| trimmed.contains(&y.to_string()));
+                    has_year || trimmed.contains("月")
+                };
             let is_unique = !target_lower.contains(&trimmed.to_lowercase());
             has_date || is_unique
         })
