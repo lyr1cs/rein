@@ -36,15 +36,23 @@ rein is a multi-source cross-validated memory MCP server (24 tools). Key modules
 - BFS traversal skips expired links
 - MCP tools: `rein_timeline`, `rein_concept_history`, `rein_recall` with `from`/`to` params
 
-## Autonomous Retrieval Routing (v0.4.0)
+## Autonomous Retrieval Routing (v0.4.0, extended v0.8.0)
 
-Query classifier routes to optimal search strategy:
+Query classifier routes to optimal search strategy (6 types):
+- **Episodic** ("what happened in our meeting") → balanced (alpha=0.5), 1.5x limit
 - **Temporal** ("when did X change?") → BM25 bias (alpha=0.7), auto-inject time bounds
+- **Preference** ("what do I prefer") → slight vector bias (alpha=0.4), 2x limit
 - **ExactKeyword** ("SqliteStore") → heavy BM25 (alpha=0.85)
 - **Semantic** ("memory management strategies") → vector dominant (alpha=0.3)
 - **Exploratory** ("what do I know about...") → balanced (alpha=0.5), 2x limit
 
 MCP response includes `[route: type]` prefix for transparency.
+
+## Search Pipeline (v0.8.0)
+
+3-channel retrieval: FTS (Tantivy BM25) + Vector (HNSW) + KG (concept FTS + BFS land-and-expand).
+Post-fusion multi-feature reranking (8 features, learned weights from M1/M2).
+Extraction postprocess: algorithmic date/preference/knowledge-update detection + LLM prompt rules.
 
 ## Adaptive Engine (v0.5.0)
 
