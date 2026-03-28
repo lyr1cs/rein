@@ -304,8 +304,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.no_extract:
-        global USE_LLM_EXTRACT
-        USE_LLM_EXTRACT = False
+        USE_LLM_EXTRACT = False  # module-level var, no global needed in __main__
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     run_benchmark(args.data, args.out, args.limit, args.workers)
