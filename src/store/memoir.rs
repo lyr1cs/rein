@@ -756,7 +756,7 @@ impl SqliteStore {
     }
 
     /// Get a concept by its ID (for BFS traversal).
-    fn get_concept_by_id(&self, id: &str) -> ReinResult<Option<Concept>> {
+    pub fn get_concept_by_id(&self, id: &str) -> ReinResult<Option<Concept>> {
         let mut stmt = self.conn().prepare("SELECT * FROM concepts WHERE id = ?1")?;
         let result = stmt.query_row(rusqlite::params![id], |row| {
             row_to_concept(row).map_err(|e| {
