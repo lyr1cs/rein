@@ -1,12 +1,16 @@
 //! Lightweight rule-based query classifier for autonomous retrieval routing.
-//! Classifies queries into Temporal/ExactKeyword/Semantic/Exploratory and
+//! Classifies queries into Episodic/Temporal/Preference/ExactKeyword/Semantic/Exploratory and
 //! produces per-query search strategy overrides. No LLM calls — pure string matching.
 
 /// Query type classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
+    /// "what happened in X session/meeting", "recap of last session"
+    Episodic,
     /// "when did X change?", "what happened last week?"
     Temporal,
+    /// "what do I prefer/like/want"
+    Preference,
     /// Short precise terms, function names, code identifiers
     ExactKeyword,
     /// "things related to memory management"
@@ -52,7 +56,20 @@ pub fn classify(query: &str, has_time_from: bool, has_time_to: bool) -> QueryStr
     let lower = query.to_lowercase();
     let word_count = query.split_whitespace().count();
 
-    // --- Priority 1: Temporal ---
+    // --- Priority 1: Episodic (must check BEFORE Temporal — "what happened" overlaps) ---
+    if is_episodic(&lower) {
+        return QueryStrategy {
+            query_type: QueryType::Episodic,
+            cc_alpha: Some(0.5),
+            limit_multiplier: 1.5,
+            skip_vec: false,
+            skip_fts: false,
+            force_temporal: false,
+            temporal_days_back: None,
+        };
+    }
+
+    // --- Priority 2: Temporal ---
     if is_temporal(&lower) {
         // Only auto-inject time bounds for relative temporal queries ("last week", "recently").
         // Absolute references ("since 2025-01-01", "history of X") should not be narrowed.
@@ -69,7 +86,20 @@ pub fn classify(query: &str, has_time_from: bool, has_time_to: bool) -> QueryStr
         };
     }
 
-    // --- Priority 2: ExactKeyword ---
+    // --- Priority 3: Preference ---
+    if is_preference(&lower) {
+        return QueryStrategy {
+            query_type: QueryType::Preference,
+            cc_alpha: Some(0.4),
+            limit_multiplier: 2.0,
+            skip_vec: false,
+            skip_fts: false,
+            force_temporal: false,
+            temporal_days_back: None,
+        };
+    }
+
+    // --- Priority 4: ExactKeyword ---
     if is_exact_keyword(query, &lower, word_count) {
         return QueryStrategy {
             query_type: QueryType::ExactKeyword,
@@ -82,7 +112,7 @@ pub fn classify(query: &str, has_time_from: bool, has_time_to: bool) -> QueryStr
         };
     }
 
-    // --- Priority 3: Exploratory ---
+    // --- Priority 5: Exploratory ---
     if is_exploratory(&lower) {
         return QueryStrategy {
             query_type: QueryType::Exploratory,
@@ -105,6 +135,64 @@ pub fn classify(query: &str, has_time_from: bool, has_time_to: bool) -> QueryStr
         force_temporal: false,
         temporal_days_back: None,
     }
+}
+
+fn is_episodic(lower: &str) -> bool {
+    const EPISODIC_EN: &[&str] = &[
+        "what did we decide",
+        "recap of",
+        "session summary",
+        "last conversation",
+        "meeting notes",
+    ];
+    const EPISODIC_ZH: &[&str] = &[
+        "会议记录",
+        "上次会话",
+        "总结一下上次",
+    ];
+
+    for pat in EPISODIC_EN {
+        if lower.contains(pat) { return true; }
+    }
+    for pat in EPISODIC_ZH {
+        if lower.contains(pat) { return true; }
+    }
+
+    // Compound pattern: "what happened in ... meeting/session"
+    if lower.contains("what happened") && (lower.contains("meeting") || lower.contains("session")) {
+        return true;
+    }
+
+    false
+}
+
+fn is_preference(lower: &str) -> bool {
+    const PREFERENCE_EN: &[&str] = &[
+        "prefer",
+        "favorite",
+        "favourite",
+        "do i like",
+        "what do i like",
+        "my preference",
+        "i tend to",
+        "usually choose",
+        "go-to",
+    ];
+    const PREFERENCE_ZH: &[&str] = &[
+        "偏好",
+        "喜欢",
+        "最爱",
+        "倾向",
+    ];
+
+    for pat in PREFERENCE_EN {
+        if lower.contains(pat) { return true; }
+    }
+    for pat in PREFERENCE_ZH {
+        if lower.contains(pat) { return true; }
+    }
+
+    false
 }
 
 fn is_temporal(lower: &str) -> bool {
@@ -204,7 +292,9 @@ fn is_exploratory(lower: &str) -> bool {
 impl std::fmt::Display for QueryType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Episodic => write!(f, "episodic"),
             Self::Temporal => write!(f, "temporal"),
+            Self::Preference => write!(f, "preference"),
             Self::ExactKeyword => write!(f, "exact"),
             Self::Semantic => write!(f, "semantic"),
             Self::Exploratory => write!(f, "exploratory"),
@@ -275,5 +365,25 @@ mod tests {
         let s = classify("what do I know about rein architecture", false, false);
         assert_eq!(s.query_type, QueryType::Exploratory);
         assert!(s.limit_multiplier > 1.5);
+    }
+
+    #[test]
+    fn test_preference_queries() {
+        assert_eq!(classify("what food do I prefer", false, false).query_type, QueryType::Preference);
+        assert_eq!(classify("my favorite programming language", false, false).query_type, QueryType::Preference);
+    }
+
+    #[test]
+    fn test_episodic_queries() {
+        assert_eq!(classify("what did we decide about the API", false, false).query_type, QueryType::Episodic);
+        assert_eq!(classify("recap of the last session", false, false).query_type, QueryType::Episodic);
+    }
+
+    #[test]
+    fn test_episodic_vs_temporal_disambiguation() {
+        // "what happened in our meeting" should be Episodic, not Temporal
+        assert_eq!(classify("what happened in our last meeting", false, false).query_type, QueryType::Episodic);
+        // "what happened last week" should still be Temporal (no session/meeting reference)
+        assert_eq!(classify("what happened last week", false, false).query_type, QueryType::Temporal);
     }
 }
