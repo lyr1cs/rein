@@ -16,17 +16,32 @@ pub fn build_memory(
     keywords: Vec<String>,
     source: Source,
 ) -> Memory {
+    // Apply rule-based postprocessing (E1 date keywords, E2 preference tagging, E3 knowledge update)
+    let mut extracted = crate::extract::llm::ExtractedMemory {
+        topic: topic.clone(),
+        summary: content.chars().take(100).collect(),
+        content: content.clone(),
+        keywords: keywords.clone(),
+        importance: format!("{}", importance),
+        should_store: true,
+        quality_confidence: 0.5,
+    };
+    crate::extract::postprocess::postprocess(&mut extracted);
+
+    // Use postprocessed values (topic/keywords/importance may have been enriched)
+    let final_importance: Importance = extracted.importance.parse().unwrap_or(importance);
+
     Memory {
         id: ulid::Ulid::new().to_string(),
-        layer: importance.auto_layer(),
-        topic,
-        summary: content.chars().take(100).collect(),
-        content,
-        keywords,
-        importance,
+        layer: final_importance.auto_layer(),
+        topic: extracted.topic,
+        summary: extracted.content.chars().take(100).collect(),
+        content: extracted.content,
+        keywords: extracted.keywords,
+        importance: final_importance,
         source,
         strength: 1.0,
-        decay_lambda: config.decay.base_lambda * importance.decay_factor(),
+        decay_lambda: config.decay.base_lambda * final_importance.decay_factor(),
         access_count: 0,
         superseded_by: None,
         related_ids: vec![],
