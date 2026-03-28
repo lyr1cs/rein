@@ -1,4 +1,5 @@
 pub mod alpha_optimizer;
+pub mod kg_search;
 pub mod chunker;
 pub mod classify;
 pub mod recall;
