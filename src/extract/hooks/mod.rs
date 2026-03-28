@@ -158,16 +158,6 @@ fn store_extracted(
             let _ = store.activate_related_concepts(&content_for_activation);
             let _ = store.apply_evolution(&id, &content_for_activation, None);
 
-            // Aggressive evolution for knowledge_update: actively supersede stale facts
-            if is_knowledge_update {
-                if let Ok(related) = store.search_fts(&content_for_activation, Some(&topic_for_evolution), 5) {
-                    for old in related {
-                        if old.id != id {
-                            let _ = store.apply_evolution(&id, &old.content, None);
-                        }
-                    }
-                }
-            }
 
             stored_ids.push(id);
             stored += 1;
