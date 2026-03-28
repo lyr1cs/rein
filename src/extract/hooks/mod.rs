@@ -11,7 +11,6 @@ pub mod scoring;
 
 use crate::config::ReinConfig;
 use crate::extract::llm::ExtractedMemory;
-use crate::types::MemoryStore;
 
 use self::buffer::*;
 use self::parsing::*;
@@ -236,17 +235,19 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     }
 
     let store = config.open_store()?;
-    let memories = store.search_fts(query, None, 8)?;
-    let concepts = store.search_all_concepts(query, 5).unwrap_or_default();
 
-    if memories.is_empty() && concepts.is_empty() {
+    // Use full recall pipeline (R1 KG + R2 reranker + R3 routing) instead of simple FTS
+    let recall_results = crate::search::recall::recall(&store, config, query, None, None, 5)?;
+    let concepts = store.search_all_concepts(query, 3).unwrap_or_default();
+
+    if recall_results.is_empty() && concepts.is_empty() {
         return Ok(());
     }
 
+    // Build ranked list from recall results + concepts
     let mut ranked: Vec<(f32, String, String)> = Vec::new();
-    for m in &memories {
-        let sim = crate::extract::similarity(query, &m.content);
-        ranked.push((sim, format!("[{}] {}", xml_escape(&m.topic), xml_escape(&m.summary)), xml_escape(&m.content)));
+    for r in &recall_results {
+        ranked.push((r.score, format!("[{}] {}", xml_escape(&r.memory.topic), xml_escape(&r.memory.summary)), xml_escape(&r.memory.content)));
     }
     for c in &concepts {
         let sim = crate::extract::similarity(query, &c.definition);
@@ -254,6 +255,9 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     }
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(8);
+
+    // Extract memories for M1 event logging below
+    let memories: Vec<&crate::types::Memory> = recall_results.iter().map(|r| &r.memory).collect();
 
     // === M1: Emit recall_access events for injected memories ===
     // Injection ≈ access (best available proxy in MCP architecture).
