@@ -141,9 +141,16 @@ pub fn recall_temporal(
     // Capture per-channel scores for reranking and M2 logging.
     // Clamp negatives (rank sentinels like -1,-2) to 0 so reranker features are in [0, +inf).
     let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion.iter()
-        .map(|(id, s)| (id.clone(), s.max(0.0))).collect();
+        .map(|(id, s)| {
+            // Convert negative rank sentinels (-1,-2,...) to positive rank scores: 1/(1+|rank|)
+            let score = if *s < 0.0 { 1.0 / (1.0 + s.abs()) } else { *s };
+            (id.clone(), score)
+        }).collect();
     let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion.iter()
-        .map(|(id, s)| (id.clone(), s.max(0.0))).collect();
+        .map(|(id, s)| {
+            let score = if *s < 0.0 { 1.0 / (1.0 + s.abs()) } else { *s };
+            (id.clone(), score)
+        }).collect();
     let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
 
     let fused = if config.search.fusion_method == "cc" {

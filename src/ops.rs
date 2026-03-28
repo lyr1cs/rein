@@ -16,7 +16,8 @@ pub fn build_memory(
     keywords: Vec<String>,
     source: Source,
 ) -> Memory {
-    // Apply rule-based postprocessing (E1 date keywords, E2 preference tagging, E3 knowledge update)
+    // Apply rule-based postprocessing for additive keyword enrichment only.
+    // User-supplied topic and importance are authoritative — postprocess cannot override them.
     let mut extracted = crate::extract::llm::ExtractedMemory {
         topic: topic.clone(),
         summary: content.chars().take(100).collect(),
@@ -28,20 +29,18 @@ pub fn build_memory(
     };
     crate::extract::postprocess::postprocess(&mut extracted);
 
-    // Use postprocessed values (topic/keywords/importance may have been enriched)
-    let final_importance: Importance = extracted.importance.parse().unwrap_or(importance);
-
+    // Only take enriched keywords from postprocess; keep caller's topic and importance
     Memory {
         id: ulid::Ulid::new().to_string(),
-        layer: final_importance.auto_layer(),
-        topic: extracted.topic,
-        summary: extracted.content.chars().take(100).collect(),
-        content: extracted.content,
-        keywords: extracted.keywords,
-        importance: final_importance,
+        layer: importance.auto_layer(),
+        topic,
+        summary: content.chars().take(100).collect(),
+        content,
+        keywords: extracted.keywords, // enriched with date/preference/update keywords
+        importance,
         source,
         strength: 1.0,
-        decay_lambda: config.decay.base_lambda * final_importance.decay_factor(),
+        decay_lambda: config.decay.base_lambda * importance.decay_factor(),
         access_count: 0,
         superseded_by: None,
         related_ids: vec![],
@@ -54,6 +53,22 @@ pub fn build_memory(
         updated_at: chrono::Utc::now(),
         last_accessed: chrono::Utc::now(),
     }
+}
+
+/// Store a memory with full post-processing (shared by CLI and MCP paths).
+/// Runs: store_with_dedup → auto_link → activate_related_concepts → apply_evolution.
+pub fn store_memory(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+    memory: Memory,
+) -> crate::types::ReinResult<String> {
+    let content = memory.content.clone();
+    let dedup_sim = config.search.dedup_similarity as f32;
+    let id = store.store_with_dedup(memory, dedup_sim, config.search.dedup_time_window_days)?;
+    let _ = store.auto_link(&id, dedup_sim, 5);
+    let _ = store.activate_related_concepts(&content);
+    let _ = store.apply_evolution(&id, &content, None);
+    Ok(id)
 }
 
 /// Build a consolidated Memory from a topic.
