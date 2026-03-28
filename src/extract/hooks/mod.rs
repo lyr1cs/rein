@@ -96,8 +96,13 @@ fn multi_factor_admission_score(
 fn store_extracted(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
-    items: Vec<ExtractedMemory>,
+    mut items: Vec<ExtractedMemory>,
 ) -> (u32, Vec<String>) {
+    // Rule-based post-processing: enrich with dates, preferences, knowledge-update signals
+    for item in &mut items {
+        crate::extract::postprocess::postprocess(item);
+    }
+
     let mut stored = 0u32;
     let mut stored_ids = Vec::new();
     for item in items {
@@ -113,6 +118,8 @@ fn store_extracted(
         }
 
         let content_for_activation = item.content.clone();
+        let is_knowledge_update = item.keywords.iter().any(|k| k == "knowledge_update");
+        let topic_for_evolution = item.topic.clone();
         let importance = item.importance.parse::<crate::types::Importance>()
             .unwrap_or(crate::types::Importance::Medium);
         let memory = crate::types::Memory {
@@ -150,6 +157,18 @@ fn store_extracted(
             let _ = store.activate_related_memories(&content_for_activation, 3);
             let _ = store.activate_related_concepts(&content_for_activation);
             let _ = store.apply_evolution(&id, &content_for_activation, None);
+
+            // Aggressive evolution for knowledge_update: actively supersede stale facts
+            if is_knowledge_update {
+                if let Ok(related) = store.search_fts(&content_for_activation, Some(&topic_for_evolution), 5) {
+                    for old in related {
+                        if old.id != id {
+                            let _ = store.apply_evolution(&id, &old.content, None);
+                        }
+                    }
+                }
+            }
+
             stored_ids.push(id);
             stored += 1;
         }
