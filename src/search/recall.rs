@@ -85,15 +85,12 @@ pub fn recall_temporal(
 
     // === R1: Knowledge Graph retrieval channel ===
     let kg_start = std::time::Instant::now();
-    let concept_results = crate::search::kg_search::search_concepts_ranked(store, query, effective_limit);
-    // BFS expand from top concept names
-    let concept_names: Vec<String> = store.search_all_concepts(query, 5)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
-    let expanded = if !concept_names.is_empty() {
-        crate::search::kg_search::bfs_expand_memories(store, &concept_names, 2, effective_limit)
+    let seed_concepts = store.search_all_concepts(query, 5).unwrap_or_default();
+    let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
+    // BFS expand from seed concept IDs (not names, to avoid cross-memoir collisions)
+    let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
+    let expanded = if !seed_ids.is_empty() {
+        crate::search::kg_search::bfs_expand_memories_by_id(store, &seed_ids, 2, effective_limit)
     } else {
         vec![]
     };
@@ -103,7 +100,9 @@ pub fn recall_temporal(
         let entry = kg_scores.entry(id).or_default();
         *entry = entry.max(score);
     }
-    let mut kg_ranked: Vec<(String, f32)> = kg_scores.into_iter().collect();
+    let mut kg_ranked: Vec<(String, f32)> = kg_scores.into_iter()
+        .filter(|(id, _)| matches_topic(store, id, topic))
+        .collect();
     kg_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     kg_ranked.truncate(effective_limit);
     tracing::debug!(elapsed_ms = kg_start.elapsed().as_millis() as u64, hits = kg_ranked.len(), "kg search");
@@ -139,9 +138,12 @@ pub fn recall_temporal(
         None
     };
 
-    // Capture normalized scores for M2 counterfactual logging (before fusion consumes them)
-    let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion.iter().cloned().collect();
-    let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion.iter().cloned().collect();
+    // Capture per-channel scores for reranking and M2 logging.
+    // Clamp negatives (rank sentinels like -1,-2) to 0 so reranker features are in [0, +inf).
+    let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion.iter()
+        .map(|(id, s)| (id.clone(), s.max(0.0))).collect();
+    let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion.iter()
+        .map(|(id, s)| (id.clone(), s.max(0.0))).collect();
     let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
 
     let fused = if config.search.fusion_method == "cc" {
@@ -252,45 +254,31 @@ pub fn recall_temporal(
     }
     local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // === R2: Multi-feature reranking ===
+    // === R2: Multi-feature reranking — overwrite scores so downstream ordering uses rerank ===
     if local_results.len() > 1 {
         let weights = crate::search::rerank::load_weights(store.conn());
-
-        local_results.sort_by(|a, b| {
-            let fa = crate::search::rerank::RerankFeatures {
-                fts_score: fts_norm_log.get(&a.0.id).copied().unwrap_or(0.0),
-                vec_score: vec_norm_log.get(&a.0.id).copied().unwrap_or(0.0),
-                kg_score: kg_norm_log.get(&a.0.id).copied().unwrap_or(0.0),
-                recency_days: (chrono::Utc::now() - a.0.created_at).num_hours() as f32 / 24.0,
-                access_count: a.0.access_count as u32,
-                strength: a.0.strength as f32,
-                importance_weight: match a.0.importance {
-                    crate::types::Importance::Critical => 1.0,
-                    crate::types::Importance::High => 0.8,
-                    crate::types::Importance::Medium => 0.6,
-                    crate::types::Importance::Low => 0.4,
-                },
-                keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &a.0.keywords, &a.0.content),
+        let importance_weight = |imp: &crate::types::Importance| -> f32 {
+            match imp {
+                crate::types::Importance::Critical => 1.0,
+                crate::types::Importance::High => 0.8,
+                crate::types::Importance::Medium => 0.6,
+                crate::types::Importance::Low => 0.4,
+            }
+        };
+        for (mem, score) in local_results.iter_mut() {
+            let features = crate::search::rerank::RerankFeatures {
+                fts_score: fts_norm_log.get(&mem.id).copied().unwrap_or(0.0),
+                vec_score: vec_norm_log.get(&mem.id).copied().unwrap_or(0.0),
+                kg_score: kg_norm_log.get(&mem.id).copied().unwrap_or(0.0),
+                recency_days: (chrono::Utc::now() - mem.created_at).num_hours() as f32 / 24.0,
+                access_count: mem.access_count,
+                strength: mem.strength as f32,
+                importance_weight: importance_weight(&mem.importance),
+                keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &mem.keywords, &mem.content),
             };
-            let fb = crate::search::rerank::RerankFeatures {
-                fts_score: fts_norm_log.get(&b.0.id).copied().unwrap_or(0.0),
-                vec_score: vec_norm_log.get(&b.0.id).copied().unwrap_or(0.0),
-                kg_score: kg_norm_log.get(&b.0.id).copied().unwrap_or(0.0),
-                recency_days: (chrono::Utc::now() - b.0.created_at).num_hours() as f32 / 24.0,
-                access_count: b.0.access_count as u32,
-                strength: b.0.strength as f32,
-                importance_weight: match b.0.importance {
-                    crate::types::Importance::Critical => 1.0,
-                    crate::types::Importance::High => 0.8,
-                    crate::types::Importance::Medium => 0.6,
-                    crate::types::Importance::Low => 0.4,
-                },
-                keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &b.0.keywords, &b.0.content),
-            };
-            let sa = crate::search::rerank::rerank_score(&fa, &weights);
-            let sb = crate::search::rerank::rerank_score(&fb, &weights);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
+            *score = crate::search::rerank::rerank_score(&features, &weights);
+        }
+        local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     // === Optional keyword filter ===

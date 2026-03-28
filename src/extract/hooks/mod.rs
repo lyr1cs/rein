@@ -118,8 +118,6 @@ fn store_extracted(
         }
 
         let content_for_activation = item.content.clone();
-        let is_knowledge_update = item.keywords.iter().any(|k| k == "knowledge_update");
-        let topic_for_evolution = item.topic.clone();
         let importance = item.importance.parse::<crate::types::Importance>()
             .unwrap_or(crate::types::Importance::Medium);
         let memory = crate::types::Memory {
