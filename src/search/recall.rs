@@ -83,6 +83,33 @@ pub fn recall_temporal(
         r
     };
 
+    // === R1: Knowledge Graph retrieval channel ===
+    let kg_start = std::time::Instant::now();
+    let concept_results = crate::search::kg_search::search_concepts_ranked(store, query, effective_limit);
+    // BFS expand from top concept names
+    let concept_names: Vec<String> = store.search_all_concepts(query, 5)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    let expanded = if !concept_names.is_empty() {
+        crate::search::kg_search::bfs_expand_memories(store, &concept_names, 2, effective_limit)
+    } else {
+        vec![]
+    };
+    // Merge concept_results and expanded (take max score per memory)
+    let mut kg_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (id, score) in concept_results.into_iter().chain(expanded.into_iter()) {
+        let entry = kg_scores.entry(id).or_default();
+        *entry = entry.max(score);
+    }
+    let mut kg_ranked: Vec<(String, f32)> = kg_scores.into_iter().collect();
+    kg_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    kg_ranked.truncate(effective_limit);
+    tracing::debug!(elapsed_ms = kg_start.elapsed().as_millis() as u64, hits = kg_ranked.len(), "kg search");
+
+    let use_kg = !kg_ranked.is_empty();
+
     // === Path quality gating (Wang 2025: weakest-link phenomenon) ===
     // Skip a path if it returned no results — avoids empty/broken paths degrading fusion.
     // Note: scores are rank-encoded (0, -1, -2...) so we gate on result count, not score value.
@@ -115,12 +142,27 @@ pub fn recall_temporal(
     // Capture normalized scores for M2 counterfactual logging (before fusion consumes them)
     let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion.iter().cloned().collect();
     let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion.iter().cloned().collect();
+    let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
 
     let fused = if config.search.fusion_method == "cc" {
         let alpha = adaptive_alpha
             .or(strategy.cc_alpha)
             .unwrap_or(config.search.cc_alpha as f32);
-        crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha)
+        // For CC mode, boost vec scores with KG signal (2-stage fusion)
+        let vec_for_cc = if use_kg {
+            let mut boosted = vec_for_fusion.clone();
+            for (id, kg_score) in &kg_ranked {
+                if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
+                    boosted[pos].1 = boosted[pos].1.max(*kg_score * 0.5);
+                } else {
+                    boosted.push((id.clone(), *kg_score * 0.5));
+                }
+            }
+            boosted
+        } else {
+            vec_for_fusion
+        };
+        crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_cc, alpha)
     } else {
         let rrf_k = config.search.rrf_k as f32;
         // Map strategy alpha to RRF weights (alpha=high → FTS dominant)
@@ -132,6 +174,10 @@ pub fn recall_temporal(
         let mut lists = Vec::new();
         if !fts_for_fusion.is_empty() { lists.push((fts_for_fusion, fts_weight)); }
         if !vec_for_fusion.is_empty() { lists.push((vec_for_fusion, vec_weight)); }
+        if !kg_ranked.is_empty() {
+            let kg_weight = 0.3; // KG is supplementary
+            lists.push((kg_ranked.clone(), kg_weight));
+        }
         crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k)
     };
 
@@ -148,6 +194,17 @@ pub fn recall_temporal(
         .collect();
     if !missing_ids.is_empty() {
         for m in store.get_batch(&missing_ids) {
+            memory_map.entry(m.id.clone()).or_insert(m);
+        }
+    }
+
+    // Batch-fetch KG-sourced memories not already in map
+    let kg_ids: Vec<String> = kg_norm_log.keys()
+        .filter(|id| !memory_map.contains_key(*id))
+        .cloned()
+        .collect();
+    if !kg_ids.is_empty() {
+        for m in store.get_batch(&kg_ids) {
             memory_map.entry(m.id.clone()).or_insert(m);
         }
     }
@@ -194,6 +251,47 @@ pub fn recall_temporal(
         }
     }
     local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // === R2: Multi-feature reranking ===
+    if local_results.len() > 1 {
+        let weights = crate::search::rerank::load_weights(store.conn());
+
+        local_results.sort_by(|a, b| {
+            let fa = crate::search::rerank::RerankFeatures {
+                fts_score: fts_norm_log.get(&a.0.id).copied().unwrap_or(0.0),
+                vec_score: vec_norm_log.get(&a.0.id).copied().unwrap_or(0.0),
+                kg_score: kg_norm_log.get(&a.0.id).copied().unwrap_or(0.0),
+                recency_days: (chrono::Utc::now() - a.0.created_at).num_hours() as f32 / 24.0,
+                access_count: a.0.access_count as u32,
+                strength: a.0.strength as f32,
+                importance_weight: match a.0.importance {
+                    crate::types::Importance::Critical => 1.0,
+                    crate::types::Importance::High => 0.8,
+                    crate::types::Importance::Medium => 0.6,
+                    crate::types::Importance::Low => 0.4,
+                },
+                keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &a.0.keywords, &a.0.content),
+            };
+            let fb = crate::search::rerank::RerankFeatures {
+                fts_score: fts_norm_log.get(&b.0.id).copied().unwrap_or(0.0),
+                vec_score: vec_norm_log.get(&b.0.id).copied().unwrap_or(0.0),
+                kg_score: kg_norm_log.get(&b.0.id).copied().unwrap_or(0.0),
+                recency_days: (chrono::Utc::now() - b.0.created_at).num_hours() as f32 / 24.0,
+                access_count: b.0.access_count as u32,
+                strength: b.0.strength as f32,
+                importance_weight: match b.0.importance {
+                    crate::types::Importance::Critical => 1.0,
+                    crate::types::Importance::High => 0.8,
+                    crate::types::Importance::Medium => 0.6,
+                    crate::types::Importance::Low => 0.4,
+                },
+                keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &b.0.keywords, &b.0.content),
+            };
+            let sa = crate::search::rerank::rerank_score(&fa, &weights);
+            let sb = crate::search::rerank::rerank_score(&fb, &weights);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 
     // === Optional keyword filter ===
     if let Some(kw) = keyword {
@@ -273,10 +371,12 @@ pub fn recall_temporal(
             .map(|r| {
                 let bm25 = fts_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
                 let vec = vec_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
+                let kg = kg_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
                 serde_json::json!({
                     "id": r.memory.id,
                     "bm25_norm": bm25,
                     "vec_norm": vec,
+                    "kg_norm": kg,
                     "final_score": r.score,
                 })
             })
