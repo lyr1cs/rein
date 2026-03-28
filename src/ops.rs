@@ -63,11 +63,18 @@ pub fn store_memory(
     memory: Memory,
 ) -> crate::types::ReinResult<String> {
     let content = memory.content.clone();
+    let original_id = memory.id.clone();
     let dedup_sim = config.search.dedup_similarity as f32;
     let id = store.store_with_dedup(memory, dedup_sim, config.search.dedup_time_window_days)?;
-    let _ = store.auto_link(&id, dedup_sim, 5);
-    let _ = store.activate_related_concepts(&content);
-    let _ = store.apply_evolution(&id, &content, None);
+    // Only run post-processing for newly created memories, not merge-into targets.
+    // store_with_dedup returns the existing ID on MergeInto — running evolution
+    // against a merged record could corrupt provenance of unrelated memories.
+    let is_new = id == original_id;
+    if is_new {
+        let _ = store.auto_link(&id, dedup_sim, 5);
+        let _ = store.activate_related_concepts(&content);
+        let _ = store.apply_evolution(&id, &content, None);
+    }
     Ok(id)
 }
 
