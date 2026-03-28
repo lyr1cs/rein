@@ -236,8 +236,12 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
 
     let store = config.open_store()?;
 
-    // Use full recall pipeline (R1 KG + R2 reranker + R3 routing) instead of simple FTS
-    let recall_results = crate::search::recall::recall(&store, config, query, None, None, 5)?;
+    // Use full recall pipeline (R1 KG + R2 reranker + R3 routing) but local-only
+    // to avoid sending prompt text to external services (Supermemory, AutoMemory).
+    let mut local_config = config.clone();
+    local_config.sync.supermemory_enabled = false;
+    local_config.sync.auto_memory_enabled = false;
+    let recall_results = crate::search::recall::recall(&store, &local_config, query, None, None, 5)?;
     let concepts = store.search_all_concepts(query, 3).unwrap_or_default();
 
     if recall_results.is_empty() && concepts.is_empty() {
