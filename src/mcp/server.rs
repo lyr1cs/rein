@@ -162,18 +162,9 @@ impl ReinServer {
             Source::Manual,
         );
 
-        let dedup_sim = self.config.search.dedup_similarity as f32;
-        let dedup_days = self.config.search.dedup_time_window_days;
-        let content_for_linking = params.content.clone();
-
+        let config = self.config.clone();
         let result = self.with_store(|store| {
-            let id = store.store_with_dedup(memory, dedup_sim, dedup_days)?;
-            // Post-store processing (same as hooks store_extracted path)
-            let _ = store.auto_link(&id, dedup_sim, 5);
-            let _ = store.activate_related_memories(&content_for_linking, 3);
-            let _ = store.activate_related_concepts(&content_for_linking);
-            let _ = store.apply_evolution(&id, &content_for_linking, None);
-            Ok(id)
+            crate::ops::store_memory(store, &config, memory)
         });
 
         match result {

@@ -193,18 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 keywords.unwrap_or_default(),
                 types::Source::Manual,
             );
-            let dedup_sim = config.search.dedup_similarity as f32;
-            let id = store
-                .store_with_dedup(
-                    memory,
-                    dedup_sim,
-                    config.search.dedup_time_window_days,
-                )?;
-            // Post-store: link, activate, evolve (same as hooks path)
-            let _ = store.auto_link(&id, dedup_sim, 5);
-            let _ = store.activate_related_memories(&content, 3);
-            let _ = store.activate_related_concepts(&content);
-            let _ = store.apply_evolution(&id, &content, None);
+            let id = rein::ops::store_memory(&store, &config, memory)?;
             println!(
                 "{}",
                 mcp::compact::format_store_result(&id, config.server.compact)
