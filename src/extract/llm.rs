@@ -132,6 +132,9 @@ Rules:
 - Max 10 concepts, max 10 links per extraction
 - concept_type "fact" = declarative knowledge, "skill" = procedural knowledge (how to do X)
 - Support both English and Chinese
+- When dates are mentioned (explicit or relative), resolve to ISO format and add as keyword: "date:YYYY-MM-DD"
+- When user expresses preferences (explicit or implicit), set topic to "user_preference", add "preference" as keyword, preserve exact words
+- When information contradicts previous knowledge, set importance to "high", add "knowledge_update" as keyword
 - Return {"memories":[],"concepts":[],"links":[],"episode":null} if nothing worth extracting"#;
 
 // ---------------------------------------------------------------------------
