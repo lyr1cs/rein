@@ -71,9 +71,17 @@ pub fn bfs_expand_memories(
             continue;
         }
 
-        // Get outgoing links (temporal validity checked inside get_links_from)
+        // Get outgoing links, filter expired/future-dated links
+        let now = chrono::Utc::now();
         let links = store.get_links_from(&concept_id).unwrap_or_default();
         for link in links {
+            // Skip links outside their temporal validity window
+            if let Some(valid_from) = link.valid_from {
+                if now < valid_from { continue; }
+            }
+            if let Some(valid_until) = link.valid_until {
+                if now > valid_until { continue; }
+            }
             if visited.insert(link.target_id.clone()) {
                 let hop_score = 1.0 / (1.0 + (depth + 1) as f32); // Decay with distance
                 frontier.push((link.target_id.clone(), depth + 1));
