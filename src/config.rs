@@ -44,6 +44,8 @@ pub struct ReinConfig {
     pub extract: ExtractConfig,
     #[serde(default)]
     pub adaptive: AdaptiveConfig,
+    #[serde(default)]
+    pub query_expansion: QueryExpansionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,10 +101,18 @@ pub struct SearchConfig {
     pub cc_alpha: f64,
     pub dedup_similarity: f64,
     pub dedup_time_window_days: i64,
+    /// LLM reranker provider: "google", "omlx", or "none". Default: "none".
+    #[serde(default = "default_llm_reranker")]
+    pub llm_reranker: String,
+    /// Number of top candidates to send to LLM reranker. Default: 15.
+    #[serde(default = "default_llm_reranker_top_n")]
+    pub llm_reranker_top_n: usize,
 }
 
 fn default_fusion_method() -> String { "rrf".to_string() }
 fn default_cc_alpha() -> f64 { 0.5 }
+fn default_llm_reranker() -> String { "none".to_string() }
+fn default_llm_reranker_top_n() -> usize { 15 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChunkingConfig {
@@ -261,6 +271,53 @@ fn default_omlx_extract_model() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Query Expansion config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueryExpansionConfig {
+    /// Provider: "google", "omlx", or "none". Default: "google".
+    #[serde(default = "default_expand_provider")]
+    pub provider: String,
+    /// Maximum number of expanded query variants. Default: 3.
+    #[serde(default = "default_max_expansions")]
+    pub max_expansions: usize,
+    #[serde(default)]
+    pub google: GoogleExpandConfig,
+    #[serde(default)]
+    pub omlx: OmlxExpandConfig,
+}
+
+fn default_expand_provider() -> String { "google".to_string() }
+fn default_max_expansions() -> usize { 3 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoogleExpandConfig {
+    #[serde(default = "default_expand_google_model")]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_google_endpoint")]
+    pub endpoint: String,
+}
+
+fn default_expand_google_model() -> String {
+    "gemini-2.0-flash-lite".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OmlxExpandConfig {
+    #[serde(default = "default_omlx_expand_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_omlx_model")]
+    pub model: String,
+}
+
+fn default_omlx_expand_endpoint() -> String {
+    "http://localhost:8000/v1".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Default implementations
 // ---------------------------------------------------------------------------
 
@@ -313,6 +370,8 @@ impl Default for SearchConfig {
             cc_alpha: 0.5,
             dedup_similarity: 0.70,
             dedup_time_window_days: 7,
+            llm_reranker: default_llm_reranker(),
+            llm_reranker_top_n: default_llm_reranker_top_n(),
         }
     }
 }
@@ -426,6 +485,36 @@ impl Default for OmlxExtractConfig {
     }
 }
 
+impl Default for QueryExpansionConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_expand_provider(),
+            max_expansions: default_max_expansions(),
+            google: GoogleExpandConfig::default(),
+            omlx: OmlxExpandConfig::default(),
+        }
+    }
+}
+
+impl Default for GoogleExpandConfig {
+    fn default() -> Self {
+        Self {
+            model: default_expand_google_model(),
+            api_key: None,
+            endpoint: default_google_endpoint(),
+        }
+    }
+}
+
+impl Default for OmlxExpandConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_omlx_expand_endpoint(),
+            model: "default".to_string(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -467,6 +556,12 @@ impl ReinConfig {
                 config.extract.google.api_key = Some(key);
             }
         }
+        // Reuse GEMINI_API_KEY for query expansion if not set separately
+        if config.query_expansion.google.api_key.is_none() {
+            if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+                config.query_expansion.google.api_key = Some(key);
+            }
+        }
         // Server overrides (useful for Docker: REIN_SSE_BIND=0.0.0.0)
         if let Ok(bind) = std::env::var("REIN_SSE_BIND") {
             config.server.sse_bind = bind;
@@ -494,6 +589,16 @@ impl ReinConfig {
     /// Get typed extract provider.
     pub fn extract_provider(&self) -> Provider {
         Provider::from_str(&self.extract.provider)
+    }
+
+    /// Get typed query expansion provider.
+    pub fn expand_provider(&self) -> Provider {
+        Provider::from_str(&self.query_expansion.provider)
+    }
+
+    /// Get typed LLM reranker provider.
+    pub fn reranker_provider(&self) -> Provider {
+        Provider::from_str(&self.search.llm_reranker)
     }
 
     /// The embedding model name (for cache keying and model-change detection).
@@ -530,6 +635,17 @@ impl ReinConfig {
             }
             Provider::Omlx => {
                 eprintln!("rein: using OMLX extract backend at {}", self.extract.omlx.endpoint);
+            }
+            Provider::None => {}
+        }
+        match self.expand_provider() {
+            Provider::Google => {
+                if self.query_expansion.google.api_key.is_none() {
+                    eprintln!("rein: NOTE — query expansion provider is 'google' but GEMINI_API_KEY is not set, expansion disabled");
+                }
+            }
+            Provider::Omlx => {
+                eprintln!("rein: using OMLX query expansion backend at {}", self.query_expansion.omlx.endpoint);
             }
             Provider::None => {}
         }
@@ -626,6 +742,14 @@ fn serde_to_value(config: &ReinConfig) -> anyhow::Result<toml::Value> {
         .and_then(|v| v.as_table_mut())
     {
         if let Some(ref key) = config.extract.google.api_key {
+            tbl.insert("api_key".to_string(), toml::Value::String(key.clone()));
+        }
+    }
+    if let Some(tbl) = val.get_mut("query_expansion")
+        .and_then(|v| v.get_mut("google"))
+        .and_then(|v| v.as_table_mut())
+    {
+        if let Some(ref key) = config.query_expansion.google.api_key {
             tbl.insert("api_key".to_string(), toml::Value::String(key.clone()));
         }
     }

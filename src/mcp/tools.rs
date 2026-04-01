@@ -16,6 +16,8 @@ pub struct RecallParams {
     pub from: Option<String>,
     /// Filter memories created before this date (YYYY-MM-DD or RFC3339).
     pub to: Option<String>,
+    /// Override query expansion: true=force, false=disable, null=use config default.
+    pub expand: Option<bool>,
 }
 
 /// Parameters for rein_store tool.

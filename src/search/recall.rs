@@ -27,10 +27,11 @@ pub fn recall(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
-    recall_temporal(store, config, query, topic, keyword, limit, None, None)
+    recall_temporal(store, config, query, topic, keyword, limit, None, None, None)
 }
 
 /// Full recall pipeline with optional temporal filtering.
+/// `expand_override`: Some(true) forces expansion, Some(false) disables, None uses config.
 pub fn recall_temporal(
     store: &SqliteStore,
     config: &ReinConfig,
@@ -40,6 +41,7 @@ pub fn recall_temporal(
     limit: usize,
     time_from: Option<chrono::DateTime<chrono::Utc>>,
     time_to: Option<chrono::DateTime<chrono::Utc>>,
+    expand_override: Option<bool>,
 ) -> ReinResult<Vec<RecallResult>> {
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
@@ -63,49 +65,141 @@ pub fn recall_temporal(
     // Apply limit multiplier from strategy
     let effective_limit = (limit as f32 * strategy.limit_multiplier) as usize;
 
-    // === Level 1: FTS (Tantivy BM25 → FTS5 fallback) ===
-    let (fts_results, fts_ranked) = if strategy.skip_fts {
-        (vec![], vec![])
+    // === Early-launch: Supermemory search (200-500ms network I/O) ===
+    // Start this immediately — it runs in parallel with everything else until we join it.
+    let sm_enabled = config.sync.supermemory_enabled;
+    let sm_api_key = config.sync.api_key.clone();
+    let sm_endpoint = config.sync.endpoint.clone();
+    let q_sm = query.to_string();
+    let sm_handle = if sm_enabled {
+        sm_api_key.map(|api_key| std::thread::spawn(move || {
+            let client = SupermemoryClient::new(api_key, sm_endpoint);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
+            rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
+                .unwrap_or_default()
+        }))
+    } else {
+        None
+    };
+
+    // === Query expansion: launch in background thread ===
+    let should_expand = match expand_override {
+        Some(true) => true,
+        Some(false) => false,
+        None => {
+            strategy.query_type != crate::search::classify::QueryType::ExactKeyword
+        }
+    };
+    let expand_config = config.clone();
+    let expand_query_str = query.to_string();
+    let expand_handle = if should_expand {
+        Some(std::thread::spawn(move || {
+            crate::search::expand::expand_query(&expand_config, &expand_query_str)
+        }))
+    } else {
+        None
+    };
+
+    // === Phase 1: Search with ORIGINAL query (runs while expansion is in flight) ===
+    let (mut fts_results, mut fts_scores, strong_signal) = if strategy.skip_fts {
+        (vec![], std::collections::HashMap::<String, f32>::new(), false)
     } else {
         let fts_start = std::time::Instant::now();
-        let r = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
-        tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = r.0.len(), "fts search");
-        r
+        let (results, ranked) = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
+        let scores: std::collections::HashMap<String, f32> = ranked.into_iter().collect();
+        let ranked_vec: Vec<(String, f32)> = scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let ss = crate::search::rerank_llm::detect_strong_signal(&ranked_vec);
+        tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = scores.len(), "fts search (original)");
+        if ss { tracing::info!("strong BM25 signal — will skip LLM reranker"); }
+        (results, scores, ss)
     };
 
-    // === Level 2+3: Vector search (cached → API) ===
-    let vec_ranked = if strategy.skip_vec {
-        vec![]
+    let mut vec_scores: std::collections::HashMap<String, f32> = if strategy.skip_vec {
+        std::collections::HashMap::new()
     } else {
         let vec_start = std::time::Instant::now();
-        let r = try_vector_search(store, config, query, topic, effective_limit);
-        tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = r.len(), "vector search");
+        let r: std::collections::HashMap<String, f32> = try_vector_search(store, config, query, topic, effective_limit)
+            .into_iter().collect();
+        tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = r.len(), "vector search (original)");
         r
     };
 
-    // === R1: Knowledge Graph retrieval channel ===
-    let kg_start = std::time::Instant::now();
-    let seed_concepts = store.search_all_concepts(query, 5).unwrap_or_default();
-    let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
-    // BFS expand from seed concept IDs (not names, to avoid cross-memoir collisions)
-    let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
-    let expanded = if !seed_ids.is_empty() {
-        crate::search::kg_search::bfs_expand_memories_by_id(store, &seed_ids, 2, effective_limit)
-    } else {
-        vec![]
-    };
-    // Merge concept_results and expanded (take max score per memory)
     let mut kg_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    for (id, score) in concept_results.into_iter().chain(expanded.into_iter()) {
-        let entry = kg_scores.entry(id).or_default();
-        *entry = entry.max(score);
+    {
+        let kg_start = std::time::Instant::now();
+        let seed_concepts = store.search_all_concepts(query, 5).unwrap_or_default();
+        let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
+        let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
+        let bfs_expanded = if !seed_ids.is_empty() {
+            crate::search::kg_search::bfs_expand_memories_by_id(store, &seed_ids, 2, effective_limit)
+        } else {
+            vec![]
+        };
+        for (id, score) in concept_results.into_iter().chain(bfs_expanded.into_iter()) {
+            let entry = kg_scores.entry(id).or_default();
+            *entry = entry.max(score);
+        }
+        tracing::debug!(elapsed_ms = kg_start.elapsed().as_millis() as u64, hits = kg_scores.len(), "kg search (original)");
     }
+
+    // === Phase 2: Join expansion thread, search with expanded queries, merge ===
+    let expanded_queries = expand_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if !expanded_queries.is_empty() {
+        tracing::debug!(count = expanded_queries.len(), "merging expanded query results");
+        for eq in &expanded_queries {
+            // FTS
+            if !strategy.skip_fts {
+                if let Ok((results, ranked)) = try_tantivy_then_fts5(store, eq, topic, effective_limit * 2) {
+                    for (id, score) in ranked {
+                        let entry = fts_scores.entry(id).or_insert(f32::MIN);
+                        *entry = entry.max(score);
+                    }
+                    for m in results {
+                        if !fts_results.iter().any(|r: &Memory| r.id == m.id) {
+                            fts_results.push(m);
+                        }
+                    }
+                }
+            }
+            // Vec
+            if !strategy.skip_vec {
+                for (id, score) in try_vector_search(store, config, eq, topic, effective_limit) {
+                    let entry = vec_scores.entry(id).or_insert(f32::MIN);
+                    *entry = entry.max(score);
+                }
+            }
+            // KG
+            let seed_concepts = store.search_all_concepts(eq, 5).unwrap_or_default();
+            let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
+            let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
+            let bfs_expanded = if !seed_ids.is_empty() {
+                crate::search::kg_search::bfs_expand_memories_by_id(store, &seed_ids, 2, effective_limit)
+            } else {
+                vec![]
+            };
+            for (id, score) in concept_results.into_iter().chain(bfs_expanded.into_iter()) {
+                let entry = kg_scores.entry(id).or_default();
+                *entry = entry.max(score);
+            }
+        }
+    }
+
+    // Convert to ranked vecs for fusion — MUST sort by descending score
+    // because RRF uses list position (rank), not score value.
+    let mut fts_ranked: Vec<(String, f32)> = fts_scores.into_iter().collect();
+    fts_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut vec_ranked: Vec<(String, f32)> = vec_scores.into_iter().collect();
+    vec_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut kg_ranked: Vec<(String, f32)> = kg_scores.into_iter()
         .filter(|(id, _)| matches_topic(store, id, topic))
         .collect();
     kg_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     kg_ranked.truncate(effective_limit);
-    tracing::debug!(elapsed_ms = kg_start.elapsed().as_millis() as u64, hits = kg_ranked.len(), "kg search");
 
     let use_kg = !kg_ranked.is_empty();
 
@@ -261,6 +355,17 @@ pub fn recall_temporal(
     }
     local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // === M5: Tier filtering — exclude Cold memories unless Exploratory query ===
+    let include_cold = strategy.query_type == crate::search::classify::QueryType::Exploratory;
+    if !include_cold {
+        let before = local_results.len();
+        local_results.retain(|(mem, _)| mem.tier != "cold");
+        let filtered = before - local_results.len();
+        if filtered > 0 {
+            tracing::debug!(filtered, "cold tier memories excluded");
+        }
+    }
+
     // === R2: Multi-feature reranking — overwrite scores so downstream ordering uses rerank ===
     if local_results.len() > 1 {
         let weights = crate::search::rerank::load_weights(store.conn());
@@ -288,6 +393,17 @@ pub fn recall_temporal(
         local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
+    // === R2+: LLM reranker — override linear scores with LLM judgement ===
+    if !strong_signal && config.reranker_provider() != crate::config::Provider::None && local_results.len() > 1 {
+        let llm_scores = crate::search::rerank_llm::rerank_with_llm(config, query, &local_results);
+        for (i, (_, score)) in local_results.iter_mut().enumerate() {
+            if let Some(&llm_s) = llm_scores.get(i) {
+                *score = llm_s;
+            }
+        }
+        local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     // === Optional keyword filter ===
     if let Some(kw) = keyword {
         let kw_lower = kw.to_lowercase();
@@ -298,36 +414,13 @@ pub fn recall_temporal(
     }
 
     // === Cross-validation (if enabled) ===
-    // Run Supermemory + AutoMemory in parallel to reduce total latency.
-    // Supermemory is 200-500ms network; AutoMemory is local file scan.
+    // Supermemory search was launched at pipeline start (sm_handle); join it here.
+    // AutoMemory is a fast local file scan.
 
-    let sm_enabled = config.sync.supermemory_enabled;
-    let sm_api_key = config.sync.api_key.clone();
-    let sm_endpoint = config.sync.endpoint.clone();
     let am_enabled = config.sync.auto_memory_enabled;
     let am_glob = config.sync.auto_memory_glob.clone();
-    let q_sm = query.to_string();
     let q_am = query.to_string();
 
-    let sm_start = std::time::Instant::now();
-
-    // Spawn Supermemory search in a thread (it's async + network I/O)
-    let sm_handle = if sm_enabled {
-        sm_api_key.map(|api_key| std::thread::spawn(move || {
-                let client = SupermemoryClient::new(api_key, sm_endpoint);
-                // Build a small runtime for this thread since we can't share the main one
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok();
-                rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
-                    .unwrap_or_default()
-            }))
-    } else {
-        None
-    };
-
-    // AutoMemory runs on current thread (fast local scan)
     let auto_memory_results = if am_enabled {
         let scanner = AutoMemoryScanner::new(am_glob);
         scanner.scan(&q_am)
@@ -335,11 +428,11 @@ pub fn recall_temporal(
         vec![]
     };
 
-    // Join Supermemory thread
+    // Join early-launched Supermemory thread (has been running since pipeline start)
     let supermemory_results = sm_handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
-    tracing::debug!(elapsed_ms = sm_start.elapsed().as_millis() as u64, hits = supermemory_results.len(), "supermemory search");
+    tracing::debug!(elapsed_ms = total_start.elapsed().as_millis() as u64, hits = supermemory_results.len(), "supermemory search (joined)");
 
     let validated = validate::cross_validate(&local_results, &supermemory_results, &auto_memory_results);
 

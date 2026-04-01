@@ -94,6 +94,7 @@ impl ReinServer {
                 limit,
                 time_from,
                 time_to,
+                params.expand,
             ).map_err(|e| ReinError::Config(format!("{e}")))
         });
 
