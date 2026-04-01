@@ -21,6 +21,8 @@ rrf_fts_weight = 0.3
 rrf_vec_weight = 0.7
 dedup_similarity = 0.70
 dedup_time_window_days = 7
+llm_reranker = "none"         # "google", "omlx", or "none" — LLM-based reranking of top results
+llm_reranker_top_n = 15       # Number of top candidates to rerank with LLM
 
 [chunking]
 max_tokens = 512
@@ -91,6 +93,20 @@ max_input_chars = 16000  # ~4K-8K tokens, suitable for 7B-13B local models. Incr
 # Works with any OpenAI-compatible server:
 # Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
 # vLLM, LocalAI, text-generation-webui, etc.
+
+[query_expansion]
+provider = "google"           # "google", "omlx", or "none"
+max_expansions = 3            # Number of query variants to generate
+
+[query_expansion.google]
+model = "gemini-2.0-flash-lite"
+# api_key auto-reads from GEMINI_API_KEY env
+# endpoint defaults to "https://generativelanguage.googleapis.com"
+
+[query_expansion.omlx]
+endpoint = "http://localhost:8000/v1"
+model = "default"
+# Works with omlx serve, Ollama, LM Studio, etc.
 
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure
