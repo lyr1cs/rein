@@ -6,7 +6,7 @@
 
 ```bash
 cargo build
-cargo test            # 189+ tests, all must pass
+cargo test            # 242+ tests, all must pass
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
 
@@ -16,7 +16,9 @@ rein is a multi-source cross-validated memory MCP server (24 tools). Key modules
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit), stop (Stop)
-- `search/recall.rs` — 3-level waterfall (Tantivy BM25 → HNSW → Gemini API) + RRF/CC fusion + Ebbinghaus decay
+- `search/recall.rs` — 3-level waterfall (Tantivy BM25 → HNSW → Gemini API) + RRF/CC fusion + Ebbinghaus decay + parallel pipeline
+- `search/expand.rs` — Query expansion (Gemini Flash Lite / OMLX dual backend)
+- `search/rerank_llm.rs` — LLM reranker (Gemini / OMLX) + strong signal bypass
 - `search/classify.rs` — Autonomous retrieval routing (Temporal/ExactKeyword/Semantic/Exploratory)
 - `store/sqlite.rs` — Per-request connection model, Tantivy singleton cache
 - `store/knowledge.rs` — Knowledge units, evolution, linking, organizing
@@ -48,11 +50,16 @@ Query classifier routes to optimal search strategy (6 types):
 
 MCP response includes `[route: type]` prefix for transparency.
 
-## Search Pipeline (v0.8.0)
+## Search Pipeline (v0.8.0 → v0.9.0)
 
 3-channel retrieval: FTS (Tantivy BM25) + Vector (HNSW) + KG (concept FTS + BFS land-and-expand).
+**Query expansion** (v0.9.0): LLM rewrites query into 2-3 variants (Gemini Flash Lite or OMLX), multi-query search with score merging.
 Post-fusion multi-feature reranking (8 features, learned weights from M1/M2).
+**LLM reranker** (v0.9.0): Optional LLM-based rescoring of top N candidates, with strong-signal bypass.
+**M5 tier filtering** (v0.9.0): Cold-tier memories excluded from non-Exploratory queries.
+**Parallel pipeline** (v0.9.0): Supermemory + expansion launched concurrently with original query search.
 Extraction postprocess: algorithmic date/preference/knowledge-update detection + LLM prompt rules.
+`hook_prompt` uses local-only recall (no external API calls for privacy).
 
 ## Adaptive Engine (v0.5.0)
 

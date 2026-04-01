@@ -2,13 +2,13 @@
 
 ## Overview
 
-rein v0.8.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 24 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with multi-feature reranking.
+rein v0.9.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 24 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline.
 
 ## Build & Test
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (227+)
+cargo test            # All tests must pass (242+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 docker build -t rein . # Docker image (~165MB)
