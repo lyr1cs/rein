@@ -100,7 +100,7 @@ provider = "google"           # "google", "omlx", or "none"
 max_expansions = 3            # Number of query variants to generate
 
 [query_expansion.google]
-model = "gemini-2.0-flash-lite"
+model = "gemini-3.1-flash-lite-preview"
 # api_key auto-reads from GEMINI_API_KEY env
 # endpoint defaults to "https://generativelanguage.googleapis.com"
 
