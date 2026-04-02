@@ -199,6 +199,9 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // Step 4: M2 — Counterfactual alpha optimization (consume events, learn alphas)
     run_alpha_learning(store, &mut state, config);
 
+    // Step 4a: Reranker weight learning from agent feedback
+    run_reranker_weight_learning(store);
+
     // Step 4b: M6 — Consume threshold exploration data + co-recall signal → update dedup thresholds
     run_m6_threshold_learning(store, &mut state);
 
@@ -707,6 +710,116 @@ fn run_alpha_learning(
 
             tracing::info!("M2: learned {qt} alpha = {shrunk:.3} ({} events)", learned.sample_count);
         }
+    }
+}
+
+// ===========================================================================
+// Reranker weight learning from agent feedback
+// ===========================================================================
+
+fn run_reranker_weight_learning(store: &SqliteStore) {
+    let conn = store.conn();
+
+    // Consume feedback events (RecallAccess with source=agent_feedback)
+    let events = match crate::store::adaptive::consume_events(
+        conn, "reranker_weights", &["recall_access"], 200,
+    ) {
+        Ok(evts) => evts,
+        Err(e) => {
+            tracing::warn!("reranker weight learning: failed to consume events: {e}");
+            return;
+        }
+    };
+
+    // Filter to agent_feedback source only
+    let feedback_events: Vec<_> = events.iter()
+        .filter(|e| {
+            e.payload.as_deref()
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .and_then(|v| v.get("source").and_then(|s| s.as_str()).map(|s| s == "agent_feedback"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if feedback_events.len() < 10 {
+        tracing::debug!(events = feedback_events.len(), "reranker weight learning: not enough feedback events (<10)");
+        return;
+    }
+
+    // Collect confirmed-used memory IDs
+    let used_ids: std::collections::HashSet<String> = feedback_events.iter()
+        .filter_map(|e| e.memory_id.clone())
+        .collect();
+
+    if used_ids.is_empty() {
+        return;
+    }
+
+    // Find recent recall_complete events to get candidate features
+    let recall_events = match crate::store::adaptive::consume_events(
+        conn, "reranker_weights_recall", &["recall_complete"], 100,
+    ) {
+        Ok(evts) => evts,
+        Err(_) => return,
+    };
+
+    // Build training pairs: for each recall, which candidates were used (positive) vs not (negative)
+    let mut weights = crate::search::rerank::load_weights(conn);
+    let lr: f32 = 0.005;
+    let mut updates = 0;
+
+    for event in &recall_events {
+        let payload = match event.payload.as_deref()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let candidates = match payload.get("candidates").and_then(|c| c.as_array()) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        for candidate in candidates {
+            let id = match candidate.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+            let bm25 = candidate.get("bm25_norm").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let vec = candidate.get("vec_norm").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let kg = candidate.get("kg_norm").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+            // Target: 1.0 if used by agent, 0.0 if not
+            let target = if used_ids.contains(id) { 1.0_f32 } else { 0.0 };
+            let predicted = weights.w_fts * bm25 + weights.w_vec * vec + weights.w_kg * kg;
+            let error = target - predicted;
+
+            // Gradient update (only for retrieval features — we have bm25/vec/kg from events)
+            weights.w_fts += lr * error * bm25;
+            weights.w_vec += lr * error * vec;
+            weights.w_kg += lr * error * kg;
+            updates += 1;
+        }
+    }
+
+    if updates > 0 {
+        // Normalize weights to sum to 1.0
+        let sum = weights.w_fts + weights.w_vec + weights.w_kg + weights.w_recency
+            + weights.w_access + weights.w_strength + weights.w_importance + weights.w_keyword;
+        if sum > 0.0 {
+            weights.w_fts /= sum;
+            weights.w_vec /= sum;
+            weights.w_kg /= sum;
+            weights.w_recency /= sum;
+            weights.w_access /= sum;
+            weights.w_strength /= sum;
+            weights.w_importance /= sum;
+            weights.w_keyword /= sum;
+        }
+
+        crate::search::rerank::save_weights(conn, &weights);
+        tracing::info!(updates, "reranker weights updated from agent feedback");
     }
 }
 
