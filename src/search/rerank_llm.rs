@@ -88,11 +88,12 @@ struct OmlxReranker {
     client: &'static Client,
     endpoint: String,
     model: String,
+    disable_thinking: bool,
 }
 
 impl OmlxReranker {
-    fn new(endpoint: String, model: String) -> Self {
-        Self { client: crate::search::cache::http_client_20s(), endpoint, model }
+    fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
+        Self { client: crate::search::cache::http_client_20s(), endpoint, model, disable_thinking }
     }
 
     async fn rerank(&self, query: &str, candidates: &[(Memory, f32)]) -> ReinResult<Vec<f32>> {
@@ -102,11 +103,17 @@ impl OmlxReranker {
             query, memories_text
         );
         let url = format!("{}/chat/completions", self.endpoint);
+        let disable_thinking = self.disable_thinking;
         let make_body = |use_json_mode: bool| {
+            let system_msg = if disable_thinking {
+                format!("/no_think\n{}", RERANK_SYSTEM_PROMPT)
+            } else {
+                RERANK_SYSTEM_PROMPT.to_string()
+            };
             let mut body = json!({
                 "model": &self.model,
                 "messages": [
-                    {"role": "system", "content": RERANK_SYSTEM_PROMPT},
+                    {"role": "system", "content": &system_msg},
                     {"role": "user", "content": &user_msg}
                 ],
                 "temperature": 0.0
@@ -175,6 +182,7 @@ fn create_reranker(config: &ReinConfig) -> Option<RerankerKind> {
         Provider::Omlx => Some(RerankerKind::Omlx(OmlxReranker::new(
             config.query_expansion.omlx.endpoint.clone(),
             config.query_expansion.omlx.model.clone(),
+            config.query_expansion.omlx.disable_thinking,
         ))),
         Provider::None => None,
     }
@@ -305,13 +313,17 @@ fn parse_rerank_response(content: &str, expected_len: usize) -> ReinResult<Vec<f
 }
 
 fn strip_code_fences(s: &str) -> String {
-    let trimmed = s.trim();
-    if let Some(rest) = trimmed.strip_prefix("```json") {
+    let s = if let Some(idx) = s.find("</think>") {
+        s[idx + 8..].trim()
+    } else {
+        s.trim()
+    };
+    if let Some(rest) = s.strip_prefix("```json") {
         rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
-    } else if let Some(rest) = trimmed.strip_prefix("```") {
+    } else if let Some(rest) = s.strip_prefix("```") {
         rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
     } else {
-        trimmed.to_string()
+        s.to_string()
     }
 }
 
