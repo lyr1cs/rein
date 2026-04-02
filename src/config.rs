@@ -567,8 +567,9 @@ impl ReinConfig {
             config.server.sse_bind = bind;
         }
         if let Ok(port) = std::env::var("REIN_SSE_PORT") {
-            if let Ok(p) = port.parse::<u16>() {
-                config.server.sse_port = p;
+            match port.parse::<u16>() {
+                Ok(p) => config.server.sse_port = p,
+                Err(_) => eprintln!("rein: WARNING — REIN_SSE_PORT='{port}' is not a valid port number, using default {}", config.server.sse_port),
             }
         }
 

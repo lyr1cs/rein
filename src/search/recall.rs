@@ -93,11 +93,17 @@ pub fn recall_temporal(
             strategy.query_type != crate::search::classify::QueryType::ExactKeyword
         }
     };
+    // Adaptive expansion count: fewer expansions for query types that benefit less
+    let adaptive_max = match strategy.query_type {
+        crate::search::classify::QueryType::Temporal => Some(1),
+        crate::search::classify::QueryType::Episodic => Some(2),
+        _ => None, // Preference/Semantic/Exploratory: use config default (3)
+    };
     let expand_config = config.clone();
     let expand_query_str = query.to_string();
     let expand_handle = if should_expand {
         Some(std::thread::spawn(move || {
-            crate::search::expand::expand_query(&expand_config, &expand_query_str)
+            crate::search::expand::expand_query(&expand_config, &expand_query_str, adaptive_max)
         }))
     } else {
         None
@@ -146,13 +152,30 @@ pub fn recall_temporal(
     }
 
     // === Phase 2: Join expansion thread, search with expanded queries, merge ===
-    let expanded_queries = expand_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    if !expanded_queries.is_empty() {
-        tracing::debug!(count = expanded_queries.len(), "merging expanded query results");
-        for eq in &expanded_queries {
-            // FTS
+    // Skip entirely if strong signal detected (BM25 top1 is dominant, expansion won't help)
+    let expanded_queries = if strong_signal {
+        tracing::info!("strong signal — skipping expanded query searches");
+        drop(expand_handle); // detach thread — LLM call completes in background, result discarded
+        vec![]
+    } else {
+        expand_handle.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
+    // Filter out expanded queries too similar to original (Jaccard word overlap > 0.8)
+    let deduped_queries: Vec<&String> = expanded_queries.iter()
+        .filter(|eq| word_jaccard(query, eq) <= 0.8)
+        .collect();
+    if deduped_queries.len() < expanded_queries.len() {
+        tracing::debug!(
+            before = expanded_queries.len(),
+            after = deduped_queries.len(),
+            "filtered similar expanded queries"
+        );
+    }
+    if !deduped_queries.is_empty() {
+        tracing::debug!(count = deduped_queries.len(), "merging expanded query results");
+
+        // FTS: per-query (Tantivy is local, already fast)
+        for eq in &deduped_queries {
             if !strategy.skip_fts {
                 if let Ok((results, ranked)) = try_tantivy_then_fts5(store, eq, topic, effective_limit * 2) {
                     for (id, score) in ranked {
@@ -166,14 +189,20 @@ pub fn recall_temporal(
                     }
                 }
             }
-            // Vec
-            if !strategy.skip_vec {
-                for (id, score) in try_vector_search(store, config, eq, topic, effective_limit) {
-                    let entry = vec_scores.entry(id).or_insert(f32::MIN);
-                    *entry = entry.max(score);
-                }
+        }
+
+        // Vec: BATCH embed all expanded queries in one API call
+        if !strategy.skip_vec {
+            let eq_strs: Vec<&str> = deduped_queries.iter().map(|s| s.as_str()).collect();
+            let batch_results = try_vector_search_batch(store, config, &eq_strs, topic, effective_limit);
+            for (id, score) in batch_results {
+                let entry = vec_scores.entry(id).or_insert(f32::MIN);
+                *entry = entry.max(score);
             }
-            // KG
+        }
+
+        // KG: per-query (local concept FTS + BFS)
+        for eq in &deduped_queries {
             let seed_concepts = store.search_all_concepts(eq, 5).unwrap_or_default();
             let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
             let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
@@ -394,7 +423,18 @@ pub fn recall_temporal(
     }
 
     // === R2+: LLM reranker — override linear scores with LLM judgement ===
-    if !strong_signal && config.reranker_provider() != crate::config::Provider::None && local_results.len() > 1 {
+    // Skip if: strong BM25 signal, or linear rerank already shows clear separation (top1 >> top2)
+    let linear_clear = if local_results.len() >= 2 {
+        let top1 = local_results[0].1;
+        let top2 = local_results[1].1;
+        top2 > 0.0 && top1 / top2 >= 1.5
+    } else {
+        false
+    };
+    if linear_clear {
+        tracing::debug!("linear rerank scores well-separated, skipping LLM reranker");
+    }
+    if !strong_signal && !linear_clear && config.reranker_provider() != crate::config::Provider::None && local_results.len() > 1 {
         let llm_scores = crate::search::rerank_llm::rerank_with_llm(config, query, &local_results);
         for (i, (_, score)) in local_results.iter_mut().enumerate() {
             if let Some(&llm_s) = llm_scores.get(i) {
@@ -551,6 +591,64 @@ fn try_vector_search(
     }
 }
 
+/// Batch vector search for multiple queries. Checks cache first, then batch-embeds uncached
+/// queries in a single API call. Returns merged (id, score) with max score per ID.
+fn try_vector_search_batch(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    queries: &[&str],
+    topic: Option<&str>,
+    limit: usize,
+) -> std::collections::HashMap<String, f32> {
+    let model = config.embedding_model();
+    let mut merged: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut uncached: Vec<(usize, &str)> = Vec::new();
+
+    // Check cache for each query
+    for (i, q) in queries.iter().enumerate() {
+        if let Ok(Some(cached)) = EmbedCache::get(store.conn(), q, &model) {
+            for (id, score) in vec_search_direct(store, &cached, topic, limit) {
+                let entry = merged.entry(id).or_insert(f32::MIN);
+                *entry = entry.max(score);
+            }
+        } else {
+            uncached.push((i, q));
+        }
+    }
+
+    if uncached.is_empty() {
+        return merged;
+    }
+
+    // Batch embed uncached queries
+    let embedder = match crate::embed::create_embedder(config) {
+        Some(e) => e,
+        None => return merged,
+    };
+
+    let texts: Vec<&str> = uncached.iter().map(|(_, q)| *q).collect();
+    let embeddings = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(embedder.embed_batch(&texts))
+    });
+
+    match embeddings {
+        Ok(embs) => {
+            for (emb, (_, q)) in embs.iter().zip(uncached.iter()) {
+                let _ = EmbedCache::put(store.conn(), q, &model, emb);
+                for (id, score) in vec_search_direct(store, emb, topic, limit) {
+                    let entry = merged.entry(id).or_insert(f32::MIN);
+                    *entry = entry.max(score);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("batch embedding failed: {e}");
+        }
+    }
+
+    merged
+}
+
 /// Check if a memory matches the requested topic filter.
 fn matches_topic(store: &SqliteStore, id: &str, topic: Option<&str>) -> bool {
     match topic {
@@ -641,4 +739,22 @@ fn try_tantivy_then_fts5(
         .map(|(i, m)| (m.id.clone(), -(i as f32)))
         .collect();
     Ok((fts_results, fts_ranked))
+}
+
+/// Jaccard similarity for query dedup.
+/// Uses word-level for space-separated text, falls back to character bigrams for CJK.
+fn word_jaccard(a: &str, b: &str) -> f32 {
+    let wa: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let wb: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    // If both queries have ≤1 whitespace token (likely CJK), use character bigrams
+    if wa.len() <= 1 && wb.len() <= 1 {
+        let ca: std::collections::HashSet<(char, char)> = a.chars().zip(a.chars().skip(1)).collect();
+        let cb: std::collections::HashSet<(char, char)> = b.chars().zip(b.chars().skip(1)).collect();
+        let inter = ca.intersection(&cb).count() as f32;
+        let union = ca.union(&cb).count() as f32;
+        return if union == 0.0 { 1.0 } else { inter / union };
+    }
+    let inter = wa.intersection(&wb).count() as f32;
+    let union = wa.union(&wb).count() as f32;
+    if union == 0.0 { 1.0 } else { inter / union }
 }

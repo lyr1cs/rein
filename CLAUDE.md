@@ -73,4 +73,4 @@ Self-learning engine that replaces fixed parameters with data-driven adaptation:
 
 ## Environment Variables
 
-GEMINI_API_KEY, SUPERMEMORY_CC_API_KEY, REIN_HTTP_TOKEN, REIN_DB, REIN_LOG
+GEMINI_API_KEY, SUPERMEMORY_CC_API_KEY, REIN_HTTP_TOKEN, REIN_DB, REIN_LOG, REIN_CONFIG, REIN_SSE_BIND, REIN_SSE_PORT
