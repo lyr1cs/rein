@@ -2,7 +2,6 @@ use crate::config::{Provider, ReinConfig};
 use crate::types::error::{ReinError, ReinResult};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::time::Duration;
 
 const EXPAND_SYSTEM_PROMPT: &str = r#"Given a memory search query, generate alternative phrasings that would help find relevant stored memories.
 
@@ -25,7 +24,7 @@ Rules:
 // ---------------------------------------------------------------------------
 
 struct GeminiExpander {
-    client: Client,
+    client: &'static Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -33,11 +32,7 @@ struct GeminiExpander {
 
 impl GeminiExpander {
     fn new(api_key: String, endpoint: String, model: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        Self { client, api_key, endpoint, model }
+        Self { client: crate::search::cache::http_client_10s(), api_key, endpoint, model }
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
@@ -89,18 +84,14 @@ impl GeminiExpander {
 // ---------------------------------------------------------------------------
 
 struct OmlxExpander {
-    client: Client,
+    client: &'static Client,
     endpoint: String,
     model: String,
 }
 
 impl OmlxExpander {
     fn new(endpoint: String, model: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        Self { client, endpoint, model }
+        Self { client: crate::search::cache::http_client_15s(), endpoint, model }
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
@@ -193,17 +184,27 @@ fn create_expander(config: &ReinConfig) -> Option<ExpanderKind> {
 
 /// Expand a query into alternative phrasings using LLM.
 /// Returns expanded queries (NOT including original). Falls back to empty vec on failure.
-pub fn expand_query(config: &ReinConfig, query: &str) -> Vec<String> {
+/// `max_override` allows callers to request fewer expansions than config default.
+pub fn expand_query(config: &ReinConfig, query: &str, max_override: Option<usize>) -> Vec<String> {
     let expander = match create_expander(config) {
         Some(e) => e,
         None => return vec![],
     };
 
-    let max = config.query_expansion.max_expansions;
+    let max = max_override.unwrap_or(config.query_expansion.max_expansions);
+    let provider = &config.query_expansion.provider;
+
+    // Check in-memory cache
+    let cache_k = crate::search::cache::cache_key(&[query, provider, &max.to_string()]);
+    if let Ok(cache) = crate::search::cache::expand_cache().lock() {
+        if let Some(cached) = cache.get(&cache_k) {
+            tracing::debug!(query_len = query.len(), "expansion cache hit");
+            return cached;
+        }
+    }
+
     let expand_start = std::time::Instant::now();
 
-    // Use block_in_place if a tokio runtime exists, otherwise create a new one.
-    // This supports both MCP context (has runtime) and std::thread::spawn (no runtime).
     let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| handle.block_on(expander.expand(query, max)))
     } else {
@@ -226,6 +227,10 @@ pub fn expand_query(config: &ReinConfig, query: &str) -> Vec<String> {
             );
             for (i, q) in expansions.iter().enumerate() {
                 tracing::debug!(idx = i, expanded = %q, "expansion variant");
+            }
+            // Store in cache
+            if let Ok(mut cache) = crate::search::cache::expand_cache().lock() {
+                cache.put(cache_k, expansions.clone());
             }
             expansions
         }
