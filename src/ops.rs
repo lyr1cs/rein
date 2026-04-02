@@ -804,9 +804,10 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     }
 
     if updates > 0 {
-        // Normalize weights to sum to 1.0
+        // Normalize all 12 weights to sum to 1.0
         let sum = weights.w_fts + weights.w_vec + weights.w_kg + weights.w_recency
-            + weights.w_access + weights.w_strength + weights.w_importance + weights.w_keyword;
+            + weights.w_access + weights.w_strength + weights.w_importance + weights.w_keyword
+            + weights.w_topic_match + weights.w_brevity + weights.w_channel_coverage + weights.w_usage_recency;
         if sum > 0.0 {
             weights.w_fts /= sum;
             weights.w_vec /= sum;
@@ -816,6 +817,10 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             weights.w_strength /= sum;
             weights.w_importance /= sum;
             weights.w_keyword /= sum;
+            weights.w_topic_match /= sum;
+            weights.w_brevity /= sum;
+            weights.w_channel_coverage /= sum;
+            weights.w_usage_recency /= sum;
         }
 
         crate::search::rerank::save_weights(conn, &weights);

@@ -408,15 +408,30 @@ pub fn recall_temporal(
             }
         };
         for (mem, score) in local_results.iter_mut() {
+            let fts = fts_norm_log.get(&mem.id).copied().unwrap_or(0.0);
+            let vec = vec_norm_log.get(&mem.id).copied().unwrap_or(0.0);
+            let kg = kg_norm_log.get(&mem.id).copied().unwrap_or(0.0);
+            // Channel coverage: how many channels found this memory (1-3)
+            let channels = (if fts > 0.0 { 1 } else { 0 })
+                + (if vec > 0.0 { 1 } else { 0 })
+                + (if kg > 0.0 { 1 } else { 0 });
+            let channel_coverage = channels.max(1) as f32 / 3.0;
+            // Topic match: does memory topic appear as a word in query?
+            let query_lower = query.to_lowercase();
+            let topic_match = if query_lower.contains(&mem.topic.to_lowercase()) { 1.0 } else { 0.0 };
             let features = crate::search::rerank::RerankFeatures {
-                fts_score: fts_norm_log.get(&mem.id).copied().unwrap_or(0.0),
-                vec_score: vec_norm_log.get(&mem.id).copied().unwrap_or(0.0),
-                kg_score: kg_norm_log.get(&mem.id).copied().unwrap_or(0.0),
+                fts_score: fts,
+                vec_score: vec,
+                kg_score: kg,
                 recency_days: (chrono::Utc::now() - mem.created_at).num_hours() as f32 / 24.0,
                 access_count: mem.access_count,
                 strength: mem.strength as f32,
                 importance_weight: importance_weight(&mem.importance),
                 keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &mem.keywords, &mem.content),
+                topic_match,
+                brevity: 1.0 / (1.0 + mem.content.len() as f32 / 500.0),
+                channel_coverage,
+                usage_recency: (chrono::Utc::now() - mem.last_accessed).num_hours() as f32 / 24.0,
             };
             *score = crate::search::rerank::rerank_score(&features, &weights);
         }
