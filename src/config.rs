@@ -260,6 +260,9 @@ pub struct OmlxExtractConfig {
     /// Max input characters for local models (default 16000, suitable for 7B-13B models).
     #[serde(default = "default_omlx_max_input_chars")]
     pub max_input_chars: usize,
+    /// Prepend /no_think to system prompts (for Qwen3 thinking mode). Default: true.
+    #[serde(default = "default_true")]
+    pub disable_thinking: bool,
 }
 
 fn default_omlx_max_input_chars() -> usize {
@@ -311,11 +314,16 @@ pub struct OmlxExpandConfig {
     pub endpoint: String,
     #[serde(default = "default_omlx_model")]
     pub model: String,
+    /// Prepend /no_think to system prompts (for Qwen3 thinking mode). Default: true.
+    #[serde(default = "default_true")]
+    pub disable_thinking: bool,
 }
 
 fn default_omlx_expand_endpoint() -> String {
     "http://localhost:8000/v1".to_string()
 }
+
+fn default_true() -> bool { true }
 
 // ---------------------------------------------------------------------------
 // Default implementations
@@ -481,6 +489,7 @@ impl Default for OmlxExtractConfig {
             endpoint: "http://localhost:11434/v1".to_string(),
             model: "default".to_string(),
             max_input_chars: default_omlx_max_input_chars(),
+            disable_thinking: true,
         }
     }
 }
@@ -511,6 +520,7 @@ impl Default for OmlxExpandConfig {
         Self {
             endpoint: default_omlx_expand_endpoint(),
             model: "default".to_string(),
+            disable_thinking: true,
         }
     }
 }

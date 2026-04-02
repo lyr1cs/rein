@@ -216,15 +216,16 @@ pub struct OmlxExtractor {
     pub(crate) client: Client,
     pub(crate) endpoint: String,
     pub(crate) model: String,
+    pub(crate) disable_thinking: bool,
 }
 
 impl OmlxExtractor {
-    pub fn new(endpoint: String, model: String) -> Self {
+    pub fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
-        Self { client, endpoint, model }
+        Self { client, endpoint, model, disable_thinking }
     }
 
     pub async fn extract(&self, text: &str) -> ReinResult<Vec<ExtractedMemory>> {
@@ -239,11 +240,16 @@ impl OmlxExtractor {
 
     async fn call_and_extract_content(&self, text: &str, system_prompt: &str) -> ReinResult<String> {
         let url = format!("{}/chat/completions", self.endpoint);
+        let prefixed_prompt = if self.disable_thinking {
+            format!("/no_think\n{}", system_prompt)
+        } else {
+            system_prompt.to_string()
+        };
         let make_body = |use_json_mode: bool| {
             let mut body = json!({
                 "model": &self.model,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": &prefixed_prompt},
                     {"role": "user", "content": text}
                 ],
                 "temperature": 0.1
@@ -320,6 +326,7 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
         Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
             config.extract.omlx.endpoint.clone(),
             config.extract.omlx.model.clone(),
+            config.extract.omlx.disable_thinking,
         ))),
         Provider::None => None,
     }
@@ -600,7 +607,12 @@ fn parse_llm_json(text: &str) -> ReinResult<Vec<ExtractedMemory>> {
 
 /// Strip markdown code fences (```json ... ```) from LLM output.
 fn strip_code_fences(text: &str) -> String {
-    let trimmed = text.trim();
+    // Strip Qwen3 <think>...</think> reasoning blocks first
+    let trimmed = if let Some(idx) = text.find("</think>") {
+        text[idx + 8..].trim()
+    } else {
+        text.trim()
+    };
     if trimmed.starts_with("```") {
         let after_first = if let Some(nl) = trimmed.find('\n') {
             &trimmed[nl + 1..]

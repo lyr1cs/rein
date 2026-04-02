@@ -90,6 +90,7 @@ max_input_chars = 0   # 0 = no truncation (1M token model). Set a limit if using
 endpoint = "http://localhost:11434/v1"
 model = "default"
 max_input_chars = 16000  # ~4K-8K tokens, suitable for 7B-13B local models. Increase for larger models.
+disable_thinking = true  # Prepend /no_think to system prompts (for Qwen3). Set false for other models.
 # Works with any OpenAI-compatible server:
 # Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
 # vLLM, LocalAI, text-generation-webui, etc.
@@ -106,6 +107,7 @@ model = "gemini-2.0-flash-lite"
 [query_expansion.omlx]
 endpoint = "http://localhost:8000/v1"
 model = "default"
+disable_thinking = true  # Prepend /no_think (for Qwen3). Set false for other models.
 # Works with omlx serve, Ollama, LM Studio, etc.
 
 [adaptive]
