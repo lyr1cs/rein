@@ -6,3 +6,4 @@ reviews/
 reviews
 bench/results*.jsonl
 bench/results*.jsonl.*
+__pycache__/

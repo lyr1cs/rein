@@ -3,7 +3,6 @@ use crate::types::error::{ReinError, ReinResult};
 use crate::types::Memory;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::time::Duration;
 
 const RERANK_SYSTEM_PROMPT: &str = r#"You are a memory relevance scoring system. Given a search query and a list of stored memories, rate each memory's relevance to the query.
 
@@ -25,7 +24,7 @@ Scoring guidelines:
 // ---------------------------------------------------------------------------
 
 struct GeminiReranker {
-    client: Client,
+    client: &'static Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -33,11 +32,7 @@ struct GeminiReranker {
 
 impl GeminiReranker {
     fn new(api_key: String, endpoint: String, model: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        Self { client, api_key, endpoint, model }
+        Self { client: crate::search::cache::http_client_15s(), api_key, endpoint, model }
     }
 
     async fn rerank(&self, query: &str, candidates: &[(Memory, f32)]) -> ReinResult<Vec<f32>> {
@@ -90,18 +85,14 @@ impl GeminiReranker {
 // ---------------------------------------------------------------------------
 
 struct OmlxReranker {
-    client: Client,
+    client: &'static Client,
     endpoint: String,
     model: String,
 }
 
 impl OmlxReranker {
     fn new(endpoint: String, model: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .unwrap_or_default();
-        Self { client, endpoint, model }
+        Self { client: crate::search::cache::http_client_20s(), endpoint, model }
     }
 
     async fn rerank(&self, query: &str, candidates: &[(Memory, f32)]) -> ReinResult<Vec<f32>> {
@@ -206,6 +197,24 @@ pub fn rerank_with_llm(
     };
 
     let top_n = config.search.llm_reranker_top_n.min(candidates.len());
+
+    // Check in-memory cache (key = query + candidate IDs in input order — order matters
+    // because the cached score vector is positionally aligned with the candidate list)
+    let id_parts: Vec<&str> = candidates[..top_n].iter().map(|(m, _)| m.id.as_str()).collect();
+    let mut key_parts: Vec<&str> = vec![query];
+    key_parts.extend(id_parts.iter());
+    let cache_k = crate::search::cache::cache_key(&key_parts);
+    if let Ok(cache) = crate::search::cache::rerank_cache().lock() {
+        if let Some(cached) = cache.get(&cache_k) {
+            if cached.len() == top_n {
+                tracing::debug!("reranker cache hit");
+                let mut scores = cached;
+                scores.extend(candidates[top_n..].iter().map(|(_, s)| *s));
+                return scores;
+            }
+        }
+    }
+
     let rerank_start = std::time::Instant::now();
 
     let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -228,6 +237,10 @@ pub fn rerank_with_llm(
             // Scale LLM scores to [0, 2.0] to match linear reranker output range
             for s in &mut scores {
                 *s *= 2.0;
+            }
+            // Store in cache (before appending tail scores)
+            if let Ok(mut cache) = crate::search::cache::rerank_cache().lock() {
+                cache.put(cache_k, scores.clone());
             }
             // Append original scores for candidates beyond top_n
             scores.extend(candidates[top_n..].iter().map(|(_, s)| *s));
