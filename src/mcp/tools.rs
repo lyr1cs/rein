@@ -49,6 +49,8 @@ pub struct UpdateParams {
 pub struct FeedbackParams {
     /// Memory IDs that were actually used by the agent.
     pub memory_ids: Vec<String>,
+    /// The request_id from the recall result (for attribution).
+    pub request_id: Option<String>,
     /// Optional: the query that produced these results.
     pub query: Option<String>,
     /// Optional: whether the recall was helpful overall (true/false).

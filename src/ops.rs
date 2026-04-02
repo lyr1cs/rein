@@ -741,9 +741,11 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         })
         .collect();
 
-    if feedback_events.len() < 10 {
-        tracing::debug!(events = feedback_events.len(), "reranker weight learning: not enough feedback events (<10)");
+    if feedback_events.is_empty() {
         return;
+    }
+    if feedback_events.len() < 10 {
+        tracing::debug!(events = feedback_events.len(), "reranker weight learning: few feedback events, learning with small batch");
     }
 
     // Collect confirmed-used memory IDs
