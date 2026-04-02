@@ -453,6 +453,10 @@ pub fn recall_temporal(
                 brevity: 1.0 / (1.0 + mem.content.len() as f32 / 500.0),
                 channel_coverage,
                 usage_recency: (chrono::Utc::now() - mem.last_accessed).num_hours() as f32 / 24.0,
+                connectivity: (mem.related_ids.len().min(10) as f32) / 10.0,
+                concept_richness: (mem.concept_ids.len().min(5) as f32) / 5.0,
+                tier_score: match mem.tier.as_str() { "hot" => 1.0, "warm" => 0.5, _ => 0.0 },
+                is_current: if mem.superseded_by.is_none() { 1.0 } else { 0.0 },
             };
             *score = crate::search::rerank::rerank_score(&features, &weights);
         }
