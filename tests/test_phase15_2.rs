@@ -299,6 +299,10 @@ fn test_rerank_changes_ordering() {
         brevity: 0.5,
         channel_coverage: 0.33,
         usage_recency: 30.0,
+        connectivity: 0.0,
+        concept_richness: 0.0,
+        tier_score: 0.0,
+        is_current: 0.0,
     };
 
     // Candidate B: low FTS but very recent, high access, high strength
@@ -315,6 +319,10 @@ fn test_rerank_changes_ordering() {
         brevity: 0.8,
         channel_coverage: 1.0,
         usage_recency: 1.0,
+        connectivity: 0.5,
+        concept_richness: 0.8,
+        tier_score: 1.0,
+        is_current: 1.0,
     };
 
     let score_a = rerank_score(&a, &w);
