@@ -44,6 +44,17 @@ pub struct UpdateParams {
     pub importance: Option<String>,
 }
 
+/// Parameters for rein_feedback tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FeedbackParams {
+    /// Memory IDs that were actually used by the agent.
+    pub memory_ids: Vec<String>,
+    /// Optional: the query that produced these results.
+    pub query: Option<String>,
+    /// Optional: whether the recall was helpful overall (true/false).
+    pub helpful: Option<bool>,
+}
+
 /// Parameters for rein_forget tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ForgetParams {
