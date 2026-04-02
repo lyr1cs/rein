@@ -27,11 +27,26 @@ pub fn recall(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
-    recall_temporal(store, config, query, topic, keyword, limit, None, None, None)
+    recall_temporal(store, config, query, topic, keyword, limit, None, None, None, false)
+}
+
+/// Fast recall: local-only search (FTS + HNSW + KG + linear reranker).
+/// Skips expansion, LLM reranker, and Supermemory. ~50-100ms latency.
+/// Designed for proxy mode and hook_prompt where latency is critical.
+pub fn recall_fast(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    query: &str,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    limit: usize,
+) -> ReinResult<Vec<RecallResult>> {
+    recall_temporal(store, config, query, topic, keyword, limit, None, None, Some(false), true)
 }
 
 /// Full recall pipeline with optional temporal filtering.
 /// `expand_override`: Some(true) forces expansion, Some(false) disables, None uses config.
+/// `fast`: if true, skips expansion, LLM reranker, and Supermemory cross-validation.
 pub fn recall_temporal(
     store: &SqliteStore,
     config: &ReinConfig,
@@ -42,6 +57,7 @@ pub fn recall_temporal(
     time_from: Option<chrono::DateTime<chrono::Utc>>,
     time_to: Option<chrono::DateTime<chrono::Utc>>,
     expand_override: Option<bool>,
+    fast: bool,
 ) -> ReinResult<Vec<RecallResult>> {
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
@@ -66,8 +82,9 @@ pub fn recall_temporal(
     let effective_limit = (limit as f32 * strategy.limit_multiplier) as usize;
 
     // === Early-launch: Supermemory search (200-500ms network I/O) ===
-    // Start this immediately — it runs in parallel with everything else until we join it.
-    let sm_enabled = config.sync.supermemory_enabled;
+    // Skip in fast mode (proxy/hook_prompt) — store-local only.
+    let sm_enabled = !fast && config.sync.supermemory_enabled;
+    let am_enabled = !fast && config.sync.auto_memory_enabled;
     let sm_api_key = config.sync.api_key.clone();
     let sm_endpoint = config.sync.endpoint.clone();
     let q_sm = query.to_string();
@@ -100,11 +117,15 @@ pub fn recall_temporal(
     };
 
     // === Query expansion: launch AFTER strong signal check to avoid unnecessary LLM calls ===
-    let should_expand = match expand_override {
-        Some(true) => true,
-        Some(false) => false,
-        None => {
-            !strong_signal && strategy.query_type != crate::search::classify::QueryType::ExactKeyword
+    let should_expand = if fast {
+        false // Fast mode: no expansion
+    } else {
+        match expand_override {
+            Some(true) => true,
+            Some(false) => false,
+            None => {
+                !strong_signal && strategy.query_type != crate::search::classify::QueryType::ExactKeyword
+            }
         }
     };
     let adaptive_max = match strategy.query_type {
@@ -450,7 +471,7 @@ pub fn recall_temporal(
     if linear_clear {
         tracing::debug!("linear rerank scores well-separated, skipping LLM reranker");
     }
-    if !strong_signal && !linear_clear && config.reranker_provider() != crate::config::Provider::None && local_results.len() > 1 {
+    if !fast && !strong_signal && !linear_clear && config.reranker_provider() != crate::config::Provider::None && local_results.len() > 1 {
         let llm_scores = crate::search::rerank_llm::rerank_with_llm(config, query, &local_results);
         for (i, (_, score)) in local_results.iter_mut().enumerate() {
             if let Some(&llm_s) = llm_scores.get(i) {
@@ -473,7 +494,7 @@ pub fn recall_temporal(
     // Supermemory search was launched at pipeline start (sm_handle); join it here.
     // AutoMemory is a fast local file scan.
 
-    let am_enabled = config.sync.auto_memory_enabled;
+    // am_enabled is set at pipeline start (respects fast mode)
     let am_glob = config.sync.auto_memory_glob.clone();
     let q_am = query.to_string();
 
