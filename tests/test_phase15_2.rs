@@ -295,6 +295,10 @@ fn test_rerank_changes_ordering() {
         strength: 0.4,
         importance_weight: 0.4,
         keyword_overlap: 0.2,
+        topic_match: 0.0,
+        brevity: 0.5,
+        channel_coverage: 0.33,
+        usage_recency: 30.0,
     };
 
     // Candidate B: low FTS but very recent, high access, high strength
@@ -307,6 +311,10 @@ fn test_rerank_changes_ordering() {
         strength: 1.0,
         importance_weight: 1.0,
         keyword_overlap: 0.8,
+        topic_match: 1.0,
+        brevity: 0.8,
+        channel_coverage: 1.0,
+        usage_recency: 1.0,
     };
 
     let score_a = rerank_score(&a, &w);
