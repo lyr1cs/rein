@@ -87,11 +87,12 @@ struct OmlxExpander {
     client: &'static Client,
     endpoint: String,
     model: String,
+    disable_thinking: bool,
 }
 
 impl OmlxExpander {
-    fn new(endpoint: String, model: String) -> Self {
-        Self { client: crate::search::cache::http_client_15s(), endpoint, model }
+    fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
+        Self { client: crate::search::cache::http_client_15s(), endpoint, model, disable_thinking }
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
@@ -100,11 +101,17 @@ impl OmlxExpander {
             max, query
         );
         let url = format!("{}/chat/completions", self.endpoint);
+        let disable_thinking = self.disable_thinking;
         let make_body = |use_json_mode: bool| {
+            let system_msg = if disable_thinking {
+                format!("/no_think\n{}", EXPAND_SYSTEM_PROMPT)
+            } else {
+                EXPAND_SYSTEM_PROMPT.to_string()
+            };
             let mut body = json!({
                 "model": &self.model,
                 "messages": [
-                    {"role": "system", "content": EXPAND_SYSTEM_PROMPT},
+                    {"role": "system", "content": &system_msg},
                     {"role": "user", "content": &user_msg}
                 ],
                 "temperature": 0.3
@@ -173,6 +180,7 @@ fn create_expander(config: &ReinConfig) -> Option<ExpanderKind> {
         Provider::Omlx => Some(ExpanderKind::Omlx(OmlxExpander::new(
             config.query_expansion.omlx.endpoint.clone(),
             config.query_expansion.omlx.model.clone(),
+            config.query_expansion.omlx.disable_thinking,
         ))),
         Provider::None => None,
     }
@@ -273,15 +281,20 @@ fn parse_expansion_response(content: &str, max: usize) -> ReinResult<Vec<String>
     Ok(expansions)
 }
 
-/// Strip markdown code fences from LLM output.
+/// Strip thinking tags and markdown code fences from LLM output.
 fn strip_code_fences(s: &str) -> String {
-    let trimmed = s.trim();
-    if let Some(rest) = trimmed.strip_prefix("```json") {
+    // Strip Qwen3 <think>...</think> reasoning blocks
+    let s = if let Some(idx) = s.find("</think>") {
+        s[idx + 8..].trim()
+    } else {
+        s.trim()
+    };
+    if let Some(rest) = s.strip_prefix("```json") {
         rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
-    } else if let Some(rest) = trimmed.strip_prefix("```") {
+    } else if let Some(rest) = s.strip_prefix("```") {
         rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
     } else {
-        trimmed.to_string()
+        s.to_string()
     }
 }
 

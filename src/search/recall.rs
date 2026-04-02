@@ -85,19 +85,32 @@ pub fn recall_temporal(
         None
     };
 
-    // === Query expansion: launch in background thread ===
+    // === Phase 1a: FTS search with ORIGINAL query (fast, ~1ms) ===
+    let (mut fts_results, mut fts_scores, strong_signal) = if strategy.skip_fts {
+        (vec![], std::collections::HashMap::<String, f32>::new(), false)
+    } else {
+        let fts_start = std::time::Instant::now();
+        let (results, ranked) = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
+        let scores: std::collections::HashMap<String, f32> = ranked.into_iter().collect();
+        let ranked_vec: Vec<(String, f32)> = scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let ss = crate::search::rerank_llm::detect_strong_signal(&ranked_vec);
+        tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = scores.len(), "fts search (original)");
+        if ss { tracing::info!("strong BM25 signal — will skip expansion + LLM reranker"); }
+        (results, scores, ss)
+    };
+
+    // === Query expansion: launch AFTER strong signal check to avoid unnecessary LLM calls ===
     let should_expand = match expand_override {
         Some(true) => true,
         Some(false) => false,
         None => {
-            strategy.query_type != crate::search::classify::QueryType::ExactKeyword
+            !strong_signal && strategy.query_type != crate::search::classify::QueryType::ExactKeyword
         }
     };
-    // Adaptive expansion count: fewer expansions for query types that benefit less
     let adaptive_max = match strategy.query_type {
         crate::search::classify::QueryType::Temporal => Some(1),
         crate::search::classify::QueryType::Episodic => Some(2),
-        _ => None, // Preference/Semantic/Exploratory: use config default (3)
+        _ => None,
     };
     let expand_config = config.clone();
     let expand_query_str = query.to_string();
@@ -109,19 +122,7 @@ pub fn recall_temporal(
         None
     };
 
-    // === Phase 1: Search with ORIGINAL query (runs while expansion is in flight) ===
-    let (mut fts_results, mut fts_scores, strong_signal) = if strategy.skip_fts {
-        (vec![], std::collections::HashMap::<String, f32>::new(), false)
-    } else {
-        let fts_start = std::time::Instant::now();
-        let (results, ranked) = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
-        let scores: std::collections::HashMap<String, f32> = ranked.into_iter().collect();
-        let ranked_vec: Vec<(String, f32)> = scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        let ss = crate::search::rerank_llm::detect_strong_signal(&ranked_vec);
-        tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = scores.len(), "fts search (original)");
-        if ss { tracing::info!("strong BM25 signal — will skip LLM reranker"); }
-        (results, scores, ss)
-    };
+    // === Phase 1b: Vec + KG search with ORIGINAL query (runs while expansion is in flight) ===
 
     let mut vec_scores: std::collections::HashMap<String, f32> = if strategy.skip_vec {
         std::collections::HashMap::new()
