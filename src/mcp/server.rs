@@ -95,6 +95,7 @@ impl ReinServer {
                 time_from,
                 time_to,
                 params.expand,
+                false, // MCP uses full pipeline
             ).map_err(|e| ReinError::Config(format!("{e}")))
         });
 
@@ -233,13 +234,16 @@ impl ReinServer {
             for mem_id in &params.memory_ids {
                 let _ = crate::store::adaptive::emit_event(conn, crate::store::adaptive::FeedbackEvent {
                     event_type: crate::store::adaptive::EventType::RecallAccess,
-                    request_id: None,
+                    request_id: params.request_id.clone(),
                     memory_id: Some(mem_id.clone()),
                     concept_id: None,
                     query: params.query.clone(),
                     query_type: None,
                     topic: None,
-                    payload: params.helpful.map(|h| serde_json::json!({"helpful": h, "source": "agent_feedback"})),
+                    payload: Some(serde_json::json!({
+                        "source": "agent_feedback",
+                        "helpful": params.helpful,
+                    })),
                 });
                 // Increment access_count on the memory
                 let _ = conn.execute(
