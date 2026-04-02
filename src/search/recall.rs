@@ -145,7 +145,9 @@ pub fn recall_temporal(
 
     // === Phase 1b: Vec + KG search with ORIGINAL query (runs while expansion is in flight) ===
 
-    let mut vec_scores: std::collections::HashMap<String, f32> = if strategy.skip_vec {
+    // In fast mode, skip vector search entirely — it may call remote embedding API on cache miss.
+    // Fast recall uses FTS + KG only (both fully local).
+    let mut vec_scores: std::collections::HashMap<String, f32> = if fast || strategy.skip_vec {
         std::collections::HashMap::new()
     } else {
         let vec_start = std::time::Instant::now();
@@ -439,7 +441,9 @@ pub fn recall_temporal(
             let channel_coverage = channels.max(1) as f32 / 3.0;
             // Topic match: does memory topic appear as a word in query?
             let query_lower = query.to_lowercase();
-            let topic_match = if query_lower.contains(&mem.topic.to_lowercase()) { 1.0 } else { 0.0 };
+            // Exact word match (not substring) to avoid "sql" matching "nosql"
+            let topic_lower = mem.topic.to_lowercase();
+            let topic_match = if query_lower.split_whitespace().any(|w| w == topic_lower) { 1.0 } else { 0.0 };
             let features = crate::search::rerank::RerankFeatures {
                 fts_score: fts,
                 vec_score: vec,
