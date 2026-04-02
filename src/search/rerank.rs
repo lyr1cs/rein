@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Eight features extracted from each candidate memory after fusion.
+/// Twelve features extracted from each candidate memory after fusion.
 #[derive(Debug, Clone)]
 pub struct RerankFeatures {
     /// Normalized BM25 score [0,1]
@@ -22,9 +22,18 @@ pub struct RerankFeatures {
     pub importance_weight: f32,
     /// Fraction of query keywords found in memory keywords+content [0,1]
     pub keyword_overlap: f32,
+    // --- New features (v0.9.1) ---
+    /// Whether memory topic exactly matches a query word [0 or 1]
+    pub topic_match: f32,
+    /// Normalized content length: shorter = more precise. 1/(1 + chars/500)
+    pub brevity: f32,
+    /// Number of channels that found this memory (1-3), normalized to [0.33, 1.0]
+    pub channel_coverage: f32,
+    /// Days since last accessed (freshness of usage, not creation)
+    pub usage_recency: f32,
 }
 
-/// Learned weights for the linear scoring model.
+/// Learned weights for the linear scoring model (12 features).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankWeights {
     pub w_fts: f32,
@@ -35,20 +44,36 @@ pub struct RerankWeights {
     pub w_strength: f32,
     pub w_importance: f32,
     pub w_keyword: f32,
+    #[serde(default = "default_w_topic_match")]
+    pub w_topic_match: f32,
+    #[serde(default = "default_w_brevity")]
+    pub w_brevity: f32,
+    #[serde(default = "default_w_channel_coverage")]
+    pub w_channel_coverage: f32,
+    #[serde(default = "default_w_usage_recency")]
+    pub w_usage_recency: f32,
 }
 
-/// Hand-tuned default weights. Retrieval signals (FTS+Vec) dominate; remaining
-/// weight is split across recency, strength, KG, importance, access, and keyword overlap.
+fn default_w_topic_match() -> f32 { 0.04 }
+fn default_w_brevity() -> f32 { 0.02 }
+fn default_w_channel_coverage() -> f32 { 0.06 }
+fn default_w_usage_recency() -> f32 { 0.03 }
+
+/// Hand-tuned default weights (sum to 1.0). Retrieval signals dominate.
 pub fn default_weights() -> RerankWeights {
     RerankWeights {
-        w_fts: 0.25,
-        w_vec: 0.25,
-        w_kg: 0.15,
-        w_recency: 0.10,
+        w_fts: 0.20,
+        w_vec: 0.20,
+        w_kg: 0.12,
+        w_recency: 0.08,
         w_access: 0.05,
-        w_strength: 0.10,
+        w_strength: 0.08,
         w_importance: 0.05,
         w_keyword: 0.05,
+        w_topic_match: 0.04,
+        w_brevity: 0.02,
+        w_channel_coverage: 0.06,
+        w_usage_recency: 0.05,
     }
 }
 
@@ -62,6 +87,8 @@ pub fn rerank_score(f: &RerankFeatures, w: &RerankWeights) -> f32 {
     let recency_factor = 1.0 / (1.0 + f.recency_days / 7.0);
     let access_factor = (f.access_count.min(20) as f32) / 20.0;
 
+    let usage_recency_factor = 1.0 / (1.0 + f.usage_recency / 14.0);
+
     let score = w.w_fts * f.fts_score
         + w.w_vec * f.vec_score
         + w.w_kg * f.kg_score
@@ -69,7 +96,11 @@ pub fn rerank_score(f: &RerankFeatures, w: &RerankWeights) -> f32 {
         + w.w_access * access_factor
         + w.w_strength * f.strength
         + w.w_importance * f.importance_weight
-        + w.w_keyword * f.keyword_overlap;
+        + w.w_keyword * f.keyword_overlap
+        + w.w_topic_match * f.topic_match
+        + w.w_brevity * f.brevity
+        + w.w_channel_coverage * f.channel_coverage
+        + w.w_usage_recency * usage_recency_factor;
 
     score.clamp(0.0, 2.0)
 }
@@ -142,6 +173,10 @@ mod tests {
             strength: 0.9,
             importance_weight: 1.0,
             keyword_overlap: 0.5,
+            topic_match: 1.0,
+            brevity: 0.5,
+            channel_coverage: 0.67,
+            usage_recency: 2.0,
         };
         let w = default_weights();
         let score = rerank_score(&f, &w);
@@ -160,6 +195,10 @@ mod tests {
             strength: 1.0,
             importance_weight: 1.0,
             keyword_overlap: 1.0,
+            topic_match: 1.0,
+            brevity: 1.0,
+            channel_coverage: 1.0,
+            usage_recency: 0.5,
         };
         let low = RerankFeatures {
             fts_score: 0.1,
@@ -170,6 +209,10 @@ mod tests {
             strength: 0.3,
             importance_weight: 0.4,
             keyword_overlap: 0.0,
+            topic_match: 0.0,
+            brevity: 0.2,
+            channel_coverage: 0.33,
+            usage_recency: 30.0,
         };
         assert!(rerank_score(&high, &w) > rerank_score(&low, &w));
     }
@@ -212,6 +255,10 @@ mod tests {
             strength: 1.0,
             importance_weight: 1.0,
             keyword_overlap: 1.0,
+            topic_match: 1.0,
+            brevity: 1.0,
+            channel_coverage: 1.0,
+            usage_recency: 0.0,
         };
         let w = default_weights();
         let score = rerank_score(&f, &w);
@@ -221,7 +268,8 @@ mod tests {
     #[test]
     fn test_default_weights_sum() {
         let w = default_weights();
-        let sum = w.w_fts + w.w_vec + w.w_kg + w.w_recency + w.w_access + w.w_strength + w.w_importance + w.w_keyword;
+        let sum = w.w_fts + w.w_vec + w.w_kg + w.w_recency + w.w_access + w.w_strength + w.w_importance + w.w_keyword
+            + w.w_topic_match + w.w_brevity + w.w_channel_coverage + w.w_usage_recency;
         assert!((sum - 1.0).abs() < 1e-6, "Default weights should sum to 1.0, got {sum}");
     }
 
