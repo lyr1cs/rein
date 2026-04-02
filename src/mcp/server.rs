@@ -104,6 +104,9 @@ impl ReinServer {
             &params.query, time_from.is_some(), time_to.is_some(),
         );
 
+        // Generate request_id for feedback attribution
+        let request_id = ulid::Ulid::new().to_string();
+
         match result {
             Ok(results) => {
                 let scored: Vec<(Memory, f32)> = results.into_iter().map(|r| (r.memory, r.score)).collect();
@@ -116,7 +119,7 @@ impl ReinServer {
                     };
                 }
                 if !self.compact() && !scored.is_empty() {
-                    text = format!("[route: {}] {}", route.query_type, text);
+                    text = format!("[route: {} | request_id: {}] {}", route.query_type, request_id, text);
                 }
                 self.maybe_nudge(&mut text);
                 text
