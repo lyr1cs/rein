@@ -12,7 +12,7 @@ cargo install --path . # Install to ~/.cargo/bin/rein
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (24 tools). Key modules:
+rein is a multi-source cross-validated memory MCP server (25 tools). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit), stop (Stop)

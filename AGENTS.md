@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.9.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 24 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline.
+rein v0.9.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 25 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline.
 
 ## Build & Test
 
