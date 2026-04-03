@@ -52,14 +52,14 @@ pub fn inject_context(body: &mut Value, context: &str) {
         if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
             match msg.get("content") {
                 Some(Value::String(existing)) => {
-                    let combined = format!("{context}\n\n{existing}");
+                    let combined = format!("{existing}\n\n{context}");
                     msg["content"] = Value::String(combined);
                 }
                 Some(Value::Array(_)) => {
-                    // Structured content parts — prepend a text part.
+                    // Structured content parts — append a text part to preserve prefix stability.
                     let new_part = serde_json::json!({"type": "text", "text": context});
                     if let Some(arr) = msg.get_mut("content").and_then(|v| v.as_array_mut()) {
-                        arr.insert(0, new_part);
+                        arr.push(new_part);
                     }
                 }
                 _ => {
@@ -73,6 +73,26 @@ pub fn inject_context(body: &mut Value, context: &str) {
     // No system message found — insert one.
     let sys_msg = serde_json::json!({"role": "system", "content": context});
     messages.insert(0, sys_msg);
+}
+
+pub fn has_injected_context(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    messages.iter().any(|msg| {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+            return false;
+        }
+        match msg.get("content") {
+            Some(Value::String(s)) => s.contains("<rein-context>"),
+            Some(Value::Array(parts)) => parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|text| text.contains("<rein-context>"))
+            }),
+            _ => false,
+        }
+    })
 }
 
 /// Extract assistant text from a non-streaming OpenAI response.
@@ -162,7 +182,7 @@ mod tests {
         });
         inject_context(&mut body, "<rein-context>memory</rein-context>");
         let sys = body["messages"][0]["content"].as_str().unwrap();
-        assert!(sys.starts_with("<rein-context>"));
+        assert!(sys.ends_with("<rein-context>memory</rein-context>"));
         assert!(sys.contains("You are helpful."));
     }
 
@@ -194,8 +214,8 @@ mod tests {
         inject_context(&mut body, "<rein-context>memory</rein-context>");
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 3);
-        assert_eq!(content[0]["text"].as_str().unwrap(), "<rein-context>memory</rein-context>");
-        assert_eq!(content[1]["text"].as_str().unwrap(), "You are helpful.");
+        assert_eq!(content[0]["text"].as_str().unwrap(), "You are helpful.");
+        assert_eq!(content[2]["text"].as_str().unwrap(), "<rein-context>memory</rein-context>");
     }
 
     #[test]
@@ -208,5 +228,18 @@ mod tests {
     fn test_parse_sse_done() {
         let chunk = "data: [DONE]\n\n";
         assert_eq!(extract_assistant_text_sse(chunk), None);
+    }
+
+    #[test]
+    fn test_detect_injected_context() {
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "You are helpful."},
+                    {"type": "text", "text": "<rein-context>memory</rein-context>"}
+                ]}
+            ]
+        });
+        assert!(has_injected_context(&body));
     }
 }
