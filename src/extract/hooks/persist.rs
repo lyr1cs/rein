@@ -5,7 +5,7 @@ use crate::extract::llm::{ExtractedMemory, ExtractionResult};
 
 use super::buffer::store_episode_concept;
 use super::parsing::looks_like_secret;
-use super::working_set::update_working_set;
+use super::working_set::{update_always_on_index, update_working_set};
 
 /// Compute adaptive admission threshold from recent quality data.
 /// Base = 0.2. Adjusts up if recent quality is low, down if high.
@@ -152,6 +152,7 @@ pub fn process_quick_extraction(
     let extracted_for_ws = extracted.clone();
     let (stored, _ids) = store_extracted(&store, config, extracted);
     let _ = update_working_set(config, &extracted_for_ws, &[], None);
+    let _ = update_always_on_index(config, &extracted_for_ws, &[], None);
     Ok(stored)
 }
 
@@ -172,6 +173,7 @@ pub fn process_full_extraction(
     let concepts_for_ws = result.concepts.clone();
     let (mem_count, memory_ids) = store_extracted(&store, config, result.memories);
     let _ = update_working_set(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref());
+    let _ = update_always_on_index(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref());
     let kg_report = store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
         .unwrap_or_default();
 

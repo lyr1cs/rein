@@ -1,4 +1,6 @@
-//! Project-scoped working set derived from recent compact/stop extractions.
+//! Project-scoped memory surfaces:
+//! - working set: recent, session-biased
+//! - always-on index: smaller, stabler, project-level summaries
 
 use crate::config::ReinConfig;
 use crate::extract::llm::{EpisodeSummary, ExtractedConcept, ExtractedMemory};
@@ -6,8 +8,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MAX_ITEMS: usize = 40;
-const DEFAULT_SELECT_LIMIT: usize = 5;
 const MIN_SELECT_SCORE: f32 = 0.32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,15 +26,14 @@ struct WorkingSetState {
     items: Vec<WorkingSetItem>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AlwaysOnState {
+    #[serde(default)]
+    items: Vec<WorkingSetItem>,
+}
+
 pub fn project_working_set_path(config: &ReinConfig) -> std::path::PathBuf {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut hasher = Sha256::new();
-    hasher.update(cwd.to_string_lossy().as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    super::buffer::resolve_buffer_dir(config).join(format!("working_set_{}.json", &digest[..12]))
+    project_scoped_path(config, "working_set")
 }
 
 pub fn load_working_set(config: &ReinConfig) -> Vec<WorkingSetItem> {
@@ -62,8 +61,42 @@ pub fn update_working_set(
     let mut incoming = build_items(memories, concepts, episode);
 
     current.append(&mut incoming);
-    let merged = merge_items(current);
+    let merged = merge_items(current, config.async_memory.max_working_set_items);
     let state = WorkingSetState { items: merged };
+    std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
+    Ok(())
+}
+
+pub fn project_always_on_index_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "always_on_index")
+}
+
+pub fn load_always_on_index(config: &ReinConfig) -> Vec<WorkingSetItem> {
+    let path = project_always_on_index_path(config);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    serde_json::from_str::<AlwaysOnState>(&text)
+        .map(|state| state.items)
+        .unwrap_or_default()
+}
+
+pub fn update_always_on_index(
+    config: &ReinConfig,
+    memories: &[ExtractedMemory],
+    concepts: &[ExtractedConcept],
+    episode: Option<&EpisodeSummary>,
+) -> anyhow::Result<()> {
+    let path = project_always_on_index_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut current = load_always_on_index(config);
+    let mut incoming = build_always_on_items(memories, concepts, episode);
+    current.append(&mut incoming);
+    let merged = merge_items(current, config.async_memory.max_always_on_items);
+    let state = AlwaysOnState { items: merged };
     std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
     Ok(())
 }
@@ -74,7 +107,17 @@ pub fn select_relevant_items(config: &ReinConfig, query: &str) -> Vec<WorkingSet
         return vec![];
     }
 
-    let mut scored: Vec<(f32, WorkingSetItem)> = load_working_set(config)
+    let working = load_working_set(config).into_iter().map(|mut item| {
+        item.score = item.score.max(0.1);
+        item
+    });
+    let always_on = load_always_on_index(config).into_iter().map(|mut item| {
+        item.score = item.score.max(0.2);
+        item
+    });
+
+    let mut scored: Vec<(f32, WorkingSetItem)> = working
+        .chain(always_on)
         .into_iter()
         .map(|item| {
             let sim = crate::extract::similarity(query, &item.detail)
@@ -90,11 +133,11 @@ pub fn select_relevant_items(config: &ReinConfig, query: &str) -> Vec<WorkingSet
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
     });
-    scored
-        .into_iter()
-        .take(DEFAULT_SELECT_LIMIT)
-        .map(|(_, item)| item)
-        .collect()
+    let merged = merge_items(
+        scored.into_iter().map(|(_, item)| item).collect(),
+        config.async_memory.selection_limit,
+    );
+    merged
 }
 
 fn build_items(
@@ -162,7 +205,74 @@ fn build_items(
     items
 }
 
-fn merge_items(mut items: Vec<WorkingSetItem>) -> Vec<WorkingSetItem> {
+fn build_always_on_items(
+    memories: &[ExtractedMemory],
+    concepts: &[ExtractedConcept],
+    episode: Option<&EpisodeSummary>,
+) -> Vec<WorkingSetItem> {
+    let now = Utc::now();
+    let mut items = Vec::new();
+
+    for memory in memories {
+        let topic = memory.topic.to_lowercase();
+        let importance_high = matches!(memory.importance.to_lowercase().as_str(), "high" | "critical");
+        let stable_topic = ["architecture", "decision", "design", "workflow", "config", "user_preference"]
+            .iter()
+            .any(|k| topic.contains(k));
+        if !importance_high && !stable_topic && memory.quality_confidence < 0.7 {
+            continue;
+        }
+        let summary = compact(&memory.summary, 110);
+        let detail = compact(&memory.content, 180);
+        if summary.is_empty() || detail.is_empty() {
+            continue;
+        }
+        items.push(WorkingSetItem {
+            kind: "always_on_memory".to_string(),
+            topic: memory.topic.clone(),
+            summary,
+            detail,
+            score: memory_score(memory).max(0.7),
+            updated_at: now,
+        });
+    }
+
+    for concept in concepts {
+        if concept.quality_confidence < 0.7 {
+            continue;
+        }
+        let summary = compact(&concept.name, 110);
+        let detail = compact(&concept.definition, 180);
+        if summary.is_empty() || detail.is_empty() {
+            continue;
+        }
+        items.push(WorkingSetItem {
+            kind: "always_on_concept".to_string(),
+            topic: concept.memoir.clone(),
+            summary,
+            detail,
+            score: (concept.quality_confidence as f32).max(0.72),
+            updated_at: now,
+        });
+    }
+
+    if let Some(ep) = episode {
+        if !ep.decisions.is_empty() {
+            items.push(WorkingSetItem {
+                kind: "always_on_episode".to_string(),
+                topic: "session".to_string(),
+                summary: compact(&ep.title, 110),
+                detail: compact(&format!("{} Decisions: {}", ep.outcome, ep.decisions.join("; ")), 180),
+                score: 0.7,
+                updated_at: now,
+            });
+        }
+    }
+
+    items
+}
+
+fn merge_items(mut items: Vec<WorkingSetItem>, max_items: usize) -> Vec<WorkingSetItem> {
     items.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -174,7 +284,8 @@ fn merge_items(mut items: Vec<WorkingSetItem>) -> Vec<WorkingSetItem> {
     'outer: for item in items {
         for existing in &mut merged {
             if existing.kind == item.kind
-                && crate::extract::similarity(&existing.detail, &item.detail) > 0.85
+                && (crate::extract::similarity(&existing.detail, &item.detail) > 0.85
+                    || crate::extract::similarity(&existing.summary, &item.summary) > 0.88)
             {
                 if item.score > existing.score {
                     *existing = item;
@@ -183,7 +294,7 @@ fn merge_items(mut items: Vec<WorkingSetItem>) -> Vec<WorkingSetItem> {
             }
         }
         merged.push(item);
-        if merged.len() >= MAX_ITEMS {
+        if merged.len() >= max_items {
             break;
         }
     }
@@ -225,6 +336,17 @@ fn looks_like_smalltalk(text: &str) -> bool {
     phrases.contains(&normalized.as_str())
 }
 
+fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut hasher = Sha256::new();
+    hasher.update(cwd.to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    super::buffer::resolve_buffer_dir(config).join(format!("{prefix}_{}.json", &digest[..12]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +358,7 @@ mod tests {
             WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "a".into(), detail: "fixed sqlite locking".into(), score: 0.7, updated_at: now },
             WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "b".into(), detail: "fixed sqlite locking issue".into(), score: 0.9, updated_at: now },
         ];
-        let merged = merge_items(items);
+        let merged = merge_items(items, 40);
         assert_eq!(merged.len(), 1);
         assert!((merged[0].score - 0.9).abs() < f32::EPSILON);
     }
