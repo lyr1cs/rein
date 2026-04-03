@@ -342,11 +342,9 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
         return Ok(());
     }
 
-    // Recreate table with widened CHECK. Use a savepoint so this can run safely
-    // even if the caller already has an open transaction.
+    // Recreate table with widened CHECK.
     conn.execute_batch(
-        "SAVEPOINT migrate_source_check; \
-         ALTER TABLE memories RENAME TO memories_old; \
+        "ALTER TABLE memories RENAME TO memories_old; \
          CREATE TABLE memories ( \
              id TEXT PRIMARY KEY NOT NULL, \
              layer TEXT NOT NULL CHECK(layer IN ('LTM', 'STM')), \
@@ -371,9 +369,14 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
              cluster_id INTEGER, \
              needs_vec_dedup INTEGER NOT NULL DEFAULT 0 \
          ); \
-         INSERT INTO memories SELECT * FROM memories_old; \
-         DROP TABLE memories_old; \
-         RELEASE migrate_source_check;"
+         INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, \
+             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
+             updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup) \
+         SELECT id, layer, topic, summary, content, keywords, importance, source, \
+             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
+             updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup \
+         FROM memories_old; \
+         DROP TABLE memories_old;"
     ).map_err(|e| crate::types::ReinError::Database(e))?;
 
     tracing::info!("migrated source CHECK to include 'proxy'");
