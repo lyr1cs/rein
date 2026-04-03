@@ -92,7 +92,19 @@ pub fn queue_memory_job(
         return Ok(());
     }
 
+    // Also check pending queue for similar jobs (prevents cross-session duplicates
+    // that fall outside the fingerprint_window_ms).
     let path = queue_path(config);
+    if let Ok(queue_content) = std::fs::read_to_string(&path) {
+        let preview: String = text.chars().take(500).collect();
+        for line in queue_content.lines().rev().take(50) {
+            if let Ok(existing) = serde_json::from_str::<MemoryJob>(line) {
+                if crate::extract::similarity(&preview, &existing.text.chars().take(500).collect::<String>()) > 0.85 {
+                    return Ok(()); // Already queued
+                }
+            }
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -154,13 +166,20 @@ pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
         .write(true)
         .truncate(false)
         .open(&lock)?;
-    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock_file), libc::LOCK_EX | libc::LOCK_NB) };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         return Ok(0);
     }
 
+    // lock_file is held for the entire operation (including async phases).
+    // The flock is advisory and process-scoped — it survives across awaits
+    // because the file descriptor stays open in lock_file.
     let result = drain_memory_queue_locked(config, &path, &inflight).await;
-    let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock_file), libc::LOCK_UN) };
+
+    // Explicitly unlock + drop (lock released when fd closes).
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    drop(lock_file);
     result
 }
 
@@ -237,17 +256,23 @@ async fn drain_memory_queue_locked(
     }
     remaining.extend(deferred);
 
+    // Write remaining jobs back to queue BEFORE deleting inflight.
+    // This ensures no data loss if we crash between these two operations:
+    // - If we crash after writing queue but before deleting inflight,
+    //   recover_inflight() will append inflight back (duplicates are harmless
+    //   because jobs have unique IDs and dedup catches them).
     if !remaining.is_empty() {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)?;
-        for job in remaining {
-            writeln!(file, "{}", serde_json::to_string(&job)?)?;
+        for job in &remaining {
+            writeln!(file, "{}", serde_json::to_string(job)?)?;
         }
     }
 
+    // Safe to delete inflight now — remaining jobs are persisted in queue.
     let _ = std::fs::remove_file(inflight);
     stats.last_run_at = Some(Utc::now().to_rfc3339());
     let _ = save_worker_stats(config, &stats);
@@ -347,10 +372,12 @@ fn touch_spawn_marker(config: &ReinConfig) -> anyhow::Result<()> {
 }
 
 fn recover_inflight(path: &std::path::Path, inflight: &std::path::Path) -> anyhow::Result<()> {
-    if !inflight.exists() {
-        return Ok(());
-    }
-    let content = std::fs::read_to_string(inflight).unwrap_or_default();
+    // Read inflight file directly — if it doesn't exist, read_to_string returns Err
+    // and we return Ok. No TOCTOU race between exists() and read().
+    let content = match std::fs::read_to_string(inflight) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // File doesn't exist or unreadable — nothing to recover.
+    };
     if !content.trim().is_empty() {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
@@ -394,7 +421,9 @@ fn dedup_quick(
 
 fn reschedule_job(config: &ReinConfig, mut job: MemoryJob) -> MemoryJob {
     let attempts = job.attempts + 1;
-    let backoff = config.async_memory.base_backoff_ms.saturating_mul(2u64.saturating_pow(job.attempts));
+    // Cap exponent at 10 to prevent overflow (max backoff = base * 1024 ≈ 34 minutes at 2000ms base).
+    let exp = job.attempts.min(10);
+    let backoff = config.async_memory.base_backoff_ms.saturating_mul(2u64.saturating_pow(exp));
     job.attempts = attempts;
     job.next_attempt_at = Some(Utc::now() + chrono::Duration::milliseconds(backoff as i64));
     job

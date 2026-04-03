@@ -103,8 +103,8 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Layer 2: UserPromptSubmit — inject recalled memories + concepts.
-/// Skipped automatically when proxy mode is active (REIN_PROXY_ACTIVE=1).
+/// Layer 2: UserPromptSubmit — currently a no-op.
+/// Injection is handled by the rein MCP prompt hook, not by this code path.
 pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     let _ = config;
     Ok(())
