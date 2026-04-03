@@ -107,7 +107,7 @@ pub fn model_max_tokens(model: &str) -> usize {
         200_000
     } else if m.contains("o1") || m.contains("o3") || m.contains("o4") {
         200_000
-    } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") {
+    } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("gpt-4.") || m.contains("gpt-5") {
         128_000
     } else if m.contains("gpt-4") {
         8_192

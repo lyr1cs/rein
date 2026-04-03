@@ -33,7 +33,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             content TEXT NOT NULL,
             keywords TEXT NOT NULL DEFAULT '[]',
             importance TEXT NOT NULL CHECK(importance IN ('critical', 'high', 'medium', 'low')),
-            source TEXT NOT NULL CHECK(source IN ('manual', 'hook', 'migration', 'supermemory')),
+            source TEXT NOT NULL CHECK(source IN ('manual', 'hook', 'migration', 'supermemory', 'proxy')),
             strength REAL NOT NULL DEFAULT 1.0,
             decay_lambda REAL NOT NULL,
             access_count INTEGER NOT NULL DEFAULT 0,
@@ -313,9 +313,70 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'").ok();
     }
 
+    // Migrate: widen source CHECK to include 'proxy' (v0.9.4)
+    // SQLite doesn't support ALTER CHECK, so we recreate the table if needed.
+    // Skip for in-memory databases (fresh schema already includes 'proxy').
+    let is_memory_db = conn.path().map(|p| p == ":memory:" || p.is_empty()).unwrap_or(true);
+    if !is_memory_db {
+        migrate_source_check(conn)?;
+    }
+
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;
 
+    Ok(())
+}
+
+/// Widen the source CHECK constraint to include 'proxy'.
+/// Only runs if the current schema rejects 'proxy' inserts.
+fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
+    // Test if 'proxy' is already allowed by attempting a dry insert via savepoint.
+    let needs_migration = conn.execute_batch(
+        "SAVEPOINT src_check_test; \
+         INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, strength, decay_lambda, access_count, created_at, updated_at, last_accessed) \
+         VALUES ('__test_proxy__', 'stm', '', '', '', '[]', 'low', 'proxy', 0, 0, 0, datetime('now'), datetime('now'), datetime('now')); \
+         ROLLBACK TO src_check_test; \
+         RELEASE src_check_test;"
+    ).is_err();
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    // Recreate table with widened CHECK. Use a transaction + temp table.
+    conn.execute_batch(
+        "BEGIN; \
+         ALTER TABLE memories RENAME TO memories_old; \
+         CREATE TABLE memories ( \
+             id TEXT PRIMARY KEY NOT NULL, \
+             layer TEXT NOT NULL CHECK(layer IN ('ltm', 'stm')), \
+             topic TEXT NOT NULL, \
+             summary TEXT NOT NULL, \
+             content TEXT NOT NULL, \
+             keywords TEXT NOT NULL DEFAULT '[]', \
+             importance TEXT NOT NULL CHECK(importance IN ('critical', 'high', 'medium', 'low')), \
+             source TEXT NOT NULL CHECK(source IN ('manual', 'hook', 'migration', 'supermemory', 'proxy')), \
+             strength REAL NOT NULL, \
+             decay_lambda REAL NOT NULL, \
+             access_count INTEGER NOT NULL DEFAULT 0, \
+             superseded_by TEXT, \
+             related_ids TEXT NOT NULL DEFAULT '[]', \
+             created_at TEXT NOT NULL, \
+             updated_at TEXT NOT NULL, \
+             last_accessed TEXT NOT NULL, \
+             embedding BLOB, \
+             status TEXT NOT NULL DEFAULT 'active', \
+             concept_ids TEXT NOT NULL DEFAULT '[]', \
+             tier TEXT NOT NULL DEFAULT 'warm', \
+             cluster_id INTEGER, \
+             needs_vec_dedup INTEGER NOT NULL DEFAULT 0 \
+         ); \
+         INSERT INTO memories SELECT * FROM memories_old; \
+         DROP TABLE memories_old; \
+         COMMIT;"
+    ).map_err(|e| crate::types::ReinError::Database(e))?;
+
+    tracing::info!("migrated source CHECK to include 'proxy'");
     Ok(())
 }
 
