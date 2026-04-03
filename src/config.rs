@@ -250,6 +250,22 @@ pub struct AsyncMemoryConfig {
     /// Which LLM provider the async memory worker uses.
     /// "inherit" follows [extract].provider.
     pub provider: String,
+    /// Maximum retry attempts for failed async memory jobs before dead-lettering.
+    pub max_retries: u32,
+    /// Base retry backoff in milliseconds. Exponential backoff uses this as step 0.
+    pub base_backoff_ms: u64,
+    /// Maximum jobs a single worker run will process before exiting.
+    pub max_jobs_per_run: usize,
+    /// Batch size used when selecting ready jobs from the queue.
+    pub batch_size: usize,
+    /// Minimum time between worker spawns for the same project queue.
+    pub spawn_cooldown_ms: u64,
+    /// Maximum items kept in the project working set.
+    pub max_working_set_items: usize,
+    /// Maximum items kept in the project always-on index.
+    pub max_always_on_items: usize,
+    /// Maximum number of injected memory-surface items selected per query.
+    pub selection_limit: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -530,6 +546,14 @@ impl Default for AsyncMemoryConfig {
     fn default() -> Self {
         Self {
             provider: "inherit".to_string(),
+            max_retries: 3,
+            base_backoff_ms: 2_000,
+            max_jobs_per_run: 32,
+            batch_size: 8,
+            spawn_cooldown_ms: 1_500,
+            max_working_set_items: 40,
+            max_always_on_items: 24,
+            selection_limit: 5,
         }
     }
 }

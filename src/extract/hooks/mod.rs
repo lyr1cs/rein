@@ -61,7 +61,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                     .join("\n---\n");
                 if !combined.is_empty() {
                     let _ = queue_memory_job(config, MemoryJobMode::Full, "hook_post", None, combined);
-                    spawn_memory_worker();
+                    spawn_memory_worker(config);
                 }
             }
         }
@@ -76,7 +76,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
     if text.is_empty() { return Ok(()); }
 
     let _ = queue_memory_job(config, MemoryJobMode::Quick, "hook_compact", None, text.clone());
-    spawn_memory_worker();
+    spawn_memory_worker(config);
     let buf_path = session_buffer_path(config, &input);
     let _ = append_to_buffer(&buf_path, &text, "compact");
     Ok(())
@@ -96,10 +96,10 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-        let selected = select_relevant_items(config, query);
-        if selected.is_empty() {
-            return Ok(());
-        }
+    let selected = select_relevant_items(config, query);
+    if selected.is_empty() {
+        return Ok(());
+    }
 
     println!("<rein-context>");
     println!("The following are concise facts from the current project working set.");
@@ -143,7 +143,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         if combined.is_empty() { return Ok(()); }
 
         let _ = queue_memory_job(config, MemoryJobMode::Full, "hook_stop", None, combined);
-        spawn_memory_worker();
+        spawn_memory_worker(config);
         eprintln!("rein: queued session memory processing");
     } else {
         let windows = extract_signal_windows(&text, config);
@@ -159,7 +159,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         if combined.is_empty() { return Ok(()); }
 
         let _ = queue_memory_job(config, MemoryJobMode::Quick, "hook_stop_fallback", None, combined);
-        spawn_memory_worker();
+        spawn_memory_worker(config);
         eprintln!("rein: queued session memory processing");
     }
     Ok(())
