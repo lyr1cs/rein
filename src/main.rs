@@ -133,6 +133,11 @@ enum Commands {
     Warmup,
     /// Show configuration
     Config,
+    /// Background worker commands
+    Worker {
+        #[command(subcommand)]
+        action: WorkerAction,
+    },
     /// Hook commands
     Hook {
         #[command(subcommand)]
@@ -150,6 +155,12 @@ enum HookAction {
     Prompt,
     /// Save session summary on conversation end (Stop)
     Stop,
+}
+
+#[derive(Subcommand)]
+enum WorkerAction {
+    /// Drain the async memory queue for the current project
+    Memory,
 }
 
 #[tokio::main]
@@ -411,6 +422,14 @@ async fn main() -> anyhow::Result<()> {
             let (cached, errors) = search::warmup::warmup(&store, &config).await;
             println!("Warmup complete: {cached} embeddings cached, {errors} errors");
         }
+        Some(Commands::Worker { action }) => match action {
+            WorkerAction::Memory => {
+                let processed = extract::hooks::queue::drain_memory_queue(&config).await?;
+                if processed > 0 {
+                    eprintln!("rein worker: processed {processed} memory jobs");
+                }
+            }
+        },
         None => {
             println!("rein v{}", env!("CARGO_PKG_VERSION"));
             println!("Run 'rein --help' for usage");
@@ -473,4 +492,3 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
-
