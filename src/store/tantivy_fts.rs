@@ -77,6 +77,7 @@ impl TantivyFts {
     }
 
     /// Index a memory document. Replaces any existing doc with the same ID.
+    /// If another process holds the writer lock, silently skips (side index, not critical).
     pub fn insert(
         &self,
         id: &str,
@@ -85,7 +86,14 @@ impl TantivyFts {
         content: &str,
         keywords: &str,
     ) -> Result<(), tantivy::TantivyError> {
-        let mut writer: IndexWriter = self.index.writer(15_000_000)?; // 15MB heap
+        let mut writer: IndexWriter = match self.index.writer(15_000_000) {
+            Ok(w) => w,
+            Err(tantivy::TantivyError::LockFailure(..)) => {
+                tracing::debug!("tantivy writer locked by another process, skipping insert");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         // Delete old doc with same ID first
         let id_term = tantivy::Term::from_field_text(self.id_field, id);
         writer.delete_term(id_term);
@@ -170,8 +178,16 @@ impl TantivyFts {
     }
 
     /// Delete a document by memory ID.
+    /// If another process holds the writer lock, silently skips.
     pub fn delete(&self, id: &str) -> Result<(), tantivy::TantivyError> {
-        let mut writer: IndexWriter = self.index.writer(15_000_000)?;
+        let mut writer: IndexWriter = match self.index.writer(15_000_000) {
+            Ok(w) => w,
+            Err(tantivy::TantivyError::LockFailure(..)) => {
+                tracing::debug!("tantivy writer locked by another process, skipping delete");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let term = tantivy::Term::from_field_text(self.id_field, id);
         writer.delete_term(term);
         writer.commit()?;

@@ -1,15 +1,15 @@
 //! Shared memory recall and formatting for proxy injection.
 
 use crate::config::ReinConfig;
+use crate::store::SqliteStore;
 
 /// Recall memories and format them for injection into the system prompt.
+/// Accepts a pre-opened store to avoid per-request connection overhead.
 ///
 /// Returns `None` if no memories or concepts are found.
-pub fn recall_and_format(config: &ReinConfig, query: &str, budget_tokens: usize) -> Option<String> {
-    let store = config.open_store().ok()?;
-
+pub fn recall_and_format(store: &SqliteStore, config: &ReinConfig, query: &str, budget_tokens: usize) -> Option<String> {
     let recall_results =
-        crate::search::recall::recall_fast(&store, config, query, None, None, config.proxy.recall_limit)
+        crate::search::recall::recall_fast(store, config, query, None, None, config.proxy.recall_limit)
             .ok()
             .unwrap_or_default();
     let concepts = store.search_all_concepts(query, 3).unwrap_or_default();

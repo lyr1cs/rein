@@ -3,6 +3,9 @@
 //! Intercepts requests to Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`)
 //! APIs, injects recalled memories into the system prompt, forwards to the upstream
 //! provider, streams responses back, and asynchronously extracts memories from responses.
+//!
+//! Uses a dedicated blocking thread with a resident SqliteStore to avoid per-request
+//! connection overhead and to prevent blocking the tokio async executor.
 
 mod anthropic;
 mod extract;
@@ -15,15 +18,29 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use provider::ProviderKind;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+/// A recall request sent to the dedicated store thread.
+struct RecallRequest {
+    query: String,
+    budget_tokens: usize,
+    reply: oneshot::Sender<Option<String>>,
+}
 
 /// Start the transparent proxy server.
 pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
+    // Signal hooks to skip injection (proxy handles it).
+    std::env::set_var("REIN_PROXY_ACTIVE", "1");
+
     let bind = format!("{}:{}", config.proxy.bind, config.proxy.port);
 
     // Security: require auth token for non-localhost binds (same as run_http).
-    let is_loopback = config.proxy.bind == "127.0.0.1" || config.proxy.bind == "localhost" || config.proxy.bind == "::1";
-    let auth_token = std::env::var("REIN_PROXY_TOKEN").ok().or_else(|| std::env::var("REIN_HTTP_TOKEN").ok());
+    let is_loopback = config.proxy.bind == "127.0.0.1"
+        || config.proxy.bind == "localhost"
+        || config.proxy.bind == "::1";
+    let auth_token = std::env::var("REIN_PROXY_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("REIN_HTTP_TOKEN").ok());
     if !is_loopback && auth_token.is_none() {
         anyhow::bail!(
             "rein proxy: refusing to bind to non-loopback address '{}' without REIN_PROXY_TOKEN set. \
@@ -34,14 +51,35 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
 
-    // Pre-warm Tantivy + HNSW indexes at startup (Layer 1: resident indexes).
-    // This eliminates the ~50ms cold-start on the first request.
-    {
-        let store = config.open_store()?;
+    // Spawn a dedicated blocking thread that owns a resident SqliteStore.
+    // All recall operations go through this thread via channel, avoiding:
+    // 1. Per-request connection overhead (open_store ~10-30ms)
+    // 2. Tantivy index reload per request (~15MB allocation)
+    // 3. Blocking the tokio async executor with sync I/O
+    let (recall_tx, mut recall_rx) = mpsc::channel::<RecallRequest>(32);
+    let config_for_store = config.clone();
+    std::thread::spawn(move || {
+        let store = match config_for_store.open_store() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("rein proxy: failed to open store: {e}");
+                return;
+            }
+        };
+
+        // Pre-warm indexes on the store thread (Layer 1: resident indexes).
         crate::search::warmup::populate_tantivy(&store);
-        crate::search::warmup::populate_hnsw(&store, &config);
+        crate::search::warmup::populate_hnsw(&store, &config_for_store);
         eprintln!("rein proxy: indexes warmed up");
-    }
+
+        // Process recall requests sequentially on this thread.
+        // SqliteStore is !Send, so it must stay on this thread.
+        while let Some(req) = recall_rx.blocking_recv() {
+            let result =
+                inject::recall_and_format(&store, &config_for_store, &req.query, req.budget_tokens);
+            let _ = req.reply.send(result);
+        }
+    });
 
     eprintln!("rein proxy listening on http://{bind}");
     eprintln!("  Anthropic: set ANTHROPIC_BASE_URL=http://{bind}");
@@ -57,6 +95,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
         tracing::debug!("proxy connection from {addr}");
         let config = config.clone();
         let client = upstream_client.clone();
+        let recall_tx = recall_tx.clone();
 
         let auth = auth_token.clone();
         tokio::spawn(async move {
@@ -64,7 +103,10 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
                 let config = config.clone();
                 let client = client.clone();
                 let auth = auth.clone();
-                async move { handle_request(req, config, client, auth.as_deref()).await }
+                let recall_tx = recall_tx.clone();
+                async move {
+                    handle_request(req, config, client, auth.as_deref(), recall_tx).await
+                }
             });
 
             if let Err(e) = hyper_util::server::conn::auto::Builder::new(
@@ -106,6 +148,7 @@ async fn handle_request(
     config: ReinConfig,
     client: reqwest::Client,
     expected_token: Option<&str>,
+    recall_tx: mpsc::Sender<RecallRequest>,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     // Auth check for non-localhost binds.
     if let Some(expected) = expected_token {
@@ -122,7 +165,10 @@ async fn handle_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     // Preserve query string for passthrough (e.g., /v1/models?foo=bar).
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| uri.path().to_string());
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
     let path = uri.path().to_string();
     let headers = req.headers().clone();
 
@@ -138,22 +184,42 @@ async fn handle_request(
         }
     };
 
+    // Log request details.
+    let body_size = body_bytes.len();
+    eprintln!("rein proxy: {method} {path_and_query} ({body_size} bytes)");
+
     // If not a known LLM endpoint, passthrough unmodified.
     let provider = match provider {
         Some(p) => p,
         None => {
-            return forward_raw(&client, &config, &method, &path_and_query, &headers, body_bytes).await;
+            return forward_raw(
+                &client,
+                &config,
+                &method,
+                &path_and_query,
+                &headers,
+                body_bytes,
+            )
+            .await;
         }
     };
 
-    // Parse and inject memories.
-    let (modified_body, query) = match inject_memories(&config, &provider, &body_bytes) {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::warn!("injection failed, forwarding unmodified: {e}");
-            (body_bytes.to_vec(), None)
-        }
-    };
+    // Parse and inject memories (async — recall runs on dedicated thread).
+    let (modified_body, query) =
+        match inject_memories(&config, &provider, &body_bytes, &recall_tx).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("injection failed, forwarding unmodified: {e}");
+                (body_bytes.to_vec(), None)
+            }
+        };
+
+    let injected = modified_body.len() != body_size;
+    eprintln!(
+        "rein proxy: injected={injected} query={:?} orig={body_size} modified={}",
+        query.as_deref().unwrap_or(""),
+        modified_body.len()
+    );
 
     // Build upstream URL.
     let upstream_base = provider.upstream_url(&config);
@@ -193,6 +259,7 @@ async fn handle_request(
     };
 
     let status = upstream_resp.status();
+    eprintln!("rein proxy: upstream responded {status}");
     let resp_headers = upstream_resp.headers().clone();
     let is_streaming = resp_headers
         .get("content-type")
@@ -255,9 +322,7 @@ async fn stream_response(
                 Ok(chunk) => {
                     // Parse SSE chunks for assistant text extraction.
                     if extract_enabled && assistant_buf.len() < MAX_EXTRACT_BUF {
-                        if let Some(text) =
-                            provider_clone.extract_assistant_text_sse(&chunk)
-                        {
+                        if let Some(text) = provider_clone.extract_assistant_text_sse(&chunk) {
                             assistant_buf.push_str(&text);
                         }
                     }
@@ -304,11 +369,12 @@ async fn forward_raw(
     body: Bytes,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     // Try to guess upstream from path pattern.
-    let upstream_base = if path.starts_with("/v1/messages") || headers.get("anthropic-version").is_some() {
-        &config.proxy.anthropic_upstream
-    } else {
-        &config.proxy.openai_upstream
-    };
+    let upstream_base =
+        if path.starts_with("/v1/messages") || headers.get("anthropic-version").is_some() {
+            &config.proxy.anthropic_upstream
+        } else {
+            &config.proxy.openai_upstream
+        };
     let upstream_url = format!("{upstream_base}{path}");
 
     let mut req = client.request(
@@ -316,7 +382,10 @@ async fn forward_raw(
         &upstream_url,
     );
     for (name, value) in headers.iter() {
-        if !matches!(name.as_str(), "host" | "content-length" | "transfer-encoding" | "connection") {
+        if !matches!(
+            name.as_str(),
+            "host" | "content-length" | "transfer-encoding" | "connection"
+        ) {
             if let Ok(v) = value.to_str() {
                 req = req.header(name.as_str(), v);
             }
@@ -354,10 +423,12 @@ fn body_str_contains_rein_context(body: &serde_json::Value) -> bool {
 }
 
 /// Parse request body, inject memories, return modified body and extracted query.
-fn inject_memories(
+/// Recall runs asynchronously on the dedicated store thread via channel.
+async fn inject_memories(
     config: &ReinConfig,
     provider: &ProviderKind,
     body_bytes: &[u8],
+    recall_tx: &mpsc::Sender<RecallRequest>,
 ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     let mut body: serde_json::Value = serde_json::from_slice(body_bytes)?;
 
@@ -386,17 +457,34 @@ fn inject_memories(
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(4096) as usize;
-    let remaining = model_max.saturating_sub(used_tokens).saturating_sub(output_reserved);
+    let remaining = model_max
+        .saturating_sub(used_tokens)
+        .saturating_sub(output_reserved);
     let budget_tokens = (remaining / 20).min(config.proxy.inject_limit); // remaining * 0.05
 
     if budget_tokens < 50 {
         return Ok((body_bytes.to_vec(), Some(query)));
     }
 
-    // Recall and format memories.
-    let context = match inject::recall_and_format(config, &query, budget_tokens) {
-        Some(ctx) => ctx,
-        None => return Ok((body_bytes.to_vec(), Some(query))),
+    // Send recall request to dedicated store thread (non-blocking).
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if recall_tx
+        .send(RecallRequest {
+            query: query.clone(),
+            budget_tokens,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        // Store thread died — forward unmodified.
+        return Ok((body_bytes.to_vec(), Some(query)));
+    }
+
+    // Wait for recall result (typically ~2-5ms with warm indexes).
+    let context = match reply_rx.await {
+        Ok(Some(ctx)) => ctx,
+        _ => return Ok((body_bytes.to_vec(), Some(query))),
     };
 
     // Inject into the appropriate location.
