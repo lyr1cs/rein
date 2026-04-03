@@ -16,6 +16,8 @@ pub struct WorkingSetItem {
     pub topic: String,
     pub summary: String,
     pub detail: String,
+    pub agent_label: String,
+    pub is_subagent: bool,
     pub score: f32,
     pub updated_at: DateTime<Utc>,
 }
@@ -51,6 +53,8 @@ pub fn update_working_set(
     memories: &[ExtractedMemory],
     concepts: &[ExtractedConcept],
     episode: Option<&EpisodeSummary>,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> anyhow::Result<()> {
     let path = project_working_set_path(config);
     if let Some(parent) = path.parent() {
@@ -58,7 +62,7 @@ pub fn update_working_set(
     }
 
     let mut current = load_working_set(config);
-    let mut incoming = build_items(memories, concepts, episode);
+    let mut incoming = build_items(memories, concepts, episode, agent_label, is_subagent);
 
     current.append(&mut incoming);
     let merged = merge_items(current, config.async_memory.max_working_set_items);
@@ -86,6 +90,8 @@ pub fn update_always_on_index(
     memories: &[ExtractedMemory],
     concepts: &[ExtractedConcept],
     episode: Option<&EpisodeSummary>,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> anyhow::Result<()> {
     let path = project_always_on_index_path(config);
     if let Some(parent) = path.parent() {
@@ -93,7 +99,7 @@ pub fn update_always_on_index(
     }
 
     let mut current = load_always_on_index(config);
-    let mut incoming = build_always_on_items(memories, concepts, episode);
+    let mut incoming = build_always_on_items(memories, concepts, episode, agent_label, is_subagent);
     current.append(&mut incoming);
     let merged = merge_items(current, config.async_memory.max_always_on_items);
     let state = AlwaysOnState { items: merged };
@@ -144,6 +150,8 @@ fn build_items(
     memories: &[ExtractedMemory],
     concepts: &[ExtractedConcept],
     episode: Option<&EpisodeSummary>,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> Vec<WorkingSetItem> {
     let now = Utc::now();
     let mut items = Vec::new();
@@ -163,6 +171,8 @@ fn build_items(
             topic: memory.topic.clone(),
             summary,
             detail,
+            agent_label: agent_label.to_string(),
+            is_subagent,
             score: memory_score(memory),
             updated_at: now,
         });
@@ -178,6 +188,8 @@ fn build_items(
             topic: concept.memoir.clone(),
             summary: compact(&concept.name, 120),
             detail,
+            agent_label: agent_label.to_string(),
+            is_subagent,
             score: concept.quality_confidence as f32 * 0.8 + 0.1,
             updated_at: now,
         });
@@ -196,6 +208,8 @@ fn build_items(
                 topic: "session".to_string(),
                 summary: compact(&ep.title, 120),
                 detail,
+                agent_label: agent_label.to_string(),
+                is_subagent,
                 score: 0.85,
                 updated_at: now,
             });
@@ -209,6 +223,8 @@ fn build_always_on_items(
     memories: &[ExtractedMemory],
     concepts: &[ExtractedConcept],
     episode: Option<&EpisodeSummary>,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> Vec<WorkingSetItem> {
     let now = Utc::now();
     let mut items = Vec::new();
@@ -232,6 +248,8 @@ fn build_always_on_items(
             topic: memory.topic.clone(),
             summary,
             detail,
+            agent_label: agent_label.to_string(),
+            is_subagent,
             score: memory_score(memory).max(0.7),
             updated_at: now,
         });
@@ -251,6 +269,8 @@ fn build_always_on_items(
             topic: concept.memoir.clone(),
             summary,
             detail,
+            agent_label: agent_label.to_string(),
+            is_subagent,
             score: (concept.quality_confidence as f32).max(0.72),
             updated_at: now,
         });
@@ -263,6 +283,8 @@ fn build_always_on_items(
                 topic: "session".to_string(),
                 summary: compact(&ep.title, 110),
                 detail: compact(&format!("{} Decisions: {}", ep.outcome, ep.decisions.join("; ")), 180),
+                agent_label: agent_label.to_string(),
+                is_subagent,
                 score: 0.7,
                 updated_at: now,
             });
@@ -284,6 +306,8 @@ fn merge_items(mut items: Vec<WorkingSetItem>, max_items: usize) -> Vec<WorkingS
     'outer: for item in items {
         for existing in &mut merged {
             if existing.kind == item.kind
+                && existing.agent_label == item.agent_label
+                && existing.is_subagent == item.is_subagent
                 && (crate::extract::similarity(&existing.detail, &item.detail) > 0.85
                     || crate::extract::similarity(&existing.summary, &item.summary) > 0.88)
             {
@@ -355,8 +379,8 @@ mod tests {
     fn merge_dedups_similar_items() {
         let now = Utc::now();
         let items = vec![
-            WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "a".into(), detail: "fixed sqlite locking".into(), score: 0.7, updated_at: now },
-            WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "b".into(), detail: "fixed sqlite locking issue".into(), score: 0.9, updated_at: now },
+            WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "a".into(), detail: "fixed sqlite locking".into(), agent_label: "claude-code".into(), is_subagent: false, score: 0.7, updated_at: now },
+            WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "b".into(), detail: "fixed sqlite locking issue".into(), agent_label: "claude-code".into(), is_subagent: false, score: 0.9, updated_at: now },
         ];
         let merged = merge_items(items, 40);
         assert_eq!(merged.len(), 1);
