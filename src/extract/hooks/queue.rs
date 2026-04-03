@@ -34,7 +34,22 @@ pub struct WorkerStats {
     pub processed: u64,
     pub requeued: u64,
     pub dead_lettered: u64,
+    pub suppressed_duplicates: u64,
     pub last_run_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecentEventEntry {
+    fingerprint: String,
+    preview: String,
+    agent_label: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RecentEventState {
+    #[serde(default)]
+    items: Vec<RecentEventEntry>,
 }
 
 pub fn queue_memory_job(
@@ -51,6 +66,32 @@ pub fn queue_memory_job(
     if text.trim().is_empty() {
         return Ok(());
     }
+    append_raw_archive(
+        config,
+        mode.clone(),
+        source,
+        source_label,
+        &agent_label,
+        is_subagent,
+        priority,
+        source_query.as_deref(),
+        &text,
+    )?;
+
+    if suppress_duplicate_event(
+        config,
+        source,
+        &agent_label,
+        is_subagent,
+        source_query.as_deref(),
+        &text,
+    )? {
+        let mut stats = load_worker_stats(config);
+        stats.suppressed_duplicates += 1;
+        let _ = save_worker_stats(config, &stats);
+        return Ok(());
+    }
+
     let path = queue_path(config);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -259,8 +300,17 @@ fn stats_path(config: &ReinConfig) -> std::path::PathBuf {
     project_scoped_path(config, "memory_worker_stats")
 }
 
+fn archive_path(config: &ReinConfig) -> std::path::PathBuf {
+    let date = Utc::now().format("%Y%m%d").to_string();
+    project_scoped_path(config, &format!("memory_raw_{date}"))
+}
+
 fn spawn_marker_path(config: &ReinConfig) -> std::path::PathBuf {
     project_scoped_path(config, "memory_worker_spawn")
+}
+
+fn recent_events_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "memory_recent_events")
 }
 
 fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
@@ -384,4 +434,148 @@ fn save_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result
     }
     std::fs::write(path, serde_json::to_string_pretty(stats)?)?;
     Ok(())
+}
+
+fn append_raw_archive(
+    config: &ReinConfig,
+    mode: MemoryJobMode,
+    source: &str,
+    source_label: &str,
+    agent_label: &str,
+    is_subagent: bool,
+    priority: u8,
+    source_query: Option<&str>,
+    text: &str,
+) -> anyhow::Result<()> {
+    let path = archive_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::json!({
+        "id": ulid::Ulid::new().to_string(),
+        "mode": mode,
+        "source": source,
+        "source_label": source_label,
+        "agent_label": agent_label,
+        "is_subagent": is_subagent,
+        "priority": priority,
+        "source_query": source_query,
+        "text": text,
+        "created_at": Utc::now().to_rfc3339(),
+    });
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
+fn suppress_duplicate_event(
+    config: &ReinConfig,
+    source: &str,
+    agent_label: &str,
+    is_subagent: bool,
+    source_query: Option<&str>,
+    text: &str,
+) -> anyhow::Result<bool> {
+    let path = recent_events_path(config);
+    let now = Utc::now();
+    let mut state = load_recent_events(config);
+    let window_ms = config.async_memory.fingerprint_window_ms as i64;
+
+    state.items.retain(|item| (now - item.created_at).num_milliseconds() <= window_ms);
+
+    let normalized = normalized_event_text(source, source_query, text);
+    let preview: String = normalized.chars().take(1000).collect();
+    let fingerprint = sha256_hex(&preview);
+
+    let duplicate = state.items.iter().any(|item| {
+        if item.agent_label != agent_label {
+            return false;
+        }
+        if is_subagent && !item.agent_label.contains(":") {
+            return false;
+        }
+        if item.fingerprint == fingerprint {
+            return true;
+        }
+        crate::extract::similarity(&item.preview, &preview) > 0.94
+    });
+
+    state.items.push(RecentEventEntry {
+        fingerprint,
+        preview,
+        agent_label: agent_label.to_string(),
+        created_at: now,
+    });
+    if state.items.len() > config.async_memory.recent_event_cache_size {
+        let start = state.items.len() - config.async_memory.recent_event_cache_size;
+        state.items = state.items.split_off(start);
+    }
+    save_recent_events(config, &path, &state)?;
+    Ok(duplicate)
+}
+
+fn load_recent_events(config: &ReinConfig) -> RecentEventState {
+    let path = recent_events_path(config);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return RecentEventState::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_recent_events(
+    _config: &ReinConfig,
+    path: &std::path::Path,
+    state: &RecentEventState,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+fn normalized_event_text(source: &str, source_query: Option<&str>, text: &str) -> String {
+    let joined = match source_query {
+        Some(query) => format!("{source}\n{query}\n{text}"),
+        None => format!("{source}\n{text}"),
+    };
+    joined
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric()
+                || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+                || ch.is_whitespace()
+            {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sha256_hex(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_event_text_collapses_punctuation() {
+        let a = normalized_event_text("hook_stop", Some("hello"), "Fixed sqlite-locking!");
+        let b = normalized_event_text("hook_stop", Some("hello"), "Fixed sqlite locking.");
+        assert!(crate::extract::similarity(&a, &b) > 0.94);
+    }
 }
