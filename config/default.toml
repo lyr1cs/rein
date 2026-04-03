@@ -110,6 +110,15 @@ model = "default"
 disable_thinking = true  # Prepend /no_think (for Qwen3). Set false for other models.
 # Works with omlx serve, Ollama, LM Studio, etc.
 
+[proxy]
+port = 8690
+bind = "127.0.0.1"
+anthropic_upstream = "https://api.anthropic.com"
+openai_upstream = "https://api.openai.com"
+inject_limit = 3000      # max tokens to inject
+extract_enabled = true    # extract memories from assistant responses
+recall_limit = 5          # memories to recall per request
+
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure
 min_samples_alpha = 10            # Min accessed events per bucket before learning alpha
