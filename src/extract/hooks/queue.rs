@@ -16,6 +16,10 @@ pub struct MemoryJob {
     pub id: String,
     pub mode: MemoryJobMode,
     pub source: String,
+    pub source_label: String,
+    pub agent_label: String,
+    pub is_subagent: bool,
+    pub priority: u8,
     pub source_query: Option<String>,
     pub text: String,
     #[serde(default)]
@@ -37,6 +41,10 @@ pub fn queue_memory_job(
     config: &ReinConfig,
     mode: MemoryJobMode,
     source: &str,
+    source_label: &str,
+    agent_label: String,
+    is_subagent: bool,
+    priority: u8,
     source_query: Option<String>,
     text: String,
 ) -> anyhow::Result<()> {
@@ -51,6 +59,10 @@ pub fn queue_memory_job(
         id: ulid::Ulid::new().to_string(),
         mode,
         source: source.to_string(),
+        source_label: source_label.to_string(),
+        agent_label,
+        is_subagent,
+        priority,
         source_query,
         text,
         attempts: 0,
@@ -142,10 +154,15 @@ async fn drain_memory_queue_locked(
             ready.push(job);
         }
     }
+    ready.sort_by(|a, b| {
+        b.priority.cmp(&a.priority)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
 
     let mut processed = 0u32;
     let mut remaining = Vec::new();
     let mut stats = load_worker_stats(config);
+    let total_ready = ready.len();
     for job in ready.into_iter().take(config.async_memory.max_jobs_per_run) {
         match process_job(config, job.clone()).await {
             Ok(done) => {
@@ -166,12 +183,17 @@ async fn drain_memory_queue_locked(
     }
 
     // Preserve unprocessed ready jobs and future-scheduled jobs.
-    let skipped_ready = content.lines()
-        .filter_map(|line| serde_json::from_str::<MemoryJob>(line).ok())
-        .filter(|job| !job.next_attempt_at.is_some_and(|ts| ts > now))
-        .skip(config.async_memory.max_jobs_per_run)
-        .collect::<Vec<_>>();
-    remaining.extend(skipped_ready);
+    if total_ready > config.async_memory.max_jobs_per_run {
+        let mut ready_tail = content.lines()
+            .filter_map(|line| serde_json::from_str::<MemoryJob>(line).ok())
+            .filter(|job| !job.next_attempt_at.is_some_and(|ts| ts > now))
+            .collect::<Vec<_>>();
+        ready_tail.sort_by(|a, b| {
+            b.priority.cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        remaining.extend(ready_tail.into_iter().skip(config.async_memory.max_jobs_per_run));
+    }
     remaining.extend(deferred);
 
     if !remaining.is_empty() {
@@ -195,13 +217,23 @@ async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32>
     match job.mode {
         MemoryJobMode::Quick => {
             let extracted = crate::extract::llm::extract_with_worker_preference(config, &job.text, 2).await;
-            let extracted = dedup_quick(extracted);
-            let stored = super::persist::process_quick_extraction(config, extracted)?;
+            let extracted = dedup_quick(extracted, &job);
+            let stored = super::persist::process_quick_extraction(
+                config,
+                extracted,
+                &job.agent_label,
+                job.is_subagent,
+            )?;
             Ok(stored)
         }
         MemoryJobMode::Full => {
             let result = crate::extract::llm::extract_full_with_worker_preference(config, &job.text).await;
-            let (memories, _concepts, _links) = super::persist::process_full_extraction(config, result)?;
+            let (memories, _concepts, _links) = super::persist::process_full_extraction(
+                config,
+                result,
+                &job.agent_label,
+                job.is_subagent,
+            )?;
             Ok(memories)
         }
     }
@@ -281,9 +313,22 @@ fn recover_inflight(path: &std::path::Path, inflight: &std::path::Path) -> anyho
     Ok(())
 }
 
-fn dedup_quick(items: Vec<crate::extract::llm::ExtractedMemory>) -> Vec<crate::extract::llm::ExtractedMemory> {
+fn dedup_quick(
+    items: Vec<crate::extract::llm::ExtractedMemory>,
+    job: &MemoryJob,
+) -> Vec<crate::extract::llm::ExtractedMemory> {
     let mut unique: Vec<crate::extract::llm::ExtractedMemory> = Vec::new();
     'outer: for item in items {
+        if job.is_subagent {
+            let score = crate::extract::patterns::score_sentence(&item.content)
+                .max(crate::extract::patterns::score_sentence(&item.summary));
+            let strong_topic = ["architecture", "decision", "debug", "config", "workflow"]
+                .iter()
+                .any(|k| item.topic.to_lowercase().contains(k));
+            if item.quality_confidence < 0.7 && score < 4 && !strong_topic {
+                continue;
+            }
+        }
         for existing in &unique {
             if item.topic == existing.topic
                 && (crate::extract::similarity(&item.summary, &existing.summary) > 0.82
