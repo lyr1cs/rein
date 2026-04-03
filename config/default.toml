@@ -129,6 +129,14 @@ store_min_score = 3        # pattern score required before proxy extraction runs
 
 [async_memory]
 provider = "inherit"       # inherit [extract].provider; can be "google", "omlx", or "none"
+max_retries = 3            # retry failed async memory jobs before dead-lettering
+base_backoff_ms = 2000     # retry backoff base (2s, 4s, 8s, ...)
+max_jobs_per_run = 32      # worker drains up to this many jobs before exiting
+batch_size = 8             # ready jobs processed per batch
+spawn_cooldown_ms = 1500   # avoid spawn storms when many events arrive together
+max_working_set_items = 40 # cap the per-project session working surface
+max_always_on_items = 24   # cap the per-project stable always-on surface
+selection_limit = 5        # max injected items selected across both surfaces
 
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure
