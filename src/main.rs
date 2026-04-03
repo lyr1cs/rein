@@ -27,6 +27,9 @@ enum Commands {
         /// Enable SSE transport (not yet implemented)
         #[arg(long)]
         sse: bool,
+        /// Start transparent proxy for LLM API memory injection
+        #[arg(long)]
+        proxy: bool,
     },
     /// Store a memory
     Store {
@@ -164,12 +167,14 @@ async fn main() -> anyhow::Result<()> {
     config.validate();
 
     match cli.command {
-        Some(Commands::Serve { compact, sse }) => {
+        Some(Commands::Serve { compact, sse, proxy }) => {
             let mut config = config;
             if compact {
                 config.server.compact = true;
             }
-            if sse {
+            if proxy {
+                rein::proxy::run_proxy(config).await?;
+            } else if sse {
                 config.server.sse_enabled = true;
                 mcp::server::run_http(config).await?;
             } else {
