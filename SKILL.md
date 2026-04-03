@@ -12,14 +12,13 @@ description: >
   memoir, concepts, timeline, history, export, or wants to save/search important context.
 ---
 
-# rein Memory System (v0.8.0)
+# rein Memory System (v0.10.0)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
-(24 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
-or local models), temporal knowledge graph (concept revision history, episode nodes, temporal
-link validity), autonomous retrieval routing (classifies queries as temporal/exact/semantic/
-exploratory and adapts fusion weights + search paths), memory evolution (refine/supersede),
-multi-factor admission control, CC/RRF search fusion, and Ebbinghaus forgetting curve decay.
+(25 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
+or local models), temporal knowledge graph, autonomous retrieval routing, memory evolution,
+transparent LLM proxy (record-only), async memory pipeline with file-based queue and
+background worker, project-scoped working set + always-on index for memory surfaces.
 
 ## CLI Commands
 
@@ -47,19 +46,26 @@ rein export [--format json|md|csv] [--topic X] [--output file]
 
 ### System
 ```bash
-rein serve [--compact] [--sse]               # Start MCP server
+rein serve [--compact] [--sse] [--proxy]     # Start MCP server or transparent proxy
 rein init [--dry-run]                        # Auto-configure MCP clients
 rein config                                  # Show configuration
 rein warmup                                  # Pre-compute embeddings
 rein migrate [--from-qmd path] [--reindex]   # Import/reindex
+rein worker memory                           # Drain async memory queue
 ```
 
 ### Hooks (used by Claude Code)
 ```bash
 rein hook post      # Buffer tool output + pattern extraction (crash safety net)
-rein hook compact   # LLM extraction + buffer for hook_stop
-rein hook prompt    # Inject recalled memories + concepts into prompt
-rein hook stop      # Full knowledge extraction: memories + concepts + links + episode
+rein hook compact   # Record compact context for async extraction
+rein hook prompt    # Compatibility no-op (injection disabled)
+rein hook stop      # Queue full knowledge extraction via async worker
+```
+
+### Proxy (record-only)
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude   # Claude Code
+OPENAI_BASE_URL=http://127.0.0.1:8690 codex       # Codex CLI
 ```
 
 ## MCP Tools (22)
