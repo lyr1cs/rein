@@ -332,6 +332,40 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
     }
 }
 
+/// Create an extractor for async memory labeling.
+///
+/// Provider is configuration-driven:
+/// - "inherit" => follow [extract].provider
+/// - "google"  => force Gemini path
+/// - "omlx"    => force OMLX path
+/// - "none"    => disable LLM labeling for the async worker
+pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
+    use crate::config::Provider;
+    match config.async_memory.provider.to_lowercase().as_str() {
+        "inherit" => create_extractor(config),
+        "google" => {
+            let api_key = config.extract.google.api_key.as_ref()?;
+            Some(ExtractorKind::Gemini(GeminiExtractor::new(
+                api_key.clone(),
+                config.extract.google.endpoint.clone(),
+                config.extract.google.model.clone(),
+            )))
+        }
+        "omlx" => Some(ExtractorKind::Omlx(OmlxExtractor::new(
+            config.extract.omlx.endpoint.clone(),
+            config.extract.omlx.model.clone(),
+            config.extract.omlx.disable_thinking,
+        ))),
+        "none" => None,
+        other => {
+            tracing::warn!("unknown async_memory.provider '{other}', falling back to extract.provider");
+            match config.extract_provider() {
+                Provider::Google | Provider::Omlx | Provider::None => create_extractor(config),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fallback: LLM extraction with pattern-based fallback
 // ---------------------------------------------------------------------------
@@ -339,6 +373,26 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
 /// Truncate input text based on config (safe default for unknown models).
 fn prepare_input(config: &ReinConfig, text: &str) -> String {
     let max_chars = resolve_max_input_chars(config);
+    if max_chars > 0 { text.chars().take(max_chars).collect() } else { text.to_string() }
+}
+
+fn prepare_input_for_kind(config: &ReinConfig, text: &str, extractor: &ExtractorKind) -> String {
+    let max_chars = match extractor {
+        ExtractorKind::Gemini(_) => {
+            let configured = config.extract.google.max_input_chars;
+            if configured > 0 {
+                configured
+            } else if is_large_context_model(&config.extract.google.model) {
+                0
+            } else {
+                SAFE_DEFAULT_MAX_CHARS
+            }
+        }
+        ExtractorKind::Omlx(_) => {
+            let configured = config.extract.omlx.max_input_chars;
+            if configured > 0 { configured } else { SAFE_DEFAULT_MAX_CHARS }
+        }
+    };
     if max_chars > 0 { text.chars().take(max_chars).collect() } else { text.to_string() }
 }
 
@@ -373,6 +427,23 @@ pub async fn extract_with_fallback(
             Ok(memories) if !memories.is_empty() => return memories,
             Ok(_) => {}
             Err(e) => tracing::warn!("LLM extraction failed, falling back to patterns: {e}"),
+        }
+    }
+    facts_to_memories(text, pattern_threshold)
+}
+
+/// Extract memories using the async memory worker provider, then pattern fallback.
+pub async fn extract_with_worker_preference(
+    config: &ReinConfig,
+    text: &str,
+    pattern_threshold: u32,
+) -> Vec<ExtractedMemory> {
+    if let Some(extractor) = create_memory_worker_extractor(config) {
+        let input = prepare_input_for_kind(config, text, &extractor);
+        match extractor.extract(&input).await {
+            Ok(memories) if !memories.is_empty() => return memories,
+            Ok(_) => {}
+            Err(e) => tracing::warn!("memory worker extraction failed, falling back: {e}"),
         }
     }
     facts_to_memories(text, pattern_threshold)
@@ -452,6 +523,33 @@ pub async fn extract_full_with_fallback(
                     }
                 }
                 tracing::warn!("LLM simple extraction also failed, falling back to patterns");
+            }
+        }
+    }
+
+    ExtractionResult {
+        memories: facts_to_memories(text, 2),
+        ..Default::default()
+    }
+}
+
+/// Full extraction using the async memory worker provider.
+pub async fn extract_full_with_worker_preference(
+    config: &ReinConfig,
+    text: &str,
+) -> ExtractionResult {
+    if let Some(extractor) = create_memory_worker_extractor(config) {
+        let input = prepare_input_for_kind(config, text, &extractor);
+
+        match extractor.extract_full(&input).await {
+            Ok(result) => return result,
+            Err(e) => {
+                tracing::warn!("memory worker full extraction failed, falling back to simple: {e}");
+                if let Ok(memories) = extractor.extract(&input).await {
+                    if !memories.is_empty() {
+                        return ExtractionResult { memories, ..Default::default() };
+                    }
+                }
             }
         }
     }
