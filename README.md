@@ -400,27 +400,52 @@ sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
 
 rein can run as a transparent HTTP proxy that records LLM conversations without modifying requests. This works with any agent that supports base URL override.
 
+#### Quick Start
+
 ```bash
-# Start the proxy
-rein serve --proxy
+# 1. Start the proxy (background)
+rein serve --proxy &
 
-# Claude Code (login mode works)
-ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
-
-# Codex CLI
-OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"
-
-# Cursor — set Override OpenAI Base URL in settings
+# 2. Use with your agent
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code (login mode works)
+OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"   # OpenAI Codex CLI
 ```
 
-**How it works:**
+#### Shell Aliases (recommended)
+
+Add to `~/.zshrc` or `~/.bashrc` for convenience:
+
+```bash
+alias rein-proxy="rein serve --proxy &"
+alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
+alias codexp="OPENAI_BASE_URL=http://127.0.0.1:8690 codex"
+```
+
+Then: `rein-proxy` to start, `claudep` or `codexp` to use.
+
+#### Supported Agents
+
+| Agent | Environment Variable | Format |
+|-------|---------------------|--------|
+| **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
+| **Codex CLI** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
+| **Cursor** | Settings > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
+| **Windsurf** | Settings > Custom API Endpoint | OpenAI `/v1/chat/completions` |
+| **Any OpenAI-compatible** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
+
+> **Note:** Claude Code login mode (no API key) works — auth tokens are forwarded transparently.
+
+#### How it works
+
 - Proxy intercepts `/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI)
 - Requests are forwarded **unmodified** (record-only, no injection)
 - Assistant responses are asynchronously extracted and stored as memories
 - SSE streaming is passed through byte-for-byte with zero latency impact
 - Dedicated blocking thread with resident SqliteStore for extraction
+- Other endpoints (e.g. `/v1/models`) are passed through unmodified
 
-**Configuration:**
+#### Configuration
+
 ```toml
 [proxy]
 port = 8690
@@ -945,22 +970,48 @@ sse_bind = "0.0.0.0"    # 需要设置 REIN_HTTP_TOKEN
 
 rein 可以作为透明 HTTP 代理运行，记录 LLM 对话而不修改请求。支持任何允许自定义 base URL 的 agent。
 
+#### 快速开始
+
 ```bash
-# 启动代理
-rein serve --proxy
+# 1. 启动代理（后台运行）
+rein serve --proxy &
 
-# Claude Code（登录模式也可用）
-ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
-
-# Codex CLI
-OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"
+# 2. 配合你的 agent 使用
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code（登录模式也可用）
+OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"   # OpenAI Codex CLI
 ```
 
-**工作原理：**
+#### Shell 别名（推荐）
+
+添加到 `~/.zshrc` 或 `~/.bashrc`：
+
+```bash
+alias rein-proxy="rein serve --proxy &"
+alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
+alias codexp="OPENAI_BASE_URL=http://127.0.0.1:8690 codex"
+```
+
+然后：`rein-proxy` 启动代理，`claudep` 或 `codexp` 使用。
+
+#### 支持的 Agent
+
+| Agent | 环境变量 | API 格式 |
+|-------|---------|----------|
+| **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
+| **Codex CLI** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
+| **Cursor** | 设置 > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
+| **Windsurf** | 设置 > Custom API Endpoint | OpenAI `/v1/chat/completions` |
+| **任何 OpenAI 兼容工具** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
+
+> **注意：** Claude Code 登录模式（无需 API key）可正常工作 — auth token 会被透明转发。
+
+#### 工作原理
+
 - 代理拦截 `/v1/messages`（Anthropic）和 `/v1/chat/completions`（OpenAI）
 - 请求**原样转发**（仅记录，不注入）
 - 异步从 assistant 响应中提取记忆并存储
 - SSE 流式传输逐字节透传，零延迟影响
+- 其他端点（如 `/v1/models`）原样透传
 
 ### 异步记忆管线 (v0.10.0)
 
