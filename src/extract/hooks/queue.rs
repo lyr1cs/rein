@@ -94,13 +94,19 @@ pub fn queue_memory_job(
 
     // Also check pending queue for similar jobs (prevents cross-session duplicates
     // that fall outside the fingerprint_window_ms).
+    // A Full job is never suppressed by a Quick job (Full produces concepts/links/episodes).
     let path = queue_path(config);
     if let Ok(queue_content) = std::fs::read_to_string(&path) {
         let preview: String = text.chars().take(500).collect();
+        let is_full = matches!(mode, MemoryJobMode::Full);
         for line in queue_content.lines().rev().take(50) {
             if let Ok(existing) = serde_json::from_str::<MemoryJob>(line) {
+                // Don't suppress a Full job if existing is Quick.
+                if is_full && matches!(existing.mode, MemoryJobMode::Quick) {
+                    continue;
+                }
                 if crate::extract::similarity(&preview, &existing.text.chars().take(500).collect::<String>()) > 0.85 {
-                    return Ok(()); // Already queued
+                    return Ok(()); // Already queued with same or higher fidelity
                 }
             }
         }
