@@ -27,7 +27,7 @@ enum Commands {
         /// Enable SSE transport (not yet implemented)
         #[arg(long)]
         sse: bool,
-        /// Start transparent proxy for LLM API memory injection
+        /// Start transparent proxy for LLM API recording
         #[arg(long)]
         proxy: bool,
     },
@@ -151,7 +151,7 @@ enum HookAction {
     Post,
     /// Extract context before compaction (PreCompact)
     Compact,
-    /// Inject recalled memories into prompt (UserPromptSubmit)
+    /// UserPromptSubmit compatibility hook (currently a no-op)
     Prompt,
     /// Save session summary on conversation end (Stop)
     Stop,

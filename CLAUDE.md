@@ -15,7 +15,7 @@ cargo install --path . # Install to ~/.cargo/bin/rein
 rein is a multi-source cross-validated memory MCP server (25 tools, 12-feature reranker). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based
-- `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit), stop (Stop)
+- `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop)
 - `search/recall.rs` — 3-level waterfall (Tantivy BM25 → HNSW → Gemini API) + RRF/CC fusion + Ebbinghaus decay + parallel pipeline
 - `search/expand.rs` — Query expansion (Gemini Flash Lite / OMLX dual backend)
 - `search/rerank_llm.rs` — LLM reranker (Gemini / OMLX) + strong signal bypass
@@ -59,7 +59,7 @@ Post-fusion multi-feature reranking (8 features, learned weights from M1/M2).
 **M5 tier filtering** (v0.9.0): Cold-tier memories excluded from non-Exploratory queries.
 **Parallel pipeline** (v0.9.0): Supermemory + expansion launched concurrently with original query search.
 Extraction postprocess: algorithmic date/preference/knowledge-update detection + LLM prompt rules.
-`hook_prompt` uses local-only recall (no external API calls for privacy).
+Automatic prompt injection is disabled. `hook_prompt` remains as a compatibility no-op while memory production flows through record-only proxy + async worker + layered memory surfaces.
 
 ## Adaptive Engine (v0.5.0)
 
