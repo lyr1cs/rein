@@ -314,6 +314,8 @@ async fn stream_response(
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
         let mut assistant_buf = String::new();
+        // SSE line buffer: transport chunks may split across SSE event boundaries.
+        let mut sse_line_buf = String::new();
         const MAX_EXTRACT_BUF: usize = 200_000; // ~50K tokens, prevent OOM
 
         use futures_util::StreamExt;
@@ -321,12 +323,23 @@ async fn stream_response(
             match chunk_result {
                 Ok(chunk) => {
                     // Parse SSE chunks for assistant text extraction.
+                    // Buffer incomplete lines across chunk boundaries.
                     if extract_enabled && assistant_buf.len() < MAX_EXTRACT_BUF {
-                        if let Some(text) = provider_clone.extract_assistant_text_sse(&chunk) {
-                            assistant_buf.push_str(&text);
+                        if let Ok(text) = std::str::from_utf8(&chunk) {
+                            sse_line_buf.push_str(text);
+                            // Process only complete lines (ending with \n).
+                            while let Some(newline_pos) = sse_line_buf.find('\n') {
+                                let line = sse_line_buf[..newline_pos].to_string();
+                                sse_line_buf = sse_line_buf[newline_pos + 1..].to_string();
+                                if let Some(extracted) =
+                                    provider_clone.extract_assistant_text_sse(line.as_bytes())
+                                {
+                                    assistant_buf.push_str(&extracted);
+                                }
+                            }
                         }
                     }
-                    // Forward chunk to client.
+                    // Forward chunk to client (unmodified, byte-perfect).
                     if tx.send(Ok(Frame::data(chunk))).await.is_err() {
                         break; // Client disconnected.
                     }
