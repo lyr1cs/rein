@@ -48,6 +48,8 @@ pub struct ReinConfig {
     pub query_expansion: QueryExpansionConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub async_memory: AsyncMemoryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -240,6 +242,14 @@ pub struct ExtractConfig {
     pub provider: String,
     pub google: GoogleExtractConfig,
     pub omlx: OmlxExtractConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AsyncMemoryConfig {
+    /// Which LLM provider the async memory worker uses.
+    /// "inherit" follows [extract].provider.
+    pub provider: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -516,6 +526,14 @@ impl Default for ExtractConfig {
     }
 }
 
+impl Default for AsyncMemoryConfig {
+    fn default() -> Self {
+        Self {
+            provider: "inherit".to_string(),
+        }
+    }
+}
+
 impl Default for GoogleExtractConfig {
     fn default() -> Self {
         Self {
@@ -635,6 +653,9 @@ impl ReinConfig {
                 Ok(p) => config.proxy.port = p,
                 Err(_) => eprintln!("rein: WARNING — REIN_PROXY_PORT='{port}' is not a valid port number, using default {}", config.proxy.port),
             }
+        }
+        if let Ok(provider) = std::env::var("REIN_ASYNC_MEMORY_PROVIDER") {
+            config.async_memory.provider = provider;
         }
 
         Ok(config)

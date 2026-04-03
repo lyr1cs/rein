@@ -127,6 +127,9 @@ summary_max_chars = 160    # summary-only injection budget per item
 store_min_chars = 220      # don't run proxy extraction on short assistant replies
 store_min_score = 3        # pattern score required before proxy extraction runs
 
+[async_memory]
+provider = "inherit"       # inherit [extract].provider; can be "google", "omlx", or "none"
+
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure
 min_samples_alpha = 10            # Min accessed events per bucket before learning alpha
