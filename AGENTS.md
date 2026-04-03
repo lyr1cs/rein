@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.9.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 25 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline.
+rein v0.10.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 25 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker.
 
 ## Build & Test
 
@@ -57,16 +57,30 @@ src/
 │   ├── llm.rs       # LLM extraction (Gemini + OMLX/Ollama), fallback to patterns
 │   ├── postprocess.rs # Rule-based post-processing (date keywords, preference tagging, knowledge update)
 │   ├── patterns.rs  # Rule-based keyword scoring (fallback when LLM unavailable)
-│   ├── hooks/       # Four-layer hook commands (parsing, buffer, scoring, mod)
+│   ├── hooks/       # Hook commands + async pipeline
+│   │   ├── mod.rs   # Hook orchestration (post, compact, prompt no-op, stop)
+│   │   ├── queue.rs # Async memory queue (file-based, flock-protected, crash-safe)
+│   │   ├── working_set.rs # Project-scoped memory surfaces (working set + always-on index)
+│   │   ├── persist.rs # Memory persistence + working-set updates
+│   │   ├── parsing.rs # JSON payload extraction, agent detection
+│   │   ├── buffer.rs  # Session buffer I/O
+│   │   └── scoring.rs # Signal scoring and filtering
 │   └── dedup.rs     # Similarity (Jaccard + containment)
 ├── sync/
 │   ├── supermemory.rs # Supermemory v4 API client
 │   ├── auto_memory.rs # ~/.claude/ file scanner
 │   └── validate.rs    # Cross-source validation
+├── proxy/
+│   ├── mod.rs       # Transparent proxy server (record-only, dedicated store thread)
+│   ├── provider.rs  # Provider detection (Anthropic / OpenAI, extensible for Gemini)
+│   ├── anthropic.rs # Anthropic /v1/messages format handling
+│   ├── openai.rs    # OpenAI /v1/chat/completions format handling
+│   ├── policy.rs    # Extraction policy decisions
+│   └── extract.rs   # Async response extraction + queue integration
 └── mcp/
-    ├── server.rs    # MCP server (24 tools, stdio + HTTP/SSE)
+    ├── server.rs    # MCP server (25 tools, stdio + HTTP/SSE)
     ├── tools.rs     # Tool parameter structs
-    └── compact.rs   # Output formatters (recall now includes content)
+    └── compact.rs   # Output formatters
 
 bench/               # LongMemEval benchmark adapters
 ├── longmemeval_fast.py  # Fast parallel adapter (per-question temp DB)
@@ -90,6 +104,9 @@ docker-compose.yml   # One-command deployment
 - HNSW and Tantivy side indexes are updated on every store/update/delete (fire-and-forget)
 - Warmup always rebuilds HNSW and Tantivy indexes before processing new embeddings
 - LLM extraction falls back to rule-based patterns when provider is unavailable
+- Tantivy writer lock failure → graceful skip (side index, not critical)
+- Tantivy/HNSW rebuild uses flock to prevent concurrent corruption
+- Proxy is record-only (no request modification); extraction via async queue
 - Tantivy topic filtering uses BooleanQuery at index level (not post-filter)
 - Auto-link creates bidirectional related_ids on store
 - `max_input_chars=0` only allowed for known 1M-token Gemini models (safety fallback to 16K)
@@ -112,4 +129,4 @@ docker-compose.yml   # One-command deployment
 
 ## Environment Variables
 
-GEMINI_API_KEY, SUPERMEMORY_CC_API_KEY, REIN_HTTP_TOKEN, REIN_DB, REIN_LOG, REIN_SSE_BIND, REIN_SSE_PORT
+GEMINI_API_KEY, SUPERMEMORY_CC_API_KEY, REIN_HTTP_TOKEN, REIN_DB, REIN_LOG, REIN_SSE_BIND, REIN_SSE_PORT, REIN_PROXY_BIND, REIN_PROXY_PORT, REIN_PROXY_TOKEN, REIN_PROXY_ACTIVE
