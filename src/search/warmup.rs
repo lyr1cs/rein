@@ -149,12 +149,27 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
 
 /// Populate the Tantivy FTS index from all memories in SQLite.
 /// Clears the existing index first to remove stale entries.
+/// Uses a file lock to prevent concurrent rebuilds across processes.
 pub fn populate_tantivy(store: &SqliteStore) {
     let db_path = store.db_path();
     if db_path.to_str() == Some(":memory:") {
         return;
     }
     let tantivy_path = db_path.with_extension("tantivy");
+    let lock_path = db_path.with_extension("tantivy.rebuild.lock");
+
+    // Acquire exclusive file lock — skip if another process is rebuilding.
+    let lock_file = match std::fs::File::create(&lock_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    use std::os::unix::io::AsRawFd;
+    let fd = lock_file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        tracing::debug!("tantivy: another process is rebuilding, skipping");
+        return;
+    }
 
     // Clear stale index before rebuilding
     let _ = std::fs::remove_dir_all(&tantivy_path);
@@ -185,4 +200,8 @@ pub fn populate_tantivy(store: &SqliteStore) {
     if indexed > 0 {
         tracing::info!("tantivy: indexed {indexed} documents");
     }
+
+    // Lock released when lock_file is dropped.
+    drop(lock_file);
+    let _ = std::fs::remove_file(&lock_path);
 }
