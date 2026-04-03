@@ -70,7 +70,10 @@ pub fn update_working_set(
         .open(&lock_path)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
     // Blocking lock — wait for other updaters to finish.
-    unsafe { libc::flock(fd, libc::LOCK_EX) };
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if rc != 0 {
+        tracing::warn!("working_set: flock failed, proceeding without lock");
+    }
 
     let mut current = load_working_set(config);
     let mut incoming = build_items(memories, concepts, episode, agent_label, is_subagent);
@@ -80,7 +83,7 @@ pub fn update_working_set(
     let state = WorkingSetState { items: merged };
     std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
 
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(lock_file);
     Ok(())
 }
@@ -120,7 +123,10 @@ pub fn update_always_on_index(
         .write(true)
         .open(&lock_path)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
-    unsafe { libc::flock(fd, libc::LOCK_EX) };
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if rc != 0 {
+        tracing::warn!("always_on_index: flock failed, proceeding without lock");
+    }
 
     let mut current = load_always_on_index(config);
     let mut incoming = build_always_on_items(memories, concepts, episode, agent_label, is_subagent);
@@ -129,7 +135,7 @@ pub fn update_always_on_index(
     let state = AlwaysOnState { items: merged };
     std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
 
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(lock_file);
     Ok(())
 }
