@@ -100,7 +100,7 @@ rein serve
 | `upgrade` | Upgrade old memories to knowledge graph | `rein upgrade [--topic X] [--dry-run]` |
 | `hook post` | Extract facts from tool output | `rein hook post` |
 | `hook compact` | Save context before compaction | `rein hook compact` |
-| `hook prompt` | Inject recalled memories + concepts into prompt | `rein hook prompt` |
+| `hook prompt` | Compatibility no-op for UserPromptSubmit | `rein hook prompt` |
 | `hook stop` | Full knowledge extraction on session end | `rein hook stop` |
 
 ### MCP Tools
@@ -156,9 +156,9 @@ rein uses LLM (Gemini 3.1 Flash Lite or local models via OMLX) for structured me
 
 **Architecture:**
 - `hook_post` — local pattern extraction (crash safety net) + buffer to session file
-- `hook_compact` — LLM extraction + buffer
-- `hook_stop` — full knowledge extraction: memories + concepts + links + episode summary
-- `hook_prompt` — injects recalled memories AND knowledge graph concepts
+- `hook_compact` — record compact context for async extraction
+- `hook_stop` — queue full session distillation: memories + concepts + links + episode summary
+- `hook_prompt` — compatibility no-op (automatic prompt injection removed)
 
 **Upgrade old memories:**
 ```bash
@@ -348,14 +348,6 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "rein hook prompt", "timeout": 10 }
-        ]
-      }
-    ],
     "Stop": [
       {
         "matcher": "",
@@ -368,12 +360,12 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
 }
 ```
 
-**Hook behavior (4 hooks):**
+**Hook behavior (3 active hooks + 1 compatibility hook):**
 
 - `PostToolUse` -- local pattern extraction (crash safety net) + buffers for session-end batch processing
-- `PreCompact` -- LLM extraction + buffers important context
-- `UserPromptSubmit` -- injects recalled memories AND knowledge graph concepts as `<rein-context>`
-- `Stop` -- full knowledge extraction: memories + concepts + links + episode summary via LLM
+- `PreCompact` -- records compact context for the async memory pipeline
+- `UserPromptSubmit` -- compatibility no-op; rein no longer auto-injects prompt context
+- `Stop` -- queues full knowledge extraction: memories + concepts + links + episode summary via async worker
 
 ### Remote Access via HTTP/SSE
 
@@ -637,14 +629,14 @@ rein serve
 | `config` | 显示当前配置 | `rein config` |
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
-| `hook prompt` | 将召回的记忆注入提示词 | `rein hook prompt` |
+| `hook prompt` | UserPromptSubmit 兼容性空操作 | `rein hook prompt` |
 | `recent` | 显示最近记忆 | `rein recent [-l 20]` |
 | `gc` | 垃圾回收弱 STM 记忆 | `rein gc [--dry-run]` |
 | `organize` | 自动关联记忆 | `rein organize` |
 | `upgrade` | 将旧记忆升级为知识图谱 | `rein upgrade [--topic X] [--dry-run]` |
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
-| `hook prompt` | 将记忆 + 知识概念注入提示词 | `rein hook prompt` |
+| `hook prompt` | 自动注入已取消，仅保留命令入口 | `rein hook prompt` |
 | `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
 
 ### MCP 工具
@@ -693,9 +685,9 @@ rein 使用 LLM（Gemini 3.1 Flash Lite 或本地模型）进行结构化记忆�
 
 **架构：**
 - `hook_post` — 本地模式提取（崩溃安全网）+ 缓冲到 session 文件
-- `hook_compact` — LLM 提取 + 缓冲
-- `hook_stop` — 完整知识提取：记忆 + 概念 + 关系 + 会话摘要
-- `hook_prompt` — 注入记忆 + 知识图谱概念（按相关度混排）
+- `hook_compact` — 记录 compact 上下文，交给异步 memory worker 提炼
+- `hook_stop` — 完整知识提取：记忆 + 概念 + 关系 + 会话摘要（异步 worker）
+- `hook_prompt` — 兼容性空操作（已取消自动注入）
 
 **升级旧记忆：**
 ```bash
@@ -831,14 +823,6 @@ sse_bind = "127.0.0.1"
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "rein hook prompt", "timeout": 10 }
-        ]
-      }
-    ],
     "Stop": [
       {
         "matcher": "",
@@ -851,12 +835,12 @@ sse_bind = "127.0.0.1"
 }
 ```
 
-**Hook 行为说明（4 个 Hook）：**
+**Hook 行为说明（3 个活跃 Hook + 1 个兼容 Hook）：**
 
 - `PostToolUse` -- 本地模式提取（崩溃安全网）+ 缓冲到 session 文件
-- `PreCompact` -- LLM 提取 + 缓冲重要上下文
-- `UserPromptSubmit` -- 将记忆 + 知识图谱概念以 `<rein-context>` 形式注入提示词
-- `Stop` -- 完整知识提取：记忆 + 概念 + 关系 + 会话摘要（通过 LLM）
+- `PreCompact` -- 记录重要上下文并交给异步 memory worker
+- `UserPromptSubmit` -- 兼容性空操作；不再自动注入提示词
+- `Stop` -- 完整知识提取：记忆 + 概念 + 关系 + 会话摘要（通过异步 worker）
 
 ### 通过 HTTP/SSE 远程访问
 
