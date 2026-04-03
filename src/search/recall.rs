@@ -441,9 +441,16 @@ pub fn recall_temporal(
             let channel_coverage = channels.max(1) as f32 / 3.0;
             // Topic match: does memory topic appear as a word in query?
             let query_lower = query.to_lowercase();
-            // Exact word match (not substring) to avoid "sql" matching "nosql"
+            // Word-boundary match: multi-word topics match as phrase, single-word as exact token.
+            // Avoids "sql" matching "nosql" while allowing "release process" to match.
             let topic_lower = mem.topic.to_lowercase();
-            let topic_match = if query_lower.split_whitespace().any(|w| w == topic_lower) { 1.0 } else { 0.0 };
+            let topic_match = if topic_lower.contains(' ') {
+                // Multi-word topic: check if the phrase appears in the query.
+                if query_lower.contains(&topic_lower) { 1.0 } else { 0.0 }
+            } else {
+                // Single-word topic: exact word match (not substring).
+                if query_lower.split_whitespace().any(|w| w == topic_lower) { 1.0 } else { 0.0 }
+            };
             let features = crate::search::rerank::RerankFeatures {
                 fts_score: fts,
                 vec_score: vec,
