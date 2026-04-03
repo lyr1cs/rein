@@ -227,7 +227,11 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
 }
 
 /// Layer 2: UserPromptSubmit — inject recalled memories + concepts.
+/// Skipped automatically when proxy mode is active (REIN_PROXY_ACTIVE=1).
 pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
+    if std::env::var("REIN_PROXY_ACTIVE").as_deref() == Ok("1") {
+        return Ok(());
+    }
     let query = std::io::read_to_string(std::io::stdin())?;
     let query = query.trim();
     if query.is_empty() || query.chars().count() < 5 {
