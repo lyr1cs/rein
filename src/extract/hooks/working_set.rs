@@ -61,13 +61,27 @@ pub fn update_working_set(
         std::fs::create_dir_all(parent)?;
     }
 
+    // File lock prevents concurrent updates from overwriting each other.
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    // Blocking lock — wait for other updaters to finish.
+    unsafe { libc::flock(fd, libc::LOCK_EX) };
+
     let mut current = load_working_set(config);
     let mut incoming = build_items(memories, concepts, episode, agent_label, is_subagent);
 
     current.append(&mut incoming);
     let merged = merge_items(current, config.async_memory.max_working_set_items);
     let state = WorkingSetState { items: merged };
-    std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
+    std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
+
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    drop(lock_file);
     Ok(())
 }
 
@@ -98,12 +112,25 @@ pub fn update_always_on_index(
         std::fs::create_dir_all(parent)?;
     }
 
+    // File lock prevents concurrent updates.
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    unsafe { libc::flock(fd, libc::LOCK_EX) };
+
     let mut current = load_always_on_index(config);
     let mut incoming = build_always_on_items(memories, concepts, episode, agent_label, is_subagent);
     current.append(&mut incoming);
     let merged = merge_items(current, config.async_memory.max_always_on_items);
     let state = AlwaysOnState { items: merged };
-    std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
+    std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
+
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    drop(lock_file);
     Ok(())
 }
 
