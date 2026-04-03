@@ -81,7 +81,7 @@ rein serve
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `serve` | Start MCP server (stdio or SSE) | `rein serve [--compact] [--sse]` |
+| `serve` | Start MCP server (stdio, SSE, or proxy) | `rein serve [--compact] [--sse] [--proxy]` |
 | `store` | Store a memory | `rein store -t debug -c "OOM fix" -I high -k oom,memory` |
 | `recall` | Search memories | `rein recall "connection pool" -t debug -l 5` |
 | `forget` | Delete a memory by ID | `rein forget 01J...` |
@@ -102,6 +102,7 @@ rein serve
 | `hook compact` | Save context before compaction | `rein hook compact` |
 | `hook prompt` | Compatibility no-op for UserPromptSubmit | `rein hook prompt` |
 | `hook stop` | Full knowledge extraction on session end | `rein hook stop` |
+| `worker memory` | Drain the async memory queue | `rein worker memory` |
 
 ### MCP Tools
 
@@ -266,6 +267,9 @@ rein loads configuration with the following priority (highest wins):
 | `REIN_DB` | Override database path |
 | `REIN_CONFIG` | Override config file path |
 | `REIN_LOG` | Log level filter (e.g. `debug`, `info`, `warn`) |
+| `REIN_PROXY_BIND` | Override proxy bind address |
+| `REIN_PROXY_PORT` | Override proxy port |
+| `REIN_PROXY_TOKEN` | Bearer token for non-localhost proxy access |
 
 #### config.toml
 
@@ -390,6 +394,72 @@ Configure bind address and port in `config.toml`:
 sse_enabled = true
 sse_port = 8680
 sse_bind = "0.0.0.0"    # requires REIN_HTTP_TOKEN
+```
+
+### Transparent Proxy (v0.10.0)
+
+rein can run as a transparent HTTP proxy that records LLM conversations without modifying requests. This works with any agent that supports base URL override.
+
+```bash
+# Start the proxy
+rein serve --proxy
+
+# Claude Code (login mode works)
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
+
+# Codex CLI
+OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"
+
+# Cursor — set Override OpenAI Base URL in settings
+```
+
+**How it works:**
+- Proxy intercepts `/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI)
+- Requests are forwarded **unmodified** (record-only, no injection)
+- Assistant responses are asynchronously extracted and stored as memories
+- SSE streaming is passed through byte-for-byte with zero latency impact
+- Dedicated blocking thread with resident SqliteStore for extraction
+
+**Configuration:**
+```toml
+[proxy]
+port = 8690
+bind = "127.0.0.1"
+anthropic_upstream = "https://api.anthropic.com"
+openai_upstream = "https://api.openai.com"
+extract_enabled = true    # record memories from responses
+store_min_chars = 220     # skip short responses
+store_min_score = 3       # quality threshold for extraction
+```
+
+**Security:** Non-localhost binds require `REIN_PROXY_TOKEN`. Auth headers are forwarded opaquely and never logged.
+
+### Async Memory Pipeline (v0.10.0)
+
+Memory extraction is now fully asynchronous. Hooks queue jobs to a file-based queue, and a background worker processes them with LLM extraction, dedup, and persistence.
+
+```bash
+# Manually drain the queue (usually automatic via spawn)
+rein worker memory
+```
+
+**Architecture:**
+- `hook_post` / `hook_compact` / `hook_stop` queue jobs to `~/.rein/memory_queue_<project>.jsonl`
+- Background worker (`rein worker memory`) processes jobs with exponential backoff and dead-lettering
+- Cross-session dedup via fingerprint + content similarity
+- **Working set** — project-scoped memory surface updated on each extraction
+- **Always-on index** — stable, high-quality summaries for project-level context
+
+**Configuration:**
+```toml
+[async_memory]
+max_retries = 3
+base_backoff_ms = 2000
+max_jobs_per_run = 32
+batch_size = 8
+spawn_cooldown_ms = 1500
+max_working_set_items = 40
+max_always_on_items = 24
 ```
 
 ### Architecture
@@ -614,7 +684,7 @@ rein serve
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `serve` | 启动 MCP 服务（stdio 或 SSE） | `rein serve [--compact] [--sse]` |
+| `serve` | 启动 MCP 服务（stdio、SSE 或 proxy） | `rein serve [--compact] [--sse] [--proxy]` |
 | `store` | 存储一条记忆 | `rein store -t debug -c "OOM fix" -I high -k oom,memory` |
 | `recall` | 搜索记忆 | `rein recall "connection pool" -t debug -l 5` |
 | `forget` | 按 ID 删除记忆 | `rein forget 01J...` |
@@ -638,6 +708,7 @@ rein serve
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
 | `hook prompt` | 自动注入已取消，仅保留命令入口 | `rein hook prompt` |
 | `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
+| `worker memory` | 清空异步记忆队列 | `rein worker memory` |
 
 ### MCP 工具
 
@@ -743,6 +814,9 @@ rein 按以下优先级加载配置（高优先级覆盖低优先级）：
 | `REIN_DB` | 覆盖数据库路径 |
 | `REIN_CONFIG` | 覆盖配置文件路径 |
 | `REIN_LOG` | 日志级别过滤（如 `debug`、`info`、`warn`） |
+| `REIN_PROXY_BIND` | 覆盖 proxy 绑定地址 |
+| `REIN_PROXY_PORT` | 覆盖 proxy 端口 |
+| `REIN_PROXY_TOKEN` | 非 localhost proxy 的 bearer token |
 
 #### config.toml
 
@@ -866,6 +940,43 @@ sse_enabled = true
 sse_port = 8680
 sse_bind = "0.0.0.0"    # 需要设置 REIN_HTTP_TOKEN
 ```
+
+### 透明代理 (v0.10.0)
+
+rein 可以作为透明 HTTP 代理运行，记录 LLM 对话而不修改请求。支持任何允许自定义 base URL 的 agent。
+
+```bash
+# 启动代理
+rein serve --proxy
+
+# Claude Code（登录模式也可用）
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
+
+# Codex CLI
+OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"
+```
+
+**工作原理：**
+- 代理拦截 `/v1/messages`（Anthropic）和 `/v1/chat/completions`（OpenAI）
+- 请求**原样转发**（仅记录，不注入）
+- 异步从 assistant 响应中提取记忆并存储
+- SSE 流式传输逐字节透传，零延迟影响
+
+### 异步记忆管线 (v0.10.0)
+
+记忆提取现在完全异步化。Hook 将任务排入文件队列，后台 worker 使用 LLM 提取、去重和持久化。
+
+```bash
+# 手动清空队列（通常自动触发）
+rein worker memory
+```
+
+**架构：**
+- `hook_post` / `hook_compact` / `hook_stop` 将任务排入 `~/.rein/memory_queue_<project>.jsonl`
+- 后台 worker 处理任务，支持指数退避和死信队列
+- 跨会话去重（指纹 + 内容相似度）
+- **Working Set** — 项目级记忆表面，每次提取时更新
+- **Always-on Index** — 稳定的高质量摘要，用于项目级上下文
 
 ### 架构
 
