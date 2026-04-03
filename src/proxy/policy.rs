@@ -1,4 +1,4 @@
-//! Fast path safety policy for proxy injection and extraction.
+//! Fast path safety policy for proxy recording and extraction.
 
 use crate::config::ReinConfig;
 
@@ -48,20 +48,6 @@ const QUESTION_HINTS: &[&str] = &[
     "哪个",
 ];
 
-pub fn should_attempt_injection(config: &ReinConfig, query: &str) -> bool {
-    let query = query.trim();
-    if query.chars().count() < config.proxy.min_query_chars {
-        return false;
-    }
-    !looks_like_smalltalk(query)
-}
-
-pub fn should_inject_ranked(top_score: Option<f32>, min_relevance_score: f32) -> bool {
-    top_score
-        .map(|score| score.is_finite() && score >= min_relevance_score)
-        .unwrap_or(false)
-}
-
 pub fn should_extract_response(
     config: &ReinConfig,
     source_query: Option<&str>,
@@ -81,19 +67,6 @@ pub fn should_extract_response(
         return true;
     }
     crate::extract::patterns::score_sentence(text) >= config.proxy.store_min_score
-}
-
-pub fn compact_summary(summary: &str, content: &str, max_chars: usize) -> String {
-    let base = if !summary.trim().is_empty() {
-        summary.trim()
-    } else {
-        content.trim()
-    };
-    let mut out: String = base.chars().take(max_chars).collect();
-    if base.chars().count() > max_chars {
-        out.push_str("...");
-    }
-    out
 }
 
 pub fn looks_like_smalltalk(text: &str) -> bool {
@@ -152,12 +125,6 @@ mod tests {
         assert!(looks_like_smalltalk("thanks!"));
         assert!(!looks_like_smalltalk("how do I fix sqlite locking"));
         assert!(!looks_like_smalltalk("为什么索引会卡住"));
-    }
-
-    #[test]
-    fn test_compact_summary() {
-        let out = compact_summary("Short summary", "Longer content", 10);
-        assert_eq!(out, "Short summ...");
     }
 
     #[test]
