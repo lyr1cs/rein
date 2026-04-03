@@ -189,6 +189,7 @@ pub enum Source {
     Hook,
     Migration,
     Supermemory,
+    Proxy,
 }
 
 impl Source {
@@ -198,6 +199,7 @@ impl Source {
             Source::Hook => "hook",
             Source::Migration => "migration",
             Source::Supermemory => "supermemory",
+            Source::Proxy => "proxy",
         }
     }
 }

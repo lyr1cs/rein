@@ -46,6 +46,8 @@ pub struct ReinConfig {
     pub adaptive: AdaptiveConfig,
     #[serde(default)]
     pub query_expansion: QueryExpansionConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -430,6 +432,32 @@ impl Default for ServerConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProxyConfig {
+    pub port: u16,
+    pub bind: String,
+    pub anthropic_upstream: String,
+    pub openai_upstream: String,
+    pub inject_limit: usize,
+    pub extract_enabled: bool,
+    pub recall_limit: usize,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            port: 8690,
+            bind: "127.0.0.1".to_string(),
+            anthropic_upstream: "https://api.anthropic.com".to_string(),
+            openai_upstream: "https://api.openai.com".to_string(),
+            inject_limit: 3000,
+            extract_enabled: true,
+            recall_limit: 5,
+        }
+    }
+}
+
 impl Default for HooksConfig {
     fn default() -> Self {
         Self {
@@ -580,6 +608,16 @@ impl ReinConfig {
             match port.parse::<u16>() {
                 Ok(p) => config.server.sse_port = p,
                 Err(_) => eprintln!("rein: WARNING — REIN_SSE_PORT='{port}' is not a valid port number, using default {}", config.server.sse_port),
+            }
+        }
+        // Proxy overrides
+        if let Ok(bind) = std::env::var("REIN_PROXY_BIND") {
+            config.proxy.bind = bind;
+        }
+        if let Ok(port) = std::env::var("REIN_PROXY_PORT") {
+            match port.parse::<u16>() {
+                Ok(p) => config.proxy.port = p,
+                Err(_) => eprintln!("rein: WARNING — REIN_PROXY_PORT='{port}' is not a valid port number, using default {}", config.proxy.port),
             }
         }
 
