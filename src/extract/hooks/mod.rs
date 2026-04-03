@@ -3,167 +3,29 @@
 //! Submodules:
 //! - `parsing` — JSON payload extraction and transcript processing
 //! - `buffer` — Session buffer I/O and lifecycle
+//! - `persist` — durable store + working-set persistence
+//! - `queue` — async memory queue and worker
 //! - `scoring` — Signal scoring and filtering
 //! - `working_set` — project-scoped session working surface for prompt injection
 
 pub mod buffer;
 pub mod parsing;
+pub mod persist;
+pub mod queue;
 pub mod scoring;
 pub mod working_set;
 
 use crate::config::ReinConfig;
-use crate::extract::llm::ExtractedMemory;
 
 use self::buffer::*;
 use self::parsing::*;
-use self::scoring::*;
+use self::queue::*;
+use self::scoring::{extract_signal_windows, worth_extracting};
 use self::working_set::*;
 
 /// Escape a string for safe XML/HTML embedding.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-/// Compute adaptive admission threshold from recent quality data.
-/// Base = 0.2. Adjusts up if recent quality is low, down if high.
-fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
-    let base = 0.2;
-    let recent_avg: f64 = store.conn()
-        .query_row(
-            "SELECT COALESCE(AVG(strength), 0.5) FROM (SELECT strength FROM memories ORDER BY created_at DESC LIMIT 100)",
-            [],
-            |r| r.get(0),
-        ).unwrap_or(0.5);
-
-    if recent_avg < 0.4 {
-        (base * 1.1_f64).min(0.60)
-    } else if recent_avg > 0.7 {
-        (base * 0.9_f64).max(0.15)
-    } else {
-        base
-    }
-}
-
-/// Multi-factor admission score (A-MAC 2026 inspired).
-/// Decomposes single quality_confidence into interpretable sub-factors:
-///   admission = w1*llm_conf + w2*novelty + w3*type_prior + w4*recency
-/// Returns a score in [0, 1]. Higher = more worth storing.
-fn multi_factor_admission_score(
-    store: &crate::store::SqliteStore,
-    item: &ExtractedMemory,
-) -> f64 {
-    // Factor 1: LLM confidence (already provided by extraction)
-    let llm_conf = item.quality_confidence;
-
-    // Factor 2: Novelty — how different is this from existing memories in the same topic?
-    // High similarity to existing = low novelty = less worth storing
-    let novelty = {
-        let existing = store.get_by_topic(&item.topic).unwrap_or_default();
-        if existing.is_empty() {
-            1.0 // first memory in topic → fully novel
-        } else {
-            let max_sim = existing.iter()
-                .map(|m| crate::extract::similarity(&item.content, &m.content))
-                .fold(0.0_f32, f32::max);
-            (1.0 - max_sim as f64).max(0.0) // invert: high sim → low novelty
-        }
-    };
-
-    // Factor 3: Content-type prior — some topics are inherently more valuable
-    let type_prior = {
-        let t = item.topic.to_lowercase();
-        if ["architecture", "decision", "design"].iter().any(|k| t.contains(k)) {
-            0.9
-        } else if ["workflow", "deployment", "config"].iter().any(|k| t.contains(k)) {
-            0.7
-        } else if ["debug", "error", "fix"].iter().any(|k| t.contains(k)) {
-            0.5
-        } else {
-            0.6 // default
-        }
-    };
-
-    // Factor 4: Recency boost (recent extractions slightly favored)
-    let recency = 0.7; // constant for now — all new extractions are "recent"
-
-    // Hard floor: if LLM explicitly rates confidence near zero, don't override
-    if llm_conf < 0.05 { return 0.0; }
-
-    // Weighted combination (weights sum to 1.0)
-    0.45 * llm_conf + 0.25 * novelty + 0.15 * type_prior + 0.15 * recency
-}
-
-/// Store a list of ExtractedMemory items into the database.
-/// Filters secrets and deduplicates. Returns (count, stored_ids).
-fn store_extracted(
-    store: &crate::store::SqliteStore,
-    config: &ReinConfig,
-    mut items: Vec<ExtractedMemory>,
-) -> (u32, Vec<String>) {
-    // Rule-based post-processing: enrich with dates, preferences, knowledge-update signals
-    for item in &mut items {
-        crate::extract::postprocess::postprocess(item);
-    }
-
-    let mut stored = 0u32;
-    let mut stored_ids = Vec::new();
-    for item in items {
-        if looks_like_secret(&item.content) { continue; }
-
-        // Multi-factor admission control (A-MAC 2026)
-        let threshold = adaptive_admission_threshold(store);
-        let admission = multi_factor_admission_score(store, &item);
-        if admission < threshold {
-            tracing::debug!("skipping low-quality memory (admission={:.2} < threshold={:.2}): {}",
-                admission, threshold, item.summary);
-            continue;
-        }
-
-        let content_for_activation = item.content.clone();
-        let importance = item.importance.parse::<crate::types::Importance>()
-            .unwrap_or(crate::types::Importance::Medium);
-        let memory = crate::types::Memory {
-            id: ulid::Ulid::new().to_string(),
-            layer: importance.auto_layer(),
-            topic: item.topic,
-            summary: item.summary,
-            content: item.content,
-            keywords: item.keywords,
-            importance,
-            source: crate::types::Source::Hook,
-            strength: item.quality_confidence.max(0.3), // Use LLM quality as initial strength
-            decay_lambda: config.decay.base_lambda * importance.decay_factor(),
-            access_count: 0,
-            superseded_by: None,
-            related_ids: vec![],
-            concept_ids: vec![],
-            status: crate::types::MemoryStatus::default(),
-            embedding: None,
-            tier: "warm".to_string(),
-            cluster_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_accessed: chrono::Utc::now(),
-        };
-        if let Ok(id) = store.store_with_dedup(
-            memory,
-            config.search.dedup_similarity as f32,
-            config.search.dedup_time_window_days,
-        ) {
-            // Post-processing: sync on same connection.
-            // Hooks run as short-lived CLI processes — detached threads would be
-            // killed on exit. Keep sync to ensure completion within hook timeout.
-            let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
-            let _ = store.activate_related_memories(&content_for_activation, 3);
-            let _ = store.activate_related_concepts(&content_for_activation);
-            let _ = store.apply_evolution(&id, &content_for_activation, None);
-
-
-            stored_ids.push(id);
-            stored += 1;
-        }
-    }
-    (stored, stored_ids)
 }
 
 // ---------------------------------------------------------------------------
@@ -198,18 +60,8 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join("\n---\n");
                 if !combined.is_empty() {
-                    let result = crate::extract::llm::extract_full_with_fallback(config, &combined).await;
-                    let memories_for_ws = result.memories.clone();
-                    let concepts_for_ws = result.concepts.clone();
-                    let episode_for_ws = result.episode.clone();
-                    let store = config.open_store()?;
-                    if !result.memories.is_empty() {
-                        let _ = store_extracted(&store, config, result.memories);
-                    }
-                    if !result.concepts.is_empty() || !result.links.is_empty() {
-                        let _ = store.store_knowledge_units(&result.concepts, &result.links);
-                    }
-                    let _ = update_working_set(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref());
+                    let _ = queue_memory_job(config, MemoryJobMode::Full, "hook_post", None, combined);
+                    spawn_memory_worker();
                 }
             }
         }
@@ -223,13 +75,8 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
     let text = extract_hook_text(&input);
     if text.is_empty() { return Ok(()); }
 
-    let extracted = crate::extract::llm::extract_with_fallback(config, &text, 2).await;
-    if !extracted.is_empty() {
-        let store = config.open_store()?;
-        let extracted_for_ws = extracted.clone();
-        let _ = store_extracted(&store, config, extracted);
-        let _ = update_working_set(config, &extracted_for_ws, &[], None);
-    }
+    let _ = queue_memory_job(config, MemoryJobMode::Quick, "hook_compact", None, text.clone());
+    spawn_memory_worker();
     let buf_path = session_buffer_path(config, &input);
     let _ = append_to_buffer(&buf_path, &text, "compact");
     Ok(())
@@ -249,10 +96,10 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let selected = select_relevant_items(config, query);
-    if selected.is_empty() {
-        return Ok(());
-    }
+        let selected = select_relevant_items(config, query);
+        if selected.is_empty() {
+            return Ok(());
+        }
 
     println!("<rein-context>");
     println!("The following are concise facts from the current project working set.");
@@ -295,74 +142,9 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         };
         if combined.is_empty() { return Ok(()); }
 
-        let mut result = crate::extract::llm::extract_full_with_fallback(config, &combined).await;
-        let max_items = config.hooks.max_items_per_session;
-        result.memories.truncate(max_items);
-
-        if result.memories.is_empty() && result.concepts.is_empty() && result.episode.is_none() {
-            return Ok(());
-        }
-
-        let store = config.open_store()?;
-        let episode_for_ws = result.episode.clone();
-        let memories_for_ws = result.memories.clone();
-        let concepts_for_ws = result.concepts.clone();
-        let (mem_count, memory_ids) = store_extracted(&store, config, result.memories);
-        let _ = update_working_set(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref());
-        let kg_report = store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
-            .unwrap_or_default();
-
-        // Collect concept IDs from this session's knowledge graph
-        let session_concept_ids: Vec<String> = result.concepts.iter()
-            .filter_map(|c| {
-                store.get_concept(&c.memoir, &c.name).ok().flatten().map(|con| con.id)
-            })
-            .collect();
-
-        if let Some(ref ep) = result.episode {
-            // Create proper Episode node in temporal graph
-            let episode = crate::types::Episode {
-                id: String::new(),
-                title: ep.title.clone(),
-                outcome: ep.outcome.clone(),
-                decisions: ep.decisions.clone(),
-                concept_ids: session_concept_ids.clone(),
-                memory_ids: memory_ids.clone(),
-                created_at: chrono::Utc::now(),
-            };
-            match store.create_episode(episode) {
-                Ok(episode_id) => {
-                    // Update concepts with episode reference
-                    for cid in &session_concept_ids {
-                        let _ = store.conn().execute(
-                            "UPDATE concepts SET last_episode_id = ?1 WHERE id = ?2",
-                            rusqlite::params![episode_id, cid],
-                        );
-                        // Update revision snapshots created in this session only.
-                        // Scope to recent revisions (last 24h) to avoid corrupting
-                        // historical revisions from older sessions.
-                        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-                        let _ = store.conn().execute(
-                            "UPDATE concept_revisions SET episode_id = ?1 WHERE concept_id = ?2 AND episode_id IS NULL AND created_at >= ?3",
-                            rusqlite::params![episode_id, cid, cutoff],
-                        );
-                    }
-                    tracing::debug!("created episode {episode_id} with {} concepts, {} memories",
-                        session_concept_ids.len(), memory_ids.len());
-                }
-                Err(e) => tracing::warn!("failed to create episode: {e}"),
-            }
-
-            // Also store as concept in "sessions" memoir for backward compatibility
-            if let Err(e) = store_episode_concept(&store, ep) {
-                tracing::warn!("failed to store episode concept: {e}");
-            }
-        }
-
-        let concept_count = kg_report.concepts_added + kg_report.concepts_refined;
-        if mem_count > 0 || concept_count > 0 {
-            eprintln!("rein: saved {mem_count} memories, {concept_count} concepts, {} links", kg_report.links_added);
-        }
+        let _ = queue_memory_job(config, MemoryJobMode::Full, "hook_stop", None, combined);
+        spawn_memory_worker();
+        eprintln!("rein: queued session memory processing");
     } else {
         let windows = extract_signal_windows(&text, config);
         if windows.is_empty() { return Ok(()); }
@@ -376,29 +158,9 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
             .join("\n---\n");
         if combined.is_empty() { return Ok(()); }
 
-        let mut extracted = crate::extract::llm::extract_with_fallback(config, &combined, 2).await;
-        extracted.truncate(max_items);
-
-        if !extracted.is_empty() {
-            let store = config.open_store()?;
-            let extracted_for_ws = extracted.clone();
-            let (stored, memory_ids) = store_extracted(&store, config, extracted);
-            let _ = update_working_set(config, &extracted_for_ws, &[], None);
-            if stored > 0 {
-                // Create Episode for non-LLM path too
-                let episode = crate::types::Episode {
-                    id: String::new(),
-                    title: format!("Session (rule-based, {} memories)", stored),
-                    outcome: String::new(),
-                    decisions: vec![],
-                    concept_ids: vec![],
-                    memory_ids,
-                    created_at: chrono::Utc::now(),
-                };
-                let _ = store.create_episode(episode);
-                eprintln!("rein: saved {stored} memories from session");
-            }
-        }
+        let _ = queue_memory_job(config, MemoryJobMode::Quick, "hook_stop_fallback", None, combined);
+        spawn_memory_worker();
+        eprintln!("rein: queued session memory processing");
     }
     Ok(())
 }
