@@ -36,5 +36,5 @@ pub async fn extract_and_store(
         tracing::warn!("proxy extract: failed to queue memory job: {e}");
         return;
     }
-    spawn_memory_worker();
+    spawn_memory_worker(config);
 }
