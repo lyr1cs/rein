@@ -2,19 +2,34 @@
 
 use crate::config::ReinConfig;
 use crate::extract::hooks::parsing::looks_like_secret;
+use crate::extract::llm::ExtractedMemory;
 use crate::types::Importance;
 
 /// Extract memories from assistant text and store them.
 ///
 /// Runs asynchronously (spawned via `tokio::spawn`) — never blocks the response stream.
-pub async fn extract_and_store(config: &ReinConfig, assistant_text: String) {
+pub async fn extract_and_store(
+    config: &ReinConfig,
+    source_query: Option<String>,
+    assistant_text: String,
+) {
     // Skip very short responses (unlikely to contain useful memories).
     if assistant_text.len() < 100 {
         return;
     }
 
+    if !super::policy::should_extract_response(
+        config,
+        source_query.as_deref(),
+        &assistant_text,
+    ) {
+        return;
+    }
+
     let extracted =
         crate::extract::llm::extract_with_fallback(config, &assistant_text, 3).await;
+
+    let extracted = dedup_extracted_items(extracted);
 
     if extracted.is_empty() {
         return;
@@ -59,5 +74,50 @@ pub async fn extract_and_store(config: &ReinConfig, assistant_text: String) {
 
     if stored > 0 {
         tracing::info!(stored, "proxy: extracted and stored memories from response");
+    }
+}
+
+fn dedup_extracted_items(items: Vec<ExtractedMemory>) -> Vec<ExtractedMemory> {
+    let mut unique: Vec<ExtractedMemory> = Vec::new();
+    'outer: for item in items {
+        for existing in &unique {
+            let summary_sim = crate::extract::similarity(&item.summary, &existing.summary);
+            let content_sim = crate::extract::similarity(&item.content, &existing.content);
+            if item.topic == existing.topic && (summary_sim > 0.82 || content_sim > 0.82) {
+                continue 'outer;
+            }
+        }
+        unique.push(item);
+    }
+    unique
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_proxy_extracted_items() {
+        let items = vec![
+            ExtractedMemory {
+                topic: "debug".into(),
+                summary: "Fixed sqlite lock".into(),
+                content: "Fixed sqlite lock by serializing writes.".into(),
+                keywords: vec![],
+                importance: "high".into(),
+                should_store: true,
+                quality_confidence: 0.8,
+            },
+            ExtractedMemory {
+                topic: "debug".into(),
+                summary: "Fixed sqlite locking".into(),
+                content: "Fixed sqlite locking by serializing writes.".into(),
+                keywords: vec![],
+                importance: "high".into(),
+                should_store: true,
+                quality_confidence: 0.7,
+            },
+        ];
+        assert_eq!(dedup_extracted_items(items).len(), 1);
     }
 }

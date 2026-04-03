@@ -439,9 +439,17 @@ pub struct ProxyConfig {
     pub bind: String,
     pub anthropic_upstream: String,
     pub openai_upstream: String,
+    pub inject_enabled: bool,
     pub inject_limit: usize,
     pub extract_enabled: bool,
     pub recall_limit: usize,
+    pub inject_timeout_ms: u64,
+    pub max_injected_items: usize,
+    pub min_query_chars: usize,
+    pub min_relevance_score: f32,
+    pub summary_max_chars: usize,
+    pub store_min_chars: usize,
+    pub store_min_score: u32,
 }
 
 impl Default for ProxyConfig {
@@ -451,9 +459,17 @@ impl Default for ProxyConfig {
             bind: "127.0.0.1".to_string(),
             anthropic_upstream: "https://api.anthropic.com".to_string(),
             openai_upstream: "https://api.openai.com".to_string(),
-            inject_limit: 3000,
+            inject_enabled: false,
+            inject_limit: 600,
             extract_enabled: true,
-            recall_limit: 5,
+            recall_limit: 3,
+            inject_timeout_ms: 50,
+            max_injected_items: 3,
+            min_query_chars: 5,
+            min_relevance_score: 0.35,
+            summary_max_chars: 160,
+            store_min_chars: 220,
+            store_min_score: 3,
         }
     }
 }

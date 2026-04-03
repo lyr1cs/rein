@@ -44,18 +44,34 @@ fn extract_text_content(content: Option<&Value>) -> String {
 pub fn inject_context(body: &mut Value, context: &str) {
     match body.get("system") {
         Some(Value::String(existing)) => {
-            let combined = format!("{context}\n\n{existing}");
+            let combined = format!("{existing}\n\n{context}");
             body["system"] = Value::String(combined);
         }
         Some(Value::Array(_)) => {
             let block = serde_json::json!({"type": "text", "text": context});
             if let Some(arr) = body.get_mut("system").and_then(|v| v.as_array_mut()) {
-                arr.insert(0, block);
+                arr.push(block);
             }
         }
         _ => {
             body["system"] = Value::String(context.to_string());
         }
+    }
+}
+
+/// Check whether the Anthropic top-level `system` field already contains a rein marker.
+pub fn has_injected_context(body: &Value) -> bool {
+    match body.get("system") {
+        Some(Value::String(s)) => s.contains("<rein-context>"),
+        Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+            block.get("type").and_then(|t| t.as_str()) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .contains("<rein-context>")
+        }),
+        _ => false,
     }
 }
 
@@ -147,7 +163,7 @@ mod tests {
         });
         inject_context(&mut body, "<rein-context>memory</rein-context>");
         let sys = body["system"].as_str().unwrap();
-        assert!(sys.starts_with("<rein-context>"));
+        assert!(sys.ends_with("<rein-context>memory</rein-context>"));
         assert!(sys.contains("You are helpful."));
     }
 
@@ -160,7 +176,7 @@ mod tests {
         inject_context(&mut body, "<rein-context>memory</rein-context>");
         let arr = body["system"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["text"].as_str().unwrap(), "<rein-context>memory</rein-context>");
+        assert_eq!(arr[1]["text"].as_str().unwrap(), "<rein-context>memory</rein-context>");
     }
 
     #[test]
@@ -168,6 +184,14 @@ mod tests {
         let mut body = json!({"messages": []});
         inject_context(&mut body, "<rein-context>memory</rein-context>");
         assert_eq!(body["system"].as_str().unwrap(), "<rein-context>memory</rein-context>");
+    }
+
+    #[test]
+    fn test_has_injected_context() {
+        let body = json!({
+            "system": [{"type": "text", "text": "safe"}, {"type": "text", "text": "<rein-context>x</rein-context>"}]
+        });
+        assert!(has_injected_context(&body));
     }
 
     #[test]
@@ -180,5 +204,16 @@ mod tests {
     fn test_parse_sse_no_text() {
         let chunk = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
         assert_eq!(extract_assistant_text_sse(chunk), None);
+    }
+
+    #[test]
+    fn test_detect_injected_context() {
+        let body = json!({
+            "system": [
+                {"type": "text", "text": "You are helpful."},
+                {"type": "text", "text": "<rein-context>memory</rein-context>"}
+            ]
+        });
+        assert!(has_injected_context(&body));
     }
 }
