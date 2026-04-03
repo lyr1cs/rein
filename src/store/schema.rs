@@ -330,26 +330,26 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
 /// Widen the source CHECK constraint to include 'proxy'.
 /// Only runs if the current schema rejects 'proxy' inserts.
 fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
-    // Test if 'proxy' is already allowed by attempting a dry insert via savepoint.
-    let needs_migration = conn.execute_batch(
-        "SAVEPOINT src_check_test; \
-         INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, strength, decay_lambda, access_count, created_at, updated_at, last_accessed) \
-         VALUES ('__test_proxy__', 'stm', '', '', '', '[]', 'low', 'proxy', 0, 0, 0, datetime('now'), datetime('now'), datetime('now')); \
-         ROLLBACK TO src_check_test; \
-         RELEASE src_check_test;"
-    ).is_err();
+    // Side-effect free schema inspection is safer than probing with an INSERT.
+    let create_sql: String = conn.query_row(
+        "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = 'memories'",
+        [],
+        |row| row.get(0),
+    )?;
+    let needs_migration = !create_sql.to_lowercase().contains("'proxy'");
 
     if !needs_migration {
         return Ok(());
     }
 
-    // Recreate table with widened CHECK. Use a transaction + temp table.
+    // Recreate table with widened CHECK. Use a savepoint so this can run safely
+    // even if the caller already has an open transaction.
     conn.execute_batch(
-        "BEGIN; \
+        "SAVEPOINT migrate_source_check; \
          ALTER TABLE memories RENAME TO memories_old; \
          CREATE TABLE memories ( \
              id TEXT PRIMARY KEY NOT NULL, \
-             layer TEXT NOT NULL CHECK(layer IN ('ltm', 'stm')), \
+             layer TEXT NOT NULL CHECK(layer IN ('LTM', 'STM')), \
              topic TEXT NOT NULL, \
              summary TEXT NOT NULL, \
              content TEXT NOT NULL, \
@@ -373,7 +373,7 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
          ); \
          INSERT INTO memories SELECT * FROM memories_old; \
          DROP TABLE memories_old; \
-         COMMIT;"
+         RELEASE migrate_source_check;"
     ).map_err(|e| crate::types::ReinError::Database(e))?;
 
     tracing::info!("migrated source CHECK to include 'proxy'");

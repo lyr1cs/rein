@@ -115,9 +115,17 @@ port = 8690
 bind = "127.0.0.1"
 anthropic_upstream = "https://api.anthropic.com"
 openai_upstream = "https://api.openai.com"
-inject_limit = 3000      # max tokens to inject
-extract_enabled = true    # extract memories from assistant responses
-recall_limit = 5          # memories to recall per request
+inject_enabled = false     # record-only by default; keep Anthropic request bytes untouched
+inject_limit = 600         # hard cap for injected context tokens (keep small for cache stability)
+extract_enabled = true     # extract memories from assistant responses
+recall_limit = 3           # smaller top-k keeps proxy low-latency and lower-risk
+inject_timeout_ms = 50     # fail open: if recall is slower, forward without injection
+max_injected_items = 3     # never inject more than N items
+min_query_chars = 5        # too-short queries skip injection entirely
+min_relevance_score = 0.35 # weak matches are dropped instead of being injected
+summary_max_chars = 160    # summary-only injection budget per item
+store_min_chars = 220      # don't run proxy extraction on short assistant replies
+store_min_score = 3        # pattern score required before proxy extraction runs
 
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure

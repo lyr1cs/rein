@@ -13,9 +13,10 @@ pub enum ProviderKind {
 impl ProviderKind {
     /// Detect provider from the request path.
     pub fn detect(path: &str) -> Option<Self> {
-        if path.starts_with("/v1/messages") {
+        let normalized = path.trim_end_matches('/');
+        if normalized == "/v1/messages" {
             Some(Self::Anthropic)
-        } else if path.starts_with("/v1/chat/completions") {
+        } else if normalized == "/v1/chat/completions" {
             Some(Self::OpenAi)
         } else {
             None
@@ -46,6 +47,14 @@ impl ProviderKind {
         }
     }
 
+    /// Check whether the request already contains a rein injection marker.
+    pub fn has_injected_context(&self, body: &serde_json::Value) -> bool {
+        match self {
+            Self::Anthropic => super::anthropic::has_injected_context(body),
+            Self::OpenAi => super::openai::has_injected_context(body),
+        }
+    }
+
     /// Extract assistant text from a non-streaming response body.
     pub fn extract_assistant_text_full(&self, body: &[u8]) -> Option<String> {
         match self {
@@ -61,5 +70,18 @@ impl ProviderKind {
             Self::Anthropic => super::anthropic::extract_assistant_text_sse(text),
             Self::OpenAi => super::openai::extract_assistant_text_sse(text),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderKind;
+
+    #[test]
+    fn detect_only_exact_sampling_routes() {
+        assert_eq!(ProviderKind::detect("/v1/messages"), Some(ProviderKind::Anthropic));
+        assert_eq!(ProviderKind::detect("/v1/messages/count_tokens"), None);
+        assert_eq!(ProviderKind::detect("/v1/chat/completions"), Some(ProviderKind::OpenAi));
+        assert_eq!(ProviderKind::detect("/v1/models"), None);
     }
 }
