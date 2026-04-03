@@ -115,15 +115,7 @@ port = 8690
 bind = "127.0.0.1"
 anthropic_upstream = "https://api.anthropic.com"
 openai_upstream = "https://api.openai.com"
-inject_enabled = false     # record-only by default; keep Anthropic request bytes untouched
-inject_limit = 600         # hard cap for injected context tokens (keep small for cache stability)
 extract_enabled = true     # extract memories from assistant responses
-recall_limit = 3           # smaller top-k keeps proxy low-latency and lower-risk
-inject_timeout_ms = 50     # fail open: if recall is slower, forward without injection
-max_injected_items = 3     # never inject more than N items
-min_query_chars = 5        # too-short queries skip injection entirely
-min_relevance_score = 0.35 # weak matches are dropped instead of being injected
-summary_max_chars = 160    # summary-only injection budget per item
 store_min_chars = 220      # don't run proxy extraction on short assistant replies
 store_min_score = 3        # pattern score required before proxy extraction runs
 
@@ -137,6 +129,8 @@ spawn_cooldown_ms = 1500   # avoid spawn storms when many events arrive together
 max_working_set_items = 40 # cap the per-project session working surface
 max_always_on_items = 24   # cap the per-project stable always-on surface
 selection_limit = 5        # max injected items selected across both surfaces
+fingerprint_window_ms = 120000 # suppress near-duplicate queued events for 2 minutes
+recent_event_cache_size = 256  # number of recent event fingerprints tracked per project
 
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure

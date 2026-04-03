@@ -39,22 +39,6 @@ impl ProviderKind {
         }
     }
 
-    /// Inject context into the system prompt.
-    pub fn inject_context(&self, body: &mut serde_json::Value, context: &str) {
-        match self {
-            Self::Anthropic => super::anthropic::inject_context(body, context),
-            Self::OpenAi => super::openai::inject_context(body, context),
-        }
-    }
-
-    /// Check whether the request already contains a rein injection marker.
-    pub fn has_injected_context(&self, body: &serde_json::Value) -> bool {
-        match self {
-            Self::Anthropic => super::anthropic::has_injected_context(body),
-            Self::OpenAi => super::openai::has_injected_context(body),
-        }
-    }
-
     /// Extract assistant text from a non-streaming response body.
     pub fn extract_assistant_text_full(&self, body: &[u8]) -> Option<String> {
         match self {
