@@ -219,6 +219,7 @@ impl FromStr for Source {
             "hook" => Ok(Source::Hook),
             "migration" => Ok(Source::Migration),
             "supermemory" => Ok(Source::Supermemory),
+            "proxy" => Ok(Source::Proxy),
             _ => Err(format!("unknown source: {s}")),
         }
     }
