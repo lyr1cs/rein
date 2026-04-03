@@ -1,6 +1,7 @@
 //! Async memory extraction from assistant responses.
 
 use crate::config::ReinConfig;
+use crate::extract::hooks::parsing::runtime_agent_label;
 use crate::extract::hooks::queue::{queue_memory_job, spawn_memory_worker, MemoryJobMode};
 
 /// Queue assistant text for background extraction and storage.
@@ -30,6 +31,10 @@ pub async fn extract_and_store(
         config,
         MemoryJobMode::Quick,
         "proxy_response",
+        "source:main-agent",
+        runtime_agent_label(),
+        false,
+        20,
         source_query,
         assistant_text,
     ) {

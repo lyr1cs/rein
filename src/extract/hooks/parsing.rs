@@ -15,6 +15,70 @@ pub fn looks_like_secret(line: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
+/// Returns the subagent identifier if the hook fired inside a subagent.
+pub fn hook_agent_id(input: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|json| json.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+pub fn hook_agent_type(input: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|json| json.get("agent_type").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+pub fn is_subagent_hook(input: &str) -> bool {
+    hook_agent_id(input).is_some()
+}
+
+/// Best-effort runtime client/agent label.
+/// Prefer explicit override, then detect common agent environments.
+pub fn runtime_agent_label() -> String {
+    if let Ok(label) = std::env::var("REIN_AGENT_LABEL") {
+        let trimmed = label.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if std::env::var("CODEX_THREAD_ID").is_ok() || std::env::var("CODEX_CI").is_ok() {
+        return "codex".to_string();
+    }
+    if std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok() {
+        return "claude-code".to_string();
+    }
+    if std::env::var("CURSOR_TRACE_ID").is_ok() || std::env::var("CURSOR_AGENT").is_ok() {
+        return "cursor".to_string();
+    }
+    if std::env::var("WINDSURF").is_ok() || std::env::var("CODEIUM").is_ok() {
+        return "windsurf".to_string();
+    }
+    if std::env::var("GEMINI_CLI").is_ok() {
+        return "gemini".to_string();
+    }
+    if std::env::var("OPENCODE").is_ok() {
+        return "opencode".to_string();
+    }
+    "unknown-agent".to_string()
+}
+
+pub fn classify_hook_agent(input: &str) -> (String, bool) {
+    let runtime = runtime_agent_label();
+    let agent_id = hook_agent_id(input);
+    let agent_type = hook_agent_type(input);
+    if let Some(agent_id) = agent_id {
+        let short_id: String = agent_id.chars().take(8).collect();
+        let label = agent_type
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| format!("{runtime}:{t}@{short_id}"))
+            .unwrap_or_else(|| format!("{runtime}:subagent@{short_id}"));
+        tracing::debug!("subagent hook detected: agent_id={agent_id}, label={label}");
+        (label, true)
+    } else {
+        (runtime, false)
+    }
+}
+
 /// Extract text content from a Claude Code hook JSON payload.
 /// Falls back to raw input if not valid JSON.
 pub fn extract_hook_text(input: &str) -> String {

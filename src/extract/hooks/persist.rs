@@ -74,9 +74,17 @@ pub fn store_extracted(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
     mut items: Vec<ExtractedMemory>,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> (u32, Vec<String>) {
     for item in &mut items {
         crate::extract::postprocess::postprocess(item);
+        if !item.keywords.iter().any(|k| k == &format!("agent:{agent_label}")) {
+            item.keywords.push(format!("agent:{agent_label}"));
+        }
+        if is_subagent && !item.keywords.iter().any(|k| k == "source:subagent") {
+            item.keywords.push("source:subagent".to_string());
+        }
     }
 
     let mut stored = 0u32;
@@ -144,21 +152,25 @@ pub fn store_extracted(
 pub fn process_quick_extraction(
     config: &ReinConfig,
     extracted: Vec<ExtractedMemory>,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> anyhow::Result<u32> {
     if extracted.is_empty() {
         return Ok(0);
     }
     let store = config.open_store()?;
     let extracted_for_ws = extracted.clone();
-    let (stored, _ids) = store_extracted(&store, config, extracted);
-    let _ = update_working_set(config, &extracted_for_ws, &[], None);
-    let _ = update_always_on_index(config, &extracted_for_ws, &[], None);
+    let (stored, _ids) = store_extracted(&store, config, extracted, agent_label, is_subagent);
+    let _ = update_working_set(config, &extracted_for_ws, &[], None, agent_label, is_subagent);
+    let _ = update_always_on_index(config, &extracted_for_ws, &[], None, agent_label, is_subagent);
     Ok(stored)
 }
 
 pub fn process_full_extraction(
     config: &ReinConfig,
     mut result: ExtractionResult,
+    agent_label: &str,
+    is_subagent: bool,
 ) -> anyhow::Result<(u32, u32, u32)> {
     let max_items = config.hooks.max_items_per_session;
     result.memories.truncate(max_items);
@@ -171,9 +183,9 @@ pub fn process_full_extraction(
     let episode_for_ws = result.episode.clone();
     let memories_for_ws = result.memories.clone();
     let concepts_for_ws = result.concepts.clone();
-    let (mem_count, memory_ids) = store_extracted(&store, config, result.memories);
-    let _ = update_working_set(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref());
-    let _ = update_always_on_index(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref());
+    let (mem_count, memory_ids) = store_extracted(&store, config, result.memories, agent_label, is_subagent);
+    let _ = update_working_set(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref(), agent_label, is_subagent);
+    let _ = update_always_on_index(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref(), agent_label, is_subagent);
     let kg_report = store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
         .unwrap_or_default();
 
