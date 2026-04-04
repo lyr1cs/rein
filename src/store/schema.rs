@@ -377,7 +377,7 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
              updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup \
          FROM memories_old; \
          DROP TABLE memories_old;"
-    ).map_err(|e| crate::types::ReinError::Database(e))?;
+    ).map_err(crate::types::ReinError::Database)?;
 
     tracing::info!("migrated source CHECK to include 'proxy'");
     Ok(())
