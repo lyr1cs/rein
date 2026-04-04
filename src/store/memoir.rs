@@ -480,8 +480,8 @@ impl SqliteStore {
         let valid_from = link.valid_from.unwrap_or(now).to_rfc3339();
         let valid_until = link.valid_until.map(|dt| dt.to_rfc3339());
 
-        self.conn().execute(
-            "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at, valid_from, valid_until)
+        let rows = self.conn().execute(
+            "INSERT OR IGNORE INTO concept_links (id, source_id, target_id, relation, weight, created_at, valid_from, valid_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 id,
@@ -495,15 +495,28 @@ impl SqliteStore {
             ],
         )?;
 
+        if rows == 0 {
+            // Duplicate link — return existing link ID
+            let existing_id: String = self.conn().query_row(
+                "SELECT id FROM concept_links WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+                rusqlite::params![link.source_id, link.target_id, link.relation.to_string()],
+                |row| row.get(0),
+            )?;
+            return Ok(existing_id);
+        }
+
         Ok(id)
     }
 
     /// Expire a link by setting its valid_until timestamp.
     pub fn expire_link(&self, link_id: &str, valid_until: DateTime<Utc>) -> ReinResult<()> {
-        self.conn().execute(
+        let rows = self.conn().execute(
             "UPDATE concept_links SET valid_until = ?1 WHERE id = ?2",
             rusqlite::params![valid_until.to_rfc3339(), link_id],
         )?;
+        if rows == 0 {
+            return Err(ReinError::NotFound(format!("link not found: {}", link_id)));
+        }
         Ok(())
     }
 
@@ -576,6 +589,7 @@ impl SqliteStore {
             })?;
 
         let mut visited: HashSet<String> = HashSet::new();
+        let mut seen_links: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<(String, usize)> = VecDeque::new();
         let mut neighbors: Vec<Concept> = Vec::new();
         let mut links: Vec<ConceptLink> = Vec::new();
@@ -603,7 +617,9 @@ impl SqliteStore {
                         continue;
                     } // not yet active
                 }
-                links.push(link.clone());
+                if seen_links.insert(link.id.clone()) {
+                    links.push(link.clone());
+                }
                 if !visited.contains(&link.target_id) {
                     visited.insert(link.target_id.clone());
                     if let Some(concept) = self.get_concept_by_id(&link.target_id)? {
@@ -626,7 +642,9 @@ impl SqliteStore {
                         continue;
                     }
                 }
-                links.push(link.clone());
+                if seen_links.insert(link.id.clone()) {
+                    links.push(link.clone());
+                }
                 if !visited.contains(&link.source_id) {
                     visited.insert(link.source_id.clone());
                     if let Some(concept) = self.get_concept_by_id(&link.source_id)? {
@@ -685,12 +703,6 @@ impl SqliteStore {
                 dot.push_str("  rankdir=LR;\n");
                 dot.push_str("  node [shape=box, style=rounded];\n\n");
 
-                // Map concept ID to name for labels
-                let id_to_name: std::collections::HashMap<&str, &str> = concepts
-                    .iter()
-                    .map(|c| (c.id.as_str(), c.name.as_str()))
-                    .collect();
-
                 for c in &concepts {
                     let escaped_def = escape_dot(&c.definition);
                     let label = if escaped_def.chars().count() > 60 {
@@ -707,14 +719,11 @@ impl SqliteStore {
                 dot.push('\n');
 
                 for l in &links {
-                    let src = id_to_name.get(l.source_id.as_str()).unwrap_or(&"?");
-                    let tgt = id_to_name.get(l.target_id.as_str()).unwrap_or(&"?");
                     let escaped_relation = escape_dot(&l.relation.to_string());
                     dot.push_str(&format!(
                         "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
                         l.source_id, l.target_id, escaped_relation
                     ));
-                    let _ = (src, tgt); // used for readable comments if needed
                 }
 
                 dot.push_str("}\n");
@@ -957,7 +966,14 @@ impl SqliteStore {
         let scan_limit = limit.max(20) * 10;
         let episodes = match (from, to) {
             (Some(from), Some(to)) => self.get_episodes_in_range(from, to)?,
-            _ => self.list_episodes(scan_limit)?,
+            (Some(from), None) => self.get_episodes_in_range(from, Utc::now() + chrono::Duration::days(1))?,
+            (None, Some(to)) => self.get_episodes_in_range(
+                chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                to,
+            )?,
+            (None, None) => self.list_episodes(scan_limit)?,
         };
         if episodes.is_empty() {
             return Ok(vec![]);
@@ -1315,8 +1331,8 @@ mod tests {
         // depth=2 from ownership should find both borrowing and lifetimes
         let (_, neighbors, links) = store.inspect_concept("rust-lang", "ownership", 2).unwrap();
         assert_eq!(neighbors.len(), 2);
-        // 3 links: ownership->borrowing (from depth-0), borrowing->lifetimes + ownership->borrowing (from depth-1)
-        assert_eq!(links.len(), 3);
+        // 2 unique links: ownership->borrowing + borrowing->lifetimes (deduped by link ID)
+        assert_eq!(links.len(), 2);
     }
 
     #[test]

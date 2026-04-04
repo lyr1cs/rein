@@ -44,7 +44,7 @@ pub struct RerankFeatures {
     pub is_current: f32,
 }
 
-/// Learned weights for the linear scoring model (12 features).
+/// Learned weights for the linear scoring model (17 features).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankWeights {
     pub w_fts: f32,
@@ -193,12 +193,13 @@ pub fn load_weights(conn: &rusqlite::Connection) -> RerankWeights {
 /// Persist rerank weights to the metadata table.
 pub fn save_weights(conn: &rusqlite::Connection, weights: &RerankWeights) {
     let json = serde_json::to_string(weights).expect("RerankWeights serialization cannot fail");
-    conn.execute(
+    if let Err(e) = conn.execute(
         "INSERT INTO metadata (key, value) VALUES ('rerank_weights', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![json],
-    )
-    .expect("save_weights: metadata upsert failed");
+    ) {
+        tracing::warn!("save_weights failed: {}", e);
+    }
 }
 
 #[cfg(test)]

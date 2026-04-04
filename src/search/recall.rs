@@ -106,12 +106,18 @@ pub fn recall_temporal(
         sm_api_key.map(|api_key| {
             std::thread::spawn(move || {
                 let client = SupermemoryClient::new(api_key, sm_endpoint);
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok();
-                rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
-                    .unwrap_or_default()
+                // Reuse existing tokio runtime if available, else create a temporary one
+                let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    std::thread::scope(|_| handle.block_on(client.search(&q_sm, effective_limit)))
+                } else {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok();
+                    rt.map(|rt| rt.block_on(client.search(&q_sm, effective_limit)))
+                        .unwrap_or_default()
+                };
+                result
             })
         })
     } else {
@@ -236,7 +242,9 @@ pub fn recall_temporal(
     // Skip entirely if strong signal detected (BM25 top1 is dominant, expansion won't help)
     let expanded_queries = if strong_signal {
         tracing::info!("strong signal — skipping expanded query searches");
-        drop(expand_handle); // detach thread — LLM call completes in background, result discarded
+        // Note: dropping JoinHandle detaches the thread but does NOT cancel the LLM API call.
+        // The call runs to completion in background. Acceptable trade-off vs. cancellation complexity.
+        drop(expand_handle);
         vec![]
     } else {
         expand_handle
@@ -413,14 +421,14 @@ pub fn recall_temporal(
             let mut boosted = vec_for_fusion.clone();
             for (id, kg_score) in &kg_ranked {
                 if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
-                    boosted[pos].1 = boosted[pos].1.max(*kg_score * 0.5);
+                    boosted[pos].1 += *kg_score * 0.5; // additive boost — KG signal adds evidence
                 } else {
                     boosted.push((id.clone(), *kg_score * 0.5));
                 }
             }
             for (id, episode_score) in &episode_ranked {
                 if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
-                    boosted[pos].1 = boosted[pos].1.max(*episode_score * 0.65);
+                    boosted[pos].1 += *episode_score * 0.65; // additive boost
                 } else {
                     boosted.push((id.clone(), *episode_score * 0.65));
                 }
@@ -787,7 +795,7 @@ pub fn recall_temporal(
 
     // Periodically update quality weights (every ~50 recalls)
     let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
-    if total_recalls.is_multiple_of(50) && total_recalls > 0 {
+    if total_recalls > 0 && total_recalls.is_multiple_of(50) {
         store.update_quality_weights();
     }
 
@@ -824,9 +832,16 @@ fn try_vector_search(
         None => return vec![],
     };
 
-    let embedding = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(embedder.embed(query))
-    });
+    let embedding = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(embedder.embed(query))),
+        Err(_) => {
+            // No tokio runtime — create a temporary one
+            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt.block_on(embedder.embed(query)),
+                Err(_) => return vec![],
+            }
+        }
+    };
 
     match embedding {
         Ok(emb) => {
@@ -899,6 +914,7 @@ fn try_vector_search_batch(
 }
 
 /// Check if a memory matches the requested topic filter.
+/// Note: N+1 query pattern — acceptable for small result sets after fusion/reranking.
 fn matches_topic(store: &SqliteStore, id: &str, topic: Option<&str>) -> bool {
     match topic {
         None => true,
@@ -915,6 +931,8 @@ fn matches_topic(store: &SqliteStore, id: &str, topic: Option<&str>) -> bool {
 }
 
 /// Rank results by position and filter by topic.
+/// Scores are converted to negative rank positions for RRF. CC fusion re-normalizes via
+/// min-max, so original score magnitudes are not needed.
 fn rank_and_filter(
     results: Vec<(String, f32)>,
     store: &SqliteStore,

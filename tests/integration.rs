@@ -129,9 +129,13 @@ fn test_dedup_lifecycle() {
 
     // Should have merged into existing
     let stats = store.stats().unwrap();
-    // Either 1 memory (merged) or 2 (if similarity didn't quite reach 0.85 threshold)
-    // The test verifies the dedup mechanism runs without error
-    assert!(stats.total_memories <= 2);
+    // With identical content the Jaccard similarity should exceed 0.85, producing 1 memory.
+    // If dedup threshold isn't met (content varies), 2 is acceptable.
+    assert!(
+        stats.total_memories <= 2,
+        "expected dedup to merge identical memories, got {}",
+        stats.total_memories
+    );
 }
 
 #[test]
