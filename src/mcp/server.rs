@@ -81,7 +81,7 @@ impl ReinServer {
     )]
     fn rein_recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let limit = params.limit.unwrap_or(10);
+        let limit = params.limit.unwrap_or(10).min(200);
 
         // Parse optional temporal filters
         let time_from = params.from.as_deref().and_then(parse_datetime);
@@ -199,6 +199,14 @@ impl ReinServer {
 
         let config = self.config.clone();
         let result = if let Some(turns) = params.turns {
+            // Enforce size cap on turns path (same 500KB limit as content path)
+            let total_chars: usize = turns.iter().map(|t| t.role.len() + t.content.len()).sum();
+            if total_chars > 500_000 {
+                return "Error: turns too large (max 500KB aggregate)".to_string();
+            }
+            if turns.len() > 1000 {
+                return "Error: too many turns (max 1000)".to_string();
+            }
             let started_at = params
                 .started_at
                 .as_deref()
@@ -460,7 +468,7 @@ impl ReinServer {
         description = "Consolidate all memories in a topic into a single summary memory, removing the originals."
     )]
     fn rein_consolidate(&self, Parameters(params): Parameters<ConsolidateParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        self.non_store_count.store(0, Ordering::Relaxed); // consolidate is a write operation
         let compact = self.compact();
 
         let result = self.with_store(|store| {
@@ -948,9 +956,10 @@ impl ReinServer {
                         }
                         let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
                         if sim >= threshold {
-                            to_delete.insert(mems[i].id.clone());
+                            // Delete the newer duplicate (j), keep the original (i)
+                            to_delete.insert(mems[j].id.clone());
                             dups_found += 1;
-                            break;
+                            // Don't break — keep scanning for more duplicates of mems[i]
                         }
                     }
                 }
@@ -998,7 +1007,7 @@ impl ReinServer {
     )]
     fn rein_recent(&self, Parameters(params): Parameters<RecentParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let limit = params.limit.unwrap_or(10);
+        let limit = params.limit.unwrap_or(10).min(100);
         let compact = self.compact();
 
         let result = self.with_store(|store| store.recent(limit));
@@ -1121,7 +1130,7 @@ impl ReinServer {
         description = "Show a chronological timeline of knowledge events: episodes, concept revisions, and memory creation. Supports date range filtering."
     )]
     fn rein_timeline(&self, Parameters(params): Parameters<TimelineParams>) -> String {
-        let limit = params.limit.unwrap_or(20);
+        let limit = params.limit.unwrap_or(20).min(200);
         let from = params.from.as_deref().and_then(parse_datetime);
         let to = params.to.as_deref().and_then(parse_datetime_end);
 
@@ -1154,14 +1163,17 @@ impl ReinServer {
                 )));
             }
 
-            // Collect concept revisions in the window
+            // Collect concept revisions in the window (parameterized queries)
             {
                 let mut where_clauses = Vec::new();
+                let mut param_values: Vec<String> = Vec::new();
                 if let Some(f) = from {
-                    where_clauses.push(format!("r.created_at >= '{}'", f.to_rfc3339()));
+                    param_values.push(f.to_rfc3339());
+                    where_clauses.push(format!("r.created_at >= ?{}", param_values.len()));
                 }
                 if let Some(t) = to {
-                    where_clauses.push(format!("r.created_at <= '{}'", t.to_rfc3339()));
+                    param_values.push(t.to_rfc3339());
+                    where_clauses.push(format!("r.created_at <= ?{}", param_values.len()));
                 }
                 let where_str = if where_clauses.is_empty() {
                     String::new()
@@ -1174,18 +1186,23 @@ impl ReinServer {
                      ORDER BY r.created_at DESC LIMIT {}",
                     where_str, limit
                 );
-                if let Ok(mut stmt) = store.conn().prepare(&rev_sql) {
-                    let rows = stmt.query_map([], |row| {
-                        Ok((
-                            row.get::<_, u32>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    });
-                    if let Ok(rows) = rows {
-                        for row in rows.flatten() {
-                            let (rev, def, created_str, name) = row;
+                match store.conn().prepare(&rev_sql) {
+                    Ok(mut stmt) => {
+                        let extract_row = |row: &rusqlite::Row| -> rusqlite::Result<(u32, String, String, String)> {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        };
+                        let collected: Vec<(u32, String, String, String)> = match param_values.len() {
+                            0 => stmt.query_map([], extract_row)
+                                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                                .unwrap_or_default(),
+                            1 => stmt.query_map(rusqlite::params![param_values[0]], extract_row)
+                                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                                .unwrap_or_default(),
+                            _ => stmt.query_map(rusqlite::params![param_values[0], param_values[1]], extract_row)
+                                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                                .unwrap_or_default(),
+                        };
+                        for (rev, def, created_str, name) in collected {
                             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&created_str) {
                                 let short_def: String = def.chars().take(80).collect();
                                 events.push((dt.with_timezone(&chrono::Utc), format!(
@@ -1193,6 +1210,9 @@ impl ReinServer {
                                 )));
                             }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!("timeline: concept revision query failed: {}", e);
                     }
                 }
             }
@@ -1260,7 +1280,7 @@ impl ReinServer {
         description = "Show the revision history of a concept: when it changed, what the old definitions were, and which episode triggered each change."
     )]
     fn rein_concept_history(&self, Parameters(params): Parameters<ConceptHistoryParams>) -> String {
-        let limit = params.limit.unwrap_or(10);
+        let limit = params.limit.unwrap_or(10).min(100);
 
         let result = self.with_store(|store| {
             let current = store
@@ -1347,10 +1367,16 @@ impl ServerHandler for ReinServer {
 /// Spawn background warmup task for embedding cache pre-computation.
 fn spawn_background_warmup(config: &ReinConfig) {
     let warmup_config = config.clone();
+    // SqliteStore is not Send, so we must run the entire warmup (including async embed)
+    // inside spawn_blocking. Use a dedicated current-thread runtime for the async parts.
     tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
         if let Ok(store) = warmup_config.open_store() {
-            rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                rt.block_on(crate::search::warmup::warmup(&store, &warmup_config));
+            }
         }
     });
 }
@@ -1435,7 +1461,14 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                if auth_header != format!("Bearer {expected}") {
+                // Constant-time comparison to prevent timing side-channel attacks
+                let expected_str = format!("Bearer {expected}");
+                let auth_match = if auth_header.len() != expected_str.len() {
+                    false
+                } else {
+                    auth_header.bytes().zip(expected_str.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+                };
+                if !auth_match {
                     return Ok::<_, std::convert::Infallible>(
                         hyper::Response::builder()
                             .status(401)

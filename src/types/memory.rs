@@ -27,6 +27,7 @@ pub struct Memory {
     #[serde(skip)]
     pub embedding: Option<Vec<f32>>,
     /// Memory tier: hot, warm, cold (M5 adaptive tiering)
+    /// TODO: Replace with MemoryTier enum from store::tiering for type safety
     #[serde(default = "default_tier")]
     pub tier: String,
     /// Cluster assignment from HDBSCAN (M4)
