@@ -131,7 +131,7 @@ export default function Brain() {
                 type: 'concept',
                 label: c.name,
                 confidence: c.confidence,
-                created_at: c.created_at,
+                created_at: c.created_at || c.updated_at || new Date().toISOString(),
               });
             }
           }

@@ -36,7 +36,7 @@ fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
     json_response(status, json!({ "error": msg }))
 }
 
-/// Parse query string into key-value pairs.
+/// Parse query string into key-value pairs with percent-decoding.
 fn parse_query(uri: &hyper::Uri) -> std::collections::HashMap<String, String> {
     uri.query()
         .map(|q| {
@@ -45,11 +45,34 @@ fn parse_query(uri: &hyper::Uri) -> std::collections::HashMap<String, String> {
                     let mut parts = pair.splitn(2, '=');
                     let key = parts.next()?;
                     let value = parts.next().unwrap_or("");
-                    Some((key.to_string(), value.to_string()))
+                    Some((percent_decode(key), percent_decode(value)))
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Simple percent-decoding: handles %XX and + (space).
+fn percent_decode(s: &str) -> String {
+    let s = s.replace('+', " ");
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Try to handle an API or GUI request. Returns `Some(response)` if matched, `None` to fall through to MCP.
@@ -121,20 +144,21 @@ fn handle_memoir_path(
 ) -> BoxedResponse {
     let rest = &path["/api/memoirs/".len()..];
     if let Some(slash) = rest.find('/') {
-        let name = &rest[..slash];
+        let name = &percent_decode(&rest[..slash]);
         let sub = &rest[slash + 1..];
         if sub == "export" {
             let format = query.get("format").map(|s| s.as_str()).unwrap_or("json");
             return api_memoir_export(config, name, format);
         }
         if sub.starts_with("inspect/") {
-            let concept = &sub["inspect/".len()..];
+            let concept = percent_decode(&sub["inspect/".len()..]);
             let depth: usize = query.get("depth").and_then(|d| d.parse().ok()).unwrap_or(1);
-            return api_memoir_inspect(config, name, concept, depth);
+            return api_memoir_inspect(config, name, &concept, depth);
         }
         api_memoir_show(config, name)
     } else {
-        api_memoir_show(config, rest)
+        let decoded = percent_decode(rest);
+        api_memoir_show(config, &decoded)
     }
 }
 
@@ -181,7 +205,7 @@ fn api_recent(config: &ReinConfig, query: &std::collections::HashMap<String, Str
     };
     match store.recent(limit) {
         Ok(memories) => {
-            let items: Vec<serde_json::Value> = memories.iter().map(|m| memory_to_json(m)).collect();
+            let items: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
             json_response(StatusCode::OK, json!({ "memories": items }))
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -362,7 +386,7 @@ fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, S
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
-    // Collect episodes
+    // Collect episodes in window
     let episodes = match (from, to) {
         (Some(f), Some(t)) => store.get_episodes_in_range(f, t).unwrap_or_default(),
         (Some(f), None) => store.get_episodes_in_range(f, chrono::Utc::now() + chrono::Duration::days(1)).unwrap_or_default(),
@@ -372,13 +396,50 @@ fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, S
         (None, None) => store.list_episodes(limit).unwrap_or_default(),
     };
 
-    // Collect recent memories
-    let memories = store.recent(limit).unwrap_or_default();
+    // Collect memories in the same window (respect from/to filters)
+    let memories = if from.is_some() || to.is_some() {
+        // Filter by date range using SQL
+        let mut all = store.recent(limit * 2).unwrap_or_default();
+        if let Some(f) = from {
+            all.retain(|m| m.created_at >= f);
+        }
+        if let Some(t) = to {
+            all.retain(|m| m.created_at <= t);
+        }
+        all.truncate(limit);
+        all
+    } else {
+        store.recent(limit).unwrap_or_default()
+    };
 
-    json_response(StatusCode::OK, json!({
-        "episodes": episodes,
-        "memories": memories.iter().map(|m| memory_to_json(m)).collect::<Vec<_>>(),
-    }))
+    // Flatten into unified events array sorted by date descending
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for ep in &episodes {
+        events.push(json!({
+            "type": "episode",
+            "id": ep.id,
+            "title": ep.title,
+            "outcome": ep.outcome,
+            "decisions": ep.decisions,
+            "created_at": ep.created_at.to_rfc3339(),
+        }));
+    }
+    for m in &memories {
+        let mut ev = memory_to_json(m);
+        if let Some(obj) = ev.as_object_mut() {
+            obj.insert("type".to_string(), json!("memory"));
+        }
+        events.push(ev);
+    }
+    // Sort by created_at descending
+    events.sort_by(|a, b| {
+        let da = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let db = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        db.cmp(da)
+    });
+    events.truncate(limit);
+
+    json_response(StatusCode::OK, json!({ "events": events }))
 }
 
 fn api_episodes(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {

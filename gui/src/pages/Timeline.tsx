@@ -1,15 +1,22 @@
 import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { apiGet } from '../api/client';
-import type { Episode, Memory } from '../api/types';
 
 /* ── types ──────────────────────────────────────────────────────── */
 
 interface TimelineEvent {
   type: 'episode' | 'memory';
-  date: string;
-  episode?: Episode;
-  memory?: Memory;
+  created_at: string;
+  // Episode fields (when type=episode)
+  id?: string;
+  title?: string;
+  outcome?: string;
+  decisions?: string[];
+  // Memory fields (when type=memory)
+  summary?: string;
+  topic?: string;
+  tier?: 'hot' | 'warm' | 'cold';
+  strength?: number;
 }
 
 interface TimelineResponse {
@@ -68,7 +75,7 @@ export default function Timeline() {
   const events = useMemo(() => {
     if (!data?.events) return [];
     return [...data.events].sort(
-      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
     );
   }, [data]);
 
@@ -138,9 +145,9 @@ export default function Timeline() {
         ) : (
           <div className="space-y-3">
             {events.map((ev, i) => {
-              const { date, time } = formatDateTime(ev.date);
-              const isEpisode = ev.type === 'episode' && ev.episode;
-              const isMemory = ev.type === 'memory' && ev.memory;
+              const { date, time } = formatDateTime(ev.created_at);
+              const isEpisode = ev.type === 'episode';
+              const isMemory = ev.type === 'memory';
 
               return (
                 <div key={i} className="flex gap-4">
@@ -170,22 +177,22 @@ export default function Timeline() {
                         : 'border-l-[3px] border-l-[var(--text-muted)] border-t-[var(--border)] border-r-[var(--border)] border-b-[var(--border)]'
                     }`}
                   >
-                    {isEpisode && ev.episode && (
+                    {isEpisode && (
                       <>
                         <div className="flex items-center gap-2 mb-2">
                           <span className="text-sm">{'\uD83C\uDFAC'}</span>
                           <span className="text-sm font-medium text-[var(--text-primary)]">
-                            {ev.episode.title}
+                            {ev.title || 'Untitled Episode'}
                           </span>
                         </div>
-                        {ev.episode.outcome && (
+                        {ev.outcome && (
                           <p className="text-xs text-[var(--text-secondary)] mb-2 leading-relaxed">
-                            {ev.episode.outcome}
+                            {ev.outcome}
                           </p>
                         )}
-                        {ev.episode.decisions.length > 0 && (
+                        {ev.decisions && ev.decisions.length > 0 && (
                           <div className="flex flex-wrap gap-1.5">
-                            {ev.episode.decisions.map((d, j) => (
+                            {ev.decisions.map((d, j) => (
                               <span
                                 key={j}
                                 className="text-xs px-2 py-0.5 rounded bg-[var(--cold)]/15 text-[var(--cold)]"
@@ -198,20 +205,22 @@ export default function Timeline() {
                       </>
                     )}
 
-                    {isMemory && ev.memory && (
+                    {isMemory && (
                       <>
                         <div className="flex items-center gap-2 mb-2">
                           <span className="text-sm">{'\uD83E\uDDE0'}</span>
                           <span className="text-sm text-[var(--text-primary)] line-clamp-1">
-                            {ev.memory.summary}
+                            {ev.summary || 'No summary'}
                           </span>
                         </div>
                         <div className="flex items-center gap-2">
-                          <span className="text-xs px-2 py-0.5 rounded bg-[var(--accent)]/15 text-[var(--accent)] truncate max-w-[40%]">
-                            {ev.memory.topic}
-                          </span>
-                          {(() => {
-                            const badge = tierBadge(ev.memory.tier);
+                          {ev.topic && (
+                            <span className="text-xs px-2 py-0.5 rounded bg-[var(--accent)]/15 text-[var(--accent)] truncate max-w-[40%]">
+                              {ev.topic}
+                            </span>
+                          )}
+                          {ev.tier && (() => {
+                            const badge = tierBadge(ev.tier);
                             return (
                               <span className={`text-xs px-2 py-0.5 rounded ${badge.bg} ${badge.text}`}>
                                 {badge.label}

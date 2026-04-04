@@ -1509,14 +1509,17 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         let token = auth_token.clone();
         let cfg = rest_config.clone();
         async move {
-            // Check bearer token if configured
-            if let Some(ref expected) = token {
+            // Check bearer token for API/MCP paths only (GUI static assets are public
+            // so the SPA can bootstrap and show a token input dialog)
+            let path = req.uri().path();
+            let needs_auth = path.starts_with("/api/") || path.starts_with("/mcp");
+            if needs_auth {
+             if let Some(ref expected) = token {
                 let auth_header = req
                     .headers()
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                // Constant-time comparison to prevent timing side-channel attacks
                 let expected_str = format!("Bearer {expected}");
                 let auth_match = if auth_header.len() != expected_str.len() {
                     false
@@ -1535,7 +1538,8 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                             .unwrap(),
                     );
                 }
-            }
+             }
+            } // needs_auth
             // Try REST API / GUI routes before MCP dispatch
             if let Some(response) = crate::mcp::rest::handle_rest_request(&req, &cfg).await {
                 return Ok::<_, std::convert::Infallible>(response);
