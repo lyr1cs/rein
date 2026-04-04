@@ -104,6 +104,7 @@ async fn handle_api(
     match (method, path) {
         // --- Read endpoints ---
         (&Method::GET, "/api/stats") => api_stats(config),
+        (&Method::GET, "/api/activity") => api_activity(config, &query),
         (&Method::GET, "/api/topics") => api_topics(config),
         (&Method::GET, "/api/recent") => api_recent(config, &query),
         (&Method::GET, "/api/adaptive") => api_adaptive(config),
@@ -184,6 +185,55 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
         })),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+    let days: i64 = query.get("days").and_then(|d| d.parse().ok()).unwrap_or(14).min(90);
+    let store = match config.open_store() {
+        Ok(s) => s,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let conn = store.conn();
+
+    // Recall events by day
+    let mut recall_stmt = conn.prepare(
+        "SELECT date(ts) as day, COUNT(*) FROM feedback_events
+         WHERE event_type = 'recall_complete' AND ts >= date('now', ?1)
+         GROUP BY day ORDER BY day"
+    ).unwrap();
+    let offset = format!("-{days} days");
+    let recall_rows: Vec<(String, i64)> = recall_stmt
+        .query_map(rusqlite::params![offset], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()
+        .map(|r| r.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default();
+
+    // Store events by day (memories created)
+    let mut store_stmt = conn.prepare(
+        "SELECT date(created_at) as day, COUNT(*) FROM memories
+         WHERE created_at >= date('now', ?1)
+         GROUP BY day ORDER BY day"
+    ).unwrap();
+    let store_rows: Vec<(String, i64)> = store_stmt
+        .query_map(rusqlite::params![offset], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()
+        .map(|r| r.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default();
+
+    // Merge into unified day series
+    let mut day_map: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    for (day, count) in &recall_rows {
+        day_map.entry(day.clone()).or_default().0 = *count;
+    }
+    for (day, count) in &store_rows {
+        day_map.entry(day.clone()).or_default().1 = *count;
+    }
+
+    let activity: Vec<serde_json::Value> = day_map.into_iter().map(|(day, (recalls, stores))| {
+        json!({ "date": day, "recalls": recalls, "stores": stores })
+    }).collect();
+
+    json_response(StatusCode::OK, json!({ "activity": activity }))
 }
 
 fn api_topics(config: &ReinConfig) -> BoxedResponse {

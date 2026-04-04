@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.10.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 25 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker.
+rein v0.11.1 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 25 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
@@ -78,9 +78,19 @@ src/
 │   ├── policy.rs    # Extraction policy decisions
 │   └── extract.rs   # Async response extraction + queue integration
 └── mcp/
-    ├── server.rs    # MCP server (25 tools, stdio + HTTP/SSE)
+    ├── server.rs    # MCP server (25 tools, stdio + HTTP/SSE + GUI)
+    ├── rest.rs      # REST API layer (21 JSON endpoints for GUI)
     ├── tools.rs     # Tool parameter structs
     └── compact.rs   # Output formatters
+
+gui/                 # Neural Wiki GUI (React 18 + TypeScript + Tailwind + Vite)
+├── src/
+│   ├── App.tsx      # Router + QueryClientProvider
+│   ├── api/         # Fetch wrapper, TypeScript types
+│   ├── hooks/       # TanStack Query hooks with configurable polling
+│   ├── components/  # Layout (icon sidebar + vitals header)
+│   └── pages/       # 8 pages: Dashboard, Brain, Memories, Adaptive, Graph, Timeline, Artifacts, Settings
+└── vite.config.ts   # Dev proxy + Tailwind plugin
 
 bench/               # LongMemEval benchmark adapters
 ├── longmemeval_fast.py  # Fast parallel adapter (per-question temp DB)

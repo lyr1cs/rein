@@ -16,7 +16,8 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 | Feature | Description |
 |---------|-------------|
-| **24 MCP tools** | 12 core memory tools + 10 knowledge graph tools + 2 temporal tools |
+| **25 MCP tools** | 12 core memory tools + 10 knowledge graph tools + 2 temporal tools + 1 adaptive |
+| **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
 | **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights per query type (M2) |
 | **Per-cluster survival decay** | Kaplan-Meier curves replace fixed Ebbinghaus when sufficient data exists (M3) |
@@ -81,7 +82,7 @@ rein serve
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `serve` | Start MCP server (stdio, SSE, or proxy) | `rein serve [--compact] [--sse] [--proxy]` |
+| `serve` | Start MCP server (stdio, SSE, proxy, or GUI) | `rein serve [--compact] [--sse] [--proxy] [--gui]` |
 | `store` | Store a memory | `rein store -t debug -c "OOM fix" -I high -k oom,memory` |
 | `recall` | Search memories | `rein recall "connection pool" -t debug -l 5` |
 | `forget` | Delete a memory by ID | `rein forget 01J...` |
@@ -97,6 +98,7 @@ rein serve
 | `recent` | Show most recent memories | `rein recent [-l 20]` |
 | `gc` | Garbage collect weak STM memories | `rein gc [--dry-run]` |
 | `organize` | Auto-link related memories | `rein organize` |
+| `dedup-concepts` | Merge duplicate concepts (case/separator variants) | `rein dedup-concepts` |
 | `upgrade` | Upgrade old memories to knowledge graph | `rein upgrade [--topic X] [--dry-run]` |
 | `hook post` | Extract facts from tool output | `rein hook post` |
 | `hook compact` | Save context before compaction | `rein hook compact` |
@@ -485,6 +487,62 @@ batch_size = 8
 spawn_cooldown_ms = 1500
 max_working_set_items = 40
 max_always_on_items = 24
+```
+
+### Neural Wiki GUI (v0.11.0)
+
+rein includes a built-in web GUI for visual exploration of your memory system. The GUI is embedded in the binary via `rust-embed` — no separate web server needed.
+
+#### Quick Start
+
+```bash
+# Build with GUI support
+cargo install --path . --features gui
+
+# Start the server with GUI enabled (implies --sse)
+rein serve --gui
+
+# Open in browser
+open http://localhost:8680
+```
+
+The GUI is available at `http://localhost:8680/` when running with `--gui`. API endpoints are at `/api/*` and MCP at `/mcp`.
+
+#### Pages
+
+| Page | Description |
+|------|-------------|
+| **Dashboard** | Overview stats, recent memories with tier badges (Hot/Warm/Cold) |
+| **Brain View** | "Neon Neurons" force-directed graph of all memories — tier-colored glowing nodes, search highlight, time slider |
+| **Memories** | Card grid with search, topic/tier filters, detail slide-over panel, delete with confirmation |
+| **Adaptive Engine** | 6-panel dashboard: learned alpha values, tier distribution, 17-feature reranker weights, event counts, K-M survival curves, cluster stats |
+| **Knowledge Graph** | Per-memoir force-directed concept graph with relation-colored edges, concept inspection panel |
+| **Timeline** | Date-range filtered chronological view of episodes and memory events |
+| **Artifacts** | Session transcript viewer with turn-by-turn styling |
+| **Settings** | Polling interval (1-60s), auth token input |
+
+#### Authentication
+
+API endpoints (`/api/*`, `/mcp`) require a bearer token when `REIN_HTTP_TOKEN` is set. The GUI itself is served without auth so the SPA can bootstrap and show a token input dialog. Set the token in the Settings page.
+
+#### Configuration
+
+```toml
+[server]
+gui_enabled = false    # enable GUI (or use --gui flag)
+sse_port = 8680        # port for HTTP/SSE/GUI
+sse_bind = "127.0.0.1" # bind address
+```
+
+#### Development
+
+The frontend source lives in `gui/` (React 18 + TypeScript + Tailwind + Vite).
+
+```bash
+cd gui
+npm install
+npm run dev    # Dev server at localhost:5173, proxies API to localhost:8680
+npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 ```
 
 ### Architecture
@@ -1028,6 +1086,40 @@ rein worker memory
 - 跨会话去重（指纹 + 内容相似度）
 - **Working Set** — 项目级记忆表面，每次提取时更新
 - **Always-on Index** — 稳定的高质量摘要，用于项目级上下文
+
+### Neural Wiki 图形界面 (v0.11.0)
+
+rein 内置 Web 图形界面，用于可视化探索记忆系统。GUI 通过 `rust-embed` 嵌入二进制文件 — 无需额外 Web 服务器。
+
+#### 快速开始
+
+```bash
+# 带 GUI 构建
+cargo install --path . --features gui
+
+# 启动 GUI 服务（自动启用 SSE）
+rein serve --gui
+
+# 在浏览器打开
+open http://localhost:8680
+```
+
+#### 页面
+
+| 页面 | 说明 |
+|------|------|
+| **Dashboard** | 概览统计、最近记忆（带 Hot/Warm/Cold 层级标签） |
+| **Brain View** | "Neon Neurons" 力导向图 — 按层级着色的发光节点、搜索高亮、时间滑块 |
+| **Memories** | 卡片网格 + 搜索、主题/层级过滤、详情面板、确认删除 |
+| **Adaptive Engine** | 6 面板仪表盘：alpha 值、层级分布、17 特征重排序权重、事件计数、K-M 生存曲线、聚类统计 |
+| **Knowledge Graph** | 按 Memoir 查看力导向概念图，关系颜色编码，概念检查面板 |
+| **Timeline** | 日期范围过滤的时间线视图（Episodes 和记忆事件） |
+| **Artifacts** | 会话记录查看器，按轮次着色 |
+| **Settings** | 刷新间隔（1-60s）、认证令牌输入 |
+
+#### 认证
+
+设置 `REIN_HTTP_TOKEN` 后，API 端点需要 Bearer 令牌认证。GUI 页面本身无需认证，可以在设置页面输入令牌。
 
 ### 架构
 
