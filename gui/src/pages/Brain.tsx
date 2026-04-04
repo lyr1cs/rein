@@ -76,7 +76,7 @@ export default function Brain() {
   /* Refs */
   const fgRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const [dimensions, setDimensions] = useState({ width: window.innerWidth - 48, height: window.innerHeight - 40 });
 
 
   /* ---- Fetch all data on mount ---- */
@@ -206,9 +206,15 @@ export default function Brain() {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    // Set initial dimensions from actual container
+    setDimensions({ width: el.clientWidth, height: el.clientHeight });
     const ro = new ResizeObserver((entries) => {
       for (const e of entries) {
-        setDimensions({ width: e.contentRect.width, height: e.contentRect.height });
+        const w = Math.floor(e.contentRect.width);
+        const h = Math.floor(e.contentRect.height);
+        if (w > 0 && h > 0) {
+          setDimensions({ width: w, height: h });
+        }
       }
     });
     ro.observe(el);
