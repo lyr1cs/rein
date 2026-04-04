@@ -1,0 +1,68 @@
+import { useQuery } from '@tanstack/react-query';
+import { apiGet } from '../api/client';
+import type { StoreStats, AdaptiveStatus, Memory, RecallResult, Episode, Artifact } from '../api/types';
+
+const DEFAULT_INTERVAL = 5000;
+
+function getPollingInterval(): number {
+  const saved = localStorage.getItem('rein_polling_interval');
+  return saved ? parseInt(saved, 10) * 1000 : DEFAULT_INTERVAL;
+}
+
+export function useStats() {
+  return useQuery({
+    queryKey: ['stats'],
+    queryFn: () => apiGet<StoreStats>('/api/stats'),
+    refetchInterval: getPollingInterval(),
+  });
+}
+
+export function useTopics() {
+  return useQuery({
+    queryKey: ['topics'],
+    queryFn: () => apiGet<{ topics: string[] }>('/api/topics'),
+  });
+}
+
+export function useRecent(limit = 20) {
+  return useQuery({
+    queryKey: ['recent', limit],
+    queryFn: () => apiGet<{ memories: Memory[] }>(`/api/recent?limit=${limit}`),
+    refetchInterval: getPollingInterval(),
+  });
+}
+
+export function useRecall(query: string, options?: { topic?: string; limit?: number }) {
+  return useQuery({
+    queryKey: ['recall', query, options],
+    queryFn: () => {
+      const params = new URLSearchParams({ q: query });
+      if (options?.topic) params.set('topic', options.topic);
+      if (options?.limit) params.set('limit', String(options.limit));
+      return apiGet<{ results: RecallResult[]; count: number }>(`/api/memories?${params}`);
+    },
+    enabled: query.length > 0,
+  });
+}
+
+export function useAdaptive() {
+  return useQuery({
+    queryKey: ['adaptive'],
+    queryFn: () => apiGet<AdaptiveStatus>('/api/adaptive'),
+    refetchInterval: getPollingInterval(),
+  });
+}
+
+export function useEpisodes(limit = 20) {
+  return useQuery({
+    queryKey: ['episodes', limit],
+    queryFn: () => apiGet<{ episodes: Episode[] }>(`/api/episodes?limit=${limit}`),
+  });
+}
+
+export function useArtifacts(limit = 20) {
+  return useQuery({
+    queryKey: ['artifacts', limit],
+    queryFn: () => apiGet<{ artifacts: Artifact[] }>(`/api/artifacts?limit=${limit}`),
+  });
+}
