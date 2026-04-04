@@ -85,19 +85,30 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
     if text.is_empty() { return Ok(()); }
     let (agent_label, is_subagent) = classify_hook_agent(&input);
 
-    let priority = if is_subagent { 25 } else { 90 };
-    let _ = queue_memory_job(
-        config,
-        MemoryJobMode::Quick,
-        "hook_compact",
-        if is_subagent { "source:subagent" } else { "source:main-agent" },
-        agent_label,
-        is_subagent,
-        priority,
-        None,
-        text.clone(),
-    );
-    spawn_memory_worker(config);
+    if let Some(mut session) = extract_hook_session_ingest(&input) {
+        session.artifact_kind = "compact".to_string();
+        session.compact_summary = Some(text.clone());
+        let _ = crate::ops::queue_ingest_session(
+            config,
+            &session,
+            Some(&agent_label),
+            is_subagent,
+        );
+    } else {
+        let priority = if is_subagent { 25 } else { 90 };
+        let _ = queue_memory_job(
+            config,
+            MemoryJobMode::Quick,
+            "hook_compact",
+            if is_subagent { "source:subagent" } else { "source:main-agent" },
+            agent_label,
+            is_subagent,
+            priority,
+            None,
+            text.clone(),
+        );
+        spawn_memory_worker(config);
+    }
     let buf_path = session_buffer_path(config, &input);
     let _ = append_to_buffer(&buf_path, &text, "compact");
     Ok(())
@@ -131,27 +142,39 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
     let buffered = read_and_clear_buffer(&buf_path);
 
     if has_llm {
-        let combined = if buffered.is_empty() {
-            text.lines().filter(|l| !looks_like_secret(l)).collect::<Vec<_>>().join("\n")
+        if let Some(mut session) = extract_hook_session_ingest(&input) {
+            if !buffered.is_empty() {
+                session.tool_outputs = buffered.clone();
+            }
+            let _ = crate::ops::queue_ingest_session(
+                config,
+                &session,
+                Some(&agent_label),
+                is_subagent,
+            );
         } else {
-            let transcript = text.lines().filter(|l| !looks_like_secret(l)).collect::<Vec<_>>().join("\n");
-            format!("{}\n\n--- Buffered tool outputs ---\n{}", transcript, buffered.join("\n---\n"))
-        };
-        if combined.is_empty() { return Ok(()); }
+            let combined = if buffered.is_empty() {
+                text.lines().filter(|l| !looks_like_secret(l)).collect::<Vec<_>>().join("\n")
+            } else {
+                let transcript = text.lines().filter(|l| !looks_like_secret(l)).collect::<Vec<_>>().join("\n");
+                format!("{}\n\n--- Buffered tool outputs ---\n{}", transcript, buffered.join("\n---\n"))
+            };
+            if combined.is_empty() { return Ok(()); }
 
-        let priority = if is_subagent { 35 } else { 100 };
-        let _ = queue_memory_job(
-            config,
-            MemoryJobMode::Full,
-            "hook_stop",
-            if is_subagent { "source:subagent" } else { "source:main-agent" },
-            agent_label.clone(),
-            is_subagent,
-            priority,
-            None,
-            combined,
-        );
-        spawn_memory_worker(config);
+            let priority = if is_subagent { 35 } else { 100 };
+            let _ = queue_memory_job(
+                config,
+                MemoryJobMode::Full,
+                "hook_stop",
+                if is_subagent { "source:subagent" } else { "source:main-agent" },
+                agent_label.clone(),
+                is_subagent,
+                priority,
+                None,
+                combined,
+            );
+            spawn_memory_worker(config);
+        }
         eprintln!("rein: queued session memory processing");
     } else {
         let windows = extract_signal_windows(&text, config);

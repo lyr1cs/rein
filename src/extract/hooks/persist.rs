@@ -7,6 +7,17 @@ use super::buffer::store_episode_concept;
 use super::parsing::looks_like_secret;
 use super::working_set::{update_always_on_index, update_working_set};
 
+#[derive(Debug, Default, Clone)]
+pub struct StoreExtractedStats {
+    pub stored_count: u32,
+    pub stored_ids: Vec<String>,
+    pub filtered_count: u32,
+    pub secret_filtered_count: u32,
+    pub created_count: u32,
+    pub merged_count: u32,
+    pub superseded_count: u32,
+}
+
 /// Compute adaptive admission threshold from recent quality data.
 /// Base = 0.2. Adjusts up if recent quality is low, down if high.
 fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
@@ -77,6 +88,17 @@ pub fn store_extracted(
     agent_label: &str,
     is_subagent: bool,
 ) -> (u32, Vec<String>) {
+    let stats = store_extracted_report(store, config, items, agent_label, is_subagent);
+    (stats.stored_count, stats.stored_ids)
+}
+
+pub fn store_extracted_report(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+    mut items: Vec<ExtractedMemory>,
+    agent_label: &str,
+    is_subagent: bool,
+) -> StoreExtractedStats {
     for item in &mut items {
         crate::extract::postprocess::postprocess(item);
         if !item.keywords.iter().any(|k| k == &format!("agent:{agent_label}")) {
@@ -87,10 +109,10 @@ pub fn store_extracted(
         }
     }
 
-    let mut stored = 0u32;
-    let mut stored_ids = Vec::new();
+    let mut stats = StoreExtractedStats::default();
     for item in items {
         if looks_like_secret(&item.content) {
+            stats.secret_filtered_count += 1;
             continue;
         }
 
@@ -103,14 +125,16 @@ pub fn store_extracted(
                 threshold,
                 item.summary
             );
+            stats.filtered_count += 1;
             continue;
         }
 
         let content_for_activation = item.content.clone();
         let importance = item.importance.parse::<crate::types::Importance>()
             .unwrap_or(crate::types::Importance::Medium);
+        let proposed_id = ulid::Ulid::new().to_string();
         let memory = crate::types::Memory {
-            id: ulid::Ulid::new().to_string(),
+            id: proposed_id.clone(),
             layer: importance.auto_layer(),
             topic: item.topic,
             summary: item.summary,
@@ -142,11 +166,28 @@ pub fn store_extracted(
             let _ = store.activate_related_concepts(&content_for_activation);
             let _ = store.apply_evolution(&id, &content_for_activation, None);
 
-            stored_ids.push(id);
-            stored += 1;
+            stats.stored_ids.push(id.clone());
+            stats.stored_count += 1;
+            if id != proposed_id {
+                stats.merged_count += 1;
+            } else {
+                let superseded_rows: u32 = store
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE superseded_by = ?1",
+                        rusqlite::params![&id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if superseded_rows > 0 {
+                    stats.superseded_count += 1;
+                } else {
+                    stats.created_count += 1;
+                }
+            }
         }
     }
-    (stored, stored_ids)
+    stats
 }
 
 pub fn process_quick_extraction(
@@ -201,6 +242,12 @@ pub fn process_full_extraction(
             title: ep.title.clone(),
             outcome: ep.outcome.clone(),
             decisions: ep.decisions.clone(),
+            primary_topics: vec![],
+            tags: vec![],
+            involved_agents: vec![agent_label.to_string()],
+            important_paths: vec![],
+            temporal_keywords: vec![],
+            source_session_id: None,
             concept_ids: session_concept_ids.clone(),
             memory_ids: memory_ids.clone(),
             created_at: chrono::Utc::now(),

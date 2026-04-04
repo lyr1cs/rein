@@ -211,8 +211,8 @@ auto_memory_enabled = false
         .enable_all()
         .build()
         .unwrap();
-    let (memories, _, _) = rt
-        .block_on(rein::ops::ingest_session_text(
+    let report = rt
+        .block_on(rein::ops::ingest_session_text_report(
             &config,
             transcript,
             Some("test-ingest"),
@@ -220,7 +220,18 @@ auto_memory_enabled = false
         ))
         .unwrap();
 
-    assert!(memories >= 1, "ingestion should store at least one memory");
+    assert!(report.memory_count >= 1, "ingestion should store at least one memory");
+    assert!(
+        report.artifact_id.is_some(),
+        "ingestion should persist a raw session artifact"
+    );
+    let artifact_rows: u32 = config
+        .open_store()
+        .unwrap()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM session_artifacts", [], |r| r.get(0))
+        .unwrap_or(0);
+    assert!(artifact_rows >= 1, "raw session artifact should be stored separately");
 
     let store = config.open_store().unwrap();
     let results = store.search_fts("PostgreSQL locking", None, 10).unwrap();
