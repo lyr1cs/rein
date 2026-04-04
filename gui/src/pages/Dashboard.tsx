@@ -1,7 +1,15 @@
+import { useState } from 'react';
 import { useStats, useRecent, useTopics, useActivity } from '../hooks/useApi';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from 'recharts';
+
+const ACTIVITY_RANGES = [
+  { label: '7d', days: 7 },
+  { label: '14d', days: 14 },
+  { label: '30d', days: 30 },
+  { label: '90d', days: 90 },
+] as const;
 
 function StatCard({ label, value, color }: { label: string; value: string | number; color: string }) {
   return (
@@ -27,10 +35,11 @@ function ActivityTooltip({ active, payload, label }: { active?: boolean; payload
 }
 
 export default function Dashboard() {
+  const [activityDays, setActivityDays] = useState(14);
   const { data: stats, isLoading } = useStats();
   const { data: recentData } = useRecent(5);
   const { data: _topicsData } = useTopics();
-  const { data: activityData } = useActivity(14);
+  const { data: activityData } = useActivity(activityDays);
 
   if (isLoading || !stats) {
     return <div className="flex items-center justify-center h-full text-[var(--text-muted)]">Loading...</div>;
@@ -49,7 +58,24 @@ export default function Dashboard() {
       {/* Activity chart */}
       {chartData.length > 0 && (
         <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4 mb-6">
-          <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-3">Activity (14 days)</div>
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider">Activity ({activityDays} days)</div>
+            <div className="flex gap-1">
+              {ACTIVITY_RANGES.map((r) => (
+                <button
+                  key={r.days}
+                  onClick={() => setActivityDays(r.days)}
+                  className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
+                    activityDays === r.days
+                      ? 'bg-[var(--accent)] text-white'
+                      : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'
+                  }`}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
           <ResponsiveContainer width="100%" height={160}>
             <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <defs>
