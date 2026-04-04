@@ -22,6 +22,12 @@ pub struct MemoryJob {
     pub priority: u8,
     pub source_query: Option<String>,
     pub text: String,
+    /// Pre-stored artifact ID — worker links it to the derived episode after extraction.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    /// Serialized SessionIngest JSON — lets the worker use the full report path.
+    #[serde(default)]
+    pub session_json: Option<String>,
     #[serde(default)]
     pub attempts: u32,
     #[serde(default)]
@@ -52,6 +58,23 @@ struct RecentEventState {
     items: Vec<RecentEventEntry>,
 }
 
+/// Queue a memory job with optional session metadata for artifact-episode linking.
+pub fn queue_memory_job_with_session(
+    config: &ReinConfig,
+    mode: MemoryJobMode,
+    source: &str,
+    source_label: &str,
+    agent_label: String,
+    is_subagent: bool,
+    priority: u8,
+    source_query: Option<String>,
+    text: String,
+    artifact_id: Option<String>,
+    session_json: Option<String>,
+) -> anyhow::Result<()> {
+    _queue_memory_job(config, mode, source, source_label, agent_label, is_subagent, priority, source_query, text, artifact_id, session_json)
+}
+
 pub fn queue_memory_job(
     config: &ReinConfig,
     mode: MemoryJobMode,
@@ -62,6 +85,22 @@ pub fn queue_memory_job(
     priority: u8,
     source_query: Option<String>,
     text: String,
+) -> anyhow::Result<()> {
+    _queue_memory_job(config, mode, source, source_label, agent_label, is_subagent, priority, source_query, text, None, None)
+}
+
+fn _queue_memory_job(
+    config: &ReinConfig,
+    mode: MemoryJobMode,
+    source: &str,
+    source_label: &str,
+    agent_label: String,
+    is_subagent: bool,
+    priority: u8,
+    source_query: Option<String>,
+    text: String,
+    artifact_id: Option<String>,
+    session_json: Option<String>,
 ) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         return Ok(());
@@ -125,6 +164,8 @@ pub fn queue_memory_job(
         priority,
         source_query,
         text,
+        artifact_id,
+        session_json,
         attempts: 0,
         next_attempt_at: None,
         created_at: Utc::now().to_rfc3339(),
@@ -301,6 +342,29 @@ async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32>
             Ok(stored)
         }
         MemoryJobMode::Full => {
+            // If we have a serialized SessionIngest, use the full report path
+            // so artifact-episode linking and rich metadata are preserved.
+            if let Some(ref session_json) = job.session_json {
+                if let Ok(session) = serde_json::from_str::<crate::types::SessionIngest>(session_json) {
+                    let result = crate::extract::llm::extract_full_with_worker_preference(config, &job.text).await;
+                    let mut report = crate::ops::ingest_extraction_report(
+                        config,
+                        &session,
+                        result,
+                        Some(&job.agent_label),
+                        job.is_subagent,
+                    )?;
+                    // Link pre-stored artifact to the derived episode
+                    if let (Some(ref artifact_id), Some(ref episode_id)) = (&job.artifact_id, &report.episode_id) {
+                        if let Ok(store) = config.open_store() {
+                            let _ = store.link_session_artifact_episode(artifact_id, episode_id);
+                        }
+                    }
+                    report.artifact_id = job.artifact_id.clone();
+                    return Ok(report.memory_count);
+                }
+            }
+            // Fallback: legacy text extraction path
             let result = crate::extract::llm::extract_full_with_worker_preference(config, &job.text).await;
             let (memories, _concepts, _links) = super::persist::process_full_extraction(
                 config,
