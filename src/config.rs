@@ -207,6 +207,8 @@ pub struct ServerConfig {
     pub sse_enabled: bool,
     pub sse_port: u16,
     pub sse_bind: String,
+    #[serde(default)]
+    pub gui_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -458,6 +460,7 @@ impl Default for ServerConfig {
             sse_enabled: false,
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
+            gui_enabled: false,
         }
     }
 }

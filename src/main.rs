@@ -28,12 +28,15 @@ enum Commands {
         /// Enable compact output mode
         #[arg(long)]
         compact: bool,
-        /// Enable SSE transport (not yet implemented)
+        /// Enable SSE transport (HTTP)
         #[arg(long)]
         sse: bool,
         /// Start transparent proxy for LLM API recording
         #[arg(long)]
         proxy: bool,
+        /// Enable web GUI (implies --sse)
+        #[arg(long)]
+        gui: bool,
     },
     /// Store a memory
     Store {
@@ -199,14 +202,19 @@ async fn main() -> anyhow::Result<()> {
             compact,
             sse,
             proxy,
+            gui,
         }) => {
             let mut config = config;
             if compact {
                 config.server.compact = true;
             }
+            if gui {
+                config.server.gui_enabled = true;
+                config.server.sse_enabled = true; // GUI implies SSE mode
+            }
             if proxy {
                 rein::proxy::run_proxy(config).await?;
-            } else if sse {
+            } else if sse || gui {
                 config.server.sse_enabled = true;
                 mcp::server::run_http(config).await?;
             } else {
