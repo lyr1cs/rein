@@ -229,7 +229,7 @@ pub async fn ingest_session_report(
     Ok(report)
 }
 
-fn ingest_extraction_report(
+pub fn ingest_extraction_report(
     config: &ReinConfig,
     session: &SessionIngest,
     mut result: extract::llm::ExtractionResult,
@@ -595,7 +595,7 @@ pub fn queue_ingest_session(
         created_at: chrono::Utc::now(),
     };
     let artifact_id = store.store_session_artifact(artifact)?;
-    crate::extract::hooks::queue::queue_memory_job(
+    crate::extract::hooks::queue::queue_memory_job_with_session(
         config,
         crate::extract::hooks::queue::MemoryJobMode::Full,
         "ingest_session",
@@ -611,6 +611,8 @@ pub fn queue_ingest_session(
         if is_subagent { 50 } else { 95 },
         None,
         trimmed.to_string(),
+        Some(artifact_id.clone()),
+        serde_json::to_string(session).ok(),
     )
     .map_err(|e| ReinError::Config(format!("{e}")))?;
     crate::extract::hooks::queue::spawn_memory_worker(config);
