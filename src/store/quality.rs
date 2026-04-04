@@ -274,7 +274,7 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
-            tier: "warm".to_string(),
+            tier: MemoryTier::Warm,
             cluster_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

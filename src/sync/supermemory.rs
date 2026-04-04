@@ -1,4 +1,4 @@
-use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, Source};
+use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source};
 
 pub struct SupermemoryClient {
     client: reqwest::Client,
@@ -148,7 +148,7 @@ impl SupermemoryClient {
                     concept_ids: vec![],
                     status: MemoryStatus::default(),
                     embedding: None,
-                    tier: "warm".to_string(),
+                    tier: MemoryTier::Warm,
                     cluster_id: None,
                     created_at,
                     updated_at,
