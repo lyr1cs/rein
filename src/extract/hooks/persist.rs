@@ -85,7 +85,7 @@ fn multi_factor_admission_score(
 pub fn store_extracted(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
-    mut items: Vec<ExtractedMemory>,
+    items: Vec<ExtractedMemory>,
     agent_label: &str,
     is_subagent: bool,
 ) -> (u32, Vec<String>) {
