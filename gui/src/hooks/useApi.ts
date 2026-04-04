@@ -53,10 +53,10 @@ export function useAdaptive() {
   });
 }
 
-export function useActivity(days = 14) {
+export function useActivity(days = 14, granularity: 'hour' | 'day' = 'hour') {
   return useQuery({
-    queryKey: ['activity', days],
-    queryFn: () => apiGet<{ activity: Array<{ date: string; recalls: number; stores: number }> }>(`/api/activity?days=${days}`),
+    queryKey: ['activity', days, granularity],
+    queryFn: () => apiGet<{ activity: Array<{ date: string; recalls: number; stores: number }>; granularity: string }>(`/api/activity?days=${days}&granularity=${granularity}`),
     refetchInterval: getPollingInterval(),
   });
 }
