@@ -218,6 +218,8 @@ async fn main() -> anyhow::Result<()> {
                 config.server.sse_enabled = true; // GUI implies SSE mode
             }
             if proxy {
+                // Set before entering async proxy to avoid set_var in multi-threaded context.
+                std::env::set_var("REIN_PROXY_ACTIVE", "1");
                 rein::proxy::run_proxy(config).await?;
             } else if sse || gui {
                 config.server.sse_enabled = true;
