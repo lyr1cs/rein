@@ -3,6 +3,7 @@
 
 use crate::config::ReinConfig;
 use crate::extract;
+use crate::extract::llm::ExtractedMemory;
 use crate::store::SqliteStore;
 use crate::types::*;
 
@@ -87,19 +88,8 @@ pub async fn ingest_session_text(
     agent_label: Option<&str>,
     is_subagent: bool,
 ) -> crate::types::ReinResult<(u32, u32, u32)> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok((0, 0, 0));
-    }
-
-    let result = extract::llm::extract_full_with_fallback(config, trimmed).await;
-    crate::extract::hooks::persist::process_full_extraction(
-        config,
-        result,
-        agent_label.unwrap_or("manual-ingest"),
-        is_subagent,
-    )
-    .map_err(|e| ReinError::Config(format!("{e}")))
+    let report = ingest_session_text_report(config, text, agent_label, is_subagent).await?;
+    Ok((report.memory_count, report.concept_count, report.link_count))
 }
 
 /// Render a structured session payload into extraction-friendly text.
@@ -120,6 +110,14 @@ pub fn render_session_ingest(session: &SessionIngest) -> String {
     }
     if let Some(summary) = session.summary.as_deref() {
         lines.push(format!("[Session summary]\n{summary}"));
+    }
+    if let Some(compact_summary) = session.compact_summary.as_deref() {
+        lines.push(format!("[Compact summary]\n{compact_summary}"));
+    }
+    for output in &session.tool_outputs {
+        if !output.trim().is_empty() {
+            lines.push(format!("[Tool output]\n{}", output.trim()));
+        }
     }
 
     for turn in &session.turns {
@@ -144,8 +142,292 @@ pub async fn ingest_session(
     agent_label: Option<&str>,
     is_subagent: bool,
 ) -> crate::types::ReinResult<(u32, u32, u32)> {
+    let report = ingest_session_report(config, session, agent_label, is_subagent).await?;
+    Ok((report.memory_count, report.concept_count, report.link_count))
+}
+
+pub async fn ingest_session_text_report(
+    config: &ReinConfig,
+    text: &str,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(IngestReport::default());
+    }
+
+    let session = SessionIngest {
+        schema_version: 1,
+        artifact_kind: "session".to_string(),
+        session_id: None,
+        title: None,
+        started_at: None,
+        ended_at: None,
+        summary: None,
+        source_agent: agent_label.map(|s| s.to_string()),
+        source_label: Some("explicit-ingest".to_string()),
+        compact_summary: None,
+        tool_outputs: vec![],
+        turns: vec![SessionTurn {
+            role: "session".to_string(),
+            content: trimmed.to_string(),
+        }],
+    };
+    ingest_session_report(config, &session, agent_label, is_subagent).await
+}
+
+pub async fn ingest_session_report(
+    config: &ReinConfig,
+    session: &SessionIngest,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
     let text = render_session_ingest(session);
-    ingest_session_text(config, &text, agent_label, is_subagent).await
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(IngestReport::default());
+    }
+
+    let store = config.open_store()?;
+    let artifact = SessionArtifact {
+        id: String::new(),
+        schema_version: session.schema_version,
+        artifact_kind: session.artifact_kind.clone(),
+        session_id: session.session_id.clone(),
+        title: session.title.clone(),
+        summary: session.summary.clone(),
+        source_agent: session
+            .source_agent
+            .clone()
+            .or_else(|| agent_label.map(|s| s.to_string())),
+        source_label: session.source_label.clone(),
+        is_subagent,
+        started_at: session.started_at,
+        ended_at: session.ended_at,
+        turn_count: session.turns.len() as u32,
+        transcript_text: trimmed.to_string(),
+        transcript_json: serde_json::to_string(session).ok(),
+        episode_id: None,
+        created_at: chrono::Utc::now(),
+    };
+    let artifact_id = store.store_session_artifact(artifact)?;
+
+    let result = extract::llm::extract_full_with_fallback(config, trimmed).await;
+    let mut report = ingest_extraction_report(config, session, result, agent_label, is_subagent)?;
+    report.artifact_id = Some(artifact_id.clone());
+    if let Some(ref episode_id) = report.episode_id {
+        let _ = store.link_session_artifact_episode(&artifact_id, episode_id);
+    }
+    Ok(report)
+}
+
+fn ingest_extraction_report(
+    config: &ReinConfig,
+    session: &SessionIngest,
+    mut result: extract::llm::ExtractionResult,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
+    let max_items = config.hooks.max_items_per_session;
+    result.memories.truncate(max_items);
+
+    if result.memories.is_empty() && result.concepts.is_empty() && result.episode.is_none() {
+        return Ok(IngestReport {
+            session_id: session.session_id.clone(),
+            turn_count: session.turns.len() as u32,
+            ..Default::default()
+        });
+    }
+
+    let store = config.open_store()?;
+    let episode_for_ws = result.episode.clone();
+    let memories_for_ws = result.memories.clone();
+    let concepts_for_ws = result.concepts.clone();
+    let ingest_agent = agent_label
+        .or(session.source_agent.as_deref())
+        .unwrap_or("manual-ingest");
+    let memory_stats = crate::extract::hooks::persist::store_extracted_report(
+        &store,
+        config,
+        result.memories,
+        ingest_agent,
+        is_subagent,
+    );
+    let memory_count = memory_stats.stored_count;
+    let stored_memory_ids = memory_stats.stored_ids.clone();
+    let _ = crate::extract::hooks::working_set::update_working_set(
+        config,
+        &memories_for_ws,
+        &concepts_for_ws,
+        episode_for_ws.as_ref(),
+        ingest_agent,
+        is_subagent,
+    );
+    let _ = crate::extract::hooks::working_set::update_always_on_index(
+        config,
+        &memories_for_ws,
+        &concepts_for_ws,
+        episode_for_ws.as_ref(),
+        ingest_agent,
+        is_subagent,
+    );
+    let kg_report = store
+        .store_knowledge_units_with_sources(&result.concepts, &result.links, &stored_memory_ids)
+        .unwrap_or_default();
+
+    let session_concept_ids: Vec<String> = result
+        .concepts
+        .iter()
+        .filter_map(|c| store.get_concept(&c.memoir, &c.name).ok().flatten().map(|con| con.id))
+        .collect();
+
+    let primary_topics = derive_primary_topics(&memories_for_ws, &concepts_for_ws);
+    let temporal_keywords = derive_temporal_keywords(&memories_for_ws, session);
+    let important_paths = derive_important_paths(&memories_for_ws, session);
+    let mut episode_id = None;
+
+    if let Some(ref ep) = result.episode {
+        let mut tags = primary_topics.clone();
+        tags.push(if is_subagent {
+            "subagent".to_string()
+        } else {
+            "main-agent".to_string()
+        });
+        if session.compact_summary.is_some() {
+            tags.push("compact".to_string());
+        }
+        tags.sort();
+        tags.dedup();
+
+        let episode = Episode {
+            id: String::new(),
+            title: ep.title.clone(),
+            outcome: ep.outcome.clone(),
+            decisions: ep.decisions.clone(),
+            primary_topics: primary_topics.clone(),
+            tags,
+            involved_agents: vec![session
+                .source_agent
+                .clone()
+                .unwrap_or_else(|| ingest_agent.to_string())],
+            important_paths,
+            temporal_keywords,
+            source_session_id: session.session_id.clone(),
+            concept_ids: session_concept_ids.clone(),
+            memory_ids: stored_memory_ids.clone(),
+            created_at: session
+                .ended_at
+                .or(session.started_at)
+                .unwrap_or_else(chrono::Utc::now),
+        };
+        if let Ok(created_episode_id) = store.create_episode(episode) {
+            episode_id = Some(created_episode_id.clone());
+            for cid in &session_concept_ids {
+                let _ = store.conn().execute(
+                    "UPDATE concepts SET last_episode_id = ?1 WHERE id = ?2",
+                    rusqlite::params![created_episode_id, cid],
+                );
+                let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                let _ = store.conn().execute(
+                    "UPDATE concept_revisions SET episode_id = ?1 WHERE concept_id = ?2 AND episode_id IS NULL AND created_at >= ?3",
+                    rusqlite::params![created_episode_id, cid, cutoff],
+                );
+            }
+            if let Err(e) = crate::extract::hooks::buffer::store_episode_concept(&store, ep) {
+                tracing::warn!("failed to store episode concept: {e}");
+            }
+        }
+    }
+
+    Ok(IngestReport {
+        queued: false,
+        artifact_id: None,
+        session_id: session.session_id.clone(),
+        episode_id,
+        memory_count,
+        concept_count: (kg_report.concepts_added + kg_report.concepts_refined) as u32,
+        link_count: kg_report.links_added as u32,
+        turn_count: session.turns.len() as u32,
+        filtered_count: memory_stats.filtered_count,
+        secret_filtered_count: memory_stats.secret_filtered_count,
+        created_count: memory_stats.created_count,
+        merged_count: memory_stats.merged_count,
+        superseded_count: memory_stats.superseded_count,
+        stored_memory_ids,
+        primary_topics,
+    })
+}
+
+fn derive_primary_topics(
+    memories: &[ExtractedMemory],
+    concepts: &[crate::extract::llm::ExtractedConcept],
+) -> Vec<String> {
+    let mut topics: Vec<String> = memories.iter().map(|m| m.topic.clone()).collect();
+    topics.extend(concepts.iter().map(|c| c.memoir.clone()));
+    topics.sort();
+    topics.dedup();
+    topics.truncate(8);
+    topics
+}
+
+fn derive_temporal_keywords(
+    memories: &[ExtractedMemory],
+    session: &SessionIngest,
+) -> Vec<String> {
+    let mut kws: Vec<String> = memories
+        .iter()
+        .flat_map(|m| m.keywords.iter().cloned())
+        .filter(|kw| kw.starts_with("date:"))
+        .collect();
+    if let Some(started_at) = session.started_at {
+        kws.push(format!("date:{}", started_at.format("%Y-%m-%d")));
+    }
+    if let Some(ended_at) = session.ended_at {
+        kws.push(format!("date:{}", ended_at.format("%Y-%m-%d")));
+    }
+    kws.sort();
+    kws.dedup();
+    kws.truncate(8);
+    kws
+}
+
+fn derive_important_paths(
+    memories: &[ExtractedMemory],
+    session: &SessionIngest,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut collect_from = |text: &str| {
+        for token in text.split_whitespace() {
+            let trimmed = token.trim_matches(|c: char| ",:;()[]{}'\"".contains(c));
+            let looks_like_path = trimmed.contains('/')
+                || [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".md", ".toml", ".json"]
+                    .iter()
+                    .any(|suffix| trimmed.ends_with(suffix));
+            if looks_like_path && trimmed.len() > 3 {
+                paths.push(trimmed.to_string());
+            }
+        }
+    };
+
+    for memory in memories {
+        collect_from(&memory.summary);
+        collect_from(&memory.content);
+    }
+    if let Some(summary) = session.summary.as_deref() {
+        collect_from(summary);
+    }
+    if let Some(compact_summary) = session.compact_summary.as_deref() {
+        collect_from(compact_summary);
+    }
+    for output in &session.tool_outputs {
+        collect_from(output);
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths.truncate(10);
+    paths
 }
 
 /// Sync wrapper for transcript ingestion.
@@ -156,13 +438,23 @@ pub fn ingest_session_text_sync(
     agent_label: Option<&str>,
     is_subagent: bool,
 ) -> crate::types::ReinResult<(u32, u32, u32)> {
+    let report = ingest_session_text_sync_report(config, text, agent_label, is_subagent)?;
+    Ok((report.memory_count, report.concept_count, report.link_count))
+}
+
+pub fn ingest_session_text_sync_report(
+    config: &ReinConfig,
+    text: &str,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
     let cfg = config.clone();
     let text = text.to_string();
     let agent_label = agent_label.map(|s| s.to_string());
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
-            handle.block_on(ingest_session_text(
+            handle.block_on(ingest_session_text_report(
                 &cfg,
                 &text,
                 agent_label.as_deref(),
@@ -174,7 +466,7 @@ pub fn ingest_session_text_sync(
             .enable_all()
             .build()
             .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
-        rt.block_on(ingest_session_text(
+        rt.block_on(ingest_session_text_report(
             &cfg,
             &text,
             agent_label.as_deref(),
@@ -190,13 +482,23 @@ pub fn ingest_session_sync(
     agent_label: Option<&str>,
     is_subagent: bool,
 ) -> crate::types::ReinResult<(u32, u32, u32)> {
+    let report = ingest_session_sync_report(config, session, agent_label, is_subagent)?;
+    Ok((report.memory_count, report.concept_count, report.link_count))
+}
+
+pub fn ingest_session_sync_report(
+    config: &ReinConfig,
+    session: &SessionIngest,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
     let cfg = config.clone();
     let session = session.clone();
     let agent_label = agent_label.map(|s| s.to_string());
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
-            handle.block_on(ingest_session(
+            handle.block_on(ingest_session_report(
                 &cfg,
                 &session,
                 agent_label.as_deref(),
@@ -208,13 +510,102 @@ pub fn ingest_session_sync(
             .enable_all()
             .build()
             .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
-        rt.block_on(ingest_session(
+        rt.block_on(ingest_session_report(
             &cfg,
             &session,
             agent_label.as_deref(),
             is_subagent,
         ))
     }
+}
+
+pub fn queue_ingest_session_text(
+    config: &ReinConfig,
+    text: &str,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
+    let session = SessionIngest {
+        schema_version: 1,
+        artifact_kind: "session".to_string(),
+        session_id: None,
+        title: None,
+        started_at: None,
+        ended_at: None,
+        summary: None,
+        source_agent: agent_label.map(|s| s.to_string()),
+        source_label: Some("explicit-ingest".to_string()),
+        compact_summary: None,
+        tool_outputs: vec![],
+        turns: vec![SessionTurn {
+            role: "session".to_string(),
+            content: text.to_string(),
+        }],
+    };
+    queue_ingest_session(config, &session, agent_label, is_subagent)
+}
+
+pub fn queue_ingest_session(
+    config: &ReinConfig,
+    session: &SessionIngest,
+    agent_label: Option<&str>,
+    is_subagent: bool,
+) -> crate::types::ReinResult<IngestReport> {
+    let text = render_session_ingest(session);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(IngestReport::default());
+    }
+    let store = config.open_store()?;
+    let artifact = SessionArtifact {
+        id: String::new(),
+        schema_version: session.schema_version,
+        artifact_kind: session.artifact_kind.clone(),
+        session_id: session.session_id.clone(),
+        title: session.title.clone(),
+        summary: session.summary.clone(),
+        source_agent: session
+            .source_agent
+            .clone()
+            .or_else(|| agent_label.map(|s| s.to_string())),
+        source_label: session.source_label.clone(),
+        is_subagent,
+        started_at: session.started_at,
+        ended_at: session.ended_at,
+        turn_count: session.turns.len() as u32,
+        transcript_text: trimmed.to_string(),
+        transcript_json: serde_json::to_string(session).ok(),
+        episode_id: None,
+        created_at: chrono::Utc::now(),
+    };
+    let artifact_id = store.store_session_artifact(artifact)?;
+    crate::extract::hooks::queue::queue_memory_job(
+        config,
+        crate::extract::hooks::queue::MemoryJobMode::Full,
+        "ingest_session",
+        session
+            .source_label
+            .as_deref()
+            .unwrap_or(if is_subagent { "source:subagent" } else { "source:main-agent" }),
+        agent_label
+            .or(session.source_agent.as_deref())
+            .unwrap_or("manual-ingest")
+            .to_string(),
+        is_subagent,
+        if is_subagent { 50 } else { 95 },
+        None,
+        trimmed.to_string(),
+    )
+    .map_err(|e| ReinError::Config(format!("{e}")))?;
+    crate::extract::hooks::queue::spawn_memory_worker(config);
+
+    Ok(IngestReport {
+        queued: true,
+        artifact_id: Some(artifact_id),
+        session_id: session.session_id.clone(),
+        turn_count: session.turns.len() as u32,
+        ..Default::default()
+    })
 }
 
 /// Build a consolidated Memory from a topic.

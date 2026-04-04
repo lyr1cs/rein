@@ -236,11 +236,42 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             title TEXT NOT NULL,
             outcome TEXT NOT NULL DEFAULT '',
             decisions TEXT NOT NULL DEFAULT '[]',
+            primary_topics TEXT NOT NULL DEFAULT '[]',
+            tags TEXT NOT NULL DEFAULT '[]',
+            involved_agents TEXT NOT NULL DEFAULT '[]',
+            important_paths TEXT NOT NULL DEFAULT '[]',
+            temporal_keywords TEXT NOT NULL DEFAULT '[]',
+            source_session_id TEXT,
             concept_ids TEXT NOT NULL DEFAULT '[]',
             memory_ids TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at);
+        CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id);
+    ")?;
+
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS session_artifacts (
+            id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            artifact_kind TEXT NOT NULL DEFAULT 'session',
+            session_id TEXT,
+            title TEXT,
+            summary TEXT,
+            source_agent TEXT,
+            source_label TEXT,
+            is_subagent INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            ended_at TEXT,
+            turn_count INTEGER NOT NULL DEFAULT 0,
+            transcript_text TEXT NOT NULL,
+            transcript_json TEXT,
+            episode_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_artifacts_created ON session_artifacts(created_at);
+        CREATE INDEX IF NOT EXISTS idx_session_artifacts_session_id ON session_artifacts(session_id);
+        CREATE INDEX IF NOT EXISTS idx_session_artifacts_episode_id ON session_artifacts(episode_id);
     ")?;
 
     // Index for temporal concept queries
@@ -314,6 +345,8 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'").ok();
     }
 
+    migrate_episode_columns(conn)?;
+
     // Migrate: widen source CHECK to include 'proxy' (v0.9.4)
     // SQLite doesn't support ALTER CHECK, so we recreate the table if needed.
     // Skip for in-memory databases (fresh schema already includes 'proxy').
@@ -324,6 +357,50 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
 
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;
+
+    Ok(())
+}
+
+fn migrate_episode_columns(conn: &Connection) -> ReinResult<()> {
+    let ensure_column = |name: &str, ddl: &str| {
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name=?1",
+                rusqlite::params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !has_column {
+            conn.execute_batch(ddl).ok();
+        }
+    };
+
+    ensure_column(
+        "primary_topics",
+        "ALTER TABLE episodes ADD COLUMN primary_topics TEXT NOT NULL DEFAULT '[]'",
+    );
+    ensure_column(
+        "tags",
+        "ALTER TABLE episodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
+    );
+    ensure_column(
+        "involved_agents",
+        "ALTER TABLE episodes ADD COLUMN involved_agents TEXT NOT NULL DEFAULT '[]'",
+    );
+    ensure_column(
+        "important_paths",
+        "ALTER TABLE episodes ADD COLUMN important_paths TEXT NOT NULL DEFAULT '[]'",
+    );
+    ensure_column(
+        "temporal_keywords",
+        "ALTER TABLE episodes ADD COLUMN temporal_keywords TEXT NOT NULL DEFAULT '[]'",
+    );
+    ensure_column(
+        "source_session_id",
+        "ALTER TABLE episodes ADD COLUMN source_session_id TEXT",
+    );
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id)").ok();
 
     Ok(())
 }

@@ -132,6 +132,68 @@ impl SqliteStore {
         }).collect())
     }
 
+    /// Persist a raw session artifact separately from derived memories.
+    pub fn store_session_artifact(&self, mut artifact: SessionArtifact) -> ReinResult<String> {
+        let id = if artifact.id.is_empty() {
+            ulid::Ulid::new().to_string()
+        } else {
+            artifact.id.clone()
+        };
+        artifact.id = id.clone();
+        let created_at = if artifact.created_at.timestamp() == 0 {
+            Utc::now()
+        } else {
+            artifact.created_at
+        };
+
+        self.conn.execute(
+            "INSERT INTO session_artifacts (
+                id, schema_version, artifact_kind, session_id, title, summary, source_agent,
+                source_label, is_subagent, started_at, ended_at, turn_count, transcript_text,
+                transcript_json, episode_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            rusqlite::params![
+                &artifact.id,
+                artifact.schema_version,
+                artifact.artifact_kind,
+                artifact.session_id,
+                artifact.title,
+                artifact.summary,
+                artifact.source_agent,
+                artifact.source_label,
+                if artifact.is_subagent { 1 } else { 0 },
+                artifact.started_at.map(|dt| dt.to_rfc3339()),
+                artifact.ended_at.map(|dt| dt.to_rfc3339()),
+                artifact.turn_count,
+                artifact.transcript_text,
+                artifact.transcript_json,
+                artifact.episode_id,
+                created_at.to_rfc3339(),
+            ],
+        )?;
+
+        Ok(id)
+    }
+
+    /// Link a raw session artifact to the episode created from it.
+    pub fn link_session_artifact_episode(
+        &self,
+        artifact_id: &str,
+        episode_id: &str,
+    ) -> ReinResult<()> {
+        let rows = self.conn.execute(
+            "UPDATE session_artifacts SET episode_id = ?1 WHERE id = ?2",
+            rusqlite::params![episode_id, artifact_id],
+        )?;
+        if rows == 0 {
+            return Err(ReinError::NotFound(format!(
+                "session artifact '{}' not found",
+                artifact_id
+            )));
+        }
+        Ok(())
+    }
+
 }
 
 /// Map a rusqlite Row to a Memory struct.
