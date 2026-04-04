@@ -472,6 +472,11 @@ pub struct ProxyConfig {
     pub extract_enabled: bool,
     pub store_min_chars: usize,
     pub store_min_score: u32,
+    pub max_retries: u32,
+    pub retry_base_ms: u64,
+    pub max_response_buffer: usize,
+    pub max_sse_buffer: usize,
+    pub max_concurrent_extractions: usize,
 }
 
 impl Default for ProxyConfig {
@@ -484,6 +489,11 @@ impl Default for ProxyConfig {
             extract_enabled: true,
             store_min_chars: 220,
             store_min_score: 3,
+            max_retries: 2,
+            retry_base_ms: 500,
+            max_response_buffer: 1_048_576,
+            max_sse_buffer: 1_048_576,
+            max_concurrent_extractions: 4,
         }
     }
 }
