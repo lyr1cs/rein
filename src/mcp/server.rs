@@ -1503,9 +1503,11 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     tracing::info!("rein HTTP server listening on {bind}");
     eprintln!("rein HTTP server listening on http://{bind}/mcp");
 
+    let rest_config = config.clone();
     let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
         let svc = service.clone();
         let token = auth_token.clone();
+        let cfg = rest_config.clone();
         async move {
             // Check bearer token if configured
             if let Some(ref expected) = token {
@@ -1534,6 +1536,11 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                     );
                 }
             }
+            // Try REST API / GUI routes before MCP dispatch
+            if let Some(response) = crate::mcp::rest::handle_rest_request(&req, &cfg).await {
+                return Ok::<_, std::convert::Infallible>(response);
+            }
+
             Ok::<_, std::convert::Infallible>(svc.handle(req).await)
         }
     });
