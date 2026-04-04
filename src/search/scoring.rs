@@ -1,5 +1,5 @@
 use crate::search::survival::SurvivalCurve;
-use crate::types::{Memory, MemoryTier};
+use crate::types::Memory;
 
 /// Calculate current memory strength using Ebbinghaus forgetting curve.
 /// strength(t) = exp(-lambda_eff * days^beta)

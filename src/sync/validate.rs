@@ -2,7 +2,7 @@
 // Containment is good for dedup (short text subset of long), but bad for corroboration
 // where we need genuine independent confirmation, not subset overlap.
 use crate::extract::dedup::jaccard_similarity;
-use crate::types::{Memory, MemoryTier};
+use crate::types::Memory;
 
 /// Cross-validation result wrapping a memory with confidence score.
 pub struct ValidatedResult {
@@ -117,7 +117,7 @@ fn has_matching_result_refs(memory: &Memory, candidates: &[&Memory]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Importance, MemoryLayer, MemoryStatus, Source};
+    use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
 
     fn make_memory(id: &str, content: &str) -> Memory {
         Memory {
