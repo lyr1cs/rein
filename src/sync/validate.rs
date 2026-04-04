@@ -2,6 +2,7 @@
 // Containment is good for dedup (short text subset of long), but bad for corroboration
 // where we need genuine independent confirmation, not subset overlap.
 use crate::extract::dedup::jaccard_similarity;
+use crate::types::MemoryTier;
 use crate::types::Memory;
 
 /// Cross-validation result wrapping a memory with confidence score.
@@ -137,7 +138,7 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
-            tier: "warm".to_string(),
+            tier: MemoryTier::Warm,
             cluster_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
