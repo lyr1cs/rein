@@ -60,9 +60,8 @@ struct ProxyState {
 
 /// Start the transparent proxy server.
 pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
-    // Signal hooks that proxy mode is active. Injection itself is disabled; the
-    // env var remains useful for agent-aware recording policy.
-    std::env::set_var("REIN_PROXY_ACTIVE", "1");
+    // REIN_PROXY_ACTIVE is set by the caller (main.rs) before entering async
+    // to avoid unsound set_var in multi-threaded context.
 
     let bind = format!("{}:{}", config.proxy.bind, config.proxy.port);
 
