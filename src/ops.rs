@@ -323,17 +323,19 @@ fn ingest_extraction_report(
         };
         if let Ok(created_episode_id) = store.create_episode(episode) {
             episode_id = Some(created_episode_id.clone());
+            let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+            let _ = store.conn().execute_batch("BEGIN");
             for cid in &session_concept_ids {
                 let _ = store.conn().execute(
                     "UPDATE concepts SET last_episode_id = ?1 WHERE id = ?2",
                     rusqlite::params![created_episode_id, cid],
                 );
-                let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
                 let _ = store.conn().execute(
                     "UPDATE concept_revisions SET episode_id = ?1 WHERE concept_id = ?2 AND episode_id IS NULL AND created_at >= ?3",
                     rusqlite::params![created_episode_id, cid, cutoff],
                 );
             }
+            let _ = store.conn().execute_batch("COMMIT");
             if let Err(e) = crate::extract::hooks::buffer::store_episode_concept(&store, ep) {
                 tracing::warn!("failed to store episode concept: {e}");
             }
@@ -398,6 +400,7 @@ fn derive_important_paths(
 ) -> Vec<String> {
     let mut paths = Vec::new();
     let mut collect_from = |text: &str| {
+        if paths.len() >= 200 { return; } // bound intermediate allocation
         for token in text.split_whitespace() {
             let trimmed = token.trim_matches(|c: char| ",:;()[]{}'\"".contains(c));
             let looks_like_path = trimmed.contains('/')
