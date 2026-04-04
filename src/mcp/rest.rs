@@ -189,6 +189,7 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
 
 fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
     let days: i64 = query.get("days").and_then(|d| d.parse().ok()).unwrap_or(14).max(1).min(90);
+    let granularity = query.get("granularity").map(|s| s.as_str()).unwrap_or("hour");
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -196,12 +197,27 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
     let conn = store.conn();
     let offset = format!("-{days} days");
 
-    // Recall events by day
-    let mut recall_stmt = match conn.prepare(
-        "SELECT date(ts) as day, COUNT(*) FROM feedback_events
+    // SQL truncation expression: hour → "YYYY-MM-DD HH:00", day → "YYYY-MM-DD"
+    let (trunc_expr, group_alias) = if granularity == "hour" {
+        ("strftime('%Y-%m-%d %H:00', {})", "bucket")
+    } else {
+        ("date({})", "bucket")
+    };
+
+    let recall_sql = format!(
+        "SELECT {} as {group_alias}, COUNT(*) FROM feedback_events
          WHERE event_type = 'recall_complete' AND ts >= date('now', ?1)
-         GROUP BY day ORDER BY day"
-    ) {
+         GROUP BY {group_alias} ORDER BY {group_alias}",
+        trunc_expr.replace("{}", "ts")
+    );
+    let store_sql = format!(
+        "SELECT {} as {group_alias}, COUNT(*) FROM memories
+         WHERE created_at >= date('now', ?1)
+         GROUP BY {group_alias} ORDER BY {group_alias}",
+        trunc_expr.replace("{}", "created_at")
+    );
+
+    let mut recall_stmt = match conn.prepare(&recall_sql) {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
@@ -211,12 +227,7 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
         .map(|r| r.filter_map(|x| x.ok()).collect())
         .unwrap_or_default();
 
-    // Store events by day (memories created)
-    let mut store_stmt = match conn.prepare(
-        "SELECT date(created_at) as day, COUNT(*) FROM memories
-         WHERE created_at >= date('now', ?1)
-         GROUP BY day ORDER BY day"
-    ) {
+    let mut store_stmt = match conn.prepare(&store_sql) {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
@@ -226,20 +237,20 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
         .map(|r| r.filter_map(|x| x.ok()).collect())
         .unwrap_or_default();
 
-    // Merge into unified day series
-    let mut day_map: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
-    for (day, count) in &recall_rows {
-        day_map.entry(day.clone()).or_default().0 = *count;
+    // Merge into unified series
+    let mut bucket_map: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    for (bucket, count) in &recall_rows {
+        bucket_map.entry(bucket.clone()).or_default().0 = *count;
     }
-    for (day, count) in &store_rows {
-        day_map.entry(day.clone()).or_default().1 = *count;
+    for (bucket, count) in &store_rows {
+        bucket_map.entry(bucket.clone()).or_default().1 = *count;
     }
 
-    let activity: Vec<serde_json::Value> = day_map.into_iter().map(|(day, (recalls, stores))| {
-        json!({ "date": day, "recalls": recalls, "stores": stores })
+    let activity: Vec<serde_json::Value> = bucket_map.into_iter().map(|(date, (recalls, stores))| {
+        json!({ "date": date, "recalls": recalls, "stores": stores })
     }).collect();
 
-    json_response(StatusCode::OK, json!({ "activity": activity }))
+    json_response(StatusCode::OK, json!({ "activity": activity, "granularity": granularity }))
 }
 
 fn api_topics(config: &ReinConfig) -> BoxedResponse {

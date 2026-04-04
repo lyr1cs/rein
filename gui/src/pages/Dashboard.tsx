@@ -36,19 +36,22 @@ function ActivityTooltip({ active, payload, label }: { active?: boolean; payload
 
 export default function Dashboard() {
   const [activityDays, setActivityDays] = useState(14);
+  const [granularity, setGranularity] = useState<'hour' | 'day'>('hour');
   const { data: stats, isLoading } = useStats();
   const { data: recentData } = useRecent(5);
   const { data: _topicsData } = useTopics();
-  const { data: activityData } = useActivity(activityDays);
+  const { data: activityData } = useActivity(activityDays, granularity);
 
   if (isLoading || !stats) {
     return <div className="flex items-center justify-center h-full text-[var(--text-muted)]">Loading...</div>;
   }
 
-  // Format activity data for chart (short date labels)
+  // Format activity data for chart
   const chartData = (activityData?.activity ?? []).map((d) => ({
     ...d,
-    label: d.date.slice(5), // "MM-DD"
+    label: granularity === 'hour'
+      ? d.date.slice(5, 16)   // "MM-DD HH:00"
+      : d.date.slice(5),       // "MM-DD"
   }));
 
   return (
@@ -60,20 +63,39 @@ export default function Dashboard() {
         <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4 mb-6">
           <div className="flex items-center justify-between mb-3">
             <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider">Activity ({activityDays} days)</div>
-            <div className="flex gap-1">
-              {ACTIVITY_RANGES.map((r) => (
-                <button
-                  key={r.days}
-                  onClick={() => setActivityDays(r.days)}
-                  className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
-                    activityDays === r.days
-                      ? 'bg-[var(--accent)] text-white'
-                      : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'
-                  }`}
-                >
-                  {r.label}
-                </button>
-              ))}
+            <div className="flex items-center gap-3">
+              {/* Granularity toggle */}
+              <div className="flex gap-0.5 bg-[var(--bg-primary)] rounded px-0.5 py-0.5">
+                {(['hour', 'day'] as const).map((g) => (
+                  <button
+                    key={g}
+                    onClick={() => setGranularity(g)}
+                    className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
+                      granularity === g
+                        ? 'bg-[var(--bg-tertiary)] text-[var(--text-primary)]'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
+                    }`}
+                  >
+                    {g === 'hour' ? 'Hourly' : 'Daily'}
+                  </button>
+                ))}
+              </div>
+              {/* Time range */}
+              <div className="flex gap-1">
+                {ACTIVITY_RANGES.map((r) => (
+                  <button
+                    key={r.days}
+                    onClick={() => setActivityDays(r.days)}
+                    className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
+                      activityDays === r.days
+                        ? 'bg-[var(--accent)] text-white'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'
+                    }`}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
           <ResponsiveContainer width="100%" height={160}>
