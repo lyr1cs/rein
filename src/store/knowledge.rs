@@ -92,8 +92,8 @@ impl SqliteStore {
                                 }
                             }
                         }
-                        // Refine (revision history is auto-snapshotted in refine_concept)
-                        if let Err(e) = self.refine_concept(memoir_name, &c.name, &c.definition) {
+                        // Refine (use existing.name for exact DB match after normalized lookup)
+                        if let Err(e) = self.refine_concept(memoir_name, &existing.name, &c.definition) {
                             tracing::warn!("failed to refine concept '{}': {e}", c.name);
                         } else {
                             report.concepts_refined += 1;
@@ -116,11 +116,11 @@ impl SqliteStore {
                         }
                     }
                     None => {
-                        // New concept with source memory references
+                        // New concept — normalize name to prevent future dupes
                         let concept = Concept {
                             id: String::new(),
                             memoir_id: memoir_name.clone(),
-                            name: c.name.clone(),
+                            name: crate::store::memoir::normalize_concept_name(&c.name),
                             definition: c.definition.clone(),
                             labels: c.labels.clone(),
                             source_memory_ids: source_memory_ids.to_vec(),
