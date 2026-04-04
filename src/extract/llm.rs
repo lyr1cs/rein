@@ -120,7 +120,7 @@ Output a JSON object with these fields:
 
 Each memory: {"topic", "summary" (under 100 chars), "content" (1-3 sentences), "keywords" (2-5), "importance" ("low"|"medium"|"high"|"critical"), "should_store" (bool), "quality_confidence" (float 0-1)}
 
-Each concept: {"name" (short identifier), "definition" (1-2 sentences), "labels" (tags), "memoir" (category: "architecture", "debugging", "workflow", "config", "learning", "tooling"), "concept_type" ("fact" or "skill"), "quality_confidence" (float 0-1)}
+Each concept: {"name" (short identifier, MUST use lowercase-kebab-case e.g. "adaptive-engine", "query-expansion", "sqlite-wal"), "definition" (1-2 sentences), "labels" (tags), "memoir" (category: "architecture", "debugging", "workflow", "config", "learning", "tooling"), "concept_type" ("fact" or "skill"), "quality_confidence" (float 0-1)}
 
 Each link: {"from" (concept name), "to" (concept name), "relation" (one of: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by)}
 Links must connect concepts within the SAME memoir category.

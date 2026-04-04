@@ -7,6 +7,31 @@ use crate::types::*;
 
 use super::sqlite::SqliteStore;
 
+/// Normalize a concept name for dedup-safe lookup.
+/// Lowercases, replaces underscores and spaces with hyphens, collapses runs of hyphens.
+pub fn normalize_concept_name(name: &str) -> String {
+    let s: String = name
+        .trim()
+        .to_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-");
+    // Collapse consecutive hyphens
+    let mut result = String::with_capacity(s.len());
+    let mut prev_hyphen = false;
+    for ch in s.chars() {
+        if ch == '-' {
+            if !prev_hyphen {
+                result.push('-');
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(ch);
+            prev_hyphen = false;
+        }
+    }
+    result.trim_matches('-').to_string()
+}
+
 /// Escape a string for use in DOT (Graphviz) quoted strings.
 fn escape_dot(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -290,6 +315,7 @@ impl SqliteStore {
     }
 
     /// Get a concept by memoir name and concept name.
+    /// Uses normalized lookup: lowercased, hyphens/underscores/spaces unified.
     pub fn get_concept(
         &self,
         memoir_name: &str,
@@ -301,6 +327,7 @@ impl SqliteStore {
             None => return Ok(None),
         };
 
+        // First try exact match (fast path)
         let mut stmt = self
             .conn()
             .prepare("SELECT * FROM concepts WHERE memoir_id = ?1 AND name = ?2")?;
@@ -315,10 +342,34 @@ impl SqliteStore {
         });
 
         match result {
-            Ok(c) => Ok(Some(c)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(ReinError::Database(e)),
+            Ok(c) => return Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(ReinError::Database(e)),
         }
+
+        // Fallback: normalized lookup — scan concepts in this memoir for a normalized match
+        let normalized = normalize_concept_name(concept_name);
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT * FROM concepts WHERE memoir_id = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![memoir.id], |row| {
+            row_to_concept(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })?;
+        for row in rows {
+            if let Ok(c) = row {
+                if normalize_concept_name(&c.name) == normalized {
+                    return Ok(Some(c));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Refine a concept: update definition, increment revision, boost confidence by 0.1 (max 1.0).
@@ -453,6 +504,130 @@ impl SqliteStore {
                 }
             })
             .collect())
+    }
+
+    /// Deduplicate concepts: merge concepts with the same normalized name within each memoir.
+    /// Keeps the oldest concept (highest revision / earliest created_at) as canonical,
+    /// merges source_memory_ids and labels from duplicates, repoints links, then deletes dupes.
+    /// Returns (groups_merged, concepts_removed).
+    pub fn dedup_concepts(&self) -> ReinResult<(usize, usize)> {
+        // Collect all concepts grouped by (memoir_id, normalized_name)
+        let mut stmt = self.conn().prepare("SELECT * FROM concepts ORDER BY created_at ASC")?;
+        let all: Vec<Concept> = stmt.query_map([], |row| {
+            row_to_concept(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        // Group by (memoir_id, normalized_name)
+        let mut groups: std::collections::HashMap<(String, String), Vec<Concept>> =
+            std::collections::HashMap::new();
+        for c in all {
+            let key = (c.memoir_id.clone(), normalize_concept_name(&c.name));
+            groups.entry(key).or_default().push(c);
+        }
+
+        let mut groups_merged = 0usize;
+        let mut concepts_removed = 0usize;
+
+        self.conn().execute_batch("SAVEPOINT dedup_concepts")
+            .map_err(ReinError::Database)?;
+
+        let result = (|| -> ReinResult<()> {
+            for ((_memoir_id, _norm), group) in &groups {
+                if group.len() <= 1 { continue; }
+
+                // Canonical = first (oldest by created_at since we sorted)
+                let canonical = &group[0];
+                let dupes = &group[1..];
+
+                // Merge source_memory_ids and labels from dupes into canonical
+                let mut merged_sources: Vec<String> = canonical.source_memory_ids.clone();
+                let mut merged_labels: Vec<String> = canonical.labels.clone();
+                // Pick the longest definition as canonical
+                let mut best_def = canonical.definition.clone();
+
+                for dupe in dupes {
+                    for sid in &dupe.source_memory_ids {
+                        if !merged_sources.contains(sid) {
+                            merged_sources.push(sid.clone());
+                        }
+                    }
+                    for label in &dupe.labels {
+                        if !merged_labels.contains(label) {
+                            merged_labels.push(label.clone());
+                        }
+                    }
+                    if dupe.definition.len() > best_def.len() {
+                        best_def = dupe.definition.clone();
+                    }
+                }
+
+                // Update canonical concept
+                let sources_json = serde_json::to_string(&merged_sources).unwrap_or_default();
+                let labels_json = serde_json::to_string(&merged_labels).unwrap_or_default();
+                self.conn().execute(
+                    "UPDATE concepts SET source_memory_ids = ?1, labels = ?2, definition = ?3 WHERE id = ?4",
+                    rusqlite::params![sources_json, labels_json, best_def, canonical.id],
+                )?;
+
+                // Repoint links from dupes to canonical
+                for dupe in dupes {
+                    self.conn().execute(
+                        "UPDATE OR IGNORE concept_links SET source_id = ?1 WHERE source_id = ?2",
+                        rusqlite::params![canonical.id, dupe.id],
+                    )?;
+                    self.conn().execute(
+                        "UPDATE OR IGNORE concept_links SET target_id = ?1 WHERE target_id = ?2",
+                        rusqlite::params![canonical.id, dupe.id],
+                    )?;
+                    // Update memory concept_ids references
+                    self.conn().execute(
+                        &format!(
+                            "UPDATE memories SET concept_ids = REPLACE(concept_ids, '\"{}\"', '\"{}\"') WHERE concept_ids LIKE '%{}%'",
+                            dupe.id, canonical.id, dupe.id
+                        ),
+                        [],
+                    )?;
+                    // Delete orphaned links (self-referencing after repoint)
+                    self.conn().execute(
+                        "DELETE FROM concept_links WHERE source_id = target_id",
+                        [],
+                    )?;
+                    // Delete duplicate concept and its revisions
+                    self.conn().execute(
+                        "DELETE FROM concept_revisions WHERE concept_id = ?1",
+                        rusqlite::params![dupe.id],
+                    )?;
+                    self.conn().execute(
+                        "DELETE FROM concepts WHERE id = ?1",
+                        rusqlite::params![dupe.id],
+                    )?;
+                    // Clean up any dangling links
+                    self.conn().execute(
+                        "DELETE FROM concept_links WHERE source_id = ?1 OR target_id = ?1",
+                        rusqlite::params![dupe.id],
+                    )?;
+                    concepts_removed += 1;
+                }
+                groups_merged += 1;
+            }
+            Ok(())
+        })();
+
+        match &result {
+            Ok(_) => {
+                self.conn().execute_batch("RELEASE dedup_concepts")
+                    .map_err(ReinError::Database)?;
+            }
+            Err(_) => {
+                let _ = self.conn().execute_batch("ROLLBACK TO dedup_concepts");
+                let _ = self.conn().execute_batch("RELEASE dedup_concepts");
+            }
+        }
+        result?;
+
+        Ok((groups_merged, concepts_removed))
     }
 
     // --- Link CRUD ---
