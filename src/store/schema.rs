@@ -266,7 +266,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             turn_count INTEGER NOT NULL DEFAULT 0,
             transcript_text TEXT NOT NULL,
             transcript_json TEXT,
-            episode_id TEXT,
+            episode_id TEXT REFERENCES episodes(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_session_artifacts_created ON session_artifacts(created_at);
