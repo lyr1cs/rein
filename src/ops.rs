@@ -589,7 +589,7 @@ pub fn queue_ingest_session(
         started_at: session.started_at,
         ended_at: session.ended_at,
         turn_count: session.turns.len() as u32,
-        transcript_text: scrubbed,
+        transcript_text: scrubbed.clone(),
         transcript_json: None, // raw JSON may contain secrets; omit from artifact
         episode_id: None,
         created_at: chrono::Utc::now(),
@@ -610,9 +610,9 @@ pub fn queue_ingest_session(
         is_subagent,
         if is_subagent { 50 } else { 95 },
         None,
-        trimmed.to_string(),
+        scrubbed, // use scrubbed text, not raw trimmed
         Some(artifact_id.clone()),
-        serde_json::to_string(session).ok(),
+        None, // don't persist raw SessionIngest JSON (may contain secrets)
     )
     .map_err(|e| ReinError::Config(format!("{e}")))?;
     crate::extract::hooks::queue::spawn_memory_worker(config);
@@ -759,13 +759,13 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
     // Event counts by type
     let event_counts: serde_json::Value = conn
         .prepare("SELECT event_type, COUNT(*) FROM feedback_events GROUP BY event_type")
-        .and_then(|mut stmt| {
+        .map(|mut stmt| {
             let rows: Vec<(String, i64)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .ok()
                 .map(|r| r.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default();
-            Ok(rows)
+            rows
         })
         .map(|rows| {
             let map: serde_json::Map<String, serde_json::Value> = rows
@@ -779,13 +779,13 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
     // Survival curves summary
     let survival_curves: Vec<serde_json::Value> = conn
         .prepare("SELECT key, value FROM metadata WHERE key LIKE 'survival_curve:%'")
-        .and_then(|mut stmt| {
+        .map(|mut stmt| {
             let rows: Vec<(String, String)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .ok()
                 .map(|r| r.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default();
-            Ok(rows)
+            rows
         })
         .map(|rows| {
             rows.into_iter()
