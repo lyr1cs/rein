@@ -793,9 +793,11 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
                     let cluster_id = key.strip_prefix("survival_curve:")?;
                     let curve: serde_json::Value = serde_json::from_str(&value).ok()?;
                     let median = curve.get("median_survival").cloned();
+                    let steps = curve.get("steps").cloned();
                     Some(serde_json::json!({
                         "cluster_id": cluster_id,
                         "median_survival": median,
+                        "steps": steps,
                     }))
                 })
                 .collect()

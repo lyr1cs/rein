@@ -1499,9 +1499,22 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         http_config,
     );
 
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("Error: port {} is already in use.", config.server.sse_port);
+            eprintln!("Another rein instance may be running. Check with:");
+            eprintln!("  lsof -i :{}", config.server.sse_port);
+            eprintln!("Kill it first, or use a different port via REIN_SSE_PORT.");
+            return Err(anyhow::anyhow!("port {} already in use", config.server.sse_port));
+        }
+        Err(e) => return Err(e.into()),
+    };
     tracing::info!("rein HTTP server listening on {bind}");
     eprintln!("rein HTTP server listening on http://{bind}/mcp");
+    if config.server.gui_enabled {
+        eprintln!("Neural Wiki GUI available at http://{bind}/");
+    }
 
     let rest_config = config.clone();
     let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
