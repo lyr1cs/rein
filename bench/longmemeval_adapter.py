@@ -114,6 +114,23 @@ def rein_store(content: str, topic: str = "longmemeval", keywords: str = "") -> 
     return None
 
 
+def rein_ingest_session(content: str, agent_label: str = "longmemeval") -> str | None:
+    """Ingest a full session in rein via MCP tools/call."""
+    result = mcp_request("tools/call", {
+        "name": "rein_ingest_session",
+        "arguments": {
+            "content": content,
+            "agent_label": agent_label,
+            "is_subagent": False,
+        },
+    })
+    if result and "content" in result:
+        for item in result["content"]:
+            if item.get("type") == "text":
+                return item["text"]
+    return None
+
+
 def rein_recall(query: str, limit: int = 10) -> str | None:
     """Recall memories from rein via MCP tools/call."""
     result = mcp_request("tools/call", {
@@ -275,13 +292,11 @@ def run_benchmark(data_path: str, output_path: str, limit: int | None = None,
         rein_forget_all()
         time.sleep(0.1)
 
-        # Store all sessions
+        # Store all sessions through full ingestion so the benchmark exercises
+        # memories + concepts + links + episodes, not just flat store().
         for j, (session, date) in enumerate(zip(sessions, dates)):
             text = format_session(session, date)
-            # Truncate very long sessions to avoid overwhelming store
-            if len(text) > 8000:
-                text = text[:8000] + "\n[truncated]"
-            rein_store(text, topic="longmemeval", keywords=qtype)
+            rein_ingest_session(text, "longmemeval")
 
         # Recall with the question
         recalled = rein_recall(question, limit=15)

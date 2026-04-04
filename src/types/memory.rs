@@ -37,7 +37,9 @@ pub struct Memory {
     pub last_accessed: DateTime<Utc>,
 }
 
-fn default_tier() -> String { "warm".to_string() }
+fn default_tier() -> String {
+    "warm".to_string()
+}
 
 /// Lifecycle status of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +51,6 @@ pub enum MemoryStatus {
     Updated,
     Deprecated,
 }
-
 
 impl fmt::Display for MemoryStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -298,6 +299,28 @@ pub struct Episode {
     /// Memory IDs created in this session.
     pub memory_ids: Vec<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A single turn in a structured session transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Structured ingestion payload for a session/transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionIngest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub turns: Vec<SessionTurn>,
 }
 
 /// Relation types between concepts.
