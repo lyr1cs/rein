@@ -188,20 +188,23 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
 }
 
 fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
-    let days: i64 = query.get("days").and_then(|d| d.parse().ok()).unwrap_or(14).min(90);
+    let days: i64 = query.get("days").and_then(|d| d.parse().ok()).unwrap_or(14).max(1).min(90);
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let conn = store.conn();
+    let offset = format!("-{days} days");
 
     // Recall events by day
-    let mut recall_stmt = conn.prepare(
+    let mut recall_stmt = match conn.prepare(
         "SELECT date(ts) as day, COUNT(*) FROM feedback_events
          WHERE event_type = 'recall_complete' AND ts >= date('now', ?1)
          GROUP BY day ORDER BY day"
-    ).unwrap();
-    let offset = format!("-{days} days");
+    ) {
+        Ok(s) => s,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let recall_rows: Vec<(String, i64)> = recall_stmt
         .query_map(rusqlite::params![offset], |row| Ok((row.get(0)?, row.get(1)?)))
         .ok()
@@ -209,11 +212,14 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
         .unwrap_or_default();
 
     // Store events by day (memories created)
-    let mut store_stmt = conn.prepare(
+    let mut store_stmt = match conn.prepare(
         "SELECT date(created_at) as day, COUNT(*) FROM memories
          WHERE created_at >= date('now', ?1)
          GROUP BY day ORDER BY day"
-    ).unwrap();
+    ) {
+        Ok(s) => s,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let store_rows: Vec<(String, i64)> = store_stmt
         .query_map(rusqlite::params![offset], |row| Ok((row.get(0)?, row.get(1)?)))
         .ok()
