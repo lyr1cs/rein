@@ -143,7 +143,8 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             relation TEXT NOT NULL,
             weight REAL NOT NULL DEFAULT 1.0,
             created_at TEXT NOT NULL,
-            CHECK(source_id != target_id)
+            CHECK(source_id != target_id),
+            UNIQUE(source_id, target_id, relation)
         );
 
         CREATE INDEX IF NOT EXISTS idx_links_source ON concept_links(source_id);
@@ -215,7 +216,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS concept_revisions (
             id TEXT PRIMARY KEY,
-            concept_id TEXT NOT NULL,
+            concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
             revision INTEGER NOT NULL,
             definition TEXT NOT NULL,
             confidence REAL NOT NULL,
@@ -342,10 +343,33 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
         return Ok(());
     }
 
+    // Check if old table has the embedding column (pre-proxy DBs may not)
+    let has_embedding: bool = conn
+        .prepare("SELECT embedding FROM memories_old LIMIT 0")
+        .is_ok();
+
     // Recreate table with widened CHECK.
+    // Conditionally copy embedding column (missing in pre-proxy databases).
+    let insert_sql = if has_embedding {
+        "INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, \
+             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
+             updated_at, last_accessed, embedding, status, concept_ids, tier, cluster_id, needs_vec_dedup) \
+         SELECT id, layer, topic, summary, content, keywords, importance, source, \
+             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
+             updated_at, last_accessed, embedding, status, concept_ids, tier, cluster_id, needs_vec_dedup \
+         FROM memories_old;"
+    } else {
+        "INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, \
+             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
+             updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup) \
+         SELECT id, layer, topic, summary, content, keywords, importance, source, \
+             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
+             updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup \
+         FROM memories_old;"
+    };
+
     conn.execute_batch(
-        "ALTER TABLE memories RENAME TO memories_old; \
-         CREATE TABLE memories ( \
+        "CREATE TABLE memories ( \
              id TEXT PRIMARY KEY NOT NULL, \
              layer TEXT NOT NULL CHECK(layer IN ('LTM', 'STM')), \
              topic TEXT NOT NULL, \
@@ -368,15 +392,38 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
              tier TEXT NOT NULL DEFAULT 'warm', \
              cluster_id INTEGER, \
              needs_vec_dedup INTEGER NOT NULL DEFAULT 0 \
-         ); \
-         INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, \
-             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
-             updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup) \
-         SELECT id, layer, topic, summary, content, keywords, importance, source, \
-             strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
-             updated_at, last_accessed, status, concept_ids, tier, cluster_id, needs_vec_dedup \
-         FROM memories_old; \
-         DROP TABLE memories_old;"
+         );"
+    ).map_err(crate::types::ReinError::Database)?;
+    conn.execute_batch(insert_sql).map_err(crate::types::ReinError::Database)?;
+    conn.execute_batch("DROP TABLE memories_old;").map_err(crate::types::ReinError::Database)?;
+
+    // Recreate indexes destroyed by table rename/drop
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic); \
+         CREATE INDEX IF NOT EXISTS idx_memories_layer ON memories(layer); \
+         CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance); \
+         CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength); \
+         CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at); \
+         CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed);"
+    ).map_err(crate::types::ReinError::Database)?;
+
+    // Recreate FTS triggers destroyed by table rename (they reference the old table)
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN \
+            INSERT INTO memories_fts(id, topic, summary, content, keywords) \
+            VALUES (new.id, new.topic, new.summary, new.content, new.keywords); \
+         END; \
+         CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories \
+            WHEN old.content != new.content OR old.topic != new.topic \
+              OR old.summary != new.summary OR old.keywords != new.keywords \
+         BEGIN \
+            DELETE FROM memories_fts WHERE id = old.id; \
+            INSERT INTO memories_fts(id, topic, summary, content, keywords) \
+            VALUES (new.id, new.topic, new.summary, new.content, new.keywords); \
+         END; \
+         CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN \
+            DELETE FROM memories_fts WHERE id = old.id; \
+         END;"
     ).map_err(crate::types::ReinError::Database)?;
 
     tracing::info!("migrated source CHECK to include 'proxy'");
