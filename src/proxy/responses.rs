@@ -95,10 +95,10 @@ pub fn extract_assistant_text_sse(chunk_text: &str) -> Option<String> {
     let mut result = String::new();
     for line in chunk_text.lines() {
         let line = line.trim();
-        if !line.starts_with("data: ") {
-            continue;
-        }
-        let data = &line[6..];
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => continue,
+        };
         if data == "[DONE]" {
             continue;
         }
