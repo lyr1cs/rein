@@ -113,6 +113,9 @@ enum Commands {
     Init {
         #[arg(long)]
         dry_run: bool,
+        /// Configure shell aliases for proxy (rein-proxy, claudep, codexp)
+        #[arg(long)]
+        proxy: bool,
     },
     /// Show most recently created memories
     Recent {
@@ -625,8 +628,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("{report}");
             }
         }
-        Some(Commands::Init { dry_run }) => {
+        Some(Commands::Init { dry_run, proxy }) => {
             rein::init::auto_configure(dry_run)?;
+            if proxy {
+                rein::init::proxy_configure(dry_run)?;
+            }
         }
         Some(Commands::Consolidate { topic, summary }) => {
             let store = config.open_store()?;
