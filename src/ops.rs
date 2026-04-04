@@ -189,6 +189,13 @@ pub async fn ingest_session_report(
         return Ok(IngestReport::default());
     }
 
+    // Filter secrets from transcript before persisting artifact
+    let scrubbed: String = trimmed
+        .lines()
+        .filter(|l| !crate::extract::hooks::parsing::looks_like_secret(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let store = config.open_store()?;
     let artifact = SessionArtifact {
         id: String::new(),
@@ -206,8 +213,8 @@ pub async fn ingest_session_report(
         started_at: session.started_at,
         ended_at: session.ended_at,
         turn_count: session.turns.len() as u32,
-        transcript_text: trimmed.to_string(),
-        transcript_json: serde_json::to_string(session).ok(),
+        transcript_text: scrubbed,
+        transcript_json: None, // raw JSON may contain secrets; omit from artifact
         episode_id: None,
         created_at: chrono::Utc::now(),
     };
@@ -559,6 +566,12 @@ pub fn queue_ingest_session(
     if trimmed.is_empty() {
         return Ok(IngestReport::default());
     }
+    // Filter secrets from transcript before persisting artifact
+    let scrubbed: String = trimmed
+        .lines()
+        .filter(|l| !crate::extract::hooks::parsing::looks_like_secret(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     let store = config.open_store()?;
     let artifact = SessionArtifact {
         id: String::new(),
@@ -576,8 +589,8 @@ pub fn queue_ingest_session(
         started_at: session.started_at,
         ended_at: session.ended_at,
         turn_count: session.turns.len() as u32,
-        transcript_text: trimmed.to_string(),
-        transcript_json: serde_json::to_string(session).ok(),
+        transcript_text: scrubbed,
+        transcript_json: None, // raw JSON may contain secrets; omit from artifact
         episode_id: None,
         created_at: chrono::Utc::now(),
     };
