@@ -129,6 +129,19 @@ fn row_to_link(row: &rusqlite::Row) -> ReinResult<ConceptLink> {
 /// Map a rusqlite Row to an Episode struct.
 fn row_to_episode(row: &rusqlite::Row) -> ReinResult<Episode> {
     let decisions_json: String = row.get("decisions").map_err(ReinError::Database)?;
+    let primary_topics_json: String = row
+        .get("primary_topics")
+        .unwrap_or_else(|_| "[]".to_string());
+    let tags_json: String = row.get("tags").unwrap_or_else(|_| "[]".to_string());
+    let involved_agents_json: String = row
+        .get("involved_agents")
+        .unwrap_or_else(|_| "[]".to_string());
+    let important_paths_json: String = row
+        .get("important_paths")
+        .unwrap_or_else(|_| "[]".to_string());
+    let temporal_keywords_json: String = row
+        .get("temporal_keywords")
+        .unwrap_or_else(|_| "[]".to_string());
     let concept_ids_json: String = row.get("concept_ids").map_err(ReinError::Database)?;
     let memory_ids_json: String = row.get("memory_ids").map_err(ReinError::Database)?;
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
@@ -142,6 +155,12 @@ fn row_to_episode(row: &rusqlite::Row) -> ReinResult<Episode> {
         title: row.get("title").map_err(ReinError::Database)?,
         outcome: row.get("outcome").map_err(ReinError::Database)?,
         decisions: serde_json::from_str(&decisions_json)?,
+        primary_topics: serde_json::from_str(&primary_topics_json).unwrap_or_default(),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        involved_agents: serde_json::from_str(&involved_agents_json).unwrap_or_default(),
+        important_paths: serde_json::from_str(&important_paths_json).unwrap_or_default(),
+        temporal_keywords: serde_json::from_str(&temporal_keywords_json).unwrap_or_default(),
+        source_session_id: row.get("source_session_id").unwrap_or(None),
         concept_ids: serde_json::from_str(&concept_ids_json)?,
         memory_ids: serde_json::from_str(&memory_ids_json)?,
         created_at,
@@ -879,14 +898,43 @@ impl SqliteStore {
             episode.id
         };
         let decisions_json = serde_json::to_string(&episode.decisions).unwrap_or_default();
+        let primary_topics_json =
+            serde_json::to_string(&episode.primary_topics).unwrap_or_default();
+        let tags_json = serde_json::to_string(&episode.tags).unwrap_or_default();
+        let involved_agents_json =
+            serde_json::to_string(&episode.involved_agents).unwrap_or_default();
+        let important_paths_json =
+            serde_json::to_string(&episode.important_paths).unwrap_or_default();
+        let temporal_keywords_json =
+            serde_json::to_string(&episode.temporal_keywords).unwrap_or_default();
         let concept_ids_json = serde_json::to_string(&episode.concept_ids).unwrap_or_default();
         let memory_ids_json = serde_json::to_string(&episode.memory_ids).unwrap_or_default();
-        let now = Utc::now();
+        let created_at = if episode.created_at.timestamp() == 0 {
+            Utc::now()
+        } else {
+            episode.created_at
+        };
 
         self.conn().execute(
-            "INSERT INTO episodes (id, title, outcome, decisions, concept_ids, memory_ids, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![id, episode.title, episode.outcome, decisions_json, concept_ids_json, memory_ids_json, now.to_rfc3339()],
+            "INSERT INTO episodes (
+                id, title, outcome, decisions, primary_topics, tags, involved_agents,
+                important_paths, temporal_keywords, source_session_id, concept_ids, memory_ids, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                id,
+                episode.title,
+                episode.outcome,
+                decisions_json,
+                primary_topics_json,
+                tags_json,
+                involved_agents_json,
+                important_paths_json,
+                temporal_keywords_json,
+                episode.source_session_id,
+                concept_ids_json,
+                memory_ids_json,
+                created_at.to_rfc3339()
+            ],
         )?;
         Ok(id)
     }
@@ -954,8 +1002,8 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Search recent episodes by title/outcome/decisions using lightweight token matching.
-    /// Returns ranked episodes with a heuristic score.
+    /// Search recent episodes by title/outcome/decisions and richer metadata.
+    /// Returns ranked episodes with a heuristic session-level score.
     pub fn search_episodes_ranked(
         &self,
         query: &str,
@@ -993,22 +1041,62 @@ impl SqliteStore {
 
         let mut ranked = Vec::new();
         for episode in episodes {
-            let haystack = format!(
-                "{}\n{}\n{}",
-                episode.title,
-                episode.outcome,
-                episode.decisions.join("\n")
-            );
-            let haystack_lower = haystack.to_lowercase();
             let mut score = 0.0_f32;
+            let title = episode.title.to_lowercase();
+            let outcome = episode.outcome.to_lowercase();
+            let decisions = episode.decisions.join("\n").to_lowercase();
+            let primary_topics = episode.primary_topics.join(" ").to_lowercase();
+            let tags = episode.tags.join(" ").to_lowercase();
+            let agents = episode.involved_agents.join(" ").to_lowercase();
+            let paths = episode.important_paths.join(" ").to_lowercase();
+            let temporal = episode.temporal_keywords.join(" ").to_lowercase();
 
-            if haystack_lower.contains(&query_lower) {
-                score += 2.5;
+            if title.contains(&query_lower) {
+                score += 3.0;
+            }
+            if outcome.contains(&query_lower) {
+                score += 2.2;
+            }
+            if decisions.contains(&query_lower) {
+                score += 2.6;
+            }
+            if primary_topics.contains(&query_lower) {
+                score += 1.8;
+            }
+            if tags.contains(&query_lower) {
+                score += 1.2;
+            }
+            if paths.contains(&query_lower) {
+                score += 1.6;
+            }
+            if temporal.contains(&query_lower) {
+                score += 2.0;
             }
 
             for token in &tokens {
-                if haystack_lower.contains(token) {
+                if title.contains(token) {
+                    score += 0.9;
+                }
+                if outcome.contains(token) {
                     score += 0.6;
+                }
+                if decisions.contains(token) {
+                    score += 0.8;
+                }
+                if primary_topics.contains(token) {
+                    score += 0.7;
+                }
+                if tags.contains(token) {
+                    score += 0.4;
+                }
+                if agents.contains(token) {
+                    score += 0.3;
+                }
+                if paths.contains(token) {
+                    score += 0.5;
+                }
+                if temporal.contains(token) {
+                    score += 0.7;
                 }
             }
 
@@ -1018,7 +1106,14 @@ impl SqliteStore {
 
             let age_days = (Utc::now() - episode.created_at).num_hours() as f32 / 24.0;
             let recency = 1.0 / (1.0 + age_days / 30.0);
-            ranked.push((episode, score + recency * 0.3));
+            let structural = 0.1 * episode.memory_ids.len().min(5) as f32
+                + 0.08 * episode.concept_ids.len().min(5) as f32;
+            let main_agent_boost = if episode.tags.iter().any(|t| t == "main-agent") {
+                0.25
+            } else {
+                0.0
+            };
+            ranked.push((episode, score + recency * 0.3 + structural + main_agent_boost));
         }
 
         ranked.sort_by(|a, b| {
@@ -1517,6 +1612,12 @@ mod tests {
             title: "Test session".to_string(),
             outcome: "Built FT-2".to_string(),
             decisions: vec!["Use SAVEPOINT".to_string()],
+            primary_topics: vec!["workflow".to_string()],
+            tags: vec!["main-agent".to_string()],
+            involved_agents: vec!["test-agent".to_string()],
+            important_paths: vec!["src/store/schema.rs".to_string()],
+            temporal_keywords: vec!["date:2026-04-04".to_string()],
+            source_session_id: Some("session-test".to_string()),
             concept_ids: vec!["c1".to_string()],
             memory_ids: vec!["m1".to_string(), "m2".to_string()],
             created_at: Utc::now(),
@@ -1545,6 +1646,12 @@ mod tests {
             title: "Today's session".to_string(),
             outcome: String::new(),
             decisions: vec![],
+            primary_topics: vec!["workflow".to_string()],
+            tags: vec!["main-agent".to_string()],
+            involved_agents: vec!["test-agent".to_string()],
+            important_paths: vec![],
+            temporal_keywords: vec!["date:2026-04-04".to_string()],
+            source_session_id: Some("session-range".to_string()),
             concept_ids: vec![],
             memory_ids: vec![],
             created_at: Utc::now(),
