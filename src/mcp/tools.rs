@@ -1,6 +1,14 @@
 use rmcp::schemars;
 use serde::Deserialize;
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionTurnParams {
+    /// Role for the turn, e.g. user/assistant/tool/system.
+    pub role: String,
+    /// Text content of the turn.
+    pub content: String,
+}
+
 /// Parameters for rein_recall tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecallParams {
@@ -31,6 +39,27 @@ pub struct StoreParams {
     pub importance: Option<String>,
     /// Comma-separated keywords for the memory.
     pub keywords: Option<String>,
+}
+
+/// Parameters for rein_ingest_session tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IngestSessionParams {
+    /// The full session/transcript text to ingest.
+    pub content: Option<String>,
+    /// Optional structured turn list for richer ingestion.
+    pub turns: Option<Vec<SessionTurnParams>>,
+    /// Optional session title.
+    pub title: Option<String>,
+    /// Optional stable session identifier.
+    pub session_id: Option<String>,
+    /// Optional RFC3339 session start time.
+    pub started_at: Option<String>,
+    /// Optional session summary or compacted synopsis.
+    pub summary: Option<String>,
+    /// Optional label for the originating agent/runtime.
+    pub agent_label: Option<String>,
+    /// Whether this session came from a subagent.
+    pub is_subagent: Option<bool>,
 }
 
 /// Parameters for rein_update tool.

@@ -182,6 +182,50 @@ fn test_health_report() {
     assert_eq!(reports[0].count, 10);
 }
 
+#[test]
+fn test_ingest_session_text_stores_recallable_memories() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ingest.db");
+    let toml_str = format!(
+        r#"
+[database]
+path = "{}"
+
+[extract]
+provider = "none"
+
+[sync]
+supermemory_enabled = false
+auto_memory_enabled = false
+"#,
+        db_path.display()
+    );
+    let config = rein::config::ReinConfig::load_from_str(&toml_str).unwrap();
+
+    let transcript = "User: We decided to switch the billing database to PostgreSQL because SQLite was locking under concurrent load.\nAssistant: We will keep the migration plan in the project memory.";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (memories, _, _) = rt
+        .block_on(rein::ops::ingest_session_text(
+            &config,
+            transcript,
+            Some("test-ingest"),
+            false,
+        ))
+        .unwrap();
+
+    assert!(memories >= 1, "ingestion should store at least one memory");
+
+    let store = config.open_store().unwrap();
+    let results = store.search_fts("PostgreSQL locking", None, 10).unwrap();
+    assert!(
+        !results.is_empty(),
+        "ingested session should become recallable through normal search"
+    );
+}
+
 /// Store a memory with an embedding vector, verify it can be found via
 /// vector search even when FTS returns nothing useful.
 #[test]
@@ -200,13 +244,17 @@ fn test_vector_only_recall() {
     let id = store.store(m).unwrap();
 
     // FTS search for a completely unrelated term should find nothing
-    let fts = store.search_fts("zzz_nonexistent_token_xyz", None, 10).unwrap();
-    assert!(fts.is_empty(), "FTS should return nothing for gibberish query");
+    let fts = store
+        .search_fts("zzz_nonexistent_token_xyz", None, 10)
+        .unwrap();
+    assert!(
+        fts.is_empty(),
+        "FTS should return nothing for gibberish query"
+    );
 
     // Vector search directly should still find the memory
     let query_vec = vec![0.1_f32; 3072];
-    let vec_results =
-        rein::store::vec::search_vec(store.conn(), &query_vec, 10).unwrap();
+    let vec_results = rein::store::vec::search_vec(store.conn(), &query_vec, 10).unwrap();
     assert!(
         !vec_results.is_empty(),
         "Vector search should return the stored memory"
@@ -267,7 +315,10 @@ fn test_dot_export_cjk() {
 
     // Basic structural checks
     assert!(dot.contains("digraph"), "DOT output must contain digraph");
-    assert!(dot.starts_with("digraph"), "DOT output must start with digraph");
+    assert!(
+        dot.starts_with("digraph"),
+        "DOT output must start with digraph"
+    );
     assert!(dot.contains("rankdir=LR"), "DOT output must set rankdir");
 
     // Escaped characters must be present (quotes escaped as \")

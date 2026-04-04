@@ -39,6 +39,26 @@ def rein_store(db_path: str, content: str, topic: str = "longmemeval") -> bool:
         return False
 
 
+def rein_ingest(db_path: str, content: str, agent_label: str = "longmemeval") -> bool:
+    """Ingest a full session using rein's full extraction pipeline."""
+    try:
+        result = subprocess.run(
+            [
+                REIN_BIN,
+                "ingest",
+                "--content",
+                content,
+                "--agent-label",
+                agent_label,
+            ],
+            env={**os.environ, "REIN_DB": db_path},
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def rein_recall(db_path: str, query: str, limit: int = 15) -> str:
     """Recall memories using rein CLI."""
     try:
@@ -197,13 +217,13 @@ def process_question(item: dict, idx: int, total: int) -> dict:
     tmp = tempfile.mktemp(suffix=".db", prefix=f"rein_bench_{qid}_")
 
     try:
-        # Store all sessions (with LLM extraction if enabled)
+        # Store all sessions.
+        # Default path uses rein's full ingestion so benchmark data exercises the
+        # same extraction/concept/episode pipeline as real sessions.
         for session, date in zip(sessions, dates):
             text = format_session(session, date)
             if USE_LLM_EXTRACT:
-                memories = llm_extract(text, date)
-                for mem in memories:
-                    rein_store(tmp, mem)
+                rein_ingest(tmp, text, "longmemeval")
             else:
                 if len(text) > 8000:
                     text = text[:8000] + "\n[truncated]"

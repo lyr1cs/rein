@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
 use crate::mcp::compact;
@@ -75,7 +75,10 @@ impl ReinServer {
 impl ReinServer {
     /// Search memories by query, topic, or keyword.
     /// Uses full pipeline: FTS5 → cached vectors → Google API → RRF fusion → Ebbinghaus weighting → cross-validation.
-    #[tool(name = "rein_recall", description = "Search and recall memories by semantic query. Uses three-level waterfall search with cross-validation. Supports optional topic and keyword filters.")]
+    #[tool(
+        name = "rein_recall",
+        description = "Search and recall memories by semantic query. Uses three-level waterfall search with cross-validation. Supports optional topic and keyword filters."
+    )]
     fn rein_recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let limit = params.limit.unwrap_or(10);
@@ -96,12 +99,15 @@ impl ReinServer {
                 time_to,
                 params.expand,
                 false, // MCP uses full pipeline
-            ).map_err(|e| ReinError::Config(format!("{e}")))
+            )
+            .map_err(|e| ReinError::Config(format!("{e}")))
         });
 
         // Re-classify for transparency (sub-microsecond, no overhead)
         let route = crate::search::classify::classify(
-            &params.query, time_from.is_some(), time_to.is_some(),
+            &params.query,
+            time_from.is_some(),
+            time_to.is_some(),
         );
 
         // Generate request_id for feedback attribution
@@ -109,7 +115,8 @@ impl ReinServer {
 
         match result {
             Ok(results) => {
-                let scored: Vec<(Memory, f32)> = results.into_iter().map(|r| (r.memory, r.score)).collect();
+                let scored: Vec<(Memory, f32)> =
+                    results.into_iter().map(|r| (r.memory, r.score)).collect();
                 let mut text = compact::format_recall_results(&scored, self.compact());
                 if text.is_empty() {
                     text = if self.compact() {
@@ -119,7 +126,10 @@ impl ReinServer {
                     };
                 }
                 if !self.compact() && !scored.is_empty() {
-                    text = format!("[route: {} | request_id: {}] {}", route.query_type, request_id, text);
+                    text = format!(
+                        "[route: {} | request_id: {}] {}",
+                        route.query_type, request_id, text
+                    );
                 }
                 self.maybe_nudge(&mut text);
                 text
@@ -133,7 +143,10 @@ impl ReinServer {
     }
 
     /// Store a new memory with topic, content, importance, and keywords.
-    #[tool(name = "rein_store", description = "Store a new memory. Automatically deduplicates against existing memories.")]
+    #[tool(
+        name = "rein_store",
+        description = "Store a new memory. Automatically deduplicates against existing memories."
+    )]
     fn rein_store(&self, Parameters(params): Parameters<StoreParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed);
 
@@ -168,9 +181,7 @@ impl ReinServer {
         );
 
         let config = self.config.clone();
-        let result = self.with_store(|store| {
-            crate::ops::store_memory(store, &config, memory)
-        });
+        let result = self.with_store(|store| crate::ops::store_memory(store, &config, memory));
 
         match result {
             Ok(id) => compact::format_store_result(&id, self.compact()),
@@ -178,8 +189,76 @@ impl ReinServer {
         }
     }
 
+    /// Ingest a full session/transcript through the full extraction pipeline.
+    #[tool(
+        name = "rein_ingest_session",
+        description = "Ingest a full session transcript into memories, concepts, links, and an episode using the full extraction pipeline."
+    )]
+    fn rein_ingest_session(&self, Parameters(params): Parameters<IngestSessionParams>) -> String {
+        self.non_store_count.store(0, Ordering::Relaxed);
+
+        let config = self.config.clone();
+        let result = if let Some(turns) = params.turns {
+            let started_at = params
+                .started_at
+                .as_deref()
+                .and_then(parse_datetime)
+                .or_else(|| params.started_at.as_deref().and_then(parse_datetime_end));
+            let session = crate::types::SessionIngest {
+                session_id: params.session_id,
+                title: params.title,
+                started_at,
+                summary: params.summary,
+                turns: turns
+                    .into_iter()
+                    .map(|turn| crate::types::SessionTurn {
+                        role: turn.role,
+                        content: turn.content,
+                    })
+                    .collect(),
+            };
+            crate::ops::ingest_session_sync(
+                &config,
+                &session,
+                params.agent_label.as_deref(),
+                params.is_subagent.unwrap_or(false),
+            )
+        } else if let Some(content) = params.content {
+            if content.len() > 500_000 {
+                return "Error: content too large (max 500KB)".to_string();
+            }
+            crate::ops::ingest_session_text_sync(
+                &config,
+                &content,
+                params.agent_label.as_deref(),
+                params.is_subagent.unwrap_or(false),
+            )
+        } else {
+            Err(crate::types::ReinError::Config(
+                "ingest_session requires either content or turns".to_string(),
+            ))
+        };
+
+        match result {
+            Ok((memories, concepts, links)) => {
+                if self.compact() {
+                    format!("ok memories:{memories} concepts:{concepts} links:{links}")
+                } else {
+                    format!(
+                        "Ingested session: {} memories, {} concepts, {} links",
+                        memories, concepts, links
+                    )
+                }
+            }
+            Err(e) => format!("Error ingesting session: {e}"),
+        }
+    }
+
     /// Update an existing memory by ID.
-    #[tool(name = "rein_update", description = "Update the content of an existing memory by its ID.")]
+    #[tool(
+        name = "rein_update",
+        description = "Update the content of an existing memory by its ID."
+    )]
     fn rein_update(&self, Parameters(params): Parameters<UpdateParams>) -> String {
         // Don't count update as non-store (it's a mutation, not a read)
         self.non_store_count.store(0, Ordering::Relaxed);
@@ -223,7 +302,10 @@ impl ReinServer {
 
     /// Report which recalled memories were actually used by the agent.
     /// This feedback improves future recall quality through adaptive weight learning.
-    #[tool(name = "rein_feedback", description = "Report which recalled memories were actually used. Improves future recall quality. Call after using rein_recall results.")]
+    #[tool(
+        name = "rein_feedback",
+        description = "Report which recalled memories were actually used. Improves future recall quality. Call after using rein_recall results."
+    )]
     fn rein_feedback(&self, Parameters(params): Parameters<FeedbackParams>) -> String {
         if params.memory_ids.is_empty() {
             return "No memory IDs provided.".to_string();
@@ -263,7 +345,10 @@ impl ReinServer {
                 let mut text = if self.compact() {
                     format!("ok:{count}")
                 } else {
-                    format!("Feedback recorded for {} memories. This improves future recall quality.", count)
+                    format!(
+                        "Feedback recorded for {} memories. This improves future recall quality.",
+                        count
+                    )
                 };
                 self.maybe_nudge(&mut text);
                 text
@@ -322,7 +407,10 @@ impl ReinServer {
     }
 
     /// Show memory store statistics.
-    #[tool(name = "rein_stats", description = "Show memory store statistics (total, LTM/STM counts, avg strength).")]
+    #[tool(
+        name = "rein_stats",
+        description = "Show memory store statistics (total, LTM/STM counts, avg strength)."
+    )]
     fn rein_stats(&self) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
 
@@ -343,13 +431,14 @@ impl ReinServer {
     }
 
     /// Check health of memory topics.
-    #[tool(name = "rein_health", description = "Check health of memory topics. Shows stale count, avg strength, consolidation needs.")]
+    #[tool(
+        name = "rein_health",
+        description = "Check health of memory topics. Shows stale count, avg strength, consolidation needs."
+    )]
     fn rein_health(&self, Parameters(params): Parameters<HealthParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
 
-        let result = self.with_store(|store| {
-            store.health(params.topic.as_deref())
-        });
+        let result = self.with_store(|store| store.health(params.topic.as_deref()));
 
         match result {
             Ok(reports) => {
@@ -366,7 +455,10 @@ impl ReinServer {
     }
 
     /// Consolidate all memories in a topic into a single summary.
-    #[tool(name = "rein_consolidate", description = "Consolidate all memories in a topic into a single summary memory, removing the originals.")]
+    #[tool(
+        name = "rein_consolidate",
+        description = "Consolidate all memories in a topic into a single summary memory, removing the originals."
+    )]
     fn rein_consolidate(&self, Parameters(params): Parameters<ConsolidateParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
@@ -421,7 +513,10 @@ impl ReinServer {
     // ===== Knowledge Graph (Memoir/Concept/Link) tools =====
 
     /// Create a new memoir (knowledge graph container).
-    #[tool(name = "rein_memoir_create", description = "Create a new memoir (named knowledge graph). Use to organize concepts and their relationships.")]
+    #[tool(
+        name = "rein_memoir_create",
+        description = "Create a new memoir (named knowledge graph). Use to organize concepts and their relationships."
+    )]
     fn rein_memoir_create(&self, Parameters(params): Parameters<MemoirCreateParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed);
         let compact = self.compact();
@@ -449,7 +544,10 @@ impl ReinServer {
     }
 
     /// List all memoirs.
-    #[tool(name = "rein_memoir_list", description = "List all memoirs (knowledge graphs).")]
+    #[tool(
+        name = "rein_memoir_list",
+        description = "List all memoirs (knowledge graphs)."
+    )]
     fn rein_memoir_list(&self) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
@@ -459,7 +557,11 @@ impl ReinServer {
         match result {
             Ok(memoirs) => {
                 if memoirs.is_empty() {
-                    return if compact { "none".to_string() } else { "No memoirs found.".to_string() };
+                    return if compact {
+                        "none".to_string()
+                    } else {
+                        "No memoirs found.".to_string()
+                    };
                 }
                 let mut text = String::new();
                 for m in &memoirs {
@@ -476,14 +578,18 @@ impl ReinServer {
     }
 
     /// Show a memoir and all its concepts.
-    #[tool(name = "rein_memoir_show", description = "Show memoir details and list all concepts within it.")]
+    #[tool(
+        name = "rein_memoir_show",
+        description = "Show memoir details and list all concepts within it."
+    )]
     fn rein_memoir_show(&self, Parameters(params): Parameters<MemoirShowParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
 
         let result = self.with_store(|store| {
-            let memoir = store.get_memoir(&params.name)?
-                .ok_or_else(|| ReinError::NotFound(format!("memoir '{}' not found", params.name)))?;
+            let memoir = store.get_memoir(&params.name)?.ok_or_else(|| {
+                ReinError::NotFound(format!("memoir '{}' not found", params.name))
+            })?;
             let export = store.export_memoir(&params.name, "ascii")?;
             Ok((memoir, export))
         });
@@ -493,7 +599,10 @@ impl ReinServer {
                 if compact {
                     export
                 } else {
-                    format!("Memoir: {} — {}\n\n{}", memoir.name, memoir.description, export)
+                    format!(
+                        "Memoir: {} — {}\n\n{}",
+                        memoir.name, memoir.description, export
+                    )
                 }
             }
             Err(e) => format!("Error: {e}"),
@@ -501,7 +610,10 @@ impl ReinServer {
     }
 
     /// Add a concept to a memoir.
-    #[tool(name = "rein_memoir_add_concept", description = "Add a concept (knowledge node) to a memoir with name, definition, and optional labels.")]
+    #[tool(
+        name = "rein_memoir_add_concept",
+        description = "Add a concept (knowledge node) to a memoir with name, definition, and optional labels."
+    )]
     fn rein_memoir_add_concept(&self, Parameters(params): Parameters<ConceptAddParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed);
         let compact = self.compact();
@@ -537,7 +649,10 @@ impl ReinServer {
                 if compact {
                     format!("ok:{id}")
                 } else {
-                    format!("Added concept '{}' to memoir '{}': {id}", params.name, params.memoir)
+                    format!(
+                        "Added concept '{}' to memoir '{}': {id}",
+                        params.name, params.memoir
+                    )
                 }
             }
             Err(e) => format!("Error: {e}"),
@@ -545,7 +660,10 @@ impl ReinServer {
     }
 
     /// Refine a concept's definition.
-    #[tool(name = "rein_memoir_refine", description = "Refine a concept: update definition, increment revision, boost confidence.")]
+    #[tool(
+        name = "rein_memoir_refine",
+        description = "Refine a concept: update definition, increment revision, boost confidence."
+    )]
     fn rein_memoir_refine(&self, Parameters(params): Parameters<ConceptRefineParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed);
         let compact = self.compact();
@@ -559,7 +677,10 @@ impl ReinServer {
                 if compact {
                     format!("ok:{}", params.name)
                 } else {
-                    format!("Refined concept '{}' in memoir '{}'", params.name, params.memoir)
+                    format!(
+                        "Refined concept '{}' in memoir '{}'",
+                        params.name, params.memoir
+                    )
                 }
             }
             Err(e) => format!("Error: {e}"),
@@ -567,27 +688,39 @@ impl ReinServer {
     }
 
     /// Search concepts within a memoir.
-    #[tool(name = "rein_memoir_search", description = "Full-text search for concepts within a memoir.")]
+    #[tool(
+        name = "rein_memoir_search",
+        description = "Full-text search for concepts within a memoir."
+    )]
     fn rein_memoir_search(&self, Parameters(params): Parameters<ConceptSearchParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
         let limit = params.limit.unwrap_or(10).min(100);
 
-        let result = self.with_store(|store| {
-            store.search_concepts(&params.memoir, &params.query, limit)
-        });
+        let result =
+            self.with_store(|store| store.search_concepts(&params.memoir, &params.query, limit));
 
         match result {
             Ok(concepts) => {
                 if concepts.is_empty() {
-                    return if compact { "none".to_string() } else { "No concepts found.".to_string() };
+                    return if compact {
+                        "none".to_string()
+                    } else {
+                        "No concepts found.".to_string()
+                    };
                 }
                 let mut text = String::new();
                 for c in &concepts {
                     if compact {
-                        text.push_str(&format!("{}:{}:r{}:c{:.1}\n", c.name, c.definition, c.revision, c.confidence));
+                        text.push_str(&format!(
+                            "{}:{}:r{}:c{:.1}\n",
+                            c.name, c.definition, c.revision, c.confidence
+                        ));
                     } else {
-                        text.push_str(&format!("- {} (rev:{}, conf:{:.1}) — {}\n", c.name, c.revision, c.confidence, c.definition));
+                        text.push_str(&format!(
+                            "- {} (rev:{}, conf:{:.1}) — {}\n",
+                            c.name, c.revision, c.confidence, c.definition
+                        ));
                     }
                 }
                 text
@@ -597,27 +730,41 @@ impl ReinServer {
     }
 
     /// Search concepts across all memoirs.
-    #[tool(name = "rein_memoir_search_all", description = "Full-text search for concepts across all memoirs.")]
-    fn rein_memoir_search_all(&self, Parameters(params): Parameters<ConceptSearchAllParams>) -> String {
+    #[tool(
+        name = "rein_memoir_search_all",
+        description = "Full-text search for concepts across all memoirs."
+    )]
+    fn rein_memoir_search_all(
+        &self,
+        Parameters(params): Parameters<ConceptSearchAllParams>,
+    ) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
         let limit = params.limit.unwrap_or(10).min(100);
 
-        let result = self.with_store(|store| {
-            store.search_all_concepts(&params.query, limit)
-        });
+        let result = self.with_store(|store| store.search_all_concepts(&params.query, limit));
 
         match result {
             Ok(concepts) => {
                 if concepts.is_empty() {
-                    return if compact { "none".to_string() } else { "No concepts found.".to_string() };
+                    return if compact {
+                        "none".to_string()
+                    } else {
+                        "No concepts found.".to_string()
+                    };
                 }
                 let mut text = String::new();
                 for c in &concepts {
                     if compact {
-                        text.push_str(&format!("{}:{}:r{}:c{:.1}\n", c.name, c.definition, c.revision, c.confidence));
+                        text.push_str(&format!(
+                            "{}:{}:r{}:c{:.1}\n",
+                            c.name, c.definition, c.revision, c.confidence
+                        ));
                     } else {
-                        text.push_str(&format!("- {} (rev:{}, conf:{:.1}) — {}\n", c.name, c.revision, c.confidence, c.definition));
+                        text.push_str(&format!(
+                            "- {} (rev:{}, conf:{:.1}) — {}\n",
+                            c.name, c.revision, c.confidence, c.definition
+                        ));
                     }
                 }
                 text
@@ -627,7 +774,10 @@ impl ReinServer {
     }
 
     /// Create a typed relation between two concepts.
-    #[tool(name = "rein_memoir_link", description = "Create a typed relation (edge) between two concepts in a memoir. Relations: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by.")]
+    #[tool(
+        name = "rein_memoir_link",
+        description = "Create a typed relation (edge) between two concepts in a memoir. Relations: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by."
+    )]
     fn rein_memoir_link(&self, Parameters(params): Parameters<LinkParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed);
         let compact = self.compact();
@@ -638,10 +788,22 @@ impl ReinServer {
         };
 
         let result = self.with_store(|store| {
-            let from = store.get_concept(&params.memoir, &params.from)?
-                .ok_or_else(|| ReinError::NotFound(format!("concept '{}' not found in memoir '{}'", params.from, params.memoir)))?;
-            let to = store.get_concept(&params.memoir, &params.to)?
-                .ok_or_else(|| ReinError::NotFound(format!("concept '{}' not found in memoir '{}'", params.to, params.memoir)))?;
+            let from = store
+                .get_concept(&params.memoir, &params.from)?
+                .ok_or_else(|| {
+                    ReinError::NotFound(format!(
+                        "concept '{}' not found in memoir '{}'",
+                        params.from, params.memoir
+                    ))
+                })?;
+            let to = store
+                .get_concept(&params.memoir, &params.to)?
+                .ok_or_else(|| {
+                    ReinError::NotFound(format!(
+                        "concept '{}' not found in memoir '{}'",
+                        params.to, params.memoir
+                    ))
+                })?;
 
             let link = crate::types::ConceptLink {
                 id: String::new(),
@@ -661,7 +823,10 @@ impl ReinServer {
                 if compact {
                     format!("ok:{id}")
                 } else {
-                    format!("Linked '{}' --{}-> '{}': {id}", params.from, params.relation, params.to)
+                    format!(
+                        "Linked '{}' --{}-> '{}': {id}",
+                        params.from, params.relation, params.to
+                    )
                 }
             }
             Err(e) => format!("Error: {e}"),
@@ -669,39 +834,59 @@ impl ReinServer {
     }
 
     /// Inspect a concept's neighborhood via BFS.
-    #[tool(name = "rein_memoir_inspect", description = "Inspect a concept's neighborhood via BFS traversal. Returns the concept, its neighbors, and connecting links up to the specified depth.")]
+    #[tool(
+        name = "rein_memoir_inspect",
+        description = "Inspect a concept's neighborhood via BFS traversal. Returns the concept, its neighbors, and connecting links up to the specified depth."
+    )]
     fn rein_memoir_inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let compact = self.compact();
         let depth = params.depth.unwrap_or(1).min(5);
 
-        let result = self.with_store(|store| {
-            store.inspect_concept(&params.memoir, &params.name, depth)
-        });
+        let result =
+            self.with_store(|store| store.inspect_concept(&params.memoir, &params.name, depth));
 
         match result {
             Ok((center, neighbors, links)) => {
                 let mut text = String::new();
                 if compact {
-                    text.push_str(&format!("center:{}:c{:.1}:r{}\n", center.name, center.confidence, center.revision));
+                    text.push_str(&format!(
+                        "center:{}:c{:.1}:r{}\n",
+                        center.name, center.confidence, center.revision
+                    ));
                     for n in &neighbors {
-                        text.push_str(&format!("neighbor:{}:c{:.1}:r{}\n", n.name, n.confidence, n.revision));
+                        text.push_str(&format!(
+                            "neighbor:{}:c{:.1}:r{}\n",
+                            n.name, n.confidence, n.revision
+                        ));
                     }
                     for l in &links {
-                        text.push_str(&format!("link:{}->{}:{}\n", l.source_id, l.target_id, l.relation));
+                        text.push_str(&format!(
+                            "link:{}->{}:{}\n",
+                            l.source_id, l.target_id, l.relation
+                        ));
                     }
                 } else {
-                    text.push_str(&format!("Center: {} (conf:{:.1}, rev:{})\n  {}\n\n", center.name, center.confidence, center.revision, center.definition));
+                    text.push_str(&format!(
+                        "Center: {} (conf:{:.1}, rev:{})\n  {}\n\n",
+                        center.name, center.confidence, center.revision, center.definition
+                    ));
                     if !neighbors.is_empty() {
                         text.push_str("Neighbors:\n");
                         for n in &neighbors {
-                            text.push_str(&format!("  - {} (conf:{:.1}, rev:{}) — {}\n", n.name, n.confidence, n.revision, n.definition));
+                            text.push_str(&format!(
+                                "  - {} (conf:{:.1}, rev:{}) — {}\n",
+                                n.name, n.confidence, n.revision, n.definition
+                            ));
                         }
                     }
                     if !links.is_empty() {
                         text.push_str("\nLinks:\n");
                         for l in &links {
-                            text.push_str(&format!("  {} --{}-> {}\n", l.source_id, l.relation, l.target_id));
+                            text.push_str(&format!(
+                                "  {} --{}-> {}\n",
+                                l.source_id, l.relation, l.target_id
+                            ));
                         }
                     }
                 }
@@ -712,7 +897,10 @@ impl ReinServer {
     }
 
     /// Export a memoir graph.
-    #[tool(name = "rein_memoir_export", description = "Export a memoir's knowledge graph. Formats: json (structured), ascii (human-readable), dot (Graphviz).")]
+    #[tool(
+        name = "rein_memoir_export",
+        description = "Export a memoir's knowledge graph. Formats: json (structured), ascii (human-readable), dot (Graphviz)."
+    )]
     fn rein_memoir_export(&self, Parameters(params): Parameters<ExportParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let format = params.format.as_deref().unwrap_or("json");
@@ -726,7 +914,10 @@ impl ReinServer {
     }
 
     /// Scan for and optionally remove duplicate memories.
-    #[tool(name = "rein_dedup", description = "Scan for duplicate memories using content similarity. Use dry_run=true to preview without deleting.")]
+    #[tool(
+        name = "rein_dedup",
+        description = "Scan for duplicate memories using content similarity. Use dry_run=true to preview without deleting."
+    )]
     fn rein_dedup(&self, Parameters(params): Parameters<DedupParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let dry_run = params.dry_run.unwrap_or(false);
@@ -745,15 +936,17 @@ impl ReinServer {
                     Err(_) => continue,
                 };
 
-                let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut to_delete: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for i in 0..mems.len() {
-                    if to_delete.contains(&mems[i].id) { continue; }
+                    if to_delete.contains(&mems[i].id) {
+                        continue;
+                    }
                     for j in (i + 1)..mems.len() {
-                        if to_delete.contains(&mems[j].id) { continue; }
-                        let sim = crate::extract::similarity(
-                            &mems[i].content,
-                            &mems[j].content,
-                        );
+                        if to_delete.contains(&mems[j].id) {
+                            continue;
+                        }
+                        let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
                         if sim >= threshold {
                             to_delete.insert(mems[i].id.clone());
                             dups_found += 1;
@@ -799,15 +992,16 @@ impl ReinServer {
     }
 
     /// Show the most recently created memories.
-    #[tool(name = "rein_recent", description = "List the most recently created memories, ordered by creation time.")]
+    #[tool(
+        name = "rein_recent",
+        description = "List the most recently created memories, ordered by creation time."
+    )]
     fn rein_recent(&self, Parameters(params): Parameters<RecentParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let limit = params.limit.unwrap_or(10);
         let compact = self.compact();
 
-        let result = self.with_store(|store| {
-            store.recent(limit)
-        });
+        let result = self.with_store(|store| store.recent(limit));
 
         match result {
             Ok(memories) => {
@@ -815,12 +1009,14 @@ impl ReinServer {
                     return "No memories found.".to_string();
                 }
                 let mut text = if compact {
-                    memories.iter()
+                    memories
+                        .iter()
                         .map(|m| format!("[{}] {}", m.topic, m.summary))
                         .collect::<Vec<_>>()
                         .join("\n")
                 } else {
-                    memories.iter()
+                    memories
+                        .iter()
                         .map(|m| {
                             let age = chrono::Utc::now().signed_duration_since(m.created_at);
                             let age_str = if age.num_days() > 0 {
@@ -846,7 +1042,10 @@ impl ReinServer {
     }
 
     /// Garbage collect weak STM memories below the configured strength threshold.
-    #[tool(name = "rein_gc", description = "Run garbage collection: apply decay to all memories, then prune weak STM memories below the configured strength threshold. Use dry_run=true to preview.")]
+    #[tool(
+        name = "rein_gc",
+        description = "Run garbage collection: apply decay to all memories, then prune weak STM memories below the configured strength threshold. Use dry_run=true to preview."
+    )]
     fn rein_gc(&self, Parameters(params): Parameters<GcParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let dry_run = params.dry_run.unwrap_or(false);
@@ -854,27 +1053,32 @@ impl ReinServer {
         let compact = self.compact();
 
         let config = self.config.clone();
-        let result = self.with_store(|store| {
-            crate::ops::run_gc_adaptive(store, &config, threshold, dry_run)
-        });
+        let result = self
+            .with_store(|store| crate::ops::run_gc_adaptive(store, &config, threshold, dry_run));
 
         match result {
             Ok((decayed, pruned, concepts)) => {
                 let mut text = if compact {
                     if dry_run {
                         let mut s = format!("would_prune:{pruned}");
-                        if concepts > 0 { s.push_str(&format!(" concepts:{concepts}")); }
+                        if concepts > 0 {
+                            s.push_str(&format!(" concepts:{concepts}"));
+                        }
                         s
                     } else {
                         format!("decayed:{decayed} pruned:{pruned}")
                     }
                 } else if dry_run {
                     let mut s = format!("GC dry run: {pruned} weak STM memories would be pruned (threshold: {threshold})");
-                    if concepts > 0 { s.push_str(&format!(", {concepts} low-quality concepts")); }
+                    if concepts > 0 {
+                        s.push_str(&format!(", {concepts} low-quality concepts"));
+                    }
                     s
                 } else {
                     let mut s = format!("GC complete: decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
-                    if concepts > 0 { s.push_str(&format!(", {concepts} low-quality concepts")); }
+                    if concepts > 0 {
+                        s.push_str(&format!(", {concepts} low-quality concepts"));
+                    }
                     s
                 };
                 self.maybe_nudge(&mut text);
@@ -885,16 +1089,17 @@ impl ReinServer {
     }
 
     /// Auto-link all memories based on content similarity. Creates bidirectional related_ids links.
-    #[tool(name = "rein_organize", description = "Scan all memories and create bidirectional links between related ones based on content similarity. Returns the number of new links created.")]
+    #[tool(
+        name = "rein_organize",
+        description = "Scan all memories and create bidirectional links between related ones based on content similarity. Returns the number of new links created."
+    )]
     fn rein_organize(&self, Parameters(params): Parameters<OrganizeParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let max_links = params.max_links.unwrap_or(5);
         let threshold = self.config.search.dedup_similarity as f32;
         let compact = self.compact();
 
-        let result = self.with_store(|store| {
-            store.organize(threshold, max_links)
-        });
+        let result = self.with_store(|store| store.organize(threshold, max_links));
 
         match result {
             Ok(links) => {
@@ -911,7 +1116,10 @@ impl ReinServer {
     }
 
     /// View a timeline of events (episodes, concept changes, memory creation) in a date range.
-    #[tool(name = "rein_timeline", description = "Show a chronological timeline of knowledge events: episodes, concept revisions, and memory creation. Supports date range filtering.")]
+    #[tool(
+        name = "rein_timeline",
+        description = "Show a chronological timeline of knowledge events: episodes, concept revisions, and memory creation. Supports date range filtering."
+    )]
     fn rein_timeline(&self, Parameters(params): Parameters<TimelineParams>) -> String {
         let limit = params.limit.unwrap_or(20);
         let from = params.from.as_deref().and_then(parse_datetime);
@@ -1035,7 +1243,8 @@ impl ReinServer {
                 if events.is_empty() {
                     "No events found in the specified range.".to_string()
                 } else {
-                    events.iter()
+                    events
+                        .iter()
                         .map(|(dt, desc)| format!("{} {}", dt.format("%Y-%m-%d %H:%M"), desc))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -1046,13 +1255,19 @@ impl ReinServer {
     }
 
     /// Show revision history of a concept — when and how its definition changed over time.
-    #[tool(name = "rein_concept_history", description = "Show the revision history of a concept: when it changed, what the old definitions were, and which episode triggered each change.")]
+    #[tool(
+        name = "rein_concept_history",
+        description = "Show the revision history of a concept: when it changed, what the old definitions were, and which episode triggered each change."
+    )]
     fn rein_concept_history(&self, Parameters(params): Parameters<ConceptHistoryParams>) -> String {
         let limit = params.limit.unwrap_or(10);
 
         let result = self.with_store(|store| {
-            let current = store.get_concept(&params.memoir, &params.name)?
-                .ok_or_else(|| ReinError::NotFound(format!("concept '{}' not found", params.name)))?;
+            let current = store
+                .get_concept(&params.memoir, &params.name)?
+                .ok_or_else(|| {
+                    ReinError::NotFound(format!("concept '{}' not found", params.name))
+                })?;
             let history = store.get_concept_history(&params.memoir, &params.name, limit)?;
             Ok((current, history))
         });
@@ -1064,9 +1279,14 @@ impl ReinServer {
                     current.name, current.revision, current.confidence, current.definition
                 )];
                 if history.is_empty() {
-                    lines.push("No revision history (concept has not been refined yet).".to_string());
+                    lines.push(
+                        "No revision history (concept has not been refined yet).".to_string(),
+                    );
                 } else {
-                    lines.push(format!("### Revision History ({} entries)\n", history.len()));
+                    lines.push(format!(
+                        "### Revision History ({} entries)\n",
+                        history.len()
+                    ));
                     for rev in &history {
                         let ep = rev.episode_id.as_deref().unwrap_or("none");
                         lines.push(format!(
@@ -1092,7 +1312,10 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let dt = date.and_hms_opt(0, 0, 0)?;
-        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            dt,
+            chrono::Utc,
+        ));
     }
     None
 }
@@ -1105,7 +1328,10 @@ fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let dt = date.and_hms_opt(23, 59, 59)?;
-        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            dt,
+            chrono::Utc,
+        ));
     }
     None
 }
@@ -1152,12 +1378,11 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     spawn_background_warmup(&config);
 
-    use std::sync::Arc;
     use http_body_util::BodyExt;
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpService, StreamableHttpServerConfig,
-        session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     let bind = format!("{}:{}", config.server.sse_bind, config.server.sse_port);
@@ -1165,7 +1390,10 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
 
     // Bearer token authentication
     let auth_token = std::env::var("REIN_HTTP_TOKEN").ok();
-    if auth_token.is_none() && config.server.sse_bind != "127.0.0.1" && config.server.sse_bind != "::1" {
+    if auth_token.is_none()
+        && config.server.sse_bind != "127.0.0.1"
+        && config.server.sse_bind != "::1"
+    {
         return Err(anyhow::anyhow!(
             "REIN_HTTP_TOKEN must be set when binding to non-localhost ({}). \
              Set REIN_HTTP_TOKEN=<secret> or use sse_bind=127.0.0.1",
@@ -1202,17 +1430,22 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         async move {
             // Check bearer token if configured
             if let Some(ref expected) = token {
-                let auth_header = req.headers()
+                let auth_header = req
+                    .headers()
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 if auth_header != format!("Bearer {expected}") {
-                    return Ok::<_, std::convert::Infallible>(hyper::Response::builder()
-                        .status(401)
-                        .body(http_body_util::Full::new(bytes::Bytes::from("Unauthorized"))
-                            .map_err(|never: std::convert::Infallible| match never {})
-                            .boxed())
-                        .unwrap());
+                    return Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(401)
+                            .body(
+                                http_body_util::Full::new(bytes::Bytes::from("Unauthorized"))
+                                    .map_err(|never: std::convert::Infallible| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap(),
+                    );
                 }
             }
             Ok::<_, std::convert::Infallible>(svc.handle(req).await)
@@ -1224,11 +1457,10 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         tracing::debug!("connection from {addr}");
         let svc = service.clone();
         tokio::spawn(async move {
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
-            .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await
             {
                 tracing::warn!("connection error: {e}");
             }

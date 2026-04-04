@@ -10,9 +10,9 @@ use super::sqlite::SqliteStore;
 /// Escape a string for use in DOT (Graphviz) quoted strings.
 fn escape_dot(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('"', "\\\"")
-     .replace('\n', "\\n")
-     .replace('\r', "\\r")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Map a rusqlite Row to a Memoir struct.
@@ -52,8 +52,11 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
     let updated_at_str: String = row.get("updated_at").map_err(ReinError::Database)?;
 
     let labels: Vec<String> = serde_json::from_str(&labels_json)?;
-    let source_memory_ids_json: String = row.get("source_memory_ids").unwrap_or_else(|_| "[]".to_string());
-    let source_memory_ids: Vec<String> = serde_json::from_str(&source_memory_ids_json).unwrap_or_default();
+    let source_memory_ids_json: String = row
+        .get("source_memory_ids")
+        .unwrap_or_else(|_| "[]".to_string());
+    let source_memory_ids: Vec<String> =
+        serde_json::from_str(&source_memory_ids_json).unwrap_or_default();
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
@@ -88,19 +91,28 @@ fn row_to_link(row: &rusqlite::Row) -> ReinResult<ConceptLink> {
     let weight: f32 = row.get("weight").map_err(ReinError::Database)?;
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
 
-    let relation = Relation::from_str(&relation_str)
-        .map_err(ReinError::Config)?;
+    let relation = Relation::from_str(&relation_str).map_err(ReinError::Config)?;
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| ReinError::Config(format!("invalid created_at: {e}")))?;
 
-    let valid_from: Option<DateTime<Utc>> = row.get::<_, Option<String>>("valid_from")
+    let valid_from: Option<DateTime<Utc>> = row
+        .get::<_, Option<String>>("valid_from")
         .unwrap_or(None)
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
-    let valid_until: Option<DateTime<Utc>> = row.get::<_, Option<String>>("valid_until")
+        .and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        });
+    let valid_until: Option<DateTime<Utc>> = row
+        .get::<_, Option<String>>("valid_until")
         .unwrap_or(None)
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc)));
+        .and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        });
 
     Ok(ConceptLink {
         id,
@@ -111,6 +123,28 @@ fn row_to_link(row: &rusqlite::Row) -> ReinResult<ConceptLink> {
         created_at,
         valid_from,
         valid_until,
+    })
+}
+
+/// Map a rusqlite Row to an Episode struct.
+fn row_to_episode(row: &rusqlite::Row) -> ReinResult<Episode> {
+    let decisions_json: String = row.get("decisions").map_err(ReinError::Database)?;
+    let concept_ids_json: String = row.get("concept_ids").map_err(ReinError::Database)?;
+    let memory_ids_json: String = row.get("memory_ids").map_err(ReinError::Database)?;
+    let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
+
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| ReinError::Config(format!("invalid episode created_at: {e}")))?;
+
+    Ok(Episode {
+        id: row.get("id").map_err(ReinError::Database)?,
+        title: row.get("title").map_err(ReinError::Database)?,
+        outcome: row.get("outcome").map_err(ReinError::Database)?,
+        decisions: serde_json::from_str(&decisions_json)?,
+        concept_ids: serde_json::from_str(&concept_ids_json)?,
+        memory_ids: serde_json::from_str(&memory_ids_json)?,
+        created_at,
     })
 }
 
@@ -146,16 +180,15 @@ impl SqliteStore {
         let mut stmt = self
             .conn()
             .prepare("SELECT * FROM memoirs WHERE name = ?1")?;
-        let result = stmt
-            .query_row(rusqlite::params![name], |row| {
-                row_to_memoir(row).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
-            });
+        let result = stmt.query_row(rusqlite::params![name], |row| {
+            row_to_memoir(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        });
 
         match result {
             Ok(m) => Ok(Some(m)),
@@ -249,9 +282,9 @@ impl SqliteStore {
             None => return Ok(None),
         };
 
-        let mut stmt = self.conn().prepare(
-            "SELECT * FROM concepts WHERE memoir_id = ?1 AND name = ?2",
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT * FROM concepts WHERE memoir_id = ?1 AND name = ?2")?;
         let result = stmt.query_row(rusqlite::params![memoir.id, concept_name], |row| {
             row_to_concept(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -368,11 +401,7 @@ impl SqliteStore {
     }
 
     /// Search concepts across all memoirs.
-    pub fn search_all_concepts(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> ReinResult<Vec<Concept>> {
+    pub fn search_all_concepts(&self, query: &str, limit: usize) -> ReinResult<Vec<Concept>> {
         let sanitized = sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(vec![]);
@@ -386,18 +415,15 @@ impl SqliteStore {
              ORDER BY bm25(concepts_fts)
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![sanitized, limit as i64],
-            |row| {
-                row_to_concept(row).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
-            },
-        )?;
+        let rows = stmt.query_map(rusqlite::params![sanitized, limit as i64], |row| {
+            row_to_concept(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })?;
 
         Ok(rows
             .filter_map(|r| match r {
@@ -415,17 +441,27 @@ impl SqliteStore {
     /// Add a link between two concepts. Returns the generated link ID.
     pub fn add_link(&self, link: ConceptLink) -> ReinResult<String> {
         // Validate both concepts exist and belong to the same memoir
-        let source_memoir: String = self.conn().query_row(
-            "SELECT memoir_id FROM concepts WHERE id = ?1",
-            rusqlite::params![&link.source_id],
-            |row| row.get(0),
-        ).map_err(|_| ReinError::NotFound(format!("source concept {} not found", link.source_id)))?;
+        let source_memoir: String = self
+            .conn()
+            .query_row(
+                "SELECT memoir_id FROM concepts WHERE id = ?1",
+                rusqlite::params![&link.source_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                ReinError::NotFound(format!("source concept {} not found", link.source_id))
+            })?;
 
-        let target_memoir: String = self.conn().query_row(
-            "SELECT memoir_id FROM concepts WHERE id = ?1",
-            rusqlite::params![&link.target_id],
-            |row| row.get(0),
-        ).map_err(|_| ReinError::NotFound(format!("target concept {} not found", link.target_id)))?;
+        let target_memoir: String = self
+            .conn()
+            .query_row(
+                "SELECT memoir_id FROM concepts WHERE id = ?1",
+                rusqlite::params![&link.target_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                ReinError::NotFound(format!("target concept {} not found", link.target_id))
+            })?;
 
         if source_memoir != target_memoir {
             return Err(ReinError::Config(format!(
@@ -558,10 +594,14 @@ impl SqliteStore {
             let outgoing = self.get_links_from(&current_id)?;
             for link in outgoing {
                 if let Some(until) = link.valid_until {
-                    if until < now { continue; } // expired link
+                    if until < now {
+                        continue;
+                    } // expired link
                 }
                 if let Some(from) = link.valid_from {
-                    if from > now { continue; } // not yet active
+                    if from > now {
+                        continue;
+                    } // not yet active
                 }
                 links.push(link.clone());
                 if !visited.contains(&link.target_id) {
@@ -577,10 +617,14 @@ impl SqliteStore {
             let incoming = self.get_links_to(&current_id)?;
             for link in incoming {
                 if let Some(until) = link.valid_until {
-                    if until < now { continue; }
+                    if until < now {
+                        continue;
+                    }
                 }
                 if let Some(from) = link.valid_from {
-                    if from > now { continue; }
+                    if from > now {
+                        continue;
+                    }
                 }
                 links.push(link.clone());
                 if !visited.contains(&link.source_id) {
@@ -683,10 +727,7 @@ impl SqliteStore {
                     .map(|c| (c.id.as_str(), c.name.as_str()))
                     .collect();
 
-                out.push_str(&format!(
-                    "=== Memoir: {} ===\n\n",
-                    memoir.name
-                ));
+                out.push_str(&format!("=== Memoir: {} ===\n\n", memoir.name));
 
                 for c in &concepts {
                     out.push_str(&format!(
@@ -699,24 +740,16 @@ impl SqliteStore {
                     let outgoing: Vec<&ConceptLink> =
                         links.iter().filter(|l| l.source_id == c.id).collect();
                     for l in &outgoing {
-                        let target_name =
-                            id_to_name.get(l.target_id.as_str()).unwrap_or(&"?");
-                        out.push_str(&format!(
-                            "|   --> {} --> {}\n",
-                            l.relation, target_name
-                        ));
+                        let target_name = id_to_name.get(l.target_id.as_str()).unwrap_or(&"?");
+                        out.push_str(&format!("|   --> {} --> {}\n", l.relation, target_name));
                     }
 
                     // Show incoming links to this concept
                     let incoming: Vec<&ConceptLink> =
                         links.iter().filter(|l| l.target_id == c.id).collect();
                     for l in &incoming {
-                        let source_name =
-                            id_to_name.get(l.source_id.as_str()).unwrap_or(&"?");
-                        out.push_str(&format!(
-                            "|   <-- {} <-- {}\n",
-                            l.relation, source_name
-                        ));
+                        let source_name = id_to_name.get(l.source_id.as_str()).unwrap_or(&"?");
+                        out.push_str(&format!("|   <-- {} <-- {}\n", l.relation, source_name));
                     }
 
                     out.push_str("|\n");
@@ -739,13 +772,11 @@ impl SqliteStore {
             return Ok(m.id);
         }
         // Then check if it's a raw ID
-        let exists: bool = self
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memoirs WHERE id = ?1",
-                rusqlite::params![name_or_id],
-                |row| row.get(0),
-            )?;
+        let exists: bool = self.conn().query_row(
+            "SELECT COUNT(*) > 0 FROM memoirs WHERE id = ?1",
+            rusqlite::params![name_or_id],
+            |row| row.get(0),
+        )?;
         if exists {
             Ok(name_or_id.to_string())
         } else {
@@ -757,7 +788,9 @@ impl SqliteStore {
 
     /// Get a concept by its ID (for BFS traversal).
     pub fn get_concept_by_id(&self, id: &str) -> ReinResult<Option<Concept>> {
-        let mut stmt = self.conn().prepare("SELECT * FROM concepts WHERE id = ?1")?;
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT * FROM concepts WHERE id = ?1")?;
         let result = stmt.query_row(rusqlite::params![id], |row| {
             row_to_concept(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -831,7 +864,11 @@ impl SqliteStore {
 
     /// Create a new episode node. Returns the generated ID.
     pub fn create_episode(&self, episode: Episode) -> ReinResult<String> {
-        let id = if episode.id.is_empty() { ulid::Ulid::new().to_string() } else { episode.id };
+        let id = if episode.id.is_empty() {
+            ulid::Ulid::new().to_string()
+        } else {
+            episode.id
+        };
         let decisions_json = serde_json::to_string(&episode.decisions).unwrap_or_default();
         let concept_ids_json = serde_json::to_string(&episode.concept_ids).unwrap_or_default();
         let memory_ids_json = serde_json::to_string(&episode.memory_ids).unwrap_or_default();
@@ -851,20 +888,12 @@ impl SqliteStore {
             "SELECT * FROM episodes WHERE id = ?1",
             rusqlite::params![id],
             |row| {
-                let decisions_json: String = row.get("decisions")?;
-                let concept_ids_json: String = row.get("concept_ids")?;
-                let memory_ids_json: String = row.get("memory_ids")?;
-                let created_at_str: String = row.get("created_at")?;
-                Ok(Episode {
-                    id: row.get("id")?,
-                    title: row.get("title")?,
-                    outcome: row.get("outcome")?,
-                    decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
-                    concept_ids: serde_json::from_str(&concept_ids_json).unwrap_or_default(),
-                    memory_ids: serde_json::from_str(&memory_ids_json).unwrap_or_default(),
-                    created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
+                row_to_episode(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })
             },
         );
@@ -877,63 +906,129 @@ impl SqliteStore {
 
     /// List recent episodes.
     pub fn list_episodes(&self, limit: usize) -> ReinResult<Vec<Episode>> {
-        let mut stmt = self.conn().prepare(
-            "SELECT * FROM episodes ORDER BY created_at DESC LIMIT ?1"
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT * FROM episodes ORDER BY created_at DESC LIMIT ?1")?;
         let rows = stmt.query_map(rusqlite::params![limit], |row| {
-            let decisions_json: String = row.get("decisions")?;
-            let concept_ids_json: String = row.get("concept_ids")?;
-            let memory_ids_json: String = row.get("memory_ids")?;
-            let created_at_str: String = row.get("created_at")?;
-            Ok(Episode {
-                id: row.get("id")?,
-                title: row.get("title")?,
-                outcome: row.get("outcome")?,
-                decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
-                concept_ids: serde_json::from_str(&concept_ids_json).unwrap_or_default(),
-                memory_ids: serde_json::from_str(&memory_ids_json).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+            row_to_episode(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Get episodes in a time range.
-    pub fn get_episodes_in_range(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> ReinResult<Vec<Episode>> {
+    pub fn get_episodes_in_range(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> ReinResult<Vec<Episode>> {
         let mut stmt = self.conn().prepare(
             "SELECT * FROM episodes WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC"
         )?;
-        let rows = stmt.query_map(rusqlite::params![from.to_rfc3339(), to.to_rfc3339()], |row| {
-            let decisions_json: String = row.get("decisions")?;
-            let concept_ids_json: String = row.get("concept_ids")?;
-            let memory_ids_json: String = row.get("memory_ids")?;
-            let created_at_str: String = row.get("created_at")?;
-            Ok(Episode {
-                id: row.get("id")?,
-                title: row.get("title")?,
-                outcome: row.get("outcome")?,
-                decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
-                concept_ids: serde_json::from_str(&concept_ids_json).unwrap_or_default(),
-                memory_ids: serde_json::from_str(&memory_ids_json).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-            })
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![from.to_rfc3339(), to.to_rfc3339()],
+            |row| {
+                row_to_episode(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            },
+        )?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Search recent episodes by title/outcome/decisions using lightweight token matching.
+    /// Returns ranked episodes with a heuristic score.
+    pub fn search_episodes_ranked(
+        &self,
+        query: &str,
+        limit: usize,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> ReinResult<Vec<(Episode, f32)>> {
+        let scan_limit = limit.max(20) * 10;
+        let episodes = match (from, to) {
+            (Some(from), Some(to)) => self.get_episodes_in_range(from, to)?,
+            _ => self.list_episodes(scan_limit)?,
+        };
+        if episodes.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let query_lower = query.trim().to_lowercase();
+        if query_lower.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let tokens: Vec<String> = query_lower
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|t| t.len() >= 2)
+            .map(ToOwned::to_owned)
+            .collect();
+
+        let mut ranked = Vec::new();
+        for episode in episodes {
+            let haystack = format!(
+                "{}\n{}\n{}",
+                episode.title,
+                episode.outcome,
+                episode.decisions.join("\n")
+            );
+            let haystack_lower = haystack.to_lowercase();
+            let mut score = 0.0_f32;
+
+            if haystack_lower.contains(&query_lower) {
+                score += 2.5;
+            }
+
+            for token in &tokens {
+                if haystack_lower.contains(token) {
+                    score += 0.6;
+                }
+            }
+
+            if score <= 0.0 {
+                continue;
+            }
+
+            let age_days = (Utc::now() - episode.created_at).num_hours() as f32 / 24.0;
+            let recency = 1.0 / (1.0 + age_days / 30.0);
+            ranked.push((episode, score + recency * 0.3));
+        }
+
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.created_at.cmp(&a.0.created_at))
+        });
+        ranked.truncate(limit);
+        Ok(ranked)
     }
 
     // --- Concept Revision History ---
 
     /// Get revision history for a concept.
-    pub fn get_concept_history(&self, memoir_name: &str, concept_name: &str, limit: usize) -> ReinResult<Vec<ConceptRevision>> {
-        let concept = self.get_concept(memoir_name, concept_name)?
+    pub fn get_concept_history(
+        &self,
+        memoir_name: &str,
+        concept_name: &str,
+        limit: usize,
+    ) -> ReinResult<Vec<ConceptRevision>> {
+        let concept = self
+            .get_concept(memoir_name, concept_name)?
             .ok_or_else(|| ReinError::NotFound(format!("concept '{concept_name}' not found")))?;
 
         let mut stmt = self.conn().prepare(
-            "SELECT * FROM concept_revisions WHERE concept_id = ?1 ORDER BY revision DESC LIMIT ?2"
+            "SELECT * FROM concept_revisions WHERE concept_id = ?1 ORDER BY revision DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![concept.id, limit], |row| {
             let labels_json: String = row.get("labels")?;
@@ -957,8 +1052,14 @@ impl SqliteStore {
     }
 
     /// Get the concept state at a specific point in time.
-    pub fn get_concept_at(&self, memoir_name: &str, concept_name: &str, at: DateTime<Utc>) -> ReinResult<Option<ConceptRevision>> {
-        let concept = self.get_concept(memoir_name, concept_name)?
+    pub fn get_concept_at(
+        &self,
+        memoir_name: &str,
+        concept_name: &str,
+        at: DateTime<Utc>,
+    ) -> ReinResult<Option<ConceptRevision>> {
+        let concept = self
+            .get_concept(memoir_name, concept_name)?
             .ok_or_else(|| ReinError::NotFound(format!("concept '{concept_name}' not found")))?;
 
         let result = self.conn().query_row(
@@ -1053,8 +1154,12 @@ mod tests {
     #[test]
     fn test_create_and_list_memoirs() {
         let store = SqliteStore::in_memory().unwrap();
-        store.create_memoir(make_memoir("rust-lang", "Rust language knowledge")).unwrap();
-        store.create_memoir(make_memoir("python", "Python knowledge")).unwrap();
+        store
+            .create_memoir(make_memoir("rust-lang", "Rust language knowledge"))
+            .unwrap();
+        store
+            .create_memoir(make_memoir("python", "Python knowledge"))
+            .unwrap();
 
         let memoirs = store.list_memoirs().unwrap();
         assert_eq!(memoirs.len(), 2);
@@ -1067,9 +1172,15 @@ mod tests {
     #[test]
     fn test_add_and_get_concept() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        let concept = make_concept(&memoir_id, "ownership", "Rust ownership model ensures memory safety without GC");
+        let concept = make_concept(
+            &memoir_id,
+            "ownership",
+            "Rust ownership model ensures memory safety without GC",
+        );
         store.add_concept(concept).unwrap();
 
         let fetched = store.get_concept("rust-lang", "ownership").unwrap();
@@ -1083,14 +1194,29 @@ mod tests {
     #[test]
     fn test_refine_concept() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        let concept = make_concept(&memoir_id, "borrowing", "Borrowing allows references without ownership transfer");
+        let concept = make_concept(
+            &memoir_id,
+            "borrowing",
+            "Borrowing allows references without ownership transfer",
+        );
         store.add_concept(concept).unwrap();
 
-        store.refine_concept("rust-lang", "borrowing", "Borrowing: immutable and mutable references with lifetime rules").unwrap();
+        store
+            .refine_concept(
+                "rust-lang",
+                "borrowing",
+                "Borrowing: immutable and mutable references with lifetime rules",
+            )
+            .unwrap();
 
-        let fetched = store.get_concept("rust-lang", "borrowing").unwrap().unwrap();
+        let fetched = store
+            .get_concept("rust-lang", "borrowing")
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.revision, 2);
         assert!((fetched.confidence - 0.6).abs() < 0.01);
         assert!(fetched.definition.contains("lifetime rules"));
@@ -1099,10 +1225,16 @@ mod tests {
     #[test]
     fn test_add_link_and_traverse() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        let c1_id = store.add_concept(make_concept(&memoir_id, "ownership", "Ownership model")).unwrap();
-        let c2_id = store.add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules")).unwrap();
+        let c1_id = store
+            .add_concept(make_concept(&memoir_id, "ownership", "Ownership model"))
+            .unwrap();
+        let c2_id = store
+            .add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules"))
+            .unwrap();
 
         let link = ConceptLink {
             id: String::new(),
@@ -1128,36 +1260,53 @@ mod tests {
     #[test]
     fn test_inspect_neighborhood() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        let c1_id = store.add_concept(make_concept(&memoir_id, "ownership", "Ownership model")).unwrap();
-        let c2_id = store.add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules")).unwrap();
-        let c3_id = store.add_concept(make_concept(&memoir_id, "lifetimes", "Lifetime annotations")).unwrap();
+        let c1_id = store
+            .add_concept(make_concept(&memoir_id, "ownership", "Ownership model"))
+            .unwrap();
+        let c2_id = store
+            .add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules"))
+            .unwrap();
+        let c3_id = store
+            .add_concept(make_concept(
+                &memoir_id,
+                "lifetimes",
+                "Lifetime annotations",
+            ))
+            .unwrap();
 
         // ownership -> borrowing -> lifetimes
-        store.add_link(ConceptLink {
-            id: String::new(),
-            source_id: c1_id.clone(),
-            target_id: c2_id.clone(),
-            relation: Relation::RelatedTo,
-            weight: 1.0,
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_until: None,
-        }).unwrap();
-        store.add_link(ConceptLink {
-            id: String::new(),
-            source_id: c2_id.clone(),
-            target_id: c3_id.clone(),
-            relation: Relation::DependsOn,
-            weight: 1.0,
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_until: None,
-        }).unwrap();
+        store
+            .add_link(ConceptLink {
+                id: String::new(),
+                source_id: c1_id.clone(),
+                target_id: c2_id.clone(),
+                relation: Relation::RelatedTo,
+                weight: 1.0,
+                created_at: Utc::now(),
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
+        store
+            .add_link(ConceptLink {
+                id: String::new(),
+                source_id: c2_id.clone(),
+                target_id: c3_id.clone(),
+                relation: Relation::DependsOn,
+                weight: 1.0,
+                created_at: Utc::now(),
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
 
         // depth=1 from ownership should find borrowing but not lifetimes
-        let (center, neighbors, links) = store.inspect_concept("rust-lang", "ownership", 1).unwrap();
+        let (center, neighbors, links) =
+            store.inspect_concept("rust-lang", "ownership", 1).unwrap();
         assert_eq!(center.name, "ownership");
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].name, "borrowing");
@@ -1173,21 +1322,29 @@ mod tests {
     #[test]
     fn test_export_json() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        let c1_id = store.add_concept(make_concept(&memoir_id, "ownership", "Ownership model")).unwrap();
-        let c2_id = store.add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules")).unwrap();
+        let c1_id = store
+            .add_concept(make_concept(&memoir_id, "ownership", "Ownership model"))
+            .unwrap();
+        let c2_id = store
+            .add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules"))
+            .unwrap();
 
-        store.add_link(ConceptLink {
-            id: String::new(),
-            source_id: c1_id,
-            target_id: c2_id,
-            relation: Relation::RelatedTo,
-            weight: 1.0,
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_until: None,
-        }).unwrap();
+        store
+            .add_link(ConceptLink {
+                id: String::new(),
+                source_id: c1_id,
+                target_id: c2_id,
+                relation: Relation::RelatedTo,
+                weight: 1.0,
+                created_at: Utc::now(),
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
 
         let json = store.export_memoir("rust-lang", "json").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1198,21 +1355,29 @@ mod tests {
     #[test]
     fn test_delete_memoir_cascades() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        let c1_id = store.add_concept(make_concept(&memoir_id, "ownership", "Ownership model")).unwrap();
-        let c2_id = store.add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules")).unwrap();
+        let c1_id = store
+            .add_concept(make_concept(&memoir_id, "ownership", "Ownership model"))
+            .unwrap();
+        let c2_id = store
+            .add_concept(make_concept(&memoir_id, "borrowing", "Borrowing rules"))
+            .unwrap();
 
-        store.add_link(ConceptLink {
-            id: String::new(),
-            source_id: c1_id.clone(),
-            target_id: c2_id.clone(),
-            relation: Relation::RelatedTo,
-            weight: 1.0,
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_until: None,
-        }).unwrap();
+        store
+            .add_link(ConceptLink {
+                id: String::new(),
+                source_id: c1_id.clone(),
+                target_id: c2_id.clone(),
+                relation: Relation::RelatedTo,
+                weight: 1.0,
+                created_at: Utc::now(),
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
 
         // Delete memoir
         store.delete_memoir("rust-lang").unwrap();
@@ -1221,30 +1386,56 @@ mod tests {
         assert!(store.get_memoir("rust-lang").unwrap().is_none());
 
         // Concepts should be cascade-deleted
-        let concept_count: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM concepts WHERE memoir_id = ?1",
-            rusqlite::params![memoir_id],
-            |row| row.get(0),
-        ).unwrap();
+        let concept_count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM concepts WHERE memoir_id = ?1",
+                rusqlite::params![memoir_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(concept_count, 0);
 
         // Links should be cascade-deleted
-        let link_count: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM concept_links WHERE source_id = ?1 OR target_id = ?2",
-            rusqlite::params![c1_id, c2_id],
-            |row| row.get(0),
-        ).unwrap();
+        let link_count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM concept_links WHERE source_id = ?1 OR target_id = ?2",
+                rusqlite::params![c1_id, c2_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(link_count, 0);
     }
 
     #[test]
     fn test_search_concepts_fts() {
         let store = SqliteStore::in_memory().unwrap();
-        let memoir_id = store.create_memoir(make_memoir("rust-lang", "Rust")).unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
 
-        store.add_concept(make_concept(&memoir_id, "ownership", "Rust ownership model ensures memory safety")).unwrap();
-        store.add_concept(make_concept(&memoir_id, "borrowing", "Borrowing allows references without ownership transfer")).unwrap();
-        store.add_concept(make_concept(&memoir_id, "lifetimes", "Lifetime annotations specify reference validity")).unwrap();
+        store
+            .add_concept(make_concept(
+                &memoir_id,
+                "ownership",
+                "Rust ownership model ensures memory safety",
+            ))
+            .unwrap();
+        store
+            .add_concept(make_concept(
+                &memoir_id,
+                "borrowing",
+                "Borrowing allows references without ownership transfer",
+            ))
+            .unwrap();
+        store
+            .add_concept(make_concept(
+                &memoir_id,
+                "lifetimes",
+                "Lifetime annotations specify reference validity",
+            ))
+            .unwrap();
 
         let results = store.search_concepts("rust-lang", "ownership", 10).unwrap();
         assert!(!results.is_empty());
@@ -1256,11 +1447,17 @@ mod tests {
     fn test_concept_revision_history() {
         let store = SqliteStore::in_memory().unwrap();
         let memoir_id = store.create_memoir(make_memoir("test", "Test")).unwrap();
-        store.add_concept(make_concept(&memoir_id, "ownership", "Original definition")).unwrap();
+        store
+            .add_concept(make_concept(&memoir_id, "ownership", "Original definition"))
+            .unwrap();
 
         // Refine twice — should create 2 revision snapshots
-        store.refine_concept("test", "ownership", "Refined definition v2").unwrap();
-        store.refine_concept("test", "ownership", "Refined definition v3").unwrap();
+        store
+            .refine_concept("test", "ownership", "Refined definition v2")
+            .unwrap();
+        store
+            .refine_concept("test", "ownership", "Refined definition v3")
+            .unwrap();
 
         let history = store.get_concept_history("test", "ownership", 10).unwrap();
         assert_eq!(history.len(), 2, "Should have 2 revisions");
@@ -1278,14 +1475,21 @@ mod tests {
     fn test_concept_at_point_in_time() {
         let store = SqliteStore::in_memory().unwrap();
         let memoir_id = store.create_memoir(make_memoir("test", "Test")).unwrap();
-        store.add_concept(make_concept(&memoir_id, "api", "REST API v1")).unwrap();
-        store.refine_concept("test", "api", "GraphQL API v2").unwrap();
+        store
+            .add_concept(make_concept(&memoir_id, "api", "REST API v1"))
+            .unwrap();
+        store
+            .refine_concept("test", "api", "GraphQL API v2")
+            .unwrap();
 
         // get_concept_at with future time should return the live (current) definition
         let future = Utc::now() + chrono::Duration::hours(1);
         let rev = store.get_concept_at("test", "api", future).unwrap();
         assert!(rev.is_some());
-        assert!(rev.unwrap().definition.contains("GraphQL"), "should return live definition after latest refine");
+        assert!(
+            rev.unwrap().definition.contains("GraphQL"),
+            "should return live definition after latest refine"
+        );
     }
 
     #[test]
@@ -1349,26 +1553,38 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let memoir_id = store.create_memoir(make_memoir("test", "Test")).unwrap();
 
-        let c1_id = store.add_concept(make_concept(&memoir_id, "a", "Concept A")).unwrap();
-        let c2_id = store.add_concept(make_concept(&memoir_id, "b", "Concept B")).unwrap();
+        let c1_id = store
+            .add_concept(make_concept(&memoir_id, "a", "Concept A"))
+            .unwrap();
+        let c2_id = store
+            .add_concept(make_concept(&memoir_id, "b", "Concept B"))
+            .unwrap();
 
-        let link_id = store.add_link(ConceptLink {
-            id: String::new(),
-            source_id: c1_id.clone(),
-            target_id: c2_id.clone(),
-            relation: Relation::RelatedTo,
-            weight: 1.0,
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_until: None,
-        }).unwrap();
+        let link_id = store
+            .add_link(ConceptLink {
+                id: String::new(),
+                source_id: c1_id.clone(),
+                target_id: c2_id.clone(),
+                relation: Relation::RelatedTo,
+                weight: 1.0,
+                created_at: Utc::now(),
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
 
         // Expire the link
         store.expire_link(&link_id, Utc::now()).unwrap();
 
         // BFS should skip expired link
         let (_, neighbors, links) = store.inspect_concept("test", "a", 1).unwrap();
-        assert!(neighbors.is_empty(), "Expired link should be skipped in BFS");
-        assert!(links.is_empty(), "Expired link should not appear in results");
+        assert!(
+            neighbors.is_empty(),
+            "Expired link should be skipped in BFS"
+        );
+        assert!(
+            links.is_empty(),
+            "Expired link should not appear in results"
+        );
     }
 }
