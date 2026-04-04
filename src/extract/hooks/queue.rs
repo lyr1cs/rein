@@ -252,7 +252,7 @@ async fn drain_memory_queue_locked(
     if total_ready > config.async_memory.max_jobs_per_run {
         let mut ready_tail = content.lines()
             .filter_map(|line| serde_json::from_str::<MemoryJob>(line).ok())
-            .filter(|job| !job.next_attempt_at.is_some_and(|ts| ts > now))
+            .filter(|job| job.next_attempt_at.is_none_or(|ts| ts <= now))
             .collect::<Vec<_>>();
         ready_tail.sort_by(|a, b| {
             b.priority.cmp(&a.priority)

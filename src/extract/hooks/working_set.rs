@@ -67,6 +67,7 @@ pub fn update_working_set(
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
     // Blocking lock — wait for other updaters to finish.
@@ -121,6 +122,7 @@ pub fn update_always_on_index(
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
     let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
@@ -157,7 +159,6 @@ pub fn select_relevant_items(config: &ReinConfig, query: &str) -> Vec<WorkingSet
 
     let mut scored: Vec<(f32, WorkingSetItem)> = working
         .chain(always_on)
-        .into_iter()
         .map(|item| {
             let sim = crate::extract::similarity(query, &item.detail)
                 .max(crate::extract::similarity(query, &item.summary))
@@ -172,11 +173,10 @@ pub fn select_relevant_items(config: &ReinConfig, query: &str) -> Vec<WorkingSet
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
     });
-    let merged = merge_items(
+    merge_items(
         scored.into_iter().map(|(_, item)| item).collect(),
         config.async_memory.selection_limit,
-    );
-    merged
+    )
 }
 
 fn build_items(
