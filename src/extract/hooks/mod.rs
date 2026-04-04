@@ -87,6 +87,7 @@ pub async fn hook_compact(config: &ReinConfig) -> anyhow::Result<()> {
 
     if let Some(mut session) = extract_hook_session_ingest(&input) {
         session.artifact_kind = "compact".to_string();
+        session.source_label = Some("hook_compact".to_string());
         session.compact_summary = Some(text.clone());
         let _ = crate::ops::queue_ingest_session(
             config,

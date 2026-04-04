@@ -205,8 +205,17 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
         .map(|s| s.to_string());
 
     if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-        let transcript_content = std::fs::read_to_string(path).ok()?;
+        let transcript_content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("session ingest: failed to read transcript {}: {}", path, e);
+                return None;
+            }
+        };
         let mut turns = Vec::new();
+        const MAX_HOOK_TURNS: usize = 500;
+        const MAX_HOOK_CHARS: usize = 500_000;
+        let mut total_chars = 0usize;
         for line in transcript_content.lines() {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -224,10 +233,14 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
                 continue;
             }
             let role = if msg_type == "human" { "User" } else { "Assistant" };
+            total_chars += content.len();
             turns.push(crate::types::SessionTurn {
                 role: role.to_string(),
                 content,
             });
+            if turns.len() >= MAX_HOOK_TURNS || total_chars >= MAX_HOOK_CHARS {
+                break;
+            }
         }
         return Some(crate::types::SessionIngest {
             schema_version: 1,
