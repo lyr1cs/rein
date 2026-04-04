@@ -35,6 +35,11 @@ tantivy = "0.22"
 libc = "0.2"
 futures-util = "0.3"
 tokio-stream = "0.1"
+rust-embed = { version = "8", features = ["compression"], optional = true }
+
+[features]
+default = []
+gui = ["rust-embed"]
 
 [dev-dependencies]
 tempfile = "3"
