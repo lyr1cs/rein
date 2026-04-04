@@ -440,7 +440,7 @@ export default function Graph() {
 
             {/* Source memory count */}
             <div className="text-xs text-[var(--text-muted)] mb-1">
-              Source memories: <span className="text-[var(--text-secondary)]">{selectedNode.source_memory_ids.length}</span>
+              Source memories: <span className="text-[var(--text-secondary)]">{selectedNode.source_memory_ids?.length ?? 0}</span>
             </div>
 
             {/* Last episode */}
