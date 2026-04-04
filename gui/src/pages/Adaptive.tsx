@@ -120,20 +120,28 @@ export default function Adaptive() {
       color: EVENT_COLORS[i % EVENT_COLORS.length],
     }));
 
-  /* Panel 5: Survival curves — synthesise plottable data from median_survival */
+  /* Panel 5: Survival curves — use actual K-M steps from backend */
   const survivalData = adaptive.survival_curves
-    .filter((c) => c.median_survival !== null)
+    .filter((c: { steps?: number[][] }) => c.steps && c.steps.length > 0)
     .slice(0, 10);
 
-  // Create synthetic K-M step data from median survival (exponential approximation)
-  const maxDays = Math.max(60, ...survivalData.map((c) => (c.median_survival ?? 30) * 3));
-  const dayPoints = Array.from({ length: 20 }, (_, i) => Math.round((i / 19) * maxDays));
-  const survivalLines = dayPoints.map((day) => {
-    const point: Record<string, number> = { day };
-    survivalData.forEach((curve) => {
-      const med = curve.median_survival ?? 30;
-      // Exponential survival: S(t) = exp(-ln(2)/median * t)
-      point[`c${curve.cluster_id}`] = Math.exp((-Math.LN2 / med) * day);
+  // Build unified time axis from all curves' step data
+  const allTimes = new Set<number>();
+  survivalData.forEach((c: { steps?: number[][] }) => {
+    c.steps?.forEach(([t]: number[]) => allTimes.add(t));
+  });
+  const sortedTimes = [...allTimes].sort((a, b) => a - b);
+
+  const survivalLines = sortedTimes.map((time) => {
+    const point: Record<string, number> = { day: Math.round(time * 10000) / 10000 };
+    survivalData.forEach((curve: { cluster_id: string; steps?: number[][] }) => {
+      // Find the last step <= this time (K-M is a step function)
+      let prob = 1.0;
+      for (const [t, p] of curve.steps ?? []) {
+        if (t <= time) prob = p;
+        else break;
+      }
+      point[`c${curve.cluster_id}`] = prob;
     });
     return point;
   });

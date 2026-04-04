@@ -126,6 +126,8 @@ enum Commands {
     },
     /// Auto-link related memories based on content similarity
     Organize,
+    /// Deduplicate concepts with same normalized name (case/separator variants)
+    DedupConcepts,
     /// Export memories to file
     Export {
         /// Output format: md, json, or csv (default json)
@@ -477,6 +479,11 @@ async fn main() -> anyhow::Result<()> {
             let threshold = config.search.dedup_similarity as f32;
             let links = store.organize(threshold, 5)?;
             println!("Organized: created {links} new links between related memories");
+        }
+        Some(Commands::DedupConcepts) => {
+            let store = config.open_store()?;
+            let (groups, removed) = store.dedup_concepts()?;
+            println!("Concept dedup: merged {groups} groups, removed {removed} duplicate concepts");
         }
         Some(Commands::Export {
             format,
