@@ -9,6 +9,7 @@ mod extract;
 mod openai;
 mod policy;
 mod provider;
+mod responses;
 
 use crate::config::ReinConfig;
 use bytes::Bytes;
@@ -333,9 +334,10 @@ async fn handle_request(
         body_size
     );
 
-    // Build upstream URL.
+    // Build upstream URL (rewrite path if needed, e.g. /responses → /v1/responses).
     let upstream_base = provider.upstream_url(&config);
-    let upstream_url = format!("{upstream_base}{path_and_query}");
+    let rewritten_path = provider.rewrite_path(&path_and_query);
+    let upstream_url = format!("{upstream_base}{rewritten_path}");
 
     // Build upstream headers (skip hop-by-hop, recalculate content-length).
     let mut upstream_headers = reqwest::header::HeaderMap::new();
