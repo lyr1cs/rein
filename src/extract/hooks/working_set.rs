@@ -70,10 +70,18 @@ pub fn update_working_set(
         .truncate(false)
         .open(&lock_path)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
-    // Blocking lock — wait for other updaters to finish.
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if rc != 0 {
-        tracing::warn!("working_set: flock failed, proceeding without lock");
+    // Blocking lock — wait for other updaters to finish. Retry on EINTR.
+    loop {
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue; // interrupted by signal, retry
+        }
+        tracing::warn!("working_set: flock failed: {}, proceeding without lock", err);
+        break;
     }
 
     let mut current = load_working_set(config);
@@ -125,9 +133,18 @@ pub fn update_always_on_index(
         .truncate(false)
         .open(&lock_path)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if rc != 0 {
-        tracing::warn!("always_on_index: flock failed, proceeding without lock");
+    // Retry on EINTR
+    loop {
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        tracing::warn!("always_on_index: flock failed: {}, proceeding without lock", err);
+        break;
     }
 
     let mut current = load_always_on_index(config);

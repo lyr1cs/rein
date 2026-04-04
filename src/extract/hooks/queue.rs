@@ -95,6 +95,7 @@ pub fn queue_memory_job(
     // Also check pending queue for similar jobs (prevents cross-session duplicates
     // that fall outside the fingerprint_window_ms).
     // A Full job is never suppressed by a Quick job (Full produces concepts/links/episodes).
+    // Note: TOCTOU race possible here — duplicates caught downstream by dedup pipeline.
     let path = queue_path(config);
     if let Ok(queue_content) = std::fs::read_to_string(&path) {
         let preview: String = text.chars().take(500).collect();
@@ -175,7 +176,13 @@ pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
     let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
     let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        return Ok(0);
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK)
+            && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            tracing::warn!("flock failed: {}", err);
+        }
+        return Ok(0); // another worker is running or lock unavailable
     }
 
     // lock_file is held for the entire operation (including async phases).
@@ -228,8 +235,13 @@ async fn drain_memory_queue_locked(
     let mut processed = 0u32;
     let mut remaining = Vec::new();
     let mut stats = load_worker_stats(config);
-    let total_ready = ready.len();
-    for job in ready.into_iter().take(config.async_memory.max_jobs_per_run) {
+
+    // Split ready jobs: process first batch, keep the rest
+    let split_at = config.async_memory.max_jobs_per_run.min(ready.len());
+    let ready_tail = ready.split_off(split_at);
+    let to_process = ready; // first `split_at` jobs
+
+    for job in to_process {
         match process_job(config, job.clone()).await {
             Ok(done) => {
                 processed += done;
@@ -248,18 +260,8 @@ async fn drain_memory_queue_locked(
         }
     }
 
-    // Preserve unprocessed ready jobs and future-scheduled jobs.
-    if total_ready > config.async_memory.max_jobs_per_run {
-        let mut ready_tail = content.lines()
-            .filter_map(|line| serde_json::from_str::<MemoryJob>(line).ok())
-            .filter(|job| job.next_attempt_at.is_none_or(|ts| ts <= now))
-            .collect::<Vec<_>>();
-        ready_tail.sort_by(|a, b| {
-            b.priority.cmp(&a.priority)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-        });
-        remaining.extend(ready_tail.into_iter().skip(config.async_memory.max_jobs_per_run));
-    }
+    // Preserve unprocessed ready jobs (already split above) and future-scheduled jobs.
+    remaining.extend(ready_tail);
     remaining.extend(deferred);
 
     // Write remaining jobs back to queue BEFORE deleting inflight.
@@ -467,7 +469,10 @@ fn save_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(stats)?)?;
+    // Atomic write: write to temp file then rename (prevents corruption on crash)
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(stats)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -569,7 +574,10 @@ fn save_recent_events(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(state)?)?;
+    // Atomic write: write to temp file then rename (prevents corruption on crash)
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

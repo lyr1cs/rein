@@ -18,9 +18,10 @@ pub fn build_memory(
 ) -> Memory {
     // Apply rule-based postprocessing for additive keyword enrichment only.
     // User-supplied topic and importance are authoritative — postprocess cannot override them.
+    let summary: String = content.chars().take(100).collect();
     let mut extracted = crate::extract::llm::ExtractedMemory {
         topic: topic.clone(),
-        summary: content.chars().take(100).collect(),
+        summary: summary.clone(),
         content: content.clone(),
         keywords: keywords.clone(),
         importance: format!("{}", importance),
@@ -34,7 +35,7 @@ pub fn build_memory(
         id: ulid::Ulid::new().to_string(),
         layer: importance.auto_layer(),
         topic,
-        summary: content.chars().take(100).collect(),
+        summary,
         content,
         keywords: extracted.keywords, // enriched with date/preference/update keywords
         importance,
@@ -423,12 +424,15 @@ fn run_hdbscan_clustering(
     // Memories outside the input set keep their existing cluster_id (from a previous run).
     let clustered_ids: std::collections::HashSet<&str> =
         embeddings.iter().map(|(id, _)| id.as_str()).collect();
+    // Batch clear cluster assignments in a transaction (avoid N+1 UPDATEs)
+    let _ = store.conn().execute_batch("BEGIN");
     for id in &clustered_ids {
         let _ = store.conn().execute(
             "UPDATE memories SET cluster_id = NULL WHERE id = ?1",
             rusqlite::params![id],
         );
     }
+    let _ = store.conn().execute_batch("COMMIT");
     // Clear stale per-cluster survival curves (will be rebuilt by M3)
     let _ = store
         .conn()
@@ -436,8 +440,9 @@ fn run_hdbscan_clustering(
     // Clear stale per-cluster dedup thresholds
     state.dedup_thresholds.clear();
 
-    // Store new cluster assignments from this run
+    // Store new cluster assignments from this run (batched in transaction)
     state.memory_clusters.clear();
+    let _ = store.conn().execute_batch("BEGIN");
     for (i, label) in result.labels.iter().enumerate() {
         let mem_id = &embeddings[i].0;
         if let Some(cluster_id) = label {
@@ -448,6 +453,7 @@ fn run_hdbscan_clustering(
             );
         }
     }
+    let _ = store.conn().execute_batch("COMMIT");
 
     // Load persisted cluster assignments for memories NOT in this clustering input
     // (keeps DB and in-memory state synchronized for capped/sampled runs)
@@ -608,6 +614,7 @@ fn run_tiering(
     }
 
     // Update tier labels on memories
+    // NOTE: SQL formula must stay in sync with crate::store::tiering::compute_access_rate
     if state.hot_threshold > 0.0 && state.cold_threshold > 0.0 {
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'hot'
@@ -667,12 +674,15 @@ fn run_tiering(
             })
             .unwrap_or_default();
 
+        // Batch cold archive stripping in a transaction
+        let _ = store.conn().execute_batch("BEGIN");
         for aid in &archived_ids {
             if let Ok(mut mem) = store.get(aid) {
                 mem.content = mem.summary.clone();
                 let _ = store.update(&mem); // Triggers Tantivy + FTS update
             }
         }
+        let _ = store.conn().execute_batch("COMMIT");
         tracing::info!(
             "M5: migrated {migrated} cold memories to archive ({} stripped), hot={:.4} cold={:.4}",
             archived_ids.len(),
@@ -1064,16 +1074,31 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             let predicted = weights.w_fts * bm25 + weights.w_vec * vec + weights.w_kg * kg;
             let error = target - predicted;
 
+            // Capture pre-update retrieval subtotal BEFORE gradient update
+            let pre_subtotal = weights.w_fts + weights.w_vec + weights.w_kg;
+
             // Gradient update (only for retrieval features — we have bm25/vec/kg from events)
             weights.w_fts += lr * error * bm25;
             weights.w_vec += lr * error * vec;
             weights.w_kg += lr * error * kg;
+
+            // Renormalize retrieval weights back to their pre-update subtotal
+            // so untouched weights are not affected by the learning step.
+            let post_subtotal = weights.w_fts + weights.w_vec + weights.w_kg;
+            if post_subtotal > 0.0 && pre_subtotal > 0.0 {
+                let scale = pre_subtotal / post_subtotal;
+                weights.w_fts *= scale;
+                weights.w_vec *= scale;
+                weights.w_kg *= scale;
+            }
+
             updates += 1;
         }
     }
 
     if updates > 0 {
-        // Normalize all 12 weights to sum to 1.0
+
+        // Now normalize ALL 17 weights (including w_episode) to sum to 1.0
         let sum = weights.w_fts
             + weights.w_vec
             + weights.w_kg
@@ -1089,7 +1114,8 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             + weights.w_connectivity
             + weights.w_concept_richness
             + weights.w_tier_score
-            + weights.w_is_current;
+            + weights.w_is_current
+            + weights.w_episode;
         if sum > 0.0 {
             weights.w_fts /= sum;
             weights.w_vec /= sum;
@@ -1107,6 +1133,7 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             weights.w_concept_richness /= sum;
             weights.w_tier_score /= sum;
             weights.w_is_current /= sum;
+            weights.w_episode /= sum;
         }
 
         crate::search::rerank::save_weights(conn, &weights);
@@ -1502,7 +1529,7 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                     if candidate.access_count >= 1
                         || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1)
                     {
-                        (&candidate.id, id, content.to_string(), "recent".to_string())
+                        (&candidate.id, id, content.to_string(), chrono::Utc::now().format("%Y-%m-%d").to_string())
                     } else {
                         (
                             id,
@@ -1550,10 +1577,7 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 .unwrap_or(false);
 
                 if is_dup {
-                    let _ = conn.execute(
-                        "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
-                        rusqlite::params![&candidate.id, id],
-                    );
+                    let _ = store.mark_superseded(id, &candidate.id);
                     tracing::info!(
                         "vec_dedup: LLM confirmed dup, superseded {id} by {} (cosine_sim={sim:.3})",
                         candidate.id
@@ -1581,8 +1605,6 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
     }
 }
 
-/// Run dedup scan across all topics.
-/// Returns (duplicates_found, duplicates_removed).
 /// Run dedup scan across all topics with provenance-preserving merge.
 ///
 /// Instead of hard-deleting duplicates (which loses temporal anchors and unique
