@@ -122,19 +122,19 @@ export default function Adaptive() {
 
   /* Panel 5: Survival curves — use actual K-M steps from backend */
   const survivalData = adaptive.survival_curves
-    .filter((c: { steps?: number[][] }) => c.steps && c.steps.length > 0)
+    .filter(c => c.steps && c.steps.length > 0)
     .slice(0, 10);
 
   // Build unified time axis from all curves' step data
   const allTimes = new Set<number>();
-  survivalData.forEach((c: { steps?: number[][] }) => {
-    c.steps?.forEach(([t]: number[]) => allTimes.add(t));
+  survivalData.forEach(c => {
+    c.steps?.forEach(([t]) => allTimes.add(t));
   });
   const sortedTimes = [...allTimes].sort((a, b) => a - b);
 
   const survivalLines = sortedTimes.map((time) => {
     const point: Record<string, number> = { day: Math.round(time * 10000) / 10000 };
-    survivalData.forEach((curve: { cluster_id: string; steps?: number[][] }) => {
+    survivalData.forEach((curve) => {
       // Find the last step <= this time (K-M is a step function)
       let prob = 1.0;
       for (const [t, p] of curve.steps ?? []) {
