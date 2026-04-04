@@ -581,18 +581,18 @@ impl SqliteStore {
                         "UPDATE OR IGNORE concept_links SET target_id = ?1 WHERE target_id = ?2",
                         rusqlite::params![canonical.id, dupe.id],
                     )?;
-                    // Update memory concept_ids references
+                    // Update memory concept_ids references (parameterized)
+                    let old_ref = format!("\"{}\"", dupe.id);
+                    let new_ref = format!("\"{}\"", canonical.id);
+                    let like_pat = format!("%{}%", dupe.id);
                     self.conn().execute(
-                        &format!(
-                            "UPDATE memories SET concept_ids = REPLACE(concept_ids, '\"{}\"', '\"{}\"') WHERE concept_ids LIKE '%{}%'",
-                            dupe.id, canonical.id, dupe.id
-                        ),
-                        [],
+                        "UPDATE memories SET concept_ids = REPLACE(concept_ids, ?1, ?2) WHERE concept_ids LIKE ?3",
+                        rusqlite::params![old_ref, new_ref, like_pat],
                     )?;
-                    // Delete orphaned links (self-referencing after repoint)
+                    // Delete self-referencing links created by repointing THIS dupe
                     self.conn().execute(
-                        "DELETE FROM concept_links WHERE source_id = target_id",
-                        [],
+                        "DELETE FROM concept_links WHERE source_id = ?1 AND target_id = ?1",
+                        rusqlite::params![canonical.id],
                     )?;
                     // Delete duplicate concept and its revisions
                     self.conn().execute(
@@ -1884,5 +1884,72 @@ mod tests {
             links.is_empty(),
             "Expired link should not appear in results"
         );
+    }
+
+    #[test]
+    fn test_normalize_concept_name() {
+        assert_eq!(normalize_concept_name("Adaptive Engine"), "adaptive-engine");
+        assert_eq!(normalize_concept_name("adaptive_engine"), "adaptive-engine");
+        assert_eq!(normalize_concept_name("adaptive-engine"), "adaptive-engine");
+        assert_eq!(normalize_concept_name("AdaptiveEngine"), "adaptiveengine");
+        assert_eq!(normalize_concept_name("  foo--bar__baz  "), "foo-bar-baz");
+        assert_eq!(normalize_concept_name("SQLite WAL"), "sqlite-wal");
+    }
+
+    #[test]
+    fn test_get_concept_normalized_lookup() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.create_memoir(make_memoir("arch", "Architecture")).unwrap();
+        store.add_concept(make_concept("arch", "Adaptive Engine", "The adaptive engine")).unwrap();
+
+        // Exact match
+        let c = store.get_concept("arch", "Adaptive Engine").unwrap();
+        assert!(c.is_some());
+
+        // Normalized matches (different separators/case)
+        let c = store.get_concept("arch", "adaptive-engine").unwrap();
+        assert!(c.is_some());
+        assert_eq!(c.unwrap().name, "Adaptive Engine");
+
+        let c = store.get_concept("arch", "adaptive_engine").unwrap();
+        assert!(c.is_some());
+
+        // Non-existent
+        let c = store.get_concept("arch", "nonexistent").unwrap();
+        assert!(c.is_none());
+    }
+
+    #[test]
+    fn test_dedup_concepts() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.create_memoir(make_memoir("arch", "Architecture")).unwrap();
+
+        // Insert duplicates with different name formats
+        store.add_concept(make_concept("arch", "Adaptive Engine", "The engine v1")).unwrap();
+        store.add_concept(make_concept("arch", "adaptive-engine", "The engine v2 longer def")).unwrap();
+        store.add_concept(make_concept("arch", "adaptive_engine", "v3")).unwrap();
+
+        // Also a non-duplicate
+        store.add_concept(make_concept("arch", "SQLite Store", "The store")).unwrap();
+
+        // Verify 4 concepts exist before dedup
+        let count: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM concepts", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 4);
+
+        let (groups, removed) = store.dedup_concepts().unwrap();
+        assert_eq!(groups, 1);
+        assert_eq!(removed, 2);
+
+        // Should have 2 concepts left
+        let count: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM concepts", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 2);
+
+        // Canonical should have the longest definition
+        let canonical = store.get_concept("arch", "adaptive-engine").unwrap().unwrap();
+        assert_eq!(canonical.definition, "The engine v2 longer def");
     }
 }
