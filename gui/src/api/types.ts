@@ -43,7 +43,7 @@ export interface AdaptiveStatus {
   cluster_info: { cluster_version: number; unique_clusters: number; assigned_memories: number };
   tier_boundaries: { hot_threshold: number; cold_threshold: number };
   event_counts: Record<string, number>;
-  survival_curves: Array<{ cluster_id: string; median_survival: number | null }>;
+  survival_curves: Array<{ cluster_id: string; median_survival: number | null; steps?: number[][] }>;
   dedup_thresholds: { per_cluster: Record<string, number>; global: number };
 }
 
