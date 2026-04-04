@@ -53,6 +53,14 @@ export function useAdaptive() {
   });
 }
 
+export function useActivity(days = 14) {
+  return useQuery({
+    queryKey: ['activity', days],
+    queryFn: () => apiGet<{ activity: Array<{ date: string; recalls: number; stores: number }> }>(`/api/activity?days=${days}`),
+    refetchInterval: getPollingInterval(),
+  });
+}
+
 export function useEpisodes(limit = 20) {
   return useQuery({
     queryKey: ['episodes', limit],

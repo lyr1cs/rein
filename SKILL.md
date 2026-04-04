@@ -2,22 +2,25 @@
 name: rein
 description: >
   Multi-source cross-validated memory system with adaptive engine, temporal knowledge graph,
-  autonomous retrieval routing, and LLM extraction. 24 MCP tools, 20+ CLI commands. Features
-  self-learning fusion weights (counterfactual alpha optimization), survival-based decay
-  (per-cluster Kaplan-Meier replacing fixed Ebbinghaus), HDBSCAN semantic clustering,
-  three-tier memory (Hot/Warm/Cold with t-digest boundaries), temporal knowledge graph
-  (revision history, episodes, temporal links), autonomous query routing, memory evolution,
-  multi-factor admission control, and CC/RRF fusion.
+  autonomous retrieval routing, and LLM extraction. 25 MCP tools, 20+ CLI commands. Features
+  Neural Wiki GUI (React + Tailwind web dashboard), self-learning fusion weights (counterfactual
+  alpha optimization), survival-based decay (per-cluster Kaplan-Meier replacing fixed Ebbinghaus),
+  HDBSCAN semantic clustering, three-tier memory (Hot/Warm/Cold with t-digest boundaries),
+  temporal knowledge graph (revision history, episodes, temporal links), autonomous query
+  routing, memory evolution, multi-factor admission control, concept dedup with name
+  normalization, and CC/RRF fusion.
   Triggers when user mentions memory, recall, remember, past sessions, knowledge graph,
-  memoir, concepts, timeline, history, export, or wants to save/search important context.
+  memoir, concepts, timeline, history, export, GUI, dashboard, or wants to save/search
+  important context.
 ---
 
-# rein Memory System (v0.10.0)
+# rein Memory System (v0.11.1)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
-(25 tools) or via CLI (20+ commands). Features LLM-powered extraction (Gemini 3.1 Flash Lite
-or local models), temporal knowledge graph, autonomous retrieval routing, memory evolution,
-transparent LLM proxy (record-only), async memory pipeline with file-based queue and
+(25 tools) or via CLI (20+ commands). Features Neural Wiki GUI (`rein serve --gui`),
+LLM-powered extraction (Gemini 3.1 Flash Lite or local models), temporal knowledge graph,
+autonomous retrieval routing, memory evolution, transparent LLM proxy (record-only),
+concept name normalization and dedup, async memory pipeline with file-based queue and
 background worker, project-scoped working set + always-on index for memory surfaces.
 
 ## CLI Commands
@@ -40,13 +43,14 @@ rein consolidate <topic> -s "summary"        # Merge topic into one memory
 rein dedup [--dry-run]                       # Scan/remove duplicates
 rein gc [--dry-run]                          # Garbage collect weak STM
 rein organize                                # Auto-link related memories
+rein dedup-concepts                          # Merge duplicate concepts (case/separator variants)
 rein upgrade [--topic X] [--dry-run]         # Upgrade old memories to knowledge graph
 rein export [--format json|md|csv] [--topic X] [--output file]
 ```
 
 ### System
 ```bash
-rein serve [--compact] [--sse] [--proxy]     # Start MCP server or transparent proxy
+rein serve [--compact] [--sse] [--proxy] [--gui]  # Start MCP server, proxy, or GUI
 rein init [--dry-run]                        # Auto-configure MCP clients
 rein config                                  # Show configuration
 rein warmup                                  # Pre-compute embeddings
