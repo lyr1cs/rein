@@ -55,7 +55,6 @@ impl ProxyMetrics {
 
 struct ProxyState {
     metrics: ProxyMetrics,
-    extraction_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// Start the transparent proxy server.
@@ -95,9 +94,6 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 
     let state = Arc::new(ProxyState {
         metrics: ProxyMetrics::new(),
-        extraction_sem: Arc::new(tokio::sync::Semaphore::new(
-            config.proxy.max_concurrent_extractions,
-        )),
     });
 
     // Graceful shutdown: stop accept loop on ctrl-c.
@@ -202,8 +198,14 @@ async fn send_with_retry(
 
         match req.send().await {
             Ok(resp) => {
-                // Retry on 5xx, not on 4xx or success.
-                if resp.status().is_server_error() && attempt < max_retries {
+                // Only retry 5xx for idempotent methods (GET, HEAD, OPTIONS).
+                // POST/PUT/PATCH are not idempotent — LLM providers may have
+                // already billed tokens or triggered side effects.
+                let is_idempotent = matches!(
+                    method,
+                    reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+                );
+                if resp.status().is_server_error() && is_idempotent && attempt < max_retries {
                     tracing::warn!(
                         "upstream returned {} (attempt {}/{}), retrying",
                         resp.status(),
@@ -438,26 +440,17 @@ fn maybe_spawn_extraction(
     query: Option<String>,
     text: String,
 ) {
-    let sem = state.extraction_sem.clone();
-    match sem.try_acquire_owned() {
-        Ok(permit) => {
-            state
-                .metrics
-                .extraction_count
-                .fetch_add(1, Ordering::Relaxed);
-            let cfg = config.clone();
-            // Move the owned permit into the task so it's released on drop.
-            tokio::spawn(async move {
-                extract::extract_and_store(&cfg, query, text).await;
-                drop(permit);
-            });
-        }
-        Err(_) => {
-            tracing::warn!(
-                "extraction backpressure: max concurrent extractions reached, skipping"
-            );
-        }
-    }
+    // extract_and_store only does a queue file append (cheap I/O),
+    // so no concurrency limit needed here. Actual LLM extraction
+    // happens in the background worker which has its own rate limiting.
+    state
+        .metrics
+        .extraction_count
+        .fetch_add(1, Ordering::Relaxed);
+    let cfg = config.clone();
+    tokio::spawn(async move {
+        extract::extract_and_store(&cfg, query, text).await;
+    });
 }
 
 /// Stream SSE response back to client while buffering assistant text.
@@ -505,11 +498,12 @@ async fn stream_response(
                             // Cap SSE line buffer to prevent unbounded growth.
                             if sse_line_buf.len() > max_sse_buffer {
                                 tracing::warn!(
-                                    "SSE line buffer exceeded {} bytes, forwarding raw",
+                                    "SSE line buffer exceeded {} bytes, forwarding raw (skipping extraction)",
                                     max_sse_buffer
                                 );
                                 sse_parsing_active = false;
                                 sse_line_buf.clear();
+                                assistant_buf.clear(); // discard partial content — don't extract truncated responses
                             } else {
                                 // Process only complete lines (ending with \n).
                                 while let Some(newline_pos) = sse_line_buf.find('\n') {
