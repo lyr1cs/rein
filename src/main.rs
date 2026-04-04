@@ -11,7 +11,11 @@ use rein::types;
 use rein::types::MemoryStore;
 
 #[derive(Parser)]
-#[command(name = "rein", version, about = "Multi-source cross-validated memory for AI agents")]
+#[command(
+    name = "rein",
+    version,
+    about = "Multi-source cross-validated memory for AI agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -42,6 +46,19 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         keywords: Option<Vec<String>>,
     },
+    /// Ingest a full session/transcript through the extraction pipeline
+    Ingest {
+        #[arg(short, long, conflicts_with = "file")]
+        content: Option<String>,
+        #[arg(short, long, conflicts_with = "content")]
+        file: Option<String>,
+        #[arg(long, conflicts_with_all = ["content", "file"])]
+        json_file: Option<String>,
+        #[arg(long)]
+        agent_label: Option<String>,
+        #[arg(long)]
+        subagent: bool,
+    },
     /// Search memories
     Recall {
         query: String,
@@ -53,9 +70,7 @@ enum Commands {
         limit: usize,
     },
     /// Delete a memory
-    Forget {
-        id: String,
-    },
+    Forget { id: String },
     /// Update a memory
     Update {
         id: String,
@@ -69,9 +84,7 @@ enum Commands {
     /// Show statistics
     Stats,
     /// Health check
-    Health {
-        topic: Option<String>,
-    },
+    Health { topic: Option<String> },
     /// Consolidate a topic into a single memory
     Consolidate {
         topic: String,
@@ -178,7 +191,11 @@ async fn main() -> anyhow::Result<()> {
     config.validate();
 
     match cli.command {
-        Some(Commands::Serve { compact, sse, proxy }) => {
+        Some(Commands::Serve {
+            compact,
+            sse,
+            proxy,
+        }) => {
             let mut config = config;
             if compact {
                 config.server.compact = true;
@@ -199,9 +216,8 @@ async fn main() -> anyhow::Result<()> {
             keywords,
         }) => {
             let store = config.open_store()?;
-            let imp: types::Importance = importance
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let imp: types::Importance =
+                importance.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let memory = rein::ops::build_memory(
                 &config,
                 topic,
@@ -216,6 +232,59 @@ async fn main() -> anyhow::Result<()> {
                 mcp::compact::format_store_result(&id, config.server.compact)
             );
         }
+        Some(Commands::Ingest {
+            content,
+            file,
+            json_file,
+            agent_label,
+            subagent,
+        }) => {
+            let (memories, concepts, links) = match (content, file, json_file) {
+                (Some(text), None, None) => {
+                    rein::ops::ingest_session_text(
+                        &config,
+                        &text,
+                        agent_label.as_deref(),
+                        subagent,
+                    )
+                    .await?
+                }
+                (None, Some(path), None) => {
+                    let text = std::fs::read_to_string(path)?;
+                    rein::ops::ingest_session_text(
+                        &config,
+                        &text,
+                        agent_label.as_deref(),
+                        subagent,
+                    )
+                    .await?
+                }
+                (None, None, Some(path)) => {
+                    let raw = std::fs::read_to_string(path)?;
+                    let session: types::SessionIngest = serde_json::from_str(&raw)?;
+                    rein::ops::ingest_session(
+                        &config,
+                        &session,
+                        agent_label.as_deref(),
+                        subagent,
+                    )
+                    .await?
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "provide exactly one of --content, --file, or --json-file"
+                    ));
+                }
+            };
+            if config.server.compact {
+                println!("ok memories:{memories} concepts:{concepts} links:{links}");
+            } else {
+                println!(
+                    "Ingested session: {} memories, {} concepts, {} links",
+                    memories, concepts, links
+                );
+            }
+        }
         Some(Commands::Recall {
             query,
             topic,
@@ -224,8 +293,12 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             let store = config.open_store()?;
             let results = search::recall::recall(
-                &store, &config, &query,
-                topic.as_deref(), keyword.as_deref(), limit,
+                &store,
+                &config,
+                &query,
+                topic.as_deref(),
+                keyword.as_deref(),
+                limit,
             )?;
             let scored: Vec<(types::Memory, f32)> =
                 results.into_iter().map(|r| (r.memory, r.score)).collect();
@@ -273,9 +346,8 @@ async fn main() -> anyhow::Result<()> {
             mem.content = content.clone();
             mem.summary = content.chars().take(100).collect();
             if let Some(imp_str) = importance {
-                let imp: types::Importance = imp_str
-                    .parse()
-                    .map_err(|e: String| anyhow::anyhow!(e))?;
+                let imp: types::Importance =
+                    imp_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
                 mem.importance = imp;
                 mem.layer = imp.auto_layer();
                 mem.decay_lambda = config.decay.base_lambda * imp.decay_factor();
@@ -289,10 +361,13 @@ async fn main() -> anyhow::Result<()> {
             println!("Embedding provider: {}", config.embedding.provider);
             println!("Embedding dimensions: {}", config.embedding.dimensions);
             println!("Extract provider: {}", config.extract.provider);
-            println!("Extract model: {}", match config.extract_provider() {
-                config::Provider::Omlx => &config.extract.omlx.model,
-                _ => &config.extract.google.model,
-            });
+            println!(
+                "Extract model: {}",
+                match config.extract_provider() {
+                    config::Provider::Omlx => &config.extract.omlx.model,
+                    _ => &config.extract.google.model,
+                }
+            );
             println!("Compact mode: {}", config.server.compact);
             println!("SSE enabled: {}", config.server.sse_enabled);
             println!("Decay base_lambda: {}", config.decay.base_lambda);
@@ -313,14 +388,18 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         format!("{}m ago", age.num_minutes())
                     };
-                    println!("[{}] {} ({}, {})", m.topic, m.summary, m.importance, age_str);
+                    println!(
+                        "[{}] {} ({}, {})",
+                        m.topic, m.summary, m.importance, age_str
+                    );
                 }
             }
         }
         Some(Commands::Gc { dry_run }) => {
             let store = config.open_store()?;
             let threshold = config.decay.prune_threshold;
-            let (decayed, pruned, concepts) = ops::run_gc_adaptive(&store, &config, threshold, dry_run)?;
+            let (decayed, pruned, concepts) =
+                ops::run_gc_adaptive(&store, &config, threshold, dry_run)?;
             if dry_run {
                 let mut msg = format!("Would decay {decayed} and prune {pruned} weak STM memories (threshold: {threshold})");
                 if concepts > 0 {
@@ -341,7 +420,11 @@ async fn main() -> anyhow::Result<()> {
             let links = store.organize(threshold, 5)?;
             println!("Organized: created {links} new links between related memories");
         }
-        Some(Commands::Export { format, topic, output }) => {
+        Some(Commands::Export {
+            format,
+            topic,
+            output,
+        }) => {
             let store = config.open_store()?;
             let topics = if let Some(ref t) = topic {
                 vec![t.clone()]
@@ -358,29 +441,48 @@ async fn main() -> anyhow::Result<()> {
             let content = match format.as_str() {
                 "json" => serde_json::to_string_pretty(&all_memories)?,
                 "csv" => {
-                    let mut lines = vec!["id,topic,summary,content,importance,keywords,strength,created_at".to_string()];
+                    let mut lines = vec![
+                        "id,topic,summary,content,importance,keywords,strength,created_at"
+                            .to_string(),
+                    ];
                     for m in &all_memories {
                         let kw = m.keywords.join(";");
                         // Escape CSV fields
                         let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-                        lines.push(format!("{},{},{},{},{},{},{:.3},{}",
-                            m.id, esc(&m.topic), esc(&m.summary), esc(&m.content),
-                            m.importance, esc(&kw), m.strength, m.created_at.to_rfc3339(),
+                        lines.push(format!(
+                            "{},{},{},{},{},{},{:.3},{}",
+                            m.id,
+                            esc(&m.topic),
+                            esc(&m.summary),
+                            esc(&m.content),
+                            m.importance,
+                            esc(&kw),
+                            m.strength,
+                            m.created_at.to_rfc3339(),
                         ));
                     }
                     lines.join("\n")
                 }
                 "md" => {
-                    let mut parts = vec![format!("# rein Memory Export\n\n{} memories, {} topics\n", all_memories.len(), topics.len())];
+                    let mut parts = vec![format!(
+                        "# rein Memory Export\n\n{} memories, {} topics\n",
+                        all_memories.len(),
+                        topics.len()
+                    )];
                     let mut current_topic = String::new();
                     // Group by topic
-                    all_memories.sort_by(|a, b| a.topic.cmp(&b.topic).then(b.created_at.cmp(&a.created_at)));
+                    all_memories.sort_by(|a, b| {
+                        a.topic.cmp(&b.topic).then(b.created_at.cmp(&a.created_at))
+                    });
                     for m in &all_memories {
                         if m.topic != current_topic {
                             current_topic = m.topic.clone();
                             parts.push(format!("\n## {}\n", current_topic));
                         }
-                        parts.push(format!("### {} ({})\n{}\n", m.summary, m.importance, m.content));
+                        parts.push(format!(
+                            "### {} ({})\n{}\n",
+                            m.summary, m.importance, m.content
+                        ));
                     }
                     parts.join("\n")
                 }
@@ -434,35 +536,27 @@ async fn main() -> anyhow::Result<()> {
             println!("rein v{}", env!("CARGO_PKG_VERSION"));
             println!("Run 'rein --help' for usage");
         }
-        Some(Commands::Hook { action }) => {
-            match action {
-                HookAction::Post => extract::hooks::hook_post(&config).await?,
-                HookAction::Compact => extract::hooks::hook_compact(&config).await?,
-                HookAction::Prompt => extract::hooks::hook_prompt(&config).await?,
-                HookAction::Stop => extract::hooks::hook_stop(&config).await?,
-            }
-        }
+        Some(Commands::Hook { action }) => match action {
+            HookAction::Post => extract::hooks::hook_post(&config).await?,
+            HookAction::Compact => extract::hooks::hook_compact(&config).await?,
+            HookAction::Prompt => extract::hooks::hook_prompt(&config).await?,
+            HookAction::Stop => extract::hooks::hook_stop(&config).await?,
+        },
         Some(Commands::Migrate { from_qmd, reindex }) => {
             if reindex {
                 let store = config.open_store()?;
                 let report = store::migrate::reindex(&store, &config).await?;
                 println!("{report}");
             } else {
-                let qmd_path = from_qmd
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| {
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
-                    });
+                let qmd_path = from_qmd.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
+                });
                 let store = config.open_store()?;
                 let embedder = embed::create_embedder(&config);
-                let report = store::migrate::migrate_from_qmd(
-                    &qmd_path,
-                    &store,
-                    &config,
-                    embedder.as_ref(),
-                )
-                .await?;
+                let report =
+                    store::migrate::migrate_from_qmd(&qmd_path, &store, &config, embedder.as_ref())
+                        .await?;
                 println!("{report}");
             }
         }
