@@ -189,7 +189,10 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
 
 fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
     let days: i64 = query.get("days").and_then(|d| d.parse().ok()).unwrap_or(14).max(1).min(90);
-    let granularity = query.get("granularity").map(|s| s.as_str()).unwrap_or("hour");
+    let granularity = match query.get("granularity").map(|s| s.as_str()) {
+        Some("hour") => "hour",
+        _ => "day",
+    };
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
