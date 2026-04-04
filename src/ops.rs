@@ -712,6 +712,113 @@ pub fn run_gc_adaptive(
     Ok(result)
 }
 
+/// Return adaptive engine status as a JSON value for inspection.
+/// Queries AdaptiveState, reranker weights, event counts, survival curves.
+pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
+    let conn = store.conn();
+
+    // Learned alphas from AdaptiveState
+    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(conn)
+        .unwrap_or_default();
+
+    let learned_alphas: serde_json::Value = state
+        .learned_alpha
+        .iter()
+        .map(|(k, entry)| {
+            (
+                k.clone(),
+                serde_json::json!({
+                    "value": entry.value,
+                    "sample_count": entry.sample_count,
+                    "last_updated": entry.last_updated,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
+
+    // Reranker weights (all 17)
+    let weights = crate::search::rerank::load_weights(conn);
+    let reranker_weights = serde_json::to_value(&weights).unwrap_or_default();
+
+    // Cluster info
+    let unique_clusters: std::collections::HashSet<u32> =
+        state.memory_clusters.values().copied().collect();
+    let cluster_info = serde_json::json!({
+        "cluster_version": state.cluster_version,
+        "unique_clusters": unique_clusters.len(),
+        "assigned_memories": state.memory_clusters.len(),
+    });
+
+    // Tier boundaries
+    let tier_boundaries = serde_json::json!({
+        "hot_threshold": state.hot_threshold,
+        "cold_threshold": state.cold_threshold,
+    });
+
+    // Event counts by type
+    let event_counts: serde_json::Value = conn
+        .prepare("SELECT event_type, COUNT(*) FROM feedback_events GROUP BY event_type")
+        .and_then(|mut stmt| {
+            let rows: Vec<(String, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .ok()
+                .map(|r| r.filter_map(|x| x.ok()).collect())
+                .unwrap_or_default();
+            Ok(rows)
+        })
+        .map(|rows| {
+            let map: serde_json::Map<String, serde_json::Value> = rows
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::from(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        })
+        .unwrap_or_else(|_| serde_json::json!({}));
+
+    // Survival curves summary
+    let survival_curves: Vec<serde_json::Value> = conn
+        .prepare("SELECT key, value FROM metadata WHERE key LIKE 'survival_curve:%'")
+        .and_then(|mut stmt| {
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .ok()
+                .map(|r| r.filter_map(|x| x.ok()).collect())
+                .unwrap_or_default();
+            Ok(rows)
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|(key, value)| {
+                    let cluster_id = key.strip_prefix("survival_curve:")?;
+                    let curve: serde_json::Value = serde_json::from_str(&value).ok()?;
+                    let median = curve.get("median_survival").cloned();
+                    Some(serde_json::json!({
+                        "cluster_id": cluster_id,
+                        "median_survival": median,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Dedup thresholds
+    let dedup_thresholds = serde_json::json!({
+        "per_cluster": state.dedup_thresholds,
+        "global": state.global_dedup_threshold,
+    });
+
+    serde_json::json!({
+        "learned_alphas": learned_alphas,
+        "reranker_weights": reranker_weights,
+        "cluster_info": cluster_info,
+        "tier_boundaries": tier_boundaries,
+        "event_counts": event_counts,
+        "survival_curves": survival_curves,
+        "dedup_thresholds": dedup_thresholds,
+    })
+}
+
 /// Run the adaptive engine slow-channel pipeline after GC.
 /// Order: M4 (HDBSCAN) → M3 (Survival) → M5 (Tiering) → M2 (Alpha) → persist.
 /// Each step is gated by readiness checks; failures skip subsequent steps.
@@ -725,6 +832,9 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // Restore or create AdaptiveState
     let mut state =
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
+
+    // Snapshot state before learning for convergence tracking
+    let prev_state = state.clone();
 
     // Count memories for readiness checks
     let mem_count: u64 = store
@@ -775,6 +885,45 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         tracing::warn!("failed to save adaptive state: {e}");
     } else {
         tracing::debug!("adaptive state v{} saved", state.version);
+    }
+
+    // Convergence health summary
+    {
+        let max_alpha_delta = state
+            .learned_alpha
+            .iter()
+            .map(|(k, entry)| {
+                let prev_val = prev_state
+                    .learned_alpha
+                    .get(k)
+                    .map(|e| e.value)
+                    .unwrap_or(entry.value);
+                (entry.value - prev_val).abs()
+            })
+            .fold(0.0_f64, f64::max);
+
+        let alpha_warning = max_alpha_delta > 0.10;
+
+        let survival_curves_active: u64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'survival_curve:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let tiers_monotonic = state.hot_threshold >= state.cold_threshold;
+
+        tracing::info!(
+            max_alpha_delta = %format!("{max_alpha_delta:.4}"),
+            alpha_warning,
+            survival_curves_active,
+            tiers_monotonic,
+            hot_threshold = %format!("{:.4}", state.hot_threshold),
+            cold_threshold = %format!("{:.4}", state.cold_threshold),
+            "adaptive convergence summary"
+        );
     }
 
     // Step 7: Cleanup expired events
