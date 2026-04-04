@@ -15,7 +15,48 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use provider::ProviderKind;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/// Basic proxy metrics exposed via `GET /rein/metrics`.
+struct ProxyMetrics {
+    request_count: AtomicU64,
+    error_count: AtomicU64,
+    extraction_count: AtomicU64,
+}
+
+impl ProxyMetrics {
+    fn new() -> Self {
+        Self {
+            request_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            extraction_count: AtomicU64::new(0),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            r#"{{"request_count":{},"error_count":{},"extraction_count":{}}}"#,
+            self.request_count.load(Ordering::Relaxed),
+            self.error_count.load(Ordering::Relaxed),
+            self.extraction_count.load(Ordering::Relaxed),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared state passed into every request handler
+// ---------------------------------------------------------------------------
+
+struct ProxyState {
+    metrics: ProxyMetrics,
+    extraction_sem: Arc<tokio::sync::Semaphore>,
+}
 
 /// Start the transparent proxy server.
 pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
@@ -52,19 +93,44 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
+    let state = Arc::new(ProxyState {
+        metrics: ProxyMetrics::new(),
+        extraction_sem: Arc::new(tokio::sync::Semaphore::new(
+            config.proxy.max_concurrent_extractions,
+        )),
+    });
+
+    // Graceful shutdown: stop accept loop on ctrl-c.
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let accept = tokio::select! {
+            res = listener.accept() => res,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("rein proxy: received shutdown signal, stopping accept loop");
+                eprintln!("rein proxy: shutting down gracefully");
+                break;
+            }
+        };
+
+        let (stream, addr) = match accept {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("proxy accept error: {e}");
+                continue;
+            }
+        };
         tracing::debug!("proxy connection from {addr}");
         let config = config.clone();
         let client = upstream_client.clone();
         let auth = auth_token.clone();
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let config = config.clone();
                 let client = client.clone();
                 let auth = auth.clone();
+                let state = Arc::clone(&state);
                 async move {
-                    handle_request(req, config, client, auth.as_deref()).await
+                    handle_request(req, config, client, auth.as_deref(), state).await
                 }
             });
 
@@ -78,6 +144,8 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
             }
         });
     }
+
+    Ok(())
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -98,7 +166,84 @@ fn error_response(status: u16, msg: &str) -> hyper::Response<BoxBody> {
         .status(status)
         .header("content-type", "text/plain")
         .body(full_body(Bytes::from(msg.to_string())))
-        .unwrap()
+        .unwrap_or_else(|_| hyper::Response::new(full_body(Bytes::from("internal error"))))
+}
+
+/// Build a response, falling back to a plain 200 with error text on builder failure.
+fn build_response(
+    builder: hyper::http::response::Builder,
+    body: BoxBody,
+) -> hyper::Response<BoxBody> {
+    builder
+        .body(body)
+        .unwrap_or_else(|_| hyper::Response::new(full_body(Bytes::from("internal error"))))
+}
+
+// ---------------------------------------------------------------------------
+// Retry with exponential backoff
+// ---------------------------------------------------------------------------
+
+async fn send_with_retry(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+    max_retries: u32,
+    retry_base_ms: u64,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 0u32;
+    loop {
+        let mut req = client.request(method.clone(), url);
+        req = req.headers(headers.clone());
+        if !body.is_empty() {
+            req = req.body(body.to_vec());
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                // Retry on 5xx, not on 4xx or success.
+                if resp.status().is_server_error() && attempt < max_retries {
+                    tracing::warn!(
+                        "upstream returned {} (attempt {}/{}), retrying",
+                        resp.status(),
+                        attempt + 1,
+                        max_retries
+                    );
+                } else {
+                    return Ok(resp);
+                }
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    tracing::warn!(
+                        "upstream network error (attempt {}/{}): {e}",
+                        attempt + 1,
+                        max_retries
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
+        // Exponential backoff with jitter (10-25% of base delay).
+        let base = retry_base_ms.saturating_mul(1u64 << attempt);
+        // Simple deterministic jitter derived from current time nanos.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        let jitter_range = base / 4; // 25% max
+        let jitter = if jitter_range > 0 {
+            (nanos % jitter_range).max(base / 10) // at least 10%
+        } else {
+            0
+        };
+        let delay = base + jitter;
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        attempt += 1;
+    }
 }
 
 /// Handle a single proxied request.
@@ -107,7 +252,10 @@ async fn handle_request(
     config: ReinConfig,
     client: reqwest::Client,
     expected_token: Option<&str>,
+    state: Arc<ProxyState>,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
+    state.metrics.request_count.fetch_add(1, Ordering::Relaxed);
+
     // Auth check for non-localhost binds.
     if let Some(expected) = expected_token {
         let auth_header = req
@@ -116,6 +264,7 @@ async fn handle_request(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth_header != expected {
+            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(401, "unauthorized"));
         }
     }
@@ -130,6 +279,17 @@ async fn handle_request(
     let path = uri.path().to_string();
     let headers = req.headers().clone();
 
+    // Metrics endpoint.
+    if method == hyper::Method::GET && path == "/rein/metrics" {
+        let json = state.metrics.to_json();
+        return Ok(build_response(
+            hyper::Response::builder()
+                .status(200)
+                .header("content-type", "application/json"),
+            full_body(Bytes::from(json)),
+        ));
+    }
+
     // Detect provider from request path. Sampling routes are tracked only to
     // capture source query metadata for recording; requests are not mutated.
     let provider = ProviderKind::detect(&path);
@@ -139,6 +299,7 @@ async fn handle_request(
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             tracing::warn!("failed to read request body: {e}");
+            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(400, "failed to read request body"));
         }
     };
@@ -174,35 +335,45 @@ async fn handle_request(
     let upstream_base = provider.upstream_url(&config);
     let upstream_url = format!("{upstream_base}{path_and_query}");
 
-    // Build upstream request with original headers.
-    let mut upstream_req = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST),
-        &upstream_url,
-    );
-
+    // Build upstream headers (skip hop-by-hop, recalculate content-length).
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
-        // Skip hop-by-hop headers and content-length (recalculated).
         if matches!(
             name_str,
             "host" | "content-length" | "transfer-encoding" | "connection"
         ) {
             continue;
         }
-        if let Ok(v) = value.to_str() {
-            upstream_req = upstream_req.header(name_str, v);
+        if let Ok(rname) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
+            if let Ok(rval) = reqwest::header::HeaderValue::from_bytes(value.as_ref()) {
+                upstream_headers.insert(rname, rval);
+            }
         }
     }
+    if let Ok(cl) = reqwest::header::HeaderValue::from_str(&body_bytes.len().to_string()) {
+        upstream_headers.insert(reqwest::header::CONTENT_LENGTH, cl);
+    }
 
-    upstream_req = upstream_req
-        .header("content-length", body_bytes.len().to_string())
-        .body(body_bytes.to_vec());
+    let req_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
 
-    // Send upstream request.
-    let upstream_resp = match upstream_req.send().await {
+    // Send upstream request with retry.
+    let upstream_resp = match send_with_retry(
+        &client,
+        req_method,
+        &upstream_url,
+        upstream_headers,
+        body_bytes,
+        config.proxy.max_retries,
+        config.proxy.retry_base_ms,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("upstream request failed: {e}");
+            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(502, "upstream request failed"));
         }
     };
@@ -217,20 +388,35 @@ async fn handle_request(
         .unwrap_or(false);
 
     if is_streaming {
-        stream_response(upstream_resp, status, &resp_headers, &config, &provider, query).await
+        stream_response(upstream_resp, status, &resp_headers, &config, &provider, query, &state)
+            .await
     } else {
+        // Large response streaming: if Content-Length exceeds max_response_buffer,
+        // stream directly without buffering/extraction.
+        let content_length: usize = resp_headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if content_length > config.proxy.max_response_buffer {
+            tracing::info!(
+                "response too large ({content_length} bytes), streaming without extraction"
+            );
+            return stream_response(
+                upstream_resp, status, &resp_headers, &config, &provider, query, &state,
+            )
+            .await;
+        }
+
         // Non-streaming: read full response, extract, forward.
         let resp_body = upstream_resp.bytes().await.unwrap_or_default();
 
-        // Async extract from non-streaming response.
+        // Async extract from non-streaming response (with backpressure).
         if config.proxy.extract_enabled {
             if let Some(text) = provider.extract_assistant_text_full(&resp_body) {
                 if policy::should_extract_response(&config, query.as_deref(), &text) {
-                    let cfg = config.clone();
-                    let query = query.clone();
-                    tokio::spawn(async move {
-                        extract::extract_and_store(&cfg, query, text).await;
-                    });
+                    maybe_spawn_extraction(&config, &state, query.clone(), text);
                 }
             }
         }
@@ -241,7 +427,36 @@ async fn handle_request(
                 builder = builder.header(name.as_str(), value);
             }
         }
-        Ok(builder.body(full_body(resp_body)).unwrap())
+        Ok(build_response(builder, full_body(resp_body)))
+    }
+}
+
+/// Attempt to spawn an extraction task, respecting the concurrency semaphore.
+fn maybe_spawn_extraction(
+    config: &ReinConfig,
+    state: &Arc<ProxyState>,
+    query: Option<String>,
+    text: String,
+) {
+    let sem = state.extraction_sem.clone();
+    match sem.try_acquire_owned() {
+        Ok(permit) => {
+            state
+                .metrics
+                .extraction_count
+                .fetch_add(1, Ordering::Relaxed);
+            let cfg = config.clone();
+            // Move the owned permit into the task so it's released on drop.
+            tokio::spawn(async move {
+                extract::extract_and_store(&cfg, query, text).await;
+                drop(permit);
+            });
+        }
+        Err(_) => {
+            tracing::warn!(
+                "extraction backpressure: max concurrent extractions reached, skipping"
+            );
+        }
     }
 }
 
@@ -253,13 +468,16 @@ async fn stream_response(
     config: &ReinConfig,
     provider: &ProviderKind,
     query: Option<String>,
+    state: &Arc<ProxyState>,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(64);
 
     let extract_enabled = config.proxy.extract_enabled;
+    let max_sse_buffer = config.proxy.max_sse_buffer;
     let provider_clone = *provider;
     let config_clone = config.clone();
     let query_clone = query.clone();
+    let state_clone = Arc::clone(state);
 
     // Spawn task to read upstream stream, forward chunks, buffer text.
     tokio::spawn(async move {
@@ -267,6 +485,8 @@ async fn stream_response(
         let mut assistant_buf = String::new();
         // SSE line buffer: transport chunks may split across SSE event boundaries.
         let mut sse_line_buf = String::new();
+        // Whether SSE parsing has been abandoned due to buffer overflow.
+        let mut sse_parsing_active = true;
         const MAX_EXTRACT_BUF: usize = 200_000; // ~50K tokens, prevent OOM
 
         use futures_util::StreamExt;
@@ -275,17 +495,32 @@ async fn stream_response(
                 Ok(chunk) => {
                     // Parse SSE chunks for assistant text extraction.
                     // Buffer incomplete lines across chunk boundaries.
-                    if extract_enabled && assistant_buf.len() < MAX_EXTRACT_BUF {
+                    if extract_enabled
+                        && sse_parsing_active
+                        && assistant_buf.len() < MAX_EXTRACT_BUF
+                    {
                         if let Ok(text) = std::str::from_utf8(&chunk) {
                             sse_line_buf.push_str(text);
-                            // Process only complete lines (ending with \n).
-                            while let Some(newline_pos) = sse_line_buf.find('\n') {
-                                let line = sse_line_buf[..newline_pos].to_string();
-                                sse_line_buf = sse_line_buf[newline_pos + 1..].to_string();
-                                if let Some(extracted) =
-                                    provider_clone.extract_assistant_text_sse(line.as_bytes())
-                                {
-                                    assistant_buf.push_str(&extracted);
+
+                            // Cap SSE line buffer to prevent unbounded growth.
+                            if sse_line_buf.len() > max_sse_buffer {
+                                tracing::warn!(
+                                    "SSE line buffer exceeded {} bytes, forwarding raw",
+                                    max_sse_buffer
+                                );
+                                sse_parsing_active = false;
+                                sse_line_buf.clear();
+                            } else {
+                                // Process only complete lines (ending with \n).
+                                while let Some(newline_pos) = sse_line_buf.find('\n') {
+                                    let line = sse_line_buf[..newline_pos].to_string();
+                                    sse_line_buf =
+                                        sse_line_buf[newline_pos + 1..].to_string();
+                                    if let Some(extracted) =
+                                        provider_clone.extract_assistant_text_sse(line.as_bytes())
+                                    {
+                                        assistant_buf.push_str(&extracted);
+                                    }
                                 }
                             }
                         }
@@ -303,11 +538,15 @@ async fn stream_response(
         }
         drop(tx); // Signal end of stream.
 
-        // After stream completes, extract memories.
+        // After stream completes, extract memories (with backpressure).
         if extract_enabled
-            && policy::should_extract_response(&config_clone, query_clone.as_deref(), &assistant_buf)
+            && policy::should_extract_response(
+                &config_clone,
+                query_clone.as_deref(),
+                &assistant_buf,
+            )
         {
-            extract::extract_and_store(&config_clone, query_clone, assistant_buf).await;
+            maybe_spawn_extraction(&config_clone, &state_clone, query_clone, assistant_buf);
         }
     });
 
@@ -322,7 +561,7 @@ async fn stream_response(
         }
     }
 
-    Ok(builder.body(box_body(stream_body)).unwrap())
+    Ok(build_response(builder, box_body(stream_body)))
 }
 
 /// Forward a request unmodified (for non-LLM endpoints like /v1/models).
@@ -373,7 +612,7 @@ async fn forward_raw(
                     builder = builder.header(name.as_str(), value);
                 }
             }
-            Ok(builder.body(full_body(resp_body)).unwrap())
+            Ok(build_response(builder, full_body(resp_body)))
         }
         Err(e) => {
             tracing::warn!("forward_raw upstream error: {e}");

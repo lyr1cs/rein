@@ -148,6 +148,8 @@ enum Commands {
     Warmup,
     /// Show configuration
     Config,
+    /// Show adaptive engine status (learned parameters, convergence info)
+    AdaptiveStatus,
     /// Background worker commands
     Worker {
         #[command(subcommand)]
@@ -415,6 +417,11 @@ async fn main() -> anyhow::Result<()> {
             println!("SSE enabled: {}", config.server.sse_enabled);
             println!("Decay base_lambda: {}", config.decay.base_lambda);
             println!("Dedup similarity: {}", config.search.dedup_similarity);
+        }
+        Some(Commands::AdaptiveStatus) => {
+            let store = config.open_store()?;
+            let status = ops::adaptive_status(&store);
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Some(Commands::Recent { limit }) => {
             let store = config.open_store()?;
