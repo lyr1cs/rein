@@ -420,13 +420,16 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
         return Ok(());
     }
 
+    // Step 1: Rename live table so we can recreate with new CHECK constraint
+    conn.execute_batch("ALTER TABLE memories RENAME TO memories_old")
+        .map_err(crate::types::ReinError::Database)?;
+
     // Check if old table has the embedding column (pre-proxy DBs may not)
     let has_embedding: bool = conn
         .prepare("SELECT embedding FROM memories_old LIMIT 0")
         .is_ok();
 
-    // Recreate table with widened CHECK.
-    // Conditionally copy embedding column (missing in pre-proxy databases).
+    // Step 2: Conditionally copy embedding column (missing in pre-proxy databases)
     let insert_sql = if has_embedding {
         "INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source, \
              strength, decay_lambda, access_count, superseded_by, related_ids, created_at, \
@@ -445,6 +448,7 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
          FROM memories_old;"
     };
 
+    // Step 3: Create new table with widened CHECK
     conn.execute_batch(
         "CREATE TABLE memories ( \
              id TEXT PRIMARY KEY NOT NULL, \
