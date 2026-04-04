@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+pub use crate::store::tiering::MemoryTier;
+
 /// A memory record with all metadata for decay, search, and cross-validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
@@ -27,9 +29,8 @@ pub struct Memory {
     #[serde(skip)]
     pub embedding: Option<Vec<f32>>,
     /// Memory tier: hot, warm, cold (M5 adaptive tiering)
-    /// TODO: Replace with MemoryTier enum from store::tiering for type safety
-    #[serde(default = "default_tier")]
-    pub tier: String,
+    #[serde(default)]
+    pub tier: MemoryTier,
     /// Cluster assignment from HDBSCAN (M4)
     #[serde(default)]
     pub cluster_id: Option<u32>,
@@ -38,9 +39,6 @@ pub struct Memory {
     pub last_accessed: DateTime<Utc>,
 }
 
-fn default_tier() -> String {
-    "warm".to_string()
-}
 
 /// Lifecycle status of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

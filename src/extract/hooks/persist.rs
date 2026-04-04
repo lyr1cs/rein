@@ -2,6 +2,7 @@
 
 use crate::config::ReinConfig;
 use crate::extract::llm::{ExtractedMemory, ExtractionResult};
+use crate::types::MemoryTier;
 
 use super::buffer::store_episode_concept;
 use super::parsing::looks_like_secret;
@@ -150,7 +151,7 @@ pub fn store_extracted_report(
             concept_ids: vec![],
             status: crate::types::MemoryStatus::default(),
             embedding: None,
-            tier: "warm".to_string(),
+            tier: MemoryTier::Warm,
             cluster_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

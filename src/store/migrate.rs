@@ -1,7 +1,7 @@
 use crate::config::ReinConfig;
 use crate::search::chunker::semantic_chunk;
 use crate::store::SqliteStore;
-use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
+use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source};
 
 /// Report summarizing a QMD migration run.
 pub struct MigrationReport {
@@ -133,7 +133,7 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
                 concept_ids: vec![],
                 status: MemoryStatus::default(),
                 embedding,
-                tier: "warm".to_string(),
+                tier: MemoryTier::Warm,
                 cluster_id: None,
                 created_at: now,
                 updated_at: now,
