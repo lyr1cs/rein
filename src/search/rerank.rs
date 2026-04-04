@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Twelve features extracted from each candidate memory after fusion.
+/// Retrieval and metadata features extracted from each candidate memory after fusion.
 #[derive(Debug, Clone)]
 pub struct RerankFeatures {
     /// Normalized BM25 score [0,1]
@@ -12,6 +12,8 @@ pub struct RerankFeatures {
     pub vec_score: f32,
     /// KG channel score [0,1]
     pub kg_score: f32,
+    /// Episode/session channel score [0,1]
+    pub episode_score: f32,
     /// Days since memory creation
     pub recency_days: f32,
     /// Times previously accessed
@@ -48,6 +50,8 @@ pub struct RerankWeights {
     pub w_fts: f32,
     pub w_vec: f32,
     pub w_kg: f32,
+    #[serde(default = "default_w_episode")]
+    pub w_episode: f32,
     pub w_recency: f32,
     pub w_access: f32,
     pub w_strength: f32,
@@ -71,18 +75,32 @@ pub struct RerankWeights {
     pub w_is_current: f32,
 }
 
-fn default_w_topic_match() -> f32 { 0.03 }
-fn default_w_brevity() -> f32 { 0.02 }
-fn default_w_channel_coverage() -> f32 { 0.05 }
-fn default_w_usage_recency() -> f32 { 0.03 }
-fn default_w_small() -> f32 { 0.02 }
+fn default_w_topic_match() -> f32 {
+    0.03
+}
+fn default_w_episode() -> f32 {
+    0.07
+}
+fn default_w_brevity() -> f32 {
+    0.02
+}
+fn default_w_channel_coverage() -> f32 {
+    0.04
+}
+fn default_w_usage_recency() -> f32 {
+    0.03
+}
+fn default_w_small() -> f32 {
+    0.02
+}
 
 /// Hand-tuned default weights (sum to 1.0). Retrieval signals dominate.
 pub fn default_weights() -> RerankWeights {
     RerankWeights {
-        w_fts: 0.18,
-        w_vec: 0.18,
-        w_kg: 0.10,
+        w_fts: 0.16,
+        w_vec: 0.16,
+        w_kg: 0.08,
+        w_episode: 0.07,
         w_recency: 0.07,
         w_access: 0.05,
         w_strength: 0.07,
@@ -90,7 +108,7 @@ pub fn default_weights() -> RerankWeights {
         w_keyword: 0.05,
         w_topic_match: 0.03,
         w_brevity: 0.02,
-        w_channel_coverage: 0.05,
+        w_channel_coverage: 0.04,
         w_usage_recency: 0.03,
         w_connectivity: 0.03,
         w_concept_richness: 0.03,
@@ -114,6 +132,7 @@ pub fn rerank_score(f: &RerankFeatures, w: &RerankWeights) -> f32 {
     let score = w.w_fts * f.fts_score
         + w.w_vec * f.vec_score
         + w.w_kg * f.kg_score
+        + w.w_episode * f.episode_score
         + w.w_recency * recency_factor
         + w.w_access * access_factor
         + w.w_strength * f.strength
@@ -152,9 +171,7 @@ pub fn compute_keyword_overlap(
 
     let matches = words
         .iter()
-        .filter(|w| {
-            keywords_lower.iter().any(|k| k == *w) || content_lower.contains(*w)
-        })
+        .filter(|w| keywords_lower.iter().any(|k| k == *w) || content_lower.contains(*w))
         .count();
 
     matches as f32 / words.len() as f32
@@ -194,6 +211,7 @@ mod tests {
             fts_score: 0.8,
             vec_score: 0.6,
             kg_score: 0.4,
+            episode_score: 0.0,
             recency_days: 1.0,
             access_count: 5,
             strength: 0.9,
@@ -220,6 +238,7 @@ mod tests {
             fts_score: 1.0,
             vec_score: 1.0,
             kg_score: 1.0,
+            episode_score: 0.8,
             recency_days: 0.5,
             access_count: 10,
             strength: 1.0,
@@ -238,6 +257,7 @@ mod tests {
             fts_score: 0.1,
             vec_score: 0.1,
             kg_score: 0.0,
+            episode_score: 0.0,
             recency_days: 30.0,
             access_count: 0,
             strength: 0.3,
@@ -288,6 +308,7 @@ mod tests {
             fts_score: 1.0,
             vec_score: 1.0,
             kg_score: 1.0,
+            episode_score: 1.0,
             recency_days: 0.0,
             access_count: 20,
             strength: 1.0,
@@ -310,10 +331,27 @@ mod tests {
     #[test]
     fn test_default_weights_sum() {
         let w = default_weights();
-        let sum = w.w_fts + w.w_vec + w.w_kg + w.w_recency + w.w_access + w.w_strength + w.w_importance + w.w_keyword
-            + w.w_topic_match + w.w_brevity + w.w_channel_coverage + w.w_usage_recency
-            + w.w_connectivity + w.w_concept_richness + w.w_tier_score + w.w_is_current;
-        assert!((sum - 1.0).abs() < 1e-6, "Default weights should sum to 1.0, got {sum}");
+        let sum = w.w_fts
+            + w.w_vec
+            + w.w_kg
+            + w.w_episode
+            + w.w_recency
+            + w.w_access
+            + w.w_strength
+            + w.w_importance
+            + w.w_keyword
+            + w.w_topic_match
+            + w.w_brevity
+            + w.w_channel_coverage
+            + w.w_usage_recency
+            + w.w_connectivity
+            + w.w_concept_richness
+            + w.w_tier_score
+            + w.w_is_current;
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "Default weights should sum to 1.0, got {sum}"
+        );
     }
 
     #[test]
@@ -332,6 +370,7 @@ mod tests {
         assert!((loaded.w_fts - w.w_fts).abs() < 1e-6);
         assert!((loaded.w_vec - w.w_vec).abs() < 1e-6);
         assert!((loaded.w_kg - w.w_kg).abs() < 1e-6);
+        assert!((loaded.w_episode - w.w_episode).abs() < 1e-6);
     }
 
     #[test]

@@ -4,8 +4,8 @@
 use crate::config::ReinConfig;
 use crate::embed::EmbedCache;
 use crate::store::SqliteStore;
-use crate::types::Embedder as _;
 use crate::sync::{auto_memory::AutoMemoryScanner, supermemory::SupermemoryClient, validate};
+use crate::types::Embedder as _;
 use crate::types::{Memory, MemoryStore, ReinResult};
 
 /// A recalled memory with score and confidence.
@@ -27,7 +27,9 @@ pub fn recall(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
-    recall_temporal(store, config, query, topic, keyword, limit, None, None, None, false)
+    recall_temporal(
+        store, config, query, topic, keyword, limit, None, None, None, false,
+    )
 }
 
 /// Fast recall: local-only search (FTS + HNSW + KG + linear reranker).
@@ -41,7 +43,18 @@ pub fn recall_fast(
     keyword: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<RecallResult>> {
-    recall_temporal(store, config, query, topic, keyword, limit, None, None, Some(false), true)
+    recall_temporal(
+        store,
+        config,
+        query,
+        topic,
+        keyword,
+        limit,
+        None,
+        None,
+        Some(false),
+        true,
+    )
 }
 
 /// Full recall pipeline with optional temporal filtering.
@@ -67,16 +80,17 @@ pub fn recall_temporal(
     tracing::debug!(query_type = %strategy.query_type, "query classified");
 
     // Auto-inject temporal bounds for temporal queries
-    let (time_from, time_to) = if strategy.force_temporal && time_from.is_none() && time_to.is_none() {
-        if let Some(days) = strategy.temporal_days_back {
-            let from = chrono::Utc::now() - chrono::Duration::days(days);
-            (Some(from), Some(chrono::Utc::now()))
+    let (time_from, time_to) =
+        if strategy.force_temporal && time_from.is_none() && time_to.is_none() {
+            if let Some(days) = strategy.temporal_days_back {
+                let from = chrono::Utc::now() - chrono::Duration::days(days);
+                (Some(from), Some(chrono::Utc::now()))
+            } else {
+                (time_from, time_to)
+            }
         } else {
             (time_from, time_to)
-        }
-    } else {
-        (time_from, time_to)
-    };
+        };
 
     // Apply limit multiplier from strategy
     let effective_limit = (limit as f32 * strategy.limit_multiplier) as usize;
@@ -89,30 +103,42 @@ pub fn recall_temporal(
     let sm_endpoint = config.sync.endpoint.clone();
     let q_sm = query.to_string();
     let sm_handle = if sm_enabled {
-        sm_api_key.map(|api_key| std::thread::spawn(move || {
-            let client = SupermemoryClient::new(api_key, sm_endpoint);
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
-            rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
-                .unwrap_or_default()
-        }))
+        sm_api_key.map(|api_key| {
+            std::thread::spawn(move || {
+                let client = SupermemoryClient::new(api_key, sm_endpoint);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                rt.map(|rt| rt.block_on(client.search(&q_sm, limit)))
+                    .unwrap_or_default()
+            })
+        })
     } else {
         None
     };
 
     // === Phase 1a: FTS search with ORIGINAL query (fast, ~1ms) ===
     let (mut fts_results, mut fts_scores, strong_signal) = if strategy.skip_fts {
-        (vec![], std::collections::HashMap::<String, f32>::new(), false)
+        (
+            vec![],
+            std::collections::HashMap::<String, f32>::new(),
+            false,
+        )
     } else {
         let fts_start = std::time::Instant::now();
         let (results, ranked) = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
         let scores: std::collections::HashMap<String, f32> = ranked.into_iter().collect();
         let ranked_vec: Vec<(String, f32)> = scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let ss = crate::search::rerank_llm::detect_strong_signal(&ranked_vec);
-        tracing::debug!(elapsed_ms = fts_start.elapsed().as_millis() as u64, hits = scores.len(), "fts search (original)");
-        if ss { tracing::info!("strong BM25 signal — will skip expansion + LLM reranker"); }
+        tracing::debug!(
+            elapsed_ms = fts_start.elapsed().as_millis() as u64,
+            hits = scores.len(),
+            "fts search (original)"
+        );
+        if ss {
+            tracing::info!("strong BM25 signal — will skip expansion + LLM reranker");
+        }
         (results, scores, ss)
     };
 
@@ -124,7 +150,8 @@ pub fn recall_temporal(
             Some(true) => true,
             Some(false) => false,
             None => {
-                !strong_signal && strategy.query_type != crate::search::classify::QueryType::ExactKeyword
+                !strong_signal
+                    && strategy.query_type != crate::search::classify::QueryType::ExactKeyword
             }
         }
     };
@@ -151,20 +178,34 @@ pub fn recall_temporal(
         std::collections::HashMap::new()
     } else {
         let vec_start = std::time::Instant::now();
-        let r: std::collections::HashMap<String, f32> = try_vector_search(store, config, query, topic, effective_limit)
-            .into_iter().collect();
-        tracing::debug!(elapsed_ms = vec_start.elapsed().as_millis() as u64, hits = r.len(), "vector search (original)");
+        let r: std::collections::HashMap<String, f32> =
+            try_vector_search(store, config, query, topic, effective_limit)
+                .into_iter()
+                .collect();
+        tracing::debug!(
+            elapsed_ms = vec_start.elapsed().as_millis() as u64,
+            hits = r.len(),
+            "vector search (original)"
+        );
         r
     };
 
     let mut kg_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut episode_scores: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
     {
         let kg_start = std::time::Instant::now();
         let seed_concepts = store.search_all_concepts(query, 5).unwrap_or_default();
-        let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
+        let concept_results =
+            crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
         let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
         let bfs_expanded = if !seed_ids.is_empty() {
-            crate::search::kg_search::bfs_expand_memories_by_id(store, &seed_ids, 2, effective_limit)
+            crate::search::kg_search::bfs_expand_memories_by_id(
+                store,
+                &seed_ids,
+                2,
+                effective_limit,
+            )
         } else {
             vec![]
         };
@@ -172,7 +213,23 @@ pub fn recall_temporal(
             let entry = kg_scores.entry(id).or_default();
             *entry = entry.max(score);
         }
-        tracing::debug!(elapsed_ms = kg_start.elapsed().as_millis() as u64, hits = kg_scores.len(), "kg search (original)");
+
+        if strategy.query_type == crate::search::classify::QueryType::Episodic
+            || time_from.is_some()
+            || time_to.is_some()
+        {
+            for (id, score) in
+                collect_episode_memory_scores(store, query, effective_limit, time_from, time_to)
+            {
+                let entry = episode_scores.entry(id).or_default();
+                *entry = entry.max(score);
+            }
+        }
+        tracing::debug!(
+            elapsed_ms = kg_start.elapsed().as_millis() as u64,
+            hits = kg_scores.len(),
+            "kg search (original)"
+        );
     }
 
     // === Phase 2: Join expansion thread, search with expanded queries, merge ===
@@ -182,10 +239,13 @@ pub fn recall_temporal(
         drop(expand_handle); // detach thread — LLM call completes in background, result discarded
         vec![]
     } else {
-        expand_handle.and_then(|h| h.join().ok()).unwrap_or_default()
+        expand_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
     };
     // Filter out expanded queries too similar to original (Jaccard word overlap > 0.8)
-    let deduped_queries: Vec<&String> = expanded_queries.iter()
+    let deduped_queries: Vec<&String> = expanded_queries
+        .iter()
         .filter(|eq| word_jaccard(query, eq) <= 0.8)
         .collect();
     if deduped_queries.len() < expanded_queries.len() {
@@ -196,12 +256,17 @@ pub fn recall_temporal(
         );
     }
     if !deduped_queries.is_empty() {
-        tracing::debug!(count = deduped_queries.len(), "merging expanded query results");
+        tracing::debug!(
+            count = deduped_queries.len(),
+            "merging expanded query results"
+        );
 
         // FTS: per-query (Tantivy is local, already fast)
         for eq in &deduped_queries {
             if !strategy.skip_fts {
-                if let Ok((results, ranked)) = try_tantivy_then_fts5(store, eq, topic, effective_limit * 2) {
+                if let Ok((results, ranked)) =
+                    try_tantivy_then_fts5(store, eq, topic, effective_limit * 2)
+                {
                     for (id, score) in ranked {
                         let entry = fts_scores.entry(id).or_insert(f32::MIN);
                         *entry = entry.max(score);
@@ -218,7 +283,8 @@ pub fn recall_temporal(
         // Vec: BATCH embed all expanded queries in one API call
         if !strategy.skip_vec {
             let eq_strs: Vec<&str> = deduped_queries.iter().map(|s| s.as_str()).collect();
-            let batch_results = try_vector_search_batch(store, config, &eq_strs, topic, effective_limit);
+            let batch_results =
+                try_vector_search_batch(store, config, &eq_strs, topic, effective_limit);
             for (id, score) in batch_results {
                 let entry = vec_scores.entry(id).or_insert(f32::MIN);
                 *entry = entry.max(score);
@@ -228,16 +294,36 @@ pub fn recall_temporal(
         // KG: per-query (local concept FTS + BFS)
         for eq in &deduped_queries {
             let seed_concepts = store.search_all_concepts(eq, 5).unwrap_or_default();
-            let concept_results = crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
+            let concept_results = crate::search::kg_search::search_concepts_ranked_from(
+                &seed_concepts,
+                effective_limit,
+            );
             let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
             let bfs_expanded = if !seed_ids.is_empty() {
-                crate::search::kg_search::bfs_expand_memories_by_id(store, &seed_ids, 2, effective_limit)
+                crate::search::kg_search::bfs_expand_memories_by_id(
+                    store,
+                    &seed_ids,
+                    2,
+                    effective_limit,
+                )
             } else {
                 vec![]
             };
             for (id, score) in concept_results.into_iter().chain(bfs_expanded.into_iter()) {
                 let entry = kg_scores.entry(id).or_default();
                 *entry = entry.max(score);
+            }
+
+            if strategy.query_type == crate::search::classify::QueryType::Episodic
+                || time_from.is_some()
+                || time_to.is_some()
+            {
+                for (id, score) in
+                    collect_episode_memory_scores(store, eq, effective_limit, time_from, time_to)
+                {
+                    let entry = episode_scores.entry(id).or_default();
+                    *entry = entry.max(score);
+                }
             }
         }
     }
@@ -248,13 +334,21 @@ pub fn recall_temporal(
     fts_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut vec_ranked: Vec<(String, f32)> = vec_scores.into_iter().collect();
     vec_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut kg_ranked: Vec<(String, f32)> = kg_scores.into_iter()
+    let mut kg_ranked: Vec<(String, f32)> = kg_scores
+        .into_iter()
         .filter(|(id, _)| matches_topic(store, id, topic))
         .collect();
     kg_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     kg_ranked.truncate(effective_limit);
+    let mut episode_ranked: Vec<(String, f32)> = episode_scores
+        .into_iter()
+        .filter(|(id, _)| matches_topic(store, id, topic))
+        .collect();
+    episode_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    episode_ranked.truncate(effective_limit);
 
     let use_kg = !kg_ranked.is_empty();
+    let use_episode = !episode_ranked.is_empty();
 
     // === Path quality gating (Wang 2025: weakest-link phenomenon) ===
     // Skip a path if it returned no results — avoids empty/broken paths degrading fusion.
@@ -268,6 +362,11 @@ pub fn recall_temporal(
     } else {
         vec![]
     };
+    let episode_ids: Vec<String> = if use_episode {
+        episode_ranked.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        vec![]
+    };
 
     // === Score fusion (RRF or Convex Combination) ===
     // Only include paths that passed quality gating
@@ -276,42 +375,54 @@ pub fn recall_temporal(
 
     // === Adaptive alpha (M2): read from AdaptiveState if available ===
     let adaptive_alpha = if config.adaptive.enabled {
-        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
-            .and_then(|s| {
-                let qt = format!("{}", strategy.query_type);
-                s.get_alpha(&qt, None) // cluster_id: None until M4 integration
-            })
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).and_then(|s| {
+            let qt = format!("{}", strategy.query_type);
+            s.get_alpha(&qt, None) // cluster_id: None until M4 integration
+        })
     } else {
         None
     };
 
     // Capture per-channel scores for reranking and M2 logging.
     // Clamp negatives (rank sentinels like -1,-2) to 0 so reranker features are in [0, +inf).
-    let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion.iter()
+    let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion
+        .iter()
         .map(|(id, s)| {
             // Convert negative rank sentinels (-1,-2,...) to positive rank scores: 1/(1+|rank|)
             let score = if *s < 0.0 { 1.0 / (1.0 + s.abs()) } else { *s };
             (id.clone(), score)
-        }).collect();
-    let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion.iter()
+        })
+        .collect();
+    let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion
+        .iter()
         .map(|(id, s)| {
             let score = if *s < 0.0 { 1.0 / (1.0 + s.abs()) } else { *s };
             (id.clone(), score)
-        }).collect();
+        })
+        .collect();
     let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
+    let episode_norm_log: std::collections::HashMap<String, f32> =
+        episode_ranked.iter().cloned().collect();
 
     let fused = if config.search.fusion_method == "cc" {
         let alpha = adaptive_alpha
             .or(strategy.cc_alpha)
             .unwrap_or(config.search.cc_alpha as f32);
-        // For CC mode, boost vec scores with KG signal (2-stage fusion)
-        let vec_for_cc = if use_kg {
+        // For CC mode, boost vec scores with supplementary channels (2-stage fusion)
+        let vec_for_cc = if use_kg || use_episode {
             let mut boosted = vec_for_fusion.clone();
             for (id, kg_score) in &kg_ranked {
                 if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
                     boosted[pos].1 = boosted[pos].1.max(*kg_score * 0.5);
                 } else {
                     boosted.push((id.clone(), *kg_score * 0.5));
+                }
+            }
+            for (id, episode_score) in &episode_ranked {
+                if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
+                    boosted[pos].1 = boosted[pos].1.max(*episode_score * 0.65);
+                } else {
+                    boosted.push((id.clone(), *episode_score * 0.65));
                 }
             }
             boosted
@@ -325,26 +436,43 @@ pub fn recall_temporal(
         let (fts_weight, vec_weight) = if let Some(alpha) = strategy.cc_alpha {
             (alpha, 1.0 - alpha)
         } else {
-            (config.search.rrf_fts_weight as f32, config.search.rrf_vec_weight as f32)
+            (
+                config.search.rrf_fts_weight as f32,
+                config.search.rrf_vec_weight as f32,
+            )
         };
         let mut lists = Vec::new();
-        if !fts_for_fusion.is_empty() { lists.push((fts_for_fusion, fts_weight)); }
-        if !vec_for_fusion.is_empty() { lists.push((vec_for_fusion, vec_weight)); }
+        if !fts_for_fusion.is_empty() {
+            lists.push((fts_for_fusion, fts_weight));
+        }
+        if !vec_for_fusion.is_empty() {
+            lists.push((vec_for_fusion, vec_weight));
+        }
         if !kg_ranked.is_empty() {
             let kg_weight = 0.3; // KG is supplementary
             lists.push((kg_ranked.clone(), kg_weight));
+        }
+        if !episode_ranked.is_empty() {
+            let episode_weight = match strategy.query_type {
+                crate::search::classify::QueryType::Episodic => 0.45,
+                crate::search::classify::QueryType::Temporal => 0.30,
+                _ => 0.18,
+            };
+            lists.push((episode_ranked.clone(), episode_weight));
         }
         crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k)
     };
 
     // Build memory lookup from already-fetched results
-    let mut memory_map: std::collections::HashMap<String, Memory> = std::collections::HashMap::new();
+    let mut memory_map: std::collections::HashMap<String, Memory> =
+        std::collections::HashMap::new();
     for m in fts_results {
         memory_map.entry(m.id.clone()).or_insert(m);
     }
 
     // Batch-fetch vector-search memories not already in FTS results (avoids N+1 queries)
-    let missing_ids: Vec<String> = vec_ids.iter()
+    let missing_ids: Vec<String> = vec_ids
+        .iter()
         .filter(|id| !memory_map.contains_key(*id))
         .cloned()
         .collect();
@@ -355,7 +483,8 @@ pub fn recall_temporal(
     }
 
     // Batch-fetch KG-sourced memories not already in map
-    let kg_ids: Vec<String> = kg_norm_log.keys()
+    let kg_ids: Vec<String> = kg_norm_log
+        .keys()
         .filter(|id| !memory_map.contains_key(*id))
         .cloned()
         .collect();
@@ -364,27 +493,43 @@ pub fn recall_temporal(
             memory_map.entry(m.id.clone()).or_insert(m);
         }
     }
+    let episode_missing_ids: Vec<String> = episode_ids
+        .into_iter()
+        .filter(|id| !memory_map.contains_key(id))
+        .collect();
+    if !episode_missing_ids.is_empty() {
+        for m in store.get_batch(&episode_missing_ids) {
+            memory_map.entry(m.id.clone()).or_insert(m);
+        }
+    }
 
     // Apply strength weighting (Ebbinghaus or KM survival curve) + temporal filter
     // Load cached per-cluster survival curves from M3 (if available)
-    let mut survival_cache: std::collections::HashMap<u32, crate::search::survival::SurvivalCurve> = std::collections::HashMap::new();
+    let mut survival_cache: std::collections::HashMap<u32, crate::search::survival::SurvivalCurve> =
+        std::collections::HashMap::new();
     if config.adaptive.enabled {
-        if let Ok(mut stmt) = store.conn().prepare(
-            "SELECT key, value FROM metadata WHERE key LIKE 'survival_curve:%'"
-        ) {
-            let _ = stmt.query_map([], |row| {
-                let key: String = row.get(0)?;
-                let json: String = row.get(1)?;
-                Ok((key, json))
-            }).ok().map(|rows| {
-                for row in rows.flatten() {
-                    if let Some(id_str) = row.0.strip_prefix("survival_curve:") {
-                        if let (Ok(cid), Ok(curve)) = (id_str.parse::<u32>(), serde_json::from_str(&row.1)) {
-                            survival_cache.insert(cid, curve);
+        if let Ok(mut stmt) = store
+            .conn()
+            .prepare("SELECT key, value FROM metadata WHERE key LIKE 'survival_curve:%'")
+        {
+            let _ = stmt
+                .query_map([], |row| {
+                    let key: String = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    Ok((key, json))
+                })
+                .ok()
+                .map(|rows| {
+                    for row in rows.flatten() {
+                        if let Some(id_str) = row.0.strip_prefix("survival_curve:") {
+                            if let (Ok(cid), Ok(curve)) =
+                                (id_str.parse::<u32>(), serde_json::from_str(&row.1))
+                            {
+                                survival_cache.insert(cid, curve);
+                            }
                         }
                     }
-                }
-            });
+                });
         }
     }
 
@@ -395,14 +540,20 @@ pub fn recall_temporal(
         if let Some(memory) = memory_map.remove(&id) {
             // Temporal filter: skip memories outside the requested time range
             if let Some(from) = time_from {
-                if memory.created_at < from { continue; }
+                if memory.created_at < from {
+                    continue;
+                }
             }
             if let Some(to) = time_to {
-                if memory.created_at > to { continue; }
+                if memory.created_at > to {
+                    continue;
+                }
             }
             // Use per-cluster survival curve if available (M3), else Ebbinghaus
             let curve = memory.cluster_id.and_then(|cid| survival_cache.get(&cid));
-            let final_score = crate::search::scoring::apply_strength_weighting_with_curve(rrf_score, &memory, curve);
+            let final_score = crate::search::scoring::apply_strength_weighting_with_curve(
+                rrf_score, &memory, curve,
+            );
             local_results.push((memory, final_score));
         }
     }
@@ -434,11 +585,13 @@ pub fn recall_temporal(
             let fts = fts_norm_log.get(&mem.id).copied().unwrap_or(0.0);
             let vec = vec_norm_log.get(&mem.id).copied().unwrap_or(0.0);
             let kg = kg_norm_log.get(&mem.id).copied().unwrap_or(0.0);
-            // Channel coverage: how many channels found this memory (1-3)
+            let episode = episode_norm_log.get(&mem.id).copied().unwrap_or(0.0);
+            // Channel coverage: how many channels found this memory (1-4)
             let channels = (if fts > 0.0 { 1 } else { 0 })
                 + (if vec > 0.0 { 1 } else { 0 })
-                + (if kg > 0.0 { 1 } else { 0 });
-            let channel_coverage = channels.max(1) as f32 / 3.0;
+                + (if kg > 0.0 { 1 } else { 0 })
+                + (if episode > 0.0 { 1 } else { 0 });
+            let channel_coverage = channels.max(1) as f32 / 4.0;
             // Topic match: does memory topic appear as a word in query?
             let query_lower = query.to_lowercase();
             // Word-boundary match: multi-word topics match as phrase, single-word as exact token.
@@ -446,28 +599,49 @@ pub fn recall_temporal(
             let topic_lower = mem.topic.to_lowercase();
             let topic_match = if topic_lower.contains(' ') {
                 // Multi-word topic: check if the phrase appears in the query.
-                if query_lower.contains(&topic_lower) { 1.0 } else { 0.0 }
+                if query_lower.contains(&topic_lower) {
+                    1.0
+                } else {
+                    0.0
+                }
             } else {
                 // Single-word topic: exact word match (not substring).
-                if query_lower.split_whitespace().any(|w| w == topic_lower) { 1.0 } else { 0.0 }
+                if query_lower.split_whitespace().any(|w| w == topic_lower) {
+                    1.0
+                } else {
+                    0.0
+                }
             };
             let features = crate::search::rerank::RerankFeatures {
                 fts_score: fts,
                 vec_score: vec,
                 kg_score: kg,
+                episode_score: episode,
                 recency_days: (chrono::Utc::now() - mem.created_at).num_hours() as f32 / 24.0,
                 access_count: mem.access_count,
                 strength: mem.strength as f32,
                 importance_weight: importance_weight(&mem.importance),
-                keyword_overlap: crate::search::rerank::compute_keyword_overlap(query, &mem.keywords, &mem.content),
+                keyword_overlap: crate::search::rerank::compute_keyword_overlap(
+                    query,
+                    &mem.keywords,
+                    &mem.content,
+                ),
                 topic_match,
                 brevity: 1.0 / (1.0 + mem.content.len() as f32 / 500.0),
                 channel_coverage,
                 usage_recency: (chrono::Utc::now() - mem.last_accessed).num_hours() as f32 / 24.0,
                 connectivity: (mem.related_ids.len().min(10) as f32) / 10.0,
                 concept_richness: (mem.concept_ids.len().min(5) as f32) / 5.0,
-                tier_score: match mem.tier.as_str() { "hot" => 1.0, "warm" => 0.5, _ => 0.0 },
-                is_current: if mem.superseded_by.is_none() { 1.0 } else { 0.0 },
+                tier_score: match mem.tier.as_str() {
+                    "hot" => 1.0,
+                    "warm" => 0.5,
+                    _ => 0.0,
+                },
+                is_current: if mem.superseded_by.is_none() {
+                    1.0
+                } else {
+                    0.0
+                },
             };
             *score = crate::search::rerank::rerank_score(&features, &weights);
         }
@@ -486,7 +660,12 @@ pub fn recall_temporal(
     if linear_clear {
         tracing::debug!("linear rerank scores well-separated, skipping LLM reranker");
     }
-    if !fast && !strong_signal && !linear_clear && config.reranker_provider() != crate::config::Provider::None && local_results.len() > 1 {
+    if !fast
+        && !strong_signal
+        && !linear_clear
+        && config.reranker_provider() != crate::config::Provider::None
+        && local_results.len() > 1
+    {
         let llm_scores = crate::search::rerank_llm::rerank_with_llm(config, query, &local_results);
         for (i, (_, score)) in local_results.iter_mut().enumerate() {
             if let Some(&llm_s) = llm_scores.get(i) {
@@ -500,7 +679,9 @@ pub fn recall_temporal(
     if let Some(kw) = keyword {
         let kw_lower = kw.to_lowercase();
         local_results.retain(|(m, _)| {
-            m.keywords.iter().any(|k| k.to_lowercase().contains(&kw_lower))
+            m.keywords
+                .iter()
+                .any(|k| k.to_lowercase().contains(&kw_lower))
                 || m.content.to_lowercase().contains(&kw_lower)
         });
     }
@@ -521,42 +702,50 @@ pub fn recall_temporal(
     };
 
     // Join early-launched Supermemory thread (has been running since pipeline start)
-    let supermemory_results = sm_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    tracing::debug!(elapsed_ms = total_start.elapsed().as_millis() as u64, hits = supermemory_results.len(), "supermemory search (joined)");
+    let supermemory_results = sm_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    tracing::debug!(
+        elapsed_ms = total_start.elapsed().as_millis() as u64,
+        hits = supermemory_results.len(),
+        "supermemory search (joined)"
+    );
 
-    let validated = validate::cross_validate(&local_results, &supermemory_results, &auto_memory_results);
+    let validated =
+        validate::cross_validate(&local_results, &supermemory_results, &auto_memory_results);
 
     // Build final results — scores already assigned by cross_validate
     let mut results: Vec<RecallResult> = validated
         .into_iter()
-        .map(|v| {
-            RecallResult {
-                memory: v.memory,
-                score: v.score,
-                confidence: v.confidence,
-                sources_hit: v.sources_hit,
-            }
+        .map(|v| RecallResult {
+            memory: v.memory,
+            score: v.score,
+            confidence: v.confidence,
+            sources_hit: v.sources_hit,
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
     if config.adaptive.enabled {
         let request_id = ulid::Ulid::new().to_string();
-        let candidates: Vec<serde_json::Value> = results.iter()
+        let candidates: Vec<serde_json::Value> = results
+            .iter()
             .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
             .map(|r| {
                 let bm25 = fts_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
                 let vec = vec_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
                 let kg = kg_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
+                let episode = episode_norm_log.get(&r.memory.id).copied().unwrap_or(0.0);
                 serde_json::json!({
                     "id": r.memory.id,
                     "bm25_norm": bm25,
                     "vec_norm": vec,
                     "kg_norm": kg,
+                    "episode_norm": episode,
                     "final_score": r.score,
                 })
             })
@@ -564,21 +753,24 @@ pub fn recall_temporal(
         let alpha_used = adaptive_alpha
             .or(strategy.cc_alpha)
             .unwrap_or(config.search.cc_alpha as f32);
-        let _ = crate::store::adaptive::emit_event(store.conn(), crate::store::adaptive::FeedbackEvent {
-            event_type: crate::store::adaptive::EventType::RecallComplete,
-            request_id: Some(request_id),
-            memory_id: None,
-            concept_id: None,
-            query: Some(query.chars().take(200).collect()),
-            query_type: Some(format!("{}", strategy.query_type)),
-            topic: topic.map(|t| t.to_string()),
-            payload: Some(serde_json::json!({
-                "candidates": candidates,
-                "alpha_used": alpha_used,
-                "fusion_method": &config.search.fusion_method,
-                "result_count": results.len(),
-            })),
-        });
+        let _ = crate::store::adaptive::emit_event(
+            store.conn(),
+            crate::store::adaptive::FeedbackEvent {
+                event_type: crate::store::adaptive::EventType::RecallComplete,
+                request_id: Some(request_id),
+                memory_id: None,
+                concept_id: None,
+                query: Some(query.chars().take(200).collect()),
+                query_type: Some(format!("{}", strategy.query_type)),
+                topic: topic.map(|t| t.to_string()),
+                payload: Some(serde_json::json!({
+                    "candidates": candidates,
+                    "alpha_used": alpha_used,
+                    "fusion_method": &config.search.fusion_method,
+                    "result_count": results.len(),
+                })),
+            },
+        );
     }
 
     // Truncate to the caller's requested limit (not effective_limit).
@@ -586,7 +778,8 @@ pub fn recall_temporal(
 
     // Record recall hit (NOT access — access should only be counted when
     // the agent/user actually uses the memory, not just when it's returned).
-    let recall_ids: Vec<String> = results.iter()
+    let recall_ids: Vec<String> = results
+        .iter()
         .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
         .map(|r| r.memory.id.clone())
         .collect();
@@ -598,7 +791,11 @@ pub fn recall_temporal(
         store.update_quality_weights();
     }
 
-    tracing::debug!(elapsed_ms = total_start.elapsed().as_millis() as u64, results = results.len(), "recall complete");
+    tracing::debug!(
+        elapsed_ms = total_start.elapsed().as_millis() as u64,
+        results = results.len(),
+        "recall complete"
+    );
     Ok(results)
 }
 
@@ -705,16 +902,27 @@ fn try_vector_search_batch(
 fn matches_topic(store: &SqliteStore, id: &str, topic: Option<&str>) -> bool {
     match topic {
         None => true,
-        Some(t) => store.conn()
-            .query_row("SELECT topic FROM memories WHERE id = ?1", rusqlite::params![id], |row| row.get::<_, String>(0))
+        Some(t) => store
+            .conn()
+            .query_row(
+                "SELECT topic FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get::<_, String>(0),
+            )
             .map(|mem_topic| mem_topic == t)
             .unwrap_or(false),
     }
 }
 
 /// Rank results by position and filter by topic.
-fn rank_and_filter(results: Vec<(String, f32)>, store: &SqliteStore, topic: Option<&str>, limit: usize) -> Vec<(String, f32)> {
-    results.into_iter()
+fn rank_and_filter(
+    results: Vec<(String, f32)>,
+    store: &SqliteStore,
+    topic: Option<&str>,
+    limit: usize,
+) -> Vec<(String, f32)> {
+    results
+        .into_iter()
         .filter(|(id, _)| matches_topic(store, id, topic))
         .take(limit)
         .enumerate()
@@ -770,7 +978,10 @@ fn try_tantivy_then_fts5(
                         if let Ok(m) = store.get(&id) {
                             // Preserve original score for CC fusion; use rank for RRF
                             // Score is Tantivy BM25 relevance (positive float)
-                            ranked.push((m.id.clone(), if score > 0.0 { score } else { -(i as f32) }));
+                            ranked.push((
+                                m.id.clone(),
+                                if score > 0.0 { score } else { -(i as f32) },
+                            ));
                             memories.push(m);
                         }
                     }
@@ -800,13 +1011,52 @@ fn word_jaccard(a: &str, b: &str) -> f32 {
     let wb: std::collections::HashSet<&str> = b.split_whitespace().collect();
     // If both queries have ≤1 whitespace token (likely CJK), use character bigrams
     if wa.len() <= 1 && wb.len() <= 1 {
-        let ca: std::collections::HashSet<(char, char)> = a.chars().zip(a.chars().skip(1)).collect();
-        let cb: std::collections::HashSet<(char, char)> = b.chars().zip(b.chars().skip(1)).collect();
+        let ca: std::collections::HashSet<(char, char)> =
+            a.chars().zip(a.chars().skip(1)).collect();
+        let cb: std::collections::HashSet<(char, char)> =
+            b.chars().zip(b.chars().skip(1)).collect();
         let inter = ca.intersection(&cb).count() as f32;
         let union = ca.union(&cb).count() as f32;
         return if union == 0.0 { 1.0 } else { inter / union };
     }
     let inter = wa.intersection(&wb).count() as f32;
     let union = wa.union(&wb).count() as f32;
-    if union == 0.0 { 1.0 } else { inter / union }
+    if union == 0.0 {
+        1.0
+    } else {
+        inter / union
+    }
+}
+
+/// Search episodes and project them back to linked memory IDs.
+/// This gives episodic queries a real session-level retrieval path instead of
+/// only changing routing parameters.
+fn collect_episode_memory_scores(
+    store: &SqliteStore,
+    query: &str,
+    limit: usize,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+) -> std::collections::HashMap<String, f32> {
+    let mut memory_scores = std::collections::HashMap::new();
+    let episodes = store
+        .search_episodes_ranked(query, limit, time_from, time_to)
+        .unwrap_or_default();
+
+    for (episode, base_score) in episodes {
+        for mem_id in &episode.memory_ids {
+            let entry = memory_scores.entry(mem_id.clone()).or_insert(0.0_f32);
+            *entry = entry.max(base_score);
+        }
+        for concept_id in &episode.concept_ids {
+            if let Ok(Some(concept)) = store.get_concept_by_id(concept_id) {
+                for mem_id in &concept.source_memory_ids {
+                    let entry = memory_scores.entry(mem_id.clone()).or_insert(0.0_f32);
+                    *entry = entry.max(base_score * 0.85);
+                }
+            }
+        }
+    }
+
+    memory_scores
 }

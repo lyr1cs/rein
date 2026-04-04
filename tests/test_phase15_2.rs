@@ -6,6 +6,7 @@ use rein::extract::llm::ExtractedMemory;
 use rein::extract::postprocess::postprocess;
 use rein::search::classify::{classify, QueryType};
 use rein::search::kg_search::{bfs_expand_memories, search_concepts_ranked};
+use rein::search::recall::recall_fast;
 use rein::search::rerank::{default_weights, rerank_score, RerankFeatures};
 use rein::store::SqliteStore;
 use rein::types::*;
@@ -114,8 +115,18 @@ fn test_bfs_expand_skips_expired_links() {
     let store = SqliteStore::in_memory().unwrap();
 
     // Store two memories
-    let m1 = make_memory("topic-a", "Source concept memory", "Source data", Importance::Medium);
-    let m2 = make_memory("topic-b", "Target concept memory", "Target data", Importance::Medium);
+    let m1 = make_memory(
+        "topic-a",
+        "Source concept memory",
+        "Source data",
+        Importance::Medium,
+    );
+    let m2 = make_memory(
+        "topic-b",
+        "Target concept memory",
+        "Target data",
+        Importance::Medium,
+    );
     let mem_id1 = store.store(m1).unwrap();
     let mem_id2 = store.store(m2).unwrap();
 
@@ -173,12 +184,7 @@ fn test_bfs_expand_skips_expired_links() {
     store.add_link(link).unwrap();
 
     // BFS from source concept — should NOT traverse expired link
-    let results = bfs_expand_memories(
-        &store,
-        &["source concept alpha".to_string()],
-        2,
-        10,
-    );
+    let results = bfs_expand_memories(&store, &["source concept alpha".to_string()], 2, 10);
 
     // Should find mem_id1 (seed concept) but NOT mem_id2 (expired link target)
     assert!(
@@ -200,8 +206,18 @@ fn test_bfs_expand_follows_valid_links() {
     let store = SqliteStore::in_memory().unwrap();
 
     // Store two memories
-    let m1 = make_memory("topic-a", "Source memory", "Source content", Importance::Medium);
-    let m2 = make_memory("topic-b", "Target memory", "Target content", Importance::Medium);
+    let m1 = make_memory(
+        "topic-a",
+        "Source memory",
+        "Source content",
+        Importance::Medium,
+    );
+    let m2 = make_memory(
+        "topic-b",
+        "Target memory",
+        "Target content",
+        Importance::Medium,
+    );
     let mem_id1 = store.store(m1).unwrap();
     let mem_id2 = store.store(m2).unwrap();
 
@@ -259,12 +275,7 @@ fn test_bfs_expand_follows_valid_links() {
     store.add_link(link).unwrap();
 
     // BFS from source concept — should traverse valid link
-    let results = bfs_expand_memories(
-        &store,
-        &["source concept gamma".to_string()],
-        2,
-        10,
-    );
+    let results = bfs_expand_memories(&store, &["source concept gamma".to_string()], 2, 10);
 
     // Should find both memories
     assert!(
@@ -274,6 +285,90 @@ fn test_bfs_expand_follows_valid_links() {
     assert!(
         results.iter().any(|(id, _)| id == &mem_id2),
         "BFS should traverse valid link and include target memory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Episode search ranks matching sessions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_episode_search_ranks_matching_sessions() {
+    let store = SqliteStore::in_memory().unwrap();
+
+    let mem = make_memory(
+        "workflow",
+        "Migration plan",
+        "Generic plan note",
+        Importance::Medium,
+    );
+    let mem_id = store.store(mem).unwrap();
+
+    let episode = Episode {
+        id: String::new(),
+        title: "Billing migration planning session".to_string(),
+        outcome: "Selected PostgreSQL rollout plan".to_string(),
+        decisions: vec!["Use PostgreSQL for billing migration".to_string()],
+        concept_ids: vec![],
+        memory_ids: vec![mem_id],
+        created_at: Utc::now(),
+    };
+    store.create_episode(episode).unwrap();
+
+    let ranked = store
+        .search_episodes_ranked("what did we decide about billing migration", 10, None, None)
+        .unwrap();
+    assert!(
+        !ranked.is_empty(),
+        "episode search should find matching sessions"
+    );
+    assert!(
+        ranked[0].0.title.contains("Billing migration"),
+        "top-ranked episode should match billing migration session"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. recall_fast uses episode signal for episodic queries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recall_fast_uses_episode_signal_for_episodic_queries() {
+    let store = SqliteStore::in_memory().unwrap();
+    let config = rein::config::ReinConfig::default();
+
+    let mem = make_memory(
+        "workflow",
+        "Chosen plan",
+        "Final implementation note recorded after the meeting.",
+        Importance::High,
+    );
+    let mem_id = store.store(mem).unwrap();
+
+    let episode = Episode {
+        id: String::new(),
+        title: "Billing migration meeting".to_string(),
+        outcome: "Agreed on the new billing migration approach".to_string(),
+        decisions: vec!["Use PostgreSQL for billing migration".to_string()],
+        concept_ids: vec![],
+        memory_ids: vec![mem_id.clone()],
+        created_at: Utc::now(),
+    };
+    store.create_episode(episode).unwrap();
+
+    let results = recall_fast(
+        &store,
+        &config,
+        "what did we decide about billing migration",
+        None,
+        None,
+        10,
+    )
+    .unwrap();
+
+    assert!(
+        results.iter().any(|r| r.memory.id == mem_id),
+        "episodic query should recall memory linked through matching episode"
     );
 }
 
@@ -290,6 +385,7 @@ fn test_rerank_changes_ordering() {
         fts_score: 0.95,
         vec_score: 0.1,
         kg_score: 0.0,
+        episode_score: 0.0,
         recency_days: 60.0,
         access_count: 0,
         strength: 0.4,
@@ -310,6 +406,7 @@ fn test_rerank_changes_ordering() {
         fts_score: 0.3,
         vec_score: 0.7,
         kg_score: 0.5,
+        episode_score: 0.7,
         recency_days: 0.5,
         access_count: 15,
         strength: 1.0,
