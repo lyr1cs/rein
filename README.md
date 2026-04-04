@@ -425,12 +425,22 @@ alias codexp="OPENAI_BASE_URL=http://127.0.0.1:8690 codex"
 
 Then: `rein-proxy` to start, `claudep` or `codexp` to use.
 
+#### Codex CLI Config (alternative)
+
+Instead of environment variables, you can configure Codex CLI permanently in `~/.codex/config.toml`:
+
+```toml
+openai_base_url = "http://127.0.0.1:8690"
+```
+
+This makes all Codex calls go through the rein proxy by default (requires proxy to be running).
+
 #### Supported Agents
 
-| Agent | Environment Variable | Format |
-|-------|---------------------|--------|
+| Agent | Configuration | Format |
+|-------|--------------|--------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
-| **Codex CLI** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
+| **Codex CLI** | `openai_base_url` in `~/.codex/config.toml` or `OPENAI_BASE_URL` env var | OpenAI `/v1/chat/completions` |
 | **Cursor** | Settings > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | Settings > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **Any OpenAI-compatible** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
@@ -1051,12 +1061,22 @@ alias codexp="OPENAI_BASE_URL=http://127.0.0.1:8690 codex"
 
 然后：`rein-proxy` 启动代理，`claudep` 或 `codexp` 使用。
 
+#### Codex CLI 配置（替代方案）
+
+也可以直接在 `~/.codex/config.toml` 中永久配置，无需环境变量：
+
+```toml
+openai_base_url = "http://127.0.0.1:8690"
+```
+
+这样所有 Codex 调用默认走 rein proxy（需先启动 proxy）。
+
 #### 支持的 Agent
 
-| Agent | 环境变量 | API 格式 |
+| Agent | 配置方式 | API 格式 |
 |-------|---------|----------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
-| **Codex CLI** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
+| **Codex CLI** | `~/.codex/config.toml` 中 `openai_base_url` 或 `OPENAI_BASE_URL` 环境变量 | OpenAI `/v1/chat/completions` |
 | **Cursor** | 设置 > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | 设置 > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **任何 OpenAI 兼容工具** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
