@@ -93,7 +93,10 @@ export default function Graph() {
 
   const graphRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const [dimensions, setDimensions] = useState(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth - 96 : 800,
+    height: typeof window !== 'undefined' ? window.innerHeight - 120 : 600,
+  }));
 
   /* ---- Fetch memoirs on mount ---- */
   useEffect(() => {
@@ -163,9 +166,14 @@ export default function Graph() {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    // Initialize dimensions immediately
+    setDimensions({ width: Math.floor(el.clientWidth), height: Math.floor(el.clientHeight) });
     const ro = new ResizeObserver((entries) => {
       for (const e of entries) {
-        setDimensions({ width: e.contentRect.width, height: e.contentRect.height });
+        setDimensions({
+          width: Math.floor(e.contentRect.width),
+          height: Math.floor(e.contentRect.height),
+        });
       }
     });
     ro.observe(el);
@@ -364,7 +372,7 @@ export default function Graph() {
       {/* Main area: graph + optional detail panel */}
       <div className="flex flex-1 min-h-0">
         {/* Graph canvas */}
-        <div ref={containerRef} className="flex-1 relative min-w-0">
+        <div ref={containerRef} className="flex-1 relative min-w-0 overflow-hidden" style={{ backgroundColor: '#050a15' }}>
           {graphLoading && (
             <div className="absolute inset-0 flex items-center justify-center z-10 text-[var(--text-muted)]">
               Loading graph...
