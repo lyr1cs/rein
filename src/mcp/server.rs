@@ -213,10 +213,17 @@ impl ReinServer {
                 .and_then(parse_datetime)
                 .or_else(|| params.started_at.as_deref().and_then(parse_datetime_end));
             let session = crate::types::SessionIngest {
+                schema_version: 1,
+                artifact_kind: "session".to_string(),
                 session_id: params.session_id,
                 title: params.title,
                 started_at,
+                ended_at: None,
                 summary: params.summary,
+                source_agent: params.agent_label.clone(),
+                source_label: Some("mcp".to_string()),
+                compact_summary: params.compact_summary,
+                tool_outputs: params.tool_outputs.unwrap_or_default(),
                 turns: turns
                     .into_iter()
                     .map(|turn| crate::types::SessionTurn {
@@ -225,22 +232,40 @@ impl ReinServer {
                     })
                     .collect(),
             };
-            crate::ops::ingest_session_sync(
-                &config,
-                &session,
-                params.agent_label.as_deref(),
-                params.is_subagent.unwrap_or(false),
-            )
+            if params.async_mode.unwrap_or(false) {
+                crate::ops::queue_ingest_session(
+                    &config,
+                    &session,
+                    params.agent_label.as_deref(),
+                    params.is_subagent.unwrap_or(false),
+                )
+            } else {
+                crate::ops::ingest_session_sync_report(
+                    &config,
+                    &session,
+                    params.agent_label.as_deref(),
+                    params.is_subagent.unwrap_or(false),
+                )
+            }
         } else if let Some(content) = params.content {
             if content.len() > 500_000 {
                 return "Error: content too large (max 500KB)".to_string();
             }
-            crate::ops::ingest_session_text_sync(
-                &config,
-                &content,
-                params.agent_label.as_deref(),
-                params.is_subagent.unwrap_or(false),
-            )
+            if params.async_mode.unwrap_or(false) {
+                crate::ops::queue_ingest_session_text(
+                    &config,
+                    &content,
+                    params.agent_label.as_deref(),
+                    params.is_subagent.unwrap_or(false),
+                )
+            } else {
+                crate::ops::ingest_session_text_sync_report(
+                    &config,
+                    &content,
+                    params.agent_label.as_deref(),
+                    params.is_subagent.unwrap_or(false),
+                )
+            }
         } else {
             Err(crate::types::ReinError::Config(
                 "ingest_session requires either content or turns".to_string(),
@@ -248,13 +273,26 @@ impl ReinServer {
         };
 
         match result {
-            Ok((memories, concepts, links)) => {
+            Ok(report) => {
                 if self.compact() {
-                    format!("ok memories:{memories} concepts:{concepts} links:{links}")
+                    format!(
+                        "ok queued:{} memories:{} concepts:{} links:{} artifact:{} episode:{}",
+                        report.queued,
+                        report.memory_count,
+                        report.concept_count,
+                        report.link_count,
+                        report.artifact_id.as_deref().unwrap_or("-"),
+                        report.episode_id.as_deref().unwrap_or("-"),
+                    )
                 } else {
                     format!(
-                        "Ingested session: {} memories, {} concepts, {} links",
-                        memories, concepts, links
+                        "Ingested session: queued={} artifact={} episode={} memories={} concepts={} links={}",
+                        report.queued,
+                        report.artifact_id.as_deref().unwrap_or("-"),
+                        report.episode_id.as_deref().unwrap_or("-"),
+                        report.memory_count,
+                        report.concept_count,
+                        report.link_count
                     )
                 }
             }

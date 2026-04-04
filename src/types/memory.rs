@@ -295,6 +295,18 @@ pub struct Episode {
     pub title: String,
     pub outcome: String,
     pub decisions: Vec<String>,
+    #[serde(default)]
+    pub primary_topics: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub involved_agents: Vec<String>,
+    #[serde(default)]
+    pub important_paths: Vec<String>,
+    #[serde(default)]
+    pub temporal_keywords: Vec<String>,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
     /// Concept IDs touched in this session.
     pub concept_ids: Vec<String>,
     /// Memory IDs created in this session.
@@ -312,6 +324,10 @@ pub struct SessionTurn {
 /// Structured ingestion payload for a session/transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionIngest {
+    #[serde(default = "default_session_schema_version")]
+    pub schema_version: u32,
+    #[serde(default = "default_session_artifact_kind")]
+    pub artifact_kind: String,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -319,9 +335,68 @@ pub struct SessionIngest {
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
+    pub source_agent: Option<String>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub compact_summary: Option<String>,
+    #[serde(default)]
+    pub tool_outputs: Vec<String>,
+    #[serde(default)]
     pub turns: Vec<SessionTurn>,
+}
+
+fn default_session_schema_version() -> u32 {
+    1
+}
+
+fn default_session_artifact_kind() -> String {
+    "session".to_string()
+}
+
+/// Persisted raw session artifact, separate from derived memories.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArtifact {
+    pub id: String,
+    pub schema_version: u32,
+    pub artifact_kind: String,
+    pub session_id: Option<String>,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_label: Option<String>,
+    pub is_subagent: bool,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub turn_count: u32,
+    pub transcript_text: String,
+    pub transcript_json: Option<String>,
+    pub episode_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Richer report for explicit session ingestion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IngestReport {
+    pub queued: bool,
+    pub artifact_id: Option<String>,
+    pub session_id: Option<String>,
+    pub episode_id: Option<String>,
+    pub memory_count: u32,
+    pub concept_count: u32,
+    pub link_count: u32,
+    pub turn_count: u32,
+    pub filtered_count: u32,
+    pub secret_filtered_count: u32,
+    pub created_count: u32,
+    pub merged_count: u32,
+    pub superseded_count: u32,
+    pub stored_memory_ids: Vec<String>,
+    pub primary_topics: Vec<String>,
 }
 
 /// Relation types between concepts.

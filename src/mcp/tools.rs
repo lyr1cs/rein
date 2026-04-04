@@ -56,10 +56,16 @@ pub struct IngestSessionParams {
     pub started_at: Option<String>,
     /// Optional session summary or compacted synopsis.
     pub summary: Option<String>,
+    /// Optional compact summary produced upstream.
+    pub compact_summary: Option<String>,
+    /// Optional tool outputs associated with the session.
+    pub tool_outputs: Option<Vec<String>>,
     /// Optional label for the originating agent/runtime.
     pub agent_label: Option<String>,
     /// Whether this session came from a subagent.
     pub is_subagent: Option<bool>,
+    /// If true, persist the raw artifact and queue full processing in the background.
+    pub async_mode: Option<bool>,
 }
 
 /// Parameters for rein_update tool.

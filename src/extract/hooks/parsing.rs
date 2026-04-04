@@ -195,3 +195,75 @@ pub fn count_transcript_turns(input: &str) -> usize {
     }
     0
 }
+
+/// Parse a hook payload into a structured SessionIngest when possible.
+pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionIngest> {
+    let json = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    let summary = json
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
+        let transcript_content = std::fs::read_to_string(path).ok()?;
+        let mut turns = Vec::new();
+        for line in transcript_content.lines() {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let msg_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if msg_type != "human" && msg_type != "assistant" {
+                continue;
+            }
+            let content = if let Some(msg) = entry.get("message") {
+                extract_message_content(msg.get("content"))
+            } else {
+                extract_message_content(entry.get("content"))
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            let role = if msg_type == "human" { "User" } else { "Assistant" };
+            turns.push(crate::types::SessionTurn {
+                role: role.to_string(),
+                content,
+            });
+        }
+        return Some(crate::types::SessionIngest {
+            schema_version: 1,
+            artifact_kind: "session".to_string(),
+            session_id: Some(path.to_string()),
+            title: None,
+            started_at: None,
+            ended_at: None,
+            summary,
+            source_agent: Some(runtime_agent_label()),
+            source_label: Some("hook_stop".to_string()),
+            compact_summary: None,
+            tool_outputs: vec![],
+            turns,
+        });
+    }
+
+    if let Some(transcript) = json.get("transcript").and_then(|v| v.as_str()) {
+        return Some(crate::types::SessionIngest {
+            schema_version: 1,
+            artifact_kind: "session".to_string(),
+            session_id: None,
+            title: None,
+            started_at: None,
+            ended_at: None,
+            summary,
+            source_agent: Some(runtime_agent_label()),
+            source_label: Some("hook_stop".to_string()),
+            compact_summary: None,
+            tool_outputs: vec![],
+            turns: vec![crate::types::SessionTurn {
+                role: "Transcript".to_string(),
+                content: transcript.to_string(),
+            }],
+        });
+    }
+
+    None
+}

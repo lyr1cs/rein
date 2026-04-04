@@ -55,6 +55,8 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["content", "file"])]
         json_file: Option<String>,
         #[arg(long)]
+        asynchronous: bool,
+        #[arg(long)]
         agent_label: Option<String>,
         #[arg(long)]
         subagent: bool,
@@ -236,39 +238,67 @@ async fn main() -> anyhow::Result<()> {
             content,
             file,
             json_file,
+            asynchronous,
             agent_label,
             subagent,
         }) => {
-            let (memories, concepts, links) = match (content, file, json_file) {
+            let report = match (content, file, json_file) {
                 (Some(text), None, None) => {
-                    rein::ops::ingest_session_text(
-                        &config,
-                        &text,
-                        agent_label.as_deref(),
-                        subagent,
-                    )
-                    .await?
+                    if asynchronous {
+                        rein::ops::queue_ingest_session_text(
+                            &config,
+                            &text,
+                            agent_label.as_deref(),
+                            subagent,
+                        )?
+                    } else {
+                        rein::ops::ingest_session_text_report(
+                            &config,
+                            &text,
+                            agent_label.as_deref(),
+                            subagent,
+                        )
+                        .await?
+                    }
                 }
                 (None, Some(path), None) => {
                     let text = std::fs::read_to_string(path)?;
-                    rein::ops::ingest_session_text(
-                        &config,
-                        &text,
-                        agent_label.as_deref(),
-                        subagent,
-                    )
-                    .await?
+                    if asynchronous {
+                        rein::ops::queue_ingest_session_text(
+                            &config,
+                            &text,
+                            agent_label.as_deref(),
+                            subagent,
+                        )?
+                    } else {
+                        rein::ops::ingest_session_text_report(
+                            &config,
+                            &text,
+                            agent_label.as_deref(),
+                            subagent,
+                        )
+                        .await?
+                    }
                 }
                 (None, None, Some(path)) => {
                     let raw = std::fs::read_to_string(path)?;
                     let session: types::SessionIngest = serde_json::from_str(&raw)?;
-                    rein::ops::ingest_session(
-                        &config,
-                        &session,
-                        agent_label.as_deref(),
-                        subagent,
-                    )
-                    .await?
+                    if asynchronous {
+                        rein::ops::queue_ingest_session(
+                            &config,
+                            &session,
+                            agent_label.as_deref(),
+                            subagent,
+                        )?
+                    } else {
+                        rein::ops::ingest_session_report(
+                            &config,
+                            &session,
+                            agent_label.as_deref(),
+                            subagent,
+                        )
+                        .await?
+                    }
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
@@ -277,11 +307,24 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             if config.server.compact {
-                println!("ok memories:{memories} concepts:{concepts} links:{links}");
+                println!(
+                    "ok queued:{} memories:{} concepts:{} links:{} artifact:{} episode:{}",
+                    report.queued,
+                    report.memory_count,
+                    report.concept_count,
+                    report.link_count,
+                    report.artifact_id.as_deref().unwrap_or("-"),
+                    report.episode_id.as_deref().unwrap_or("-"),
+                );
             } else {
                 println!(
-                    "Ingested session: {} memories, {} concepts, {} links",
-                    memories, concepts, links
+                    "Ingested session: queued={} artifact={} episode={} memories={} concepts={} links={}",
+                    report.queued,
+                    report.artifact_id.as_deref().unwrap_or("-"),
+                    report.episode_id.as_deref().unwrap_or("-"),
+                    report.memory_count,
+                    report.concept_count,
+                    report.link_count
                 );
             }
         }

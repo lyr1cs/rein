@@ -740,6 +740,20 @@ pub fn recall_temporal(
     // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
     if config.adaptive.enabled {
         let request_id = ulid::Ulid::new().to_string();
+        let episode_matches: Vec<serde_json::Value> = episode_ranked
+            .iter()
+            .take(5)
+            .filter_map(|(memory_id, score)| {
+                store.get(memory_id).ok().map(|memory| {
+                    serde_json::json!({
+                        "memory_id": memory.id,
+                        "memory_topic": memory.topic,
+                        "memory_summary": memory.summary,
+                        "episode_score": score,
+                    })
+                })
+            })
+            .collect();
         let candidates: Vec<serde_json::Value> = results
             .iter()
             .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
@@ -772,10 +786,11 @@ pub fn recall_temporal(
                 query_type: Some(format!("{}", strategy.query_type)),
                 topic: topic.map(|t| t.to_string()),
                 payload: Some(serde_json::json!({
-                    "candidates": candidates,
-                    "alpha_used": alpha_used,
-                    "fusion_method": &config.search.fusion_method,
-                    "result_count": results.len(),
+                "candidates": candidates,
+                "episode_matches": episode_matches,
+                "alpha_used": alpha_used,
+                "fusion_method": &config.search.fusion_method,
+                "result_count": results.len(),
                 })),
             },
         );
@@ -1065,6 +1080,12 @@ fn collect_episode_memory_scores(
         for mem_id in &episode.memory_ids {
             let entry = memory_scores.entry(mem_id.clone()).or_insert(0.0_f32);
             *entry = entry.max(base_score);
+            if let Ok(memory) = store.get(mem_id) {
+                for related_id in &memory.related_ids {
+                    let related = memory_scores.entry(related_id.clone()).or_insert(0.0_f32);
+                    *related = related.max(base_score * 0.65);
+                }
+            }
         }
         for concept_id in &episode.concept_ids {
             if let Ok(Some(concept)) = store.get_concept_by_id(concept_id) {
