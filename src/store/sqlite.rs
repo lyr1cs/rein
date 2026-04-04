@@ -262,7 +262,10 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
         concept_ids,
         status,
         embedding: None,
-        tier: row.get::<_, String>("tier").unwrap_or_else(|_| "warm".to_string()),
+        tier: row.get::<_, String>("tier")
+            .unwrap_or_else(|_| "warm".to_string())
+            .parse()
+            .unwrap_or_default(),
         cluster_id: row.get::<_, Option<u32>>("cluster_id").unwrap_or(None),
         created_at,
         updated_at,
@@ -1041,7 +1044,7 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
-            tier: "warm".to_string(),
+            tier: MemoryTier::Warm,
             cluster_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1243,7 +1246,7 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
-            tier: "warm".to_string(),
+            tier: MemoryTier::Warm,
             cluster_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

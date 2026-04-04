@@ -30,7 +30,7 @@ fn make_memory(topic: &str, summary: &str, content: &str, importance: Importance
         concept_ids: vec![],
         status: MemoryStatus::default(),
         embedding: None,
-        tier: "warm".to_string(),
+        tier: MemoryTier::Warm,
         cluster_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

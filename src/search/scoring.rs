@@ -1,5 +1,5 @@
 use crate::search::survival::SurvivalCurve;
-use crate::types::Memory;
+use crate::types::{Memory, MemoryTier};
 
 /// Calculate current memory strength using Ebbinghaus forgetting curve.
 /// strength(t) = exp(-lambda_eff * days^beta)
@@ -78,7 +78,7 @@ mod tests {
             concept_ids: vec![],
             status: MemoryStatus::default(),
             embedding: None,
-            tier: "warm".to_string(),
+            tier: MemoryTier::Warm,
             cluster_id: None,
             created_at: Utc::now() - Duration::days(days_ago),
             updated_at: Utc::now(),
