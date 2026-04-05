@@ -7,13 +7,24 @@ use std::sync::OnceLock;
 pub fn looks_like_secret(line: &str) -> bool {
     let lower = line.to_lowercase();
     let patterns = [
-        "api_key=", "api-key=", "apikey=",
-        "token=", "secret=", "password=",
-        "authorization:", "bearer ",
-        "export gemini_api_key", "export supermemory",
-        "export rein_http_token", "export openai_api_key",
-        "sk-", "gho_", "ghp_", "sm_",
-        "-----begin", "-----end",
+        "api_key=",
+        "api-key=",
+        "apikey=",
+        "token=",
+        "secret=",
+        "password=",
+        "authorization:",
+        "bearer ",
+        "export gemini_api_key",
+        "export supermemory",
+        "export rein_http_token",
+        "export openai_api_key",
+        "sk-",
+        "gho_",
+        "ghp_",
+        "sm_",
+        "-----begin",
+        "-----end",
     ];
     patterns.iter().any(|p| lower.contains(p))
         || secret_redactors().iter().any(|pair| pair.0.is_match(line))
@@ -73,13 +84,21 @@ fn secret_redactors() -> &'static Vec<(Regex, &'static str)> {
 pub fn hook_agent_id(input: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(input)
         .ok()
-        .and_then(|json| json.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .and_then(|json| {
+            json.get("agent_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 pub fn hook_agent_type(input: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(input)
         .ok()
-        .and_then(|json| json.get("agent_type").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .and_then(|json| {
+            json.get("agent_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 pub fn is_subagent_hook(input: &str) -> bool {
@@ -178,7 +197,11 @@ pub fn extract_hook_text_for_llm(input: &str) -> String {
     input.to_string()
 }
 
-fn extract_transcript_text_with_limits(jsonl: &str, max_turns: usize, max_chars_per_turn: usize) -> String {
+fn extract_transcript_text_with_limits(
+    jsonl: &str,
+    max_turns: usize,
+    max_chars_per_turn: usize,
+) -> String {
     let mut turns = Vec::new();
     for line in jsonl.lines() {
         if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
@@ -192,13 +215,21 @@ fn extract_transcript_text_with_limits(jsonl: &str, max_turns: usize, max_chars_
                 extract_message_content(entry.get("content"))
             };
             if !content.is_empty() {
-                let prefix = if msg_type == "human" { "User" } else { "Assistant" };
+                let prefix = if msg_type == "human" {
+                    "User"
+                } else {
+                    "Assistant"
+                };
                 let truncated: String = content.chars().take(max_chars_per_turn).collect();
                 turns.push(format!("{}: {}", prefix, truncated));
             }
         }
     }
-    let start = if turns.len() > max_turns { turns.len() - max_turns } else { 0 };
+    let start = if turns.len() > max_turns {
+        turns.len() - max_turns
+    } else {
+        0
+    };
     turns[start..].join("\n\n")
 }
 
@@ -213,20 +244,21 @@ fn extract_transcript_text_for_llm(jsonl: &str) -> String {
 fn extract_message_content(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter()
-                .filter_map(|item| {
-                    if let Some(s) = item.as_str() {
-                        Some(s.to_string())
-                    } else if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| {
+                if let Some(s) = item.as_str() {
+                    Some(s.to_string())
+                } else if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    item.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
     }
 }
@@ -236,11 +268,16 @@ pub fn count_transcript_turns(input: &str) -> usize {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(input) {
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
             if let Ok(content) = std::fs::read_to_string(path) {
-                return content.lines()
+                return content
+                    .lines()
                     .filter(|line| {
                         serde_json::from_str::<serde_json::Value>(line)
                             .ok()
-                            .and_then(|e| e.get("type").and_then(|t| t.as_str()).map(|t| t == "human" || t == "assistant"))
+                            .and_then(|e| {
+                                e.get("type")
+                                    .and_then(|t| t.as_str())
+                                    .map(|t| t == "human" || t == "assistant")
+                            })
                             .unwrap_or(false)
                     })
                     .count();
@@ -286,7 +323,11 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
             if content.trim().is_empty() {
                 continue;
             }
-            let role = if msg_type == "human" { "User" } else { "Assistant" };
+            let role = if msg_type == "human" {
+                "User"
+            } else {
+                "Assistant"
+            };
             total_chars += content.len();
             turns.push(crate::types::SessionTurn {
                 role: role.to_string(),
@@ -350,8 +391,14 @@ mod tests {
 
     #[test]
     fn secret_detection_catches_known_token_formats() {
-        assert!(looks_like_secret("Authorization: Bearer sk-abcdefghijklmnopqrstuvwx1234567890"));
-        assert!(looks_like_secret("github_pat_abcdefghijklmnopqrstuvwxyz0123456789"));
-        assert!(!looks_like_secret("We chose PostgreSQL for the billing database."));
+        assert!(looks_like_secret(
+            "Authorization: Bearer sk-abcdefghijklmnopqrstuvwx1234567890"
+        ));
+        assert!(looks_like_secret(
+            "github_pat_abcdefghijklmnopqrstuvwxyz0123456789"
+        ));
+        assert!(!looks_like_secret(
+            "We chose PostgreSQL for the billing database."
+        ));
     }
 }

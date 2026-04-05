@@ -30,8 +30,14 @@ pub trait MemoryStore {
     fn get(&self, id: &str) -> ReinResult<Memory>;
     fn update(&self, memory: &Memory) -> ReinResult<()>;
     fn delete(&self, id: &str) -> ReinResult<()>;
-    fn search_fts(&self, query: &str, topic: Option<&str>, limit: usize) -> ReinResult<Vec<Memory>>;
-    fn search_vec(&self, embedding: &[f32], topic: Option<&str>, limit: usize) -> ReinResult<Vec<Memory>>;
+    fn search_fts(&self, query: &str, topic: Option<&str>, limit: usize)
+        -> ReinResult<Vec<Memory>>;
+    fn search_vec(
+        &self,
+        embedding: &[f32],
+        topic: Option<&str>,
+        limit: usize,
+    ) -> ReinResult<Vec<Memory>>;
     fn apply_decay(&self) -> ReinResult<u64>;
     fn prune(&self, threshold: f64) -> ReinResult<u64>;
     fn list_topics(&self) -> ReinResult<Vec<String>>;

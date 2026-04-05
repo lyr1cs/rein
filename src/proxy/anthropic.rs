@@ -129,5 +129,4 @@ mod tests {
         let chunk = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
         assert_eq!(extract_assistant_text_sse(chunk), None);
     }
-
 }

@@ -30,15 +30,26 @@ pub fn convex_combination(
     // Normalize each list to [0,1] using min-max normalization.
     // Singleton lists get score 1.0 (not 0.0) to preserve their contribution.
     fn normalize(results: &[(String, f32)]) -> Vec<(String, f32)> {
-        if results.is_empty() { return vec![]; }
-        let max = results.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
-        let min = results.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+        if results.is_empty() {
+            return vec![];
+        }
+        let max = results
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min = results
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f32::INFINITY, f32::min);
         let range = max - min;
         if range < 1e-6 {
             // All scores equal (including singleton) → assign 1.0 to all
             return results.iter().map(|(id, _)| (id.clone(), 1.0)).collect();
         }
-        results.iter().map(|(id, s)| (id.clone(), (s - min) / range)).collect()
+        results
+            .iter()
+            .map(|(id, s)| (id.clone(), (s - min) / range))
+            .collect()
     }
 
     let fts_norm = normalize(fts_results);
@@ -83,14 +94,8 @@ mod tests {
 
     #[test]
     fn test_rrf_two_lists() {
-        let list1 = vec![
-            ("a".to_string(), 10.0),
-            ("b".to_string(), 5.0),
-        ];
-        let list2 = vec![
-            ("a".to_string(), 8.0),
-            ("c".to_string(), 3.0),
-        ];
+        let list1 = vec![("a".to_string(), 10.0), ("b".to_string(), 5.0)];
+        let list2 = vec![("a".to_string(), 8.0), ("c".to_string(), 3.0)];
         let k = 60.0;
         let result = reciprocal_rank_fusion(&[(list1, 1.0), (list2, 1.0)], k);
 
@@ -99,8 +104,14 @@ mod tests {
         let b_score = result.iter().find(|(id, _)| id == "b").unwrap().1;
         let c_score = result.iter().find(|(id, _)| id == "c").unwrap().1;
 
-        assert!(a_score > b_score, "a in both lists should score higher than b in one");
-        assert!(a_score > c_score, "a in both lists should score higher than c in one");
+        assert!(
+            a_score > b_score,
+            "a in both lists should score higher than b in one"
+        );
+        assert!(
+            a_score > c_score,
+            "a in both lists should score higher than c in one"
+        );
         assert!((a_score - 2.0 / 61.0).abs() < 1e-6);
     }
 
@@ -124,14 +135,8 @@ mod tests {
 
     #[test]
     fn test_cc_basic() {
-        let fts = vec![
-            ("a".to_string(), 10.0),
-            ("b".to_string(), 5.0),
-        ];
-        let vec = vec![
-            ("a".to_string(), 8.0),
-            ("c".to_string(), 6.0),
-        ];
+        let fts = vec![("a".to_string(), 10.0), ("b".to_string(), 5.0)];
+        let vec = vec![("a".to_string(), 8.0), ("c".to_string(), 6.0)];
         let result = convex_combination(&fts, &vec, 0.5);
 
         // "a" appears in both with high scores → should be #1
@@ -149,7 +154,10 @@ mod tests {
         let result = convex_combination(&fts, &vec, 0.9);
         let x_score = result.iter().find(|(id, _)| id == "x").unwrap().1;
         let y_score = result.iter().find(|(id, _)| id == "y").unwrap().1;
-        assert!(x_score > y_score, "alpha=0.9 should favor FTS (x={x_score}) over vec (y={y_score})");
+        assert!(
+            x_score > y_score,
+            "alpha=0.9 should favor FTS (x={x_score}) over vec (y={y_score})"
+        );
     }
 
     #[test]

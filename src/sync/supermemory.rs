@@ -62,54 +62,63 @@ impl SupermemoryClient {
                 // - "chunk" field (from document chunks, Notion sync etc.)
                 // - both in some cases
 
-                let (content, summary) = if let Some(memory_text) = item.get("memory").and_then(|v| v.as_str()) {
-                    // Memory entry (from Claude Code plugin conversations)
-                    (memory_text.to_string(), memory_text.chars().take(100).collect::<String>())
-                } else if let Some(chunk_text) = item.get("chunk").and_then(|v| v.as_str()) {
-                    // Document chunk (from Notion sync / uploaded files)
-                    let title = item.get("documents")
-                        .and_then(|d| d.as_array())
-                        .and_then(|docs| docs.first())
-                        .and_then(|doc| doc.get("title"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    let summary = if title.is_empty() {
-                        chunk_text.chars().take(100).collect()
+                let (content, summary) =
+                    if let Some(memory_text) = item.get("memory").and_then(|v| v.as_str()) {
+                        // Memory entry (from Claude Code plugin conversations)
+                        (
+                            memory_text.to_string(),
+                            memory_text.chars().take(100).collect::<String>(),
+                        )
+                    } else if let Some(chunk_text) = item.get("chunk").and_then(|v| v.as_str()) {
+                        // Document chunk (from Notion sync / uploaded files)
+                        let title = item
+                            .get("documents")
+                            .and_then(|d| d.as_array())
+                            .and_then(|docs| docs.first())
+                            .and_then(|doc| doc.get("title"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let summary = if title.is_empty() {
+                            chunk_text.chars().take(100).collect()
+                        } else {
+                            title.to_string()
+                        };
+                        (chunk_text.to_string(), summary)
                     } else {
-                        title.to_string()
+                        // Try legacy format: chunks array
+                        let chunk_content = item
+                            .get("chunks")
+                            .and_then(|c| c.as_array())
+                            .map(|chunks| {
+                                chunks
+                                    .iter()
+                                    .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n")
+                            })
+                            .unwrap_or_default();
+                        if chunk_content.is_empty() {
+                            return None;
+                        }
+                        let title = item
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let summary = if title.is_empty() {
+                            chunk_content.chars().take(100).collect()
+                        } else {
+                            title
+                        };
+                        (chunk_content, summary)
                     };
-                    (chunk_text.to_string(), summary)
-                } else {
-                    // Try legacy format: chunks array
-                    let chunk_content = item.get("chunks")
-                        .and_then(|c| c.as_array())
-                        .map(|chunks| {
-                            chunks.iter()
-                                .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
-                                .collect::<Vec<_>>()
-                                .join("\n\n")
-                        })
-                        .unwrap_or_default();
-                    if chunk_content.is_empty() {
-                        return None;
-                    }
-                    let title = item.get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let summary = if title.is_empty() {
-                        chunk_content.chars().take(100).collect()
-                    } else {
-                        title
-                    };
-                    (chunk_content, summary)
-                };
 
                 if content.is_empty() {
                     return None;
                 }
 
-                let base_id = item.get("id")
+                let base_id = item
+                    .get("id")
                     .or_else(|| item.get("documentId"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
@@ -117,14 +126,16 @@ impl SupermemoryClient {
 
                 // Extract original timestamps from API response (preserve temporal accuracy)
                 let now = chrono::Utc::now();
-                let created_at = item.get("createdAt")
+                let created_at = item
+                    .get("createdAt")
                     .or_else(|| item.get("created_at"))
                     .or_else(|| item.get("timestamp"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or(now);
-                let updated_at = item.get("updatedAt")
+                let updated_at = item
+                    .get("updatedAt")
                     .or_else(|| item.get("updated_at"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -144,6 +155,12 @@ impl SupermemoryClient {
                     decay_lambda: 0.0,
                     access_count: 0,
                     superseded_by: None,
+                    canonical_id: None,
+                    support_count: 1,
+                    merge_count: 0,
+                    dedup_confidence: 1.0,
+                    source_diversity: 1.0,
+                    contradiction_score: 0.0,
                     related_ids: vec![],
                     concept_ids: vec![],
                     status: MemoryStatus::default(),
@@ -171,9 +188,7 @@ mod tests {
         //   let id = format!("sm:{base_id}:{idx}");
         // where base_id comes from the result and idx is the enumeration index.
         let base_id = "doc123";
-        let ids: Vec<String> = (0..5)
-            .map(|idx| format!("sm:{base_id}:{idx}"))
-            .collect();
+        let ids: Vec<String> = (0..5).map(|idx| format!("sm:{base_id}:{idx}")).collect();
 
         // All IDs must be unique
         let unique: std::collections::HashSet<&String> = ids.iter().collect();

@@ -137,16 +137,13 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
                 let client = client.clone();
                 let auth = auth.clone();
                 let state = Arc::clone(&state);
-                async move {
-                    handle_request(req, config, client, auth.as_deref(), state).await
-                }
+                async move { handle_request(req, config, client, auth.as_deref(), state).await }
             });
 
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
-            .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
+                    .await
             {
                 tracing::warn!("proxy connection error: {e}");
             }
@@ -451,8 +448,16 @@ async fn handle_request(
         .unwrap_or(false);
 
     if is_streaming {
-        stream_response(upstream_resp, status, &resp_headers, &config, &provider, query, &state)
-            .await
+        stream_response(
+            upstream_resp,
+            status,
+            &resp_headers,
+            &config,
+            &provider,
+            query,
+            &state,
+        )
+        .await
     } else {
         // Large response streaming: if Content-Length exceeds max_response_buffer,
         // stream directly without buffering/extraction.
@@ -467,7 +472,13 @@ async fn handle_request(
                 "response too large ({content_length} bytes), streaming without extraction"
             );
             return stream_response(
-                upstream_resp, status, &resp_headers, &config, &provider, query, &state,
+                upstream_resp,
+                status,
+                &resp_headers,
+                &config,
+                &provider,
+                query,
+                &state,
             )
             .await;
         }
@@ -568,8 +579,7 @@ async fn stream_response(
                                 // Process only complete lines (ending with \n).
                                 while let Some(newline_pos) = sse_line_buf.find('\n') {
                                     let line = sse_line_buf[..newline_pos].to_string();
-                                    sse_line_buf =
-                                        sse_line_buf[newline_pos + 1..].to_string();
+                                    sse_line_buf = sse_line_buf[newline_pos + 1..].to_string();
                                     if let Some(extracted) =
                                         provider_clone.extract_assistant_text_sse(line.as_bytes())
                                     {
@@ -697,10 +707,7 @@ async fn forward_raw(
     }
 }
 
-fn extract_query_for_recording(
-    provider: &ProviderKind,
-    body_bytes: &[u8],
-) -> Option<String> {
+fn extract_query_for_recording(provider: &ProviderKind, body_bytes: &[u8]) -> Option<String> {
     let body: serde_json::Value = serde_json::from_slice(body_bytes).ok()?;
     let query = provider.extract_query(&body);
     let query = query.trim();
@@ -739,7 +746,8 @@ async fn handle_websocket_proxy(
         _ => return Ok(error_response(400, "missing sec-websocket-key")),
     };
 
-    let upstream = match connect_upstream_websocket(config, provider, path_and_query, headers).await {
+    let upstream = match connect_upstream_websocket(config, provider, path_and_query, headers).await
+    {
         Ok(upstream) => upstream,
         Err(e) => {
             tracing::warn!("websocket upstream connect failed: {e}");
@@ -819,7 +827,10 @@ async fn connect_upstream_websocket(
     let mut request = format!(
         "GET {rewritten_path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
     );
-    if let Some(key) = headers.get("sec-websocket-key").and_then(|v| v.to_str().ok()) {
+    if let Some(key) = headers
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+    {
         request.push_str(&format!("Sec-WebSocket-Key: {key}\r\n"));
     }
     for (name, value) in headers.iter() {
@@ -981,9 +992,8 @@ mod tests {
 
     fn fake_jwt_with_scopes(scopes: &[&str]) -> String {
         let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-        let payload = BASE64_URL_SAFE_NO_PAD.encode(
-            serde_json::json!({ "scp": scopes }).to_string().as_bytes(),
-        );
+        let payload = BASE64_URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "scp": scopes }).to_string().as_bytes());
         format!("{header}.{payload}.sig")
     }
 

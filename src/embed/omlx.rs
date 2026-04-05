@@ -50,12 +50,13 @@ impl Embedder for OmlxEmbedder {
         if !status.is_success() {
             let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "OMLX API returned {}: {truncated}", status
+                "OMLX API returned {}: {truncated}",
+                status
             )));
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Embedding(e.to_string()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Embedding(e.to_string()))?;
 
         let values = parsed["data"][0]["embedding"]
             .as_array()
@@ -68,7 +69,9 @@ impl Embedder for OmlxEmbedder {
 
         if embedding.len() != self.dimensions {
             return Err(ReinError::Embedding(format!(
-                "dimension mismatch: expected {}, got {}", self.dimensions, embedding.len()
+                "dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                embedding.len()
             )));
         }
 
@@ -89,12 +92,13 @@ impl Embedder for OmlxEmbedder {
         if !status.is_success() {
             let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "OMLX batch API returned {}: {truncated}", status
+                "OMLX batch API returned {}: {truncated}",
+                status
             )));
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Embedding(e.to_string()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Embedding(e.to_string()))?;
 
         let data = parsed["data"]
             .as_array()
@@ -112,7 +116,9 @@ impl Embedder for OmlxEmbedder {
 
             if embedding.len() != self.dimensions {
                 return Err(ReinError::Embedding(format!(
-                    "dimension mismatch: expected {}, got {}", self.dimensions, embedding.len()
+                    "dimension mismatch: expected {}, got {}",
+                    self.dimensions,
+                    embedding.len()
                 )));
             }
 

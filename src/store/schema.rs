@@ -81,6 +81,24 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             DELETE FROM memories_fts WHERE id = old.id;
         END;
 
+        CREATE TABLE IF NOT EXISTS memory_canonical_state (
+            memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+            canonical_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+            support_count INTEGER NOT NULL DEFAULT 1,
+            merge_count INTEGER NOT NULL DEFAULT 0,
+            dedup_confidence REAL NOT NULL DEFAULT 1.0,
+            source_diversity REAL NOT NULL DEFAULT 1.0,
+            contradiction_score REAL NOT NULL DEFAULT 0.0,
+            last_merged_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_canonical ON memory_canonical_state(canonical_id);
+
+        CREATE TRIGGER IF NOT EXISTS memories_canonical_ai AFTER INSERT ON memories BEGIN
+            INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id)
+            VALUES (new.id, new.id);
+        END;
+
         CREATE TABLE IF NOT EXISTS embed_cache (
             query_hash TEXT PRIMARY KEY,
             embedding BLOB,
@@ -91,6 +109,43 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS memory_evidence (
+            id TEXT PRIMARY KEY,
+            canonical_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            memory_id TEXT,
+            source_topic TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            content TEXT NOT NULL,
+            keywords TEXT NOT NULL DEFAULT '[]',
+            source TEXT NOT NULL CHECK(source IN ('manual', 'hook', 'migration', 'supermemory', 'proxy')),
+            created_at TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_evidence_canonical ON memory_evidence(canonical_id, imported_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_evidence_memory_id ON memory_evidence(memory_id);
+
+        CREATE TABLE IF NOT EXISTS dedup_decisions (
+            id TEXT PRIMARY KEY,
+            winner_id TEXT,
+            loser_id TEXT,
+            canonical_id TEXT,
+            lexical_score REAL,
+            embedding_score REAL,
+            relation TEXT NOT NULL CHECK(relation IN ('duplicate', 'update', 'related', 'distinct')),
+            confidence REAL NOT NULL DEFAULT 0.0,
+            reason TEXT NOT NULL,
+            operator TEXT NOT NULL DEFAULT 'auto',
+            reversible INTEGER NOT NULL DEFAULT 1,
+            merged_summary TEXT,
+            novel_facts TEXT NOT NULL DEFAULT '[]',
+            conflict_detected INTEGER NOT NULL DEFAULT 0,
+            payload TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dedup_decisions_canonical ON dedup_decisions(canonical_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_dedup_decisions_winner ON dedup_decisions(winner_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_dedup_decisions_loser ON dedup_decisions(loser_id, created_at DESC);
 
         CREATE TABLE IF NOT EXISTS memoirs (
             id TEXT PRIMARY KEY,
@@ -162,58 +217,88 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     conn.execute_batch(&vec_sql)?;
 
     // Migrate: add status column if missing (for existing databases)
-    let has_status: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='status'",
-        [],
-        |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_status: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='status'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_status {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")?;
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        )?;
     }
 
     // Migrate: add concept_ids to memories if missing
-    let has_concept_ids: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='concept_ids'",
-        [],
-        |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_concept_ids: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='concept_ids'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_concept_ids {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN concept_ids TEXT NOT NULL DEFAULT '[]'").ok();
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN concept_ids TEXT NOT NULL DEFAULT '[]'",
+        )
+        .ok();
     }
 
     // Migrate: add source_memory_ids to concepts if missing
-    let has_source_memory_ids: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='source_memory_ids'",
-        [],
-        |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_source_memory_ids: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='source_memory_ids'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_source_memory_ids {
-        conn.execute_batch("ALTER TABLE concepts ADD COLUMN source_memory_ids TEXT NOT NULL DEFAULT '[]'").ok();
+        conn.execute_batch(
+            "ALTER TABLE concepts ADD COLUMN source_memory_ids TEXT NOT NULL DEFAULT '[]'",
+        )
+        .ok();
     }
 
     // Migrate: add temporal fields to concept_links
-    let has_valid_from: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('concept_links') WHERE name='valid_from'",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_valid_from: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('concept_links') WHERE name='valid_from'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_valid_from {
         conn.execute_batch("ALTER TABLE concept_links ADD COLUMN valid_from TEXT")?;
         conn.execute_batch("ALTER TABLE concept_links ADD COLUMN valid_until TEXT")?;
         // Backfill: existing links get valid_from = created_at
-        conn.execute_batch("UPDATE concept_links SET valid_from = created_at WHERE valid_from IS NULL").ok();
+        conn.execute_batch(
+            "UPDATE concept_links SET valid_from = created_at WHERE valid_from IS NULL",
+        )
+        .ok();
     }
 
     // Migrate: add last_episode_id to concepts
-    let has_episode_id: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='last_episode_id'",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_episode_id: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='last_episode_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_episode_id {
-        conn.execute_batch("ALTER TABLE concepts ADD COLUMN last_episode_id TEXT").ok();
+        conn.execute_batch("ALTER TABLE concepts ADD COLUMN last_episode_id TEXT")
+            .ok();
     }
 
     // Create concept_revisions table (revision history)
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS concept_revisions (
             id TEXT PRIMARY KEY,
             concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
@@ -227,10 +312,12 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_revisions_concept ON concept_revisions(concept_id);
         CREATE INDEX IF NOT EXISTS idx_revisions_created ON concept_revisions(created_at);
-    ")?;
+    ",
+    )?;
 
     // Create episodes table (session nodes in temporal graph)
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS episodes (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -248,7 +335,8 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at);
         CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id);
-    ")?;
+    ",
+    )?;
 
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS session_artifacts (
@@ -275,12 +363,14 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     ")?;
 
     // Index for temporal concept queries
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_concepts_updated ON concepts(updated_at)").ok();
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_concepts_updated ON concepts(updated_at)")
+        .ok();
 
     // === Adaptive Engine tables (v0.5.0) ===
 
     // M1: Feedback event log (append-only event sourcing)
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS feedback_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -296,53 +386,76 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         CREATE INDEX IF NOT EXISTS idx_fe_ts ON feedback_events(ts);
         CREATE INDEX IF NOT EXISTS idx_fe_type ON feedback_events(event_type);
         CREATE INDEX IF NOT EXISTS idx_fe_request ON feedback_events(request_id);
-    ")?;
+    ",
+    )?;
 
     // M1: Per-consumer offset tracking (each module tracks its own read position)
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS consumer_offsets (
             consumer TEXT PRIMARY KEY,
             last_event_id INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
-    ")?;
+    ",
+    )?;
 
     // M5: Cold archive for compressed cold-tier memories
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS cold_archive (
             memory_id TEXT PRIMARY KEY,
             content TEXT NOT NULL,
             archived_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
-    ")?;
+    ",
+    )?;
 
     // M5: Migrate: add tier column to memories
-    let has_tier: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='tier'",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_tier: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='tier'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_tier {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'warm'").ok();
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'warm'")
+            .ok();
     }
 
     // M4: Migrate: add cluster_id column to memories
-    let has_cluster_id: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='cluster_id'",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_cluster_id: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='cluster_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_cluster_id {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN cluster_id INTEGER").ok();
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN cluster_id INTEGER")
+            .ok();
     }
 
     // Migrate: add needs_vec_dedup flag for deferred embedding-based dedup
-    let has_nvd: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='needs_vec_dedup'",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_nvd: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='needs_vec_dedup'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     if !has_nvd {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN needs_vec_dedup INTEGER NOT NULL DEFAULT 0").ok();
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN needs_vec_dedup INTEGER NOT NULL DEFAULT 0",
+        )
+        .ok();
         // Backfill: mark all existing active memories for vec dedup sweep
-        conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'").ok();
+        conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'")
+            .ok();
     }
 
     migrate_episode_columns(conn)?;
@@ -350,13 +463,23 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     // Migrate: widen source CHECK to include 'proxy' (v0.9.4)
     // SQLite doesn't support ALTER CHECK, so we recreate the table if needed.
     // Skip for in-memory databases (fresh schema already includes 'proxy').
-    let is_memory_db = conn.path().map(|p| p == ":memory:" || p.is_empty()).unwrap_or(true);
+    let is_memory_db = conn
+        .path()
+        .map(|p| p == ":memory:" || p.is_empty())
+        .unwrap_or(true);
     if !is_memory_db {
         migrate_source_check(conn)?;
     }
 
     // Migrate FTS tokenizer from porter to unicode61 (for CJK support)
     migrate_fts_tokenizer(conn)?;
+
+    // Backfill canonical state for databases created before the trigger existed.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id)
+         SELECT id, id FROM memories;",
+    )
+    .ok();
 
     Ok(())
 }
@@ -400,7 +523,10 @@ fn migrate_episode_columns(conn: &Connection) -> ReinResult<()> {
         "source_session_id",
         "ALTER TABLE episodes ADD COLUMN source_session_id TEXT",
     );
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id)").ok();
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id)",
+    )
+    .ok();
 
     Ok(())
 }
@@ -475,8 +601,10 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
              needs_vec_dedup INTEGER NOT NULL DEFAULT 0 \
          );"
     ).map_err(crate::types::ReinError::Database)?;
-    conn.execute_batch(insert_sql).map_err(crate::types::ReinError::Database)?;
-    conn.execute_batch("DROP TABLE memories_old;").map_err(crate::types::ReinError::Database)?;
+    conn.execute_batch(insert_sql)
+        .map_err(crate::types::ReinError::Database)?;
+    conn.execute_batch("DROP TABLE memories_old;")
+        .map_err(crate::types::ReinError::Database)?;
 
     // Recreate indexes destroyed by table rename/drop
     conn.execute_batch(
@@ -485,8 +613,9 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
          CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance); \
          CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength); \
          CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at); \
-         CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed);"
-    ).map_err(crate::types::ReinError::Database)?;
+         CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed);",
+    )
+    .map_err(crate::types::ReinError::Database)?;
 
     // Recreate FTS triggers destroyed by table rename (they reference the old table)
     conn.execute_batch(
@@ -504,8 +633,9 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
          END; \
          CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN \
             DELETE FROM memories_fts WHERE id = old.id; \
-         END;"
-    ).map_err(crate::types::ReinError::Database)?;
+         END;",
+    )
+    .map_err(crate::types::ReinError::Database)?;
 
     tracing::info!("migrated source CHECK to include 'proxy'");
     Ok(())
@@ -536,18 +666,23 @@ fn migrate_fts_tokenizer(conn: &Connection) -> ReinResult<()> {
                 "CREATE VIRTUAL TABLE memories_fts USING fts5(
                     id, topic, summary, content, keywords,
                     tokenize='unicode61'
-                );"
+                );",
             )?;
             conn.execute_batch(
                 "INSERT INTO memories_fts(id, topic, summary, content, keywords)
-                 SELECT id, topic, summary, content, keywords FROM memories;"
+                 SELECT id, topic, summary, content, keywords FROM memories;",
             )?;
 
             let concepts_needs_rebuild: bool = conn
                 .query_row(
                     "SELECT sql FROM sqlite_master WHERE name = 'concepts_fts'",
-                    [], |row| { let sql: String = row.get(0)?; Ok(sql.contains("porter")) },
-                ).unwrap_or(false);
+                    [],
+                    |row| {
+                        let sql: String = row.get(0)?;
+                        Ok(sql.contains("porter"))
+                    },
+                )
+                .unwrap_or(false);
 
             if concepts_needs_rebuild {
                 conn.execute_batch("DROP TABLE IF EXISTS concepts_fts;")?;
@@ -555,18 +690,23 @@ fn migrate_fts_tokenizer(conn: &Connection) -> ReinResult<()> {
                     "CREATE VIRTUAL TABLE concepts_fts USING fts5(
                         id, name, definition, labels,
                         tokenize='unicode61'
-                    );"
+                    );",
                 )?;
                 conn.execute_batch(
                     "INSERT INTO concepts_fts(id, name, definition, labels)
-                     SELECT id, name, definition, labels FROM concepts;"
+                     SELECT id, name, definition, labels FROM concepts;",
                 )?;
             }
             Ok(())
         })();
         match result {
-            Ok(()) => { conn.execute_batch("COMMIT")?; }
-            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
 
         tracing::info!("FTS index rebuilt with unicode61");
@@ -578,11 +718,7 @@ fn migrate_fts_tokenizer(conn: &Connection) -> ReinResult<()> {
 /// Check if the embedding model has changed since last run.
 /// Returns true if model changed (requiring re-embedding).
 /// Stores current model info in metadata for next startup.
-pub fn check_embedding_model(
-    conn: &Connection,
-    model: &str,
-    dims: usize,
-) -> ReinResult<bool> {
+pub fn check_embedding_model(conn: &Connection, model: &str, dims: usize) -> ReinResult<bool> {
     let stored_model: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key = 'embedding_model'",

@@ -40,10 +40,7 @@ fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
 }
 
 /// Multi-factor admission score (A-MAC 2026 inspired).
-fn multi_factor_admission_score(
-    store: &crate::store::SqliteStore,
-    item: &ExtractedMemory,
-) -> f64 {
+fn multi_factor_admission_score(store: &crate::store::SqliteStore, item: &ExtractedMemory) -> f64 {
     let llm_conf = item.quality_confidence;
 
     let novelty = {
@@ -51,7 +48,8 @@ fn multi_factor_admission_score(
         if existing.is_empty() {
             1.0
         } else {
-            let max_sim = existing.iter()
+            let max_sim = existing
+                .iter()
                 .map(|m| crate::extract::similarity(&item.content, &m.content))
                 .fold(0.0_f32, f32::max);
             (1.0 - max_sim as f64).max(0.0)
@@ -60,9 +58,15 @@ fn multi_factor_admission_score(
 
     let type_prior = {
         let t = item.topic.to_lowercase();
-        if ["architecture", "decision", "design"].iter().any(|k| t.contains(k)) {
+        if ["architecture", "decision", "design"]
+            .iter()
+            .any(|k| t.contains(k))
+        {
             0.9
-        } else if ["workflow", "deployment", "config"].iter().any(|k| t.contains(k)) {
+        } else if ["workflow", "deployment", "config"]
+            .iter()
+            .any(|k| t.contains(k))
+        {
             0.7
         } else if ["debug", "error", "fix"].iter().any(|k| t.contains(k)) {
             0.5
@@ -102,7 +106,11 @@ pub fn store_extracted_report(
 ) -> StoreExtractedStats {
     for item in &mut items {
         crate::extract::postprocess::postprocess(item);
-        if !item.keywords.iter().any(|k| k == &format!("agent:{agent_label}")) {
+        if !item
+            .keywords
+            .iter()
+            .any(|k| k == &format!("agent:{agent_label}"))
+        {
             item.keywords.push(format!("agent:{agent_label}"));
         }
         if is_subagent && !item.keywords.iter().any(|k| k == "source:subagent") {
@@ -131,7 +139,9 @@ pub fn store_extracted_report(
         }
 
         let content_for_activation = item.content.clone();
-        let importance = item.importance.parse::<crate::types::Importance>()
+        let importance = item
+            .importance
+            .parse::<crate::types::Importance>()
             .unwrap_or(crate::types::Importance::Medium);
         let proposed_id = ulid::Ulid::new().to_string();
         let memory = crate::types::Memory {
@@ -147,6 +157,12 @@ pub fn store_extracted_report(
             decay_lambda: config.decay.base_lambda * importance.decay_factor(),
             access_count: 0,
             superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: item.quality_confidence as f32,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
             related_ids: vec![],
             concept_ids: vec![],
             status: crate::types::MemoryStatus::default(),
@@ -202,8 +218,22 @@ pub fn process_quick_extraction(
     let store = config.open_store()?;
     let extracted_for_ws = extracted.clone();
     let (stored, _ids) = store_extracted(&store, config, extracted, agent_label, is_subagent);
-    let _ = update_working_set(config, &extracted_for_ws, &[], None, agent_label, is_subagent);
-    let _ = update_always_on_index(config, &extracted_for_ws, &[], None, agent_label, is_subagent);
+    let _ = update_working_set(
+        config,
+        &extracted_for_ws,
+        &[],
+        None,
+        agent_label,
+        is_subagent,
+    );
+    let _ = update_always_on_index(
+        config,
+        &extracted_for_ws,
+        &[],
+        None,
+        agent_label,
+        is_subagent,
+    );
     Ok(stored)
 }
 
@@ -224,15 +254,37 @@ pub fn process_full_extraction(
     let episode_for_ws = result.episode.clone();
     let memories_for_ws = result.memories.clone();
     let concepts_for_ws = result.concepts.clone();
-    let (mem_count, memory_ids) = store_extracted(&store, config, result.memories, agent_label, is_subagent);
-    let _ = update_working_set(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref(), agent_label, is_subagent);
-    let _ = update_always_on_index(config, &memories_for_ws, &concepts_for_ws, episode_for_ws.as_ref(), agent_label, is_subagent);
-    let kg_report = store.store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
+    let (mem_count, memory_ids) =
+        store_extracted(&store, config, result.memories, agent_label, is_subagent);
+    let _ = update_working_set(
+        config,
+        &memories_for_ws,
+        &concepts_for_ws,
+        episode_for_ws.as_ref(),
+        agent_label,
+        is_subagent,
+    );
+    let _ = update_always_on_index(
+        config,
+        &memories_for_ws,
+        &concepts_for_ws,
+        episode_for_ws.as_ref(),
+        agent_label,
+        is_subagent,
+    );
+    let kg_report = store
+        .store_knowledge_units_with_sources(&result.concepts, &result.links, &memory_ids)
         .unwrap_or_default();
 
-    let session_concept_ids: Vec<String> = result.concepts.iter()
+    let session_concept_ids: Vec<String> = result
+        .concepts
+        .iter()
         .filter_map(|c| {
-            store.get_concept(&c.memoir, &c.name).ok().flatten().map(|con| con.id)
+            store
+                .get_concept(&c.memoir, &c.name)
+                .ok()
+                .flatten()
+                .map(|con| con.id)
         })
         .collect();
 

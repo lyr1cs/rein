@@ -109,16 +109,45 @@ pub struct HealthParams {
 /// Parameters for rein_consolidate tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConsolidateParams {
-    /// The topic to consolidate.
-    pub topic: String,
-    /// Summary for the consolidated memory.
-    pub summary: String,
+    /// Single topic to consolidate.
+    pub topic: Option<String>,
+    /// Optional comma-separated topic list to consolidate.
+    pub topics: Option<Vec<String>>,
+    /// Optional glob pattern for matching topics.
+    pub pattern: Option<String>,
+    /// If true, process all topics.
+    pub all: Option<bool>,
+    /// Group case/space/hyphen topic variants before consolidating.
+    pub merge_variants: Option<bool>,
+    /// Summary text or template. Supports {topic}, {count}, {topics}. If omitted, rein auto-generates one.
+    pub summary: Option<String>,
+    /// If true, only preview matched groups without writing.
+    pub dry_run: Option<bool>,
 }
 
 /// Parameters for rein_dedup tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DedupParams {
     /// If true, only report duplicates without removing them.
+    pub dry_run: Option<bool>,
+    /// If true, deduplicate across normalized topic variants instead of exact-topic only.
+    pub merge_variants: Option<bool>,
+}
+
+/// Parameters for rein_cleanup tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CleanupParams {
+    /// Optional single topic to clean.
+    pub topic: Option<String>,
+    /// Optional topic list to clean.
+    pub topics: Option<Vec<String>>,
+    /// Optional glob pattern for matching topics.
+    pub pattern: Option<String>,
+    /// If true, process all topics.
+    pub all: Option<bool>,
+    /// If true, keep exact topic boundaries instead of grouping variants.
+    pub exact_topics: Option<bool>,
+    /// If true, only preview matched groups without writing.
     pub dry_run: Option<bool>,
 }
 

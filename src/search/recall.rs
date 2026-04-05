@@ -16,6 +16,61 @@ pub struct RecallResult {
     pub sources_hit: usize,
 }
 
+fn collapse_results_to_canonicals(
+    store: &SqliteStore,
+    results: Vec<RecallResult>,
+) -> ReinResult<Vec<RecallResult>> {
+    let mut ordered_ids = Vec::new();
+    let mut meta: std::collections::HashMap<String, (f32, f32, usize)> =
+        std::collections::HashMap::new();
+    let mut fallback: std::collections::HashMap<String, Memory> = std::collections::HashMap::new();
+    let mut passthrough = Vec::new();
+
+    for result in results {
+        if result.memory.id.starts_with("sm:") || result.memory.id.starts_with("auto:") {
+            passthrough.push(result);
+            continue;
+        }
+        let canonical_id = store.canonical_id_for(&result.memory.id)?;
+        if !meta.contains_key(&canonical_id) {
+            ordered_ids.push(canonical_id.clone());
+        }
+        meta.entry(canonical_id.clone())
+            .and_modify(|entry| {
+                entry.0 = entry.0.max(result.score);
+                entry.1 = entry.1.max(result.confidence);
+                entry.2 = entry.2.max(result.sources_hit);
+            })
+            .or_insert((result.score, result.confidence, result.sources_hit));
+        fallback.entry(canonical_id).or_insert(result.memory);
+    }
+
+    let mut canonical_map: std::collections::HashMap<String, Memory> = store
+        .get_batch(&ordered_ids)
+        .into_iter()
+        .map(|memory| (memory.id.clone(), memory))
+        .collect();
+
+    let mut collapsed = Vec::new();
+    for canonical_id in ordered_ids {
+        if let Some((score, confidence, sources_hit)) = meta.remove(&canonical_id) {
+            if let Some(memory) = canonical_map
+                .remove(&canonical_id)
+                .or_else(|| fallback.remove(&canonical_id))
+            {
+                collapsed.push(RecallResult {
+                    memory,
+                    score,
+                    confidence,
+                    sources_hit,
+                });
+            }
+        }
+    }
+    collapsed.extend(passthrough);
+    Ok(collapsed)
+}
+
 /// Full recall pipeline: waterfall search + optional cross-validation.
 ///
 /// This is sync-safe: embedding uses reqwest::blocking if needed.
@@ -758,6 +813,7 @@ pub fn recall_temporal_with_request_id(
             sources_hit: v.sources_hit,
         })
         .collect();
+    results = collapse_results_to_canonicals(store, results)?;
 
     results.sort_by(|a, b| {
         b.score
@@ -879,7 +935,10 @@ fn try_vector_search(
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(embedder.embed(query))),
         Err(_) => {
             // No tokio runtime — create a temporary one
-            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt.block_on(embedder.embed(query)),
                 Err(_) => return vec![],
             }
@@ -1057,10 +1116,7 @@ fn try_tantivy_then_fts5(
                         if seen_ids.insert(mem_id.clone()) {
                             // Preserve original score for CC fusion; use rank for RRF
                             // Score is Tantivy BM25 relevance (positive float)
-                            ranked.push((
-                                mem_id,
-                                if score > 0.0 { score } else { -(i as f32) },
-                            ));
+                            ranked.push((mem_id, if score > 0.0 { score } else { -(i as f32) }));
                             memories.push(m);
                         }
                     }

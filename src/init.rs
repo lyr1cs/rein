@@ -102,10 +102,7 @@ fn configure_json_client(path: &Path) -> anyhow::Result<()> {
 
 /// Expected proxy aliases and their correct values.
 const PROXY_ALIASES: &[(&str, &str)] = &[
-    (
-        "rein-proxy",
-        r#"alias rein-proxy="rein serve --proxy &""#,
-    ),
+    ("rein-proxy", r#"alias rein-proxy="rein serve --proxy &""#),
     (
         "claudep",
         r#"alias claudep="REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude""#,

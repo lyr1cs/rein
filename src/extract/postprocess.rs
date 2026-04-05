@@ -144,7 +144,11 @@ fn extract_nearby_year(s: &str) -> Option<u32> {
 
 /// Get current year as fallback for informal dates without year.
 fn current_year() -> u32 {
-    chrono::Utc::now().format("%Y").to_string().parse().unwrap_or(2026)
+    chrono::Utc::now()
+        .format("%Y")
+        .to_string()
+        .parse()
+        .unwrap_or(2026)
 }
 
 /// Detect if content expresses a user preference.
@@ -152,14 +156,33 @@ fn current_year() -> u32 {
 pub fn is_preference_content(content: &str) -> bool {
     let lower = content.to_lowercase();
     let en_keywords = [
-        "i prefer", "i like", "i love", "my favorite", "my favourite",
-        "i usually", "i always", "i tend to", "i often",
-        "prefer to", "rather than", "instead of using",
-        "i enjoy", "i favor", "i favour",
+        "i prefer",
+        "i like",
+        "i love",
+        "my favorite",
+        "my favourite",
+        "i usually",
+        "i always",
+        "i tend to",
+        "i often",
+        "prefer to",
+        "rather than",
+        "instead of using",
+        "i enjoy",
+        "i favor",
+        "i favour",
     ];
     let zh_keywords = [
-        "我喜欢", "我偏好", "我习惯", "我倾向", "我更喜欢",
-        "我通常", "我总是", "比较喜欢", "更倾向于", "偏爱",
+        "我喜欢",
+        "我偏好",
+        "我习惯",
+        "我倾向",
+        "我更喜欢",
+        "我通常",
+        "我总是",
+        "比较喜欢",
+        "更倾向于",
+        "偏爱",
     ];
 
     for kw in &en_keywords {
@@ -179,15 +202,34 @@ pub fn is_preference_content(content: &str) -> bool {
 pub fn is_knowledge_update(content: &str) -> bool {
     let lower = content.to_lowercase();
     let patterns = [
-        "changed to", "switched to", "moved to", "migrated to",
-        "replaced with", "upgraded to", "downgraded to", "updated to",
-        "no longer", "instead of", "now using", "now uses",
-        "deprecated", "replaced by", "superseded by",
-        "was renamed to", "renamed to",
+        "changed to",
+        "switched to",
+        "moved to",
+        "migrated to",
+        "replaced with",
+        "upgraded to",
+        "downgraded to",
+        "updated to",
+        "no longer",
+        "instead of",
+        "now using",
+        "now uses",
+        "deprecated",
+        "replaced by",
+        "superseded by",
+        "was renamed to",
+        "renamed to",
     ];
     let zh_patterns = [
-        "改为", "换成", "迁移到", "升级到", "不再使用", "替换为",
-        "现在使用", "已弃用", "已废弃",
+        "改为",
+        "换成",
+        "迁移到",
+        "升级到",
+        "不再使用",
+        "替换为",
+        "现在使用",
+        "已弃用",
+        "已废弃",
     ];
 
     for p in &patterns {
@@ -388,7 +430,8 @@ mod tests {
 
     #[test]
     fn test_postprocess_combined() {
-        let mut mem = make_memory("On 2026-01-15 I switched to Neovim because I prefer modal editing");
+        let mut mem =
+            make_memory("On 2026-01-15 I switched to Neovim because I prefer modal editing");
         postprocess(&mut mem);
         assert!(mem.keywords.contains(&"date:2026-01-15".to_string()));
         assert!(mem.keywords.contains(&"knowledge_update".to_string()));
@@ -402,7 +445,11 @@ mod tests {
         let mut mem = make_memory("Switched to new system");
         mem.keywords.push("knowledge_update".to_string());
         postprocess(&mut mem);
-        let count = mem.keywords.iter().filter(|k| k.as_str() == "knowledge_update").count();
+        let count = mem
+            .keywords
+            .iter()
+            .filter(|k| k.as_str() == "knowledge_update")
+            .count();
         assert_eq!(count, 1);
     }
 }

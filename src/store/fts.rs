@@ -41,7 +41,11 @@ pub fn search_fts(
         )?;
         let rows = stmt.query_map(rusqlite::params![sanitized, topic, limit as i64], |row| {
             let memory = row_to_memory(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let rank: f64 = row.get("rank")?;
             Ok((memory, rank as f32))
@@ -58,7 +62,11 @@ pub fn search_fts(
         )?;
         let rows = stmt.query_map(rusqlite::params![sanitized, limit as i64], |row| {
             let memory = row_to_memory(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let rank: f64 = row.get("rank")?;
             Ok((memory, rank as f32))
@@ -82,11 +90,18 @@ pub fn search_fts(
              ORDER BY strength DESC
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(rusqlite::params![like_pattern, topic, limit as i64], |row| {
-            row_to_memory(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-            })
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![like_pattern, topic, limit as i64],
+            |row| {
+                row_to_memory(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(|m| (m, 0.0f32))
@@ -100,7 +115,11 @@ pub fn search_fts(
         )?;
         let rows = stmt.query_map(rusqlite::params![like_pattern, limit as i64], |row| {
             row_to_memory(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()?

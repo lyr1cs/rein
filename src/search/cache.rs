@@ -39,17 +39,22 @@ impl<T: Clone> TtlCache<T> {
         }
         // If still at capacity, evict oldest
         if self.entries.len() >= self.max_size {
-            if let Some(oldest_key) = self.entries.iter()
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.created)
                 .map(|(k, _)| k.clone())
             {
                 self.entries.remove(&oldest_key);
             }
         }
-        self.entries.insert(key, CacheEntry {
-            value,
-            created: Instant::now(),
-        });
+        self.entries.insert(
+            key,
+            CacheEntry {
+                value,
+                created: Instant::now(),
+            },
+        );
     }
 }
 
@@ -62,16 +67,12 @@ static RERANK_CACHE: OnceLock<Mutex<TtlCache<Vec<f32>>>> = OnceLock::new();
 
 /// Get the global expansion cache (24h TTL, 500 entries max).
 pub fn expand_cache() -> &'static Mutex<TtlCache<Vec<String>>> {
-    EXPAND_CACHE.get_or_init(|| {
-        Mutex::new(TtlCache::new(Duration::from_secs(86400), 500))
-    })
+    EXPAND_CACHE.get_or_init(|| Mutex::new(TtlCache::new(Duration::from_secs(86400), 500)))
 }
 
 /// Get the global reranker cache (1h TTL, 200 entries max).
 pub fn rerank_cache() -> &'static Mutex<TtlCache<Vec<f32>>> {
-    RERANK_CACHE.get_or_init(|| {
-        Mutex::new(TtlCache::new(Duration::from_secs(3600), 200))
-    })
+    RERANK_CACHE.get_or_init(|| Mutex::new(TtlCache::new(Duration::from_secs(3600), 200)))
 }
 
 // ---------------------------------------------------------------------------
@@ -121,8 +122,8 @@ pub fn http_client_20s() -> &'static reqwest::Client {
 
 /// Hash a cache key using a simple FNV-like approach (fast, not cryptographic).
 pub fn cache_key(parts: &[&str]) -> String {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     for part in parts {
         part.hash(&mut hasher);

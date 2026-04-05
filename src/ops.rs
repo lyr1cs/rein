@@ -45,6 +45,12 @@ pub fn build_memory(
         decay_lambda: config.decay.base_lambda * importance.decay_factor(),
         access_count: 0,
         superseded_by: None,
+        canonical_id: None,
+        support_count: 1,
+        merge_count: 0,
+        dedup_confidence: 1.0,
+        source_diversity: 1.0,
+        contradiction_score: 0.0,
         related_ids: vec![],
         concept_ids: vec![],
         status: MemoryStatus::default(),
@@ -103,10 +109,7 @@ pub fn render_session_ingest(session: &SessionIngest) -> String {
         lines.push(format!("[Session id: {session_id}]"));
     }
     if let Some(started_at) = session.started_at {
-        lines.push(format!(
-            "[Session started_at: {}]",
-            started_at.to_rfc3339()
-        ));
+        lines.push(format!("[Session started_at: {}]", started_at.to_rfc3339()));
     }
     if let Some(summary) = session.summary.as_deref() {
         lines.push(format!("[Session summary]\n{summary}"));
@@ -282,7 +285,13 @@ pub fn ingest_extraction_report(
     let session_concept_ids: Vec<String> = result
         .concepts
         .iter()
-        .filter_map(|c| store.get_concept(&c.memoir, &c.name).ok().flatten().map(|con| con.id))
+        .filter_map(|c| {
+            store
+                .get_concept(&c.memoir, &c.name)
+                .ok()
+                .flatten()
+                .map(|con| con.id)
+        })
         .collect();
 
     let primary_topics = derive_primary_topics(&memories_for_ws, &concepts_for_ws);
@@ -376,10 +385,7 @@ fn derive_primary_topics(
     topics
 }
 
-fn derive_temporal_keywords(
-    memories: &[ExtractedMemory],
-    session: &SessionIngest,
-) -> Vec<String> {
+fn derive_temporal_keywords(memories: &[ExtractedMemory], session: &SessionIngest) -> Vec<String> {
     let mut kws: Vec<String> = memories
         .iter()
         .flat_map(|m| m.keywords.iter().cloned())
@@ -397,19 +403,20 @@ fn derive_temporal_keywords(
     kws
 }
 
-fn derive_important_paths(
-    memories: &[ExtractedMemory],
-    session: &SessionIngest,
-) -> Vec<String> {
+fn derive_important_paths(memories: &[ExtractedMemory], session: &SessionIngest) -> Vec<String> {
     let mut paths = Vec::new();
     let mut collect_from = |text: &str| {
-        if paths.len() >= 200 { return; } // bound intermediate allocation
+        if paths.len() >= 200 {
+            return;
+        } // bound intermediate allocation
         for token in text.split_whitespace() {
             let trimmed = token.trim_matches(|c: char| ",:;()[]{}'\"".contains(c));
             let looks_like_path = trimmed.contains('/')
-                || [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".md", ".toml", ".json"]
-                    .iter()
-                    .any(|suffix| trimmed.ends_with(suffix));
+                || [
+                    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".md", ".toml", ".json",
+                ]
+                .iter()
+                .any(|suffix| trimmed.ends_with(suffix));
             if looks_like_path && trimmed.len() > 3 {
                 paths.push(trimmed.to_string());
             }
@@ -611,10 +618,11 @@ pub fn queue_ingest_session(
         config,
         crate::extract::hooks::queue::MemoryJobMode::Full,
         "ingest_session",
-        session
-            .source_label
-            .as_deref()
-            .unwrap_or(if is_subagent { "source:subagent" } else { "source:main-agent" }),
+        session.source_label.as_deref().unwrap_or(if is_subagent {
+            "source:subagent"
+        } else {
+            "source:main-agent"
+        }),
         agent_label
             .or(session.source_agent.as_deref())
             .unwrap_or("manual-ingest")
@@ -659,6 +667,12 @@ pub fn build_consolidated(
         decay_lambda: config.decay.base_lambda * importance.decay_factor(),
         access_count: 0,
         superseded_by: None,
+        canonical_id: None,
+        support_count: 1,
+        merge_count: 0,
+        dedup_confidence: 1.0,
+        source_diversity: 1.0,
+        contradiction_score: 0.0,
         related_ids,
         concept_ids: vec![],
         status: MemoryStatus::default(),
@@ -668,6 +682,1036 @@ pub fn build_consolidated(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed: chrono::Utc::now(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicGroup {
+    pub canonical_topic: String,
+    pub topics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsolidationGroupReport {
+    pub canonical_topic: String,
+    pub source_topics: Vec<String>,
+    pub memory_count: usize,
+    pub created_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConsolidateReport {
+    pub groups: Vec<ConsolidationGroupReport>,
+    pub groups_processed: usize,
+    pub memories_replaced: usize,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CleanupReport {
+    pub consolidation: ConsolidateReport,
+    pub duplicates_found: u32,
+    pub duplicates_merged: u32,
+    pub dry_run: bool,
+}
+
+/// Normalize topic names for variant grouping.
+/// Lowercases and collapses all non-alphanumeric runs into `-`.
+pub fn normalize_topic_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut prev_sep = false;
+
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_alphanumeric() {
+            normalized.push(ch);
+            prev_sep = false;
+        } else if !prev_sep && !normalized.is_empty() {
+            normalized.push('-');
+            prev_sep = true;
+        }
+    }
+
+    normalized.trim_matches('-').to_string()
+}
+
+fn topic_display_score(topic: &str) -> i32 {
+    let spaces = topic.chars().filter(|c| *c == ' ').count() as i32;
+    let hyphens = topic.chars().filter(|c| *c == '-').count() as i32;
+    let underscores = topic.chars().filter(|c| *c == '_').count() as i32;
+    let uppercase = topic.chars().filter(|c| c.is_uppercase()).count() as i32;
+    spaces * 3 + uppercase - hyphens - (underscores * 2)
+}
+
+fn choose_canonical_topic(store: &SqliteStore, topics: &[String]) -> ReinResult<String> {
+    let mut best_topic = topics
+        .first()
+        .cloned()
+        .ok_or_else(|| ReinError::Config("empty topic group".to_string()))?;
+    let mut best_count = 0usize;
+    let mut best_score = i32::MIN;
+
+    for topic in topics {
+        let count = store.get_by_topic(topic)?.len();
+        let score = topic_display_score(topic);
+        let better = count > best_count
+            || (count == best_count && score > best_score)
+            || (count == best_count && score == best_score && topic.len() < best_topic.len())
+            || (count == best_count
+                && score == best_score
+                && topic.len() == best_topic.len()
+                && topic.to_lowercase() < best_topic.to_lowercase());
+        if better {
+            best_topic = topic.clone();
+            best_count = count;
+            best_score = score;
+        }
+    }
+
+    Ok(best_topic)
+}
+
+/// Resolve user-facing topic selectors into concrete consolidation groups.
+pub fn resolve_topic_groups(
+    store: &SqliteStore,
+    topic: Option<&str>,
+    topics: &[String],
+    pattern: Option<&str>,
+    all: bool,
+    merge_variants: bool,
+) -> ReinResult<Vec<TopicGroup>> {
+    let stored_topics = store.list_topics()?;
+
+    let mut selected = if let Some(topic) = topic {
+        vec![topic.to_string()]
+    } else if !topics.is_empty() {
+        topics.to_vec()
+    } else if let Some(pattern) = pattern {
+        let glob = glob::Pattern::new(pattern)
+            .map_err(|e| ReinError::Config(format!("invalid pattern '{pattern}': {e}")))?;
+        let opts = glob::MatchOptions {
+            case_sensitive: false,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+        stored_topics
+            .iter()
+            .filter(|candidate| glob.matches_with(candidate, opts))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else if all || merge_variants {
+        stored_topics.clone()
+    } else {
+        return Err(ReinError::Config(
+            "select a topic, --topics, --pattern, or --all".to_string(),
+        ));
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    selected.retain(|value| seen.insert(value.clone()));
+
+    if selected.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if !merge_variants {
+        return Ok(selected
+            .into_iter()
+            .map(|selected_topic| TopicGroup {
+                canonical_topic: selected_topic.clone(),
+                topics: vec![selected_topic],
+            })
+            .collect());
+    }
+
+    let mut grouped_topics: Vec<Vec<String>> = Vec::new();
+    let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for selected_topic in selected {
+        let key = normalize_topic_name(&selected_topic);
+        if let Some(index) = by_key.get(&key).copied() {
+            grouped_topics[index].push(selected_topic);
+        } else {
+            by_key.insert(key, grouped_topics.len());
+            grouped_topics.push(vec![selected_topic]);
+        }
+    }
+
+    let mut groups = Vec::with_capacity(grouped_topics.len());
+    for topics in grouped_topics {
+        let canonical_topic = choose_canonical_topic(store, &topics)?;
+        groups.push(TopicGroup {
+            canonical_topic,
+            topics,
+        });
+    }
+    Ok(groups)
+}
+
+fn render_summary_template(
+    template: &str,
+    canonical_topic: &str,
+    source_topics: &[String],
+    memory_count: usize,
+) -> String {
+    template
+        .replace("{topic}", canonical_topic)
+        .replace("{count}", &memory_count.to_string())
+        .replace("{topics}", &source_topics.join(", "))
+}
+
+fn synthesize_consolidation_summary(
+    canonical_topic: &str,
+    source_topics: &[String],
+    memory_count: usize,
+) -> String {
+    if source_topics.len() > 1 {
+        format!(
+            "{canonical_topic}: merged {memory_count} memories from {} topic variants",
+            source_topics.len()
+        )
+    } else {
+        format!("{canonical_topic}: consolidated {memory_count} memories")
+    }
+}
+
+fn collect_unique_detail_lines(memories: &[&Memory], max_lines: usize, max_chars: usize) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    let mut total_chars = 0usize;
+
+    for memory in memories {
+        for line in memory.content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let normalized = trimmed.to_lowercase();
+            if !seen.insert(normalized) {
+                continue;
+            }
+
+            let bullet = format!("- {trimmed}");
+            let bullet_chars = bullet.chars().count() + 1;
+            if lines.len() >= max_lines || total_chars + bullet_chars > max_chars {
+                lines.push(format!(
+                    "- ... truncated after {} unique detail lines",
+                    lines.len()
+                ));
+                return lines.join("\n");
+            }
+            total_chars += bullet_chars;
+            lines.push(bullet);
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn synthesize_consolidation_content(
+    canonical_topic: &str,
+    source_topics: &[String],
+    memories: &[&Memory],
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "Consolidated {} memories into topic '{canonical_topic}'.",
+        memories.len()
+    ));
+    if source_topics.len() > 1 {
+        parts.push(format!("Source topics: {}", source_topics.join(", ")));
+    }
+
+    parts.push(String::new());
+    parts.push("Summaries:".to_string());
+    for memory in memories.iter().take(20) {
+        parts.push(format!("- [{}] {}", memory.topic, memory.summary));
+    }
+    if memories.len() > 20 {
+        parts.push(format!("- ... {} more memories", memories.len() - 20));
+    }
+
+    let details = collect_unique_detail_lines(memories, 40, 8000);
+    if !details.is_empty() {
+        parts.push(String::new());
+        parts.push("Details:".to_string());
+        parts.push(details);
+    }
+
+    parts.join("\n")
+}
+
+fn dominant_tier(memories: &[&Memory]) -> MemoryTier {
+    if memories.iter().any(|memory| memory.tier == MemoryTier::Hot) {
+        MemoryTier::Hot
+    } else if memories
+        .iter()
+        .any(|memory| memory.tier == MemoryTier::Warm)
+    {
+        MemoryTier::Warm
+    } else {
+        MemoryTier::Cold
+    }
+}
+
+fn stronger_tier(left: MemoryTier, right: MemoryTier) -> MemoryTier {
+    match (left, right) {
+        (MemoryTier::Hot, _) | (_, MemoryTier::Hot) => MemoryTier::Hot,
+        (MemoryTier::Warm, _) | (_, MemoryTier::Warm) => MemoryTier::Warm,
+        _ => MemoryTier::Cold,
+    }
+}
+
+/// Build a consolidated memory for one topic or a normalized topic group.
+pub fn build_consolidated_from_memories(
+    config: &ReinConfig,
+    canonical_topic: String,
+    source_topics: &[String],
+    memories: &[Memory],
+    summary_template: Option<&str>,
+) -> Memory {
+    let mut ordered: Vec<&Memory> = memories.iter().collect();
+    ordered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let memory_count = ordered.len();
+    let rendered = summary_template.map(|template| {
+        render_summary_template(template, &canonical_topic, source_topics, memory_count)
+    });
+    let summary = rendered.clone().unwrap_or_else(|| {
+        synthesize_consolidation_summary(&canonical_topic, source_topics, memory_count)
+    });
+    let content = rendered.unwrap_or_else(|| {
+        synthesize_consolidation_content(&canonical_topic, source_topics, &ordered)
+    });
+
+    let mut keyword_seen = std::collections::HashSet::new();
+    let mut keywords = Vec::new();
+    for memory in &ordered {
+        for keyword in &memory.keywords {
+            if keyword_seen.insert(keyword.to_lowercase()) {
+                keywords.push(keyword.clone());
+            }
+        }
+    }
+    keywords.truncate(24);
+
+    let importance = ordered
+        .iter()
+        .map(|memory| memory.importance)
+        .max()
+        .unwrap_or(Importance::High)
+        .max(Importance::High);
+
+    let related_ids = ordered.iter().map(|memory| memory.id.clone()).collect();
+    let total_access_count: u32 = ordered.iter().map(|memory| memory.access_count).sum();
+    let avg_strength =
+        ordered.iter().map(|memory| memory.strength).sum::<f64>() / memory_count.max(1) as f64;
+    let reinforced_strength =
+        (avg_strength + 0.05 * (memory_count.saturating_sub(1) as f64)).min(1.0);
+    let decay_lambda = ordered.iter().map(|memory| memory.decay_lambda).fold(
+        config.decay.base_lambda * importance.decay_factor(),
+        f64::min,
+    );
+    let last_accessed = ordered
+        .iter()
+        .map(|memory| memory.last_accessed)
+        .max()
+        .unwrap_or_else(chrono::Utc::now);
+
+    Memory {
+        id: ulid::Ulid::new().to_string(),
+        layer: importance.auto_layer(),
+        topic: canonical_topic,
+        summary: summary.chars().take(100).collect(),
+        content,
+        keywords,
+        importance,
+        source: Source::Manual,
+        strength: reinforced_strength,
+        decay_lambda,
+        access_count: total_access_count,
+        superseded_by: None,
+        canonical_id: None,
+        support_count: memory_count as u32,
+        merge_count: memory_count.saturating_sub(1) as u32,
+        dedup_confidence: 0.9,
+        source_diversity: source_topics.len().max(1) as f32,
+        contradiction_score: 0.0,
+        related_ids,
+        concept_ids: vec![],
+        status: MemoryStatus::default(),
+        embedding: None,
+        tier: dominant_tier(&ordered),
+        cluster_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        last_accessed,
+    }
+}
+
+fn build_consolidated_from_extracted(
+    config: &ReinConfig,
+    canonical_topic: String,
+    source_topics: &[String],
+    memories: &[Memory],
+    extracted: ExtractedMemory,
+) -> Memory {
+    let mut consolidated = build_consolidated_from_memories(
+        config,
+        canonical_topic.clone(),
+        source_topics,
+        memories,
+        None,
+    );
+
+    let importance = extracted
+        .importance
+        .parse::<Importance>()
+        .unwrap_or(Importance::High)
+        .max(Importance::High);
+
+    consolidated.topic = canonical_topic;
+    consolidated.summary = extracted.summary.chars().take(100).collect();
+    consolidated.content = extracted.content;
+    if !extracted.keywords.is_empty() {
+        consolidated.keywords = extracted.keywords;
+    }
+    consolidated.importance = importance;
+    consolidated.layer = importance.auto_layer();
+    consolidated.decay_lambda = config.decay.base_lambda * importance.decay_factor();
+    consolidated
+}
+
+/// Build a consolidated memory, preferring LLM synthesis when no explicit summary was provided.
+pub async fn build_consolidated_from_memories_async(
+    config: &ReinConfig,
+    canonical_topic: String,
+    source_topics: &[String],
+    memories: &[Memory],
+    summary_template: Option<&str>,
+) -> Memory {
+    if summary_template.is_some() {
+        return build_consolidated_from_memories(
+            config,
+            canonical_topic,
+            source_topics,
+            memories,
+            summary_template,
+        );
+    }
+
+    match crate::extract::llm::summarize_topic_group(
+        config,
+        &canonical_topic,
+        source_topics,
+        memories,
+    )
+    .await
+    {
+        Ok(Some(extracted)) => build_consolidated_from_extracted(
+            config,
+            canonical_topic,
+            source_topics,
+            memories,
+            extracted,
+        ),
+        Ok(None) => {
+            build_consolidated_from_memories(config, canonical_topic, source_topics, memories, None)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "llm consolidation failed for topic '{}': {}",
+                canonical_topic,
+                error
+            );
+            build_consolidated_from_memories(config, canonical_topic, source_topics, memories, None)
+        }
+    }
+}
+
+/// Execute one or more consolidations selected by topic/pattern, optionally grouping
+/// normalized topic variants together.
+pub fn run_consolidation(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    groups: &[TopicGroup],
+    summary_template: Option<&str>,
+    dry_run: bool,
+) -> ReinResult<ConsolidateReport> {
+    let mut report = ConsolidateReport {
+        dry_run,
+        ..Default::default()
+    };
+    let mut changed = false;
+
+    for group in groups {
+        let mut memories = Vec::new();
+        for topic in &group.topics {
+            memories.extend(store.get_by_topic(topic)?);
+        }
+
+        if memories.is_empty() {
+            report.groups.push(ConsolidationGroupReport {
+                canonical_topic: group.canonical_topic.clone(),
+                source_topics: group.topics.clone(),
+                memory_count: 0,
+                created_id: None,
+            });
+            continue;
+        }
+
+        report.memories_replaced += memories.len();
+        report.groups_processed += 1;
+
+        let created_id = if dry_run {
+            None
+        } else {
+            let replacement = build_consolidated_from_memories(
+                config,
+                group.canonical_topic.clone(),
+                &group.topics,
+                &memories,
+                summary_template,
+            );
+            let new_id = replacement.id.clone();
+            let old_memories = if group.topics.len() == 1 {
+                store.consolidate_atomic(&group.topics[0], replacement)?
+            } else {
+                store.consolidate_topics_atomic(&group.topics, replacement)?
+            };
+            emit_consolidation_events(store, group, &new_id, &old_memories);
+            changed = true;
+            Some(new_id)
+        };
+
+        report.groups.push(ConsolidationGroupReport {
+            canonical_topic: group.canonical_topic.clone(),
+            source_topics: group.topics.clone(),
+            memory_count: memories.len(),
+            created_id,
+        });
+    }
+
+    if changed {
+        run_adaptive_pipeline(store, config);
+    }
+
+    Ok(report)
+}
+
+/// Async batch consolidation: LLM synthesis for each group is generated in parallel,
+/// then writes are committed sequentially to keep SQLite mutations deterministic.
+pub async fn run_consolidation_async(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    groups: &[TopicGroup],
+    summary_template: Option<&str>,
+    dry_run: bool,
+) -> ReinResult<ConsolidateReport> {
+    let mut report = ConsolidateReport {
+        dry_run,
+        ..Default::default()
+    };
+    let mut non_empty = Vec::new();
+    let mut changed = false;
+
+    for group in groups {
+        let memories = load_group_memories(store, group)?;
+        if memories.is_empty() {
+            report.groups.push(ConsolidationGroupReport {
+                canonical_topic: group.canonical_topic.clone(),
+                source_topics: group.topics.clone(),
+                memory_count: 0,
+                created_id: None,
+            });
+        } else {
+            non_empty.push((group.clone(), memories));
+        }
+    }
+
+    let summary_template_owned = summary_template.map(str::to_string);
+    let config_owned = config.clone();
+    let prepared =
+        futures_util::future::join_all(non_empty.into_iter().map(|(group, memories)| {
+            let config = config_owned.clone();
+            let summary_template = summary_template_owned.clone();
+            async move {
+                let replacement = if dry_run {
+                    None
+                } else {
+                    Some(
+                        build_consolidated_from_memories_async(
+                            &config,
+                            group.canonical_topic.clone(),
+                            &group.topics,
+                            &memories,
+                            summary_template.as_deref(),
+                        )
+                        .await,
+                    )
+                };
+                (group, memories, replacement)
+            }
+        }))
+        .await;
+
+    for (group, memories, replacement) in prepared {
+        report.memories_replaced += memories.len();
+        report.groups_processed += 1;
+
+        let created_id = if let Some(replacement) = replacement {
+            let new_id = replacement.id.clone();
+            let old_memories = if group.topics.len() == 1 {
+                store.consolidate_atomic(&group.topics[0], replacement)?
+            } else {
+                store.consolidate_topics_atomic(&group.topics, replacement)?
+            };
+            emit_consolidation_events(store, &group, &new_id, &old_memories);
+            changed = true;
+            Some(new_id)
+        } else {
+            None
+        };
+
+        report.groups.push(ConsolidationGroupReport {
+            canonical_topic: group.canonical_topic.clone(),
+            source_topics: group.topics.clone(),
+            memory_count: memories.len(),
+            created_id,
+        });
+    }
+
+    if changed {
+        run_adaptive_pipeline(store, config);
+    }
+
+    Ok(report)
+}
+
+/// Sync wrapper for async consolidation so MCP handlers can reuse the same logic.
+pub fn run_consolidation_sync(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    groups: &[TopicGroup],
+    summary_template: Option<&str>,
+    dry_run: bool,
+) -> ReinResult<ConsolidateReport> {
+    let cfg = config.clone();
+    let groups = groups.to_vec();
+    let summary = summary_template.map(|value| value.to_string());
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(run_consolidation_async(
+                store,
+                &cfg,
+                &groups,
+                summary.as_deref(),
+                dry_run,
+            ))
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
+        rt.block_on(run_consolidation_async(
+            store,
+            &cfg,
+            &groups,
+            summary.as_deref(),
+            dry_run,
+        ))
+    }
+}
+
+/// One-click cleanup: consolidate fragmented topics first, then run content dedup.
+/// Default callers should pass groups resolved from the desired scope; for a full-store
+/// cleanup, resolve with `all=true`.
+pub async fn run_cleanup_async(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    groups: &[TopicGroup],
+    merge_variants: bool,
+    dry_run: bool,
+) -> ReinResult<CleanupReport> {
+    let consolidation = run_consolidation_async(store, config, groups, None, dry_run).await?;
+    let threshold = config.search.dedup_similarity as f32;
+    let (duplicates_found, duplicates_merged) =
+        run_dedup(store, config, threshold, dry_run, merge_variants)?;
+
+    Ok(CleanupReport {
+        consolidation,
+        duplicates_found,
+        duplicates_merged,
+        dry_run,
+    })
+}
+
+pub fn run_cleanup_sync(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    groups: &[TopicGroup],
+    merge_variants: bool,
+    dry_run: bool,
+) -> ReinResult<CleanupReport> {
+    let cfg = config.clone();
+    let groups = groups.to_vec();
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(run_cleanup_async(
+                store,
+                &cfg,
+                &groups,
+                merge_variants,
+                dry_run,
+            ))
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
+        rt.block_on(run_cleanup_async(
+            store,
+            &cfg,
+            &groups,
+            merge_variants,
+            dry_run,
+        ))
+    }
+}
+
+fn load_group_memories(store: &SqliteStore, group: &TopicGroup) -> ReinResult<Vec<Memory>> {
+    let mut memories = Vec::new();
+    for topic in &group.topics {
+        memories.extend(store.get_by_topic(topic)?);
+    }
+    Ok(memories)
+}
+
+fn emit_cleanup_event(
+    store: &SqliteStore,
+    event_type: crate::store::adaptive::EventType,
+    memory_id: Option<String>,
+    topic: Option<String>,
+    payload: serde_json::Value,
+) {
+    let _ = crate::store::adaptive::emit_event(
+        store.conn(),
+        crate::store::adaptive::FeedbackEvent {
+            event_type,
+            request_id: None,
+            memory_id,
+            concept_id: None,
+            query: None,
+            query_type: Some("cleanup".to_string()),
+            topic,
+            payload: Some(payload),
+        },
+    );
+}
+
+fn record_dedup_artifacts(
+    store: &SqliteStore,
+    winner_id: &str,
+    loser: &Memory,
+    relation: DedupRelation,
+    lexical_score: Option<f32>,
+    embedding_score: Option<f32>,
+    reason: &str,
+    payload: Option<serde_json::Value>,
+) {
+    let canonical_id = store
+        .canonical_id_for(winner_id)
+        .unwrap_or_else(|_| winner_id.to_string());
+    let _ = store.snapshot_memory_as_evidence(&canonical_id, loser);
+    let merged_summary = store.get(winner_id).ok().map(|memory| memory.summary);
+    let _ = store.record_dedup_decision(DedupDecision {
+        id: String::new(),
+        winner_id: Some(winner_id.to_string()),
+        loser_id: Some(loser.id.clone()),
+        canonical_id: Some(canonical_id),
+        lexical_score,
+        embedding_score,
+        relation,
+        confidence: lexical_score
+            .or(embedding_score)
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0),
+        reason: reason.to_string(),
+        operator: "auto".to_string(),
+        reversible: true,
+        merged_summary,
+        novel_facts: vec![],
+        conflict_detected: matches!(relation, DedupRelation::Update),
+        payload,
+        created_at: chrono::Utc::now(),
+    });
+}
+
+fn merge_memory_into_winner(
+    store: &SqliteStore,
+    winner_id: &str,
+    loser: &Memory,
+    lexical_score: Option<f32>,
+    embedding_score: Option<f32>,
+    reason: &str,
+    payload: Option<serde_json::Value>,
+) -> ReinResult<()> {
+    if let Ok(mut winner) = store.get(winner_id) {
+        let unique = extract_unique_lines(&loser.content, &winner.content);
+        if !unique.is_empty() {
+            winner.content.push_str(&format!(
+                "\n\n[merged from {} on {}]\n{}",
+                loser.id,
+                loser.created_at.format("%Y-%m-%d"),
+                unique,
+            ));
+        }
+        for kw in &loser.keywords {
+            if !winner.keywords.contains(kw) {
+                winner.keywords.push(kw.clone());
+            }
+        }
+        winner.access_count = winner
+            .access_count
+            .saturating_add(loser.access_count)
+            .saturating_add(1);
+        winner.strength = (winner.strength + 0.1).min(1.0);
+        winner.importance = winner.importance.max(loser.importance);
+        winner.layer = winner.importance.auto_layer();
+        winner.decay_lambda = winner.decay_lambda.min(loser.decay_lambda);
+        winner.tier = stronger_tier(winner.tier, loser.tier);
+        winner.last_accessed = winner.last_accessed.max(loser.last_accessed);
+        winner.updated_at = chrono::Utc::now();
+        winner.summary = winner.content.chars().take(100).collect();
+        store.update(&winner)?;
+    }
+    store.mark_superseded(&loser.id, winner_id)?;
+    record_dedup_artifacts(
+        store,
+        winner_id,
+        loser,
+        DedupRelation::Duplicate,
+        lexical_score,
+        embedding_score,
+        reason,
+        payload,
+    );
+    Ok(())
+}
+
+pub async fn resolve_dedup_job_async(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    existing_id: &str,
+    new_id: &str,
+    lexical_score: Option<f32>,
+    reason: &str,
+) -> ReinResult<DedupRelation> {
+    let existing = match store.get(existing_id) {
+        Ok(memory) => memory,
+        Err(_) => return Ok(DedupRelation::Distinct),
+    };
+    let new_memory = match store.get(new_id) {
+        Ok(memory) => memory,
+        Err(_) => return Ok(DedupRelation::Distinct),
+    };
+
+    if existing.superseded_by.is_some() || new_memory.superseded_by.is_some() {
+        return Ok(DedupRelation::Distinct);
+    }
+
+    let existing_canonical = store.canonical_id_for(existing_id)?;
+    let new_canonical = store.canonical_id_for(new_id)?;
+    if existing_canonical == new_canonical {
+        return Ok(DedupRelation::Duplicate);
+    }
+
+    let verdict =
+        crate::extract::llm::llm_dedup_verdict(config, &existing.content, &new_memory.content)
+            .await?
+            .unwrap_or_default();
+    let payload = Some(serde_json::json!({
+        "confidence": verdict.confidence,
+        "merged_summary": verdict.merged_summary,
+        "novel_facts": verdict.novel_facts,
+        "suggested_topic": verdict.suggested_topic,
+        "conflict_detected": verdict.conflict_detected,
+        "reason": reason,
+    }));
+
+    match verdict.relation {
+        DedupRelation::Duplicate => {
+            merge_memory_into_winner(
+                store,
+                existing_id,
+                &new_memory,
+                lexical_score,
+                None,
+                reason,
+                payload,
+            )?;
+            Ok(DedupRelation::Duplicate)
+        }
+        DedupRelation::Update => {
+            if let Ok(mut winner) = store.get(new_id) {
+                for kw in &existing.keywords {
+                    if !winner.keywords.contains(kw) {
+                        winner.keywords.push(kw.clone());
+                    }
+                }
+                winner.importance = winner.importance.max(existing.importance);
+                winner.layer = winner.importance.auto_layer();
+                winner.decay_lambda = winner.decay_lambda.min(existing.decay_lambda);
+                winner.strength = (winner.strength + 0.05).min(1.0);
+                if !verdict.merged_summary.trim().is_empty() {
+                    winner.summary = verdict.merged_summary.chars().take(100).collect();
+                }
+                winner.updated_at = chrono::Utc::now();
+                store.update(&winner)?;
+            }
+            store.mark_superseded(existing_id, new_id)?;
+            record_dedup_artifacts(
+                store,
+                new_id,
+                &existing,
+                DedupRelation::Update,
+                lexical_score,
+                None,
+                reason,
+                payload,
+            );
+            Ok(DedupRelation::Update)
+        }
+        DedupRelation::Related => {
+            if let Ok(mut left) = store.get(existing_id) {
+                if !left.related_ids.contains(&new_id.to_string()) {
+                    left.related_ids.push(new_id.to_string());
+                    let _ = store.update(&left);
+                }
+            }
+            if let Ok(mut right) = store.get(new_id) {
+                if !right.related_ids.contains(&existing_id.to_string()) {
+                    right.related_ids.push(existing_id.to_string());
+                    let _ = store.update(&right);
+                }
+            }
+            let _ = store.record_dedup_decision(DedupDecision {
+                id: String::new(),
+                winner_id: None,
+                loser_id: Some(new_id.to_string()),
+                canonical_id: None,
+                lexical_score,
+                embedding_score: None,
+                relation: DedupRelation::Related,
+                confidence: verdict.confidence as f32,
+                reason: reason.to_string(),
+                operator: "auto".to_string(),
+                reversible: true,
+                merged_summary: (!verdict.merged_summary.trim().is_empty())
+                    .then_some(verdict.merged_summary),
+                novel_facts: verdict.novel_facts,
+                conflict_detected: verdict.conflict_detected,
+                payload,
+                created_at: chrono::Utc::now(),
+            });
+            Ok(DedupRelation::Related)
+        }
+        DedupRelation::Distinct => {
+            let _ = store.record_dedup_decision(DedupDecision {
+                id: String::new(),
+                winner_id: None,
+                loser_id: Some(new_id.to_string()),
+                canonical_id: None,
+                lexical_score,
+                embedding_score: None,
+                relation: DedupRelation::Distinct,
+                confidence: verdict.confidence as f32,
+                reason: reason.to_string(),
+                operator: "auto".to_string(),
+                reversible: true,
+                merged_summary: (!verdict.merged_summary.trim().is_empty())
+                    .then_some(verdict.merged_summary),
+                novel_facts: verdict.novel_facts,
+                conflict_detected: verdict.conflict_detected,
+                payload,
+                created_at: chrono::Utc::now(),
+            });
+            Ok(DedupRelation::Distinct)
+        }
+    }
+}
+
+fn record_deleted_memory_as_evidence(store: &SqliteStore, canonical_id: &str, memory: &Memory) {
+    let _ = store.add_memory_evidence(MemoryEvidence {
+        id: String::new(),
+        canonical_id: canonical_id.to_string(),
+        memory_id: None,
+        source_topic: memory.topic.clone(),
+        summary: memory.summary.clone(),
+        content: memory.content.clone(),
+        keywords: memory.keywords.clone(),
+        source: memory.source,
+        created_at: memory.created_at,
+        imported_at: chrono::Utc::now(),
+    });
+}
+
+fn emit_consolidation_events(
+    store: &SqliteStore,
+    group: &TopicGroup,
+    new_id: &str,
+    old_memories: &[Memory],
+) {
+    emit_cleanup_event(
+        store,
+        crate::store::adaptive::EventType::Store,
+        Some(new_id.to_string()),
+        Some(group.canonical_topic.clone()),
+        serde_json::json!({
+            "source": "consolidate",
+            "source_topics": group.topics.clone(),
+            "source_count": old_memories.len(),
+        }),
+    );
+
+    for old_memory in old_memories {
+        record_deleted_memory_as_evidence(store, new_id, old_memory);
+        let _ = store.record_dedup_decision(DedupDecision {
+            id: String::new(),
+            winner_id: Some(new_id.to_string()),
+            loser_id: None,
+            canonical_id: Some(new_id.to_string()),
+            lexical_score: None,
+            embedding_score: None,
+            relation: DedupRelation::Update,
+            confidence: 0.85,
+            reason: "consolidate".to_string(),
+            operator: "manual".to_string(),
+            reversible: true,
+            merged_summary: Some(group.canonical_topic.clone()),
+            novel_facts: vec![],
+            conflict_detected: false,
+            payload: Some(serde_json::json!({
+                "source_memory_id": old_memory.id,
+                "source_topic": old_memory.topic,
+            })),
+            created_at: chrono::Utc::now(),
+        });
+        emit_cleanup_event(
+            store,
+            crate::store::adaptive::EventType::Forget,
+            Some(old_memory.id.clone()),
+            Some(old_memory.topic.clone()),
+            serde_json::json!({
+                "source": "consolidate",
+                "replacement_id": new_id,
+                "canonical_topic": group.canonical_topic.clone(),
+            }),
+        );
     }
 }
 
@@ -730,8 +1774,7 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
     let conn = store.conn();
 
     // Learned alphas from AdaptiveState
-    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(conn)
-        .unwrap_or_default();
+    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(conn).unwrap_or_default();
 
     let learned_alphas: serde_json::Value = state
         .learned_alpha
@@ -1669,7 +2712,6 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     }
 
     if updates > 0 {
-
         // Now normalize ALL 17 weights (including w_episode) to sum to 1.0
         let sum = weights.w_fts
             + weights.w_vec
@@ -2101,7 +3143,12 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                     if candidate.access_count >= 1
                         || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1)
                     {
-                        (&candidate.id, id, content.to_string(), chrono::Utc::now().format("%Y-%m-%d").to_string())
+                        (
+                            &candidate.id,
+                            id,
+                            content.to_string(),
+                            chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                        )
                     } else {
                         (
                             id,
@@ -2125,6 +3172,18 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                     let _ = store.update(&kept);
                 }
                 let _ = store.mark_superseded(discard_id, keep_id);
+                if let Ok(discard_memory) = store.get(discard_id) {
+                    record_dedup_artifacts(
+                        store,
+                        keep_id,
+                        &discard_memory,
+                        DedupRelation::Duplicate,
+                        None,
+                        Some(sim as f32),
+                        "vec_dedup_strong",
+                        Some(serde_json::json!({ "cosine_similarity": sim })),
+                    );
+                }
 
                 tracing::info!(
                     "vec_dedup: merged {discard_id} into {keep_id} (cosine_sim={sim:.3})"
@@ -2134,24 +3193,41 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 break;
             } else if sim > 0.70 {
                 // Moderate match — use LLM to confirm (if available)
-                let is_dup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let relation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            crate::extract::llm::llm_is_duplicate(
+                            crate::extract::llm::llm_dedup_verdict(
                                 config,
                                 content,
                                 &candidate.content,
                             )
                             .await
+                            .ok()
+                            .flatten()
+                            .map(|verdict| verdict.relation)
+                            .unwrap_or(DedupRelation::Distinct)
                         })
                     })
                 }))
-                .unwrap_or(false);
+                .unwrap_or(DedupRelation::Distinct);
 
-                if is_dup {
+                if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
                     let _ = store.mark_superseded(id, &candidate.id);
+                    if let Ok(discard_memory) = store.get(id) {
+                        record_dedup_artifacts(
+                            store,
+                            &candidate.id,
+                            &discard_memory,
+                            relation,
+                            None,
+                            Some(sim as f32),
+                            "vec_dedup_llm",
+                            Some(serde_json::json!({ "cosine_similarity": sim })),
+                        );
+                    }
                     tracing::info!(
-                        "vec_dedup: LLM confirmed dup, superseded {id} by {} (cosine_sim={sim:.3})",
+                        "vec_dedup: LLM verdict {} superseded {id} by {} (cosine_sim={sim:.3})",
+                        relation,
                         candidate.id
                     );
                     merged += 1;
@@ -2184,13 +3260,19 @@ fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
 /// "winner" with a provenance marker. The loser is then superseded, not deleted.
 ///
 /// Returns (duplicates_found, duplicates_merged).
-pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResult<(u32, u32)> {
-    let topics = store.list_topics()?;
+pub fn run_dedup(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    threshold: f32,
+    dry_run: bool,
+    merge_variants: bool,
+) -> ReinResult<(u32, u32)> {
+    let groups = resolve_topic_groups(store, None, &[], None, true, merge_variants)?;
     let mut dups_found = 0u32;
     let mut dups_merged = 0u32;
-    for topic in &topics {
-        let mems: Vec<_> = store
-            .get_by_topic(topic)?
+    let mut changed = false;
+    for group in &groups {
+        let mems: Vec<_> = load_group_memories(store, group)?
             .into_iter()
             .filter(|m| m.superseded_by.is_none())
             .collect();
@@ -2204,7 +3286,31 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                     continue;
                 }
                 let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
-                if sim >= threshold {
+                let relation = if sim >= threshold {
+                    DedupRelation::Duplicate
+                } else if !dry_run && sim >= (threshold - 0.15).max(0.50) {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                crate::extract::llm::llm_dedup_verdict(
+                                    config,
+                                    &mems[i].content,
+                                    &mems[j].content,
+                                )
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|verdict| verdict.relation)
+                                .unwrap_or(DedupRelation::Distinct)
+                            })
+                        })
+                    }))
+                    .unwrap_or(DedupRelation::Distinct)
+                } else {
+                    DedupRelation::Distinct
+                };
+
+                if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
                     dups_found += 1;
                     // Determine winner (longer/newer) and loser
                     let (winner_idx, loser_idx) = if mems[j].content.len() >= mems[i].content.len()
@@ -2229,26 +3335,79 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                             &mems[loser_idx].content,
                             &mems[winner_idx].content,
                         );
-                        if !unique.is_empty() {
-                            let provenance = format!(
-                                "\n\n[merged from {} on {}]\n{}",
-                                mems[loser_idx].id,
-                                mems[loser_idx].created_at.format("%Y-%m-%d"),
-                                unique,
-                            );
-                            if let Ok(mut winner) = store.get(&mems[winner_idx].id) {
+                        let canonical_id = store
+                            .canonical_id_for(&mems[winner_idx].id)
+                            .unwrap_or_else(|_| mems[winner_idx].id.clone());
+                        if let Ok(mut winner) = store.get(&mems[winner_idx].id) {
+                            if !unique.is_empty() {
+                                let provenance = format!(
+                                    "\n\n[merged from {} on {}]\n{}",
+                                    mems[loser_idx].id,
+                                    mems[loser_idx].created_at.format("%Y-%m-%d"),
+                                    unique,
+                                );
                                 winner.content.push_str(&provenance);
-                                for kw in &mems[loser_idx].keywords {
-                                    if !winner.keywords.contains(kw) {
-                                        winner.keywords.push(kw.clone());
-                                    }
-                                }
-                                winner.strength = (winner.strength + 0.1).min(1.0);
-                                let _ = store.update(&winner);
                             }
+                            for kw in &mems[loser_idx].keywords {
+                                if !winner.keywords.contains(kw) {
+                                    winner.keywords.push(kw.clone());
+                                }
+                            }
+                            winner.access_count = winner
+                                .access_count
+                                .saturating_add(mems[loser_idx].access_count)
+                                .saturating_add(1);
+                            winner.strength = (winner.strength + 0.1).min(1.0);
+                            winner.importance = winner.importance.max(mems[loser_idx].importance);
+                            winner.layer = winner.importance.auto_layer();
+                            winner.decay_lambda =
+                                winner.decay_lambda.min(mems[loser_idx].decay_lambda);
+                            winner.tier = stronger_tier(winner.tier, mems[loser_idx].tier);
+                            winner.last_accessed = chrono::Utc::now();
+                            winner.updated_at = chrono::Utc::now();
+                            let _ = store.update(&winner);
                         }
                         let _ = store.mark_superseded(&mems[loser_idx].id, &mems[winner_idx].id);
+                        let _ = store.snapshot_memory_as_evidence(&canonical_id, &mems[loser_idx]);
+                        let _ = store.record_dedup_decision(DedupDecision {
+                            id: String::new(),
+                            winner_id: Some(mems[winner_idx].id.clone()),
+                            loser_id: Some(mems[loser_idx].id.clone()),
+                            canonical_id: Some(canonical_id.clone()),
+                            lexical_score: Some(sim),
+                            embedding_score: None,
+                            relation,
+                            confidence: sim,
+                            reason: "batch_dedup".to_string(),
+                            operator: "manual".to_string(),
+                            reversible: true,
+                            merged_summary: Some(mems[winner_idx].summary.clone()),
+                            novel_facts: unique
+                                .lines()
+                                .map(|line| line.trim().to_string())
+                                .filter(|line| !line.is_empty())
+                                .collect(),
+                            conflict_detected: matches!(relation, DedupRelation::Update),
+                            payload: Some(serde_json::json!({
+                                "merge_variants": merge_variants,
+                            })),
+                            created_at: chrono::Utc::now(),
+                        });
+                        emit_cleanup_event(
+                            store,
+                            crate::store::adaptive::EventType::Forget,
+                            Some(mems[loser_idx].id.clone()),
+                            Some(mems[loser_idx].topic.clone()),
+                            serde_json::json!({
+                                "source": "dedup",
+                                "replacement_id": mems[winner_idx].id,
+                                "winner_topic": mems[winner_idx].topic,
+                                "similarity": sim,
+                                "merge_variants": merge_variants,
+                            }),
+                        );
                         dups_merged += 1;
+                        changed = true;
                     }
                     // Mark only the loser as processed
                     processed.insert(mems[loser_idx].id.clone());
@@ -2260,6 +3419,20 @@ pub fn run_dedup(store: &SqliteStore, threshold: f32, dry_run: bool) -> ReinResu
                 }
             }
         }
+    }
+    if changed {
+        emit_cleanup_event(
+            store,
+            crate::store::adaptive::EventType::ParamUpdate,
+            None,
+            None,
+            serde_json::json!({
+                "source": "dedup",
+                "duplicates_merged": dups_merged,
+                "merge_variants": merge_variants,
+            }),
+        );
+        run_adaptive_pipeline(store, config);
     }
     Ok((dups_found, dups_merged))
 }
@@ -2515,6 +3688,41 @@ pub async fn run_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReinConfig;
+    use crate::store::SqliteStore;
+    use chrono::Utc;
+
+    fn test_memory(topic: &str, summary: &str, content: &str) -> Memory {
+        Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: summary.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::High,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::default(),
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
 
     #[test]
     fn test_extract_unique_lines_preserves_dates() {
@@ -2561,5 +3769,125 @@ mod tests {
         let unique = extract_unique_lines("alpha\nbeta", "gamma\ndelta");
         assert!(unique.contains("alpha"));
         assert!(unique.contains("beta"));
+    }
+
+    #[test]
+    fn test_normalize_topic_name_groups_variants() {
+        assert_eq!(
+            normalize_topic_name("Docker Deployment"),
+            normalize_topic_name("docker-deployment")
+        );
+        assert_eq!(
+            normalize_topic_name("docker deployment"),
+            normalize_topic_name("docker_deployment")
+        );
+        assert_eq!(
+            normalize_topic_name("  RMCP 1.3.0 Compatibility "),
+            "rmcp-1-3-0-compatibility"
+        );
+    }
+
+    #[test]
+    fn test_resolve_topic_groups_merges_variants() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(test_memory(
+                "Docker Deployment",
+                "primary",
+                "deploy via compose",
+            ))
+            .unwrap();
+        store
+            .store(test_memory(
+                "Docker Deployment",
+                "primary 2",
+                "pin image tag",
+            ))
+            .unwrap();
+        store
+            .store(test_memory(
+                "docker-deployment",
+                "secondary",
+                "same topic variant",
+            ))
+            .unwrap();
+        store
+            .store(test_memory("CP2K MPI Failure", "cp2k", "exit code 7"))
+            .unwrap();
+
+        let groups = resolve_topic_groups(&store, None, &[], None, true, true).unwrap();
+        let docker_group = groups
+            .iter()
+            .find(|group| {
+                group
+                    .topics
+                    .iter()
+                    .any(|topic| topic == "Docker Deployment")
+            })
+            .unwrap();
+
+        assert_eq!(docker_group.canonical_topic, "Docker Deployment");
+        assert_eq!(docker_group.topics.len(), 2);
+        assert!(docker_group
+            .topics
+            .iter()
+            .any(|topic| topic == "docker-deployment"));
+    }
+
+    #[test]
+    fn test_run_dedup_merge_variants_scans_across_topic_variants() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        store
+            .store(test_memory(
+                "Docker Deployment",
+                "compose setup",
+                "Use docker compose for the local stack",
+            ))
+            .unwrap();
+        store
+            .store(test_memory(
+                "docker-deployment",
+                "compose setup duplicate",
+                "Use docker compose for the local stack",
+            ))
+            .unwrap();
+
+        let (without_variants, _) = run_dedup(&store, &config, 0.70, true, false).unwrap();
+        let (with_variants, _) = run_dedup(&store, &config, 0.70, true, true).unwrap();
+
+        assert_eq!(without_variants, 0);
+        assert_eq!(with_variants, 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_consolidation_async_dry_run_reports_grouped_variants() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        store
+            .store(test_memory(
+                "query expansion strategy",
+                "strategy",
+                "Use LLM-based synonym expansion",
+            ))
+            .unwrap();
+        store
+            .store(test_memory(
+                "query-expansion-strategy",
+                "strategy duplicate",
+                "Prefer query rewrites with synonyms",
+            ))
+            .unwrap();
+
+        let groups = resolve_topic_groups(&store, None, &[], None, true, true).unwrap();
+        let report = run_consolidation_async(&store, &config, &groups, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(report.groups_processed, 1);
+        assert_eq!(report.memories_replaced, 2);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].memory_count, 2);
+        assert!(report.groups[0].created_id.is_none());
     }
 }

@@ -1,7 +1,9 @@
 use crate::config::ReinConfig;
 use crate::search::chunker::semantic_chunk;
 use crate::store::SqliteStore;
-use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source};
+use crate::types::{
+    Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+};
 
 /// Report summarizing a QMD migration run.
 pub struct MigrationReport {
@@ -96,9 +98,7 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
                     Err(e) => {
                         tracing::warn!("Embedding batch failed: {e}");
                         report.errors += 1;
-                        all_embeddings.extend(
-                            std::iter::repeat_with(Vec::new).take(batch.len()),
-                        );
+                        all_embeddings.extend(std::iter::repeat_with(Vec::new).take(batch.len()));
                     }
                 }
             }
@@ -129,6 +129,12 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
                 decay_lambda: config.decay.base_lambda * importance.decay_factor(),
                 access_count: 0,
                 superseded_by: None,
+                canonical_id: None,
+                support_count: 1,
+                merge_count: 0,
+                dedup_confidence: 1.0,
+                source_diversity: 1.0,
+                contradiction_score: 0.0,
                 related_ids: vec![],
                 concept_ids: vec![],
                 status: MemoryStatus::default(),
@@ -177,21 +183,21 @@ impl std::fmt::Display for ReindexReport {
 /// 1. Rebuilds the vector index (drops old vec_memories, creates new with current dims)
 /// 2. Fetches all memories and batch-embeds them
 /// 3. Clears the embed_cache (old model's cache)
-pub async fn reindex(
-    store: &SqliteStore,
-    config: &ReinConfig,
-) -> anyhow::Result<ReindexReport> {
+pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result<ReindexReport> {
     use crate::store::schema;
     use crate::types::Embedder as _;
 
     // 1. Validate embedder is available BEFORE touching the vector index
-    let embedder = crate::embed::create_embedder(config)
-        .ok_or_else(|| anyhow::anyhow!("no embedding provider configured (set provider and API key)"))?;
+    let embedder = crate::embed::create_embedder(config).ok_or_else(|| {
+        anyhow::anyhow!("no embedding provider configured (set provider and API key)")
+    })?;
 
     // 2. Health check: test embed one string to verify the API works
     let test_result = embedder.embed("health check").await;
     if let Err(e) = test_result {
-        return Err(anyhow::anyhow!("embedding health check failed: {e}. Vector index NOT modified."));
+        return Err(anyhow::anyhow!(
+            "embedding health check failed: {e}. Vector index NOT modified."
+        ));
     }
 
     // 3. Now safe to rebuild vector index
@@ -209,7 +215,9 @@ pub async fn reindex(
         .conn()
         .prepare("SELECT id, topic, summary, content FROM memories")?;
     let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -238,7 +246,11 @@ pub async fn reindex(
         match embedder.embed_batch(&text_refs).await {
             Ok(embs) => {
                 if embs.len() != chunk.len() {
-                    tracing::warn!("batch returned {} embeddings for {} inputs, skipping batch", embs.len(), chunk.len());
+                    tracing::warn!(
+                        "batch returned {} embeddings for {} inputs, skipping batch",
+                        embs.len(),
+                        chunk.len()
+                    );
                     errors += chunk.len();
                     continue;
                 }
@@ -310,8 +322,12 @@ mod tests {
             ).unwrap();
             conn.execute(
                 "INSERT INTO content (hash, doc) VALUES (?1, ?2)",
-                rusqlite::params!["hash2", "Second document about Rust programming. Memory management is important."],
-            ).unwrap();
+                rusqlite::params![
+                    "hash2",
+                    "Second document about Rust programming. Memory management is important."
+                ],
+            )
+            .unwrap();
 
             conn.execute(
                 "INSERT INTO documents (id, collection, path, title, hash, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -338,9 +354,14 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
 
-        let report = migrate_from_qmd(qmd_path, &store, &config, None::<&crate::embed::EmbedderKind>)
-            .await
-            .unwrap();
+        let report = migrate_from_qmd(
+            qmd_path,
+            &store,
+            &config,
+            None::<&crate::embed::EmbedderKind>,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.documents_read, 2);
         assert!(

@@ -9,8 +9,7 @@ impl EmbedCache {
     /// `model` is included in the hash so different models don't share cache entries.
     pub fn get(conn: &Connection, query: &str, model: &str) -> ReinResult<Option<Vec<f32>>> {
         let hash = Self::hash_query(model, query);
-        let mut stmt =
-            conn.prepare("SELECT embedding FROM embed_cache WHERE query_hash = ?1")?;
+        let mut stmt = conn.prepare("SELECT embedding FROM embed_cache WHERE query_hash = ?1")?;
         let result = stmt.query_row([&hash], |row| {
             let blob: Vec<u8> = row.get(0)?;
             Ok(blob)
@@ -34,9 +33,9 @@ impl EmbedCache {
             "INSERT OR REPLACE INTO embed_cache (query_hash, embedding, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![hash, blob, now],
         )?;
-        let count: usize = conn.query_row(
-            "SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0)
-        ).unwrap_or(0);
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))
+            .unwrap_or(0);
         // TTL cleanup: when cache is moderately full, remove stale entries
         if count > 5_000 {
             let _ = Self::cleanup(conn, 30);
@@ -111,7 +110,9 @@ mod tests {
         }
 
         EmbedCache::put(&conn, "test query", "test-model", &vec).unwrap();
-        let result = EmbedCache::get(&conn, "test query", "test-model").unwrap().unwrap();
+        let result = EmbedCache::get(&conn, "test query", "test-model")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.len(), 3072);
         for (a, b) in vec.iter().zip(result.iter()) {

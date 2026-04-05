@@ -32,7 +32,12 @@ struct GeminiReranker {
 
 impl GeminiReranker {
     fn new(api_key: String, endpoint: String, model: String) -> Self {
-        Self { client: crate::search::cache::http_client_15s(), api_key, endpoint, model }
+        Self {
+            client: crate::search::cache::http_client_15s(),
+            api_key,
+            endpoint,
+            model,
+        }
     }
 
     async fn rerank(&self, query: &str, candidates: &[(Memory, f32)]) -> ReinResult<Vec<f32>> {
@@ -53,7 +58,9 @@ impl GeminiReranker {
             }
         });
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
@@ -69,12 +76,14 @@ impl GeminiReranker {
             )));
         }
 
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
 
         let content = parsed["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
-            .ok_or_else(|| ReinError::Extract("missing candidates[0].content.parts[0].text".into()))?;
+            .ok_or_else(|| {
+                ReinError::Extract("missing candidates[0].content.parts[0].text".into())
+            })?;
 
         parse_rerank_response(content, candidates.len())
     }
@@ -93,15 +102,17 @@ struct OmlxReranker {
 
 impl OmlxReranker {
     fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
-        Self { client: crate::search::cache::http_client_20s(), endpoint, model, disable_thinking }
+        Self {
+            client: crate::search::cache::http_client_20s(),
+            endpoint,
+            model,
+            disable_thinking,
+        }
     }
 
     async fn rerank(&self, query: &str, candidates: &[(Memory, f32)]) -> ReinResult<Vec<f32>> {
         let memories_text = format_candidates(candidates);
-        let user_msg = format!(
-            "Query: \"{}\"\n\nMemories:\n{}",
-            query, memories_text
-        );
+        let user_msg = format!("Query: \"{}\"\n\nMemories:\n{}", query, memories_text);
         let url = format!("{}/chat/completions", self.endpoint);
         let disable_thinking = self.disable_thinking;
         let make_body = |use_json_mode: bool| {
@@ -128,19 +139,27 @@ impl OmlxReranker {
             Ok(resp) if resp.status().is_success() => resp.text().await?,
             _ => {
                 tracing::info!("OMLX rerank JSON mode failed, retrying without response_format");
-                let resp = self.client.post(&url).json(&make_body(false)).send().await?;
+                let resp = self
+                    .client
+                    .post(&url)
+                    .json(&make_body(false))
+                    .send()
+                    .await?;
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
                     let truncated: String = body.chars().take(500).collect();
-                    return Err(ReinError::Extract(format!("OMLX rerank API returned {}: {truncated}", status)));
+                    return Err(ReinError::Extract(format!(
+                        "OMLX rerank API returned {}: {truncated}",
+                        status
+                    )));
                 }
                 body
             }
         };
 
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
 
         let content = parsed["choices"][0]["message"]["content"]
             .as_str()
@@ -194,11 +213,7 @@ fn create_reranker(config: &ReinConfig) -> Option<RerankerKind> {
 
 /// Rerank candidates using LLM. Returns new scores aligned with input order.
 /// Falls back to original scores on failure.
-pub fn rerank_with_llm(
-    config: &ReinConfig,
-    query: &str,
-    candidates: &[(Memory, f32)],
-) -> Vec<f32> {
+pub fn rerank_with_llm(config: &ReinConfig, query: &str, candidates: &[(Memory, f32)]) -> Vec<f32> {
     let reranker = match create_reranker(config) {
         Some(r) => r,
         None => return candidates.iter().map(|(_, s)| *s).collect(),
@@ -208,7 +223,10 @@ pub fn rerank_with_llm(
 
     // Check in-memory cache (key = query + candidate IDs in input order — order matters
     // because the cached score vector is positionally aligned with the candidate list)
-    let id_parts: Vec<&str> = candidates[..top_n].iter().map(|(m, _)| m.id.as_str()).collect();
+    let id_parts: Vec<&str> = candidates[..top_n]
+        .iter()
+        .map(|(m, _)| m.id.as_str())
+        .collect();
     let mut key_parts: Vec<&str> = vec![query];
     key_parts.extend(id_parts.iter());
     let cache_k = crate::search::cache::cache_key(&key_parts);
@@ -226,7 +244,9 @@ pub fn rerank_with_llm(
     let rerank_start = std::time::Instant::now();
 
     let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(reranker.rerank(query, &candidates[..top_n])))
+        tokio::task::block_in_place(|| {
+            handle.block_on(reranker.rerank(query, &candidates[..top_n]))
+        })
     } else {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -269,14 +289,23 @@ pub fn rerank_with_llm(
 // ---------------------------------------------------------------------------
 
 fn format_candidates(candidates: &[(Memory, f32)]) -> String {
-    candidates.iter().enumerate().map(|(i, (mem, _score))| {
-        let preview: String = mem.content.chars().take(200).collect();
-        let date = mem.created_at.format("%Y-%m-%d");
-        format!(
-            "{}. [{}] {} (created: {}, accessed: {} times)",
-            i + 1, mem.topic, preview, date, mem.access_count
-        )
-    }).collect::<Vec<_>>().join("\n")
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(i, (mem, _score))| {
+            let preview: String = mem.content.chars().take(200).collect();
+            let date = mem.created_at.format("%Y-%m-%d");
+            format!(
+                "{}. [{}] {} (created: {}, accessed: {} times)",
+                i + 1,
+                mem.topic,
+                preview,
+                date,
+                mem.access_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_rerank_response(content: &str, expected_len: usize) -> ReinResult<Vec<f32>> {
@@ -290,10 +319,13 @@ fn parse_rerank_response(content: &str, expected_len: usize) -> ReinResult<Vec<f
     } else if let Some(arr) = parsed.as_array() {
         arr.clone()
     } else {
-        return Err(ReinError::Extract("rerank response must be {\"scores\": [...]} or [...]".into()));
+        return Err(ReinError::Extract(
+            "rerank response must be {\"scores\": [...]} or [...]".into(),
+        ));
     };
 
-    let scores: Vec<f32> = arr.iter()
+    let scores: Vec<f32> = arr
+        .iter()
         .map(|v| v.as_f64().unwrap_or(0.0) as f32)
         .map(|s| s.clamp(0.0, 1.0))
         .collect();
@@ -338,7 +370,8 @@ pub fn detect_strong_signal(fts_ranked: &[(String, f32)]) -> bool {
         return false;
     }
 
-    let mut scores: Vec<f32> = fts_ranked.iter()
+    let mut scores: Vec<f32> = fts_ranked
+        .iter()
         .map(|(_, s)| *s)
         .filter(|s| *s > 0.0) // Only positive Tantivy scores, not FTS5 rank sentinels
         .collect();
@@ -353,7 +386,12 @@ pub fn detect_strong_signal(fts_ranked: &[(String, f32)]) -> bool {
 
     // Strong signal: top1 is at least 1.5x the runner-up
     if top2 > 0.0 && top1 / top2 >= 1.5 {
-        tracing::debug!(top1, top2, ratio = top1 / top2, "strong BM25 signal detected");
+        tracing::debug!(
+            top1,
+            top2,
+            ratio = top1 / top2,
+            "strong BM25 signal detected"
+        );
         return true;
     }
 

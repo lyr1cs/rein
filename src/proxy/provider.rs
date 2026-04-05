@@ -91,26 +91,57 @@ mod tests {
 
     #[test]
     fn detect_only_exact_sampling_routes() {
-        assert_eq!(ProviderKind::detect("/v1/messages"), Some(ProviderKind::Anthropic));
+        assert_eq!(
+            ProviderKind::detect("/v1/messages"),
+            Some(ProviderKind::Anthropic)
+        );
         assert_eq!(ProviderKind::detect("/v1/messages/count_tokens"), None);
-        assert_eq!(ProviderKind::detect("/v1/chat/completions"), Some(ProviderKind::OpenAi));
+        assert_eq!(
+            ProviderKind::detect("/v1/chat/completions"),
+            Some(ProviderKind::OpenAi)
+        );
         assert_eq!(ProviderKind::detect("/v1/models"), None);
-        assert_eq!(ProviderKind::detect("/responses"), Some(ProviderKind::OpenAiResponses));
-        assert_eq!(ProviderKind::detect("/v1/responses"), Some(ProviderKind::OpenAiResponses));
+        assert_eq!(
+            ProviderKind::detect("/responses"),
+            Some(ProviderKind::OpenAiResponses)
+        );
+        assert_eq!(
+            ProviderKind::detect("/v1/responses"),
+            Some(ProviderKind::OpenAiResponses)
+        );
     }
 
     #[test]
     fn rewrite_path_responses_api() {
         let provider = ProviderKind::OpenAiResponses;
-        assert_eq!(provider.rewrite_path("/responses").as_ref(), "/v1/responses");
-        assert_eq!(provider.rewrite_path("/responses?stream=true").as_ref(), "/v1/responses?stream=true");
+        assert_eq!(
+            provider.rewrite_path("/responses").as_ref(),
+            "/v1/responses"
+        );
+        assert_eq!(
+            provider.rewrite_path("/responses?stream=true").as_ref(),
+            "/v1/responses?stream=true"
+        );
         // Already has /v1 prefix — no double rewrite
-        assert_eq!(provider.rewrite_path("/v1/responses").as_ref(), "/v1/responses");
+        assert_eq!(
+            provider.rewrite_path("/v1/responses").as_ref(),
+            "/v1/responses"
+        );
     }
 
     #[test]
     fn rewrite_path_other_providers_noop() {
-        assert_eq!(ProviderKind::Anthropic.rewrite_path("/v1/messages").as_ref(), "/v1/messages");
-        assert_eq!(ProviderKind::OpenAi.rewrite_path("/v1/chat/completions").as_ref(), "/v1/chat/completions");
+        assert_eq!(
+            ProviderKind::Anthropic
+                .rewrite_path("/v1/messages")
+                .as_ref(),
+            "/v1/messages"
+        );
+        assert_eq!(
+            ProviderKind::OpenAi
+                .rewrite_path("/v1/chat/completions")
+                .as_ref(),
+            "/v1/chat/completions"
+        );
     }
 }

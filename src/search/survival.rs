@@ -263,22 +263,33 @@ mod tests {
         // At t=5: 5 events have occurred out of 10 subjects
         // S(1) = 9/10, S(2) = 9/10 * 8/9 = 8/10, ..., S(5) = 5/10 = 0.5
         let s5 = curve.probability_at(5.0);
-        assert!(
-            (s5 - 0.5).abs() < 1e-6,
-            "S(5) should be ~0.5, got {}",
-            s5
-        );
+        assert!((s5 - 0.5).abs() < 1e-6, "S(5) should be ~0.5, got {}", s5);
     }
 
     #[test]
     fn test_kaplan_meier_with_censoring() {
         // Mix of events and censored observations
         let intervals = vec![
-            SurvivalInterval { duration_days: 1.0, is_event: true },
-            SurvivalInterval { duration_days: 2.0, is_event: false }, // censored
-            SurvivalInterval { duration_days: 3.0, is_event: true },
-            SurvivalInterval { duration_days: 4.0, is_event: false }, // censored
-            SurvivalInterval { duration_days: 5.0, is_event: true },
+            SurvivalInterval {
+                duration_days: 1.0,
+                is_event: true,
+            },
+            SurvivalInterval {
+                duration_days: 2.0,
+                is_event: false,
+            }, // censored
+            SurvivalInterval {
+                duration_days: 3.0,
+                is_event: true,
+            },
+            SurvivalInterval {
+                duration_days: 4.0,
+                is_event: false,
+            }, // censored
+            SurvivalInterval {
+                duration_days: 5.0,
+                is_event: true,
+            },
         ];
 
         let curve = kaplan_meier(&intervals).unwrap();
@@ -291,11 +302,7 @@ mod tests {
         // t=4: censored, at_risk drops to 1
         // t=5: at_risk=1, events=1 → S = 0.5333 * 0/1 = 0.0
         let s1 = curve.probability_at(1.0);
-        assert!(
-            (s1 - 0.8).abs() < 1e-6,
-            "S(1) should be 0.8, got {}",
-            s1
-        );
+        assert!((s1 - 0.8).abs() < 1e-6, "S(1) should be 0.8, got {}", s1);
 
         let s3 = curve.probability_at(3.0);
         let expected = 0.8 * (2.0 / 3.0);
@@ -343,16 +350,31 @@ mod tests {
     fn test_probability_at_extrapolation() {
         // Use events + censored so the curve doesn't drop to 0.0
         let intervals = vec![
-            SurvivalInterval { duration_days: 1.0, is_event: true },
-            SurvivalInterval { duration_days: 3.0, is_event: true },
-            SurvivalInterval { duration_days: 5.0, is_event: false }, // censored keeps S > 0
-            SurvivalInterval { duration_days: 5.0, is_event: false },
+            SurvivalInterval {
+                duration_days: 1.0,
+                is_event: true,
+            },
+            SurvivalInterval {
+                duration_days: 3.0,
+                is_event: true,
+            },
+            SurvivalInterval {
+                duration_days: 5.0,
+                is_event: false,
+            }, // censored keeps S > 0
+            SurvivalInterval {
+                duration_days: 5.0,
+                is_event: false,
+            },
         ];
 
         let curve = kaplan_meier(&intervals).unwrap();
 
         let s_last_step = *curve.steps.last().map(|(_, p)| p).unwrap();
-        assert!(s_last_step > 0.0, "Last step should be > 0 for extrapolation test");
+        assert!(
+            s_last_step > 0.0,
+            "Last step should be > 0 for extrapolation test"
+        );
 
         // Beyond last observation, extrapolation should still decrease
         let s_beyond = curve.probability_at(20.0);
@@ -530,8 +552,14 @@ mod tests {
     fn test_median_survival_none_when_never_below_half() {
         // All censored: curve never drops, so no median
         let intervals = vec![
-            SurvivalInterval { duration_days: 1.0, is_event: false },
-            SurvivalInterval { duration_days: 2.0, is_event: false },
+            SurvivalInterval {
+                duration_days: 1.0,
+                is_event: false,
+            },
+            SurvivalInterval {
+                duration_days: 2.0,
+                is_event: false,
+            },
         ];
 
         let curve = kaplan_meier(&intervals).unwrap();
@@ -554,7 +582,10 @@ mod tests {
         let intervals = access_times_to_intervals(&times, now);
 
         assert_eq!(intervals.len(), 1);
-        assert!(!intervals[0].is_event, "Single access should produce censored interval");
+        assert!(
+            !intervals[0].is_event,
+            "Single access should produce censored interval"
+        );
         assert!(
             (intervals[0].duration_days - 3.0).abs() < 0.01,
             "Duration should be ~3 days"
