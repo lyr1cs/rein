@@ -105,6 +105,9 @@ rein serve
 | `hook prompt` | Compatibility no-op for UserPromptSubmit | `rein hook prompt` |
 | `hook stop` | Full knowledge extraction on session end | `rein hook stop` |
 | `worker memory` | Drain the async memory queue | `rein worker memory` |
+| `dashboard` | Show service status, metrics, memory stats | `rein dashboard` |
+| `gui on/off` | Start/stop GUI server in background | `rein gui on` |
+| `proxy on/off` | Start/stop proxy in background | `rein proxy on` |
 
 ### MCP Tools
 
@@ -802,10 +805,13 @@ rein serve
 | `hook prompt` | 自动注入已取消，仅保留命令入口 | `rein hook prompt` |
 | `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
 | `worker memory` | 清空异步记忆队列 | `rein worker memory` |
+| `dashboard` | 显示服务状态、指标、记忆统计 | `rein dashboard` |
+| `gui on/off` | 后台启动/停止 GUI 服务 | `rein gui on` |
+| `proxy on/off` | 后台启动/停止 proxy 服务 | `rein proxy on` |
 
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），共暴露 22 个工具。
+以 MCP 服务运行时（`rein serve`），共暴露 25 个工具。
 
 #### 核心工具（12 个）
 
