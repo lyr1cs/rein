@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
@@ -10,6 +10,7 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, TantivyDocument};
 pub struct TantivyFts {
     index: Index,
     reader: IndexReader,
+    dirty_marker_path: PathBuf,
     id_field: Field,
     topic_field: Field,
     topic_exact_field: Field,
@@ -67,6 +68,7 @@ impl TantivyFts {
         Ok(Self {
             index,
             reader,
+            dirty_marker_path: index_path.join(".dirty"),
             id_field,
             topic_field,
             topic_exact_field,
@@ -77,7 +79,8 @@ impl TantivyFts {
     }
 
     /// Index a memory document. Replaces any existing doc with the same ID.
-    /// If another process holds the writer lock, silently skips (side index, not critical).
+    /// If another process holds the writer lock, mark the index dirty so the next
+    /// recall/warmup can rebuild it.
     pub fn insert(
         &self,
         id: &str,
@@ -89,7 +92,8 @@ impl TantivyFts {
         let mut writer: IndexWriter = match self.index.writer(15_000_000) {
             Ok(w) => w,
             Err(tantivy::TantivyError::LockFailure(..)) => {
-                tracing::debug!("tantivy writer locked by another process, skipping insert");
+                self.mark_dirty();
+                tracing::debug!("tantivy writer locked by another process, marking index dirty");
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -178,12 +182,14 @@ impl TantivyFts {
     }
 
     /// Delete a document by memory ID.
-    /// If another process holds the writer lock, silently skips.
+    /// If another process holds the writer lock, mark the index dirty so it can
+    /// be rebuilt later.
     pub fn delete(&self, id: &str) -> Result<(), tantivy::TantivyError> {
         let mut writer: IndexWriter = match self.index.writer(15_000_000) {
             Ok(w) => w,
             Err(tantivy::TantivyError::LockFailure(..)) => {
-                tracing::debug!("tantivy writer locked by another process, skipping delete");
+                self.mark_dirty();
+                tracing::debug!("tantivy writer locked by another process, marking index dirty");
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -192,6 +198,10 @@ impl TantivyFts {
         writer.delete_term(term);
         writer.commit()?;
         Ok(())
+    }
+
+    fn mark_dirty(&self) {
+        let _ = std::fs::write(&self.dirty_marker_path, b"dirty");
     }
 }
 

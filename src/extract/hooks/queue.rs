@@ -1,6 +1,7 @@
 //! Async memory queue for record-only proxy and hooks.
 
 use crate::config::ReinConfig;
+use crate::extract::hooks::parsing::redact_secrets;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -102,6 +103,8 @@ fn _queue_memory_job(
     artifact_id: Option<String>,
     session_json: Option<String>,
 ) -> anyhow::Result<()> {
+    let text = redact_secrets(&text);
+    let source_query = source_query.map(|q| redact_secrets(&q));
     if text.trim().is_empty() {
         return Ok(());
     }
@@ -116,29 +119,27 @@ fn _queue_memory_job(
         source_query.as_deref(),
         &text,
     )?;
-
-    if suppress_duplicate_event(
-        config,
-        source,
-        &agent_label,
-        is_subagent,
-        source_query.as_deref(),
-        &text,
-    )? {
-        let mut stats = load_worker_stats(config);
-        stats.suppressed_duplicates += 1;
-        let _ = save_worker_stats(config, &stats);
-        return Ok(());
-    }
-
-    // Also check pending queue for similar jobs (prevents cross-session duplicates
-    // that fall outside the fingerprint_window_ms).
-    // A Full job is never suppressed by a Quick job (Full produces concepts/links/episodes).
-    // Note: TOCTOU race possible here — duplicates caught downstream by dedup pipeline.
     let path = queue_path(config);
-    if let Ok(queue_content) = std::fs::read_to_string(&path) {
+    with_advisory_lock(&lock_path(config), true, || {
+        if suppress_duplicate_event(
+            config,
+            source,
+            &agent_label,
+            is_subagent,
+            source_query.as_deref(),
+            &text,
+        )? {
+            let mut stats = load_worker_stats(config);
+            stats.suppressed_duplicates += 1;
+            let _ = save_worker_stats(config, &stats);
+            return Ok(());
+        }
+
+        // Also check pending queue for similar jobs (prevents cross-session duplicates
+        // that fall outside the fingerprint_window_ms).
         let preview: String = text.chars().take(500).collect();
         let is_full = matches!(mode, MemoryJobMode::Full);
+        let queue_content = std::fs::read_to_string(&path).unwrap_or_default();
         for line in queue_content.lines().rev().take(50) {
             if let Ok(existing) = serde_json::from_str::<MemoryJob>(line) {
                 // Don't suppress a Full job if existing is Quick.
@@ -150,33 +151,27 @@ fn _queue_memory_job(
                 }
             }
         }
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let job = MemoryJob {
-        id: ulid::Ulid::new().to_string(),
-        mode,
-        source: source.to_string(),
-        source_label: source_label.to_string(),
-        agent_label,
-        is_subagent,
-        priority,
-        source_query,
-        text,
-        artifact_id,
-        session_json,
-        attempts: 0,
-        next_attempt_at: None,
-        created_at: Utc::now().to_rfc3339(),
-    };
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    writeln!(file, "{}", serde_json::to_string(&job)?)?;
-    Ok(())
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let job = MemoryJob {
+            id: ulid::Ulid::new().to_string(),
+            mode,
+            source: source.to_string(),
+            source_label: source_label.to_string(),
+            agent_label,
+            is_subagent,
+            priority,
+            source_query,
+            text,
+            artifact_id,
+            session_json,
+            attempts: 0,
+            next_attempt_at: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        append_jsonl(&path, &serde_json::to_string(&job)?)
+    })
 }
 
 pub fn spawn_memory_worker(config: &ReinConfig) {
@@ -567,13 +562,7 @@ fn append_raw_archive(
         "text": text,
         "created_at": Utc::now().to_rfc3339(),
     });
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
-    Ok(())
+    append_jsonl(&path, &serde_json::to_string(&payload)?)
 }
 
 fn suppress_duplicate_event(
@@ -673,6 +662,62 @@ fn sha256_hex(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn append_jsonl(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = std::path::PathBuf::from(format!("{}.lock", path.display()));
+    with_advisory_lock(&lock_path, true, || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    })
+}
+
+fn with_advisory_lock<T, F>(
+    lock_path: &std::path::Path,
+    blocking: bool,
+    f: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mode = if blocking {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_EX | libc::LOCK_NB
+        };
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), mode) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let result = f();
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    drop(lock_file);
+    result
 }
 
 #[cfg(test)]

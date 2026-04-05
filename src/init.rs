@@ -112,7 +112,7 @@ const PROXY_ALIASES: &[(&str, &str)] = &[
     ),
     (
         "codexp",
-        r#"alias codexp="REIN_PROXY_ACTIVE=1 OPENAI_BASE_URL=http://127.0.0.1:8690 codex""#,
+        r#"alias codexp="REIN_PROXY_ACTIVE=1 codex -c 'openai_base_url=\"http://127.0.0.1:8690\"'""#,
     ),
 ];
 

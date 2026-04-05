@@ -162,16 +162,15 @@ pub fn store_extracted_report(
             config.search.dedup_similarity as f32,
             config.search.dedup_time_window_days,
         ) {
-            let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
-            let _ = store.activate_related_memories(&content_for_activation, 3);
-            let _ = store.activate_related_concepts(&content_for_activation);
-            let _ = store.apply_evolution(&id, &content_for_activation, None);
-
             stats.stored_ids.push(id.clone());
             stats.stored_count += 1;
             if id != proposed_id {
                 stats.merged_count += 1;
             } else {
+                let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
+                let _ = store.activate_related_memories(&content_for_activation, 3);
+                let _ = store.activate_related_concepts(&content_for_activation);
+                let _ = store.apply_evolution(&id, &content_for_activation, None);
                 let superseded_rows: u32 = store
                     .conn()
                     .query_row(

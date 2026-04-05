@@ -1,5 +1,8 @@
 //! Payload parsing for Claude Code hook JSON formats.
 
+use regex::Regex;
+use std::sync::OnceLock;
+
 /// Check if a line likely contains secrets
 pub fn looks_like_secret(line: &str) -> bool {
     let lower = line.to_lowercase();
@@ -13,6 +16,57 @@ pub fn looks_like_secret(line: &str) -> bool {
         "-----begin", "-----end",
     ];
     patterns.iter().any(|p| lower.contains(p))
+        || secret_redactors().iter().any(|pair| pair.0.is_match(line))
+}
+
+/// Redact obvious secrets from free-form text before persistence or display.
+pub fn redact_secrets(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for (re, replacement) in secret_redactors().iter() {
+        redacted = re.replace_all(&redacted, *replacement).into_owned();
+    }
+    redacted
+}
+
+fn secret_redactors() -> &'static Vec<(Regex, &'static str)> {
+    static REDACTORS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    REDACTORS.get_or_init(|| {
+        vec![
+            (
+                Regex::new(r"(?is)-----BEGIN [^-]+-----.*?-----END [^-]+-----").unwrap(),
+                "[REDACTED_PEM_BLOCK]",
+            ),
+            (
+                Regex::new(r"(?i)\b(authorization\s*:\s*bearer)\s+[^\s]+").unwrap(),
+                "$1 [REDACTED]",
+            ),
+            (
+                Regex::new(r#"(?i)\b((?:api[_-]?key|token|secret|password)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s]+)"#).unwrap(),
+                "$1[REDACTED]",
+            ),
+            (
+                Regex::new(r"(?i)\b(export\s+(?:gemini_api_key|supermemory_cc_api_key|rein_http_token|openai_api_key)\s*=\s*)[^\s]+").unwrap(),
+                "$1[REDACTED]",
+            ),
+            (Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}\b").unwrap(), "[REDACTED_API_KEY]"),
+            (
+                Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(),
+                "[REDACTED_GITHUB_TOKEN]",
+            ),
+            (
+                Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b").unwrap(),
+                "[REDACTED_GITHUB_TOKEN]",
+            ),
+            (Regex::new(r"\bhf_[A-Za-z]{20,}\b").unwrap(), "[REDACTED_HF_TOKEN]"),
+            (Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(), "[REDACTED_AWS_KEY]"),
+            (Regex::new(r"\bAIza[0-9A-Za-z\-_]{20,}\b").unwrap(), "[REDACTED_GCP_KEY]"),
+            (
+                Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b").unwrap(),
+                "[REDACTED_SLACK_TOKEN]",
+            ),
+            (Regex::new(r"\bsm_[A-Za-z0-9_-]{20,}\b").unwrap(), "[REDACTED_SM_TOKEN]"),
+        ]
+    })
 }
 
 /// Returns the subagent identifier if the hook fired inside a subagent.
@@ -279,4 +333,25 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{looks_like_secret, redact_secrets};
+
+    #[test]
+    fn redact_masks_assignment_and_bearer_values() {
+        let input = "authorization: Bearer sk-secret-12345678901234567890\nOPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz1234567890";
+        let output = redact_secrets(input);
+        assert!(!output.contains("sk-secret-12345678901234567890"));
+        assert!(!output.contains("sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"));
+        assert!(output.contains("[REDACTED]") || output.contains("[REDACTED_API_KEY]"));
+    }
+
+    #[test]
+    fn secret_detection_catches_known_token_formats() {
+        assert!(looks_like_secret("Authorization: Bearer sk-abcdefghijklmnopqrstuvwx1234567890"));
+        assert!(looks_like_secret("github_pat_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(!looks_like_secret("We chose PostgreSQL for the billing database."));
+    }
 }
