@@ -6,7 +6,7 @@ use crate::config::ReinConfig;
 use crate::extract::llm::{EpisodeSummary, ExtractedConcept, ExtractedMemory};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
 
 const MIN_SELECT_SCORE: f32 = 0.32;
 
@@ -452,14 +452,16 @@ fn looks_like_smalltalk(text: &str) -> bool {
 }
 
 fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut hasher = Sha256::new();
-    hasher.update(cwd.to_string_lossy().as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    super::buffer::resolve_buffer_dir(config).join(format!("{prefix}_{}.json", &digest[..12]))
+    let base = super::buffer::resolve_buffer_dir(config);
+    let db_tag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        config.resolve_db_path().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let queue_dir = base.join("queue").join(&db_tag);
+    let _ = std::fs::create_dir_all(&queue_dir);
+    queue_dir.join(format!("{prefix}.json"))
 }
 
 #[cfg(test)]

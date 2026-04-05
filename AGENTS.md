@@ -2,13 +2,13 @@
 
 ## Overview
 
-rein v0.11.1 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 25 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
+rein v0.13.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 26 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (242+)
+cargo test            # All tests must pass (300+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 docker build -t rein . # Docker image (~165MB)
@@ -18,10 +18,15 @@ docker build -t rein . # Docker image (~165MB)
 
 ```
 src/
-├── main.rs          # CLI entry point (clap subcommands, 20 commands)
+├── main.rs          # CLI entry point (clap subcommands, 20+ commands)
+├── commands.rs      # CLI command handler bodies (extracted from main.rs)
 ├── lib.rs           # Public API re-exports
 ├── config.rs        # Configuration loading (TOML + env), includes [extract] section
-├── ops.rs           # Shared business logic (build_memory, store_memory, gc, upgrade)
+├── ops/             # Shared business logic (modularized)
+│   ├── mod.rs       # Ingestion, GC, topic utilities, re-exports
+│   ├── adaptive.rs  # M2-M6 adaptive pipeline, alpha learning, clustering, tiering
+│   ├── dedup.rs     # Dedup strategies, merge, batch dedup (cluster-grouped)
+│   └── consolidation.rs # Topic consolidation, cleanup orchestration
 ├── init.rs          # Auto-configure MCP clients (JSON + TOML)
 ├── types/           # Memory, Importance, Embedder trait, errors (incl. Extract variant)
 ├── store/
