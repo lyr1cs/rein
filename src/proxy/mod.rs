@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,6 @@ impl ProxyMetrics {
 
 struct ProxyState {
     metrics: ProxyMetrics,
-    extraction_permits: Arc<Semaphore>,
 }
 
 /// Start the transparent proxy server.
@@ -104,9 +103,6 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 
     let state = Arc::new(ProxyState {
         metrics: ProxyMetrics::new(),
-        extraction_permits: Arc::new(Semaphore::new(
-            config.proxy.max_concurrent_extractions.max(1),
-        )),
     });
 
     // Graceful shutdown: stop accept loop on ctrl-c.
@@ -346,22 +342,32 @@ async fn handle_request(
         }
     }
 
-    // Read full request body.
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            tracing::warn!("failed to read request body: {e}");
-            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
-            return Ok(error_response(400, "failed to read request body"));
+    // Read request body incrementally with size cap (handles chunked TE too).
+    let max_body = config.proxy.max_request_body;
+    let mut body_buf = Vec::new();
+    let mut body_stream = req.into_body();
+    loop {
+        let frame = match body_stream.frame().await {
+            Some(Ok(f)) => f,
+            Some(Err(e)) => {
+                tracing::warn!("failed to read request body: {e}");
+                state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(error_response(400, "failed to read request body"));
+            }
+            None => break,
+        };
+        if let Some(data) = frame.data_ref() {
+            body_buf.extend_from_slice(data);
+            if body_buf.len() > max_body {
+                state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(error_response(413, "request body too large"));
+            }
         }
-    };
+    }
+    let body_bytes = Bytes::from(body_buf);
 
     // Log request details.
     let body_size = body_bytes.len();
-    if body_size > config.proxy.max_request_body {
-        state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
-        return Ok(error_response(413, "request body too large"));
-    }
     eprintln!("rein proxy: {method} {path_and_query} ({body_size} bytes)");
 
     // If not a known sampling endpoint, passthrough unmodified.
@@ -485,27 +491,21 @@ async fn handle_request(
     }
 }
 
-/// Attempt to spawn an extraction task, respecting the concurrency semaphore.
+/// Spawn an extraction task. extract_and_store only appends to a durable
+/// file-based queue (cheap I/O), so no concurrency limiting is needed here.
+/// Actual LLM extraction happens in the background worker with its own rate limiting.
 fn maybe_spawn_extraction(
     config: &ReinConfig,
     state: &Arc<ProxyState>,
     query: Option<String>,
     text: String,
 ) {
-    let permit = match Arc::clone(&state.extraction_permits).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            tracing::warn!("proxy extraction skipped: concurrency limit reached");
-            return;
-        }
-    };
     state
         .metrics
         .extraction_count
         .fetch_add(1, Ordering::Relaxed);
     let cfg = config.clone();
     tokio::spawn(async move {
-        let _permit = permit;
         extract::extract_and_store(&cfg, query, text).await;
     });
 }
@@ -657,12 +657,13 @@ async fn forward_raw(
             let mut resp_bytes = Vec::new();
             let mut stream = resp.bytes_stream();
             use futures_util::StreamExt;
+            let mut exceeded = false;
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(c) => {
                         resp_bytes.extend_from_slice(&c);
                         if resp_bytes.len() > max_raw {
-                            tracing::warn!("forward_raw: response exceeded {max_raw} bytes, truncating");
+                            exceeded = true;
                             break;
                         }
                     }
@@ -671,6 +672,10 @@ async fn forward_raw(
                         return Ok(error_response(502, "upstream read failed"));
                     }
                 }
+            }
+            if exceeded {
+                tracing::warn!("forward_raw: response exceeded {max_raw} bytes, returning 502");
+                return Ok(error_response(502, "upstream response too large"));
             }
             let resp_body = Bytes::from(resp_bytes);
 

@@ -3,7 +3,9 @@ target/
 .claude/*.local.md
 .claude/*.log
 reviews/
-reviews
 bench/results*.jsonl
 bench/results*.jsonl.*
 __pycache__/
+.superpowers/
+gui/dist/
+gui/node_modules/

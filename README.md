@@ -108,7 +108,7 @@ rein serve
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 24 tools are exposed.
+When running as an MCP server (`rein serve`), 25 tools are exposed.
 
 #### Core Tools (12)
 
@@ -562,7 +562,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
                             |
                    +--------+--------+
                    |                 |
-               CLI (20 cmds)  MCP Server (24 tools)
+               CLI (20 cmds)  MCP Server (25 tools)
                    |                 |
                    +--------+--------+
                             |
