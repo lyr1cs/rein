@@ -13,15 +13,14 @@ pub fn search_concepts_ranked(
     query: &str,
     limit: usize,
 ) -> Vec<(String, f32)> {
-    let concepts = store.search_all_concepts(query, limit * 2).unwrap_or_default();
+    let concepts = store
+        .search_all_concepts(query, limit * 2)
+        .unwrap_or_default();
     search_concepts_ranked_from(&concepts, limit)
 }
 
 /// Score memory IDs from pre-fetched concepts (avoids redundant FTS query).
-pub fn search_concepts_ranked_from(
-    concepts: &[Concept],
-    limit: usize,
-) -> Vec<(String, f32)> {
+pub fn search_concepts_ranked_from(concepts: &[Concept], limit: usize) -> Vec<(String, f32)> {
     if concepts.is_empty() {
         return vec![];
     }
@@ -64,7 +63,13 @@ pub fn bfs_expand_memories_by_id(
         }
     }
 
-    bfs_core(store, &mut visited, &mut memory_scores, &mut frontier, max_hops);
+    bfs_core(
+        store,
+        &mut visited,
+        &mut memory_scores,
+        &mut frontier,
+        max_hops,
+    );
 
     let mut ranked: Vec<(String, f32)> = memory_scores.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -96,7 +101,13 @@ pub fn bfs_expand_memories(
         }
     }
 
-    bfs_core(store, &mut visited, &mut memory_scores, &mut frontier, max_hops);
+    bfs_core(
+        store,
+        &mut visited,
+        &mut memory_scores,
+        &mut frontier,
+        max_hops,
+    );
 
     let mut ranked: Vec<(String, f32)> = memory_scores.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -125,10 +136,14 @@ fn bfs_core(
         let links = store.get_links_from(&concept_id).unwrap_or_default();
         for link in links {
             if let Some(valid_from) = link.valid_from {
-                if now < valid_from { continue; }
+                if now < valid_from {
+                    continue;
+                }
             }
             if let Some(valid_until) = link.valid_until {
-                if now > valid_until { continue; }
+                if now > valid_until {
+                    continue;
+                }
             }
             if visited.insert(link.target_id.clone()) {
                 let hop_score = 1.0 / (1.0 + (depth + 1) as f32);

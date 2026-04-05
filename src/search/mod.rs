@@ -1,9 +1,9 @@
 pub mod alpha_optimizer;
 pub mod cache;
-pub mod expand;
-pub mod kg_search;
 pub mod chunker;
 pub mod classify;
+pub mod expand;
+pub mod kg_search;
 pub mod recall;
 pub mod rerank;
 pub mod rerank_llm;

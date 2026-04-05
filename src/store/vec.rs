@@ -13,7 +13,10 @@ pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinR
 
 /// Delete an embedding vector for a memory.
 pub fn delete_embedding(conn: &Connection, id: &str) -> ReinResult<()> {
-    conn.execute("DELETE FROM vec_memories WHERE id = ?1", rusqlite::params![id])?;
+    conn.execute(
+        "DELETE FROM vec_memories WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
     Ok(())
 }
 
@@ -40,8 +43,5 @@ pub fn search_vec(
 }
 
 fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
-    embedding
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect()
+    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }

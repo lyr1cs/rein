@@ -211,7 +211,11 @@ mod tests {
     fn test_chunk_by_heading() {
         let text = "## Introduction\nThis is the intro.\n\n## Methods\nThese are the methods.\n\n## Results\nHere are results.";
         let chunks = semantic_chunk(text, 512, 0);
-        assert!(chunks.len() >= 3, "Should split by headings, got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "Should split by headings, got {} chunks",
+            chunks.len()
+        );
         assert!(chunks[0].contains("Introduction"));
         assert!(chunks[1].contains("Methods"));
         assert!(chunks[2].contains("Results"));
@@ -223,7 +227,11 @@ mod tests {
         let sentence = "This is a test sentence that should be used to fill up content. ";
         let text = sentence.repeat(50); // ~3200 chars = ~800 tokens
         let chunks = semantic_chunk(&text, 512, 0);
-        assert!(chunks.len() > 1, "Long text should produce multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "Long text should produce multiple chunks, got {}",
+            chunks.len()
+        );
         for chunk in &chunks {
             assert!(
                 chunk.len() <= 512 * 4 + 100, // allow small margin for sentence boundaries
@@ -260,7 +268,10 @@ mod tests {
             // Each chunk should end with a sentence-ending punctuation or be the last chunk
             let trimmed = chunk.trim();
             assert!(
-                trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') || trimmed == chunks.last().unwrap().trim(),
+                trimmed.ends_with('.')
+                    || trimmed.ends_with('!')
+                    || trimmed.ends_with('?')
+                    || trimmed == chunks.last().unwrap().trim(),
                 "Chunk should end at sentence boundary: '{}'",
                 trimmed
             );

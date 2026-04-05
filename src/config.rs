@@ -119,10 +119,18 @@ pub struct SearchConfig {
     pub llm_reranker_top_n: usize,
 }
 
-fn default_fusion_method() -> String { "rrf".to_string() }
-fn default_cc_alpha() -> f64 { 0.5 }
-fn default_llm_reranker() -> String { "none".to_string() }
-fn default_llm_reranker_top_n() -> usize { 15 }
+fn default_fusion_method() -> String {
+    "rrf".to_string()
+}
+fn default_cc_alpha() -> f64 {
+    0.5
+}
+fn default_llm_reranker() -> String {
+    "none".to_string()
+}
+fn default_llm_reranker_top_n() -> usize {
+    15
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -178,13 +186,27 @@ pub struct AdaptiveConfig {
     pub shrinkage_prior: f64,
 }
 
-fn default_adaptive_enabled() -> bool { true }
-fn default_min_samples_alpha() -> usize { 10 }
-fn default_survival_cold_start() -> usize { 20 }
-fn default_tier_cold_start() -> usize { 100 }
-fn default_event_retention_days() -> u64 { 90 }
-fn default_alpha_max_step() -> f64 { 0.15 }
-fn default_shrinkage_prior() -> f64 { 5.0 }
+fn default_adaptive_enabled() -> bool {
+    true
+}
+fn default_min_samples_alpha() -> usize {
+    10
+}
+fn default_survival_cold_start() -> usize {
+    20
+}
+fn default_tier_cold_start() -> usize {
+    100
+}
+fn default_event_retention_days() -> u64 {
+    90
+}
+fn default_alpha_max_step() -> f64 {
+    0.15
+}
+fn default_shrinkage_prior() -> f64 {
+    5.0
+}
 
 impl Default for AdaptiveConfig {
     fn default() -> Self {
@@ -344,8 +366,12 @@ pub struct QueryExpansionConfig {
     pub omlx: OmlxExpandConfig,
 }
 
-fn default_expand_provider() -> String { "google".to_string() }
-fn default_max_expansions() -> usize { 3 }
+fn default_expand_provider() -> String {
+    "google".to_string()
+}
+fn default_max_expansions() -> usize {
+    3
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,12 +404,13 @@ fn default_omlx_expand_endpoint() -> String {
     "http://localhost:8000/v1".to_string()
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Default implementations
 // ---------------------------------------------------------------------------
-
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
@@ -545,19 +572,60 @@ impl Default for HooksConfig {
 fn default_signal_keywords() -> Vec<String> {
     vec![
         // English
-        "decided", "chose", "architecture", "design", "pattern",
-        "bug", "fix", "fixed", "resolved", "error", "crash",
-        "installed", "deployed", "migrated",
-        "important", "remember", "solution", "tradeoff",
-        "upgrade", "deprecated", "workflow", "released",
-        "because", "reason", "switched", "selected", "prefer",
-        "root cause", "workaround", "conclusion",
+        "decided",
+        "chose",
+        "architecture",
+        "design",
+        "pattern",
+        "bug",
+        "fix",
+        "fixed",
+        "resolved",
+        "error",
+        "crash",
+        "installed",
+        "deployed",
+        "migrated",
+        "important",
+        "remember",
+        "solution",
+        "tradeoff",
+        "upgrade",
+        "deprecated",
+        "workflow",
+        "released",
+        "because",
+        "reason",
+        "switched",
+        "selected",
+        "prefer",
+        "root cause",
+        "workaround",
+        "conclusion",
         // Chinese (for matching Chinese conversation content)
-        "决策", "选型", "架构", "设计", "模式",
-        "修复", "解决", "安装", "部署", "迁移",
-        "重要", "记住", "记录", "方案", "权衡",
-        "升级", "废弃", "流程", "发布",
-    ].into_iter().map(String::from).collect()
+        "决策",
+        "选型",
+        "架构",
+        "设计",
+        "模式",
+        "修复",
+        "解决",
+        "安装",
+        "部署",
+        "迁移",
+        "重要",
+        "记住",
+        "记录",
+        "方案",
+        "权衡",
+        "升级",
+        "废弃",
+        "流程",
+        "发布",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 impl Default for ExtractConfig {
@@ -656,9 +724,7 @@ impl ReinConfig {
         // Determine config file path
         let config_path = std::env::var("REIN_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_config_path()
-            });
+            .unwrap_or_else(|_| dirs_config_path());
 
         // Merge TOML file if it exists
         if config_path.exists() {
@@ -769,7 +835,10 @@ impl ReinConfig {
                 }
             }
             Provider::Omlx => {
-                eprintln!("rein: using OMLX embedding backend at {}", self.embedding.omlx.endpoint);
+                eprintln!(
+                    "rein: using OMLX embedding backend at {}",
+                    self.embedding.omlx.endpoint
+                );
             }
             Provider::None => {}
         }
@@ -783,7 +852,10 @@ impl ReinConfig {
                 }
             }
             Provider::Omlx => {
-                eprintln!("rein: using OMLX extract backend at {}", self.extract.omlx.endpoint);
+                eprintln!(
+                    "rein: using OMLX extract backend at {}",
+                    self.extract.omlx.endpoint
+                );
             }
             Provider::None => {}
         }
@@ -794,7 +866,10 @@ impl ReinConfig {
                 }
             }
             Provider::Omlx => {
-                eprintln!("rein: using OMLX query expansion backend at {}", self.query_expansion.omlx.endpoint);
+                eprintln!(
+                    "rein: using OMLX query expansion backend at {}",
+                    self.query_expansion.omlx.endpoint
+                );
             }
             Provider::None => {}
         }
@@ -824,7 +899,11 @@ impl ReinConfig {
                     if old_path.exists() {
                         std::fs::create_dir_all(&new_dir).ok();
                         if std::fs::rename(&old_path, &new_path).is_ok() {
-                            eprintln!("rein: migrated database from {} to {}", old_path.display(), new_path.display());
+                            eprintln!(
+                                "rein: migrated database from {} to {}",
+                                old_path.display(),
+                                new_path.display()
+                            );
                         }
                     }
                 }
@@ -841,18 +920,16 @@ impl ReinConfig {
 fn validate_provider_name(field: &str, value: &str) -> anyhow::Result<()> {
     match value.to_lowercase().as_str() {
         "google" | "omlx" | "none" => Ok(()),
-        _ => anyhow::bail!(
-            "invalid {field}='{value}'. Expected one of: google, omlx, none"
-        ),
+        _ => anyhow::bail!("invalid {field}='{value}'. Expected one of: google, omlx, none"),
     }
 }
 
 fn validate_provider_name_or_inherit(field: &str, value: &str) -> anyhow::Result<()> {
     match value.to_lowercase().as_str() {
         "inherit" | "google" | "omlx" | "none" => Ok(()),
-        _ => anyhow::bail!(
-            "invalid {field}='{value}'. Expected one of: inherit, google, omlx, none"
-        ),
+        _ => {
+            anyhow::bail!("invalid {field}='{value}'. Expected one of: inherit, google, omlx, none")
+        }
     }
 }
 
@@ -892,7 +969,8 @@ fn serde_to_value(config: &ReinConfig) -> anyhow::Result<toml::Value> {
     let mut val: toml::Value = toml::from_str(default_str)?;
 
     // Patch fields that may differ from the embedded default (e.g., api_key)
-    if let Some(tbl) = val.get_mut("embedding")
+    if let Some(tbl) = val
+        .get_mut("embedding")
         .and_then(|v| v.get_mut("google"))
         .and_then(|v| v.as_table_mut())
     {
@@ -905,7 +983,8 @@ fn serde_to_value(config: &ReinConfig) -> anyhow::Result<toml::Value> {
             tbl.insert("api_key".to_string(), toml::Value::String(key.clone()));
         }
     }
-    if let Some(tbl) = val.get_mut("extract")
+    if let Some(tbl) = val
+        .get_mut("extract")
         .and_then(|v| v.get_mut("google"))
         .and_then(|v| v.as_table_mut())
     {
@@ -913,7 +992,8 @@ fn serde_to_value(config: &ReinConfig) -> anyhow::Result<toml::Value> {
             tbl.insert("api_key".to_string(), toml::Value::String(key.clone()));
         }
     }
-    if let Some(tbl) = val.get_mut("query_expansion")
+    if let Some(tbl) = val
+        .get_mut("query_expansion")
         .and_then(|v| v.get_mut("google"))
         .and_then(|v| v.as_table_mut())
     {
@@ -924,7 +1004,10 @@ fn serde_to_value(config: &ReinConfig) -> anyhow::Result<toml::Value> {
 
     // Patch database path
     if let Some(tbl) = val.get_mut("database").and_then(|v| v.as_table_mut()) {
-        tbl.insert("path".to_string(), toml::Value::String(config.database.path.clone()));
+        tbl.insert(
+            "path".to_string(),
+            toml::Value::String(config.database.path.clone()),
+        );
     }
 
     Ok(val)
@@ -1015,7 +1098,10 @@ rrf_k = 30.0
         let mut config = ReinConfig::default();
         // Custom path should be returned as-is
         config.database.path = "/custom/path/test.db".to_string();
-        assert_eq!(config.resolve_db_path(), std::path::PathBuf::from("/custom/path/test.db"));
+        assert_eq!(
+            config.resolve_db_path(),
+            std::path::PathBuf::from("/custom/path/test.db")
+        );
     }
 
     #[test]

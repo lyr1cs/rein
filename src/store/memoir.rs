@@ -512,12 +512,21 @@ impl SqliteStore {
     /// Returns (groups_merged, concepts_removed).
     pub fn dedup_concepts(&self) -> ReinResult<(usize, usize)> {
         // Collect all concepts grouped by (memoir_id, normalized_name)
-        let mut stmt = self.conn().prepare("SELECT * FROM concepts ORDER BY created_at ASC")?;
-        let all: Vec<Concept> = stmt.query_map([], |row| {
-            row_to_concept(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT * FROM concepts ORDER BY created_at ASC")?;
+        let all: Vec<Concept> = stmt
+            .query_map([], |row| {
+                row_to_concept(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         // Group by (memoir_id, normalized_name)
         let mut groups: std::collections::HashMap<(String, String), Vec<Concept>> =
@@ -530,12 +539,15 @@ impl SqliteStore {
         let mut groups_merged = 0usize;
         let mut concepts_removed = 0usize;
 
-        self.conn().execute_batch("SAVEPOINT dedup_concepts")
+        self.conn()
+            .execute_batch("SAVEPOINT dedup_concepts")
             .map_err(ReinError::Database)?;
 
         let result = (|| -> ReinResult<()> {
             for ((_memoir_id, _norm), group) in &groups {
-                if group.len() <= 1 { continue; }
+                if group.len() <= 1 {
+                    continue;
+                }
 
                 // Canonical = first (oldest by created_at since we sorted)
                 let canonical = &group[0];
@@ -617,7 +629,8 @@ impl SqliteStore {
 
         match &result {
             Ok(_) => {
-                self.conn().execute_batch("RELEASE dedup_concepts")
+                self.conn()
+                    .execute_batch("RELEASE dedup_concepts")
                     .map_err(ReinError::Database)?;
             }
             Err(_) => {
@@ -1189,7 +1202,9 @@ impl SqliteStore {
         let scan_limit = limit.max(20) * 10;
         let episodes = match (from, to) {
             (Some(from), Some(to)) => self.get_episodes_in_range(from, to)?,
-            (Some(from), None) => self.get_episodes_in_range(from, Utc::now() + chrono::Duration::days(1))?,
+            (Some(from), None) => {
+                self.get_episodes_in_range(from, Utc::now() + chrono::Duration::days(1))?
+            }
             (None, Some(to)) => self.get_episodes_in_range(
                 chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
                     .unwrap()
@@ -1288,7 +1303,10 @@ impl SqliteStore {
             } else {
                 0.0
             };
-            ranked.push((episode, score + recency * 0.3 + structural + main_agent_boost));
+            ranked.push((
+                episode,
+                score + recency * 0.3 + structural + main_agent_boost,
+            ));
         }
 
         ranked.sort_by(|a, b| {
@@ -1899,8 +1917,16 @@ mod tests {
     #[test]
     fn test_get_concept_normalized_lookup() {
         let store = SqliteStore::in_memory().unwrap();
-        store.create_memoir(make_memoir("arch", "Architecture")).unwrap();
-        store.add_concept(make_concept("arch", "Adaptive Engine", "The adaptive engine")).unwrap();
+        store
+            .create_memoir(make_memoir("arch", "Architecture"))
+            .unwrap();
+        store
+            .add_concept(make_concept(
+                "arch",
+                "Adaptive Engine",
+                "The adaptive engine",
+            ))
+            .unwrap();
 
         // Exact match
         let c = store.get_concept("arch", "Adaptive Engine").unwrap();
@@ -1922,20 +1948,35 @@ mod tests {
     #[test]
     fn test_dedup_concepts() {
         let store = SqliteStore::in_memory().unwrap();
-        store.create_memoir(make_memoir("arch", "Architecture")).unwrap();
+        store
+            .create_memoir(make_memoir("arch", "Architecture"))
+            .unwrap();
 
         // Insert duplicates with different name formats
-        store.add_concept(make_concept("arch", "Adaptive Engine", "The engine v1")).unwrap();
-        store.add_concept(make_concept("arch", "adaptive-engine", "The engine v2 longer def")).unwrap();
-        store.add_concept(make_concept("arch", "adaptive_engine", "v3")).unwrap();
+        store
+            .add_concept(make_concept("arch", "Adaptive Engine", "The engine v1"))
+            .unwrap();
+        store
+            .add_concept(make_concept(
+                "arch",
+                "adaptive-engine",
+                "The engine v2 longer def",
+            ))
+            .unwrap();
+        store
+            .add_concept(make_concept("arch", "adaptive_engine", "v3"))
+            .unwrap();
 
         // Also a non-duplicate
-        store.add_concept(make_concept("arch", "SQLite Store", "The store")).unwrap();
+        store
+            .add_concept(make_concept("arch", "SQLite Store", "The store"))
+            .unwrap();
 
         // Verify 4 concepts exist before dedup
-        let count: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM concepts", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM concepts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 4);
 
         let (groups, removed) = store.dedup_concepts().unwrap();
@@ -1943,13 +1984,17 @@ mod tests {
         assert_eq!(removed, 2);
 
         // Should have 2 concepts left
-        let count: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM concepts", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM concepts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 2);
 
         // Canonical should have the longest definition
-        let canonical = store.get_concept("arch", "adaptive-engine").unwrap().unwrap();
+        let canonical = store
+            .get_concept("arch", "adaptive-engine")
+            .unwrap()
+            .unwrap();
         assert_eq!(canonical.definition, "The engine v2 longer def");
     }
 }

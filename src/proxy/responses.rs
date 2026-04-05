@@ -183,11 +183,9 @@ mod tests {
 
     #[test]
     fn test_extract_sse_delta() {
-        let chunk = "data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"Hello\"}}\n\n";
-        assert_eq!(
-            extract_assistant_text_sse(chunk),
-            Some("Hello".to_string())
-        );
+        let chunk =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":{\"text\":\"Hello\"}}\n\n";
+        assert_eq!(extract_assistant_text_sse(chunk), Some("Hello".to_string()));
     }
 
     #[test]

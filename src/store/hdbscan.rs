@@ -90,7 +90,6 @@ struct MstEdge {
     weight: f32,
 }
 
-
 // ---------------------------------------------------------------------------
 // Core algorithm
 // ---------------------------------------------------------------------------
@@ -102,7 +101,10 @@ fn compute_core_distances(dist_matrix: &[Vec<f32>], min_samples: usize) -> Vec<f
     let k = min_samples.min(n.saturating_sub(1));
     let mut core = vec![0.0f32; n];
     for i in 0..n {
-        let mut dists: Vec<f32> = (0..n).filter(|&j| j != i).map(|j| dist_matrix[i][j]).collect();
+        let mut dists: Vec<f32> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| dist_matrix[i][j])
+            .collect();
         dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         core[i] = if k == 0 { 0.0 } else { dists[k - 1] };
     }
@@ -157,8 +159,7 @@ fn build_mst(dist_matrix: &[Vec<f32>], core_dists: &[f32]) -> Vec<MstEdge> {
 
         for j in 0..n {
             if !in_tree[j] {
-                let w =
-                    mutual_reachability(core_dists[best], core_dists[j], dist_matrix[best][j]);
+                let w = mutual_reachability(core_dists[best], core_dists[j], dist_matrix[best][j]);
                 if w < min_weight[j] {
                     min_weight[j] = w;
                     nearest[j] = best;
@@ -288,10 +289,10 @@ impl UnionFind {
 /// Leaf nodes (index < n) are individual points.
 /// Internal nodes (index >= n) represent merges.
 struct DendrogramNode {
-    left: usize,    // left child index (point or internal node)
-    right: usize,   // right child index
-    distance: f32,  // merge distance (mutual reachability)
-    _size: usize,    // total points in this subtree
+    left: usize,   // left child index (point or internal node)
+    right: usize,  // right child index
+    distance: f32, // merge distance (mutual reachability)
+    _size: usize,  // total points in this subtree
 }
 
 /// Build a single-linkage dendrogram from sorted MST edges.
@@ -306,7 +307,9 @@ fn build_dendrogram(edges: &[MstEdge], n: usize) -> (Vec<DendrogramNode>, usize)
     for edge in edges {
         let ra = uf.find(edge.u);
         let rb = uf.find(edge.v);
-        if ra == rb { continue; }
+        if ra == rb {
+            continue;
+        }
 
         let left = node_of[ra];
         let right = node_of[rb];
@@ -380,11 +383,17 @@ fn build_condensed_tree(
             return (None, vec![]);
         }
         let dnode = &dendro[dendro_idx];
-        let lambda = if dnode.distance > 0.0 { 1.0 / dnode.distance as f64 } else { f64::MAX };
+        let lambda = if dnode.distance > 0.0 {
+            1.0 / dnode.distance as f64
+        } else {
+            f64::MAX
+        };
 
         // Recurse into children
-        let (left_cluster, left_points) = traverse(dendro, n, dnode.left, min_cluster_size, clusters, lambda);
-        let (right_cluster, right_points) = traverse(dendro, n, dnode.right, min_cluster_size, clusters, lambda);
+        let (left_cluster, left_points) =
+            traverse(dendro, n, dnode.left, min_cluster_size, clusters, lambda);
+        let (right_cluster, right_points) =
+            traverse(dendro, n, dnode.right, min_cluster_size, clusters, lambda);
 
         let left_size = left_points.len();
         let right_size = right_points.len();
@@ -472,7 +481,8 @@ fn build_condensed_tree(
         }
     }
 
-    let (_root_cluster, _all_points) = traverse(dendro, n, root, min_cluster_size, &mut clusters, 0.0);
+    let (_root_cluster, _all_points) =
+        traverse(dendro, n, root, min_cluster_size, &mut clusters, 0.0);
     clusters
 }
 
@@ -490,11 +500,21 @@ fn build_condensed_tree(
 /// where n_surviving = leaf_points count (points alive from birth to death).
 fn compute_stability(clusters: &mut [CondensedCluster]) {
     // Find max lambda: highest density level observed
-    let lambda_max = clusters.iter()
+    let lambda_max = clusters
+        .iter()
         .flat_map(|c| c.fell_out.iter().map(|&(_, l)| l))
-        .chain(clusters.iter().map(|c| c.lambda_death).filter(|&l| l > 0.0 && l.is_finite()))
+        .chain(
+            clusters
+                .iter()
+                .map(|c| c.lambda_death)
+                .filter(|&l| l > 0.0 && l.is_finite()),
+        )
         .fold(0.0f64, f64::max);
-    let lambda_max = if lambda_max.is_finite() && lambda_max > 0.0 { lambda_max } else { 1.0 };
+    let lambda_max = if lambda_max.is_finite() && lambda_max > 0.0 {
+        lambda_max
+    } else {
+        1.0
+    };
 
     for c in clusters.iter_mut() {
         // Ensure lambda_death is set
@@ -508,7 +528,11 @@ fn compute_stability(clusters: &mut [CondensedCluster]) {
 
         // Points that fell out: each contributes (lambda_fell - lambda_birth)
         for &(_, lambda_fell) in &c.fell_out {
-            let lf = if lambda_fell.is_finite() { lambda_fell } else { death };
+            let lf = if lambda_fell.is_finite() {
+                lambda_fell
+            } else {
+                death
+            };
             stab += (lf - birth).max(0.0);
         }
 
@@ -550,7 +574,9 @@ fn eombst_select(clusters: &[CondensedCluster]) -> Vec<bool> {
     // select parent and deselect children
     for i in 0..n {
         if !clusters[i].children.is_empty() {
-            let children_stab: f64 = clusters[i].children.iter()
+            let children_stab: f64 = clusters[i]
+                .children
+                .iter()
                 .map(|&c| effective_stability[c])
                 .sum();
             if effective_stability[i] > children_stab {
@@ -613,7 +639,11 @@ fn build_condensed_tree_and_extract(
         return (Vec::new(), vec![None; n]);
     }
     if edges.is_empty() {
-        let c = Cluster { id: 0, member_indices: (0..n).collect(), stability: 0.0 };
+        let c = Cluster {
+            id: 0,
+            member_indices: (0..n).collect(),
+            stability: 0.0,
+        };
         return (vec![c], vec![Some(0); n]);
     }
 
@@ -626,7 +656,11 @@ fn build_condensed_tree_and_extract(
     if condensed.is_empty() {
         // No splits found — all points in one cluster or all noise
         if n >= min_cluster_size {
-            let c = Cluster { id: 0, member_indices: (0..n).collect(), stability: 0.0 };
+            let c = Cluster {
+                id: 0,
+                member_indices: (0..n).collect(),
+                stability: 0.0,
+            };
             return (vec![c], vec![Some(0); n]);
         } else {
             return (Vec::new(), vec![None; n]);
@@ -645,12 +679,16 @@ fn build_condensed_tree_and_extract(
     let mut cid = 0u32;
 
     for (i, &sel) in selected.iter().enumerate() {
-        if !sel { continue; }
+        if !sel {
+            continue;
+        }
         let mut members = gather_points(&condensed, i, &selected);
         members.sort();
         members.dedup();
 
-        if members.len() < min_cluster_size { continue; }
+        if members.len() < min_cluster_size {
+            continue;
+        }
 
         for &m in &members {
             if labels[m].is_none() {
@@ -702,7 +740,12 @@ pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> Hd
 
     // For large datasets, sample + cluster + propagate labels to avoid O(n^2) OOM
     if n > HDBSCAN_FULL_MATRIX_LIMIT {
-        return hdbscan_sampled(embeddings, min_cluster_size, None, HDBSCAN_FULL_MATRIX_LIMIT);
+        return hdbscan_sampled(
+            embeddings,
+            min_cluster_size,
+            None,
+            HDBSCAN_FULL_MATRIX_LIMIT,
+        );
     }
 
     let mcs = min_cluster_size.max(2);
@@ -747,7 +790,12 @@ pub fn hdbscan_with_params(
 
     // OOM protection: route to sampled path for large datasets
     if n > HDBSCAN_FULL_MATRIX_LIMIT {
-        return hdbscan_sampled(embeddings, min_cluster_size, min_samples, HDBSCAN_FULL_MATRIX_LIMIT);
+        return hdbscan_sampled(
+            embeddings,
+            min_cluster_size,
+            min_samples,
+            HDBSCAN_FULL_MATRIX_LIMIT,
+        );
     }
 
     let mcs = min_cluster_size.max(2);
@@ -804,11 +852,7 @@ pub fn hdbscan_approximate(
     let mut core_dists = vec![0.0f32; n];
     for i in 0..n {
         let k = ms.min(knn_lists[i].len());
-        core_dists[i] = if k == 0 {
-            0.0
-        } else {
-            knn_lists[i][k - 1].1
-        };
+        core_dists[i] = if k == 0 { 0.0 } else { knn_lists[i][k - 1].1 };
     }
 
     let mst = build_mst_approximate(knn_lists, &core_dists, n);
@@ -958,7 +1002,9 @@ fn hdbscan_sampled(
     // Then, assign remaining points to nearest cluster centroid
     let sampled_set: HashSet<usize> = sample_indices.iter().copied().collect();
     for i in 0..n {
-        if sampled_set.contains(&i) { continue; }
+        if sampled_set.contains(&i) {
+            continue;
+        }
         labels[i] = assign_to_nearest(
             &embeddings[i].1,
             &sample_result.clusters,
@@ -967,7 +1013,12 @@ fn hdbscan_sampled(
     }
 
     // Rebuild clusters with all points
-    let max_cluster_id = sample_result.clusters.iter().map(|c| c.id).max().unwrap_or(0);
+    let max_cluster_id = sample_result
+        .clusters
+        .iter()
+        .map(|c| c.id)
+        .max()
+        .unwrap_or(0);
     let mut cluster_members: Vec<Vec<usize>> = vec![Vec::new(); (max_cluster_id + 1) as usize];
     let mut noise_indices = Vec::new();
 
@@ -988,7 +1039,9 @@ fn hdbscan_sampled(
         .filter(|(_, members)| !members.is_empty())
         .map(|(id, members)| {
             // Use the sample cluster's stability as a proxy
-            let stability = sample_result.clusters.iter()
+            let stability = sample_result
+                .clusters
+                .iter()
                 .find(|c| c.id == id as u32)
                 .map(|c| c.stability)
                 .unwrap_or(0.0);
@@ -1160,13 +1213,22 @@ mod tests {
         let label_c = group_c.iter().find_map(|l| *l);
 
         if let (Some(la), Some(lb)) = (label_a, label_b) {
-            assert_ne!(la, lb, "Groups A and B should have different cluster labels");
+            assert_ne!(
+                la, lb,
+                "Groups A and B should have different cluster labels"
+            );
         }
         if let (Some(la), Some(lc)) = (label_a, label_c) {
-            assert_ne!(la, lc, "Groups A and C should have different cluster labels");
+            assert_ne!(
+                la, lc,
+                "Groups A and C should have different cluster labels"
+            );
         }
         if let (Some(lb), Some(lc)) = (label_b, label_c) {
-            assert_ne!(lb, lc, "Groups B and C should have different cluster labels");
+            assert_ne!(
+                lb, lc,
+                "Groups B and C should have different cluster labels"
+            );
         }
     }
 
@@ -1200,10 +1262,7 @@ mod tests {
             result.labels
         );
 
-        let labelled_in_groups: usize = result.labels[0..20]
-            .iter()
-            .filter(|l| l.is_some())
-            .count();
+        let labelled_in_groups: usize = result.labels[0..20].iter().filter(|l| l.is_some()).count();
         assert!(
             labelled_in_groups >= 14,
             "Expected most of the 20 group points to be clustered, got {}",
@@ -1337,18 +1396,31 @@ mod tests {
         let mut embeddings = Vec::new();
         // Create 20 points in 2 clusters (test the sampling path with smaller data)
         for i in 0..10 {
-            embeddings.push((format!("a{i}"), make_cluster(&mut rng, &center_a, 1, 0.2).remove(0)));
+            embeddings.push((
+                format!("a{i}"),
+                make_cluster(&mut rng, &center_a, 1, 0.2).remove(0),
+            ));
         }
         for i in 0..10 {
-            embeddings.push((format!("b{i}"), make_cluster(&mut rng, &center_b, 1, 0.2).remove(0)));
+            embeddings.push((
+                format!("b{i}"),
+                make_cluster(&mut rng, &center_b, 1, 0.2).remove(0),
+            ));
         }
 
         // Test that hdbscan_sampled produces labels for ALL points
         let result = hdbscan_sampled(&embeddings, 3, None, 10);
-        assert_eq!(result.labels.len(), 20, "Should have labels for all 20 points");
+        assert_eq!(
+            result.labels.len(),
+            20,
+            "Should have labels for all 20 points"
+        );
 
         // At least some points should be clustered (not all noise)
         let clustered = result.labels.iter().filter(|l| l.is_some()).count();
-        assert!(clustered > 0, "Sampled HDBSCAN should assign some points to clusters");
+        assert!(
+            clustered > 0,
+            "Sampled HDBSCAN should assign some points to clusters"
+        );
     }
 }

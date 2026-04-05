@@ -30,7 +30,6 @@ pub enum MemoryTier {
     Cold,
 }
 
-
 impl std::fmt::Display for MemoryTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -102,12 +101,15 @@ impl QuantileEstimator {
             // Use nonce from global counter to avoid identical seeds in concurrent instances
             static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-            let accept = pseudo_random(self.total_seen.wrapping_add(nonce)) % self.total_seen < self.max_samples;
+            let accept = pseudo_random(self.total_seen.wrapping_add(nonce)) % self.total_seen
+                < self.max_samples;
             if accept {
                 // Replace a random existing entry.
-                let idx = pseudo_random(self.total_seen.wrapping_mul(7).wrapping_add(nonce)) % self.max_samples;
+                let idx = pseudo_random(self.total_seen.wrapping_mul(7).wrapping_add(nonce))
+                    % self.max_samples;
                 self.samples[idx] = value;
-                self.samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                self.samples
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             }
         }
     }
@@ -225,11 +227,7 @@ impl TierBoundaries {
     /// cluster average is below the cold threshold the memory is demoted to
     /// Cold. This prevents isolated low-access memories in otherwise active
     /// topic clusters from being incorrectly cooled.
-    pub fn tier_for_with_cluster(
-        &self,
-        access_rate: f64,
-        cluster_avg_rate: f64,
-    ) -> MemoryTier {
+    pub fn tier_for_with_cluster(&self, access_rate: f64, cluster_avg_rate: f64) -> MemoryTier {
         let base = self.tier_for(access_rate);
         match base {
             MemoryTier::Warm => {
@@ -280,7 +278,10 @@ impl MigrationTracker {
     /// Returns `true` when the same tier has been proposed for **two
     /// consecutive** calls (i.e., migration should proceed).
     pub fn signal(&mut self, memory_id: &str, proposed_tier: MemoryTier) -> bool {
-        let entry = self.pending.entry(memory_id.to_owned()).or_insert((proposed_tier, 0));
+        let entry = self
+            .pending
+            .entry(memory_id.to_owned())
+            .or_insert((proposed_tier, 0));
 
         if entry.0 == proposed_tier {
             entry.1 += 1;
@@ -313,10 +314,7 @@ impl Default for MigrationTracker {
 ///
 /// Defined as `access_count / max(1, days_since_creation)` so that very
 /// recent memories do not receive an inflated rate.
-pub fn compute_access_rate(
-    access_count: u32,
-    created_at: chrono::DateTime<chrono::Utc>,
-) -> f64 {
+pub fn compute_access_rate(access_count: u32, created_at: chrono::DateTime<chrono::Utc>) -> f64 {
     let days = (Utc::now() - created_at).num_days().max(1) as f64;
     access_count as f64 / days
 }
@@ -433,10 +431,7 @@ mod tests {
 
         // 50 is Warm by itself, but cluster average 90 should promote to Hot.
         assert_eq!(tb.tier_for(50.0), MemoryTier::Warm);
-        assert_eq!(
-            tb.tier_for_with_cluster(50.0, 90.0),
-            MemoryTier::Hot,
-        );
+        assert_eq!(tb.tier_for_with_cluster(50.0, 90.0), MemoryTier::Hot,);
     }
 
     #[test]
@@ -446,10 +441,7 @@ mod tests {
         tb.update(&rates);
 
         // 50 is Warm by itself, cluster average 5 should demote to Cold.
-        assert_eq!(
-            tb.tier_for_with_cluster(50.0, 5.0),
-            MemoryTier::Cold,
-        );
+        assert_eq!(tb.tier_for_with_cluster(50.0, 5.0), MemoryTier::Cold,);
     }
 
     #[test]
@@ -459,10 +451,7 @@ mod tests {
         tb.update(&rates);
 
         // Hot stays Hot regardless of cluster.
-        assert_eq!(
-            tb.tier_for_with_cluster(95.0, 5.0),
-            MemoryTier::Hot,
-        );
+        assert_eq!(tb.tier_for_with_cluster(95.0, 5.0), MemoryTier::Hot,);
     }
 
     // -- MigrationTracker ---------------------------------------------------

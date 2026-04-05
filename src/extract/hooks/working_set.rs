@@ -80,7 +80,10 @@ pub fn update_working_set(
         if err.raw_os_error() == Some(libc::EINTR) {
             continue; // interrupted by signal, retry
         }
-        tracing::warn!("working_set: flock failed: {}, proceeding without lock", err);
+        tracing::warn!(
+            "working_set: flock failed: {}, proceeding without lock",
+            err
+        );
         break;
     }
 
@@ -143,7 +146,10 @@ pub fn update_always_on_index(
         if err.raw_os_error() == Some(libc::EINTR) {
             continue;
         }
-        tracing::warn!("always_on_index: flock failed: {}, proceeding without lock", err);
+        tracing::warn!(
+            "always_on_index: flock failed: {}, proceeding without lock",
+            err
+        );
         break;
     }
 
@@ -208,11 +214,14 @@ fn build_items(
 
     for memory in memories {
         let summary = compact(&memory.summary, 120);
-        let detail = compact(if memory.content.trim().is_empty() {
-            &memory.summary
-        } else {
-            &memory.content
-        }, 220);
+        let detail = compact(
+            if memory.content.trim().is_empty() {
+                &memory.summary
+            } else {
+                &memory.content
+            },
+            220,
+        );
         if detail.is_empty() {
             continue;
         }
@@ -251,7 +260,10 @@ fn build_items(
         } else {
             format!(" Decisions: {}", ep.decisions.join("; "))
         };
-        let detail = compact(&format!("{} Outcome: {}{}", ep.title, ep.outcome, decisions), 220);
+        let detail = compact(
+            &format!("{} Outcome: {}{}", ep.title, ep.outcome, decisions),
+            220,
+        );
         if !detail.is_empty() {
             items.push(WorkingSetItem {
                 kind: "episode".to_string(),
@@ -281,10 +293,20 @@ fn build_always_on_items(
 
     for memory in memories {
         let topic = memory.topic.to_lowercase();
-        let importance_high = matches!(memory.importance.to_lowercase().as_str(), "high" | "critical");
-        let stable_topic = ["architecture", "decision", "design", "workflow", "config", "user_preference"]
-            .iter()
-            .any(|k| topic.contains(k));
+        let importance_high = matches!(
+            memory.importance.to_lowercase().as_str(),
+            "high" | "critical"
+        );
+        let stable_topic = [
+            "architecture",
+            "decision",
+            "design",
+            "workflow",
+            "config",
+            "user_preference",
+        ]
+        .iter()
+        .any(|k| topic.contains(k));
         if !importance_high && !stable_topic && memory.quality_confidence < 0.7 {
             continue;
         }
@@ -332,7 +354,10 @@ fn build_always_on_items(
                 kind: "always_on_episode".to_string(),
                 topic: "session".to_string(),
                 summary: compact(&ep.title, 110),
-                detail: compact(&format!("{} Decisions: {}", ep.outcome, ep.decisions.join("; ")), 180),
+                detail: compact(
+                    &format!("{} Decisions: {}", ep.outcome, ep.decisions.join("; ")),
+                    180,
+                ),
                 agent_label: agent_label.to_string(),
                 is_subagent,
                 score: 0.7,
@@ -398,11 +423,27 @@ fn compact(text: &str, max_chars: usize) -> String {
 fn looks_like_smalltalk(text: &str) -> bool {
     let lower = text.to_lowercase();
     let phrases = [
-        "hi", "hello", "hey", "thanks", "thank you", "你好", "您好", "哈喽", "嗨", "谢谢",
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "你好",
+        "您好",
+        "哈喽",
+        "嗨",
+        "谢谢",
     ];
     let normalized = lower
         .chars()
-        .map(|ch| if ch.is_alphanumeric() || ch.is_whitespace() || ('\u{4e00}'..='\u{9fff}').contains(&ch) { ch } else { ' ' })
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+            {
+                ch
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -429,8 +470,26 @@ mod tests {
     fn merge_dedups_similar_items() {
         let now = Utc::now();
         let items = vec![
-            WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "a".into(), detail: "fixed sqlite locking".into(), agent_label: "claude-code".into(), is_subagent: false, score: 0.7, updated_at: now },
-            WorkingSetItem { kind: "memory".into(), topic: "debug".into(), summary: "b".into(), detail: "fixed sqlite locking issue".into(), agent_label: "claude-code".into(), is_subagent: false, score: 0.9, updated_at: now },
+            WorkingSetItem {
+                kind: "memory".into(),
+                topic: "debug".into(),
+                summary: "a".into(),
+                detail: "fixed sqlite locking".into(),
+                agent_label: "claude-code".into(),
+                is_subagent: false,
+                score: 0.7,
+                updated_at: now,
+            },
+            WorkingSetItem {
+                kind: "memory".into(),
+                topic: "debug".into(),
+                summary: "b".into(),
+                detail: "fixed sqlite locking issue".into(),
+                agent_label: "claude-code".into(),
+                is_subagent: false,
+                score: 0.9,
+                updated_at: now,
+            },
         ];
         let merged = merge_items(items, 40);
         assert_eq!(merged.len(), 1);

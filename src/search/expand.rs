@@ -32,7 +32,12 @@ struct GeminiExpander {
 
 impl GeminiExpander {
     fn new(api_key: String, endpoint: String, model: String) -> Self {
-        Self { client: crate::search::cache::http_client_10s(), api_key, endpoint, model }
+        Self {
+            client: crate::search::cache::http_client_10s(),
+            api_key,
+            endpoint,
+            model,
+        }
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
@@ -52,7 +57,9 @@ impl GeminiExpander {
             }
         });
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
@@ -68,12 +75,14 @@ impl GeminiExpander {
             )));
         }
 
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
 
         let content = parsed["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
-            .ok_or_else(|| ReinError::Extract("missing candidates[0].content.parts[0].text".into()))?;
+            .ok_or_else(|| {
+                ReinError::Extract("missing candidates[0].content.parts[0].text".into())
+            })?;
 
         parse_expansion_response(content, max)
     }
@@ -92,7 +101,12 @@ struct OmlxExpander {
 
 impl OmlxExpander {
     fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
-        Self { client: crate::search::cache::http_client_15s(), endpoint, model, disable_thinking }
+        Self {
+            client: crate::search::cache::http_client_15s(),
+            endpoint,
+            model,
+            disable_thinking,
+        }
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
@@ -127,19 +141,27 @@ impl OmlxExpander {
             Ok(resp) if resp.status().is_success() => resp.text().await?,
             _ => {
                 tracing::info!("OMLX expand JSON mode failed, retrying without response_format");
-                let resp = self.client.post(&url).json(&make_body(false)).send().await?;
+                let resp = self
+                    .client
+                    .post(&url)
+                    .json(&make_body(false))
+                    .send()
+                    .await?;
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
                     let truncated: String = body.chars().take(500).collect();
-                    return Err(ReinError::Extract(format!("OMLX expand API returned {}: {truncated}", status)));
+                    return Err(ReinError::Extract(format!(
+                        "OMLX expand API returned {}: {truncated}",
+                        status
+                    )));
                 }
                 body
             }
         };
 
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
 
         let content = parsed["choices"][0]["message"]["content"]
             .as_str()
@@ -219,7 +241,9 @@ pub fn expand_query(config: &ReinConfig, query: &str, max_override: Option<usize
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| crate::types::error::ReinError::Extract(format!("failed to create runtime: {e}")));
+            .map_err(|e| {
+                crate::types::error::ReinError::Extract(format!("failed to create runtime: {e}"))
+            });
         match rt {
             Ok(rt) => rt.block_on(expander.expand(query, max)),
             Err(e) => Err(e),
@@ -272,7 +296,8 @@ fn parse_expansion_response(content: &str, max: usize) -> ReinResult<Vec<String>
         return Ok(vec![]);
     };
 
-    let expansions: Vec<String> = arr.iter()
+    let expansions: Vec<String> = arr
+        .iter()
         .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
         .filter(|s| !s.is_empty() && s.len() <= 200)
         .take(max)

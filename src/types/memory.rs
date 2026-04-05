@@ -20,6 +20,18 @@ pub struct Memory {
     pub decay_lambda: f64,
     pub access_count: u32,
     pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub canonical_id: Option<String>,
+    #[serde(default = "default_support_count")]
+    pub support_count: u32,
+    #[serde(default)]
+    pub merge_count: u32,
+    #[serde(default = "default_dedup_confidence")]
+    pub dedup_confidence: f32,
+    #[serde(default = "default_source_diversity")]
+    pub source_diversity: f32,
+    #[serde(default)]
+    pub contradiction_score: f32,
     pub related_ids: Vec<String>,
     /// IDs of concepts derived from this memory (Memory → Concept link)
     #[serde(default)]
@@ -39,6 +51,95 @@ pub struct Memory {
     pub last_accessed: DateTime<Utc>,
 }
 
+fn default_support_count() -> u32 {
+    1
+}
+
+fn default_dedup_confidence() -> f32 {
+    1.0
+}
+
+fn default_source_diversity() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupRelation {
+    Duplicate,
+    Update,
+    Related,
+    #[default]
+    Distinct,
+}
+
+impl DedupRelation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::Update => "update",
+            Self::Related => "related",
+            Self::Distinct => "distinct",
+        }
+    }
+}
+
+impl fmt::Display for DedupRelation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for DedupRelation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "duplicate" => Ok(Self::Duplicate),
+            "update" => Ok(Self::Update),
+            "related" => Ok(Self::Related),
+            "distinct" => Ok(Self::Distinct),
+            other => Err(format!("unknown dedup relation: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEvidence {
+    pub id: String,
+    pub canonical_id: String,
+    pub memory_id: Option<String>,
+    pub source_topic: String,
+    pub summary: String,
+    pub content: String,
+    pub keywords: Vec<String>,
+    pub source: Source,
+    pub created_at: DateTime<Utc>,
+    pub imported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupDecision {
+    pub id: String,
+    pub winner_id: Option<String>,
+    pub loser_id: Option<String>,
+    pub canonical_id: Option<String>,
+    pub lexical_score: Option<f32>,
+    pub embedding_score: Option<f32>,
+    pub relation: DedupRelation,
+    pub confidence: f32,
+    pub reason: String,
+    pub operator: String,
+    pub reversible: bool,
+    pub merged_summary: Option<String>,
+    #[serde(default)]
+    pub novel_facts: Vec<String>,
+    #[serde(default)]
+    pub conflict_detected: bool,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
 
 /// Lifecycle status of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

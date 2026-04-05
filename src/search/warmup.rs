@@ -3,7 +3,7 @@
 //! eliminating the 255ms Google API delay during recall.
 
 use crate::config::ReinConfig;
-use crate::embed::{EmbedCache, create_embedder, prepend_metadata};
+use crate::embed::{create_embedder, prepend_metadata, EmbedCache};
 use crate::store::SqliteStore;
 use crate::types::Embedder as _;
 use std::path::{Path, PathBuf};
@@ -126,7 +126,10 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         use std::os::unix::io::AsRawFd;
         let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
-            tracing::warn!("hnsw: failed to acquire rebuild lock: {}", std::io::Error::last_os_error());
+            tracing::warn!(
+                "hnsw: failed to acquire rebuild lock: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
     }
@@ -156,10 +159,9 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
     for (id, topic, summary, content, _keywords) in &memories {
         let text = prepend_metadata(topic, summary, content);
         if let Ok(Some(emb)) = EmbedCache::get(store.conn(), &text, &model) {
-            if emb.len() == dims
-                && index.insert(id, &emb).is_ok() {
-                    inserted += 1;
-                }
+            if emb.len() == dims && index.insert(id, &emb).is_ok() {
+                inserted += 1;
+            }
         }
     }
 
@@ -236,7 +238,10 @@ pub fn populate_tantivy(store: &SqliteStore) {
     let mut indexed = 0usize;
     let mut errors = 0usize;
     for (id, topic, summary, content, keywords) in &memories {
-        if tantivy.insert(id, topic, summary, content, keywords).is_ok() {
+        if tantivy
+            .insert(id, topic, summary, content, keywords)
+            .is_ok()
+        {
             indexed += 1;
         } else {
             errors += 1;

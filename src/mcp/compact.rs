@@ -55,8 +55,14 @@ pub fn format_stats(stats: &StoreStats, compact: bool) -> String {
     if compact {
         format!(
             "total:{} ltm:{} stm:{} topics:{} str:{:.3} memoirs:{} concepts:{} links:{}",
-            stats.total_memories, stats.ltm_count, stats.stm_count, stats.topic_count,
-            stats.avg_strength, stats.memoir_count, stats.concept_count, stats.link_count
+            stats.total_memories,
+            stats.ltm_count,
+            stats.stm_count,
+            stats.topic_count,
+            stats.avg_strength,
+            stats.memoir_count,
+            stats.concept_count,
+            stats.link_count
         )
     } else {
         format!(

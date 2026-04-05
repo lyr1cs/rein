@@ -36,6 +36,44 @@ pub struct MemoryJob {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupJob {
+    pub id: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub exact_topics: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupJob {
+    pub id: String,
+    pub existing_id: String,
+    pub new_id: String,
+    #[serde(default)]
+    pub lexical_score: Option<f32>,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerStats {
     pub processed: u64,
@@ -73,7 +111,19 @@ pub fn queue_memory_job_with_session(
     artifact_id: Option<String>,
     session_json: Option<String>,
 ) -> anyhow::Result<()> {
-    _queue_memory_job(config, mode, source, source_label, agent_label, is_subagent, priority, source_query, text, artifact_id, session_json)
+    _queue_memory_job(
+        config,
+        mode,
+        source,
+        source_label,
+        agent_label,
+        is_subagent,
+        priority,
+        source_query,
+        text,
+        artifact_id,
+        session_json,
+    )
 }
 
 pub fn queue_memory_job(
@@ -87,7 +137,19 @@ pub fn queue_memory_job(
     source_query: Option<String>,
     text: String,
 ) -> anyhow::Result<()> {
-    _queue_memory_job(config, mode, source, source_label, agent_label, is_subagent, priority, source_query, text, None, None)
+    _queue_memory_job(
+        config,
+        mode,
+        source,
+        source_label,
+        agent_label,
+        is_subagent,
+        priority,
+        source_query,
+        text,
+        None,
+        None,
+    )
 }
 
 fn _queue_memory_job(
@@ -146,7 +208,11 @@ fn _queue_memory_job(
                 if is_full && matches!(existing.mode, MemoryJobMode::Quick) {
                     continue;
                 }
-                if crate::extract::similarity(&preview, &existing.text.chars().take(500).collect::<String>()) > 0.85 {
+                if crate::extract::similarity(
+                    &preview,
+                    &existing.text.chars().take(500).collect::<String>(),
+                ) > 0.85
+                {
                     return Ok(()); // Already queued with same or higher fidelity
                 }
             }
@@ -178,7 +244,10 @@ pub fn spawn_memory_worker(config: &ReinConfig) {
     if std::env::var("REIN_MEMORY_WORKER").as_deref() == Ok("1") {
         return;
     }
-    if !should_spawn_worker(config) {
+    if !should_spawn_worker(
+        &spawn_marker_path(config),
+        config.async_memory.spawn_cooldown_ms,
+    ) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -193,6 +262,128 @@ pub fn spawn_memory_worker(config: &ReinConfig) {
         .stderr(std::process::Stdio::null());
     let _ = cmd.spawn();
     let _ = touch_spawn_marker(config);
+}
+
+pub fn queue_cleanup_job(
+    config: &ReinConfig,
+    topic: Option<String>,
+    topics: Vec<String>,
+    pattern: Option<String>,
+    all: bool,
+    exact_topics: bool,
+    dry_run: bool,
+) -> anyhow::Result<String> {
+    let job = CleanupJob {
+        id: ulid::Ulid::new().to_string(),
+        topic,
+        topics,
+        pattern,
+        all,
+        exact_topics,
+        dry_run,
+        attempts: 0,
+        next_attempt_at: None,
+        created_at: Utc::now().to_rfc3339(),
+    };
+
+    let fingerprint = cleanup_job_fingerprint(&job);
+    let path = cleanup_queue_path(config);
+    let inflight = cleanup_inflight_path(config);
+    with_advisory_lock(&cleanup_lock_path(config), true, || {
+        for queued in read_cleanup_jobs(&path)
+            .into_iter()
+            .chain(read_cleanup_jobs(&inflight).into_iter())
+        {
+            if cleanup_job_fingerprint(&queued) == fingerprint {
+                return Ok(queued.id);
+            }
+        }
+        append_jsonl(&path, &serde_json::to_string(&job)?)?;
+        Ok(job.id.clone())
+    })
+}
+
+pub fn spawn_cleanup_worker(config: &ReinConfig) {
+    if std::env::var("REIN_CLEANUP_WORKER").as_deref() == Ok("1") {
+        return;
+    }
+    if !should_spawn_worker(
+        &cleanup_spawn_marker_path(config),
+        config.async_memory.spawn_cooldown_ms,
+    ) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("worker")
+        .arg("cleanup-queue")
+        .env("REIN_CLEANUP_WORKER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
+    let _ = touch_worker_marker(&cleanup_spawn_marker_path(config));
+}
+
+pub fn queue_dedup_job(
+    config: &ReinConfig,
+    existing_id: String,
+    new_id: String,
+    lexical_score: Option<f32>,
+    reason: impl Into<String>,
+) -> anyhow::Result<String> {
+    let job = DedupJob {
+        id: ulid::Ulid::new().to_string(),
+        existing_id,
+        new_id,
+        lexical_score,
+        reason: reason.into(),
+        attempts: 0,
+        next_attempt_at: None,
+        created_at: Utc::now().to_rfc3339(),
+    };
+
+    let fingerprint = dedup_job_fingerprint(&job);
+    let path = dedup_queue_path(config);
+    let inflight = dedup_inflight_path(config);
+    with_advisory_lock(&dedup_lock_path(config), true, || {
+        for queued in read_dedup_jobs(&path)
+            .into_iter()
+            .chain(read_dedup_jobs(&inflight).into_iter())
+        {
+            if dedup_job_fingerprint(&queued) == fingerprint {
+                return Ok(queued.id);
+            }
+        }
+        append_jsonl(&path, &serde_json::to_string(&job)?)?;
+        Ok(job.id.clone())
+    })
+}
+
+pub fn spawn_dedup_worker(config: &ReinConfig) {
+    if std::env::var("REIN_DEDUP_WORKER").as_deref() == Ok("1") {
+        return;
+    }
+    if !should_spawn_worker(
+        &dedup_spawn_marker_path(config),
+        config.async_memory.spawn_cooldown_ms,
+    ) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("worker")
+        .arg("dedup-queue")
+        .env("REIN_DEDUP_WORKER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
+    let _ = touch_worker_marker(&dedup_spawn_marker_path(config));
 }
 
 pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
@@ -213,8 +404,7 @@ pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
     let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK)
-            && err.raw_os_error() != Some(libc::EAGAIN)
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EAGAIN)
         {
             tracing::warn!("flock failed: {}", err);
         }
@@ -227,6 +417,70 @@ pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
     let result = drain_memory_queue_locked(config, &path, &inflight).await;
 
     // Explicitly unlock + drop (lock released when fd closes).
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    drop(lock_file);
+    result
+}
+
+pub async fn drain_cleanup_queue(config: &ReinConfig) -> anyhow::Result<u32> {
+    let path = cleanup_queue_path(config);
+    let inflight = cleanup_inflight_path(config);
+    let lock = cleanup_lock_path(config);
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            tracing::warn!("cleanup flock failed: {}", err);
+        }
+        return Ok(0);
+    }
+
+    let result = drain_cleanup_queue_locked(config, &path, &inflight).await;
+
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    drop(lock_file);
+    result
+}
+
+pub async fn drain_dedup_queue(config: &ReinConfig) -> anyhow::Result<u32> {
+    let path = dedup_queue_path(config);
+    let inflight = dedup_inflight_path(config);
+    let lock = dedup_lock_path(config);
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            tracing::warn!("dedup flock failed: {}", err);
+        }
+        return Ok(0);
+    }
+
+    let result = drain_dedup_queue_locked(config, &path, &inflight).await;
+
     let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(lock_file);
     result
@@ -249,7 +503,8 @@ async fn drain_memory_queue_locked(
 
     std::fs::rename(path, inflight)?;
     let content = std::fs::read_to_string(inflight).unwrap_or_default();
-    let jobs = content.lines()
+    let jobs = content
+        .lines()
         .filter_map(|line| serde_json::from_str::<MemoryJob>(line).ok())
         .collect::<Vec<_>>();
 
@@ -264,7 +519,8 @@ async fn drain_memory_queue_locked(
         }
     }
     ready.sort_by(|a, b| {
-        b.priority.cmp(&a.priority)
+        b.priority
+            .cmp(&a.priority)
             .then_with(|| a.created_at.cmp(&b.created_at))
     });
 
@@ -326,7 +582,8 @@ async fn drain_memory_queue_locked(
 async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32> {
     match job.mode {
         MemoryJobMode::Quick => {
-            let extracted = crate::extract::llm::extract_with_worker_preference(config, &job.text, 2).await;
+            let extracted =
+                crate::extract::llm::extract_with_worker_preference(config, &job.text, 2).await;
             let extracted = dedup_quick(extracted, &job);
             let stored = super::persist::process_quick_extraction(
                 config,
@@ -340,8 +597,12 @@ async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32>
             // If we have a serialized SessionIngest, use the full report path
             // so artifact-episode linking and rich metadata are preserved.
             if let Some(ref session_json) = job.session_json {
-                if let Ok(session) = serde_json::from_str::<crate::types::SessionIngest>(session_json) {
-                    let result = crate::extract::llm::extract_full_with_worker_preference(config, &job.text).await;
+                if let Ok(session) =
+                    serde_json::from_str::<crate::types::SessionIngest>(session_json)
+                {
+                    let result =
+                        crate::extract::llm::extract_full_with_worker_preference(config, &job.text)
+                            .await;
                     let mut report = crate::ops::ingest_extraction_report(
                         config,
                         &session,
@@ -350,7 +611,9 @@ async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32>
                         job.is_subagent,
                     )?;
                     // Link pre-stored artifact to the derived episode
-                    if let (Some(ref artifact_id), Some(ref episode_id)) = (&job.artifact_id, &report.episode_id) {
+                    if let (Some(ref artifact_id), Some(ref episode_id)) =
+                        (&job.artifact_id, &report.episode_id)
+                    {
                         if let Ok(store) = config.open_store() {
                             let _ = store.link_session_artifact_episode(artifact_id, episode_id);
                         }
@@ -360,7 +623,8 @@ async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32>
                 }
             }
             // Fallback: legacy text extraction path
-            let result = crate::extract::llm::extract_full_with_worker_preference(config, &job.text).await;
+            let result =
+                crate::extract::llm::extract_full_with_worker_preference(config, &job.text).await;
             let (memories, _concepts, _links) = super::persist::process_full_extraction(
                 config,
                 result,
@@ -405,6 +669,54 @@ fn recent_events_path(config: &ReinConfig) -> std::path::PathBuf {
     project_scoped_path(config, "memory_recent_events")
 }
 
+fn cleanup_queue_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "cleanup_queue")
+}
+
+fn cleanup_inflight_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "cleanup_queue_inflight")
+}
+
+fn cleanup_lock_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "cleanup_queue_lock")
+}
+
+fn cleanup_dead_letter_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "cleanup_queue_dead")
+}
+
+fn cleanup_stats_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "cleanup_worker_stats")
+}
+
+fn cleanup_spawn_marker_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "cleanup_worker_spawn")
+}
+
+fn dedup_queue_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "dedup_queue")
+}
+
+fn dedup_inflight_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "dedup_queue_inflight")
+}
+
+fn dedup_lock_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "dedup_queue_lock")
+}
+
+fn dedup_dead_letter_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "dedup_queue_dead")
+}
+
+fn dedup_stats_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "dedup_worker_stats")
+}
+
+fn dedup_spawn_marker_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "dedup_worker_spawn")
+}
+
 fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
     let cwd = std::env::current_dir()
         .ok()
@@ -416,8 +728,7 @@ fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf 
     super::buffer::resolve_buffer_dir(config).join(format!("{prefix}_{}.jsonl", &digest[..12]))
 }
 
-fn should_spawn_worker(config: &ReinConfig) -> bool {
-    let path = spawn_marker_path(config);
+fn should_spawn_worker(path: &std::path::Path, cooldown_ms: u64) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return true;
     };
@@ -426,11 +737,14 @@ fn should_spawn_worker(config: &ReinConfig) -> bool {
     };
     let modified_utc: DateTime<Utc> = modified.into();
     let elapsed = Utc::now() - modified_utc;
-    elapsed.num_milliseconds() >= config.async_memory.spawn_cooldown_ms as i64
+    elapsed.num_milliseconds() >= cooldown_ms as i64
 }
 
 fn touch_spawn_marker(config: &ReinConfig) -> anyhow::Result<()> {
-    let path = spawn_marker_path(config);
+    touch_worker_marker(&spawn_marker_path(config))
+}
+
+fn touch_worker_marker(path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -490,7 +804,10 @@ fn reschedule_job(config: &ReinConfig, mut job: MemoryJob) -> MemoryJob {
     let attempts = job.attempts + 1;
     // Cap exponent at 10 to prevent overflow (max backoff = base * 1024 ≈ 34 minutes at 2000ms base).
     let exp = job.attempts.min(10);
-    let backoff = config.async_memory.base_backoff_ms.saturating_mul(2u64.saturating_pow(exp));
+    let backoff = config
+        .async_memory
+        .base_backoff_ms
+        .saturating_mul(2u64.saturating_pow(exp));
     job.attempts = attempts;
     job.next_attempt_at = Some(Utc::now() + chrono::Duration::milliseconds(backoff as i64));
     job
@@ -498,6 +815,52 @@ fn reschedule_job(config: &ReinConfig, mut job: MemoryJob) -> MemoryJob {
 
 fn append_dead_letter(config: &ReinConfig, job: &MemoryJob, error: &str) -> anyhow::Result<()> {
     let path = dead_letter_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let payload = serde_json::json!({
+        "job": job,
+        "error": error,
+        "failed_at": Utc::now().to_rfc3339(),
+    });
+    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
+fn append_cleanup_dead_letter(
+    config: &ReinConfig,
+    job: &CleanupJob,
+    error: &str,
+) -> anyhow::Result<()> {
+    let path = cleanup_dead_letter_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let payload = serde_json::json!({
+        "job": job,
+        "error": error,
+        "failed_at": Utc::now().to_rfc3339(),
+    });
+    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
+fn append_dedup_dead_letter(
+    config: &ReinConfig,
+    job: &DedupJob,
+    error: &str,
+) -> anyhow::Result<()> {
+    let path = dedup_dead_letter_path(config);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -523,6 +886,22 @@ fn load_worker_stats(config: &ReinConfig) -> WorkerStats {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+fn load_cleanup_worker_stats(config: &ReinConfig) -> WorkerStats {
+    let path = cleanup_stats_path(config);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return WorkerStats::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn load_dedup_worker_stats(config: &ReinConfig) -> WorkerStats {
+    let path = dedup_stats_path(config);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return WorkerStats::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
 fn save_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result<()> {
     let path = stats_path(config);
     if let Some(parent) = path.parent() {
@@ -533,6 +912,304 @@ fn save_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result
     std::fs::write(&tmp, serde_json::to_string_pretty(stats)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+fn save_cleanup_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result<()> {
+    let path = cleanup_stats_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(stats)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn save_dedup_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result<()> {
+    let path = dedup_stats_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(stats)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+async fn drain_cleanup_queue_locked(
+    config: &ReinConfig,
+    path: &std::path::Path,
+    inflight: &std::path::Path,
+) -> anyhow::Result<u32> {
+    recover_inflight(path, inflight)?;
+
+    if !path.exists() {
+        return Ok(0);
+    }
+    let meta = std::fs::metadata(path)?;
+    if meta.len() == 0 {
+        return Ok(0);
+    }
+
+    std::fs::rename(path, inflight)?;
+    let content = std::fs::read_to_string(inflight).unwrap_or_default();
+    let jobs = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<CleanupJob>(line).ok())
+        .collect::<Vec<_>>();
+
+    let now = Utc::now();
+    let mut deferred = Vec::new();
+    let mut ready = Vec::new();
+    for job in jobs {
+        if job.next_attempt_at.is_some_and(|ts| ts > now) {
+            deferred.push(job);
+        } else {
+            ready.push(job);
+        }
+    }
+    ready.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let mut processed = 0u32;
+    let mut remaining = Vec::new();
+    let mut stats = load_cleanup_worker_stats(config);
+
+    let split_at = config.async_memory.batch_size.min(ready.len());
+    let ready_tail = ready.split_off(split_at);
+    let to_process = ready;
+
+    for job in to_process {
+        match process_cleanup_job(config, job.clone()).await {
+            Ok(done) => {
+                processed += done;
+                stats.processed += done as u64;
+            }
+            Err(e) => {
+                tracing::warn!("cleanup worker job failed: {e}");
+                if job.attempts + 1 >= config.async_memory.max_retries {
+                    let _ = append_cleanup_dead_letter(config, &job, &e.to_string());
+                    stats.dead_lettered += 1;
+                } else {
+                    remaining.push(reschedule_cleanup_job(config, job));
+                    stats.requeued += 1;
+                }
+            }
+        }
+    }
+
+    remaining.extend(ready_tail);
+    remaining.extend(deferred);
+
+    if !remaining.is_empty() {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        for job in &remaining {
+            writeln!(file, "{}", serde_json::to_string(job)?)?;
+        }
+    }
+
+    let _ = std::fs::remove_file(inflight);
+    stats.last_run_at = Some(Utc::now().to_rfc3339());
+    let _ = save_cleanup_worker_stats(config, &stats);
+    Ok(processed)
+}
+
+async fn process_cleanup_job(config: &ReinConfig, job: CleanupJob) -> anyhow::Result<u32> {
+    let store = config.open_store()?;
+    let scope_all =
+        job.all || (job.topic.is_none() && job.topics.is_empty() && job.pattern.is_none());
+    let merge_variants = !job.exact_topics;
+    let groups = crate::ops::resolve_topic_groups(
+        &store,
+        job.topic.as_deref(),
+        &job.topics,
+        job.pattern.as_deref(),
+        scope_all,
+        merge_variants,
+    )?;
+    if groups.is_empty() {
+        tracing::info!(
+            "cleanup worker: no topics matched for queued job {}",
+            job.id
+        );
+        return Ok(1);
+    }
+
+    let report =
+        crate::ops::run_cleanup_async(&store, config, &groups, merge_variants, job.dry_run).await?;
+    tracing::info!(
+        "cleanup worker: job {} finished; groups={}, memories={}, dedup_removed={}/{}",
+        job.id,
+        report.consolidation.groups_processed,
+        report.consolidation.memories_replaced,
+        report.duplicates_merged,
+        report.duplicates_found
+    );
+    Ok(1)
+}
+
+async fn drain_dedup_queue_locked(
+    config: &ReinConfig,
+    path: &std::path::Path,
+    inflight: &std::path::Path,
+) -> anyhow::Result<u32> {
+    recover_inflight(path, inflight)?;
+
+    if !path.exists() {
+        return Ok(0);
+    }
+    let meta = std::fs::metadata(path)?;
+    if meta.len() == 0 {
+        return Ok(0);
+    }
+
+    std::fs::rename(path, inflight)?;
+    let content = std::fs::read_to_string(inflight).unwrap_or_default();
+    let jobs = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<DedupJob>(line).ok())
+        .collect::<Vec<_>>();
+
+    let now = Utc::now();
+    let mut deferred = Vec::new();
+    let mut ready = Vec::new();
+    for job in jobs {
+        if job.next_attempt_at.is_some_and(|ts| ts > now) {
+            deferred.push(job);
+        } else {
+            ready.push(job);
+        }
+    }
+    ready.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let mut processed = 0u32;
+    let mut remaining = Vec::new();
+    let mut stats = load_dedup_worker_stats(config);
+
+    let split_at = config.async_memory.batch_size.min(ready.len());
+    let ready_tail = ready.split_off(split_at);
+    let to_process = ready;
+
+    for job in to_process {
+        match process_dedup_job(config, job.clone()).await {
+            Ok(done) => {
+                processed += done;
+                stats.processed += done as u64;
+            }
+            Err(e) => {
+                tracing::warn!("dedup worker job failed: {e}");
+                if job.attempts + 1 >= config.async_memory.max_retries {
+                    let _ = append_dedup_dead_letter(config, &job, &e.to_string());
+                    stats.dead_lettered += 1;
+                } else {
+                    remaining.push(reschedule_dedup_job(config, job));
+                    stats.requeued += 1;
+                }
+            }
+        }
+    }
+
+    remaining.extend(ready_tail);
+    remaining.extend(deferred);
+
+    if !remaining.is_empty() {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        for job in &remaining {
+            writeln!(file, "{}", serde_json::to_string(job)?)?;
+        }
+    }
+
+    let _ = std::fs::remove_file(inflight);
+    stats.last_run_at = Some(Utc::now().to_rfc3339());
+    let _ = save_dedup_worker_stats(config, &stats);
+    Ok(processed)
+}
+
+async fn process_dedup_job(config: &ReinConfig, job: DedupJob) -> anyhow::Result<u32> {
+    let store = config.open_store()?;
+    let relation = crate::ops::resolve_dedup_job_async(
+        &store,
+        config,
+        &job.existing_id,
+        &job.new_id,
+        job.lexical_score,
+        &job.reason,
+    )
+    .await?;
+    tracing::info!(
+        "dedup worker: job {} resolved {} vs {} => {}",
+        job.id,
+        job.existing_id,
+        job.new_id,
+        relation
+    );
+    Ok(1)
+}
+
+fn cleanup_job_fingerprint(job: &CleanupJob) -> String {
+    let mut topics = job.topics.clone();
+    topics.sort();
+    topics.dedup();
+    format!(
+        "topic={:?}|topics={:?}|pattern={:?}|all={}|exact={}|dry={}",
+        job.topic, topics, job.pattern, job.all, job.exact_topics, job.dry_run
+    )
+}
+
+fn dedup_job_fingerprint(job: &DedupJob) -> String {
+    let (left, right) = if job.existing_id <= job.new_id {
+        (&job.existing_id, &job.new_id)
+    } else {
+        (&job.new_id, &job.existing_id)
+    };
+    format!("{left}|{right}|{}", job.reason)
+}
+
+fn read_cleanup_jobs(path: &std::path::Path) -> Vec<CleanupJob> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<CleanupJob>(line).ok())
+        .collect()
+}
+
+fn read_dedup_jobs(path: &std::path::Path) -> Vec<DedupJob> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<DedupJob>(line).ok())
+        .collect()
+}
+
+fn reschedule_cleanup_job(config: &ReinConfig, mut job: CleanupJob) -> CleanupJob {
+    let attempts = job.attempts + 1;
+    let exp = job.attempts.min(10);
+    let backoff = config
+        .async_memory
+        .base_backoff_ms
+        .saturating_mul(2u64.saturating_pow(exp));
+    job.attempts = attempts;
+    job.next_attempt_at = Some(Utc::now() + chrono::Duration::milliseconds(backoff as i64));
+    job
+}
+
+fn reschedule_dedup_job(config: &ReinConfig, mut job: DedupJob) -> DedupJob {
+    let attempts = job.attempts + 1;
+    let exp = job.attempts.min(10);
+    let backoff = config
+        .async_memory
+        .base_backoff_ms
+        .saturating_mul(2u64.saturating_pow(exp));
+    job.attempts = attempts;
+    job.next_attempt_at = Some(Utc::now() + chrono::Duration::milliseconds(backoff as i64));
+    job
 }
 
 fn append_raw_archive(
@@ -578,7 +1255,9 @@ fn suppress_duplicate_event(
     let mut state = load_recent_events(config);
     let window_ms = config.async_memory.fingerprint_window_ms as i64;
 
-    state.items.retain(|item| (now - item.created_at).num_milliseconds() <= window_ms);
+    state
+        .items
+        .retain(|item| (now - item.created_at).num_milliseconds() <= window_ms);
 
     let normalized = normalized_event_text(source, source_query, text);
     let preview: String = normalized.chars().take(1000).collect();
@@ -643,9 +1322,7 @@ fn normalized_event_text(source: &str, source_query: Option<&str>, text: &str) -
         .to_lowercase()
         .chars()
         .map(|ch| {
-            if ch.is_alphanumeric()
-                || ('\u{4e00}'..='\u{9fff}').contains(&ch)
-                || ch.is_whitespace()
+            if ch.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&ch) || ch.is_whitespace()
             {
                 ch
             } else {
@@ -680,11 +1357,7 @@ fn append_jsonl(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
     })
 }
 
-fn with_advisory_lock<T, F>(
-    lock_path: &std::path::Path,
-    blocking: bool,
-    f: F,
-) -> anyhow::Result<T>
+fn with_advisory_lock<T, F>(lock_path: &std::path::Path, blocking: bool, f: F) -> anyhow::Result<T>
 where
     F: FnOnce() -> anyhow::Result<T>,
 {
@@ -729,5 +1402,61 @@ mod tests {
         let a = normalized_event_text("hook_stop", Some("hello"), "Fixed sqlite-locking!");
         let b = normalized_event_text("hook_stop", Some("hello"), "Fixed sqlite locking.");
         assert!(crate::extract::similarity(&a, &b) > 0.94);
+    }
+
+    #[test]
+    fn cleanup_job_fingerprint_sorts_topics() {
+        let a = CleanupJob {
+            id: "a".into(),
+            topic: None,
+            topics: vec!["rmcp".into(), "docker".into()],
+            pattern: None,
+            all: false,
+            exact_topics: false,
+            dry_run: false,
+            attempts: 0,
+            next_attempt_at: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let b = CleanupJob {
+            id: "b".into(),
+            topic: None,
+            topics: vec!["docker".into(), "rmcp".into(), "docker".into()],
+            pattern: None,
+            all: false,
+            exact_topics: false,
+            dry_run: false,
+            attempts: 0,
+            next_attempt_at: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        assert_eq!(cleanup_job_fingerprint(&a), cleanup_job_fingerprint(&b));
+    }
+
+    #[test]
+    fn dedup_job_fingerprint_sorts_pair_ids() {
+        let a = DedupJob {
+            id: "a".into(),
+            existing_id: "old".into(),
+            new_id: "new".into(),
+            lexical_score: Some(0.62),
+            reason: "store_gray_zone".into(),
+            attempts: 0,
+            next_attempt_at: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let b = DedupJob {
+            id: "b".into(),
+            existing_id: "new".into(),
+            new_id: "old".into(),
+            lexical_score: Some(0.62),
+            reason: "store_gray_zone".into(),
+            attempts: 0,
+            next_attempt_at: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        assert_eq!(dedup_job_fingerprint(&a), dedup_job_fingerprint(&b));
     }
 }

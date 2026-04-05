@@ -406,22 +406,73 @@ mod tests {
 
         let final_w = load_weights(&conn);
         let tolerance = 1e-6;
-        assert!((final_w.w_fts - initial.w_fts).abs() < tolerance, "w_fts drifted");
-        assert!((final_w.w_vec - initial.w_vec).abs() < tolerance, "w_vec drifted");
-        assert!((final_w.w_kg - initial.w_kg).abs() < tolerance, "w_kg drifted");
-        assert!((final_w.w_episode - initial.w_episode).abs() < tolerance, "w_episode drifted");
-        assert!((final_w.w_recency - initial.w_recency).abs() < tolerance, "w_recency drifted");
-        assert!((final_w.w_access - initial.w_access).abs() < tolerance, "w_access drifted");
-        assert!((final_w.w_strength - initial.w_strength).abs() < tolerance, "w_strength drifted");
-        assert!((final_w.w_importance - initial.w_importance).abs() < tolerance, "w_importance drifted");
-        assert!((final_w.w_keyword - initial.w_keyword).abs() < tolerance, "w_keyword drifted");
-        assert!((final_w.w_topic_match - initial.w_topic_match).abs() < tolerance, "w_topic_match drifted");
-        assert!((final_w.w_brevity - initial.w_brevity).abs() < tolerance, "w_brevity drifted");
-        assert!((final_w.w_channel_coverage - initial.w_channel_coverage).abs() < tolerance, "w_channel_coverage drifted");
-        assert!((final_w.w_usage_recency - initial.w_usage_recency).abs() < tolerance, "w_usage_recency drifted");
-        assert!((final_w.w_connectivity - initial.w_connectivity).abs() < tolerance, "w_connectivity drifted");
-        assert!((final_w.w_concept_richness - initial.w_concept_richness).abs() < tolerance, "w_concept_richness drifted");
-        assert!((final_w.w_tier_score - initial.w_tier_score).abs() < tolerance, "w_tier_score drifted");
-        assert!((final_w.w_is_current - initial.w_is_current).abs() < tolerance, "w_is_current drifted");
+        assert!(
+            (final_w.w_fts - initial.w_fts).abs() < tolerance,
+            "w_fts drifted"
+        );
+        assert!(
+            (final_w.w_vec - initial.w_vec).abs() < tolerance,
+            "w_vec drifted"
+        );
+        assert!(
+            (final_w.w_kg - initial.w_kg).abs() < tolerance,
+            "w_kg drifted"
+        );
+        assert!(
+            (final_w.w_episode - initial.w_episode).abs() < tolerance,
+            "w_episode drifted"
+        );
+        assert!(
+            (final_w.w_recency - initial.w_recency).abs() < tolerance,
+            "w_recency drifted"
+        );
+        assert!(
+            (final_w.w_access - initial.w_access).abs() < tolerance,
+            "w_access drifted"
+        );
+        assert!(
+            (final_w.w_strength - initial.w_strength).abs() < tolerance,
+            "w_strength drifted"
+        );
+        assert!(
+            (final_w.w_importance - initial.w_importance).abs() < tolerance,
+            "w_importance drifted"
+        );
+        assert!(
+            (final_w.w_keyword - initial.w_keyword).abs() < tolerance,
+            "w_keyword drifted"
+        );
+        assert!(
+            (final_w.w_topic_match - initial.w_topic_match).abs() < tolerance,
+            "w_topic_match drifted"
+        );
+        assert!(
+            (final_w.w_brevity - initial.w_brevity).abs() < tolerance,
+            "w_brevity drifted"
+        );
+        assert!(
+            (final_w.w_channel_coverage - initial.w_channel_coverage).abs() < tolerance,
+            "w_channel_coverage drifted"
+        );
+        assert!(
+            (final_w.w_usage_recency - initial.w_usage_recency).abs() < tolerance,
+            "w_usage_recency drifted"
+        );
+        assert!(
+            (final_w.w_connectivity - initial.w_connectivity).abs() < tolerance,
+            "w_connectivity drifted"
+        );
+        assert!(
+            (final_w.w_concept_richness - initial.w_concept_richness).abs() < tolerance,
+            "w_concept_richness drifted"
+        );
+        assert!(
+            (final_w.w_tier_score - initial.w_tier_score).abs() < tolerance,
+            "w_tier_score drifted"
+        );
+        assert!(
+            (final_w.w_is_current - initial.w_is_current).abs() < tolerance,
+            "w_is_current drifted"
+        );
     }
 }

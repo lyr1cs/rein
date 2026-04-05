@@ -12,16 +12,16 @@ use std::collections::HashMap;
 /// All feedback event types emitted by the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
-    RecallComplete,     // recall returned results (includes full candidate set)
-    RecallAccess,       // agent used a recalled memory
-    RecallMiss,         // recall returned but not accessed (record-only)
-    RecallRetry,        // same query recalled again in session
-    Store,              // new memory stored
-    StoreQuickRecall,   // memory recalled shortly after being stored
-    Forget,             // agent explicitly forgot/deprecated
-    Refine,             // concept refined/superseded
-    SessionEnd,         // hook_stop fired
-    ParamUpdate,        // slow-channel parameter update (audit trail)
+    RecallComplete,   // recall returned results (includes full candidate set)
+    RecallAccess,     // agent used a recalled memory
+    RecallMiss,       // recall returned but not accessed (record-only)
+    RecallRetry,      // same query recalled again in session
+    Store,            // new memory stored
+    StoreQuickRecall, // memory recalled shortly after being stored
+    Forget,           // agent explicitly forgot/deprecated
+    Refine,           // concept refined/superseded
+    SessionEnd,       // hook_stop fired
+    ParamUpdate,      // slow-channel parameter update (audit trail)
 }
 
 impl EventType {
@@ -108,7 +108,9 @@ pub fn consume_events(
         .unwrap_or(0);
 
     // Build event type filter
-    let type_placeholders: Vec<String> = event_types.iter().enumerate()
+    let type_placeholders: Vec<String> = event_types
+        .iter()
+        .enumerate()
         .map(|(i, _)| format!("?{}", i + 3))
         .collect();
     let type_filter = if type_placeholders.is_empty() {
@@ -126,10 +128,8 @@ pub fn consume_events(
     let mut stmt = conn.prepare(&sql)?;
 
     // Build params dynamically
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-        Box::new(last_id),
-        Box::new(limit as i64),
-    ];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(last_id), Box::new(limit as i64)];
     for et in event_types {
         params.push(Box::new(et.to_string()));
     }
@@ -227,7 +227,9 @@ pub struct AdaptiveState {
     pub version: u64,
 }
 
-fn default_global_dedup_threshold() -> f32 { 0.70 }
+fn default_global_dedup_threshold() -> f32 {
+    0.70
+}
 
 /// A learned alpha entry with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,8 +305,7 @@ impl AdaptiveState {
     /// Checks that the stored version matches our base version to prevent lost updates
     /// when two concurrent GC runs modify the state simultaneously.
     pub fn save_snapshot(&self, conn: &Connection) -> ReinResult<()> {
-        let json = serde_json::to_string(self)
-            .map_err(ReinError::Serialization)?;
+        let json = serde_json::to_string(self).map_err(ReinError::Serialization)?;
 
         // Optimistic concurrency: only update if version hasn't changed since we loaded
         let rows = conn.execute(
@@ -316,10 +317,13 @@ impl AdaptiveState {
 
         if rows == 0 {
             // Either no row exists yet (first run) or version mismatch
-            let exists: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM metadata WHERE key = 'adaptive_state'",
-                [], |r| r.get(0),
-            ).unwrap_or(false);
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM metadata WHERE key = 'adaptive_state'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
 
             if !exists {
                 // First save — insert
@@ -330,8 +334,11 @@ impl AdaptiveState {
             } else {
                 // Version conflict — log warning, re-read and merge would be ideal,
                 // but for now just force-write (the concurrent writer already committed)
-                tracing::warn!("adaptive state version conflict (expected v{}), force-saving v{}",
-                    self.version.saturating_sub(1), self.version);
+                tracing::warn!(
+                    "adaptive state version conflict (expected v{}), force-saving v{}",
+                    self.version.saturating_sub(1),
+                    self.version
+                );
                 conn.execute(
                     "UPDATE metadata SET value = ?1 WHERE key = 'adaptive_state'",
                     rusqlite::params![&json],
@@ -362,7 +369,8 @@ mod tests {
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         // Minimal schema for testing
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE feedback_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -376,7 +384,9 @@ mod tests {
                 updated_at TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         conn
     }
 
@@ -386,15 +396,20 @@ mod tests {
 
         // Emit 3 events
         for i in 0..3 {
-            emit_event(&conn, FeedbackEvent {
-                event_type: EventType::RecallComplete,
-                request_id: Some(format!("req-{i}")),
-                memory_id: None, concept_id: None,
-                query: Some("test query".into()),
-                query_type: Some("semantic".into()),
-                topic: Some("test".into()),
-                payload: Some(serde_json::json!({"alpha": 0.5})),
-            }).unwrap();
+            emit_event(
+                &conn,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("req-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("test query".into()),
+                    query_type: Some("semantic".into()),
+                    topic: Some("test".into()),
+                    payload: Some(serde_json::json!({"alpha": 0.5})),
+                },
+            )
+            .unwrap();
         }
 
         assert_eq!(event_count(&conn), 3);
@@ -450,12 +465,20 @@ mod tests {
         // Add global semantic with enough samples
         state.learned_alpha.insert(
             "semantic".into(),
-            LearnedAlphaEntry { value: 0.4, sample_count: 15, last_updated: String::new() },
+            LearnedAlphaEntry {
+                value: 0.4,
+                sample_count: 15,
+                last_updated: String::new(),
+            },
         );
         // Cluster-specific with too few samples
         state.learned_alpha.insert(
             "semantic:1".into(),
-            LearnedAlphaEntry { value: 0.8, sample_count: 3, last_updated: String::new() },
+            LearnedAlphaEntry {
+                value: 0.8,
+                sample_count: 3,
+                last_updated: String::new(),
+            },
         );
 
         // Should fall back to global (cluster has < 10 samples)
@@ -463,7 +486,11 @@ mod tests {
         assert!((alpha - 0.4).abs() < 0.01);
 
         // Give cluster enough samples
-        state.learned_alpha.get_mut("semantic:1").unwrap().sample_count = 12;
+        state
+            .learned_alpha
+            .get_mut("semantic:1")
+            .unwrap()
+            .sample_count = 12;
         let alpha = state.get_alpha("semantic", Some(1)).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
     }
@@ -473,14 +500,22 @@ mod tests {
         let mut state = AdaptiveState::default();
         state.learned_alpha.insert(
             "global".into(),
-            LearnedAlphaEntry { value: 0.55, sample_count: 20, last_updated: String::new() },
+            LearnedAlphaEntry {
+                value: 0.55,
+                sample_count: 20,
+                last_updated: String::new(),
+            },
         );
         let alpha = state.get_alpha("temporal", None).unwrap();
         assert!((alpha - 0.55).abs() < 0.01);
 
         state.learned_alpha.insert(
             "Temporal".into(),
-            LearnedAlphaEntry { value: 0.8, sample_count: 20, last_updated: String::new() },
+            LearnedAlphaEntry {
+                value: 0.8,
+                sample_count: 20,
+                last_updated: String::new(),
+            },
         );
         let alpha = state.get_alpha("Temporal", None).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
@@ -490,16 +525,34 @@ mod tests {
     fn test_event_type_filter() {
         let conn = setup_db();
 
-        emit_event(&conn, FeedbackEvent {
-            event_type: EventType::RecallComplete,
-            request_id: None, memory_id: None, concept_id: None,
-            query: None, query_type: None, topic: None, payload: None,
-        }).unwrap();
-        emit_event(&conn, FeedbackEvent {
-            event_type: EventType::Store,
-            request_id: None, memory_id: Some("m1".into()), concept_id: None,
-            query: None, query_type: None, topic: None, payload: None,
-        }).unwrap();
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::Store,
+                request_id: None,
+                memory_id: Some("m1".into()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        )
+        .unwrap();
 
         // Filter by store only
         let events = consume_events(&conn, "test", &["store"], 100).unwrap();
