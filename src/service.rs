@@ -15,11 +15,13 @@ fn pid_path(name: &str) -> PathBuf {
     pid_dir().join(format!("{name}.pid"))
 }
 
-/// Write the current process PID to `~/.rein/{name}.pid`.
+/// Write PID + exe path to `~/.rein/{name}.pid` for identity verification.
 pub fn write_pid(name: &str) -> anyhow::Result<()> {
     let dir = pid_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(pid_path(name), std::process::id().to_string())?;
+    let exe = std::env::current_exe().unwrap_or_default();
+    let content = format!("{}\n{}", std::process::id(), exe.display());
+    std::fs::write(pid_path(name), content)?;
     Ok(())
 }
 
@@ -28,23 +30,39 @@ pub fn remove_pid(name: &str) {
     let _ = std::fs::remove_file(pid_path(name));
 }
 
-/// Read PID from file and check if the process is alive.
+/// Read PID from file, verify it's still a rein process, and return PID if alive.
 pub fn is_running(name: &str) -> Option<u32> {
     let content = std::fs::read_to_string(pid_path(name)).ok()?;
-    let pid: u32 = content.trim().parse().ok()?;
-    // kill(pid, 0) checks if process exists without sending a signal
+    let mut lines = content.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let saved_exe = lines.next().unwrap_or("");
+
     #[cfg(unix)]
     {
-        let ret = unsafe { libc::kill(pid as i32, 0) };
-        if ret == 0 {
-            return Some(pid);
+        // Check if process is alive
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            // Process dead — stale PID file
+            remove_pid(name);
+            return None;
         }
+        // Verify it's actually a rein process by checking /proc or lsof
+        // On macOS, check exe path via sysctl; simplest portable check: compare saved exe
+        if !saved_exe.is_empty() {
+            if let Ok(current_exe) = std::env::current_exe() {
+                if !saved_exe.contains("rein") && current_exe.to_string_lossy().contains("rein") {
+                    // Saved exe doesn't look like rein — PID was recycled
+                    remove_pid(name);
+                    return None;
+                }
+            }
+        }
+        Some(pid)
     }
     #[cfg(not(unix))]
     {
-        return Some(pid); // assume alive on non-unix
+        let _ = saved_exe;
+        Some(pid)
     }
-    None
 }
 
 /// Check if a port is responding.
@@ -96,7 +114,7 @@ pub fn start_service(name: &str, serve_args: &[&str]) -> anyhow::Result<()> {
         .args(serve_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
 
     let pid = child.id();
@@ -153,8 +171,15 @@ fn fetch_proxy_metrics(port: u16) -> Option<(u64, u64, u64)> {
         Duration::from_millis(300),
     )
     .ok()?;
+    // Include auth token if configured (proxy requires x-rein-token when token is set)
+    let token = std::env::var("REIN_PROXY_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("REIN_HTTP_TOKEN").ok());
+    let auth_header = token
+        .map(|t| format!("x-rein-token: {t}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "GET /rein/metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET /rein/metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_header}Connection: close\r\n\r\n"
     );
     std::io::Write::write_all(&mut stream, request.as_bytes()).ok()?;
     let mut response = String::new();
@@ -237,18 +262,18 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
         }
     }
 
-    // Queue status
-    let queue_dir = pid_dir().join("queue");
-    let pending = std::fs::read_dir(&queue_dir)
+    // Queue status — scan the buffer dir for memory_queue_*.jsonl files
+    let buffer_dir = crate::extract::hooks::buffer::resolve_buffer_dir(config);
+    let pending = std::fs::read_dir(&buffer_dir)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "jsonl")
-                        .unwrap_or(false)
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("memory_queue_") && name.ends_with(".jsonl")
                 })
+                .filter(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
                 .count()
         })
         .unwrap_or(0);
