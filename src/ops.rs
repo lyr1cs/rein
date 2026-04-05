@@ -190,11 +190,7 @@ pub async fn ingest_session_report(
     }
 
     // Filter secrets from transcript before persisting artifact
-    let scrubbed: String = trimmed
-        .lines()
-        .filter(|l| !crate::extract::hooks::parsing::looks_like_secret(l))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let scrubbed = crate::extract::hooks::parsing::redact_secrets(trimmed);
 
     let store = config.open_store()?;
     let artifact = SessionArtifact {
@@ -213,14 +209,14 @@ pub async fn ingest_session_report(
         started_at: session.started_at,
         ended_at: session.ended_at,
         turn_count: session.turns.len() as u32,
-        transcript_text: scrubbed,
+        transcript_text: scrubbed.clone(),
         transcript_json: None, // raw JSON may contain secrets; omit from artifact
         episode_id: None,
         created_at: chrono::Utc::now(),
     };
     let artifact_id = store.store_session_artifact(artifact)?;
 
-    let result = extract::llm::extract_full_with_fallback(config, trimmed).await;
+    let result = extract::llm::extract_full_with_fallback(config, &scrubbed).await;
     let mut report = ingest_extraction_report(config, session, result, agent_label, is_subagent)?;
     report.artifact_id = Some(artifact_id.clone());
     if let Some(ref episode_id) = report.episode_id {
@@ -567,11 +563,7 @@ pub fn queue_ingest_session(
         return Ok(IngestReport::default());
     }
     // Filter secrets from transcript before persisting artifact
-    let scrubbed: String = trimmed
-        .lines()
-        .filter(|l| !crate::extract::hooks::parsing::looks_like_secret(l))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let scrubbed = crate::extract::hooks::parsing::redact_secrets(trimmed);
     let store = config.open_store()?;
     let artifact = SessionArtifact {
         id: String::new(),
@@ -595,6 +587,26 @@ pub fn queue_ingest_session(
         created_at: chrono::Utc::now(),
     };
     let artifact_id = store.store_session_artifact(artifact)?;
+    let mut sanitized_session = session.clone();
+    sanitized_session.summary = sanitized_session
+        .summary
+        .map(|s| crate::extract::hooks::parsing::redact_secrets(&s));
+    sanitized_session.compact_summary = sanitized_session
+        .compact_summary
+        .map(|s| crate::extract::hooks::parsing::redact_secrets(&s));
+    sanitized_session.tool_outputs = sanitized_session
+        .tool_outputs
+        .into_iter()
+        .map(|s| crate::extract::hooks::parsing::redact_secrets(&s))
+        .collect();
+    sanitized_session.turns = sanitized_session
+        .turns
+        .into_iter()
+        .map(|turn| crate::types::SessionTurn {
+            role: turn.role,
+            content: crate::extract::hooks::parsing::redact_secrets(&turn.content),
+        })
+        .collect();
     crate::extract::hooks::queue::queue_memory_job_with_session(
         config,
         crate::extract::hooks::queue::MemoryJobMode::Full,
@@ -612,7 +624,7 @@ pub fn queue_ingest_session(
         None,
         scrubbed, // use scrubbed text, not raw trimmed
         Some(artifact_id.clone()),
-        None, // don't persist raw SessionIngest JSON (may contain secrets)
+        serde_json::to_string(&sanitized_session).ok(),
     )
     .map_err(|e| ReinError::Config(format!("{e}")))?;
     crate::extract::hooks::queue::spawn_memory_worker(config);
@@ -1474,7 +1486,7 @@ fn run_alpha_learning(
     }
 
     // Per-query-type alphas
-    for qt in &["Temporal", "ExactKeyword", "Semantic", "Exploratory"] {
+    for qt in &["temporal", "exact", "semantic", "exploratory"] {
         let qt_events: Vec<_> = events_with_access
             .iter()
             .filter(|e| {

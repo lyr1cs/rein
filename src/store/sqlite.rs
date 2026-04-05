@@ -775,69 +775,151 @@ impl SqliteStore {
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
-        // First pass: run check_dedup with caller's threshold to find best candidate
-        let dedup_action = crate::extract::check_dedup(
-            self, &memory.topic, &memory.content, similarity_threshold, time_window_days,
-        )?;
+        enum PendingLlm {
+            Resolve {
+                candidate_id: String,
+                old_content: String,
+                sim: f32,
+            },
+        }
 
-        // Derive cluster from the matched candidate (if any) for adaptive threshold.
-        // This is more accurate than picking a random topic neighbor.
-        let candidate_cluster = match &dedup_action {
-            DedupAction::MergeInto(id) | DedupAction::Supersede(id) | DedupAction::GrayZone(id, _) => {
-                self.get(id).ok().and_then(|m| m.cluster_id)
-            }
-            DedupAction::CreateNew => memory.cluster_id,
-        };
+        let mut memory = Some(memory);
+        let mut llm_judgment: Option<(String, String, bool)> = None;
 
-        // Re-check with adaptive threshold if it differs from caller's threshold
-        let dedup_action = if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn) {
-            let effective = state.get_dedup_threshold(candidate_cluster);
-            if (effective - similarity_threshold).abs() > 0.01 {
-                // Threshold changed — re-run dedup with adaptive value
-                crate::extract::check_dedup(
-                    self, &memory.topic, &memory.content, effective, time_window_days,
-                )?
-            } else {
-                dedup_action
-            }
-        } else {
-            dedup_action
-        };
-        let resolved_action = match dedup_action {
-            DedupAction::GrayZone(ref candidate_id, sim) => {
-                // LLM semantic check outside transaction
-                let is_dup = if let Ok(existing) = self.get(candidate_id) {
-                    let new_content = memory.content.clone();
-                    let old_content = existing.content.clone();
-                    std::panic::catch_unwind(|| {
+        loop {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let decision = (|| -> ReinResult<Result<String, PendingLlm>> {
+                let memory_ref = memory
+                    .as_ref()
+                    .expect("memory remains available until final commit");
+                let dedup_action = crate::extract::check_dedup(
+                    self,
+                    &memory_ref.topic,
+                    &memory_ref.content,
+                    similarity_threshold,
+                    time_window_days,
+                )?;
+
+                let candidate_cluster = match &dedup_action {
+                    DedupAction::MergeInto(id)
+                    | DedupAction::Supersede(id)
+                    | DedupAction::GrayZone(id, _) => self.get(id).ok().and_then(|m| m.cluster_id),
+                    DedupAction::CreateNew => memory_ref.cluster_id,
+                };
+
+                let dedup_action = if let Some(state) =
+                    crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
+                {
+                    let effective = state.get_dedup_threshold(candidate_cluster);
+                    if (effective - similarity_threshold).abs() > 0.01 {
+                        crate::extract::check_dedup(
+                            self,
+                            &memory_ref.topic,
+                            &memory_ref.content,
+                            effective,
+                            time_window_days,
+                        )?
+                    } else {
+                        dedup_action
+                    }
+                } else {
+                    dedup_action
+                };
+
+                let resolved_action = match dedup_action {
+                    DedupAction::GrayZone(candidate_id, sim) => {
+                        let existing = match self.get(&candidate_id).ok() {
+                            Some(existing) => existing,
+                            None => {
+                                let result = self.store_with_dedup_resolved(
+                                    memory
+                                        .take()
+                                        .expect("memory is consumed only when a final action is chosen"),
+                                    DedupAction::CreateNew,
+                                )?;
+                                return Ok(Ok(result));
+                            }
+                        };
+                        match &llm_judgment {
+                            Some((cached_id, cached_content, is_dup))
+                                if cached_id == &candidate_id
+                                    && cached_content == &existing.content =>
+                            {
+                                if *is_dup {
+                                    tracing::info!(
+                                        "LLM confirmed duplicate (sim={sim:.2}), merging into {candidate_id}"
+                                    );
+                                    DedupAction::MergeInto(candidate_id)
+                                } else {
+                                    tracing::info!(
+                                        "LLM says not duplicate (sim={sim:.2}), creating new"
+                                    );
+                                    DedupAction::CreateNew
+                                }
+                            }
+                            _ => {
+                                return Ok(Err(PendingLlm::Resolve {
+                                    candidate_id,
+                                    old_content: existing.content,
+                                    sim,
+                                }));
+                            }
+                        }
+                    }
+                    other => other,
+                };
+
+                let result = self.store_with_dedup_resolved(
+                    memory
+                        .take()
+                        .expect("memory is consumed only when a final action is chosen"),
+                    resolved_action,
+                )?;
+                Ok(Ok(result))
+            })();
+
+            match decision {
+                Ok(Ok(result)) => {
+                    self.conn.execute_batch("COMMIT")?;
+                    return Ok(result);
+                }
+                Ok(Err(PendingLlm::Resolve {
+                    candidate_id,
+                    old_content,
+                    sim,
+                })) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    let new_content = memory
+                        .as_ref()
+                        .expect("memory persists across gray-zone retries")
+                        .content
+                        .clone();
+                    let is_dup = std::panic::catch_unwind(|| {
                         tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
                                 let config = crate::config::ReinConfig::load().unwrap_or_default();
-                                crate::extract::llm::llm_is_duplicate(&config, &new_content, &old_content).await
+                                crate::extract::llm::llm_is_duplicate(
+                                    &config,
+                                    &new_content,
+                                    &old_content,
+                                )
+                                .await
                             })
                         })
-                    }).unwrap_or(false)
-                } else {
-                    false
-                };
-                if is_dup {
-                    tracing::info!("LLM confirmed duplicate (sim={sim:.2}), merging into {candidate_id}");
-                    DedupAction::MergeInto(candidate_id.clone())
-                } else {
-                    tracing::info!("LLM says not duplicate (sim={sim:.2}), creating new");
-                    DedupAction::CreateNew
+                    })
+                    .unwrap_or(false);
+                    tracing::debug!(
+                        "gray-zone dedup revalidation for {candidate_id} (sim={sim:.2}) => {}",
+                        if is_dup { "duplicate" } else { "new" }
+                    );
+                    llm_judgment = Some((candidate_id, old_content, is_dup));
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
                 }
             }
-            other => other,
-        };
-
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = self.store_with_dedup_resolved(memory, resolved_action);
-        match &result {
-            Ok(_) => { self.conn.execute_batch("COMMIT")?; }
-            Err(_) => { let _ = self.conn.execute_batch("ROLLBACK"); }
         }
-        result
     }
 
     /// Execute a pre-resolved dedup action within a BEGIN IMMEDIATE transaction.
@@ -971,10 +1053,18 @@ impl SqliteStore {
             }
         }
 
-        let mut index = crate::store::hnsw::HnswIndex::open(&hnsw_path, dims).ok()?;
+        let mut index = match crate::store::hnsw::HnswIndex::open(&hnsw_path, dims) {
+            Ok(index) => index,
+            Err(e) => {
+                tracing::warn!("HNSW index open failed: {e}");
+                crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
+                return None;
+            }
+        };
         let result = f(&mut index);
         if let Err(e) = index.save() {
             tracing::warn!("HNSW index save failed: {e}");
+            crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
         }
 
         #[cfg(unix)]

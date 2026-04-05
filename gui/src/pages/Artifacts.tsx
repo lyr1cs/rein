@@ -7,6 +7,7 @@ import type { Artifact } from '../api/types';
 
 interface ArtifactDetail extends Artifact {
   transcript_text: string | null;
+  transcript_available?: boolean;
 }
 
 /* ── helpers ─────────────────────────────────────────────────────── */
@@ -78,7 +79,7 @@ export default function Artifacts() {
       setDetail(null);
       setDetailLoading(true);
       try {
-        const d = await apiGet<ArtifactDetail>(`/api/artifacts/${artifact.id}`);
+        const d = await apiGet<ArtifactDetail>(`/api/artifacts/${artifact.id}?include_transcript=true`);
         setDetail(d);
       } catch (err) {
         console.error('Failed to fetch artifact detail:', err);
