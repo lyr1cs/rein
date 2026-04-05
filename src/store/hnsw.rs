@@ -146,12 +146,26 @@ impl HnswIndex {
         std::fs::write(&meta_path, meta)
             .map_err(|e| ReinError::Config(format!("hnsw meta save: {e}")))?;
 
+        let _ = std::fs::remove_file(Self::dirty_marker_path(&self.path));
+
         Ok(())
     }
 
     /// Dimensions this index was created with.
     pub fn dims(&self) -> usize {
         self.dims
+    }
+
+    pub fn dirty_marker_path(path: &Path) -> PathBuf {
+        path.with_extension("usearch.dirty")
+    }
+
+    pub fn mark_dirty(path: &Path) {
+        let _ = std::fs::write(Self::dirty_marker_path(path), b"dirty");
+    }
+
+    pub fn is_dirty(path: &Path) -> bool {
+        Self::dirty_marker_path(path).exists()
     }
 }
 

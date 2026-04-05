@@ -410,7 +410,7 @@ rein serve --proxy &
 
 # 2. Use with your agent
 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code (login mode works)
-OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"   # OpenAI Codex CLI
+codex -c 'openai_base_url="http://127.0.0.1:8690"' "hello"   # Codex CLI
 ```
 
 #### Shell Aliases (recommended)
@@ -420,7 +420,7 @@ Add to `~/.zshrc` or `~/.bashrc` for convenience:
 ```bash
 alias rein-proxy="rein serve --proxy &"
 alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
-alias codexp="OPENAI_BASE_URL=http://127.0.0.1:8690 codex"
+alias codexp="codex -c 'openai_base_url=\"http://127.0.0.1:8690\"'"
 ```
 
 Then: `rein-proxy` to start, `claudep` or `codexp` to use.
@@ -440,7 +440,7 @@ This makes all Codex calls go through the rein proxy by default (requires proxy 
 | Agent | Configuration | Format |
 |-------|--------------|--------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
-| **Codex CLI** | `openai_base_url` in `~/.codex/config.toml` or `OPENAI_BASE_URL` env var | OpenAI `/v1/chat/completions` |
+| **Codex CLI** | `openai_base_url` in `~/.codex/config.toml` or `codex -c 'openai_base_url=\"...\"'` | OpenAI `/responses` |
 | **Cursor** | Settings > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | Settings > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **Any OpenAI-compatible** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
@@ -449,7 +449,7 @@ This makes all Codex calls go through the rein proxy by default (requires proxy 
 
 #### How it works
 
-- Proxy intercepts `/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI)
+- Proxy intercepts `/v1/messages` (Anthropic), `/v1/chat/completions` (OpenAI), and `/responses` / `/v1/responses` (Codex / OpenAI Responses API)
 - Requests are forwarded **unmodified** (record-only, no injection)
 - Assistant responses are asynchronously extracted and stored as memories
 - SSE streaming is passed through byte-for-byte with zero latency impact
@@ -1046,7 +1046,7 @@ rein serve --proxy &
 
 # 2. 配合你的 agent 使用
 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code（登录模式也可用）
-OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"   # OpenAI Codex CLI
+codex -c 'openai_base_url="http://127.0.0.1:8690"' "hello"   # Codex CLI
 ```
 
 #### Shell 别名（推荐）
@@ -1056,7 +1056,7 @@ OPENAI_BASE_URL=http://127.0.0.1:8690 codex "hello"   # OpenAI Codex CLI
 ```bash
 alias rein-proxy="rein serve --proxy &"
 alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
-alias codexp="OPENAI_BASE_URL=http://127.0.0.1:8690 codex"
+alias codexp="codex -c 'openai_base_url=\"http://127.0.0.1:8690\"'"
 ```
 
 然后：`rein-proxy` 启动代理，`claudep` 或 `codexp` 使用。
@@ -1076,7 +1076,7 @@ openai_base_url = "http://127.0.0.1:8690"
 | Agent | 配置方式 | API 格式 |
 |-------|---------|----------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
-| **Codex CLI** | `~/.codex/config.toml` 中 `openai_base_url` 或 `OPENAI_BASE_URL` 环境变量 | OpenAI `/v1/chat/completions` |
+| **Codex CLI** | `~/.codex/config.toml` 中 `openai_base_url` 或 `codex -c 'openai_base_url=\"...\"'` | OpenAI `/responses` |
 | **Cursor** | 设置 > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | 设置 > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **任何 OpenAI 兼容工具** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |

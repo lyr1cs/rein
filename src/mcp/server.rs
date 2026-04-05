@@ -86,9 +86,10 @@ impl ReinServer {
         // Parse optional temporal filters
         let time_from = params.from.as_deref().and_then(parse_datetime);
         let time_to = params.to.as_deref().and_then(parse_datetime_end);
+        let request_id = ulid::Ulid::new().to_string();
 
         let result = self.with_store(|store| {
-            crate::search::recall::recall_temporal(
+            crate::search::recall::recall_temporal_with_request_id(
                 store,
                 &self.config,
                 &params.query,
@@ -99,6 +100,7 @@ impl ReinServer {
                 time_to,
                 params.expand,
                 false, // MCP uses full pipeline
+                Some(request_id.clone()),
             )
             .map_err(|e| ReinError::Config(format!("{e}")))
         });
@@ -109,9 +111,6 @@ impl ReinServer {
             time_from.is_some(),
             time_to.is_some(),
         );
-
-        // Generate request_id for feedback attribution
-        let request_id = ulid::Ulid::new().to_string();
 
         match result {
             Ok(results) => {
@@ -1469,13 +1468,14 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
 
     // Bearer token authentication
     let auth_token = std::env::var("REIN_HTTP_TOKEN").ok();
-    if auth_token.is_none()
-        && config.server.sse_bind != "127.0.0.1"
-        && config.server.sse_bind != "::1"
-    {
+    let allow_loopback_unauth = config.server.allow_unauthenticated_loopback
+        && (config.server.sse_bind == "127.0.0.1"
+            || config.server.sse_bind == "::1"
+            || config.server.sse_bind == "localhost");
+    if auth_token.is_none() && !allow_loopback_unauth {
         return Err(anyhow::anyhow!(
-            "REIN_HTTP_TOKEN must be set when binding to non-localhost ({}). \
-             Set REIN_HTTP_TOKEN=<secret> or use sse_bind=127.0.0.1",
+            "REIN_HTTP_TOKEN must be set for HTTP/SSE access on '{}'. \
+             Set REIN_HTTP_TOKEN=<secret> or explicitly opt into unauthenticated loopback with [server].allow_unauthenticated_loopback=true",
             config.server.sse_bind
         ));
     }

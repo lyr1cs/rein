@@ -6,6 +6,7 @@ use crate::config::ReinConfig;
 use crate::embed::{EmbedCache, create_embedder, prepend_metadata};
 use crate::store::SqliteStore;
 use crate::types::Embedder as _;
+use std::path::{Path, PathBuf};
 
 /// Warm up the embedding cache by pre-computing embeddings for uncached memories.
 /// Returns (cached_count, error_count).
@@ -103,8 +104,32 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         return; // skip for in-memory test databases
     }
     let hnsw_path = db_path.with_extension("");
+    let lock_path = hnsw_path.with_extension("usearch.lock");
     let dims = config.embedding.dimensions;
     let model = config.embedding_model();
+
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!("hnsw: failed to open rebuild lock: {e}");
+            return;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            tracing::warn!("hnsw: failed to acquire rebuild lock: {}", std::io::Error::last_os_error());
+            return;
+        }
+    }
 
     // Clear stale index before rebuilding
     let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
@@ -145,6 +170,13 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
             tracing::info!("hnsw: indexed {inserted} vectors");
         }
     }
+    let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Populate the Tantivy FTS index from all memories in SQLite.
@@ -163,12 +195,15 @@ pub fn populate_tantivy(store: &SqliteStore) {
         Ok(f) => f,
         Err(_) => return,
     };
-    use std::os::unix::io::AsRawFd;
-    let fd = lock_file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret != 0 {
-        tracing::debug!("tantivy: another process is rebuilding, skipping");
-        return;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            tracing::debug!("tantivy: another process is rebuilding, skipping");
+            return;
+        }
     }
 
     // Clear stale index before rebuilding
@@ -201,7 +236,13 @@ pub fn populate_tantivy(store: &SqliteStore) {
         tracing::info!("tantivy: indexed {indexed} documents");
     }
 
+    let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
+
     // Lock released when lock_file is dropped.
     drop(lock_file);
     let _ = std::fs::remove_file(&lock_path);
+}
+
+pub fn tantivy_dirty_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("tantivy").join(".dirty")
 }
