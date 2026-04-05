@@ -2,6 +2,7 @@
 target/
 .claude/*.local.md
 .claude/*.log
+bench/
 reviews/
 bench/results*.jsonl
 bench/results*.jsonl.*
