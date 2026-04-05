@@ -1515,6 +1515,8 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     if config.server.gui_enabled {
         eprintln!("Neural Wiki GUI available at http://{bind}/");
     }
+    // Write PID file for service management (rein gui on/off, rein dashboard).
+    let _ = crate::service::write_pid("gui");
 
     let rest_config = config.clone();
     let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
