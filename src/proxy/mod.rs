@@ -827,11 +827,16 @@ async fn connect_upstream_websocket(
     let mut request = format!(
         "GET {rewritten_path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
     );
+    /// Strip control characters from header values for defense-in-depth
+    fn sanitize_header_value(s: &str) -> String {
+        s.chars().filter(|c| !c.is_control()).collect()
+    }
+
     if let Some(key) = headers
         .get("sec-websocket-key")
         .and_then(|v| v.to_str().ok())
     {
-        request.push_str(&format!("Sec-WebSocket-Key: {key}\r\n"));
+        request.push_str(&format!("Sec-WebSocket-Key: {}\r\n", sanitize_header_value(key)));
     }
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
@@ -839,7 +844,7 @@ async fn connect_upstream_websocket(
             continue;
         }
         if let Ok(v) = value.to_str() {
-            request.push_str(&format!("{name_str}: {v}\r\n"));
+            request.push_str(&format!("{name_str}: {}\r\n", sanitize_header_value(v)));
         }
     }
     request.push_str("\r\n");

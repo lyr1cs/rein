@@ -1,0 +1,1105 @@
+//! Dedup operations: merge, provenance-preserving dedup, embedding-based dedup,
+//! and cleanup event emission.
+
+use crate::config::ReinConfig;
+use crate::store::SqliteStore;
+use crate::types::*;
+
+use super::adaptive::run_adaptive_pipeline;
+use super::consolidation::load_group_memories;
+use super::stronger_tier;
+
+pub(crate) fn emit_cleanup_event(
+    store: &SqliteStore,
+    event_type: crate::store::adaptive::EventType,
+    memory_id: Option<String>,
+    topic: Option<String>,
+    payload: serde_json::Value,
+) {
+    let _ = crate::store::adaptive::emit_event(
+        store.conn(),
+        crate::store::adaptive::FeedbackEvent {
+            event_type,
+            request_id: None,
+            memory_id,
+            concept_id: None,
+            query: None,
+            query_type: Some("cleanup".to_string()),
+            topic,
+            payload: Some(payload),
+        },
+    );
+}
+
+fn record_dedup_artifacts(
+    store: &SqliteStore,
+    winner_id: &str,
+    loser: &Memory,
+    relation: DedupRelation,
+    lexical_score: Option<f32>,
+    embedding_score: Option<f32>,
+    reason: &str,
+    payload: Option<serde_json::Value>,
+) {
+    let canonical_id = store
+        .canonical_id_for(winner_id)
+        .unwrap_or_else(|_| winner_id.to_string());
+    if let Err(e) = store.snapshot_memory_as_evidence(&canonical_id, loser) {
+        tracing::warn!("dedup: failed to snapshot evidence for {}: {e}", loser.id);
+    }
+    let merged_summary = store.get(winner_id).ok().map(|memory| memory.summary);
+    if let Err(e) = store.record_dedup_decision(DedupDecision {
+        id: String::new(),
+        winner_id: Some(winner_id.to_string()),
+        loser_id: Some(loser.id.clone()),
+        canonical_id: Some(canonical_id),
+        lexical_score,
+        embedding_score,
+        relation,
+        confidence: lexical_score
+            .or(embedding_score)
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0),
+        reason: reason.to_string(),
+        operator: "auto".to_string(),
+        reversible: true,
+        merged_summary,
+        novel_facts: vec![],
+        conflict_detected: matches!(relation, DedupRelation::Update),
+        payload,
+        created_at: chrono::Utc::now(),
+    }) {
+        tracing::warn!("dedup: failed to record decision for loser {}: {e}", loser.id);
+    }
+}
+
+fn merge_memory_into_winner(
+    store: &SqliteStore,
+    winner_id: &str,
+    loser: &Memory,
+    lexical_score: Option<f32>,
+    embedding_score: Option<f32>,
+    reason: &str,
+    payload: Option<serde_json::Value>,
+) -> ReinResult<()> {
+    // Wrap in SAVEPOINT for atomicity: if any step fails (update, mark_superseded,
+    // evidence snapshot), the entire merge is rolled back to prevent partial state
+    // (e.g. winner updated but loser provenance lost).
+    store
+        .conn()
+        .execute_batch("SAVEPOINT merge_winner")?;
+    let result = (|| -> ReinResult<()> {
+        let mut winner = match store.get(winner_id) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("merge: winner {winner_id} not found: {e}");
+                return Err(e);
+            }
+        };
+        let unique = extract_unique_lines(&loser.content, &winner.content);
+        if !unique.is_empty() {
+            winner.content.push_str(&format!(
+                "\n\n[merged from {} on {}]\n{}",
+                loser.id,
+                loser.created_at.format("%Y-%m-%d"),
+                unique,
+            ));
+        }
+        for kw in &loser.keywords {
+            if !winner.keywords.contains(kw) {
+                winner.keywords.push(kw.clone());
+            }
+        }
+        winner.access_count = winner
+            .access_count
+            .saturating_add(loser.access_count)
+            .saturating_add(1);
+        winner.strength = (winner.strength + 0.1).min(1.0);
+        winner.importance = winner.importance.max(loser.importance);
+        winner.layer = winner.importance.auto_layer();
+        winner.decay_lambda = winner.decay_lambda.min(loser.decay_lambda);
+        winner.tier = stronger_tier(winner.tier, loser.tier);
+        winner.last_accessed = winner.last_accessed.max(loser.last_accessed);
+        winner.updated_at = chrono::Utc::now();
+        winner.summary = winner.content.chars().take(100).collect();
+        store.update(&winner)?;
+        store.mark_superseded(&loser.id, winner_id)?;
+        record_dedup_artifacts(
+            store,
+            winner_id,
+            loser,
+            DedupRelation::Duplicate,
+            lexical_score,
+            embedding_score,
+            reason,
+            payload,
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            store
+                .conn()
+                .execute_batch("RELEASE merge_winner")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = store.conn().execute_batch("ROLLBACK TO merge_winner");
+            let _ = store.conn().execute_batch("RELEASE merge_winner");
+            Err(e)
+        }
+    }
+}
+
+pub async fn resolve_dedup_job_async(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    existing_id: &str,
+    new_id: &str,
+    lexical_score: Option<f32>,
+    reason: &str,
+) -> ReinResult<DedupRelation> {
+    let existing = match store.get(existing_id) {
+        Ok(memory) => memory,
+        Err(_) => return Ok(DedupRelation::Distinct),
+    };
+    let new_memory = match store.get(new_id) {
+        Ok(memory) => memory,
+        Err(_) => return Ok(DedupRelation::Distinct),
+    };
+
+    if existing.superseded_by.is_some() || new_memory.superseded_by.is_some() {
+        return Ok(DedupRelation::Distinct);
+    }
+
+    let existing_canonical = store.canonical_id_for(existing_id)?;
+    let new_canonical = store.canonical_id_for(new_id)?;
+    if existing_canonical == new_canonical {
+        return Ok(DedupRelation::Duplicate);
+    }
+
+    let verdict = match crate::extract::llm::llm_dedup_verdict(
+        config,
+        &existing.content,
+        &new_memory.content,
+    )
+    .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::debug!("LLM dedup verdict returned None, falling back to Distinct");
+            crate::extract::llm::DedupVerdict {
+                relation: DedupRelation::Distinct,
+                confidence: 0.5,
+                merged_summary: String::new(),
+                novel_facts: vec![],
+                conflict_detected: false,
+                suggested_topic: None,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("LLM dedup verdict failed, falling back to Distinct: {e}");
+            crate::extract::llm::DedupVerdict {
+                relation: DedupRelation::Distinct,
+                confidence: 0.5,
+                merged_summary: String::new(),
+                novel_facts: vec![],
+                conflict_detected: false,
+                suggested_topic: None,
+            }
+        }
+    };
+    let payload = Some(serde_json::json!({
+        "confidence": verdict.confidence,
+        "merged_summary": verdict.merged_summary,
+        "novel_facts": verdict.novel_facts,
+        "suggested_topic": verdict.suggested_topic,
+        "conflict_detected": verdict.conflict_detected,
+        "reason": reason,
+    }));
+
+    match verdict.relation {
+        DedupRelation::Duplicate => {
+            merge_memory_into_winner(
+                store,
+                existing_id,
+                &new_memory,
+                lexical_score,
+                None,
+                reason,
+                payload,
+            )?;
+            Ok(DedupRelation::Duplicate)
+        }
+        DedupRelation::Update => {
+            if let Ok(mut winner) = store.get(new_id) {
+                for kw in &existing.keywords {
+                    if !winner.keywords.contains(kw) {
+                        winner.keywords.push(kw.clone());
+                    }
+                }
+                winner.importance = winner.importance.max(existing.importance);
+                winner.layer = winner.importance.auto_layer();
+                winner.decay_lambda = winner.decay_lambda.min(existing.decay_lambda);
+                winner.strength = (winner.strength + 0.05).min(1.0);
+                if !verdict.merged_summary.trim().is_empty() {
+                    winner.summary = verdict.merged_summary.chars().take(100).collect();
+                }
+                winner.updated_at = chrono::Utc::now();
+                store.update(&winner)?;
+            }
+            store.mark_superseded(existing_id, new_id)?;
+            record_dedup_artifacts(
+                store,
+                new_id,
+                &existing,
+                DedupRelation::Update,
+                lexical_score,
+                None,
+                reason,
+                payload,
+            );
+            Ok(DedupRelation::Update)
+        }
+        DedupRelation::Related => {
+            if let Ok(mut left) = store.get(existing_id) {
+                if !left.related_ids.contains(&new_id.to_string()) {
+                    left.related_ids.push(new_id.to_string());
+                    let _ = store.update(&left);
+                }
+            }
+            if let Ok(mut right) = store.get(new_id) {
+                if !right.related_ids.contains(&existing_id.to_string()) {
+                    right.related_ids.push(existing_id.to_string());
+                    let _ = store.update(&right);
+                }
+            }
+            let _ = store.record_dedup_decision(DedupDecision {
+                id: String::new(),
+                winner_id: None,
+                loser_id: Some(new_id.to_string()),
+                canonical_id: None,
+                lexical_score,
+                embedding_score: None,
+                relation: DedupRelation::Related,
+                confidence: verdict.confidence as f32,
+                reason: reason.to_string(),
+                operator: "auto".to_string(),
+                reversible: true,
+                merged_summary: (!verdict.merged_summary.trim().is_empty())
+                    .then_some(verdict.merged_summary),
+                novel_facts: verdict.novel_facts,
+                conflict_detected: verdict.conflict_detected,
+                payload,
+                created_at: chrono::Utc::now(),
+            });
+            Ok(DedupRelation::Related)
+        }
+        DedupRelation::Distinct => {
+            let _ = store.record_dedup_decision(DedupDecision {
+                id: String::new(),
+                winner_id: None,
+                loser_id: Some(new_id.to_string()),
+                canonical_id: None,
+                lexical_score,
+                embedding_score: None,
+                relation: DedupRelation::Distinct,
+                confidence: verdict.confidence as f32,
+                reason: reason.to_string(),
+                operator: "auto".to_string(),
+                reversible: true,
+                merged_summary: (!verdict.merged_summary.trim().is_empty())
+                    .then_some(verdict.merged_summary),
+                novel_facts: verdict.novel_facts,
+                conflict_detected: verdict.conflict_detected,
+                payload,
+                created_at: chrono::Utc::now(),
+            });
+            Ok(DedupRelation::Distinct)
+        }
+    }
+}
+
+pub(crate) fn record_deleted_memory_as_evidence(store: &SqliteStore, canonical_id: &str, memory: &Memory) {
+    let _ = store.add_memory_evidence(MemoryEvidence {
+        id: String::new(),
+        canonical_id: canonical_id.to_string(),
+        memory_id: None,
+        source_topic: memory.topic.clone(),
+        summary: memory.summary.clone(),
+        content: memory.content.clone(),
+        keywords: memory.keywords.clone(),
+        source: memory.source,
+        created_at: memory.created_at,
+        imported_at: chrono::Utc::now(),
+    });
+}
+
+/// Embedding-based dedup sweep for memories marked `needs_vec_dedup`.
+/// Computes embeddings (if missing), searches vec_memories for near-duplicates,
+/// and merges/supersedes matches. Runs in the GC slow channel (zero hot-path cost).
+pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
+    let conn = store.conn();
+
+    // Fetch memories needing vec dedup (batch limit to avoid holding resources too long)
+    let pending: Vec<(String, String, String, String)> = match conn.prepare(
+        "SELECT id, topic, summary, content FROM memories
+         WHERE needs_vec_dedup = 1 AND status = 'active' AND superseded_by IS NULL
+         LIMIT 50",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+
+    if pending.is_empty() {
+        return;
+    }
+
+    tracing::debug!("vec_dedup: processing {} memories", pending.len());
+
+    // Create embedder (needed for computing embeddings of new memories)
+    let embedder = match crate::embed::create_embedder(config) {
+        Some(e) => e,
+        None => {
+            tracing::debug!(
+                "vec_dedup: no embedder configured, skipping (flags preserved for later)"
+            );
+            return;
+        }
+    };
+
+    let model_name = config.embedding_model();
+    let mut merged = 0u32;
+
+    for (id, topic, summary, content) in &pending {
+        // Step 1: Get or compute embedding for this memory
+        let enriched = crate::embed::prepend_metadata(topic, summary, content);
+        let embedding = match crate::embed::EmbedCache::get(conn, &enriched, &model_name) {
+            Ok(Some(cached)) => {
+                // Ensure this memory is also in vec_memories (cache may exist from warmup
+                // without a corresponding vec_memories row)
+                let _ = crate::store::vec::insert_embedding(conn, id, &cached);
+                cached
+            }
+            _ => {
+                // Compute embedding (async → sync bridge)
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            use crate::types::traits::Embedder;
+                            embedder.embed(&enriched).await
+                        })
+                    })
+                })) {
+                    Ok(Ok(emb)) => {
+                        // Cache + store in vec_memories
+                        let _ = crate::embed::EmbedCache::put(conn, &enriched, &model_name, &emb);
+                        let _ = crate::store::vec::insert_embedding(conn, id, &emb);
+                        emb
+                    }
+                    _ => {
+                        tracing::debug!("vec_dedup: failed to compute embedding for {id}");
+                        let _ = conn.execute(
+                            "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                            rusqlite::params![id],
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // Step 2: Search vec_memories for near-duplicates (excluding self)
+        let vec_results = match crate::store::vec::search_vec(conn, &embedding, 10) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = conn.execute(
+                    "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                    rusqlite::params![id],
+                );
+                continue;
+            }
+        };
+
+        let mut found_dup = false;
+        for (candidate_id, distance) in &vec_results {
+            if candidate_id == id {
+                continue;
+            }
+
+            // cosine distance → similarity
+            let sim = 1.0 - (*distance as f64);
+            if sim < 0.70 {
+                break;
+            } // Results are sorted by distance; no point continuing
+
+            let candidate = match store.get(candidate_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if candidate.superseded_by.is_some()
+                || candidate.status != crate::types::MemoryStatus::Active
+            {
+                continue;
+            }
+
+            if sim > 0.85 {
+                // Strong semantic match — provenance-preserving merge
+                let (keep_id, discard_id, discard_content, discard_created) =
+                    if candidate.access_count >= 1
+                        || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1)
+                    {
+                        (
+                            &candidate.id,
+                            id,
+                            content.to_string(),
+                            chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                        )
+                    } else {
+                        (
+                            id,
+                            candidate_id,
+                            candidate.content.clone(),
+                            candidate.created_at.format("%Y-%m-%d").to_string(),
+                        )
+                    };
+
+                // Extract unique lines from the loser and append to winner
+                if let Ok(mut kept) = store.get(keep_id) {
+                    let unique = extract_unique_lines(&discard_content, &kept.content);
+                    if !unique.is_empty() {
+                        kept.content.push_str(&format!(
+                            "\n\n[merged from {discard_id} on {discard_created}]\n{unique}"
+                        ));
+                    }
+                    kept.summary = kept.content.chars().take(100).collect();
+                    kept.strength = (kept.strength + 0.2).min(1.0);
+                    kept.updated_at = chrono::Utc::now();
+                    let _ = store.update(&kept);
+                }
+                let _ = store.mark_superseded(discard_id, keep_id);
+                if let Ok(discard_memory) = store.get(discard_id) {
+                    record_dedup_artifacts(
+                        store,
+                        keep_id,
+                        &discard_memory,
+                        DedupRelation::Duplicate,
+                        None,
+                        Some(sim as f32),
+                        "vec_dedup_strong",
+                        Some(serde_json::json!({ "cosine_similarity": sim })),
+                    );
+                }
+
+                tracing::info!(
+                    "vec_dedup: merged {discard_id} into {keep_id} (cosine_sim={sim:.3})"
+                );
+                merged += 1;
+                found_dup = true;
+                break;
+            } else if sim > 0.70 {
+                // Moderate match — use LLM to confirm (if available)
+                let relation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            crate::extract::llm::llm_dedup_verdict(
+                                config,
+                                content,
+                                &candidate.content,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|verdict| verdict.relation)
+                            .unwrap_or(DedupRelation::Distinct)
+                        })
+                    })
+                }))
+                .unwrap_or(DedupRelation::Distinct);
+
+                if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
+                    let _ = store.mark_superseded(id, &candidate.id);
+                    if let Ok(discard_memory) = store.get(id) {
+                        record_dedup_artifacts(
+                            store,
+                            &candidate.id,
+                            &discard_memory,
+                            relation,
+                            None,
+                            Some(sim as f32),
+                            "vec_dedup_llm",
+                            Some(serde_json::json!({ "cosine_similarity": sim })),
+                        );
+                    }
+                    tracing::info!(
+                        "vec_dedup: LLM verdict {} superseded {id} by {} (cosine_sim={sim:.3})",
+                        relation,
+                        candidate.id
+                    );
+                    merged += 1;
+                    found_dup = true;
+                    break;
+                }
+            }
+        }
+
+        // Clear the flag whether or not we found a dup
+        let _ = conn.execute(
+            "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+            rusqlite::params![id],
+        );
+        // If this memory was merged away, also clear the other's flag
+        if found_dup {
+            // Already handled above via superseded_by
+        }
+    }
+
+    if merged > 0 {
+        tracing::info!("vec_dedup: merged {merged} semantic duplicates");
+    }
+}
+
+/// Run dedup scan across all topics with provenance-preserving merge.
+///
+/// Instead of hard-deleting duplicates (which loses temporal anchors and unique
+/// details), this extracts unique lines from the "loser" and appends them to the
+/// "winner" with a provenance marker. The loser is then superseded, not deleted.
+///
+/// Returns (duplicates_found, duplicates_merged).
+pub fn run_dedup(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    threshold: f32,
+    dry_run: bool,
+    merge_variants: bool,
+) -> ReinResult<(u32, u32)> {
+    let groups = super::resolve_topic_groups(store, None, &[], None, true, merge_variants)?;
+    let mut dups_found = 0u32;
+    let mut dups_merged = 0u32;
+    let mut changed = false;
+    for group in &groups {
+        let mems: Vec<_> = load_group_memories(store, group)?
+            .into_iter()
+            .filter(|m| m.superseded_by.is_none())
+            .collect();
+        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Group memories by cluster_id for O(n * max_cluster_size) comparison
+        // instead of O(n^2). Unassigned memories (cluster_id = None) form their own group.
+        let mut cluster_groups: std::collections::HashMap<Option<u32>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, mem) in mems.iter().enumerate() {
+            cluster_groups.entry(mem.cluster_id).or_default().push(idx);
+        }
+
+        // Compare within each cluster group (much smaller than full pairwise)
+        for (_cluster_id, indices) in &cluster_groups {
+        for ii in 0..indices.len() {
+            let i = indices[ii];
+            if processed.contains(&mems[i].id) {
+                continue;
+            }
+            for jj in (ii + 1)..indices.len() {
+                let j = indices[jj];
+                if processed.contains(&mems[j].id) {
+                    continue;
+                }
+                let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
+                let relation = if sim >= threshold {
+                    DedupRelation::Duplicate
+                } else if !dry_run && sim >= (threshold - 0.15).max(0.50) {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                crate::extract::llm::llm_dedup_verdict(
+                                    config,
+                                    &mems[i].content,
+                                    &mems[j].content,
+                                )
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|verdict| verdict.relation)
+                                .unwrap_or(DedupRelation::Distinct)
+                            })
+                        })
+                    }))
+                    .unwrap_or(DedupRelation::Distinct)
+                } else {
+                    DedupRelation::Distinct
+                };
+
+                if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
+                    dups_found += 1;
+                    // Determine winner (longer/newer) and loser
+                    let (winner_idx, loser_idx) = if mems[j].content.len() >= mems[i].content.len()
+                    {
+                        (j, i)
+                    } else {
+                        (i, j)
+                    };
+                    if dry_run {
+                        tracing::debug!(
+                            "dup: '{}' ~ '{}'",
+                            &mems[loser_idx].summary.chars().take(40).collect::<String>(),
+                            &mems[winner_idx]
+                                .summary
+                                .chars()
+                                .take(40)
+                                .collect::<String>()
+                        );
+                    } else {
+                        // Provenance-preserving merge wrapped in SAVEPOINT for atomicity
+                        let sp_name = format!("dedup_{dups_found}");
+                        if let Err(e) = store.conn().execute_batch(&format!("SAVEPOINT {sp_name}")) {
+                            tracing::warn!("dedup: failed to create savepoint: {e}");
+                            continue;
+                        }
+
+                        let unique = extract_unique_lines(
+                            &mems[loser_idx].content,
+                            &mems[winner_idx].content,
+                        );
+                        let canonical_id = store
+                            .canonical_id_for(&mems[winner_idx].id)
+                            .unwrap_or_else(|_| mems[winner_idx].id.clone());
+
+                        let merge_result = (|| -> ReinResult<()> {
+                            let mut winner = store.get(&mems[winner_idx].id)?;
+                            if !unique.is_empty() {
+                                let provenance = format!(
+                                    "\n\n[merged from {} on {}]\n{}",
+                                    mems[loser_idx].id,
+                                    mems[loser_idx].created_at.format("%Y-%m-%d"),
+                                    unique,
+                                );
+                                winner.content.push_str(&provenance);
+                            }
+                            for kw in &mems[loser_idx].keywords {
+                                if !winner.keywords.contains(kw) {
+                                    winner.keywords.push(kw.clone());
+                                }
+                            }
+                            winner.access_count = winner
+                                .access_count
+                                .saturating_add(mems[loser_idx].access_count)
+                                .saturating_add(1);
+                            winner.strength = (winner.strength + 0.1).min(1.0);
+                            winner.importance = winner.importance.max(mems[loser_idx].importance);
+                            winner.layer = winner.importance.auto_layer();
+                            winner.decay_lambda =
+                                winner.decay_lambda.min(mems[loser_idx].decay_lambda);
+                            winner.tier = stronger_tier(winner.tier, mems[loser_idx].tier);
+                            winner.last_accessed = chrono::Utc::now();
+                            winner.updated_at = chrono::Utc::now();
+                            store.update(&winner)?;
+                            store.mark_superseded(&mems[loser_idx].id, &mems[winner_idx].id)?;
+                            store.snapshot_memory_as_evidence(&canonical_id, &mems[loser_idx])?;
+                            store.record_dedup_decision(DedupDecision {
+                                id: String::new(),
+                                winner_id: Some(mems[winner_idx].id.clone()),
+                                loser_id: Some(mems[loser_idx].id.clone()),
+                                canonical_id: Some(canonical_id.clone()),
+                                lexical_score: Some(sim),
+                                embedding_score: None,
+                                relation,
+                                confidence: sim,
+                                reason: "batch_dedup".to_string(),
+                                operator: "manual".to_string(),
+                                reversible: true,
+                                merged_summary: Some(mems[winner_idx].summary.clone()),
+                                novel_facts: unique
+                                    .lines()
+                                    .map(|line| line.trim().to_string())
+                                    .filter(|line| !line.is_empty())
+                                    .collect(),
+                                conflict_detected: matches!(relation, DedupRelation::Update),
+                                payload: Some(serde_json::json!({
+                                    "merge_variants": merge_variants,
+                                })),
+                                created_at: chrono::Utc::now(),
+                            })?;
+                            Ok(())
+                        })();
+
+                        match merge_result {
+                            Ok(()) => {
+                                let _ = store.conn().execute_batch(&format!("RELEASE {sp_name}"));
+                                emit_cleanup_event(
+                                    store,
+                                    crate::store::adaptive::EventType::Forget,
+                                    Some(mems[loser_idx].id.clone()),
+                                    Some(mems[loser_idx].topic.clone()),
+                                    serde_json::json!({
+                                        "source": "dedup",
+                                        "replacement_id": mems[winner_idx].id,
+                                        "winner_topic": mems[winner_idx].topic,
+                                        "similarity": sim,
+                                        "merge_variants": merge_variants,
+                                    }),
+                                );
+                                dups_merged += 1;
+                                changed = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!("dedup merge failed, rolling back: {e}");
+                                let _ = store.conn().execute_batch(&format!("ROLLBACK TO {sp_name}"));
+                                let _ = store.conn().execute_batch(&format!("RELEASE {sp_name}"));
+                            }
+                        }
+                    }
+                    // Mark only the loser as processed
+                    processed.insert(mems[loser_idx].id.clone());
+                    // If mems[i] was the loser, stop scanning (it's been superseded)
+                    // If mems[i] was the winner, continue scanning for more duplicates
+                    if loser_idx == i {
+                        break;
+                    }
+                }
+            }
+        }
+        } // end for (_cluster_id, indices)
+    }
+    if changed {
+        emit_cleanup_event(
+            store,
+            crate::store::adaptive::EventType::ParamUpdate,
+            None,
+            None,
+            serde_json::json!({
+                "source": "dedup",
+                "duplicates_merged": dups_merged,
+                "merge_variants": merge_variants,
+            }),
+        );
+        run_adaptive_pipeline(store, config);
+    }
+    Ok((dups_found, dups_merged))
+}
+
+/// Extract lines from `source` that are not present in `target`.
+/// Used for provenance-preserving merge: keeps unique temporal anchors and details.
+pub fn extract_unique_lines(source: &str, target: &str) -> String {
+    let target_lower = target.to_lowercase();
+    let unique: Vec<&str> = source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            // Skip merge markers from previous merges (prevent marker accumulation)
+            if trimmed.starts_with("[merged from ") || trimmed.starts_with("[merged on ") {
+                return false;
+            }
+            // Keep lines that have dates (temporal anchors) or aren't found in target
+            let has_date = trimmed.chars().any(|c| c.is_ascii_digit()) && {
+                // Dynamic date detection: current year ± 10
+                use chrono::Datelike;
+                let year = chrono::Utc::now().year();
+                let has_year =
+                    ((year - 10)..=(year + 10)).any(|y: i32| trimmed.contains(&y.to_string()));
+                has_year || trimmed.contains("月")
+            };
+            let is_unique = !target_lower.contains(&trimmed.to_lowercase());
+            has_date || is_unique
+        })
+        .collect();
+    unique.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ReinConfig;
+    use crate::store::SqliteStore;
+    use crate::types::traits::MemoryStore;
+    use chrono::Utc;
+
+    fn test_memory(topic: &str, content: &str) -> Memory {
+        Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: content.chars().take(50).collect(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 0.5,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::default(),
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    fn test_memory_with_cluster(topic: &str, content: &str, cluster: u32) -> Memory {
+        let mut m = test_memory(topic, content);
+        m.cluster_id = Some(cluster);
+        m
+    }
+
+    #[test]
+    fn test_run_dedup_finds_and_merges_duplicates() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        // Two memories with same topic and nearly identical content (>0.70 similarity)
+        let id1 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production config",
+            ))
+            .unwrap();
+        let id2 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production configuration",
+            ))
+            .unwrap();
+
+        let (found, merged) = run_dedup(&store, &config, 0.70, false, false).unwrap();
+        assert_eq!(found, 1, "should find 1 duplicate pair");
+        assert_eq!(merged, 1, "should merge 1 duplicate pair");
+
+        // One of them should be superseded
+        let m1 = store.get(&id1).ok();
+        let m2 = store.get(&id2).ok();
+        let superseded_count = [&m1, &m2]
+            .iter()
+            .filter(|m| m.as_ref().map_or(false, |m| m.superseded_by.is_some()))
+            .count();
+        assert_eq!(superseded_count, 1, "exactly one memory should be superseded");
+    }
+
+    #[test]
+    fn test_run_dedup_dry_run_does_not_modify() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        let id1 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production config",
+            ))
+            .unwrap();
+        let id2 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production configuration",
+            ))
+            .unwrap();
+
+        let (found, merged) = run_dedup(&store, &config, 0.70, true, false).unwrap();
+        assert_eq!(found, 1, "should find 1 duplicate pair in dry run");
+        assert_eq!(merged, 0, "should merge 0 in dry run");
+
+        // Neither should be superseded
+        let m1 = store.get(&id1).unwrap();
+        let m2 = store.get(&id2).unwrap();
+        assert!(m1.superseded_by.is_none(), "m1 should not be superseded");
+        assert!(m2.superseded_by.is_none(), "m2 should not be superseded");
+    }
+
+    #[test]
+    fn test_run_dedup_cluster_grouping() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        // Cluster 1: two similar memories about docker
+        store
+            .store(test_memory_with_cluster(
+                "infra",
+                "deploy the application using docker compose up with the production config",
+                1,
+            ))
+            .unwrap();
+        store
+            .store(test_memory_with_cluster(
+                "infra",
+                "deploy the application using docker compose up with the production configuration",
+                1,
+            ))
+            .unwrap();
+
+        // Cluster 2: two similar memories about kubernetes
+        store
+            .store(test_memory_with_cluster(
+                "infra",
+                "scale the kubernetes pods using kubectl scale deployment app replicas three",
+                2,
+            ))
+            .unwrap();
+        store
+            .store(test_memory_with_cluster(
+                "infra",
+                "scale the kubernetes pods using kubectl scale deployment app replicas to three",
+                2,
+            ))
+            .unwrap();
+
+        let (found, merged) = run_dedup(&store, &config, 0.70, false, false).unwrap();
+        // Should find duplicates only within each cluster, not cross-cluster
+        assert_eq!(found, 2, "should find 2 within-cluster duplicate pairs");
+        assert_eq!(merged, 2, "should merge 2 within-cluster duplicate pairs");
+    }
+
+    #[test]
+    fn test_run_dedup_savepoint_atomicity() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        let id1 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production config",
+            ))
+            .unwrap();
+        let id2 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production configuration",
+            ))
+            .unwrap();
+
+        let (_found, merged) = run_dedup(&store, &config, 0.70, false, false).unwrap();
+        assert_eq!(merged, 1);
+
+        // Determine winner and loser
+        let m1 = store.get(&id1).unwrap();
+        let m2 = store.get(&id2).unwrap();
+        let (winner_id, _loser_id) = if m1.superseded_by.is_some() {
+            (&id2, &id1)
+        } else {
+            (&id1, &id2)
+        };
+
+        // Winner should have merged content (or at least be the longer one)
+        let winner = store.get(winner_id).unwrap();
+        // The loser should be superseded
+        let loser_id = if winner_id == &id1 { &id2 } else { &id1 };
+        let loser = store.get(loser_id).unwrap();
+        assert!(loser.superseded_by.is_some(), "loser should be superseded");
+        assert_eq!(
+            loser.superseded_by.as_deref(),
+            Some(winner_id.as_str()),
+            "loser should point to winner"
+        );
+
+        // dedup_decisions table should have a record
+        let decisions = store.list_dedup_decisions(None, 10).unwrap();
+        assert!(
+            !decisions.is_empty(),
+            "dedup_decisions should have at least one record"
+        );
+        assert_eq!(decisions[0].winner_id.as_deref(), Some(winner.id.as_str()));
+    }
+
+    #[test]
+    fn test_merge_memory_into_winner_basic() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut winner_mem = test_memory("docker", "deploy with docker compose up");
+        winner_mem.keywords = vec!["docker".to_string(), "deploy".to_string()];
+        let winner_id = store.store(winner_mem).unwrap();
+
+        let mut loser_mem = test_memory("docker", "deploy with docker compose up and custom network settings");
+        loser_mem.keywords = vec!["docker".to_string(), "network".to_string()];
+        let loser_id = store.store(loser_mem).unwrap();
+
+        let loser = store.get(&loser_id).unwrap();
+
+        merge_memory_into_winner(&store, &winner_id, &loser, Some(0.85), None, "test_merge", None)
+            .unwrap();
+
+        let winner = store.get(&winner_id).unwrap();
+
+        // Winner content should include provenance marker
+        assert!(
+            winner.content.contains("[merged from"),
+            "winner should contain provenance marker, got: {}",
+            winner.content
+        );
+
+        // Winner keywords should include loser's keywords
+        assert!(
+            winner.keywords.contains(&"network".to_string()),
+            "winner should have loser's keyword 'network': {:?}",
+            winner.keywords
+        );
+
+        // Loser should be marked superseded
+        let loser_after = store.get(&loser_id).unwrap();
+        assert!(
+            loser_after.superseded_by.is_some(),
+            "loser should be superseded"
+        );
+        assert_eq!(
+            loser_after.superseded_by.as_deref(),
+            Some(winner_id.as_str())
+        );
+    }
+
+    #[test]
+    fn test_merge_memory_into_winner_rollback_on_missing_winner() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Store only the loser
+        let loser_mem = test_memory("docker", "some content for the loser memory");
+        let loser_id = store.store(loser_mem).unwrap();
+        let loser = store.get(&loser_id).unwrap();
+
+        // Attempt to merge with a non-existent winner
+        let result = merge_memory_into_winner(
+            &store,
+            "nonexistent-winner-id",
+            &loser,
+            Some(0.85),
+            None,
+            "test_rollback",
+            None,
+        );
+
+        assert!(result.is_err(), "should return Err for missing winner");
+
+        // Loser should NOT be marked superseded (SAVEPOINT rollback)
+        let loser_after = store.get(&loser_id).unwrap();
+        assert!(
+            loser_after.superseded_by.is_none(),
+            "loser should not be superseded after rollback"
+        );
+    }
+
+    #[test]
+    fn test_extract_unique_lines_basic() {
+        let source = "line A\nline B\nline C\nline D";
+        let target = "line A\nline C\nline E";
+
+        let unique = extract_unique_lines(source, target);
+        assert!(unique.contains("line B"), "should keep unique line B");
+        assert!(unique.contains("line D"), "should keep unique line D");
+        assert!(!unique.contains("line A"), "should exclude shared line A");
+        assert!(!unique.contains("line C"), "should exclude shared line C");
+    }
+}
