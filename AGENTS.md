@@ -92,10 +92,6 @@ gui/                 # Neural Wiki GUI (React 18 + TypeScript + Tailwind + Vite)
 │   └── pages/       # 8 pages: Dashboard, Brain, Memories, Adaptive, Graph, Timeline, Artifacts, Settings
 └── vite.config.ts   # Dev proxy + Tailwind plugin
 
-bench/               # LongMemEval benchmark adapters
-├── longmemeval_fast.py  # Fast parallel adapter (per-question temp DB)
-└── longmemeval_adapter.py # MCP HTTP adapter
-
 Dockerfile           # Multi-stage build (rust:latest → debian:trixie-slim)
 docker-compose.yml   # One-command deployment
 ```
