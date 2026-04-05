@@ -482,7 +482,7 @@ impl Default for ServerConfig {
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
             gui_enabled: false,
-            allow_unauthenticated_loopback: false,
+            allow_unauthenticated_loopback: true,
         }
     }
 }
@@ -523,7 +523,7 @@ impl Default for ProxyConfig {
             max_response_buffer: 1_048_576,
             max_sse_buffer: 1_048_576,
             max_concurrent_extractions: 4,
-            allow_unauthenticated_loopback: false,
+            allow_unauthenticated_loopback: true,
         }
     }
 }

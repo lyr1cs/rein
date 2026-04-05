@@ -66,7 +66,7 @@ export default function Timeline() {
     queryFn: () => {
       const params = new URLSearchParams();
       if (from) params.set('from', from);
-      if (to) params.set('to', `${to}T23:59:59`);
+      if (to) params.set('to', `${to}T23:59:59Z`);
       params.set('limit', String(limit));
       return apiGet<TimelineResponse>(`/api/timeline?${params}`);
     },
