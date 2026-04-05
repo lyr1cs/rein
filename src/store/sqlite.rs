@@ -601,6 +601,9 @@ fn row_to_dedup_decision(row: &rusqlite::Row) -> ReinResult<DedupDecision> {
 
 impl MemoryStore for SqliteStore {
     fn store(&self, mut memory: Memory) -> ReinResult<String> {
+        // Normalize topic to prevent fragmentation (case, hyphen, underscore variants)
+        memory.topic = crate::ops::normalize_topic_name(&memory.topic);
+
         let id = if memory.id.is_empty() {
             ulid::Ulid::new().to_string()
         } else {
@@ -1119,10 +1122,13 @@ impl SqliteStore {
     /// - Otherwise, creates a new memory.
     pub fn store_with_dedup(
         &self,
-        memory: Memory,
+        mut memory: Memory,
         similarity_threshold: f32,
         time_window_days: i64,
     ) -> ReinResult<String> {
+        // Normalize topic to prevent fragmentation (case, hyphen, underscore variants)
+        memory.topic = crate::ops::normalize_topic_name(&memory.topic);
+
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut pending_grayzone: Option<(String, f32)> = None;
 
@@ -1994,17 +2000,17 @@ mod tests {
         let old = store
             .consolidate_topics_atomic(
                 &[
-                    "Docker Deployment".to_string(),
                     "docker-deployment".to_string(),
                 ],
                 replacement,
             )
             .unwrap();
 
+        // Both original memories were stored with normalized topic "docker-deployment"
         assert_eq!(old.len(), 2);
-        let consolidated = store.get_by_topic("Docker Deployment").unwrap();
+        // Replacement topic "Docker Deployment" is normalized to "docker-deployment" at store time
+        let consolidated = store.get_by_topic("docker-deployment").unwrap();
         assert_eq!(consolidated.len(), 1);
-        assert!(store.get_by_topic("docker-deployment").unwrap().is_empty());
     }
 
     #[test]

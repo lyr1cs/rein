@@ -251,8 +251,13 @@ pub fn recall_temporal_with_request_id(
     };
     let expand_config = config.clone();
     let expand_query_str = query.to_string();
+    let cancel_expand = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_expand_clone = cancel_expand.clone();
     let expand_handle = if should_expand {
         Some(std::thread::spawn(move || {
+            if cancel_expand_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                return vec![];
+            }
             crate::search::expand::expand_query(&expand_config, &expand_query_str, adaptive_max)
         }))
     } else {
@@ -325,8 +330,8 @@ pub fn recall_temporal_with_request_id(
     // Skip entirely if strong signal detected (BM25 top1 is dominant, expansion won't help)
     let expanded_queries = if strong_signal {
         tracing::info!("strong signal — skipping expanded query searches");
-        // Note: dropping JoinHandle detaches the thread but does NOT cancel the LLM API call.
-        // The call runs to completion in background. Acceptable trade-off vs. cancellation complexity.
+        // Signal the expansion thread to skip the LLM API call if it hasn't started yet.
+        cancel_expand.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(expand_handle);
         vec![]
     } else {
@@ -425,15 +430,26 @@ pub fn recall_temporal_with_request_id(
     fts_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut vec_ranked: Vec<(String, f32)> = vec_scores.into_iter().collect();
     vec_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Batch-fetch topics for KG and episode results to avoid N+1 queries
+    let kg_episode_ids: Vec<String> = if topic.is_some() {
+        kg_scores
+            .iter()
+            .chain(episode_scores.iter())
+            .map(|(id, _)| id.clone())
+            .collect()
+    } else {
+        vec![]
+    };
+    let kg_episode_topic_map = batch_topic_map(store, &kg_episode_ids);
     let mut kg_ranked: Vec<(String, f32)> = kg_scores
         .into_iter()
-        .filter(|(id, _)| matches_topic(store, id, topic))
+        .filter(|(id, _)| matches_topic_from_map(&kg_episode_topic_map, id, topic))
         .collect();
     kg_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     kg_ranked.truncate(effective_limit);
     let mut episode_ranked: Vec<(String, f32)> = episode_scores
         .into_iter()
-        .filter(|(id, _)| matches_topic(store, id, topic))
+        .filter(|(id, _)| matches_topic_from_map(&kg_episode_topic_map, id, topic))
         .collect();
     episode_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     episode_ranked.truncate(effective_limit);
@@ -475,7 +491,8 @@ pub fn recall_temporal_with_request_id(
     };
 
     // Capture per-channel scores for reranking and M2 logging.
-    // Clamp negatives (rank sentinels like -1,-2) to 0 so reranker features are in [0, +inf).
+    // Clamp negatives (rank sentinels like -1,-2) to positive via 1/(1+|rank|),
+    // then max-normalize positive scores to [0,1] so CC fusion channels are comparable.
     let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion
         .iter()
         .map(|(id, s)| {
@@ -484,6 +501,15 @@ pub fn recall_temporal_with_request_id(
             (id.clone(), score)
         })
         .collect();
+    let fts_max = fts_norm_log.values().copied().fold(0.0f32, f32::max);
+    let fts_norm_log: std::collections::HashMap<String, f32> = if fts_max > 1.0 {
+        fts_norm_log
+            .into_iter()
+            .map(|(id, s)| (id, s / fts_max))
+            .collect()
+    } else {
+        fts_norm_log
+    };
     let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion
         .iter()
         .map(|(id, s)| {
@@ -491,6 +517,15 @@ pub fn recall_temporal_with_request_id(
             (id.clone(), score)
         })
         .collect();
+    let vec_max = vec_norm_log.values().copied().fold(0.0f32, f32::max);
+    let vec_norm_log: std::collections::HashMap<String, f32> = if vec_max > 1.0 {
+        vec_norm_log
+            .into_iter()
+            .map(|(id, s)| (id, s / vec_max))
+            .collect()
+    } else {
+        vec_norm_log
+    };
     let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
     let episode_norm_log: std::collections::HashMap<String, f32> =
         episode_ranked.iter().cloned().collect();
@@ -672,6 +707,9 @@ pub fn recall_temporal_with_request_id(
                 crate::types::Importance::Low => 0.4,
             }
         };
+        // Pre-compute lowercased query and words once for the entire loop
+        let query_lower = query.to_lowercase();
+        let query_words: Vec<&str> = query_lower.split_whitespace().collect();
         for (mem, score) in local_results.iter_mut() {
             let fts = fts_norm_log.get(&mem.id).copied().unwrap_or(0.0);
             let vec = vec_norm_log.get(&mem.id).copied().unwrap_or(0.0);
@@ -684,7 +722,6 @@ pub fn recall_temporal_with_request_id(
                 + (if episode > 0.0 { 1 } else { 0 });
             let channel_coverage = channels.max(1) as f32 / 4.0;
             // Topic match: does memory topic appear as a word in query?
-            let query_lower = query.to_lowercase();
             // Word-boundary match: multi-word topics match as phrase, single-word as exact token.
             // Avoids "sql" matching "nosql" while allowing "release process" to match.
             let topic_lower = mem.topic.to_lowercase();
@@ -697,7 +734,7 @@ pub fn recall_temporal_with_request_id(
                 }
             } else {
                 // Single-word topic: exact word match (not substring).
-                if query_lower.split_whitespace().any(|w| w == topic_lower) {
+                if query_words.iter().any(|w| *w == topic_lower) {
                     1.0
                 } else {
                     0.0
@@ -712,8 +749,8 @@ pub fn recall_temporal_with_request_id(
                 access_count: mem.access_count,
                 strength: mem.strength as f32,
                 importance_weight: importance_weight(&mem.importance),
-                keyword_overlap: crate::search::rerank::compute_keyword_overlap(
-                    query,
+                keyword_overlap: crate::search::rerank::compute_keyword_overlap_with_words(
+                    &query_words,
                     &mem.keywords,
                     &mem.content,
                 ),
@@ -1015,20 +1052,51 @@ fn try_vector_search_batch(
     merged
 }
 
-/// Check if a memory matches the requested topic filter.
-/// Note: N+1 query pattern — acceptable for small result sets after fusion/reranking.
-fn matches_topic(store: &SqliteStore, id: &str, topic: Option<&str>) -> bool {
+/// Batch-fetch topic for a set of memory IDs in a single query.
+/// Returns a map from memory ID to topic string.
+fn batch_topic_map(store: &SqliteStore, ids: &[String]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return map;
+    }
+    // Process in chunks to avoid SQLite parameter limits
+    for chunk in ids.chunks(500) {
+        let placeholders: String = (1..=chunk.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, topic FROM memories WHERE id IN ({})",
+            placeholders
+        );
+        if let Ok(mut stmt) = store.conn().prepare(&sql) {
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    map.insert(row.0, row.1);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Check if a memory matches the requested topic filter using a pre-fetched topic map.
+fn matches_topic_from_map(
+    topic_map: &std::collections::HashMap<String, String>,
+    id: &str,
+    topic: Option<&str>,
+) -> bool {
     match topic {
         None => true,
-        Some(t) => store
-            .conn()
-            .query_row(
-                "SELECT topic FROM memories WHERE id = ?1",
-                rusqlite::params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|mem_topic| mem_topic == t)
-            .unwrap_or(false),
+        Some(t) => topic_map.get(id).map(|mt| {
+            // Compare both raw and normalized forms so user-supplied filters
+            // match even after store-time topic normalization.
+            mt == t || crate::ops::normalize_topic_name(mt) == crate::ops::normalize_topic_name(t)
+        }).unwrap_or(false),
     }
 }
 
@@ -1041,9 +1109,19 @@ fn rank_and_filter(
     topic: Option<&str>,
     limit: usize,
 ) -> Vec<(String, f32)> {
+    if topic.is_none() {
+        return results
+            .into_iter()
+            .take(limit)
+            .enumerate()
+            .map(|(i, (id, _))| (id, -(i as f32)))
+            .collect();
+    }
+    let ids: Vec<String> = results.iter().map(|(id, _)| id.clone()).collect();
+    let topic_map = batch_topic_map(store, &ids);
     results
         .into_iter()
-        .filter(|(id, _)| matches_topic(store, id, topic))
+        .filter(|(id, _)| matches_topic_from_map(&topic_map, id, topic))
         .take(limit)
         .enumerate()
         .map(|(i, (id, _))| (id, -(i as f32)))

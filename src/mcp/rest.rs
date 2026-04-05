@@ -366,9 +366,18 @@ fn api_health(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     match store.health(topic) {
-        Ok(report) => {
-            // HealthReport may not implement Serialize, convert via Debug
-            json_response(StatusCode::OK, json!({ "health": format!("{:?}", report) }))
+        Ok(reports) => {
+            let items: Vec<serde_json::Value> = reports
+                .iter()
+                .map(|r| json!({
+                    "topic": r.topic,
+                    "count": r.count,
+                    "avg_strength": r.avg_strength,
+                    "stale_count": r.stale_count,
+                    "needs_consolidation": r.needs_consolidation,
+                }))
+                .collect();
+            json_response(StatusCode::OK, json!({ "health": items }))
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

@@ -378,7 +378,8 @@ pub fn detect_strong_signal(fts_ranked: &[(String, f32)]) -> bool {
     scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
     if scores.len() < 2 {
-        return false;
+        // Only one positive result — strong signal if it has a decent BM25 score
+        return scores.len() == 1 && scores[0] >= 3.0;
     }
 
     let top1 = scores[0];
@@ -471,13 +472,23 @@ mod tests {
     }
 
     #[test]
-    fn test_strong_signal_ignores_negative_scores() {
-        // FTS5 rank sentinels are negative
+    fn test_strong_signal_single_positive_among_negatives() {
+        // FTS5 rank sentinels are negative; only 1 positive score with high BM25 → strong signal
         let ranked = vec![
             ("a".to_string(), 8.0),
             ("b".to_string(), -1.0),
             ("c".to_string(), -2.0),
         ];
-        assert!(!detect_strong_signal(&ranked)); // Only 1 positive score → false
+        assert!(detect_strong_signal(&ranked)); // Single strong positive hit (>= 3.0)
+    }
+
+    #[test]
+    fn test_strong_signal_weak_single_positive() {
+        // Single positive score but too low → not a strong signal
+        let ranked = vec![
+            ("a".to_string(), 1.5),
+            ("b".to_string(), -1.0),
+        ];
+        assert!(!detect_strong_signal(&ranked));
     }
 }

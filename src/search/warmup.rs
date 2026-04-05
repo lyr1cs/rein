@@ -174,8 +174,13 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
             }
             Err(e) => tracing::warn!("hnsw: failed to save index: {e}"),
         }
+    } else if memories.is_empty() {
+        rebuild_ok = true; // no memories at all, empty index is correct
     } else {
-        rebuild_ok = true; // nothing to index, still valid
+        tracing::debug!(
+            "hnsw: {} memories but 0 cached embeddings, keeping dirty marker",
+            memories.len()
+        );
     }
     // Only clear dirty marker on successful rebuild
     if rebuild_ok {
@@ -252,9 +257,14 @@ pub fn populate_tantivy(store: &SqliteStore) {
         tracing::info!("tantivy: indexed {indexed} documents ({errors} errors)");
     }
 
-    // Only clear dirty marker if rebuild had no errors
-    if errors == 0 {
+    // Only clear dirty marker if rebuild succeeded with actual data, or there are truly no memories
+    if errors == 0 && (indexed > 0 || memories.is_empty()) {
         let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
+    } else if indexed == 0 && !memories.is_empty() {
+        tracing::debug!(
+            "tantivy: {} memories but 0 indexed, keeping dirty marker",
+            memories.len()
+        );
     }
 
     // Lock released when lock_file is dropped.
