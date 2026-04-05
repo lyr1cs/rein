@@ -718,14 +718,19 @@ fn dedup_spawn_marker_path(config: &ReinConfig) -> std::path::PathBuf {
 }
 
 fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut hasher = Sha256::new();
-    hasher.update(cwd.to_string_lossy().as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    super::buffer::resolve_buffer_dir(config).join(format!("{prefix}_{}.jsonl", &digest[..12]))
+    let base = super::buffer::resolve_buffer_dir(config);
+    // Derive a short discriminator from the DB path so separate rein instances
+    // (different databases) get isolated queues, while instances sharing the same
+    // DB correctly share one queue.
+    let db_tag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        config.resolve_db_path().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let queue_dir = base.join("queue").join(&db_tag);
+    let _ = std::fs::create_dir_all(&queue_dir);
+    queue_dir.join(format!("{prefix}.jsonl"))
 }
 
 fn should_spawn_worker(path: &std::path::Path, cooldown_ms: u64) -> bool {

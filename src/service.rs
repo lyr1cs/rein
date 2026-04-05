@@ -17,10 +17,15 @@ fn pid_path(name: &str) -> PathBuf {
 
 /// Write PID + exe path to `~/.rein/{name}.pid` for identity verification.
 pub fn write_pid(name: &str) -> anyhow::Result<()> {
+    write_pid_of(name, std::process::id())
+}
+
+/// Write an arbitrary PID + current exe path to `~/.rein/{name}.pid`.
+pub fn write_pid_of(name: &str, pid: u32) -> anyhow::Result<()> {
     let dir = pid_dir();
     std::fs::create_dir_all(&dir)?;
     let exe = std::env::current_exe().unwrap_or_default();
-    let content = format!("{}\n{}", std::process::id(), exe.display());
+    let content = format!("{}\n{}", pid, exe.display());
     std::fs::write(pid_path(name), content)?;
     Ok(())
 }
@@ -30,12 +35,36 @@ pub fn remove_pid(name: &str) {
     let _ = std::fs::remove_file(pid_path(name));
 }
 
+/// Check whether the process at `pid` is actually a rein binary.
+/// Uses OS-specific introspection to guard against PID recycling.
+fn is_process_rein(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            return exe.to_string_lossy().contains("rein");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).contains("rein");
+            }
+        }
+    }
+    // If we can't determine, assume it's still rein (conservative)
+    true
+}
+
 /// Read PID from file, verify it's still a rein process, and return PID if alive.
 pub fn is_running(name: &str) -> Option<u32> {
     let content = std::fs::read_to_string(pid_path(name)).ok()?;
     let mut lines = content.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
-    let saved_exe = lines.next().unwrap_or("");
+    let _saved_exe = lines.next().unwrap_or("");
 
     #[cfg(unix)]
     {
@@ -45,16 +74,10 @@ pub fn is_running(name: &str) -> Option<u32> {
             remove_pid(name);
             return None;
         }
-        // Verify it's actually a rein process by checking /proc or lsof
-        // On macOS, check exe path via sysctl; simplest portable check: compare saved exe
-        if !saved_exe.is_empty() {
-            if let Ok(current_exe) = std::env::current_exe() {
-                if !saved_exe.contains("rein") && current_exe.to_string_lossy().contains("rein") {
-                    // Saved exe doesn't look like rein — PID was recycled
-                    remove_pid(name);
-                    return None;
-                }
-            }
+        // Verify the running process is actually rein (guards against PID recycling)
+        if !is_process_rein(pid) {
+            remove_pid(name);
+            return None;
         }
         Some(pid)
     }
@@ -118,6 +141,8 @@ pub fn start_service(name: &str, serve_args: &[&str]) -> anyhow::Result<()> {
         .spawn()?;
 
     let pid = child.id();
+    // Write PID file immediately to prevent race with concurrent start attempts
+    let _ = write_pid_of(name, pid);
     println!("Started {name} (PID {pid})");
 
     // Wait a moment and check if the process is still alive (catches immediate failures).
@@ -172,9 +197,10 @@ fn fetch_proxy_metrics(port: u16) -> Option<(u64, u64, u64)> {
     )
     .ok()?;
     // Include auth token if configured (proxy requires x-rein-token when token is set)
+    // Prefer REIN_PROXY_TOKEN (matches proxy auth) then REIN_HTTP_TOKEN as fallback
     let token = std::env::var("REIN_PROXY_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("REIN_HTTP_TOKEN").ok());
+        .or_else(|_| std::env::var("REIN_HTTP_TOKEN"))
+        .ok();
     let auth_header = token
         .map(|t| format!("x-rein-token: {t}\r\n"))
         .unwrap_or_default();
@@ -260,8 +286,16 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
         }
     }
 
-    // Queue status — scan the buffer dir for memory_queue_*.jsonl files
-    let buffer_dir = crate::extract::hooks::buffer::resolve_buffer_dir(config);
+    // Queue status — scan the DB-scoped queue subdir for memory_queue*.jsonl files
+    let db_tag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        config.resolve_db_path().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let buffer_dir = crate::extract::hooks::buffer::resolve_buffer_dir(config)
+        .join("queue")
+        .join(&db_tag);
     let pending = std::fs::read_dir(&buffer_dir)
         .map(|entries| {
             entries
@@ -269,7 +303,7 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
                 .filter(|e| {
                     let name = e.file_name();
                     let name = name.to_string_lossy();
-                    name.starts_with("memory_queue_") && name.ends_with(".jsonl")
+                    name.starts_with("memory_queue") && name.ends_with(".jsonl")
                 })
                 .filter(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
                 .count()

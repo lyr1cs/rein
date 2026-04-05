@@ -1,14 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use rein::config;
-use rein::embed;
-use rein::extract;
-use rein::mcp;
-use rein::ops;
-use rein::search;
-use rein::store;
-use rein::types;
-use rein::types::MemoryStore;
+
+mod commands;
 
 #[derive(Parser)]
 #[command(
@@ -303,49 +297,13 @@ async fn main() -> anyhow::Result<()> {
             sse,
             proxy,
             gui,
-        }) => {
-            let mut config = config;
-            if compact {
-                config.server.compact = true;
-            }
-            if gui {
-                config.server.gui_enabled = true;
-                config.server.sse_enabled = true; // GUI implies SSE mode
-            }
-            if proxy {
-                // Set before entering async proxy to avoid set_var in multi-threaded context.
-                std::env::set_var("REIN_PROXY_ACTIVE", "1");
-                rein::proxy::run_proxy(config).await?;
-            } else if sse || gui {
-                config.server.sse_enabled = true;
-                mcp::server::run_http(config).await?;
-            } else {
-                mcp::server::run_stdio(config).await?;
-            }
-        }
+        }) => commands::handle_serve(config, compact, sse, proxy, gui).await?,
         Some(Commands::Store {
             topic,
             content,
             importance,
             keywords,
-        }) => {
-            let store = config.open_store()?;
-            let imp: types::Importance =
-                importance.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            let memory = rein::ops::build_memory(
-                &config,
-                topic,
-                content.clone(),
-                imp,
-                keywords.unwrap_or_default(),
-                types::Source::Manual,
-            );
-            let id = rein::ops::store_memory(&store, &config, memory)?;
-            println!(
-                "{}",
-                mcp::compact::format_store_result(&id, config.server.compact)
-            );
-        }
+        }) => commands::handle_store(&config, topic, content, importance, keywords)?,
         Some(Commands::Ingest {
             content,
             file,
@@ -354,361 +312,45 @@ async fn main() -> anyhow::Result<()> {
             agent_label,
             subagent,
         }) => {
-            let report = match (content, file, json_file) {
-                (Some(text), None, None) => {
-                    if asynchronous {
-                        rein::ops::queue_ingest_session_text(
-                            &config,
-                            &text,
-                            agent_label.as_deref(),
-                            subagent,
-                        )?
-                    } else {
-                        rein::ops::ingest_session_text_report(
-                            &config,
-                            &text,
-                            agent_label.as_deref(),
-                            subagent,
-                        )
-                        .await?
-                    }
-                }
-                (None, Some(path), None) => {
-                    let text = std::fs::read_to_string(path)?;
-                    if asynchronous {
-                        rein::ops::queue_ingest_session_text(
-                            &config,
-                            &text,
-                            agent_label.as_deref(),
-                            subagent,
-                        )?
-                    } else {
-                        rein::ops::ingest_session_text_report(
-                            &config,
-                            &text,
-                            agent_label.as_deref(),
-                            subagent,
-                        )
-                        .await?
-                    }
-                }
-                (None, None, Some(path)) => {
-                    let raw = std::fs::read_to_string(path)?;
-                    let session: types::SessionIngest = serde_json::from_str(&raw)?;
-                    if asynchronous {
-                        rein::ops::queue_ingest_session(
-                            &config,
-                            &session,
-                            agent_label.as_deref(),
-                            subagent,
-                        )?
-                    } else {
-                        rein::ops::ingest_session_report(
-                            &config,
-                            &session,
-                            agent_label.as_deref(),
-                            subagent,
-                        )
-                        .await?
-                    }
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "provide exactly one of --content, --file, or --json-file"
-                    ));
-                }
-            };
-            if config.server.compact {
-                println!(
-                    "ok queued:{} memories:{} concepts:{} links:{} artifact:{} episode:{}",
-                    report.queued,
-                    report.memory_count,
-                    report.concept_count,
-                    report.link_count,
-                    report.artifact_id.as_deref().unwrap_or("-"),
-                    report.episode_id.as_deref().unwrap_or("-"),
-                );
-            } else {
-                println!(
-                    "Ingested session: queued={} artifact={} episode={} memories={} concepts={} links={}",
-                    report.queued,
-                    report.artifact_id.as_deref().unwrap_or("-"),
-                    report.episode_id.as_deref().unwrap_or("-"),
-                    report.memory_count,
-                    report.concept_count,
-                    report.link_count
-                );
-            }
+            commands::handle_ingest(
+                &config, content, file, json_file, asynchronous, agent_label, subagent,
+            )
+            .await?
         }
         Some(Commands::Recall {
             query,
             topic,
             keyword,
             limit,
-        }) => {
-            let store = config.open_store()?;
-            let results = search::recall::recall(
-                &store,
-                &config,
-                &query,
-                topic.as_deref(),
-                keyword.as_deref(),
-                limit,
-            )?;
-            let scored: Vec<(types::Memory, f32)> =
-                results.into_iter().map(|r| (r.memory, r.score)).collect();
-            println!(
-                "{}",
-                mcp::compact::format_recall_results(&scored, config.server.compact)
-            );
-        }
-        Some(Commands::Topics) => {
-            let store = config.open_store()?;
-            let topics = store.list_topics()?;
-            println!(
-                "{}",
-                mcp::compact::format_topics(&topics, config.server.compact)
-            );
-        }
-        Some(Commands::Stats) => {
-            let store = config.open_store()?;
-            let stats = store.stats()?;
-            println!(
-                "{}",
-                mcp::compact::format_stats(&stats, config.server.compact)
-            );
-        }
-        Some(Commands::Health { topic }) => {
-            let store = config.open_store()?;
-            let reports = store.health(topic.as_deref())?;
-            println!(
-                "{}",
-                mcp::compact::format_health(&reports, config.server.compact)
-            );
-        }
-        Some(Commands::Forget { id }) => {
-            let store = config.open_store()?;
-            store.delete(&id)?;
-            println!("Deleted memory: {id}");
-        }
+        }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
+        Some(Commands::Topics) => commands::handle_topics(&config)?,
+        Some(Commands::Stats) => commands::handle_stats(&config)?,
+        Some(Commands::Health { topic }) => commands::handle_health(&config, topic)?,
+        Some(Commands::Forget { id }) => commands::handle_forget(&config, id)?,
         Some(Commands::Update {
             id,
             content,
             importance,
-        }) => {
-            let store = config.open_store()?;
-            let mut mem = store.get(&id)?;
-            mem.content = content.clone();
-            mem.summary = content.chars().take(100).collect();
-            if let Some(imp_str) = importance {
-                let imp: types::Importance =
-                    imp_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                mem.importance = imp;
-                mem.layer = imp.auto_layer();
-                mem.decay_lambda = config.decay.base_lambda * imp.decay_factor();
-            }
-            mem.updated_at = chrono::Utc::now();
-            store.update(&mem)?;
-            println!("Updated memory: {id}");
-        }
-        Some(Commands::Config) => {
-            println!("Database path: {}", config.resolve_db_path().display());
-            println!("Embedding provider: {}", config.embedding.provider);
-            println!("Embedding dimensions: {}", config.embedding.dimensions);
-            println!("Extract provider: {}", config.extract.provider);
-            println!(
-                "Extract model: {}",
-                match config.extract_provider() {
-                    config::Provider::Omlx => &config.extract.omlx.model,
-                    _ => &config.extract.google.model,
-                }
-            );
-            println!("Compact mode: {}", config.server.compact);
-            println!("SSE enabled: {}", config.server.sse_enabled);
-            println!("Decay base_lambda: {}", config.decay.base_lambda);
-            println!("Dedup similarity: {}", config.search.dedup_similarity);
-        }
-        Some(Commands::AdaptiveStatus) => {
-            let store = config.open_store()?;
-            let status = ops::adaptive_status(&store);
-            println!("{}", serde_json::to_string_pretty(&status)?);
-        }
-        Some(Commands::Recent { limit }) => {
-            let store = config.open_store()?;
-            let memories = store.recent(limit)?;
-            if memories.is_empty() {
-                println!("No memories found.");
-            } else {
-                for m in &memories {
-                    let age = chrono::Utc::now().signed_duration_since(m.created_at);
-                    let age_str = if age.num_days() > 0 {
-                        format!("{}d ago", age.num_days())
-                    } else if age.num_hours() > 0 {
-                        format!("{}h ago", age.num_hours())
-                    } else {
-                        format!("{}m ago", age.num_minutes())
-                    };
-                    println!(
-                        "[{}] {} ({}, {})",
-                        m.topic, m.summary, m.importance, age_str
-                    );
-                }
-            }
-        }
-        Some(Commands::Gc { dry_run }) => {
-            let store = config.open_store()?;
-            let threshold = config.decay.prune_threshold;
-            let (decayed, pruned, concepts) =
-                ops::run_gc_adaptive(&store, &config, threshold, dry_run)?;
-            if dry_run {
-                let mut msg = format!("Would decay {decayed} and prune {pruned} weak STM memories (threshold: {threshold})");
-                if concepts > 0 {
-                    msg.push_str(&format!(", {concepts} low-quality concepts"));
-                }
-                println!("{msg}");
-            } else {
-                let mut msg = format!("Decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
-                if concepts > 0 {
-                    msg.push_str(&format!(", {concepts} low-quality concepts"));
-                }
-                println!("{msg}");
-            }
-        }
-        Some(Commands::Organize) => {
-            let store = config.open_store()?;
-            let threshold = config.search.dedup_similarity as f32;
-            let links = store.organize(threshold, 5)?;
-            println!("Organized: created {links} new links between related memories");
-        }
-        Some(Commands::DedupConcepts) => {
-            let store = config.open_store()?;
-            let (groups, removed) = store.dedup_concepts()?;
-            println!("Concept dedup: merged {groups} groups, removed {removed} duplicate concepts");
-        }
+        }) => commands::handle_update(&config, id, content, importance)?,
+        Some(Commands::Config) => commands::handle_config(&config),
+        Some(Commands::AdaptiveStatus) => commands::handle_adaptive_status(&config)?,
+        Some(Commands::Recent { limit }) => commands::handle_recent(&config, limit)?,
+        Some(Commands::Gc { dry_run }) => commands::handle_gc(&config, dry_run)?,
+        Some(Commands::Organize) => commands::handle_organize(&config)?,
+        Some(Commands::DedupConcepts) => commands::handle_dedup_concepts(&config)?,
         Some(Commands::Export {
             format,
             topic,
             output,
-        }) => {
-            let store = config.open_store()?;
-            let topics = if let Some(ref t) = topic {
-                vec![t.clone()]
-            } else {
-                store.list_topics()?
-            };
-
-            let mut all_memories: Vec<types::Memory> = Vec::new();
-            for t in &topics {
-                all_memories.extend(store.get_by_topic(t)?);
-            }
-            all_memories = store.collapse_to_canonicals(all_memories, usize::MAX)?;
-            all_memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-            let content = match format.as_str() {
-                "json" => serde_json::to_string_pretty(&all_memories)?,
-                "csv" => {
-                    let mut lines = vec![
-                        "id,topic,summary,content,importance,keywords,strength,created_at"
-                            .to_string(),
-                    ];
-                    for m in &all_memories {
-                        let kw = m.keywords.join(";");
-                        // Escape CSV fields
-                        let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-                        lines.push(format!(
-                            "{},{},{},{},{},{},{:.3},{}",
-                            m.id,
-                            esc(&m.topic),
-                            esc(&m.summary),
-                            esc(&m.content),
-                            m.importance,
-                            esc(&kw),
-                            m.strength,
-                            m.created_at.to_rfc3339(),
-                        ));
-                    }
-                    lines.join("\n")
-                }
-                "md" => {
-                    let mut parts = vec![format!(
-                        "# rein Memory Export\n\n{} memories, {} topics\n",
-                        all_memories.len(),
-                        topics.len()
-                    )];
-                    let mut current_topic = String::new();
-                    // Group by topic
-                    all_memories.sort_by(|a, b| {
-                        a.topic.cmp(&b.topic).then(b.created_at.cmp(&a.created_at))
-                    });
-                    for m in &all_memories {
-                        if m.topic != current_topic {
-                            current_topic = m.topic.clone();
-                            parts.push(format!("\n## {}\n", current_topic));
-                        }
-                        parts.push(format!(
-                            "### {} ({})\n{}\n",
-                            m.summary, m.importance, m.content
-                        ));
-                    }
-                    parts.join("\n")
-                }
-                _ => {
-                    eprintln!("Unknown format '{}', use json, csv, or md", format);
-                    return Ok(());
-                }
-            };
-
-            if let Some(ref path) = output {
-                std::fs::write(path, &content)?;
-                println!("Exported {} memories to {}", all_memories.len(), path);
-            } else {
-                println!("{content}");
-            }
-        }
+        }) => commands::handle_export(&config, format, topic, output)?,
         Some(Commands::Upgrade { topic, dry_run }) => {
-            if extract::llm::create_extractor(&config).is_none() {
-                eprintln!("rein: WARNING — no LLM configured. Upgrade will use local rules only.");
-            }
-            let store = config.open_store()?;
-            let report = ops::run_upgrade(&store, &config, topic.as_deref(), dry_run).await?;
-            for line in &report.preview_lines {
-                println!("{line}");
-            }
-            if dry_run {
-                println!("\nDry run: would enrich {} memories, create {} concepts, {} links across {} topics",
-                    report.enriched, report.concepts, report.links, report.topics_processed);
-            } else {
-                if report.deprecated > 0 {
-                    println!("Deprecated {} low-quality memories", report.deprecated);
-                }
-                println!("Upgrade complete: {} memories enriched, {} memoirs created, {} concepts, {} links",
-                    report.enriched, report.memoirs, report.concepts, report.links);
-            }
+            commands::handle_upgrade(&config, topic, dry_run).await?
         }
-        Some(Commands::Warmup) => {
-            let store = config.open_store()?;
-            let (cached, errors) = search::warmup::warmup(&store, &config).await;
-            println!("Warmup complete: {cached} embeddings cached, {errors} errors");
-        }
+        Some(Commands::Warmup) => commands::handle_warmup(&config).await?,
         Some(Commands::Worker { action }) => match action {
-            WorkerAction::Memory => {
-                let processed = extract::hooks::queue::drain_memory_queue(&config).await?;
-                if processed > 0 {
-                    eprintln!("rein worker: processed {processed} memory jobs");
-                }
-            }
-            WorkerAction::DedupQueue => {
-                let processed = extract::hooks::queue::drain_dedup_queue(&config).await?;
-                if processed > 0 {
-                    eprintln!("rein worker: processed {processed} dedup jobs");
-                }
-            }
-            WorkerAction::CleanupQueue => {
-                let processed = extract::hooks::queue::drain_cleanup_queue(&config).await?;
-                if processed > 0 {
-                    eprintln!("rein worker: processed {processed} cleanup jobs");
-                }
-            }
+            WorkerAction::Memory => commands::handle_worker_memory(&config).await?,
+            WorkerAction::DedupQueue => commands::handle_worker_dedup_queue(&config).await?,
+            WorkerAction::CleanupQueue => commands::handle_worker_cleanup_queue(&config).await?,
             WorkerAction::Cleanup {
                 topic,
                 topics,
@@ -717,69 +359,35 @@ async fn main() -> anyhow::Result<()> {
                 exact_topics,
                 dry_run,
             } => {
-                let selected_topics = topics.unwrap_or_default();
-                let scope_all =
-                    all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
-                let store = config.open_store()?;
-                let merge_variants = !exact_topics;
-                let groups = ops::resolve_topic_groups(
-                    &store,
-                    topic.as_deref(),
-                    &selected_topics,
-                    pattern.as_deref(),
-                    scope_all,
-                    merge_variants,
-                )?;
-                if groups.is_empty() {
-                    eprintln!("rein worker: no topics matched the selected scope");
-                } else {
-                    let report =
-                        ops::run_cleanup_async(&store, &config, &groups, merge_variants, dry_run)
-                            .await?;
-                    eprintln!(
-                        "rein worker: cleanup finished; groups={}, memories={}, dedup_removed={}/{}",
-                        report.consolidation.groups_processed,
-                        report.consolidation.memories_replaced,
-                        report.duplicates_merged,
-                        report.duplicates_found
-                    );
-                }
+                commands::handle_worker_cleanup(
+                    &config,
+                    topic,
+                    topics,
+                    pattern,
+                    all,
+                    exact_topics,
+                    dry_run,
+                )
+                .await?
             }
         },
         None => {
             println!("rein v{}", env!("CARGO_PKG_VERSION"));
             println!("Run 'rein --help' for usage");
         }
-        Some(Commands::Hook { action }) => match action {
-            HookAction::Post => extract::hooks::hook_post(&config).await?,
-            HookAction::Compact => extract::hooks::hook_compact(&config).await?,
-            HookAction::Prompt => extract::hooks::hook_prompt(&config).await?,
-            HookAction::Stop => extract::hooks::hook_stop(&config).await?,
-        },
+        Some(Commands::Hook { action }) => {
+            let action_str = match action {
+                HookAction::Post => "post",
+                HookAction::Compact => "compact",
+                HookAction::Prompt => "prompt",
+                HookAction::Stop => "stop",
+            };
+            commands::handle_hook(&config, action_str).await?
+        }
         Some(Commands::Migrate { from_qmd, reindex }) => {
-            if reindex {
-                let store = config.open_store()?;
-                let report = store::migrate::reindex(&store, &config).await?;
-                println!("{report}");
-            } else {
-                let qmd_path = from_qmd.map(std::path::PathBuf::from).unwrap_or_else(|| {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
-                });
-                let store = config.open_store()?;
-                let embedder = embed::create_embedder(&config);
-                let report =
-                    store::migrate::migrate_from_qmd(&qmd_path, &store, &config, embedder.as_ref())
-                        .await?;
-                println!("{report}");
-            }
+            commands::handle_migrate(&config, from_qmd, reindex).await?
         }
-        Some(Commands::Init { dry_run, proxy }) => {
-            rein::init::auto_configure(dry_run)?;
-            if proxy {
-                rein::init::proxy_configure(dry_run)?;
-            }
-        }
+        Some(Commands::Init { dry_run, proxy }) => commands::handle_init(dry_run, proxy)?,
         Some(Commands::Consolidate {
             topic,
             summary,
@@ -789,81 +397,22 @@ async fn main() -> anyhow::Result<()> {
             merge_variants,
             dry_run,
         }) => {
-            let store = config.open_store()?;
-            let selected_topics = topics.unwrap_or_default();
-            let groups = ops::resolve_topic_groups(
-                &store,
-                topic.as_deref(),
-                &selected_topics,
-                pattern.as_deref(),
+            commands::handle_consolidate(
+                &config,
+                topic,
+                summary,
+                topics,
+                pattern,
                 all,
                 merge_variants,
-            )?;
-
-            if groups.is_empty() {
-                if let Some(topic) = topic {
-                    println!("No memories found in topic '{topic}'");
-                } else if let Some(pattern) = pattern {
-                    println!("No topics matched pattern '{pattern}'");
-                } else {
-                    println!("No topics matched the selected scope");
-                }
-            } else {
-                let report = ops::run_consolidation_async(
-                    &store,
-                    &config,
-                    &groups,
-                    summary.as_deref(),
-                    dry_run,
-                )
-                .await?;
-
-                if dry_run {
-                    println!(
-                        "Dry run: {} groups, {} memories would be consolidated",
-                        report.groups_processed, report.memories_replaced
-                    );
-                } else {
-                    println!(
-                        "Consolidated {} groups ({} memories)",
-                        report.groups_processed, report.memories_replaced
-                    );
-                }
-
-                for group in report.groups.iter().filter(|group| group.memory_count > 0) {
-                    let sources = if group.source_topics.len() > 1 {
-                        format!(" <= {}", group.source_topics.join(", "))
-                    } else {
-                        String::new()
-                    };
-                    if dry_run {
-                        println!(
-                            "- {}{} [{} memories]",
-                            group.canonical_topic, sources, group.memory_count
-                        );
-                    } else if let Some(created_id) = &group.created_id {
-                        println!(
-                            "- {}{} [{} memories] -> {}",
-                            group.canonical_topic, sources, group.memory_count, created_id
-                        );
-                    }
-                }
-            }
+                dry_run,
+            )
+            .await?
         }
         Some(Commands::Dedup {
             dry_run,
             merge_variants,
-        }) => {
-            let store = config.open_store()?;
-            let threshold = config.search.dedup_similarity as f32;
-            let (dups_found, dups_removed) =
-                ops::run_dedup(&store, &config, threshold, dry_run, merge_variants)?;
-            if dry_run {
-                println!("Found {dups_found} duplicates (dry-run, nothing removed)");
-            } else {
-                println!("Removed {dups_removed} of {dups_found} duplicates");
-            }
-        }
+        }) => commands::handle_dedup(&config, dry_run, merge_variants)?,
         Some(Commands::Cleanup {
             topic,
             topics,
@@ -873,136 +422,34 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             asynchronous,
         }) => {
-            let selected_topics = topics.unwrap_or_default();
-            let scope_all =
-                all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
-            if asynchronous {
-                let job_id = extract::hooks::queue::queue_cleanup_job(
-                    &config,
-                    topic.clone(),
-                    selected_topics,
-                    pattern.clone(),
-                    scope_all,
-                    exact_topics,
-                    dry_run,
-                )?;
-                extract::hooks::queue::spawn_cleanup_worker(&config);
-                println!("Queued cleanup job {job_id}");
-            } else {
-                let store = config.open_store()?;
-                let merge_variants = !exact_topics;
-                let groups = ops::resolve_topic_groups(
-                    &store,
-                    topic.as_deref(),
-                    &selected_topics,
-                    pattern.as_deref(),
-                    scope_all,
-                    merge_variants,
-                )?;
-                if groups.is_empty() {
-                    if let Some(topic) = topic {
-                        println!("No memories found in topic '{topic}'");
-                    } else if let Some(pattern) = pattern {
-                        println!("No topics matched pattern '{pattern}'");
-                    } else {
-                        println!("No topics matched the selected scope");
-                    }
-                } else {
-                    let report =
-                        ops::run_cleanup_async(&store, &config, &groups, merge_variants, dry_run)
-                            .await?;
-                    if dry_run {
-                        println!(
-                            "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
-                            report.consolidation.groups_processed,
-                            report.consolidation.memories_replaced,
-                            report.duplicates_found
-                        );
-                    } else {
-                        println!(
-                            "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
-                            report.consolidation.groups_processed,
-                            report.consolidation.memories_replaced,
-                            report.duplicates_merged,
-                            report.duplicates_found
-                        );
-                    }
-                }
-            }
+            commands::handle_cleanup(
+                &config,
+                topic,
+                topics,
+                pattern,
+                all,
+                exact_topics,
+                dry_run,
+                asynchronous,
+            )
+            .await?
         }
-        Some(Commands::Canonicals { limit }) => {
-            let store = config.open_store()?;
-            let canonicals = store.list_canonical_memories(limit)?;
-            if canonicals.is_empty() {
-                println!("No canonical memories found");
-            } else {
-                for memory in canonicals {
-                    println!(
-                        "- {} [{}] support={} merges={} diversity={:.2} dedup_conf={:.2}",
-                        memory.id,
-                        memory.summary,
-                        memory.support_count,
-                        memory.merge_count,
-                        memory.source_diversity,
-                        memory.dedup_confidence,
-                    );
-                }
-            }
-        }
+        Some(Commands::Canonicals { limit }) => commands::handle_canonicals(&config, limit)?,
         Some(Commands::Evidence {
             canonical_id,
             limit,
-        }) => {
-            let store = config.open_store()?;
-            let evidence = store.list_memory_evidence(&canonical_id, limit)?;
-            if evidence.is_empty() {
-                println!("No evidence found for canonical '{canonical_id}'");
-            } else {
-                for item in evidence {
-                    println!(
-                        "- {} [{}] {}\n{}",
-                        item.id, item.source_topic, item.summary, item.content
-                    );
-                }
-            }
-        }
+        }) => commands::handle_evidence(&config, canonical_id, limit)?,
         Some(Commands::DedupLog { canonical, limit }) => {
-            let store = config.open_store()?;
-            let decisions = store.list_dedup_decisions(canonical.as_deref(), limit)?;
-            if decisions.is_empty() {
-                println!("No dedup decisions found");
-            } else {
-                for decision in decisions {
-                    println!(
-                        "- {} relation={} confidence={:.2} winner={:?} loser={:?} reason={}",
-                        decision.id,
-                        decision.relation,
-                        decision.confidence,
-                        decision.winner_id,
-                        decision.loser_id,
-                        decision.reason
-                    );
-                }
-            }
+            commands::handle_dedup_log(&config, canonical, limit)?
         }
-        Some(Commands::Dashboard) => {
-            rein::service::print_dashboard(&config);
-        }
+        Some(Commands::Dashboard) => commands::handle_dashboard(&config),
         Some(Commands::Gui { action }) => match action {
-            ServiceAction::On => {
-                rein::service::start_service("gui", &["serve", "--gui"])?;
-            }
-            ServiceAction::Off => {
-                rein::service::stop_service("gui")?;
-            }
+            ServiceAction::On => commands::handle_gui_on()?,
+            ServiceAction::Off => commands::handle_gui_off()?,
         },
         Some(Commands::Proxy { action }) => match action {
-            ServiceAction::On => {
-                rein::service::start_service("proxy", &["serve", "--proxy"])?;
-            }
-            ServiceAction::Off => {
-                rein::service::stop_service("proxy")?;
-            }
+            ServiceAction::On => commands::handle_proxy_on()?,
+            ServiceAction::Off => commands::handle_proxy_off()?,
         },
     }
     Ok(())

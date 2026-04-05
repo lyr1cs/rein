@@ -177,6 +177,25 @@ pub fn compute_keyword_overlap(
     matches as f32 / words.len() as f32
 }
 
+/// Like [`compute_keyword_overlap`] but accepts pre-split, pre-lowercased query words
+/// to avoid re-lowercasing the query on every call in a reranking loop.
+pub fn compute_keyword_overlap_with_words(
+    query_words: &[&str],
+    memory_keywords: &[String],
+    memory_content: &str,
+) -> f32 {
+    if query_words.is_empty() {
+        return 0.0;
+    }
+    let keywords_lower: Vec<String> = memory_keywords.iter().map(|k| k.to_lowercase()).collect();
+    let content_lower = memory_content.to_lowercase();
+    let matches = query_words
+        .iter()
+        .filter(|w| keywords_lower.iter().any(|k| k == **w) || content_lower.contains(**w))
+        .count();
+    matches as f32 / query_words.len() as f32
+}
+
 /// Load rerank weights from the metadata table, falling back to defaults.
 pub fn load_weights(conn: &rusqlite::Connection) -> RerankWeights {
     let result: Result<String, _> = conn.query_row(
