@@ -20,7 +20,11 @@ impl ProviderKind {
             Some(Self::Anthropic)
         } else if normalized == "/v1/chat/completions" {
             Some(Self::OpenAi)
-        } else if normalized == "/responses" || normalized == "/v1/responses" {
+        } else if normalized == "/responses"
+            || normalized.starts_with("/responses/")
+            || normalized == "/v1/responses"
+            || normalized.starts_with("/v1/responses/")
+        {
             Some(Self::OpenAiResponses)
         } else {
             None
