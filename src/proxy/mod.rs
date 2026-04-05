@@ -95,6 +95,8 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     eprintln!("rein proxy listening on http://{bind}");
     eprintln!("  Anthropic: set ANTHROPIC_BASE_URL=http://{bind}");
     eprintln!("  OpenAI:    set OPENAI_BASE_URL=http://{bind}");
+    // Write PID file for service management (rein proxy on/off, rein dashboard).
+    let _ = crate::service::write_pid("proxy");
 
     // Shared reqwest client for all upstream requests (connection pooling).
     let upstream_client = reqwest::Client::builder()
@@ -112,6 +114,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("rein proxy: received shutdown signal, stopping accept loop");
                 eprintln!("rein proxy: shutting down gracefully");
+                crate::service::remove_pid("proxy");
                 break;
             }
         };
