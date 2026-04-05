@@ -6,7 +6,9 @@ use crate::extract::hooks::parsing::redact_secrets;
 /// Resolve the buffer directory (auto = ~/.rein/).
 pub fn resolve_buffer_dir(config: &ReinConfig) -> std::path::PathBuf {
     if config.hooks.buffer_dir == "auto" {
-        config.resolve_db_path().parent()
+        config
+            .resolve_db_path()
+            .parent()
             .unwrap_or(std::path::Path::new("/tmp"))
             .to_path_buf()
     } else {
@@ -18,7 +20,7 @@ pub fn resolve_buffer_dir(config: &ReinConfig) -> std::path::PathBuf {
 pub fn session_buffer_path(config: &ReinConfig, input: &str) -> std::path::PathBuf {
     let session_id = if let Ok(json) = serde_json::from_str::<serde_json::Value>(input) {
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-            use sha2::{Sha256, Digest};
+            use sha2::{Digest, Sha256};
             let hash = Sha256::digest(path.as_bytes());
             format!("{:x}", hash).chars().take(12).collect()
         } else {
@@ -56,13 +58,20 @@ pub fn read_and_clear_buffer(path: &std::path::Path) -> Vec<String> {
             Err(_) => return Ok(vec![]),
         };
         let _ = std::fs::remove_file(path);
-        Ok(content.lines()
+        Ok(content
+            .lines()
             .filter_map(|line| {
-                serde_json::from_str::<serde_json::Value>(line).ok()
-                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
             })
             .collect())
-    }).unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 /// Adaptive flush threshold: adjusts based on signal density in the buffer.
@@ -72,20 +81,32 @@ pub fn adaptive_flush_threshold(base: usize, buf_path: &std::path::Path) -> usiz
         Err(_) => return base,
     };
     let total_lines = content.lines().count();
-    if total_lines < 5 { return base; }
+    if total_lines < 5 {
+        return base;
+    }
 
-    let high_signal = content.lines()
+    let high_signal = content
+        .lines()
         .filter_map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).ok()
-                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                })
         })
         .filter(|text| super::scoring::worth_extracting(text))
         .count();
 
     let density = high_signal as f64 / total_lines as f64;
-    if density > 0.5 { base / 2 }
-    else if density < 0.1 { base * 2 }
-    else { base }
+    if density > 0.5 {
+        base / 2
+    } else if density < 0.1 {
+        base * 2
+    } else {
+        base
+    }
 }
 
 /// Clean up stale buffer files older than 24 hours.
@@ -159,12 +180,24 @@ pub fn store_episode_concept(
         };
         store.create_memoir(memoir)?;
     }
-    let date = format!("{}-{}", chrono::Utc::now().format("%Y-%m-%d-%H%M"),
-        ulid::Ulid::new().to_string().chars().take(6).collect::<String>());
+    let date = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y-%m-%d-%H%M"),
+        ulid::Ulid::new()
+            .to_string()
+            .chars()
+            .take(6)
+            .collect::<String>()
+    );
     let definition = if episode.decisions.is_empty() {
         format!("{}\nOutcome: {}", episode.title, episode.outcome)
     } else {
-        format!("{}\nOutcome: {}\nDecisions: {}", episode.title, episode.outcome, episode.decisions.join("; "))
+        format!(
+            "{}\nOutcome: {}\nDecisions: {}",
+            episode.title,
+            episode.outcome,
+            episode.decisions.join("; ")
+        )
     };
     let concept = crate::types::Concept {
         id: String::new(),

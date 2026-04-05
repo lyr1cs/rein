@@ -18,6 +18,12 @@ fn make_memory(topic: &str, summary: &str, content: &str, importance: Importance
         decay_lambda: 0.06 * importance.decay_factor(),
         access_count: 0,
         superseded_by: None,
+        canonical_id: None,
+        support_count: 1,
+        merge_count: 0,
+        dedup_confidence: 1.0,
+        source_diversity: 1.0,
+        contradiction_score: 0.0,
         related_ids: vec![],
         concept_ids: vec![],
         status: MemoryStatus::default(),
@@ -220,7 +226,10 @@ auto_memory_enabled = false
         ))
         .unwrap();
 
-    assert!(report.memory_count >= 1, "ingestion should store at least one memory");
+    assert!(
+        report.memory_count >= 1,
+        "ingestion should store at least one memory"
+    );
     assert!(
         report.artifact_id.is_some(),
         "ingestion should persist a raw session artifact"
@@ -231,7 +240,10 @@ auto_memory_enabled = false
         .conn()
         .query_row("SELECT COUNT(*) FROM session_artifacts", [], |r| r.get(0))
         .unwrap_or(0);
-    assert!(artifact_rows >= 1, "raw session artifact should be stored separately");
+    assert!(
+        artifact_rows >= 1,
+        "raw session artifact should be stored separately"
+    );
 
     let store = config.open_store().unwrap();
     let results = store.search_fts("PostgreSQL locking", None, 10).unwrap();

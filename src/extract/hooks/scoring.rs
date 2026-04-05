@@ -15,7 +15,9 @@ pub fn pattern_quality_confidence(text: &str) -> f64 {
 
 /// Quick local check: does this text likely contain anything worth storing?
 pub fn worth_extracting(text: &str) -> bool {
-    if text.len() < 80 { return false; }
+    if text.len() < 80 {
+        return false;
+    }
 
     let dominated_by_code = text.matches("```").count() >= 2
         || text.matches("---").count() >= 3
@@ -25,17 +27,31 @@ pub fn worth_extracting(text: &str) -> bool {
         || text.starts_with("pub ")
         || text.starts_with("use ")
         || text.starts_with("impl ");
-    if dominated_by_code { return false; }
+    if dominated_by_code {
+        return false;
+    }
 
     let score = crate::extract::patterns::score_sentence(text);
-    if score >= 3 { return true; }
+    if score >= 3 {
+        return true;
+    }
 
     let lower = text.to_lowercase();
     let value_signals = [
-        "because", "reason", "instead of", "switched to",
-        "root cause", "workaround", "decided",
-        "chose", "selected", "prefer",
-        "因为", "原因", "切换到", "决定",
+        "because",
+        "reason",
+        "instead of",
+        "switched to",
+        "root cause",
+        "workaround",
+        "decided",
+        "chose",
+        "selected",
+        "prefer",
+        "因为",
+        "原因",
+        "切换到",
+        "决定",
     ];
     value_signals.iter().any(|s| lower.contains(s))
 }
@@ -59,13 +75,16 @@ pub fn extract_signal_windows(text: &str, config: &ReinConfig) -> Vec<String> {
     }
 
     let merged = merge_ranges(&hit_ranges);
-    merged.iter()
+    merged
+        .iter()
         .map(|(start, end)| lines[*start..*end].join("\n"))
         .collect()
 }
 
 fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    if ranges.is_empty() { return vec![]; }
+    if ranges.is_empty() {
+        return vec![];
+    }
     let mut sorted = ranges.to_vec();
     sorted.sort_by_key(|r| r.0);
     let mut merged = vec![sorted[0]];

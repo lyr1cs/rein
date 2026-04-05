@@ -16,7 +16,7 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 | Feature | Description |
 |---------|-------------|
-| **25 MCP tools** | 12 core memory tools + 10 knowledge graph tools + 2 temporal tools + 1 adaptive |
+| **26 MCP tools** | 13 core memory tools + 10 knowledge graph tools + 2 temporal tools + 1 adaptive |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
 | **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights per query type (M2) |
@@ -90,12 +90,16 @@ rein serve
 | `topics` | List all topics | `rein topics` |
 | `stats` | Show store statistics | `rein stats` |
 | `health` | Check topic health | `rein health [topic]` |
-| `consolidate` | Merge topic into one memory | `rein consolidate debug -s "summary"` |
-| `dedup` | Scan / remove duplicates | `rein dedup [--dry-run]` |
+| `consolidate` | Merge one or many topics into consolidated memories | `rein consolidate --pattern 'rmcp*' --merge-variants --dry-run` |
+| `dedup` | Scan / remove duplicates, optionally across topic variants | `rein dedup [--dry-run] [--merge-variants]` |
+| `cleanup` | One-click consolidation + dedup + adaptive refresh | `rein cleanup [--pattern 'rmcp*'] [--dry-run] [--async]` |
 | `migrate` | Import from QMD / reindex | `rein migrate [--from-qmd path] [--reindex]` |
 | `init` | Auto-configure MCP clients | `rein init [--dry-run]` |
 | `config` | Show current configuration | `rein config` |
 | `recent` | Show most recent memories | `rein recent [-l 20]` |
+| `canonicals` | Show canonical memories | `rein canonicals [-l 20]` |
+| `evidence` | Show evidence snapshots for a canonical memory | `rein evidence <canonical_id> [-l 20]` |
+| `dedup-log` | Show recent dedup decisions | `rein dedup-log [--canonical ID] [-l 20]` |
 | `gc` | Garbage collect weak STM memories | `rein gc [--dry-run]` |
 | `organize` | Auto-link related memories | `rein organize` |
 | `dedup-concepts` | Merge duplicate concepts (case/separator variants) | `rein dedup-concepts` |
@@ -105,15 +109,41 @@ rein serve
 | `hook prompt` | Compatibility no-op for UserPromptSubmit | `rein hook prompt` |
 | `hook stop` | Full knowledge extraction on session end | `rein hook stop` |
 | `worker memory` | Drain the async memory queue | `rein worker memory` |
+| `worker dedup-queue` | Drain queued store-time dedup jobs | `rein worker dedup-queue` |
+| `worker cleanup-queue` | Drain queued cleanup jobs | `rein worker cleanup-queue` |
 | `dashboard` | Show service status, metrics, memory stats | `rein dashboard` |
 | `gui on/off` | Start/stop GUI server in background | `rein gui on` |
 | `proxy on/off` | Start/stop proxy in background | `rein proxy on` |
 
+`consolidate` keeps the old `rein consolidate <topic> -s "summary"` flow, but also supports:
+- `--topics a,b,c` to batch a named topic set
+- `--pattern 'rmcp*'` to batch by glob
+- `--all` to process every topic
+- `--merge-variants` to group case/space/hyphen variants such as `Docker Deployment` / `docker-deployment`
+- omitting `--summary` to let rein auto-generate a consolidated memory, using the configured LLM when available and a local fallback otherwise
+
+Batch consolidation fans out LLM synthesis asynchronously and in parallel, then commits SQLite writes sequentially. Cleanup actions also emit adaptive feedback and refresh M1-M6 state after the batch completes.
+
+For a full-store terminal cleanup without an agent:
+- `rein cleanup` runs across the whole store by default
+- `rein cleanup --dry-run` previews the scope
+- `rein cleanup --async` queues a durable cleanup job and wakes a background cleanup worker
+
+Store-time gray-zone dedup now also uses a dedicated async queue:
+- hot-path store creates the new memory without blocking on remote LLM verdicts
+- a `dedup-queue` worker later resolves gray-zone pairs with structured LLM verdicts
+- you can drain it manually with `rein worker dedup-queue`
+
+Operator inspection commands:
+- `rein canonicals` shows canonical memories and their support/merge counters
+- `rein evidence <canonical_id>` shows absorbed evidence snapshots
+- `rein dedup-log` shows the recent dedup ledger
+
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 25 tools are exposed.
+When running as an MCP server (`rein serve`), 26 tools are exposed.
 
-#### Core Tools (12)
+#### Core Tools (13)
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
@@ -124,8 +154,9 @@ When running as an MCP server (`rein serve`), 25 tools are exposed.
 | `rein_list_topics` | *(none)* | List all memory topics |
 | `rein_stats` | *(none)* | Total count, LTM/STM breakdown, avg strength |
 | `rein_health` | `topic?` | Stale count, avg strength, consolidation hints |
-| `rein_consolidate` | `topic`, `summary` | Merge all memories in a topic into one |
-| `rein_dedup` | `dry_run?` | Scan for and remove duplicate memories |
+| `rein_consolidate` | `topic?`, `topics?`, `pattern?`, `all?`, `merge_variants?`, `summary?`, `dry_run?` | Consolidate one or many topics, optionally grouping topic variants first |
+| `rein_dedup` | `dry_run?`, `merge_variants?` | Scan for and remove duplicate memories, optionally across topic variants |
+| `rein_cleanup` | `topic?`, `topics?`, `pattern?`, `all?`, `exact_topics?`, `dry_run?` | One-click cleanup: consolidate fragmented topics, deduplicate, and refresh adaptive state |
 | `rein_recent` | `limit?` | List most recently created memories |
 | `rein_gc` | `dry_run?` | Garbage collect weak STM memories |
 | `rein_organize` | `max_links?` | Auto-link related memories |
@@ -788,11 +819,15 @@ rein serve
 | `topics` | 列出所有主题 | `rein topics` |
 | `stats` | 显示存储统计 | `rein stats` |
 | `health` | 检查主题健康状态 | `rein health [topic]` |
-| `consolidate` | 将主题合并为一条记忆 | `rein consolidate debug -s "summary"` |
-| `dedup` | 扫描/移除重复项 | `rein dedup [--dry-run]` |
+| `consolidate` | 将一个或多个主题批量合并为精简记忆 | `rein consolidate --pattern 'rmcp*' --merge-variants --dry-run` |
+| `dedup` | 扫描/移除重复项，可跨 topic 变体处理 | `rein dedup [--dry-run] [--merge-variants]` |
+| `cleanup` | 一键做 consolidate + dedup + adaptive refresh | `rein cleanup [--pattern 'rmcp*'] [--dry-run] [--async]` |
 | `migrate` | 从 QMD 导入 / 重建索引 | `rein migrate [--from-qmd path] [--reindex]` |
 | `init` | 自动配置 MCP 客户端 | `rein init [--dry-run]` |
 | `config` | 显示当前配置 | `rein config` |
+| `canonicals` | 查看 canonical memory 列表 | `rein canonicals [-l 20]` |
+| `evidence` | 查看某个 canonical 的 evidence 快照 | `rein evidence <canonical_id> [-l 20]` |
+| `dedup-log` | 查看最近的 dedup 决策日志 | `rein dedup-log [--canonical ID] [-l 20]` |
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
 | `hook prompt` | UserPromptSubmit 兼容性空操作 | `rein hook prompt` |
@@ -805,15 +840,41 @@ rein serve
 | `hook prompt` | 自动注入已取消，仅保留命令入口 | `rein hook prompt` |
 | `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
 | `worker memory` | 清空异步记忆队列 | `rein worker memory` |
+| `worker dedup-queue` | 清空 store 灰区 dedup 任务队列 | `rein worker dedup-queue` |
+| `worker cleanup-queue` | 清空 cleanup 任务队列 | `rein worker cleanup-queue` |
 | `dashboard` | 显示服务状态、指标、记忆统计 | `rein dashboard` |
 | `gui on/off` | 后台启动/停止 GUI 服务 | `rein gui on` |
 | `proxy on/off` | 后台启动/停止 proxy 服务 | `rein proxy on` |
 
+`consolidate` 兼容旧用法 `rein consolidate <topic> -s "summary"`，同时新增：
+- `--topics a,b,c`：按显式 topic 列表批量处理
+- `--pattern 'rmcp*'`：按 glob 批量匹配
+- `--all`：处理所有 topic
+- `--merge-variants`：先把大小写、空格、连字符、下划线等 topic 变体归并后再合并
+- 不传 `--summary`：由 rein 自动生成 consolidated memory；有可用 LLM 时优先用 LLM，没有则回退到本地规则
+
+批量 consolidate 会异步并行生成各 group 的 LLM summary/content，但 SQLite 写入仍按顺序事务提交。清理完成后还会写入 adaptive feedback，并刷新一轮 M1-M6 状态。
+
+如果你想完全在 terminal 里自己跑全库清理：
+- `rein cleanup` 默认处理整个库
+- `rein cleanup --dry-run` 先预览
+- `rein cleanup --async` 会先把 cleanup 任务持久化入队，再唤起后台 worker
+
+store 热路径里的灰区 dedup 现在也会走专门异步队列：
+- 新记忆先正常入库，不阻塞等待远程 LLM
+- 后台 `dedup-queue` worker 再对灰区 pair 做结构化判定
+- 需要手动消费时可运行 `rein worker dedup-queue`
+
+可观测性命令：
+- `rein canonicals` 查看 canonical memory 及其 support / merge 计数
+- `rein evidence <canonical_id>` 查看被吸收的 evidence 快照
+- `rein dedup-log` 查看最近的 dedup ledger
+
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），共暴露 25 个工具。
+以 MCP 服务运行时（`rein serve`），共暴露 26 个工具。
 
-#### 核心工具（12 个）
+#### 核心工具（13 个）
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
@@ -824,8 +885,9 @@ rein serve
 | `rein_list_topics` | *(无)* | 列出所有记忆主题 |
 | `rein_stats` | *(无)* | 总数、LTM/STM 分布、平均强度 |
 | `rein_health` | `topic?` | 陈旧计数、平均强度、合并建议 |
-| `rein_consolidate` | `topic`, `summary` | 将主题内所有记忆合并为一条 |
-| `rein_dedup` | `dry_run?` | 扫描并移除重复记忆 |
+| `rein_consolidate` | `topic?`, `topics?`, `pattern?`, `all?`, `merge_variants?`, `summary?`, `dry_run?` | 合并一个或多个 topic，可先自动归并 topic 变体 |
+| `rein_dedup` | `dry_run?`, `merge_variants?` | 扫描并移除重复记忆，可跨 topic 变体去重 |
+| `rein_cleanup` | `topic?`, `topics?`, `pattern?`, `all?`, `exact_topics?`, `dry_run?` | 一键做 consolidate + dedup + adaptive refresh |
 | `rein_recent` | `limit?` | 查看最近创建的记忆 |
 | `rein_gc` | `dry_run?` | 垃圾回收弱 STM 记忆 |
 | `rein_organize` | `max_links?` | 自动关联记忆 |

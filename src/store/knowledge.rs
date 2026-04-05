@@ -27,12 +27,16 @@ impl SqliteStore {
         source_memory_ids: &[String],
     ) -> ReinResult<super::KnowledgeStoreReport> {
         // Wrap in savepoint for atomicity — many DB writes follow
-        self.conn.execute_batch("SAVEPOINT knowledge_units")
+        self.conn
+            .execute_batch("SAVEPOINT knowledge_units")
             .map_err(crate::types::ReinError::Database)?;
         let result = self.store_knowledge_units_inner(concepts, links, source_memory_ids);
         match &result {
-            Ok(_) => { self.conn.execute_batch("RELEASE knowledge_units")
-                .map_err(crate::types::ReinError::Database)?; }
+            Ok(_) => {
+                self.conn
+                    .execute_batch("RELEASE knowledge_units")
+                    .map_err(crate::types::ReinError::Database)?;
+            }
             Err(_) => {
                 let _ = self.conn.execute_batch("ROLLBACK TO knowledge_units");
                 let _ = self.conn.execute_batch("RELEASE knowledge_units");
@@ -50,8 +54,10 @@ impl SqliteStore {
         let mut report = super::KnowledgeStoreReport::default();
 
         // Group concepts by memoir
-        let mut by_memoir: std::collections::HashMap<String, Vec<&crate::extract::ExtractedConcept>> =
-            std::collections::HashMap::new();
+        let mut by_memoir: std::collections::HashMap<
+            String,
+            Vec<&crate::extract::ExtractedConcept>,
+        > = std::collections::HashMap::new();
         for c in concepts {
             by_memoir.entry(c.memoir.clone()).or_default().push(c);
         }
@@ -93,7 +99,9 @@ impl SqliteStore {
                             }
                         }
                         // Refine (use existing.name for exact DB match after normalized lookup)
-                        if let Err(e) = self.refine_concept(memoir_name, &existing.name, &c.definition) {
+                        if let Err(e) =
+                            self.refine_concept(memoir_name, &existing.name, &c.definition)
+                        {
                             tracing::warn!("failed to refine concept '{}': {e}", c.name);
                         } else {
                             report.concepts_refined += 1;
@@ -158,7 +166,10 @@ impl SqliteStore {
                 let relation = match std::str::FromStr::from_str(&link.relation) {
                     Ok(r) => r,
                     Err(_) => {
-                        tracing::warn!("unknown relation '{}', defaulting to related_to", link.relation);
+                        tracing::warn!(
+                            "unknown relation '{}', defaulting to related_to",
+                            link.relation
+                        );
                         Relation::RelatedTo
                     }
                 };
@@ -226,25 +237,38 @@ impl SqliteStore {
     /// - sim > 0.8 → supersede (mark old as superseded_by new_id)
     /// - 0.5 < sim <= 0.8 → refine (append new content to old memory)
     /// Returns number of evolved memories.
-    pub fn apply_evolution(&self, new_id: &str, new_content: &str, new_embedding: Option<&[f32]>) -> ReinResult<usize> {
+    pub fn apply_evolution(
+        &self,
+        new_id: &str,
+        new_content: &str,
+        new_embedding: Option<&[f32]>,
+    ) -> ReinResult<usize> {
         let similar = self.search_fts(new_content, None, 5)?;
         let mut evolved = 0usize;
 
         // Wrap in savepoint — multiple UPDATEs should be atomic
-        self.conn.execute_batch("SAVEPOINT evolution")
+        self.conn
+            .execute_batch("SAVEPOINT evolution")
             .map_err(crate::types::ReinError::Database)?;
 
         let result = (|| -> ReinResult<usize> {
             for old in &similar {
-                if old.id == new_id { continue; }
-                if old.superseded_by.is_some() { continue; }
+                if old.id == new_id {
+                    continue;
+                }
+                if old.superseded_by.is_some() {
+                    continue;
+                }
 
                 let sim = if let Some(new_emb) = new_embedding {
                     if let Ok(vec_results) = self.search_vec(new_emb, None, 5) {
-                        vec_results.iter()
+                        vec_results
+                            .iter()
                             .find(|m| m.id == old.id)
                             .map(|_| 0.85f32)
-                            .unwrap_or_else(|| crate::extract::similarity(new_content, &old.content))
+                            .unwrap_or_else(|| {
+                                crate::extract::similarity(new_content, &old.content)
+                            })
                     } else {
                         crate::extract::similarity(new_content, &old.content)
                     }
@@ -274,8 +298,11 @@ impl SqliteStore {
         })();
 
         match &result {
-            Ok(_) => { self.conn.execute_batch("RELEASE evolution")
-                .map_err(crate::types::ReinError::Database)?; }
+            Ok(_) => {
+                self.conn
+                    .execute_batch("RELEASE evolution")
+                    .map_err(crate::types::ReinError::Database)?;
+            }
             Err(_) => {
                 let _ = self.conn.execute_batch("ROLLBACK TO evolution");
                 let _ = self.conn.execute_batch("RELEASE evolution");
@@ -286,7 +313,11 @@ impl SqliteStore {
 
     /// Activate related memories: bump strength + last_accessed for memories similar to new content.
     /// This keeps old relevant memories alive instead of letting them decay.
-    pub fn activate_related_memories(&self, content: &str, max_activate: usize) -> ReinResult<usize> {
+    pub fn activate_related_memories(
+        &self,
+        content: &str,
+        max_activate: usize,
+    ) -> ReinResult<usize> {
         let similar = self.search_fts(content, None, max_activate)?;
         let mut activated = 0usize;
         for mem in &similar {
@@ -304,18 +335,23 @@ impl SqliteStore {
         let similar_concepts = self.search_all_concepts(content, 5)?;
         let mut activated = 0usize;
         // Cache memoir_id → name mapping to avoid O(N*M) lookups
-        let mut memoir_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut memoir_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for concept in &similar_concepts {
             let sim = crate::extract::similarity(content, &concept.definition);
             if sim > 0.2 {
                 // Look up memoir name from concept's memoir_id (cached)
-                let memoir_name = memoir_names.entry(concept.memoir_id.clone()).or_insert_with(|| {
-                    self.conn.query_row(
-                        "SELECT name FROM memoirs WHERE id = ?1",
-                        rusqlite::params![concept.memoir_id],
-                        |r| r.get::<_, String>(0),
-                    ).unwrap_or_default()
-                });
+                let memoir_name = memoir_names
+                    .entry(concept.memoir_id.clone())
+                    .or_insert_with(|| {
+                        self.conn
+                            .query_row(
+                                "SELECT name FROM memoirs WHERE id = ?1",
+                                rusqlite::params![concept.memoir_id],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .unwrap_or_default()
+                    });
                 if !memoir_name.is_empty() {
                     let _ = self.refine_concept(memoir_name, &concept.name, &concept.definition);
                     activated += 1;
@@ -339,15 +375,21 @@ impl SqliteStore {
 
         // Hoist link lookup outside loop to avoid repeated DB queries
         let existing_links = self.get_links_from(&concept.id)?;
-        let existing_targets: std::collections::HashSet<&str> = existing_links.iter()
-            .map(|l| l.target_id.as_str()).collect();
+        let existing_targets: std::collections::HashSet<&str> = existing_links
+            .iter()
+            .map(|l| l.target_id.as_str())
+            .collect();
 
         for candidate in &similar {
-            if candidate.id == concept.id { continue; }
+            if candidate.id == concept.id {
+                continue;
+            }
 
             let sim = crate::extract::similarity(&concept.definition, &candidate.definition);
             if sim > 0.2 {
-                if existing_targets.contains(candidate.id.as_str()) { continue; }
+                if existing_targets.contains(candidate.id.as_str()) {
+                    continue;
+                }
 
                 let link = ConceptLink {
                     id: String::new(),
@@ -382,7 +424,12 @@ impl SqliteStore {
     /// Uses FTS to find similar content, then checks Jaccard similarity.
     /// Both sides of each link are written in a single transaction.
     /// Returns the number of new links created.
-    pub fn auto_link(&self, id: &str, similarity_threshold: f32, max_links: usize) -> ReinResult<usize> {
+    pub fn auto_link(
+        &self,
+        id: &str,
+        similarity_threshold: f32,
+        max_links: usize,
+    ) -> ReinResult<usize> {
         let memory = self.get(id)?;
         // Search for similar memories by content
         let candidates = self.search_fts(&memory.content, Some(&memory.topic), max_links * 2)?;
@@ -401,17 +448,27 @@ impl SqliteStore {
         let mut peer_updates: Vec<(String, Vec<String>)> = Vec::new();
 
         for candidate in &all_candidates {
-            if candidate.id == id { continue; }
-            if updated_related.contains(&candidate.id) { continue; }
-            if updated_related.len() >= max_links { break; }
+            if candidate.id == id {
+                continue;
+            }
+            if updated_related.contains(&candidate.id) {
+                continue;
+            }
+            if updated_related.len() >= max_links {
+                break;
+            }
 
             let sim = crate::extract::similarity(&memory.content, &candidate.content);
-            if sim < similarity_threshold { continue; }
+            if sim < similarity_threshold {
+                continue;
+            }
 
             updated_related.push(candidate.id.clone());
 
             // Prepare peer update
-            if !candidate.related_ids.contains(&memory.id) && candidate.related_ids.len() < max_links {
+            if !candidate.related_ids.contains(&memory.id)
+                && candidate.related_ids.len() < max_links
+            {
                 let mut peer_related = candidate.related_ids.clone();
                 peer_related.push(memory.id.clone());
                 peer_updates.push((candidate.id.clone(), peer_related));
@@ -432,7 +489,9 @@ impl SqliteStore {
             }
             Ok(())
         })() {
-            let _ = self.conn.execute_batch("ROLLBACK TO auto_link; RELEASE auto_link");
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO auto_link; RELEASE auto_link");
             return Err(e);
         }
         self.conn.execute_batch("RELEASE auto_link")?;
@@ -442,9 +501,14 @@ impl SqliteStore {
 
     /// Organize all memories: scan for related pairs and create bidirectional links.
     /// Returns total number of new links created.
-    pub fn organize(&self, similarity_threshold: f32, max_links_per_memory: usize) -> ReinResult<usize> {
+    pub fn organize(
+        &self,
+        similarity_threshold: f32,
+        max_links_per_memory: usize,
+    ) -> ReinResult<usize> {
         let mut stmt = self.conn.prepare("SELECT id FROM memories")?;
-        let ids: Vec<String> = stmt.query_map([], |row| row.get(0))?
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -471,13 +535,17 @@ impl SqliteStore {
             "DELETE FROM memories WHERE topic = ?1",
             rusqlite::params![topic],
         ) {
-            let _ = self.conn.execute_batch("ROLLBACK TO consolidate_atomic; RELEASE consolidate_atomic");
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO consolidate_atomic; RELEASE consolidate_atomic");
             return Err(e.into());
         }
 
         // Insert replacement within same savepoint
         if let Err(e) = self.store(replacement) {
-            let _ = self.conn.execute_batch("ROLLBACK TO consolidate_atomic; RELEASE consolidate_atomic");
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO consolidate_atomic; RELEASE consolidate_atomic");
             return Err(e);
         }
 
@@ -487,6 +555,51 @@ impl SqliteStore {
         for m in &old_memories {
             self.remove_from_tantivy(&m.id);
             self.remove_from_hnsw(&m.id);
+        }
+
+        Ok(old_memories)
+    }
+
+    /// Atomically consolidate multiple topics into a single replacement memory.
+    /// Used for normalized topic-variant cleanup (case/space/hyphen variants).
+    pub fn consolidate_topics_atomic(
+        &self,
+        topics: &[String],
+        replacement: Memory,
+    ) -> ReinResult<Vec<Memory>> {
+        self.conn
+            .execute_batch("SAVEPOINT consolidate_topics_atomic")?;
+
+        let mut old_memories = Vec::new();
+        for topic in topics {
+            old_memories.extend(self.get_by_topic(topic)?);
+        }
+
+        for topic in topics {
+            if let Err(e) = self.conn.execute(
+                "DELETE FROM memories WHERE topic = ?1",
+                rusqlite::params![topic],
+            ) {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO consolidate_topics_atomic; RELEASE consolidate_topics_atomic",
+                );
+                return Err(e.into());
+            }
+        }
+
+        if let Err(e) = self.store(replacement) {
+            let _ = self.conn.execute_batch(
+                "ROLLBACK TO consolidate_topics_atomic; RELEASE consolidate_topics_atomic",
+            );
+            return Err(e);
+        }
+
+        self.conn
+            .execute_batch("RELEASE consolidate_topics_atomic")?;
+
+        for memory in &old_memories {
+            self.remove_from_tantivy(&memory.id);
+            self.remove_from_hnsw(&memory.id);
         }
 
         Ok(old_memories)

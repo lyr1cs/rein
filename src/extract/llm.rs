@@ -1,9 +1,10 @@
 use crate::config::ReinConfig;
 use crate::types::error::{ReinError, ReinResult};
+use crate::types::{DedupRelation, Memory};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::cmp::Ordering;
 use std::time::Duration;
-
 
 const EXTRACT_SYSTEM_PROMPT: &str = r#"You are a memory extraction system. Analyze the following text from a coding session and extract facts worth remembering long-term.
 
@@ -24,6 +25,43 @@ Rules:
 - Return an empty array [] if nothing is worth storing
 - Keep summaries concise and content factual"#;
 
+const CONSOLIDATE_SYSTEM_PROMPT: &str = r#"You are consolidating multiple existing memory entries about the same durable topic into one high-quality memory.
+
+Output a JSON array with exactly one object using this schema:
+- "topic": MUST be exactly the target topic provided in the input
+- "summary": concise summary under 100 characters
+- "content": 2-5 sentences capturing the durable facts worth keeping
+- "keywords": array of 3-8 relevant keywords
+- "importance": one of "low", "medium", "high", "critical"
+- "should_store": true
+- "quality_confidence": float 0-1
+
+Rules:
+- Merge repeated facts; do not repeat the same detail twice
+- Keep concrete names, versions, dates, and decisions when they matter
+- Preserve important distinctions or updates mentioned across memories
+- Prefer "high" importance unless the merged content is obviously minor
+- Support both English and Chinese
+- Return exactly one JSON object inside the array"#;
+
+const DEDUP_VERDICT_SYSTEM_PROMPT: &str = r#"You are deciding whether two memory texts refer to the same durable memory.
+
+Output a single JSON object with these fields:
+- "relation": one of "duplicate", "update", "related", "distinct"
+- "confidence": float 0-1
+- "merged_summary": short summary to keep if relation is duplicate/update, else empty string
+- "novel_facts": array of facts present in Text B but not fully covered by Text A
+- "conflict_detected": boolean
+- "suggested_topic": optional topic/category if the two texts should live under a better topic
+
+Decision rules:
+- "duplicate": same core fact, minor wording or detail differences
+- "update": same underlying fact/entity, but Text B materially updates or supersedes Text A
+- "related": same broader area but should not be merged
+- "distinct": different memories
+
+Be conservative about merging. Support both English and Chinese. Return JSON only."#;
+
 /// A memory extracted by the LLM with structured fields.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ExtractedMemory {
@@ -38,6 +76,22 @@ pub struct ExtractedMemory {
     pub should_store: bool,
     #[serde(default = "default_quality_confidence")]
     pub quality_confidence: f64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct DedupVerdict {
+    #[serde(default)]
+    pub relation: DedupRelation,
+    #[serde(default = "default_quality_confidence")]
+    pub confidence: f64,
+    #[serde(default)]
+    pub merged_summary: String,
+    #[serde(default)]
+    pub novel_facts: Vec<String>,
+    #[serde(default)]
+    pub conflict_detected: bool,
+    #[serde(default)]
+    pub suggested_topic: Option<String>,
 }
 
 fn default_importance() -> String {
@@ -154,7 +208,12 @@ impl GeminiExtractor {
             .timeout(Duration::from_secs(15))
             .build()
             .unwrap_or_default();
-        Self { client, api_key, endpoint, model }
+        Self {
+            client,
+            api_key,
+            endpoint,
+            model,
+        }
     }
 
     /// Common Gemini API call: send prompt + text, return raw content text from response.
@@ -173,7 +232,9 @@ impl GeminiExtractor {
             }
         });
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
@@ -183,12 +244,14 @@ impl GeminiExtractor {
 
         if !status.is_success() {
             return Err(ReinError::Extract(format!(
-                "Gemini API returned {}: {}", status, crate::types::truncate_for_error(&text_body, 500)
+                "Gemini API returned {}: {}",
+                status,
+                crate::types::truncate_for_error(&text_body, 500)
             )));
         }
 
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
 
         parsed["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
@@ -225,20 +288,33 @@ impl OmlxExtractor {
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
-        Self { client, endpoint, model, disable_thinking }
+        Self {
+            client,
+            endpoint,
+            model,
+            disable_thinking,
+        }
     }
 
     pub async fn extract(&self, text: &str) -> ReinResult<Vec<ExtractedMemory>> {
-        let content_text = self.call_and_extract_content(text, EXTRACT_SYSTEM_PROMPT).await?;
+        let content_text = self
+            .call_and_extract_content(text, EXTRACT_SYSTEM_PROMPT)
+            .await?;
         parse_llm_json(&content_text)
     }
 
     pub async fn extract_full(&self, text: &str) -> ReinResult<ExtractionResult> {
-        let content_text = self.call_and_extract_content(text, EXTRACT_FULL_PROMPT).await?;
+        let content_text = self
+            .call_and_extract_content(text, EXTRACT_FULL_PROMPT)
+            .await?;
         parse_extraction_result(&content_text)
     }
 
-    async fn call_and_extract_content(&self, text: &str, system_prompt: &str) -> ReinResult<String> {
+    async fn call_and_extract_content(
+        &self,
+        text: &str,
+        system_prompt: &str,
+    ) -> ReinResult<String> {
         let url = format!("{}/chat/completions", self.endpoint);
         let prefixed_prompt = if self.disable_thinking {
             format!("/no_think\n{}", system_prompt)
@@ -265,19 +341,27 @@ impl OmlxExtractor {
             Ok(resp) if resp.status().is_success() => resp.text().await?,
             _ => {
                 tracing::info!("OMLX JSON mode failed, retrying without response_format");
-                let resp = self.client.post(&url).json(&make_body(false)).send().await?;
+                let resp = self
+                    .client
+                    .post(&url)
+                    .json(&make_body(false))
+                    .send()
+                    .await?;
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
                     let truncated: String = body.chars().take(500).collect();
-                    return Err(ReinError::Extract(format!("OMLX API returned {}: {truncated}", status)));
+                    return Err(ReinError::Extract(format!(
+                        "OMLX API returned {}: {truncated}",
+                        status
+                    )));
                 }
                 body
             }
         };
 
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|e| ReinError::Extract(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
 
         parsed["choices"][0]["message"]["content"]
             .as_str()
@@ -296,11 +380,27 @@ pub enum ExtractorKind {
 }
 
 impl ExtractorKind {
+    async fn raw_with_prompt(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
+        match self {
+            Self::Gemini(e) => e.call_api(system_prompt, text).await,
+            Self::Omlx(e) => e.call_and_extract_content(text, system_prompt).await,
+        }
+    }
+
     pub async fn extract(&self, text: &str) -> ReinResult<Vec<ExtractedMemory>> {
         match self {
             Self::Gemini(e) => e.extract(text).await,
             Self::Omlx(e) => e.extract(text).await,
         }
+    }
+
+    pub async fn extract_with_prompt(
+        &self,
+        system_prompt: &str,
+        text: &str,
+    ) -> ReinResult<Vec<ExtractedMemory>> {
+        let content = self.raw_with_prompt(system_prompt, text).await?;
+        parse_llm_json(&content)
     }
 
     pub async fn extract_full(&self, text: &str) -> ReinResult<ExtractionResult> {
@@ -358,12 +458,96 @@ pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKi
         ))),
         "none" => None,
         other => {
-            tracing::warn!("unknown async_memory.provider '{other}', falling back to extract.provider");
+            tracing::warn!(
+                "unknown async_memory.provider '{other}', falling back to extract.provider"
+            );
             match config.extract_provider() {
                 Provider::Google | Provider::Omlx | Provider::None => create_extractor(config),
             }
         }
     }
+}
+
+/// Summarize a topic group into a single extracted memory using the configured LLM.
+/// Returns Ok(None) when no extractor is configured or no usable summary is produced.
+pub async fn summarize_topic_group(
+    config: &ReinConfig,
+    canonical_topic: &str,
+    source_topics: &[String],
+    memories: &[Memory],
+) -> ReinResult<Option<ExtractedMemory>> {
+    let Some(extractor) = create_extractor(config) else {
+        return Ok(None);
+    };
+
+    let mut input = format!(
+        "TARGET_TOPIC: {canonical_topic}\nSOURCE_TOPICS: {}\nMEMORY_COUNT: {}\n\n",
+        source_topics.join(", "),
+        memories.len()
+    );
+
+    for memory in memories.iter().take(50) {
+        input.push_str(&format!(
+            "[topic={} created_at={} importance={}]\nsummary: {}\ncontent:\n{}\n\n",
+            memory.topic,
+            memory.created_at.to_rfc3339(),
+            memory.importance,
+            memory.summary,
+            memory.content
+        ));
+    }
+
+    let prepared = prepare_input_for_kind(config, &input, &extractor);
+    let mut extracted = extractor
+        .extract_with_prompt(CONSOLIDATE_SYSTEM_PROMPT, &prepared)
+        .await?;
+    if extracted.is_empty() {
+        return Ok(None);
+    }
+
+    extracted.sort_by(|a, b| {
+        b.quality_confidence
+            .partial_cmp(&a.quality_confidence)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let mut best = match extracted.into_iter().find(|memory| memory.should_store) {
+        Some(memory) => memory,
+        None => return Ok(None),
+    };
+
+    best.topic = canonical_topic.to_string();
+    if best.keywords.is_empty() {
+        best.keywords = source_topics.iter().take(6).cloned().collect();
+    }
+    if best.importance.trim().is_empty() {
+        best.importance = "high".to_string();
+    }
+
+    Ok(Some(best))
+}
+
+/// Ask the configured LLM for a structured dedup verdict between two texts.
+pub async fn llm_dedup_verdict(
+    config: &ReinConfig,
+    text_a: &str,
+    text_b: &str,
+) -> ReinResult<Option<DedupVerdict>> {
+    let Some(extractor) = create_extractor(config) else {
+        return Ok(None);
+    };
+
+    let input = format!(
+        "Text A:\n{}\n\nText B:\n{}",
+        text_a.chars().take(1200).collect::<String>(),
+        text_b.chars().take(1200).collect::<String>()
+    );
+    let prepared = prepare_input_for_kind(config, &input, &extractor);
+    let content = extractor
+        .raw_with_prompt(DEDUP_VERDICT_SYSTEM_PROMPT, &prepared)
+        .await?;
+
+    parse_dedup_verdict(&content).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +557,11 @@ pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKi
 /// Truncate input text based on config (safe default for unknown models).
 fn prepare_input(config: &ReinConfig, text: &str) -> String {
     let max_chars = resolve_max_input_chars(config);
-    if max_chars > 0 { text.chars().take(max_chars).collect() } else { text.to_string() }
+    if max_chars > 0 {
+        text.chars().take(max_chars).collect()
+    } else {
+        text.to_string()
+    }
 }
 
 fn prepare_input_for_kind(config: &ReinConfig, text: &str, extractor: &ExtractorKind) -> String {
@@ -390,10 +578,18 @@ fn prepare_input_for_kind(config: &ReinConfig, text: &str, extractor: &Extractor
         }
         ExtractorKind::Omlx(_) => {
             let configured = config.extract.omlx.max_input_chars;
-            if configured > 0 { configured } else { SAFE_DEFAULT_MAX_CHARS }
+            if configured > 0 {
+                configured
+            } else {
+                SAFE_DEFAULT_MAX_CHARS
+            }
         }
     };
-    if max_chars > 0 { text.chars().take(max_chars).collect() } else { text.to_string() }
+    if max_chars > 0 {
+        text.chars().take(max_chars).collect()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Convert pattern-based facts to ExtractedMemory structs (common fallback path).
@@ -452,64 +648,18 @@ pub async fn extract_with_worker_preference(
 /// LLM semantic dedup: ask the model if two texts are about the same thing.
 /// Returns true if the LLM judges them as duplicates.
 pub async fn llm_is_duplicate(config: &ReinConfig, text_a: &str, text_b: &str) -> bool {
-    let Some(extractor) = create_extractor(config) else {
-        return false; // no LLM available, can't judge
-    };
-
-    let prompt = format!(
-        "Are these two texts saying essentially the same thing? Answer ONLY \"yes\" or \"no\".\n\nText A: {}\n\nText B: {}",
-        text_a.chars().take(500).collect::<String>(),
-        text_b.chars().take(500).collect::<String>(),
-    );
-
-    let result = match &extractor {
-        ExtractorKind::Gemini(e) => {
-            let url = format!("{}/v1beta/models/{}:generateContent", e.endpoint, e.model);
-            let body = json!({
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.0, "maxOutputTokens": 5}
-            });
-            e.client.post(&url)
-                .header("x-goog-api-key", &e.api_key)
-                .json(&body)
-                .send().await
-                .ok()
-                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
-        }
-        ExtractorKind::Omlx(e) => {
-            let url = format!("{}/chat/completions", e.endpoint);
-            let body = json!({
-                "model": &e.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0, "max_tokens": 5
-            });
-            e.client.post(&url)
-                .json(&body)
-                .send().await
-                .ok()
-                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
-        }
-    };
-
-    if let Some(resp) = result {
-        if let Ok(body) = resp.text().await {
-            let lower = body.to_lowercase();
-            // Check for "yes" in various response formats
-            // Gemini: candidates[0].content.parts[0].text
-            // OMLX: choices[0].message.content
-            // Also handle raw "yes"
-            return lower.contains("yes");
-        }
+    match llm_dedup_verdict(config, text_a, text_b).await {
+        Ok(Some(verdict)) => matches!(
+            verdict.relation,
+            DedupRelation::Duplicate | DedupRelation::Update
+        ),
+        _ => false,
     }
-    false // default: not duplicate (conservative)
 }
 
 /// Full extraction (memories + concepts + links + episode) with fallback.
 /// Used by hook_stop for session-level knowledge extraction.
-pub async fn extract_full_with_fallback(
-    config: &ReinConfig,
-    text: &str,
-) -> ExtractionResult {
+pub async fn extract_full_with_fallback(config: &ReinConfig, text: &str) -> ExtractionResult {
     if let Some(extractor) = create_extractor(config) {
         let input = prepare_input(config, text);
 
@@ -519,7 +669,10 @@ pub async fn extract_full_with_fallback(
                 tracing::warn!("LLM full extraction failed, falling back to simple: {e}");
                 if let Ok(memories) = extractor.extract(&input).await {
                     if !memories.is_empty() {
-                        return ExtractionResult { memories, ..Default::default() };
+                        return ExtractionResult {
+                            memories,
+                            ..Default::default()
+                        };
                     }
                 }
                 tracing::warn!("LLM simple extraction also failed, falling back to patterns");
@@ -547,7 +700,10 @@ pub async fn extract_full_with_worker_preference(
                 tracing::warn!("memory worker full extraction failed, falling back to simple: {e}");
                 if let Ok(memories) = extractor.extract(&input).await {
                     if !memories.is_empty() {
-                        return ExtractionResult { memories, ..Default::default() };
+                        return ExtractionResult {
+                            memories,
+                            ..Default::default()
+                        };
                     }
                 }
             }
@@ -570,10 +726,10 @@ const SAFE_DEFAULT_MAX_CHARS: usize = 16000;
 /// Check if a Gemini model is known to support 1M+ token input.
 /// All Gemini 2.0+ models (2.0, 2.5, 3.x) support 1,048,576 input tokens.
 fn is_large_context_model(model: &str) -> bool {
-    model.starts_with("gemini-2.") ||
-    model.starts_with("gemini-3") ||
-    model.starts_with("gemini-2-") ||
-    model.starts_with("gemini-3.")
+    model.starts_with("gemini-2.")
+        || model.starts_with("gemini-3")
+        || model.starts_with("gemini-2-")
+        || model.starts_with("gemini-3.")
 }
 
 /// Resolve the effective max_input_chars for the current config.
@@ -585,7 +741,11 @@ fn resolve_max_input_chars(config: &ReinConfig) -> usize {
     match config.extract_provider() {
         Provider::Omlx => {
             let configured = config.extract.omlx.max_input_chars;
-            if configured > 0 { configured } else { SAFE_DEFAULT_MAX_CHARS }
+            if configured > 0 {
+                configured
+            } else {
+                SAFE_DEFAULT_MAX_CHARS
+            }
         }
         Provider::Google | Provider::None => {
             let configured = config.extract.google.max_input_chars;
@@ -630,12 +790,16 @@ fn parse_extraction_result(text: &str) -> ReinResult<ExtractionResult> {
 
         // Try to parse each field independently for partial success
         if let Some(memories_val) = obj.get("memories") {
-            if let Ok(memories) = serde_json::from_value::<Vec<ExtractedMemory>>(memories_val.clone()) {
+            if let Ok(memories) =
+                serde_json::from_value::<Vec<ExtractedMemory>>(memories_val.clone())
+            {
                 result.memories = memories.into_iter().filter(|m| m.should_store).collect();
             }
         }
         if let Some(concepts_val) = obj.get("concepts") {
-            if let Ok(concepts) = serde_json::from_value::<Vec<ExtractedConcept>>(concepts_val.clone()) {
+            if let Ok(concepts) =
+                serde_json::from_value::<Vec<ExtractedConcept>>(concepts_val.clone())
+            {
                 result.concepts = concepts;
             }
         }
@@ -667,11 +831,56 @@ fn parse_extraction_result(text: &str) -> ReinResult<ExtractionResult> {
 
     // Try as plain memories array (backward compat)
     if let Ok(memories) = parse_llm_json(&cleaned) {
-        return Ok(ExtractionResult { memories, ..Default::default() });
+        return Ok(ExtractionResult {
+            memories,
+            ..Default::default()
+        });
     }
 
     Err(ReinError::Extract(format!(
         "failed to parse extraction result: {}",
+        cleaned.chars().take(200).collect::<String>()
+    )))
+}
+
+fn parse_dedup_verdict(text: &str) -> ReinResult<DedupVerdict> {
+    let cleaned = strip_code_fences(text.trim());
+    let lower = cleaned.to_lowercase();
+
+    if lower == "yes" || lower == "\"yes\"" {
+        return Ok(DedupVerdict {
+            relation: DedupRelation::Duplicate,
+            confidence: 0.8,
+            ..Default::default()
+        });
+    }
+    if lower == "no" || lower == "\"no\"" {
+        return Ok(DedupVerdict {
+            relation: DedupRelation::Distinct,
+            confidence: 0.8,
+            ..Default::default()
+        });
+    }
+
+    if let Ok(verdict) = serde_json::from_str::<DedupVerdict>(&cleaned) {
+        return Ok(verdict);
+    }
+
+    if let Ok(obj) = serde_json::from_str::<Value>(&cleaned) {
+        if let Some(obj_map) = obj.as_object() {
+            if let Ok(verdict) = serde_json::from_value::<DedupVerdict>(obj.clone()) {
+                return Ok(verdict);
+            }
+            for (_key, value) in obj_map {
+                if let Ok(verdict) = serde_json::from_value::<DedupVerdict>(value.clone()) {
+                    return Ok(verdict);
+                }
+            }
+        }
+    }
+
+    Err(ReinError::Extract(format!(
+        "failed to parse dedup verdict: {}",
         cleaned.chars().take(200).collect::<String>()
     )))
 }
@@ -715,7 +924,9 @@ fn strip_code_fences(text: &str) -> String {
         let after_first = if let Some(nl) = trimmed.find('\n') {
             &trimmed[nl + 1..]
         } else {
-            trimmed.trim_start_matches("```json").trim_start_matches("```")
+            trimmed
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
         };
         if let Some(end) = after_first.rfind("```") {
             return after_first[..end].trim().to_string();
@@ -780,7 +991,8 @@ mod tests {
 
     #[test]
     fn test_default_fields() {
-        let json = r#"[{"topic": "test", "summary": "minimal", "content": "just topic/summary/content"}]"#;
+        let json =
+            r#"[{"topic": "test", "summary": "minimal", "content": "just topic/summary/content"}]"#;
         let result = parse_llm_json(json).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].importance, "medium");
@@ -793,6 +1005,25 @@ mod tests {
         assert_eq!(strip_code_fences("```json\n[]\n```"), "[]");
         assert_eq!(strip_code_fences("```\n[]\n```"), "[]");
         assert_eq!(strip_code_fences("[]"), "[]");
+    }
+
+    #[test]
+    fn test_parse_dedup_verdict_json() {
+        let verdict = parse_dedup_verdict(
+            r#"{"relation":"update","confidence":0.92,"merged_summary":"updated summary","novel_facts":["new port"],"conflict_detected":true}"#,
+        )
+        .unwrap();
+        assert_eq!(verdict.relation, DedupRelation::Update);
+        assert!(verdict.conflict_detected);
+        assert_eq!(verdict.novel_facts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_dedup_verdict_yes_no_fallback() {
+        let yes = parse_dedup_verdict("yes").unwrap();
+        let no = parse_dedup_verdict("no").unwrap();
+        assert_eq!(yes.relation, DedupRelation::Duplicate);
+        assert_eq!(no.relation, DedupRelation::Distinct);
     }
 
     #[test]

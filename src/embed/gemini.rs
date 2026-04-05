@@ -43,8 +43,7 @@ impl Embedder for GeminiEmbedder {
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>> {
         let url = format!(
             "{}/v1beta/models/{}:embedContent",
-            self.endpoint,
-            self.model
+            self.endpoint, self.model
         );
         let body = json!({
             "model": format!("models/{}", self.model),
@@ -52,16 +51,21 @@ impl Embedder for GeminiEmbedder {
             "outputDimensionality": self.dimensions
         });
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .header("x-goog-api-key", &self.api_key)
-            .json(&body).send().await?;
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text_body = resp.text().await?;
 
         if !status.is_success() {
             let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "Gemini API returned {}: {truncated}", status
+                "Gemini API returned {}: {truncated}",
+                status
             )));
         }
 
@@ -99,16 +103,21 @@ impl Embedder for GeminiEmbedder {
 
         let body = json!({ "requests": requests });
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .header("x-goog-api-key", &self.api_key)
-            .json(&body).send().await?;
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text_body = resp.text().await?;
 
         if !status.is_success() {
             let truncated: String = text_body.chars().take(500).collect();
             return Err(ReinError::Embedding(format!(
-                "Gemini batch API returned {}: {truncated}", status
+                "Gemini batch API returned {}: {truncated}",
+                status
             )));
         }
 
@@ -143,7 +152,12 @@ mod tests {
     #[ignore] // requires live API key in GEMINI_API_KEY env var
     async fn test_google_embed_live() {
         let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY not set");
-        let embedder = GeminiEmbedder::new(api_key, "https://generativelanguage.googleapis.com".to_string(), "gemini-embedding-001".to_string(), 3072);
+        let embedder = GeminiEmbedder::new(
+            api_key,
+            "https://generativelanguage.googleapis.com".to_string(),
+            "gemini-embedding-001".to_string(),
+            3072,
+        );
         let result = embedder.embed("hello world").await.unwrap();
         assert_eq!(result.len(), 3072);
     }

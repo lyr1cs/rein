@@ -214,10 +214,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fts = TantivyFts::open(dir.path()).unwrap();
 
-        fts.insert("m1", "rust", "ownership rules", "Rust ownership and borrowing", "rust,memory")
-            .unwrap();
-        fts.insert("m2", "python", "decorators", "Python decorators for functions", "python,decorators")
-            .unwrap();
+        fts.insert(
+            "m1",
+            "rust",
+            "ownership rules",
+            "Rust ownership and borrowing",
+            "rust,memory",
+        )
+        .unwrap();
+        fts.insert(
+            "m2",
+            "python",
+            "decorators",
+            "Python decorators for functions",
+            "python,decorators",
+        )
+        .unwrap();
 
         let results = fts.search("ownership", None, 10).unwrap();
         assert!(!results.is_empty());
