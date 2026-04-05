@@ -163,14 +163,22 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         }
     }
 
+    let mut rebuild_ok = false;
     if inserted > 0 {
-        if let Err(e) = index.save() {
-            tracing::warn!("hnsw: failed to save index: {e}");
-        } else {
-            tracing::info!("hnsw: indexed {inserted} vectors");
+        match index.save() {
+            Ok(()) => {
+                tracing::info!("hnsw: indexed {inserted} vectors");
+                rebuild_ok = true;
+            }
+            Err(e) => tracing::warn!("hnsw: failed to save index: {e}"),
         }
+    } else {
+        rebuild_ok = true; // nothing to index, still valid
     }
-    let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path));
+    // Only clear dirty marker on successful rebuild
+    if rebuild_ok {
+        let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path));
+    }
 
     #[cfg(unix)]
     {
@@ -226,17 +234,23 @@ pub fn populate_tantivy(store: &SqliteStore) {
     };
 
     let mut indexed = 0usize;
+    let mut errors = 0usize;
     for (id, topic, summary, content, keywords) in &memories {
         if tantivy.insert(id, topic, summary, content, keywords).is_ok() {
             indexed += 1;
+        } else {
+            errors += 1;
         }
     }
 
     if indexed > 0 {
-        tracing::info!("tantivy: indexed {indexed} documents");
+        tracing::info!("tantivy: indexed {indexed} documents ({errors} errors)");
     }
 
-    let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
+    // Only clear dirty marker if rebuild had no errors
+    if errors == 0 {
+        let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
+    }
 
     // Lock released when lock_file is dropped.
     drop(lock_file);
