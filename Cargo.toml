@@ -24,6 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
+regex = "1"
 glob = "0.3"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
@@ -35,6 +36,10 @@ tantivy = "0.22"
 libc = "0.2"
 futures-util = "0.3"
 tokio-stream = "0.1"
+base64 = "0.22"
+ring = "0.17"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 rust-embed = { version = "8", features = ["compression"], optional = true }
 
 [features]

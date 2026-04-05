@@ -140,18 +140,19 @@ impl SqliteStore {
             }
         }
 
-        // Store averages for all features
+        // Store sums for all features. concept_quality_score() turns them into
+        // averages using good_count/bad_count when loading.
         if good_count > 0.0 {
-            upsert("quality:good_llm_sum", sum_llm / good_count);
-            upsert("quality:good_utility_sum", sum_util / good_count);
-            upsert("quality:good_connectivity_sum", sum_conn / good_count);
-            upsert("quality:good_recency_sum", sum_rec / good_count);
+            upsert("quality:good_llm_sum", sum_llm);
+            upsert("quality:good_utility_sum", sum_util);
+            upsert("quality:good_connectivity_sum", sum_conn);
+            upsert("quality:good_recency_sum", sum_rec);
         }
         if bad_count > 0.0 {
-            upsert("quality:bad_llm_sum", bad_llm / bad_count);
-            upsert("quality:bad_utility_sum", bad_util / bad_count);
-            upsert("quality:bad_connectivity_sum", bad_conn / bad_count);
-            upsert("quality:bad_recency_sum", bad_rec / bad_count);
+            upsert("quality:bad_llm_sum", bad_llm);
+            upsert("quality:bad_utility_sum", bad_util);
+            upsert("quality:bad_connectivity_sum", bad_conn);
+            upsert("quality:bad_recency_sum", bad_rec);
         }
     }
 

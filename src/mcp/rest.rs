@@ -36,6 +36,42 @@ fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
     json_response(status, json!({ "error": msg }))
 }
 
+fn parse_bounded_usize(
+    query: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, String> {
+    match query.get(key) {
+        Some(raw) => {
+            let value = raw
+                .parse::<usize>()
+                .map_err(|_| format!("invalid '{key}' parameter"))?;
+            Ok(value.clamp(min, max))
+        }
+        None => Ok(default.clamp(min, max)),
+    }
+}
+
+fn parse_bounded_i64(
+    query: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> Result<i64, String> {
+    match query.get(key) {
+        Some(raw) => {
+            let value = raw
+                .parse::<i64>()
+                .map_err(|_| format!("invalid '{key}' parameter"))?;
+            Ok(value.clamp(min, max))
+        }
+        None => Ok(default.clamp(min, max)),
+    }
+}
+
 /// Parse query string into key-value pairs with percent-decoding.
 fn parse_query(uri: &hyper::Uri) -> std::collections::HashMap<String, String> {
     uri.query()
@@ -125,7 +161,7 @@ async fn handle_api(
         (&Method::GET, "/api/artifacts") => api_artifacts(config, &query),
         (&Method::GET, p) if p.starts_with("/api/artifacts/") => {
             let id = &p["/api/artifacts/".len()..];
-            api_artifact_detail(config, id)
+            api_artifact_detail(config, id, &query)
         }
 
         // --- Mutation endpoints (placeholder for Phase 2) ---
@@ -153,7 +189,10 @@ fn handle_memoir_path(
         }
         if sub.starts_with("inspect/") {
             let concept = percent_decode(&sub["inspect/".len()..]);
-            let depth: usize = query.get("depth").and_then(|d| d.parse().ok()).unwrap_or(1);
+            let depth = match parse_bounded_usize(query, "depth", 1, 1, 8) {
+                Ok(depth) => depth,
+                Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+            };
             return api_memoir_inspect(config, name, &concept, depth);
         }
         api_memoir_show(config, name)
@@ -188,10 +227,14 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
 }
 
 fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
-    let days: i64 = query.get("days").and_then(|d| d.parse().ok()).unwrap_or(14).max(1).min(90);
+    let days = match parse_bounded_i64(query, "days", 14, 1, 90) {
+        Ok(days) => days,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
     let granularity = match query.get("granularity").map(|s| s.as_str()) {
         Some("hour") => "hour",
-        _ => "day",
+        Some("day") | None => "day",
+        Some(_) => return error_response(StatusCode::BAD_REQUEST, "invalid 'granularity' parameter"),
     };
     let store = match config.open_store() {
         Ok(s) => s,
@@ -268,7 +311,10 @@ fn api_topics(config: &ReinConfig) -> BoxedResponse {
 }
 
 fn api_recent(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20).min(100);
+    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
+        Ok(limit) => limit,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -312,9 +358,12 @@ fn api_recall(config: &ReinConfig, query: &std::collections::HashMap<String, Str
     };
     let topic = query.get("topic").map(|s| s.as_str());
     let keyword = query.get("keyword").map(|s| s.as_str());
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20).min(100);
+    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
+        Ok(limit) => limit,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
     let from = query.get("from").and_then(|s| parse_datetime(s));
-    let to = query.get("to").and_then(|s| parse_datetime(s));
+    let to = query.get("to").and_then(|s| parse_datetime_end(s));
 
     let store = match config.open_store() {
         Ok(s) => s,
@@ -447,9 +496,12 @@ fn api_memoir_inspect(config: &ReinConfig, memoir: &str, concept: &str, depth: u
 }
 
 fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50).min(200);
+    let limit = match parse_bounded_usize(query, "limit", 50, 1, 200) {
+        Ok(limit) => limit,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
     let from = query.get("from").and_then(|s| parse_datetime(s));
-    let to = query.get("to").and_then(|s| parse_datetime(s));
+    let to = query.get("to").and_then(|s| parse_datetime_end(s));
 
     let store = match config.open_store() {
         Ok(s) => s,
@@ -468,16 +520,34 @@ fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, S
 
     // Collect memories in the same window (respect from/to filters)
     let memories = if from.is_some() || to.is_some() {
-        // Filter by date range using SQL
-        let mut all = store.recent(limit * 2).unwrap_or_default();
-        if let Some(f) = from {
-            all.retain(|m| m.created_at >= f);
-        }
-        if let Some(t) = to {
-            all.retain(|m| m.created_at <= t);
-        }
-        all.truncate(limit);
-        all
+        let from_bound = from.unwrap_or_else(|| {
+            chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        });
+        let to_bound = to.unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(1));
+        let mut stmt = match store.conn().prepare(
+            "SELECT * FROM memories WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC LIMIT ?3",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![from_bound.to_rfc3339(), to_bound.to_rfc3339(), limit],
+            |row| {
+                crate::store::sqlite::row_to_memory(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+        rows.filter_map(|r| r.ok()).collect()
     } else {
         store.recent(limit).unwrap_or_default()
     };
@@ -513,7 +583,10 @@ fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, S
 }
 
 fn api_episodes(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20).min(100);
+    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
+        Ok(limit) => limit,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -525,8 +598,14 @@ fn api_episodes(config: &ReinConfig, query: &std::collections::HashMap<String, S
 }
 
 fn api_artifacts(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20).min(100);
-    let offset: usize = query.get("offset").and_then(|o| o.parse().ok()).unwrap_or(0);
+    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
+        Ok(limit) => limit,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let offset = match parse_bounded_usize(query, "offset", 0, 0, 10000) {
+        Ok(offset) => offset,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -559,16 +638,23 @@ fn api_artifacts(config: &ReinConfig, query: &std::collections::HashMap<String, 
     }
 }
 
-fn api_artifact_detail(config: &ReinConfig, id: &str) -> BoxedResponse {
+fn api_artifact_detail(
+    config: &ReinConfig,
+    id: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    let include_transcript =
+        matches!(query.get("include_transcript").map(|v| v.as_str()), Some("true"));
     let sql = "SELECT id, schema_version, artifact_kind, session_id, title, summary, \
                source_agent, source_label, is_subagent, started_at, ended_at, \
                turn_count, transcript_text, transcript_json, episode_id, created_at \
                FROM session_artifacts WHERE id = ?1";
     let result = store.conn().query_row(sql, rusqlite::params![id], |row| {
+        let transcript_text: String = row.get(12)?;
         Ok(json!({
             "id": row.get::<_, String>(0)?,
             "schema_version": row.get::<_, i32>(1)?,
@@ -582,8 +668,14 @@ fn api_artifact_detail(config: &ReinConfig, id: &str) -> BoxedResponse {
             "started_at": row.get::<_, Option<String>>(9)?,
             "ended_at": row.get::<_, Option<String>>(10)?,
             "turn_count": row.get::<_, u32>(11)?,
-            "transcript_text": row.get::<_, String>(12)?,
-            "transcript_json": row.get::<_, Option<String>>(13)?,
+            "transcript_text": if include_transcript {
+                Some(crate::extract::hooks::parsing::redact_secrets(&transcript_text))
+            } else {
+                None::<String>
+            },
+            "transcript_available": !transcript_text.trim().is_empty(),
+            "transcript_json": row.get::<_, Option<String>>(13)?
+                .map(|j| crate::extract::hooks::parsing::redact_secrets(&j)),
             "episode_id": row.get::<_, Option<String>>(14)?,
             "created_at": row.get::<_, String>(15)?,
         }))
@@ -631,6 +723,18 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .ok()
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc())
+        })
+}
+
+fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(23, 59, 59))
                 .map(|dt| dt.and_utc())
         })
 }

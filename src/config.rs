@@ -29,6 +29,7 @@ impl Provider {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[derive(Default)]
 pub struct ReinConfig {
     pub database: DatabaseConfig,
@@ -53,11 +54,13 @@ pub struct ReinConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     pub provider: String,
     pub dimensions: usize,
@@ -66,6 +69,7 @@ pub struct EmbeddingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleEmbeddingConfig {
     pub model: String,
     #[serde(default)]
@@ -81,6 +85,7 @@ fn default_google_endpoint() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OmlxEmbeddingConfig {
     pub endpoint: String,
     #[serde(default = "default_omlx_model")]
@@ -92,6 +97,7 @@ fn default_omlx_model() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     pub rrf_k: f64,
     pub rrf_fts_weight: f64,
@@ -119,6 +125,7 @@ fn default_llm_reranker() -> String { "none".to_string() }
 fn default_llm_reranker_top_n() -> usize { 15 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkingConfig {
     pub max_tokens: usize,
     pub overlap_percent: usize,
@@ -126,6 +133,7 @@ pub struct ChunkingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncConfig {
     pub supermemory_enabled: bool,
     pub auto_memory_enabled: bool,
@@ -145,6 +153,7 @@ fn default_supermemory_endpoint() -> String {
 /// All parameters here are operational settings, not model parameters —
 /// model parameters are learned from data.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveConfig {
     /// Enable the adaptive engine. Default true.
     #[serde(default = "default_adaptive_enabled")]
@@ -192,6 +201,7 @@ impl Default for AdaptiveConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecayConfig {
     pub base_lambda: f64,
     pub ltm_beta: f64,
@@ -202,6 +212,7 @@ pub struct DecayConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub compact: bool,
     pub sse_enabled: bool,
@@ -209,9 +220,12 @@ pub struct ServerConfig {
     pub sse_bind: String,
     #[serde(default)]
     pub gui_enabled: bool,
+    #[serde(default)]
+    pub allow_unauthenticated_loopback: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HooksConfig {
     pub min_turns: usize,
     pub context_before: usize,
@@ -240,6 +254,7 @@ fn default_buffer_flush_threshold() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractConfig {
     pub provider: String,
     pub google: GoogleExtractConfig,
@@ -247,6 +262,7 @@ pub struct ExtractConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct AsyncMemoryConfig {
     /// Which LLM provider the async memory worker uses.
@@ -275,6 +291,7 @@ pub struct AsyncMemoryConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleExtractConfig {
     pub model: String,
     #[serde(default)]
@@ -287,6 +304,7 @@ pub struct GoogleExtractConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OmlxExtractConfig {
     pub endpoint: String,
     #[serde(default = "default_omlx_extract_model")]
@@ -312,6 +330,7 @@ fn default_omlx_extract_model() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryExpansionConfig {
     /// Provider: "google", "omlx", or "none". Default: "google".
     #[serde(default = "default_expand_provider")]
@@ -329,6 +348,7 @@ fn default_expand_provider() -> String { "google".to_string() }
 fn default_max_expansions() -> usize { 3 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleExpandConfig {
     #[serde(default = "default_expand_google_model")]
     pub model: String,
@@ -343,6 +363,7 @@ fn default_expand_google_model() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OmlxExpandConfig {
     #[serde(default = "default_omlx_expand_endpoint")]
     pub endpoint: String,
@@ -461,11 +482,13 @@ impl Default for ServerConfig {
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
             gui_enabled: false,
+            allow_unauthenticated_loopback: false,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct ProxyConfig {
     pub port: u16,
@@ -477,9 +500,11 @@ pub struct ProxyConfig {
     pub store_min_score: u32,
     pub max_retries: u32,
     pub retry_base_ms: u64,
+    pub max_request_body: usize,
     pub max_response_buffer: usize,
     pub max_sse_buffer: usize,
     pub max_concurrent_extractions: usize,
+    pub allow_unauthenticated_loopback: bool,
 }
 
 impl Default for ProxyConfig {
@@ -494,9 +519,11 @@ impl Default for ProxyConfig {
             store_min_score: 3,
             max_retries: 2,
             retry_base_ms: 500,
+            max_request_body: 1_048_576,
             max_response_buffer: 1_048_576,
             max_sse_buffer: 1_048_576,
             max_concurrent_extractions: 4,
+            allow_unauthenticated_loopback: false,
         }
     }
 }
@@ -685,13 +712,16 @@ impl ReinConfig {
             config.async_memory.provider = provider;
         }
 
+        config.validate()?;
         Ok(config)
     }
 
     /// Load configuration from a specific TOML string (for testing).
     pub fn load_from_str(toml_str: &str) -> anyhow::Result<Self> {
         let config = Self::default();
-        merge_toml(config, toml_str)
+        let merged = merge_toml(config, toml_str)?;
+        merged.validate()?;
+        Ok(merged)
     }
 
     /// Get typed embedding provider (prevents typo misconfiguration).
@@ -723,8 +753,14 @@ impl ReinConfig {
         }
     }
 
-    /// Validate configuration and print warnings for common misconfigurations.
-    pub fn validate(&self) {
+    /// Validate configuration and return an error for invalid values.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_provider_name("embedding.provider", &self.embedding.provider)?;
+        validate_provider_name("extract.provider", &self.extract.provider)?;
+        validate_provider_name("query_expansion.provider", &self.query_expansion.provider)?;
+        validate_provider_name("search.llm_reranker", &self.search.llm_reranker)?;
+        validate_provider_name_or_inherit("async_memory.provider", &self.async_memory.provider)?;
+
         match self.embedding_provider() {
             Provider::Google => {
                 if self.embedding.google.api_key.is_none() {
@@ -762,6 +798,7 @@ impl ReinConfig {
             }
             Provider::None => {}
         }
+        Ok(())
     }
 
     /// Open a SqliteStore with the current config's model and dimensions.
@@ -798,6 +835,24 @@ impl ReinConfig {
         } else {
             PathBuf::from(&self.database.path)
         }
+    }
+}
+
+fn validate_provider_name(field: &str, value: &str) -> anyhow::Result<()> {
+    match value.to_lowercase().as_str() {
+        "google" | "omlx" | "none" => Ok(()),
+        _ => anyhow::bail!(
+            "invalid {field}='{value}'. Expected one of: google, omlx, none"
+        ),
+    }
+}
+
+fn validate_provider_name_or_inherit(field: &str, value: &str) -> anyhow::Result<()> {
+    match value.to_lowercase().as_str() {
+        "inherit" | "google" | "omlx" | "none" => Ok(()),
+        _ => anyhow::bail!(
+            "invalid {field}='{value}'. Expected one of: inherit, google, omlx, none"
+        ),
     }
 }
 
@@ -961,5 +1016,22 @@ rrf_k = 30.0
         // Custom path should be returned as-is
         config.database.path = "/custom/path/test.db".to_string();
         assert_eq!(config.resolve_db_path(), std::path::PathBuf::from("/custom/path/test.db"));
+    }
+
+    #[test]
+    fn test_unknown_config_field_rejected() {
+        let toml_str = r#"
+[search]
+rrf_k = 30.0
+unknown_knob = true
+"#;
+        assert!(ReinConfig::load_from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_invalid_provider_rejected_by_validate() {
+        let mut cfg = ReinConfig::default();
+        cfg.embedding.provider = "bogus".to_string();
+        assert!(cfg.validate().is_err());
     }
 }

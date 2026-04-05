@@ -1,6 +1,7 @@
 //! Session buffer I/O for hook_post → hook_stop pipeline.
 
 use crate::config::ReinConfig;
+use crate::extract::hooks::parsing::redact_secrets;
 
 /// Resolve the buffer directory (auto = ~/.rein/).
 pub fn resolve_buffer_dir(config: &ReinConfig) -> std::path::PathBuf {
@@ -31,33 +32,37 @@ pub fn session_buffer_path(config: &ReinConfig, input: &str) -> std::path::PathB
 
 /// Append a text entry to the session buffer file.
 pub fn append_to_buffer(path: &std::path::Path, text: &str, source: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    let entry = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "text": text,
-        "source": source,
-    });
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    writeln!(file, "{}", entry)?;
-    Ok(())
+    with_buffer_lock(path, || {
+        use std::io::Write;
+        let entry = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "text": redact_secrets(text),
+            "source": source,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        writeln!(file, "{}", entry)?;
+        Ok(())
+    })
 }
 
 /// Read all text entries from a buffer file and delete it.
 pub fn read_and_clear_buffer(path: &std::path::Path) -> Vec<String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let _ = std::fs::remove_file(path);
-    content.lines()
-        .filter_map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).ok()
-                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
-        })
-        .collect()
+    with_buffer_lock(path, || {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return Ok(vec![]),
+        };
+        let _ = std::fs::remove_file(path);
+        Ok(content.lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).ok()
+                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            })
+            .collect())
+    }).unwrap_or_default()
 }
 
 /// Adaptive flush threshold: adjusts based on signal density in the buffer.
@@ -101,6 +106,42 @@ pub fn cleanup_stale_buffers(config: &ReinConfig) {
             }
         }
     }
+}
+
+fn buffer_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.lock", path.display()))
+}
+
+fn with_buffer_lock<T, F>(path: &std::path::Path, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    let lock_path = buffer_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let result = f();
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    drop(lock_file);
+    result
 }
 
 /// Store an episode summary as a concept in the "sessions" memoir.

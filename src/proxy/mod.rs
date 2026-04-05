@@ -12,13 +12,21 @@ mod provider;
 mod responses;
 
 use crate::config::ReinConfig;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
+use native_tls::TlsConnector;
 use provider::ProviderKind;
+use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Semaphore};
+use tokio_native_tls::TlsConnector as TokioTlsConnector;
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -56,6 +64,7 @@ impl ProxyMetrics {
 
 struct ProxyState {
     metrics: ProxyMetrics,
+    extraction_permits: Arc<Semaphore>,
 }
 
 /// Start the transparent proxy server.
@@ -65,17 +74,18 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 
     let bind = format!("{}:{}", config.proxy.bind, config.proxy.port);
 
-    // Security: require auth token for non-localhost binds (same as run_http).
+    // Security: require auth token by default, even on loopback.
     let is_loopback = config.proxy.bind == "127.0.0.1"
         || config.proxy.bind == "localhost"
         || config.proxy.bind == "::1";
     let auth_token = std::env::var("REIN_PROXY_TOKEN")
         .ok()
         .or_else(|| std::env::var("REIN_HTTP_TOKEN").ok());
-    if !is_loopback && auth_token.is_none() {
+    let allow_loopback_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
+    if auth_token.is_none() && !allow_loopback_unauth {
         anyhow::bail!(
-            "rein proxy: refusing to bind to non-loopback address '{}' without REIN_PROXY_TOKEN set. \
-             Set REIN_PROXY_TOKEN=<secret> or bind to 127.0.0.1.",
+            "rein proxy: refusing to start on '{}' without REIN_PROXY_TOKEN set. \
+             Set REIN_PROXY_TOKEN=<secret> or explicitly opt into unauthenticated loopback with [proxy].allow_unauthenticated_loopback=true.",
             config.proxy.bind
         );
     }
@@ -94,6 +104,9 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 
     let state = Arc::new(ProxyState {
         metrics: ProxyMetrics::new(),
+        extraction_permits: Arc::new(Semaphore::new(
+            config.proxy.max_concurrent_extractions.max(1),
+        )),
     });
 
     // Graceful shutdown: stop accept loop on ctrl-c.
@@ -133,7 +146,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
             if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                 hyper_util::rt::TokioExecutor::new(),
             )
-            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
             .await
             {
                 tracing::warn!("proxy connection error: {e}");
@@ -145,6 +158,11 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+type BoxedIo = Box<dyn AsyncIo>;
 
 fn box_body<B>(body: B) -> BoxBody
 where
@@ -296,6 +314,38 @@ async fn handle_request(
     // capture source query metadata for recording; requests are not mutated.
     let provider = ProviderKind::detect(&path);
 
+    if let Some(provider_kind) = provider {
+        if let Some(msg) = responses_scope_error(provider_kind, &method, req.headers()) {
+            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(error_response(401, &msg));
+        }
+    }
+
+    if method == hyper::Method::GET
+        && is_websocket_upgrade(req.headers())
+        && matches!(provider, Some(ProviderKind::OpenAiResponses))
+    {
+        return handle_websocket_proxy(
+            req,
+            &config,
+            &path_and_query,
+            &headers,
+            ProviderKind::OpenAiResponses,
+        )
+        .await;
+    }
+
+    if let Some(content_length) = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if content_length > config.proxy.max_request_body {
+            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(error_response(413, "request body too large"));
+        }
+    }
+
     // Read full request body.
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -308,6 +358,10 @@ async fn handle_request(
 
     // Log request details.
     let body_size = body_bytes.len();
+    if body_size > config.proxy.max_request_body {
+        state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+        return Ok(error_response(413, "request body too large"));
+    }
     eprintln!("rein proxy: {method} {path_and_query} ({body_size} bytes)");
 
     // If not a known sampling endpoint, passthrough unmodified.
@@ -342,10 +396,7 @@ async fn handle_request(
     let mut upstream_headers = reqwest::header::HeaderMap::new();
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
-        if matches!(
-            name_str,
-            "host" | "content-length" | "transfer-encoding" | "connection"
-        ) {
+        if should_strip_request_header(name_str) {
             continue;
         }
         if let Ok(rname) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
@@ -441,15 +492,20 @@ fn maybe_spawn_extraction(
     query: Option<String>,
     text: String,
 ) {
-    // extract_and_store only does a queue file append (cheap I/O),
-    // so no concurrency limit needed here. Actual LLM extraction
-    // happens in the background worker which has its own rate limiting.
+    let permit = match Arc::clone(&state.extraction_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!("proxy extraction skipped: concurrency limit reached");
+            return;
+        }
+    };
     state
         .metrics
         .extraction_count
         .fetch_add(1, Ordering::Relaxed);
     let cfg = config.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         extract::extract_and_store(&cfg, query, text).await;
     });
 }
@@ -582,10 +638,7 @@ async fn forward_raw(
         &upstream_url,
     );
     for (name, value) in headers.iter() {
-        if !matches!(
-            name.as_str(),
-            "host" | "content-length" | "transfer-encoding" | "connection"
-        ) {
+        if !should_strip_request_header(name.as_str()) {
             if let Ok(v) = value.to_str() {
                 req = req.header(name.as_str(), v);
             }
@@ -599,7 +652,27 @@ async fn forward_raw(
         Ok(resp) => {
             let status = resp.status();
             let resp_headers = resp.headers().clone();
-            let resp_body = resp.bytes().await.unwrap_or_default();
+            // Cap response body to prevent unbounded memory allocation.
+            let max_raw = config.proxy.max_response_buffer;
+            let mut resp_bytes = Vec::new();
+            let mut stream = resp.bytes_stream();
+            use futures_util::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(c) => {
+                        resp_bytes.extend_from_slice(&c);
+                        if resp_bytes.len() > max_raw {
+                            tracing::warn!("forward_raw: response exceeded {max_raw} bytes, truncating");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("forward_raw upstream read error: {e}");
+                        return Ok(error_response(502, "upstream read failed"));
+                    }
+                }
+            }
+            let resp_body = Bytes::from(resp_bytes);
 
             let mut builder = hyper::Response::builder().status(status.as_u16());
             for (name, value) in resp_headers.iter() {
@@ -627,5 +700,315 @@ fn extract_query_for_recording(
         None
     } else {
         Some(query.to_string())
+    }
+}
+
+fn should_strip_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "x-rein-token"
+    )
+}
+
+async fn handle_websocket_proxy(
+    req: hyper::Request<hyper::body::Incoming>,
+    config: &ReinConfig,
+    path_and_query: &str,
+    headers: &hyper::HeaderMap,
+    provider: ProviderKind,
+) -> Result<hyper::Response<BoxBody>, hyper::Error> {
+    let client_key = match headers
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(key) if !key.trim().is_empty() => key.to_string(),
+        _ => return Ok(error_response(400, "missing sec-websocket-key")),
+    };
+
+    let upstream = match connect_upstream_websocket(config, provider, path_and_query, headers).await {
+        Ok(upstream) => upstream,
+        Err(e) => {
+            tracing::warn!("websocket upstream connect failed: {e}");
+            return Ok(error_response(502, "upstream websocket handshake failed"));
+        }
+    };
+
+    let accept = websocket_accept(&client_key);
+    let on_upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let mut upgraded = hyper_util::rt::TokioIo::new(upgraded);
+                let mut upstream_io = upstream.io;
+                if !upstream.buffered.is_empty() {
+                    let _ = upgraded.write_all(&upstream.buffered).await;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut *upstream_io).await;
+            }
+            Err(e) => tracing::warn!("client websocket upgrade failed: {e}"),
+        }
+    });
+
+    let mut builder = hyper::Response::builder()
+        .status(101)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-accept", accept);
+    if let Some(protocol) = upstream.protocol {
+        builder = builder.header("sec-websocket-protocol", protocol);
+    }
+    if let Some(extensions) = upstream.extensions {
+        builder = builder.header("sec-websocket-extensions", extensions);
+    }
+    Ok(build_response(builder, full_body(Bytes::new())))
+}
+
+struct UpstreamWebsocket {
+    io: BoxedIo,
+    protocol: Option<String>,
+    extensions: Option<String>,
+    buffered: Vec<u8>,
+}
+
+async fn connect_upstream_websocket(
+    config: &ReinConfig,
+    provider: ProviderKind,
+    path_and_query: &str,
+    headers: &hyper::HeaderMap,
+) -> anyhow::Result<UpstreamWebsocket> {
+    let upstream_base = provider.upstream_url(config);
+    let upstream_uri: hyper::Uri = upstream_base.parse()?;
+    let host = upstream_uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("upstream host missing"))?
+        .to_string();
+    let secure = matches!(upstream_uri.scheme_str(), Some("https" | "wss"));
+    let port = upstream_uri
+        .port_u16()
+        .unwrap_or(if secure { 443 } else { 80 });
+    let rewritten_path = provider.rewrite_path(path_and_query).into_owned();
+
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    let mut io: BoxedIo = if secure {
+        let connector = TokioTlsConnector::from(TlsConnector::new()?);
+        Box::new(connector.connect(&host, tcp).await?)
+    } else {
+        Box::new(tcp)
+    };
+
+    let host_header = if (secure && port == 443) || (!secure && port == 80) {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+
+    let mut request = format!(
+        "GET {rewritten_path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+    );
+    if let Some(key) = headers.get("sec-websocket-key").and_then(|v| v.to_str().ok()) {
+        request.push_str(&format!("Sec-WebSocket-Key: {key}\r\n"));
+    }
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if should_strip_ws_handshake_header(name_str) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            request.push_str(&format!("{name_str}: {v}\r\n"));
+        }
+    }
+    request.push_str("\r\n");
+    io.write_all(request.as_bytes()).await?;
+    io.flush().await?;
+
+    let (status, resp_headers, buffered) = read_http_response_head(&mut *io).await?;
+    if status != 101 {
+        let preview = String::from_utf8_lossy(&buffered);
+        anyhow::bail!(
+            "upstream websocket handshake returned status {status}; body={}",
+            preview.chars().take(500).collect::<String>()
+        );
+    }
+
+    Ok(UpstreamWebsocket {
+        io,
+        protocol: resp_headers.get("sec-websocket-protocol").cloned(),
+        extensions: resp_headers.get("sec-websocket-extensions").cloned(),
+        buffered,
+    })
+}
+
+async fn read_http_response_head(
+    io: &mut dyn AsyncIo,
+) -> anyhow::Result<(u16, std::collections::HashMap<String, String>, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let header_end = loop {
+        let n = io.read(&mut tmp).await?;
+        if n == 0 {
+            anyhow::bail!("upstream closed before websocket handshake completed");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(idx) = find_header_end(&buf) {
+            break idx;
+        }
+        if buf.len() > 64 * 1024 {
+            anyhow::bail!("upstream websocket handshake headers too large");
+        }
+    };
+
+    let head = std::str::from_utf8(&buf[..header_end])?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid upstream websocket status line"))?
+        .parse::<u16>()?;
+    let mut headers = std::collections::HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    Ok((status, headers, buf[header_end + 4..].to_vec()))
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn websocket_accept(key: &str) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    ctx.update(key.as_bytes());
+    ctx.update(WS_GUID.as_bytes());
+    BASE64_STANDARD.encode(ctx.finish())
+}
+
+fn is_websocket_upgrade(headers: &hyper::HeaderMap) -> bool {
+    let upgrade = headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    let connection = headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    upgrade.contains("websocket") && connection.contains("upgrade")
+}
+
+fn should_strip_ws_handshake_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "x-rein-token"
+    )
+}
+
+fn responses_scope_error(
+    provider: ProviderKind,
+    method: &hyper::Method,
+    headers: &hyper::HeaderMap,
+) -> Option<String> {
+    if provider != ProviderKind::OpenAiResponses {
+        return None;
+    }
+
+    let required_scope = if method == hyper::Method::GET {
+        "api.responses.read"
+    } else if method == hyper::Method::POST {
+        "api.responses.write"
+    } else {
+        return None;
+    };
+
+    let scopes = bearer_jwt_scopes(headers)?;
+    if scopes.iter().any(|scope| scope == required_scope) {
+        return None;
+    }
+
+    Some(format!(
+        "Codex proxy request blocked locally: bearer token is missing required scope '{required_scope}'. \
+This usually means ChatGPT login tokens are not compatible with OpenAI Responses API proxying."
+    ))
+}
+
+fn bearer_jwt_scopes(headers: &hyper::HeaderMap) -> Option<Vec<String>> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let token = auth.strip_prefix("Bearer ")?;
+    let payload = token.split('.').nth(1)?;
+    let decoded = BASE64_URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let json: Value = serde_json::from_slice(&decoded).ok()?;
+    let scopes = json.get("scp")?.as_array()?;
+    Some(
+        scopes
+            .iter()
+            .filter_map(|scope| scope.as_str().map(|s| s.to_string()))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_jwt_with_scopes(scopes: &[&str]) -> String {
+        let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(
+            serde_json::json!({ "scp": scopes }).to_string().as_bytes(),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn chatgpt_login_jwt_without_responses_scope_is_rejected() {
+        let token = fake_jwt_with_scopes(&["openid", "profile", "offline_access"]);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let msg = responses_scope_error(
+            ProviderKind::OpenAiResponses,
+            &hyper::Method::POST,
+            &headers,
+        )
+        .unwrap();
+        assert!(msg.contains("api.responses.write"));
+    }
+
+    #[test]
+    fn api_jwt_with_responses_scope_is_allowed() {
+        let token = fake_jwt_with_scopes(&["api.responses.read", "api.responses.write"]);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert!(responses_scope_error(
+            ProviderKind::OpenAiResponses,
+            &hyper::Method::POST,
+            &headers,
+        )
+        .is_none());
     }
 }

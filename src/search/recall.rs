@@ -72,6 +72,34 @@ pub fn recall_temporal(
     expand_override: Option<bool>,
     fast: bool,
 ) -> ReinResult<Vec<RecallResult>> {
+    recall_temporal_with_request_id(
+        store,
+        config,
+        query,
+        topic,
+        keyword,
+        limit,
+        time_from,
+        time_to,
+        expand_override,
+        fast,
+        None,
+    )
+}
+
+pub fn recall_temporal_with_request_id(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    query: &str,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    limit: usize,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+    expand_override: Option<bool>,
+    fast: bool,
+    request_id: Option<String>,
+) -> ReinResult<Vec<RecallResult>> {
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
 
@@ -739,7 +767,7 @@ pub fn recall_temporal(
 
     // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
     if config.adaptive.enabled {
-        let request_id = ulid::Ulid::new().to_string();
+        let request_id = request_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
         let episode_matches: Vec<serde_json::Value> = episode_ranked
             .iter()
             .take(5)
@@ -835,7 +863,7 @@ fn try_vector_search(
 
     // Level 2: Check embedding cache
     if let Ok(Some(cached)) = EmbedCache::get(store.conn(), query, &model) {
-        let results = vec_search_direct(store, &cached, topic, limit);
+        let results = vec_search_direct(store, &cached, topic, limit, Some(config));
         if !results.is_empty() {
             return results;
         }
@@ -861,7 +889,7 @@ fn try_vector_search(
     match embedding {
         Ok(emb) => {
             let _ = EmbedCache::put(store.conn(), query, &model, &emb);
-            vec_search_direct(store, &emb, topic, limit)
+            vec_search_direct(store, &emb, topic, limit, Some(config))
         }
         Err(e) => {
             tracing::warn!("embedding failed, falling back to FTS-only: {e}");
@@ -886,7 +914,7 @@ fn try_vector_search_batch(
     // Check cache for each query
     for (i, q) in queries.iter().enumerate() {
         if let Ok(Some(cached)) = EmbedCache::get(store.conn(), q, &model) {
-            for (id, score) in vec_search_direct(store, &cached, topic, limit) {
+            for (id, score) in vec_search_direct(store, &cached, topic, limit, Some(config)) {
                 let entry = merged.entry(id).or_insert(f32::MIN);
                 *entry = entry.max(score);
             }
@@ -914,7 +942,7 @@ fn try_vector_search_batch(
         Ok(embs) => {
             for (emb, (_, q)) in embs.iter().zip(uncached.iter()) {
                 let _ = EmbedCache::put(store.conn(), q, &model, emb);
-                for (id, score) in vec_search_direct(store, emb, topic, limit) {
+                for (id, score) in vec_search_direct(store, emb, topic, limit, Some(config)) {
                     let entry = merged.entry(id).or_insert(f32::MIN);
                     *entry = entry.max(score);
                 }
@@ -969,9 +997,20 @@ fn vec_search_direct(
     embedding: &[f32],
     topic: Option<&str>,
     limit: usize,
+    config: Option<&ReinConfig>,
 ) -> Vec<(String, f32)> {
     // Try HNSW first (O(log n) approximate nearest neighbor)
     let hnsw_path = store.db_path().with_extension("");
+    if crate::store::hnsw::HnswIndex::is_dirty(&hnsw_path) {
+        tracing::info!("hnsw index marked dirty, rebuilding before vector search");
+        if let Some(cfg) = config {
+            crate::search::warmup::populate_hnsw(store, cfg);
+        } else {
+            let mut fallback = crate::config::ReinConfig::load().unwrap_or_default();
+            fallback.embedding.dimensions = embedding.len();
+            crate::search::warmup::populate_hnsw(store, &fallback);
+        }
+    }
     if let Ok(index) = crate::store::hnsw::HnswIndex::open(&hnsw_path, embedding.len()) {
         if !index.is_empty() {
             if let Ok(results) = index.search(embedding, limit * 2) {
@@ -998,43 +1037,52 @@ fn try_tantivy_then_fts5(
     topic: Option<&str>,
     limit: usize,
 ) -> ReinResult<(Vec<Memory>, Vec<(String, f32)>)> {
+    let mut memories = Vec::new();
+    let mut ranked = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+
     let db_path = store.db_path();
     if db_path.to_str() != Some(":memory:") {
+        let dirty_path = crate::search::warmup::tantivy_dirty_path(db_path);
+        if dirty_path.exists() {
+            tracing::info!("tantivy index marked dirty, rebuilding before search");
+            crate::search::warmup::populate_tantivy(store);
+        }
         let tantivy_path = db_path.with_extension("tantivy");
         if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
             if let Ok(results) = tantivy.search(query, topic, limit) {
-                if !results.is_empty() {
-                    // Convert tantivy results to Memory objects
-                    let mut memories = Vec::new();
-                    let mut ranked = Vec::new();
-                    for (i, (id, score)) in results.into_iter().enumerate() {
-                        if let Ok(m) = store.get(&id) {
+                for (i, (id, score)) in results.into_iter().enumerate() {
+                    if let Ok(m) = store.get(&id) {
+                        let mem_id = m.id.clone();
+                        if seen_ids.insert(mem_id.clone()) {
                             // Preserve original score for CC fusion; use rank for RRF
                             // Score is Tantivy BM25 relevance (positive float)
                             ranked.push((
-                                m.id.clone(),
+                                mem_id,
                                 if score > 0.0 { score } else { -(i as f32) },
                             ));
                             memories.push(m);
                         }
-                    }
-                    if !memories.is_empty() {
-                        tracing::debug!(hits = memories.len(), "tantivy search");
-                        return Ok((memories, ranked));
                     }
                 }
             }
         }
     }
 
-    // Fall back to FTS5
+    // Always run FTS5 too. It complements Tantivy when side-index updates were skipped
+    // or when the Tantivy index is stale.
     let fts_results = store.search_fts(query, topic, limit)?;
-    let fts_ranked: Vec<(String, f32)> = fts_results
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.id.clone(), -(i as f32)))
-        .collect();
-    Ok((fts_results, fts_ranked))
+    for (i, m) in fts_results.into_iter().enumerate() {
+        if seen_ids.insert(m.id.clone()) {
+            ranked.push((m.id.clone(), -(i as f32)));
+            memories.push(m);
+        }
+    }
+
+    if !memories.is_empty() {
+        tracing::debug!(hits = memories.len(), "tantivy+fts search");
+    }
+    Ok((memories, ranked))
 }
 
 /// Jaccard similarity for query dedup.

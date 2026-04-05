@@ -240,14 +240,16 @@ pub struct LearnedAlphaEntry {
 impl AdaptiveState {
     /// Build bucket key from query_type and optional cluster_id.
     pub fn bucket_key(query_type: &str, cluster_id: Option<u32>) -> String {
+        let query_type = query_type.to_lowercase();
         match cluster_id {
             Some(c) => format!("{query_type}:{c}"),
-            None => query_type.to_string(),
+            None => query_type,
         }
     }
 
     /// Get learned alpha for a query type and optional cluster, with fallback chain.
     pub fn get_alpha(&self, query_type: &str, cluster_id: Option<u32>) -> Option<f32> {
+        let legacy_key = query_type.to_string();
         // Try specific bucket first
         if let Some(cluster) = cluster_id {
             let key = Self::bucket_key(query_type, Some(cluster));
@@ -256,10 +258,26 @@ impl AdaptiveState {
                     return Some(entry.value as f32);
                 }
             }
+            let legacy_cluster_key = format!("{legacy_key}:{cluster}");
+            if let Some(entry) = self.learned_alpha.get(&legacy_cluster_key) {
+                if entry.sample_count >= 10 {
+                    return Some(entry.value as f32);
+                }
+            }
         }
         // Fall back to query-type level
         let key = Self::bucket_key(query_type, None);
         if let Some(entry) = self.learned_alpha.get(&key) {
+            if entry.sample_count >= 10 {
+                return Some(entry.value as f32);
+            }
+        }
+        if let Some(entry) = self.learned_alpha.get(&legacy_key) {
+            if entry.sample_count >= 10 {
+                return Some(entry.value as f32);
+            }
+        }
+        if let Some(entry) = self.learned_alpha.get("global") {
             if entry.sample_count >= 10 {
                 return Some(entry.value as f32);
             }
@@ -447,6 +465,24 @@ mod tests {
         // Give cluster enough samples
         state.learned_alpha.get_mut("semantic:1").unwrap().sample_count = 12;
         let alpha = state.get_alpha("semantic", Some(1)).unwrap();
+        assert!((alpha - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_alpha_global_and_legacy_key_fallback() {
+        let mut state = AdaptiveState::default();
+        state.learned_alpha.insert(
+            "global".into(),
+            LearnedAlphaEntry { value: 0.55, sample_count: 20, last_updated: String::new() },
+        );
+        let alpha = state.get_alpha("temporal", None).unwrap();
+        assert!((alpha - 0.55).abs() < 0.01);
+
+        state.learned_alpha.insert(
+            "Temporal".into(),
+            LearnedAlphaEntry { value: 0.8, sample_count: 20, last_updated: String::new() },
+        );
+        let alpha = state.get_alpha("Temporal", None).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
     }
 

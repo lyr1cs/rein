@@ -241,6 +241,97 @@ auto_memory_enabled = false
     );
 }
 
+#[test]
+fn test_ingest_session_redacts_artifact_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ingest-redact.db");
+    let toml_str = format!(
+        r#"
+[database]
+path = "{}"
+
+[extract]
+provider = "none"
+
+[sync]
+supermemory_enabled = false
+auto_memory_enabled = false
+"#,
+        db_path.display()
+    );
+    let config = rein::config::ReinConfig::load_from_str(&toml_str).unwrap();
+
+    let transcript = "User: token=super-secret-value\nAssistant: Deploy completed.";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _ = rt
+        .block_on(rein::ops::ingest_session_text_report(
+            &config,
+            transcript,
+            Some("test-ingest"),
+            false,
+        ))
+        .unwrap();
+
+    let store = config.open_store().unwrap();
+    let artifact_text: String = store
+        .conn()
+        .query_row(
+            "SELECT transcript_text FROM session_artifacts ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!artifact_text.contains("super-secret-value"));
+    assert!(artifact_text.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_recall_uses_supplied_request_id_for_feedback_event() {
+    let store = SqliteStore::in_memory().unwrap();
+    let memory = make_memory(
+        "debug",
+        "pool fix",
+        "Fixed connection pool saturation by lowering max concurrency",
+        Importance::High,
+    );
+    store.store(memory).unwrap();
+
+    let mut config = rein::config::ReinConfig::default();
+    config.sync.supermemory_enabled = false;
+    config.sync.auto_memory_enabled = false;
+    config.search.llm_reranker = "none".to_string();
+
+    let request_id = "req-test-123".to_string();
+    let results = rein::search::recall::recall_temporal_with_request_id(
+        &store,
+        &config,
+        "connection pool",
+        None,
+        None,
+        5,
+        None,
+        None,
+        Some(false),
+        true,
+        Some(request_id.clone()),
+    )
+    .unwrap();
+    assert!(!results.is_empty());
+
+    let logged_request_id: String = store
+        .conn()
+        .query_row(
+            "SELECT request_id FROM feedback_events WHERE event_type = 'recall_complete' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(logged_request_id, request_id);
+}
+
 /// Store a memory with an embedding vector, verify it can be found via
 /// vector search even when FTS returns nothing useful.
 #[test]

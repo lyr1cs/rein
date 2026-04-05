@@ -50,6 +50,7 @@ compact = false
 sse_enabled = false
 sse_port = 8680
 sse_bind = "127.0.0.1"    # use 0.0.0.0 for Tailscale/LAN access
+allow_unauthenticated_loopback = false # set true only for explicit local-only dev use
 
 [hooks]
 min_turns = 20
@@ -118,6 +119,8 @@ openai_upstream = "https://api.openai.com"
 extract_enabled = true     # extract memories from assistant responses
 store_min_chars = 220      # don't run proxy extraction on short assistant replies
 store_min_score = 3        # pattern score required before proxy extraction runs
+max_request_body = 1048576 # reject oversized client requests before forwarding
+allow_unauthenticated_loopback = false # set true only for explicit local-only dev use
 
 [async_memory]
 provider = "inherit"       # inherit [extract].provider; can be "google", "omlx", or "none"
