@@ -19,11 +19,7 @@ pub async fn extract_and_store(
         return;
     }
 
-    if !super::policy::should_extract_response(
-        config,
-        source_query.as_deref(),
-        &assistant_text,
-    ) {
+    if !super::policy::should_extract_response(config, source_query.as_deref(), &assistant_text) {
         return;
     }
 

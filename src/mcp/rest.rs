@@ -96,10 +96,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(byte);
                 i += 3;
                 continue;
@@ -145,7 +144,9 @@ async fn handle_api(
         (&Method::GET, "/api/recent") => api_recent(config, &query),
         (&Method::GET, "/api/adaptive") => api_adaptive(config),
         (&Method::GET, "/api/health") => api_health(config, &query),
-        (&Method::GET, p) if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" => {
+        (&Method::GET, p)
+            if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" =>
+        {
             api_recall(config, &query)
         }
         (&Method::GET, p) if p.starts_with("/api/memories/") => {
@@ -212,21 +213,27 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     match store.stats() {
-        Ok(stats) => json_response(StatusCode::OK, json!({
-            "total_memories": stats.total_memories,
-            "ltm_count": stats.ltm_count,
-            "stm_count": stats.stm_count,
-            "topic_count": stats.topic_count,
-            "avg_strength": stats.avg_strength,
-            "memoir_count": stats.memoir_count,
-            "concept_count": stats.concept_count,
-            "link_count": stats.link_count,
-        })),
+        Ok(stats) => json_response(
+            StatusCode::OK,
+            json!({
+                "total_memories": stats.total_memories,
+                "ltm_count": stats.ltm_count,
+                "stm_count": stats.stm_count,
+                "topic_count": stats.topic_count,
+                "avg_strength": stats.avg_strength,
+                "memoir_count": stats.memoir_count,
+                "concept_count": stats.concept_count,
+                "link_count": stats.link_count,
+            }),
+        ),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
-fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_activity(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let days = match parse_bounded_i64(query, "days", 14, 1, 90) {
         Ok(days) => days,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
@@ -234,7 +241,9 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
     let granularity = match query.get("granularity").map(|s| s.as_str()) {
         Some("hour") => "hour",
         Some("day") | None => "day",
-        Some(_) => return error_response(StatusCode::BAD_REQUEST, "invalid 'granularity' parameter"),
+        Some(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid 'granularity' parameter")
+        }
     };
     let store = match config.open_store() {
         Ok(s) => s,
@@ -268,7 +277,9 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let recall_rows: Vec<(String, i64)> = recall_stmt
-        .query_map(rusqlite::params![offset], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map(rusqlite::params![offset], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .ok()
         .map(|r| r.filter_map(|x| x.ok()).collect())
         .unwrap_or_default();
@@ -278,13 +289,16 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let store_rows: Vec<(String, i64)> = store_stmt
-        .query_map(rusqlite::params![offset], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map(rusqlite::params![offset], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .ok()
         .map(|r| r.filter_map(|x| x.ok()).collect())
         .unwrap_or_default();
 
     // Merge into unified series
-    let mut bucket_map: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    let mut bucket_map: std::collections::BTreeMap<String, (i64, i64)> =
+        std::collections::BTreeMap::new();
     for (bucket, count) in &recall_rows {
         bucket_map.entry(bucket.clone()).or_default().0 = *count;
     }
@@ -296,7 +310,10 @@ fn api_activity(config: &ReinConfig, query: &std::collections::HashMap<String, S
         json!({ "date": date, "recalls": recalls, "stores": stores })
     }).collect();
 
-    json_response(StatusCode::OK, json!({ "activity": activity, "granularity": granularity }))
+    json_response(
+        StatusCode::OK,
+        json!({ "activity": activity, "granularity": granularity }),
+    )
 }
 
 fn api_topics(config: &ReinConfig) -> BoxedResponse {
@@ -310,7 +327,10 @@ fn api_topics(config: &ReinConfig) -> BoxedResponse {
     }
 }
 
-fn api_recent(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_recent(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
         Ok(limit) => limit,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
@@ -336,7 +356,10 @@ fn api_adaptive(config: &ReinConfig) -> BoxedResponse {
     json_response(StatusCode::OK, crate::ops::adaptive_status(&store))
 }
 
-fn api_health(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_health(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let topic = query.get("topic").map(|s| s.as_str());
     let store = match config.open_store() {
         Ok(s) => s,
@@ -351,7 +374,10 @@ fn api_health(config: &ReinConfig, query: &std::collections::HashMap<String, Str
     }
 }
 
-fn api_recall(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_recall(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let q = match query.get("q") {
         Some(q) if !q.is_empty() => q.clone(),
         _ => return error_response(StatusCode::BAD_REQUEST, "missing 'q' query parameter"),
@@ -386,7 +412,10 @@ fn api_recall(config: &ReinConfig, query: &std::collections::HashMap<String, Str
                     m
                 })
                 .collect();
-            json_response(StatusCode::OK, json!({ "results": items, "count": items.len() }))
+            json_response(
+                StatusCode::OK,
+                json!({ "results": items, "count": items.len() }),
+            )
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -469,33 +498,46 @@ fn api_memoir_export(config: &ReinConfig, name: &str, format: &str) -> BoxedResp
                     .status(200)
                     .header("content-type", "text/plain")
                     .body(body)
-                    .unwrap_or_else(|_| Response::new(
-                        Full::new(Bytes::new())
-                            .map_err(|never: std::convert::Infallible| match never {})
-                            .boxed(),
-                    ))
+                    .unwrap_or_else(|_| {
+                        Response::new(
+                            Full::new(Bytes::new())
+                                .map_err(|never: std::convert::Infallible| match never {})
+                                .boxed(),
+                        )
+                    })
             }
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
-fn api_memoir_inspect(config: &ReinConfig, memoir: &str, concept: &str, depth: usize) -> BoxedResponse {
+fn api_memoir_inspect(
+    config: &ReinConfig,
+    memoir: &str,
+    concept: &str,
+    depth: usize,
+) -> BoxedResponse {
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     match store.inspect_concept(memoir, concept, depth) {
-        Ok((center, neighbors, links)) => json_response(StatusCode::OK, json!({
-            "center": center,
-            "neighbors": neighbors,
-            "links": links,
-        })),
+        Ok((center, neighbors, links)) => json_response(
+            StatusCode::OK,
+            json!({
+                "center": center,
+                "neighbors": neighbors,
+                "links": links,
+            }),
+        ),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
-fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_timeline(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let limit = match parse_bounded_usize(query, "limit", 50, 1, 200) {
         Ok(limit) => limit,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
@@ -511,10 +553,17 @@ fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, S
     // Collect episodes in window
     let episodes = match (from, to) {
         (Some(f), Some(t)) => store.get_episodes_in_range(f, t).unwrap_or_default(),
-        (Some(f), None) => store.get_episodes_in_range(f, chrono::Utc::now() + chrono::Duration::days(1)).unwrap_or_default(),
-        (None, Some(t)) => store.get_episodes_in_range(
-            chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z").unwrap().with_timezone(&chrono::Utc), t
-        ).unwrap_or_default(),
+        (Some(f), None) => store
+            .get_episodes_in_range(f, chrono::Utc::now() + chrono::Duration::days(1))
+            .unwrap_or_default(),
+        (None, Some(t)) => store
+            .get_episodes_in_range(
+                chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                t,
+            )
+            .unwrap_or_default(),
         (None, None) => store.list_episodes(limit).unwrap_or_default(),
     };
 
@@ -582,7 +631,10 @@ fn api_timeline(config: &ReinConfig, query: &std::collections::HashMap<String, S
     json_response(StatusCode::OK, json!({ "events": events }))
 }
 
-fn api_episodes(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_episodes(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
         Ok(limit) => limit,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
@@ -597,7 +649,10 @@ fn api_episodes(config: &ReinConfig, query: &std::collections::HashMap<String, S
     }
 }
 
-fn api_artifacts(config: &ReinConfig, query: &std::collections::HashMap<String, String>) -> BoxedResponse {
+fn api_artifacts(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
     let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
         Ok(limit) => limit,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
@@ -647,8 +702,10 @@ fn api_artifact_detail(
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let include_transcript =
-        matches!(query.get("include_transcript").map(|v| v.as_str()), Some("true"));
+    let include_transcript = matches!(
+        query.get("include_transcript").map(|v| v.as_str()),
+        Some("true")
+    );
     let sql = "SELECT id, schema_version, artifact_kind, session_id, title, summary, \
                source_agent, source_label, is_subagent, started_at, ended_at, \
                turn_count, transcript_text, transcript_json, episode_id, created_at \
@@ -751,7 +808,11 @@ struct GuiAssets;
 fn serve_gui(#[allow(unused)] path: &str) -> BoxedResponse {
     #[cfg(feature = "gui")]
     {
-        let file_path = if path == "/" { "index.html" } else { &path[1..] };
+        let file_path = if path == "/" {
+            "index.html"
+        } else {
+            &path[1..]
+        };
         if let Some(content) = GuiAssets::get(file_path) {
             let mime = mime_from_path(file_path);
             return Response::builder()
@@ -762,7 +823,12 @@ fn serve_gui(#[allow(unused)] path: &str) -> BoxedResponse {
                         .map_err(|never: std::convert::Infallible| match never {})
                         .boxed(),
                 )
-                .unwrap_or_else(|_| json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "build response failed"})));
+                .unwrap_or_else(|_| {
+                    json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": "build response failed"}),
+                    )
+                });
         }
         // SPA fallback: serve index.html for client-side routing
         if let Some(index) = GuiAssets::get("index.html") {
@@ -774,22 +840,41 @@ fn serve_gui(#[allow(unused)] path: &str) -> BoxedResponse {
                         .map_err(|never: std::convert::Infallible| match never {})
                         .boxed(),
                 )
-                .unwrap_or_else(|_| json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "build response failed"})));
+                .unwrap_or_else(|_| {
+                    json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": "build response failed"}),
+                    )
+                });
         }
     }
-    error_response(StatusCode::NOT_FOUND, "GUI not available (build with --features gui)")
+    error_response(
+        StatusCode::NOT_FOUND,
+        "GUI not available (build with --features gui)",
+    )
 }
 
 #[cfg(feature = "gui")]
 fn mime_from_path(path: &str) -> &'static str {
-    if path.ends_with(".html") { "text/html" }
-    else if path.ends_with(".js") { "application/javascript" }
-    else if path.ends_with(".css") { "text/css" }
-    else if path.ends_with(".json") { "application/json" }
-    else if path.ends_with(".svg") { "image/svg+xml" }
-    else if path.ends_with(".png") { "image/png" }
-    else if path.ends_with(".ico") { "image/x-icon" }
-    else if path.ends_with(".woff2") { "font/woff2" }
-    else if path.ends_with(".woff") { "font/woff" }
-    else { "application/octet-stream" }
+    if path.ends_with(".html") {
+        "text/html"
+    } else if path.ends_with(".js") {
+        "application/javascript"
+    } else if path.ends_with(".css") {
+        "text/css"
+    } else if path.ends_with(".json") {
+        "application/json"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".ico") {
+        "image/x-icon"
+    } else if path.ends_with(".woff2") {
+        "font/woff2"
+    } else if path.ends_with(".woff") {
+        "font/woff"
+    } else {
+        "application/octet-stream"
+    }
 }

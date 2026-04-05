@@ -51,7 +51,8 @@ pub fn cross_validate(
 
     // Add unique results from supermemory not in local.
     // Score them LOWER than local results so they supplement, not replace.
-    let local_min_score = local_results.iter()
+    let local_min_score = local_results
+        .iter()
         .map(|(_, s)| *s)
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0.0);
@@ -133,6 +134,12 @@ mod tests {
             decay_lambda: 0.0,
             access_count: 0,
             superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
             related_ids: vec![],
             concept_ids: vec![],
             status: MemoryStatus::default(),
@@ -174,7 +181,10 @@ mod tests {
 
     #[test]
     fn test_confidence_one_source() {
-        let local = vec![(make_memory("local-1", "unique local content only here"), 0.5)];
+        let local = vec![(
+            make_memory("local-1", "unique local content only here"),
+            0.5,
+        )];
         let supermemory: Vec<Memory> = vec![];
         let auto: Vec<Memory> = vec![];
 
@@ -188,7 +198,10 @@ mod tests {
     fn test_no_match_across_sources() {
         // Completely different content in each source -> each gets 0.62
         // External-only results should have lower score than local
-        let local = vec![(make_memory("local-1", "alpha beta gamma delta epsilon"), 0.5)];
+        let local = vec![(
+            make_memory("local-1", "alpha beta gamma delta epsilon"),
+            0.5,
+        )];
         let supermemory = vec![make_memory("sm-1", "one two three four five six")];
         let auto = vec![make_memory("auto-1", "rouge bleu vert jaune orange")];
 
@@ -199,7 +212,13 @@ mod tests {
             assert_eq!(r.sources_hit, 1);
         }
         // Local result should have higher score than external results
-        assert!(results[0].score > results[1].score, "local should rank above supermemory");
-        assert!(results[0].score > results[2].score, "local should rank above auto-memory");
+        assert!(
+            results[0].score > results[1].score,
+            "local should rank above supermemory"
+        );
+        assert!(
+            results[0].score > results[2].score,
+            "local should rank above auto-memory"
+        );
     }
 }

@@ -48,7 +48,11 @@ pub fn apply_strength_weighting(rrf_score: f32, memory: &Memory) -> f32 {
 }
 
 /// Apply strength weighting with optional per-cluster survival curve.
-pub fn apply_strength_weighting_with_curve(rrf_score: f32, memory: &Memory, curve: Option<&SurvivalCurve>) -> f32 {
+pub fn apply_strength_weighting_with_curve(
+    rrf_score: f32,
+    memory: &Memory,
+    curve: Option<&SurvivalCurve>,
+) -> f32 {
     let strength = calculate_strength_with_curve(memory, curve);
     let recency = recency_boost(memory);
     rrf_score * strength as f32 * (1.0 + memory.access_count as f32 * 0.2) * recency
@@ -60,7 +64,12 @@ mod tests {
     use crate::types::*;
     use chrono::{Duration, Utc};
 
-    fn make_memory(importance: Importance, layer: MemoryLayer, days_ago: i64, access_count: u32) -> Memory {
+    fn make_memory(
+        importance: Importance,
+        layer: MemoryLayer,
+        days_ago: i64,
+        access_count: u32,
+    ) -> Memory {
         Memory {
             id: "test".to_string(),
             layer,
@@ -74,6 +83,12 @@ mod tests {
             decay_lambda: 0.06 * importance.decay_factor(),
             access_count,
             superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
             related_ids: vec![],
             concept_ids: vec![],
             status: MemoryStatus::default(),
@@ -90,14 +105,22 @@ mod tests {
     fn test_critical_no_decay() {
         let mem = make_memory(Importance::Critical, MemoryLayer::LTM, 365, 0);
         let strength = calculate_strength(&mem);
-        assert!((strength - 1.0).abs() < 1e-6, "Critical should always be 1.0, got {}", strength);
+        assert!(
+            (strength - 1.0).abs() < 1e-6,
+            "Critical should always be 1.0, got {}",
+            strength
+        );
     }
 
     #[test]
     fn test_low_fast_decay() {
         let mem = make_memory(Importance::Low, MemoryLayer::STM, 90, 0);
         let strength = calculate_strength(&mem);
-        assert!(strength < 0.1, "Low STM after 90 days should be very low, got {}", strength);
+        assert!(
+            strength < 0.1,
+            "Low STM after 90 days should be very low, got {}",
+            strength
+        );
     }
 
     #[test]

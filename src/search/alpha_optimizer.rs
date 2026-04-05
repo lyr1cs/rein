@@ -84,7 +84,11 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
         let mut mrr_sum = 0.0_f64;
         for (rank_0, &(_score, idx)) in scored.iter().enumerate() {
             let rank = rank_0 + 1;
-            if event.accessed_ids.iter().any(|id| *id == event.candidates[idx].memory_id) {
+            if event
+                .accessed_ids
+                .iter()
+                .any(|id| *id == event.candidates[idx].memory_id)
+            {
                 mrr_sum += 1.0 / rank as f64;
             }
         }
@@ -335,17 +339,9 @@ mod tests {
     #[test]
     fn test_time_weighted_mean_favours_recent() {
         // Old event: BM25 dominant → high alpha.
-        let old = make_event(
-            &[("t", 1.0, 0.0), ("n", 0.0, 1.0)],
-            &["t"],
-            365,
-        );
+        let old = make_event(&[("t", 1.0, 0.0), ("n", 0.0, 1.0)], &["t"], 365);
         // Recent event: vector dominant → low alpha.
-        let recent = make_event(
-            &[("t", 0.0, 1.0), ("n", 1.0, 0.0)],
-            &["t"],
-            0,
-        );
+        let recent = make_event(&[("t", 0.0, 1.0), ("n", 1.0, 0.0)], &["t"], 0);
 
         // With strong decay (lambda=0.1), the year-old event should be
         // heavily down-weighted, so the result is closer to the recent event's
@@ -361,11 +357,7 @@ mod tests {
 
     #[test]
     fn test_optimize_alpha_single_event() {
-        let event = make_event(
-            &[("t", 1.0, 0.0), ("n", 0.0, 1.0)],
-            &["t"],
-            0,
-        );
+        let event = make_event(&[("t", 1.0, 0.0), ("n", 0.0, 1.0)], &["t"], 0);
         let learned = optimize_alpha(&[event], 0.01).unwrap();
         assert!(learned.value >= 0.5);
         assert_eq!(learned.sample_count, 1);

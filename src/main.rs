@@ -92,14 +92,56 @@ enum Commands {
     Health { topic: Option<String> },
     /// Consolidate a topic into a single memory
     Consolidate {
-        topic: String,
+        /// Single topic to consolidate (legacy mode)
+        topic: Option<String>,
         #[arg(short, long)]
-        summary: String,
+        summary: Option<String>,
+        /// Comma-separated topic list
+        #[arg(long, value_delimiter = ',')]
+        topics: Option<Vec<String>>,
+        /// Glob pattern for topics, e.g. "rmcp*"
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Consolidate all topics
+        #[arg(long)]
+        all: bool,
+        /// Group case/space/hyphen variants before consolidating
+        #[arg(long)]
+        merge_variants: bool,
+        /// Preview matched groups without writing changes
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Scan for duplicates
     Dedup {
         #[arg(long)]
         dry_run: bool,
+        /// Deduplicate across normalized topic variants instead of only exact topics
+        #[arg(long)]
+        merge_variants: bool,
+    },
+    /// One-click cleanup: consolidate fragmented topics, deduplicate, refresh adaptive state
+    Cleanup {
+        /// Optional single topic to clean
+        topic: Option<String>,
+        /// Optional comma-separated topic list to clean
+        #[arg(long, value_delimiter = ',')]
+        topics: Option<Vec<String>>,
+        /// Optional glob pattern for matching topics
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Force processing all topics (default when no selector is provided)
+        #[arg(long)]
+        all: bool,
+        /// Disable topic-variant grouping; use exact topic boundaries only
+        #[arg(long)]
+        exact_topics: bool,
+        /// Preview matched groups without writing changes
+        #[arg(long)]
+        dry_run: bool,
+        /// Spawn cleanup in a detached background worker process
+        #[arg(long)]
+        asynchronous: bool,
     },
     /// Migrate from QMD
     Migrate {
@@ -120,6 +162,24 @@ enum Commands {
     /// Show most recently created memories
     Recent {
         #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Show canonical memories (one row per canonical)
+    Canonicals {
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show evidence snapshots for a canonical memory
+    Evidence {
+        canonical_id: String,
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show recent dedup decisions
+    DedupLog {
+        #[arg(long)]
+        canonical: Option<String>,
+        #[arg(short, long, default_value = "20")]
         limit: usize,
     },
     /// Garbage collect weak/stale STM memories below strength threshold
@@ -204,6 +264,24 @@ enum HookAction {
 enum WorkerAction {
     /// Drain the async memory queue for the current project
     Memory,
+    /// Drain queued store-time dedup jobs for the current project
+    DedupQueue,
+    /// Run a detached cleanup pass in the current project
+    Cleanup {
+        topic: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        topics: Option<Vec<String>>,
+        #[arg(long)]
+        pattern: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        exact_topics: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Drain queued cleanup jobs for the current project
+    CleanupQueue,
 }
 
 #[tokio::main]
@@ -523,6 +601,7 @@ async fn main() -> anyhow::Result<()> {
             for t in &topics {
                 all_memories.extend(store.get_by_topic(t)?);
             }
+            all_memories = store.collapse_to_canonicals(all_memories, usize::MAX)?;
             all_memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
             let content = match format.as_str() {
@@ -618,6 +697,54 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("rein worker: processed {processed} memory jobs");
                 }
             }
+            WorkerAction::DedupQueue => {
+                let processed = extract::hooks::queue::drain_dedup_queue(&config).await?;
+                if processed > 0 {
+                    eprintln!("rein worker: processed {processed} dedup jobs");
+                }
+            }
+            WorkerAction::CleanupQueue => {
+                let processed = extract::hooks::queue::drain_cleanup_queue(&config).await?;
+                if processed > 0 {
+                    eprintln!("rein worker: processed {processed} cleanup jobs");
+                }
+            }
+            WorkerAction::Cleanup {
+                topic,
+                topics,
+                pattern,
+                all,
+                exact_topics,
+                dry_run,
+            } => {
+                let selected_topics = topics.unwrap_or_default();
+                let scope_all =
+                    all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
+                let store = config.open_store()?;
+                let merge_variants = !exact_topics;
+                let groups = ops::resolve_topic_groups(
+                    &store,
+                    topic.as_deref(),
+                    &selected_topics,
+                    pattern.as_deref(),
+                    scope_all,
+                    merge_variants,
+                )?;
+                if groups.is_empty() {
+                    eprintln!("rein worker: no topics matched the selected scope");
+                } else {
+                    let report =
+                        ops::run_cleanup_async(&store, &config, &groups, merge_variants, dry_run)
+                            .await?;
+                    eprintln!(
+                        "rein worker: cleanup finished; groups={}, memories={}, dedup_removed={}/{}",
+                        report.consolidation.groups_processed,
+                        report.consolidation.memories_replaced,
+                        report.duplicates_merged,
+                        report.duplicates_found
+                    );
+                }
+            }
         },
         None => {
             println!("rein v{}", env!("CARGO_PKG_VERSION"));
@@ -653,24 +780,209 @@ async fn main() -> anyhow::Result<()> {
                 rein::init::proxy_configure(dry_run)?;
             }
         }
-        Some(Commands::Consolidate { topic, summary }) => {
+        Some(Commands::Consolidate {
+            topic,
+            summary,
+            topics,
+            pattern,
+            all,
+            merge_variants,
+            dry_run,
+        }) => {
             let store = config.open_store()?;
-            let consolidated = ops::build_consolidated(&config, topic.clone(), summary, vec![]);
-            let old = store.consolidate_atomic(&topic, consolidated)?;
-            if old.is_empty() {
-                println!("No memories found in topic '{topic}'");
+            let selected_topics = topics.unwrap_or_default();
+            let groups = ops::resolve_topic_groups(
+                &store,
+                topic.as_deref(),
+                &selected_topics,
+                pattern.as_deref(),
+                all,
+                merge_variants,
+            )?;
+
+            if groups.is_empty() {
+                if let Some(topic) = topic {
+                    println!("No memories found in topic '{topic}'");
+                } else if let Some(pattern) = pattern {
+                    println!("No topics matched pattern '{pattern}'");
+                } else {
+                    println!("No topics matched the selected scope");
+                }
             } else {
-                println!("Consolidated {} memories in topic '{topic}'", old.len());
+                let report = ops::run_consolidation_async(
+                    &store,
+                    &config,
+                    &groups,
+                    summary.as_deref(),
+                    dry_run,
+                )
+                .await?;
+
+                if dry_run {
+                    println!(
+                        "Dry run: {} groups, {} memories would be consolidated",
+                        report.groups_processed, report.memories_replaced
+                    );
+                } else {
+                    println!(
+                        "Consolidated {} groups ({} memories)",
+                        report.groups_processed, report.memories_replaced
+                    );
+                }
+
+                for group in report.groups.iter().filter(|group| group.memory_count > 0) {
+                    let sources = if group.source_topics.len() > 1 {
+                        format!(" <= {}", group.source_topics.join(", "))
+                    } else {
+                        String::new()
+                    };
+                    if dry_run {
+                        println!(
+                            "- {}{} [{} memories]",
+                            group.canonical_topic, sources, group.memory_count
+                        );
+                    } else if let Some(created_id) = &group.created_id {
+                        println!(
+                            "- {}{} [{} memories] -> {}",
+                            group.canonical_topic, sources, group.memory_count, created_id
+                        );
+                    }
+                }
             }
         }
-        Some(Commands::Dedup { dry_run }) => {
+        Some(Commands::Dedup {
+            dry_run,
+            merge_variants,
+        }) => {
             let store = config.open_store()?;
             let threshold = config.search.dedup_similarity as f32;
-            let (dups_found, dups_removed) = ops::run_dedup(&store, threshold, dry_run)?;
+            let (dups_found, dups_removed) =
+                ops::run_dedup(&store, &config, threshold, dry_run, merge_variants)?;
             if dry_run {
                 println!("Found {dups_found} duplicates (dry-run, nothing removed)");
             } else {
                 println!("Removed {dups_removed} of {dups_found} duplicates");
+            }
+        }
+        Some(Commands::Cleanup {
+            topic,
+            topics,
+            pattern,
+            all,
+            exact_topics,
+            dry_run,
+            asynchronous,
+        }) => {
+            let selected_topics = topics.unwrap_or_default();
+            let scope_all =
+                all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
+            if asynchronous {
+                let job_id = extract::hooks::queue::queue_cleanup_job(
+                    &config,
+                    topic.clone(),
+                    selected_topics,
+                    pattern.clone(),
+                    scope_all,
+                    exact_topics,
+                    dry_run,
+                )?;
+                extract::hooks::queue::spawn_cleanup_worker(&config);
+                println!("Queued cleanup job {job_id}");
+            } else {
+                let store = config.open_store()?;
+                let merge_variants = !exact_topics;
+                let groups = ops::resolve_topic_groups(
+                    &store,
+                    topic.as_deref(),
+                    &selected_topics,
+                    pattern.as_deref(),
+                    scope_all,
+                    merge_variants,
+                )?;
+                if groups.is_empty() {
+                    if let Some(topic) = topic {
+                        println!("No memories found in topic '{topic}'");
+                    } else if let Some(pattern) = pattern {
+                        println!("No topics matched pattern '{pattern}'");
+                    } else {
+                        println!("No topics matched the selected scope");
+                    }
+                } else {
+                    let report =
+                        ops::run_cleanup_async(&store, &config, &groups, merge_variants, dry_run)
+                            .await?;
+                    if dry_run {
+                        println!(
+                            "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
+                            report.consolidation.groups_processed,
+                            report.consolidation.memories_replaced,
+                            report.duplicates_found
+                        );
+                    } else {
+                        println!(
+                            "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
+                            report.consolidation.groups_processed,
+                            report.consolidation.memories_replaced,
+                            report.duplicates_merged,
+                            report.duplicates_found
+                        );
+                    }
+                }
+            }
+        }
+        Some(Commands::Canonicals { limit }) => {
+            let store = config.open_store()?;
+            let canonicals = store.list_canonical_memories(limit)?;
+            if canonicals.is_empty() {
+                println!("No canonical memories found");
+            } else {
+                for memory in canonicals {
+                    println!(
+                        "- {} [{}] support={} merges={} diversity={:.2} dedup_conf={:.2}",
+                        memory.id,
+                        memory.summary,
+                        memory.support_count,
+                        memory.merge_count,
+                        memory.source_diversity,
+                        memory.dedup_confidence,
+                    );
+                }
+            }
+        }
+        Some(Commands::Evidence {
+            canonical_id,
+            limit,
+        }) => {
+            let store = config.open_store()?;
+            let evidence = store.list_memory_evidence(&canonical_id, limit)?;
+            if evidence.is_empty() {
+                println!("No evidence found for canonical '{canonical_id}'");
+            } else {
+                for item in evidence {
+                    println!(
+                        "- {} [{}] {}\n{}",
+                        item.id, item.source_topic, item.summary, item.content
+                    );
+                }
+            }
+        }
+        Some(Commands::DedupLog { canonical, limit }) => {
+            let store = config.open_store()?;
+            let decisions = store.list_dedup_decisions(canonical.as_deref(), limit)?;
+            if decisions.is_empty() {
+                println!("No dedup decisions found");
+            } else {
+                for decision in decisions {
+                    println!(
+                        "- {} relation={} confidence={:.2} winner={:?} loser={:?} reason={}",
+                        decision.id,
+                        decision.relation,
+                        decision.confidence,
+                        decision.winner_id,
+                        decision.loser_id,
+                        decision.reason
+                    );
+                }
             }
         }
         Some(Commands::Dashboard) => {

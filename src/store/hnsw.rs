@@ -27,8 +27,7 @@ impl HnswIndex {
             ..Default::default()
         };
 
-        let index = Index::new(&opts)
-            .map_err(|e| ReinError::Config(format!("hnsw init: {e}")))?;
+        let index = Index::new(&opts).map_err(|e| ReinError::Config(format!("hnsw init: {e}")))?;
 
         let index_path = path.with_extension("usearch");
         let meta_path = path.with_extension("usearch.meta");

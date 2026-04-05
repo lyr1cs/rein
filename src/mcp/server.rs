@@ -507,43 +507,110 @@ impl ReinServer {
     fn rein_consolidate(&self, Parameters(params): Parameters<ConsolidateParams>) -> String {
         self.non_store_count.store(0, Ordering::Relaxed); // consolidate is a write operation
         let compact = self.compact();
+        let dry_run = params.dry_run.unwrap_or(false);
+        let merge_variants = params.merge_variants.unwrap_or(false);
+        let topic = params.topic.clone();
+        let topics = params.topics.clone().unwrap_or_default();
+        let pattern = params.pattern.clone();
+        let summary = params.summary.clone();
+        let all = params.all.unwrap_or(false);
 
         let result = self.with_store(|store| {
-            // Check if topic has any memories first
-            let existing = store.get_by_topic(&params.topic)?;
-            if existing.is_empty() {
-                return Ok((0, String::new()));
+            let groups = crate::ops::resolve_topic_groups(
+                store,
+                topic.as_deref(),
+                &topics,
+                pattern.as_deref(),
+                all,
+                merge_variants,
+            )?;
+            if groups.is_empty() {
+                return Ok(None);
             }
-
-            let related_ids = existing.iter().map(|m| m.id.clone()).collect();
-            let consolidated = crate::ops::build_consolidated(
+            let report = crate::ops::run_consolidation_sync(
+                store,
                 &self.config,
-                params.topic.clone(),
-                params.summary.clone(),
-                related_ids,
-            );
-            let new_id = consolidated.id.clone();
-
-            let old = store.consolidate_atomic(&params.topic, consolidated)?;
-            Ok((old.len(), new_id))
+                &groups,
+                summary.as_deref(),
+                dry_run,
+            )?;
+            Ok(Some(report))
         });
 
         match result {
-            Ok((0, _)) => {
+            Ok(None) => {
                 let mut text = if compact {
-                    "err:no_memories".to_string()
+                    "none".to_string()
+                } else if let Some(topic) = topic {
+                    format!("No memories found for topic: {topic}")
+                } else if let Some(pattern) = pattern {
+                    format!("No topics matched pattern: {pattern}")
                 } else {
-                    format!("No memories found for topic: {}", params.topic)
+                    "No topics matched the selected scope.".to_string()
                 };
                 self.maybe_nudge(&mut text);
                 text
             }
-            Ok((count, id)) => {
+            Ok(Some(report)) => {
                 let mut text = if compact {
-                    format!("ok:{id} consolidated:{count}")
+                    if dry_run {
+                        format!(
+                            "dry:groups={} memories={}",
+                            report.groups_processed, report.memories_replaced
+                        )
+                    } else {
+                        format!(
+                            "ok:groups={} memories={}",
+                            report.groups_processed, report.memories_replaced
+                        )
+                    }
+                } else if dry_run {
+                    format!(
+                        "Dry run: {} groups ({} memories) would be consolidated",
+                        report.groups_processed, report.memories_replaced
+                    )
                 } else {
-                    format!("Consolidated {count} memories into new memory: {id}")
+                    format!(
+                        "Consolidated {} groups ({} memories)",
+                        report.groups_processed, report.memories_replaced
+                    )
                 };
+
+                if !compact {
+                    let visible_groups: Vec<_> = report
+                        .groups
+                        .iter()
+                        .filter(|group| group.memory_count > 0)
+                        .take(8)
+                        .collect();
+                    for group in &visible_groups {
+                        if group.source_topics.len() > 1 {
+                            text.push_str(&format!(
+                                "\n- {} <= {} [{} memories]",
+                                group.canonical_topic,
+                                group.source_topics.join(", "),
+                                group.memory_count
+                            ));
+                        } else {
+                            text.push_str(&format!(
+                                "\n- {} [{} memories]",
+                                group.canonical_topic, group.memory_count
+                            ));
+                        }
+                    }
+                    let total_non_empty = report
+                        .groups
+                        .iter()
+                        .filter(|group| group.memory_count > 0)
+                        .count();
+                    if total_non_empty > visible_groups.len() {
+                        text.push_str(&format!(
+                            "\n... {} more groups",
+                            total_non_empty - visible_groups.len()
+                        ));
+                    }
+                }
+
                 self.maybe_nudge(&mut text);
                 text
             }
@@ -966,49 +1033,12 @@ impl ReinServer {
     fn rein_dedup(&self, Parameters(params): Parameters<DedupParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let dry_run = params.dry_run.unwrap_or(false);
+        let merge_variants = params.merge_variants.unwrap_or(false);
         let threshold = self.config.search.dedup_similarity as f32;
         let compact = self.compact();
 
         let result = self.with_store(|store| {
-            let topics = store.list_topics()?;
-            let mut dups_found = 0u32;
-            let mut dups_removed = 0u32;
-
-            for topic in &topics {
-                // List ALL memories in this topic using direct SQL (not FTS with topic as query)
-                let mems: Vec<Memory> = match store.get_by_topic(topic) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                let mut to_delete: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for i in 0..mems.len() {
-                    if to_delete.contains(&mems[i].id) {
-                        continue;
-                    }
-                    for j in (i + 1)..mems.len() {
-                        if to_delete.contains(&mems[j].id) {
-                            continue;
-                        }
-                        let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
-                        if sim >= threshold {
-                            // Delete the newer duplicate (j), keep the original (i)
-                            to_delete.insert(mems[j].id.clone());
-                            dups_found += 1;
-                            // Don't break — keep scanning for more duplicates of mems[i]
-                        }
-                    }
-                }
-                if !dry_run {
-                    for id in &to_delete {
-                        if store.delete(id).is_ok() {
-                            dups_removed += 1;
-                        }
-                    }
-                }
-            }
-            Ok((dups_found, dups_removed))
+            crate::ops::run_dedup(store, &self.config, threshold, dry_run, merge_variants)
         });
 
         match result {
@@ -1026,6 +1056,142 @@ impl ReinServer {
                         dups_found, dups_removed
                     )
                 };
+                self.maybe_nudge(&mut text);
+                text
+            }
+            Err(e) => {
+                let mut text = format!("Error: {e}");
+                self.maybe_nudge(&mut text);
+                text
+            }
+        }
+    }
+
+    /// One-click cleanup: consolidate fragmented topics, then deduplicate and refresh adaptive state.
+    #[tool(
+        name = "rein_cleanup",
+        description = "One-click cleanup for memories: consolidate fragmented topics, deduplicate, and refresh adaptive state. Supports dry_run preview."
+    )]
+    fn rein_cleanup(&self, Parameters(params): Parameters<CleanupParams>) -> String {
+        self.non_store_count.store(0, Ordering::Relaxed);
+        let compact = self.compact();
+        let dry_run = params.dry_run.unwrap_or(false);
+        let topic = params.topic.clone();
+        let topics = params.topics.clone().unwrap_or_default();
+        let pattern = params.pattern.clone();
+        let exact_topics = params.exact_topics.unwrap_or(false);
+        let merge_variants = !exact_topics;
+        let all = params.all.unwrap_or(false)
+            || (topic.is_none() && topics.is_empty() && pattern.is_none());
+
+        let result = self.with_store(|store| {
+            let groups = crate::ops::resolve_topic_groups(
+                store,
+                topic.as_deref(),
+                &topics,
+                pattern.as_deref(),
+                all,
+                merge_variants,
+            )?;
+            if groups.is_empty() {
+                return Ok(None);
+            }
+            let report = crate::ops::run_cleanup_sync(
+                store,
+                &self.config,
+                &groups,
+                merge_variants,
+                dry_run,
+            )?;
+            Ok(Some(report))
+        });
+
+        match result {
+            Ok(None) => {
+                let mut text = if compact {
+                    "none".to_string()
+                } else if let Some(topic) = topic {
+                    format!("No memories found for topic: {topic}")
+                } else if let Some(pattern) = pattern {
+                    format!("No topics matched pattern: {pattern}")
+                } else {
+                    "No topics matched the selected scope.".to_string()
+                };
+                self.maybe_nudge(&mut text);
+                text
+            }
+            Ok(Some(report)) => {
+                let mut text = if compact {
+                    if dry_run {
+                        format!(
+                            "dry:groups={} memories={} found={}",
+                            report.consolidation.groups_processed,
+                            report.consolidation.memories_replaced,
+                            report.duplicates_found
+                        )
+                    } else {
+                        format!(
+                            "ok:groups={} memories={} removed={}/{}",
+                            report.consolidation.groups_processed,
+                            report.consolidation.memories_replaced,
+                            report.duplicates_merged,
+                            report.duplicates_found
+                        )
+                    }
+                } else if dry_run {
+                    format!(
+                        "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
+                        report.consolidation.groups_processed,
+                        report.consolidation.memories_replaced,
+                        report.duplicates_found
+                    )
+                } else {
+                    format!(
+                        "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
+                        report.consolidation.groups_processed,
+                        report.consolidation.memories_replaced,
+                        report.duplicates_merged,
+                        report.duplicates_found
+                    )
+                };
+
+                if !compact {
+                    let visible_groups: Vec<_> = report
+                        .consolidation
+                        .groups
+                        .iter()
+                        .filter(|group| group.memory_count > 0)
+                        .take(8)
+                        .collect();
+                    for group in &visible_groups {
+                        if group.source_topics.len() > 1 {
+                            text.push_str(&format!(
+                                "\n- {} <= {} [{} memories]",
+                                group.canonical_topic,
+                                group.source_topics.join(", "),
+                                group.memory_count
+                            ));
+                        } else {
+                            text.push_str(&format!(
+                                "\n- {} [{} memories]",
+                                group.canonical_topic, group.memory_count
+                            ));
+                        }
+                    }
+                    let total_non_empty = report
+                        .consolidation
+                        .groups
+                        .iter()
+                        .filter(|group| group.memory_count > 0)
+                        .count();
+                    if total_non_empty > visible_groups.len() {
+                        text.push_str(&format!(
+                            "\n... {} more groups",
+                            total_non_empty - visible_groups.len()
+                        ));
+                    }
+                }
+
                 self.maybe_nudge(&mut text);
                 text
             }
@@ -1370,8 +1536,9 @@ impl ReinServer {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let result = self.with_store(|store| Ok(crate::ops::adaptive_status(store)));
         match result {
-            Ok(status) => serde_json::to_string_pretty(&status)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(status) => {
+                serde_json::to_string_pretty(&status).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1506,7 +1673,10 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             eprintln!("Another rein instance may be running. Check with:");
             eprintln!("  lsof -i :{}", config.server.sse_port);
             eprintln!("Kill it first, or use a different port via REIN_SSE_PORT.");
-            return Err(anyhow::anyhow!("port {} already in use", config.server.sse_port));
+            return Err(anyhow::anyhow!(
+                "port {} already in use",
+                config.server.sse_port
+            ));
         }
         Err(e) => return Err(e.into()),
     };
@@ -1529,33 +1699,37 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             let path = req.uri().path();
             let needs_auth = path.starts_with("/api/") || path.starts_with("/mcp");
             if needs_auth {
-             if let Some(ref expected) = token {
-                let auth_header = req
-                    .headers()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let expected_str = format!("Bearer {expected}");
-                let auth_match = if auth_header.len() != expected_str.len() {
-                    false
-                } else {
-                    auth_header.bytes().zip(expected_str.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-                };
-                if !auth_match {
-                    return Ok::<_, std::convert::Infallible>(
-                        hyper::Response::builder()
-                            .status(401)
-                            .body(
-                                http_body_util::Full::new(bytes::Bytes::from("Unauthorized"))
-                                    .map_err(|never: std::convert::Infallible| match never {})
-                                    .boxed(),
-                            )
-                            .unwrap(),
-                    );
+                if let Some(ref expected) = token {
+                    let auth_header = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let expected_str = format!("Bearer {expected}");
+                    let auth_match = if auth_header.len() != expected_str.len() {
+                        false
+                    } else {
+                        auth_header
+                            .bytes()
+                            .zip(expected_str.bytes())
+                            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                            == 0
+                    };
+                    if !auth_match {
+                        return Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(401)
+                                .body(
+                                    http_body_util::Full::new(bytes::Bytes::from("Unauthorized"))
+                                        .map_err(|never: std::convert::Infallible| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        );
+                    }
                 }
-             }
             } // needs_auth
-            // Try REST API / GUI routes before MCP dispatch
+              // Try REST API / GUI routes before MCP dispatch
             if let Some(response) = crate::mcp::rest::handle_rest_request(&req, &cfg).await {
                 return Ok::<_, std::convert::Infallible>(response);
             }

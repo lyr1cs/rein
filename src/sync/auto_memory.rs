@@ -47,6 +47,12 @@ impl AutoMemoryScanner {
                             decay_lambda: 0.0,
                             access_count: 0,
                             superseded_by: None,
+                            canonical_id: None,
+                            support_count: 1,
+                            merge_count: 0,
+                            dedup_confidence: 1.0,
+                            source_diversity: 1.0,
+                            contradiction_score: 0.0,
                             related_ids: vec![],
                             concept_ids: vec![],
                             status: MemoryStatus::default(),
@@ -79,7 +85,13 @@ fn parse_frontmatter(content: &str) -> (Option<String>, String) {
             let title = frontmatter
                 .lines()
                 .find(|l| l.starts_with("name:") || l.starts_with("title:"))
-                .map(|l| l.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string());
+                .map(|l| {
+                    l.split_once(':')
+                        .map(|x| x.1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                });
             return (title, body);
         }
     }
@@ -118,11 +130,13 @@ mod tests {
     fn test_scan_with_tempdir() {
         let dir = tempfile::tempdir().unwrap();
         let file1 = dir.path().join("rust_tips.md");
-        std::fs::write(&file1, "Rust Tips\nUse pattern matching for error handling")
-            .unwrap();
+        std::fs::write(&file1, "Rust Tips\nUse pattern matching for error handling").unwrap();
         let file2 = dir.path().join("python_notes.md");
-        std::fs::write(&file2, "Python Notes\nUse list comprehensions for clean code")
-            .unwrap();
+        std::fs::write(
+            &file2,
+            "Python Notes\nUse list comprehensions for clean code",
+        )
+        .unwrap();
 
         let pattern = format!("{}/*.md", dir.path().display());
         let scanner = AutoMemoryScanner::new(pattern);

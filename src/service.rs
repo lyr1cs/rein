@@ -149,8 +149,8 @@ impl ServiceStatus {
     fn status_indicator(&self) -> &'static str {
         match (self.pid, self.port_open) {
             (Some(_), true) => "\x1b[32m●\x1b[0m", // green
-            (None, true) => "\x1b[33m●\x1b[0m",     // yellow (port open, no PID file)
-            _ => "\x1b[31m●\x1b[0m",                 // red
+            (None, true) => "\x1b[33m●\x1b[0m",    // yellow (port open, no PID file)
+            _ => "\x1b[31m●\x1b[0m",               // red
         }
     }
 
@@ -225,9 +225,7 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
     );
     if gui_status.port_open {
         let bind = &config.server.sse_bind;
-        println!(
-            "  {:<12}   http://{bind}:{gui_port}/"
-        , "");
+        println!("  {:<12}   http://{bind}:{gui_port}/", "");
     }
     println!(
         "  {:<12} {} {}",

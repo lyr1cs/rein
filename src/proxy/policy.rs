@@ -102,7 +102,8 @@ fn normalize_phrase(text: &str) -> String {
     text.to_lowercase()
         .chars()
         .map(|ch| {
-            if ch.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&ch) || ch.is_whitespace() {
+            if ch.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&ch) || ch.is_whitespace()
+            {
                 ch
             } else {
                 ' '
@@ -129,7 +130,9 @@ mod tests {
 
     #[test]
     fn test_error_response_detection() {
-        assert!(looks_like_error_response("API Error: Request rejected (429)"));
+        assert!(looks_like_error_response(
+            "API Error: Request rejected (429)"
+        ));
         assert!(!looks_like_error_response("We decided to use SQLite"));
     }
 }

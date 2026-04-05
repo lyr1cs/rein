@@ -91,7 +91,11 @@ fn split_sentences(text: &str) -> Vec<&str> {
             let followed_by_space = !at_end && indices[i + 1].1.is_whitespace();
             if at_end || followed_by_space {
                 let byte_start = indices[start].0;
-                let byte_end = if i + 1 < len { indices[i + 1].0 } else { text.len() };
+                let byte_end = if i + 1 < len {
+                    indices[i + 1].0
+                } else {
+                    text.len()
+                };
                 let sentence = text[byte_start..byte_end].trim();
                 if !sentence.is_empty() {
                     sentences.push(sentence);
@@ -167,7 +171,11 @@ mod tests {
     fn test_extract_filters_low() {
         let text = "Hello world. The system uses a microservices architecture. Today is sunny. We decided to use PostgreSQL for the database.";
         let facts = extract_facts(text, 3);
-        assert!(facts.len() >= 2, "Expected at least 2 facts, got {}", facts.len());
+        assert!(
+            facts.len() >= 2,
+            "Expected at least 2 facts, got {}",
+            facts.len()
+        );
         assert!(facts.iter().any(|f| f.contains("microservices")));
         assert!(facts.iter().any(|f| f.contains("PostgreSQL")));
         // "Hello world" and "Today is sunny" should not be included
@@ -179,6 +187,11 @@ mod tests {
     fn test_extract_dedup() {
         let text = "The system uses a microservices architecture. The system uses a microservices architecture pattern.";
         let facts = extract_facts(text, 3);
-        assert_eq!(facts.len(), 1, "Expected 1 fact after dedup, got {}", facts.len());
+        assert_eq!(
+            facts.len(),
+            1,
+            "Expected 1 fact after dedup, got {}",
+            facts.len()
+        );
     }
 }
