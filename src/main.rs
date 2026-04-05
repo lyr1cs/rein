@@ -168,6 +168,24 @@ enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Show service status dashboard
+    Dashboard,
+    /// Manage GUI server
+    Gui {
+        #[arg(value_enum)]
+        action: ServiceAction,
+    },
+    /// Manage proxy server
+    Proxy {
+        #[arg(value_enum)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum ServiceAction {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -655,6 +673,25 @@ async fn main() -> anyhow::Result<()> {
                 println!("Removed {dups_removed} of {dups_found} duplicates");
             }
         }
+        Some(Commands::Dashboard) => {
+            rein::service::print_dashboard(&config);
+        }
+        Some(Commands::Gui { action }) => match action {
+            ServiceAction::On => {
+                rein::service::start_service("gui", &["serve", "--gui"])?;
+            }
+            ServiceAction::Off => {
+                rein::service::stop_service("gui")?;
+            }
+        },
+        Some(Commands::Proxy { action }) => match action {
+            ServiceAction::On => {
+                rein::service::start_service("proxy", &["serve", "--proxy"])?;
+            }
+            ServiceAction::Off => {
+                rein::service::stop_service("proxy")?;
+            }
+        },
     }
     Ok(())
 }

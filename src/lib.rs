@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod ops;
 pub mod proxy;
 pub mod search;
+pub mod service;
 pub mod store;
 pub mod sync;
 pub mod types;
