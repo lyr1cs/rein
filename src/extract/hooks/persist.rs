@@ -23,7 +23,10 @@ pub struct StoreExtractedStats {
 
 /// Compute adaptive admission threshold from recent quality data.
 /// Base = 0.2. Adjusts up if recent quality is low, down if high.
-fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
+fn adaptive_admission_threshold(
+    store: &crate::store::SqliteStore,
+    cluster_id: Option<u32>,
+) -> f64 {
     let base = 0.2;
     let recent_avg: f64 = store.conn()
         .query_row(
@@ -32,12 +35,31 @@ fn adaptive_admission_threshold(store: &crate::store::SqliteStore) -> f64 {
             |r| r.get(0),
         ).unwrap_or(0.5);
 
-    if recent_avg < 0.4 {
+    let global = if recent_avg < 0.4 {
         (base * 1.1_f64).min(0.60)
     } else if recent_avg > 0.7 {
         (base * 0.9_f64).max(0.15)
     } else {
         base
+    };
+
+    let Some(cluster_id) = cluster_id else {
+        return global;
+    };
+    let cluster_avg: Option<f64> = store
+        .conn()
+        .query_row(
+            "SELECT AVG(strength) FROM memories
+             WHERE cluster_id = ?1 AND superseded_by IS NULL AND status IN ('active', 'updated')",
+            rusqlite::params![cluster_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+
+    match cluster_avg {
+        Some(avg) if avg > 0.0 && recent_avg > 0.0 => (global * (recent_avg / avg)).clamp(0.15, 0.60),
+        _ => global,
     }
 }
 
@@ -114,6 +136,19 @@ fn current_topic_memories(store: &crate::store::SqliteStore, topic: &str) -> Vec
         .collect()
 }
 
+fn dominant_cluster(memories: &[Memory]) -> Option<u32> {
+    let mut counts = std::collections::HashMap::new();
+    for memory in memories {
+        if let Some(cluster_id) = memory.cluster_id {
+            *counts.entry(cluster_id).or_insert(0usize) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(cluster_id, _)| cluster_id)
+}
+
 /// Store a list of ExtractedMemory items into the database.
 /// Filters secrets and deduplicates. Returns (count, stored_ids).
 pub fn store_extracted(
@@ -149,15 +184,15 @@ pub fn store_extracted_report(
     }
 
     let mut stats = StoreExtractedStats::default();
-    // Compute threshold once per batch to avoid N redundant DB queries.
-    // The threshold (avg of last 100 strengths) shifts negligibly as items are added.
-    let threshold = adaptive_admission_threshold(store);
     for item in items {
         if looks_like_secret(&item.content) {
             stats.secret_filtered_count += 1;
             continue;
         }
 
+        let current = current_topic_memories(store, &item.topic);
+        let cluster_id = dominant_cluster(&current);
+        let threshold = adaptive_admission_threshold(store, cluster_id);
         let admission = multi_factor_admission_score(store, &item);
         if admission < threshold {
             tracing::debug!(
@@ -587,5 +622,28 @@ mod tests {
         let current = current_topic_memories(&store, "Docker Deployment");
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].topic, "docker-deployment");
+    }
+
+    #[test]
+    fn adaptive_admission_threshold_varies_by_cluster_strength() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut strong = stored_memory("architecture", "strong", "high-signal architecture fact");
+        strong.cluster_id = Some(1);
+        strong.strength = 0.9;
+        store.store(strong).unwrap();
+
+        let mut weak = stored_memory("debug", "weak", "low-signal debug note");
+        weak.cluster_id = Some(2);
+        weak.strength = 0.2;
+        store.store(weak).unwrap();
+
+        let strong_threshold = adaptive_admission_threshold(&store, Some(1));
+        let weak_threshold = adaptive_admission_threshold(&store, Some(2));
+
+        assert!(
+            strong_threshold < weak_threshold,
+            "high-strength clusters should admit more easily"
+        );
     }
 }
