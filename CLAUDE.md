@@ -6,7 +6,7 @@
 
 ```bash
 cargo build
-cargo test            # 330+ tests, all must pass
+cargo test            # 333+ tests, all must pass
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
 
@@ -30,6 +30,7 @@ rein is a multi-source cross-validated memory MCP server (26 tools, evidence-awa
 - `search/alpha_optimizer.rs` — Counterfactual offline alpha optimization with KG/episode/support/diversity-aware scoring
 - `search/survival.rs` — Kaplan-Meier non-parametric survival analysis for adaptive decay
 - `extract/dedup.rs` — Hybrid lexical dedup: whitespace tokens + `jieba-rs` + CJK bigrams
+- `ops/mod.rs` — adaptive_status now exposes cluster profiles used by the Adaptive GUI page
 
 ## Temporal Knowledge Graph (v0.4.0)
 
