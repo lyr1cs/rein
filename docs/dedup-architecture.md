@@ -16,12 +16,27 @@ This document describes the current dedup architecture after the canonical/evide
 Hot-path dedup runs during `store_with_dedup` and stays cheap:
 
 - lexical candidate generation via FTS
+- mixed CJK lexical tokenization: jieba-rs word segmentation plus character bigrams
 - topic-variant expansion via normalized topic keys
 - adaptive threshold override from `AdaptiveState`
 - immediate resolution for strong matches
 - gray-zone pairs are queued for async dedup resolution instead of blocking the hot path
 
 The hot path is optimized for correctness first and latency second. It should avoid remote calls entirely unless an operator explicitly chooses a synchronous batch path.
+
+### CJK Tokenization Strategy
+
+For CJK-heavy memories, pure whitespace tokenization is insufficient. The current design uses a hybrid lexical strategy:
+
+- `jieba-rs` provides word-level Chinese segmentation
+- character bigrams remain enabled for Chinese/Japanese/Korean fallback
+- both token streams are merged before Jaccard / containment scoring
+
+Why both:
+
+- bigrams are robust for OOV terms, code-adjacent text, paths, and mixed technical language
+- jieba-rs improves phrase-level overlap for natural Chinese text
+- using both is safer than replacing one with the other in a coding-memory corpus
 
 ### Warm Path
 
