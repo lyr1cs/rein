@@ -42,6 +42,26 @@ pub fn search_vec(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Fetch an embedding vector by memory id, if present.
+pub fn get_embedding(conn: &Connection, id: &str) -> ReinResult<Option<Vec<f32>>> {
+    let result: Result<Vec<u8>, _> = conn.query_row(
+        "SELECT embedding FROM vec_memories WHERE id = ?1",
+        rusqlite::params![id],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(bytes) => Ok(Some(bytes_to_embedding(&bytes))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }

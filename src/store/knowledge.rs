@@ -683,12 +683,39 @@ impl SqliteStore {
             rusqlite::params![now.to_rfc3339(), id],
         )?;
 
-        // STM→LTM promotion: if access_count > 5 and layer is STM, promote to LTM
-        self.conn.execute(
-            "UPDATE memories SET layer = 'LTM', decay_lambda = decay_lambda * 0.33
-             WHERE id = ?1 AND layer = 'STM' AND access_count > 5",
-            rusqlite::params![id],
-        )?;
+        let promotion_row: Option<(u32, Option<u32>)> = self
+            .conn
+            .query_row(
+                "SELECT access_count, cluster_id FROM memories WHERE id = ?1 AND layer = 'STM'",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if let Some((access_count, cluster_id)) = promotion_row {
+            let threshold = cluster_id
+                .and_then(|cid| {
+                    let key = format!("survival_curve:{cid}");
+                    self.conn
+                        .query_row(
+                            "SELECT value FROM metadata WHERE key = ?1",
+                            rusqlite::params![key],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                        .and_then(|json| serde_json::from_str::<crate::search::survival::SurvivalCurve>(&json).ok())
+                })
+                .map(|curve| crate::search::survival::promotion_access_threshold(&curve))
+                .unwrap_or(5);
+
+            if access_count > threshold {
+                self.conn.execute(
+                    "UPDATE memories SET layer = 'LTM', decay_lambda = decay_lambda * 0.33
+                     WHERE id = ?1 AND layer = 'STM'",
+                    rusqlite::params![id],
+                )?;
+            }
+        }
 
         Ok(())
     }

@@ -48,6 +48,19 @@ pub(crate) fn memory_select_base() -> String {
 }
 
 impl SqliteStore {
+    fn infer_cluster_from_cache(&self, memory: &Memory) -> Option<u32> {
+        let config = crate::config::ReinConfig::load().ok()?;
+        let model = config.embedding_model();
+        let enriched = crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
+        let embedding = crate::embed::EmbedCache::get(self.conn(), &enriched, &model)
+            .ok()
+            .flatten()?;
+        crate::store::vec::search_vec(self.conn(), &embedding, 8)
+            .ok()?
+            .into_iter()
+            .find_map(|(id, _)| self.get(&id).ok().and_then(|m| m.cluster_id))
+    }
+
     /// Open or create a database at the given path.
     /// Uses SQLITE_OPEN_FULL_MUTEX for thread-safe access via serialized mode.
     /// `model` and `dims` track the embedding model; if changed, vector index is rebuilt.
@@ -1146,12 +1159,14 @@ impl SqliteStore {
         let mut pending_grayzone: Option<(String, f32)> = None;
 
         let decision = (|| -> ReinResult<String> {
+            let inferred_cluster = memory.cluster_id.or_else(|| self.infer_cluster_from_cache(&memory));
             let dedup_action = crate::extract::check_dedup(
                 self,
                 &memory.topic,
                 &memory.content,
                 similarity_threshold,
                 time_window_days,
+                inferred_cluster,
             )?;
 
             let candidate_cluster = match &dedup_action {
@@ -1172,6 +1187,7 @@ impl SqliteStore {
                         &memory.content,
                         effective,
                         time_window_days,
+                        inferred_cluster,
                     )?
                 } else {
                     dedup_action
@@ -1990,6 +2006,44 @@ mod tests {
     }
 
     #[test]
+    fn test_store_with_dedup_uses_cached_cluster_hint() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut existing = test_memory_with_content(
+            "docker",
+            "docker stack",
+            "docker compose local development stack service api database cache queue search metrics logging stable deterministic reusable maintainable portable observable local safe stable reusable maintainable",
+            Importance::High,
+        );
+        existing.cluster_id = Some(7);
+        let existing_id = store.store(existing).unwrap();
+
+        let mut embedding = vec![0.0f32; 3072];
+        embedding[0] = 1.0;
+        let _ = crate::store::vec::insert_embedding(store.conn(), &existing_id, &embedding);
+
+        let candidate = test_memory_with_content(
+            "docker",
+            "docker stack variant",
+            "docker compose local development stack service api database cache queue search metrics logging stable deterministic reusable maintainable portable observable testing staged portable observable efficient",
+            Importance::High,
+        );
+        let enriched =
+            crate::embed::prepend_metadata(&candidate.topic, &candidate.summary, &candidate.content);
+        let model = crate::config::ReinConfig::load().unwrap_or_default().embedding_model();
+        let _ = crate::embed::EmbedCache::put(store.conn(), &enriched, &model, &embedding);
+
+        let inferred_cluster = store.infer_cluster_from_cache(&candidate);
+        assert_eq!(inferred_cluster, Some(7));
+
+        assert_eq!(
+            inferred_cluster,
+            Some(7),
+            "cached local embedding should infer the nearest cluster without a remote call"
+        );
+    }
+
+    #[test]
     fn test_store_with_dedup_sets_needs_vec_dedup() {
         let store = SqliteStore::in_memory().unwrap();
         let mem = test_memory_with_content(
@@ -2204,5 +2258,32 @@ mod tests {
         let fetched = store.get(&id).unwrap();
         assert_eq!(fetched.layer, MemoryLayer::LTM);
         assert_eq!(fetched.access_count, 6);
+    }
+
+    #[test]
+    fn test_stm_to_ltm_promotion_uses_survival_curve_threshold() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = test_memory("test", "cluster-guided promotion", Importance::Medium);
+        mem.cluster_id = Some(7);
+        let id = store.store(mem).unwrap();
+
+        let curve = crate::search::survival::SurvivalCurve {
+            steps: vec![(0.0, 1.0), (14.0, 0.4)],
+            event_count: 20,
+            total_count: 25,
+            median_survival: Some(14.0),
+        };
+        store.conn().execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params!["survival_curve:7", serde_json::to_string(&curve).unwrap()],
+        ).unwrap();
+
+        for _ in 0..4 {
+            store.record_access(&id).unwrap();
+        }
+
+        let fetched = store.get(&id).unwrap();
+        assert_eq!(fetched.layer, MemoryLayer::LTM);
+        assert_eq!(fetched.access_count, 4);
     }
 }

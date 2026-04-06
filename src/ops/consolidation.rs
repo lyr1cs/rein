@@ -9,6 +9,10 @@ use crate::types::*;
 use super::adaptive::run_adaptive_pipeline;
 use super::dedup::{emit_cleanup_event, record_deleted_memory_as_evidence, run_dedup_scoped};
 
+fn normalize_summary(summary: &str) -> String {
+    summary.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Build a consolidated Memory from a topic.
 pub fn build_consolidated(
     config: &ReinConfig,
@@ -21,7 +25,7 @@ pub fn build_consolidated(
         id: ulid::Ulid::new().to_string(),
         layer: MemoryLayer::LTM,
         topic,
-        summary: summary.chars().take(100).collect(),
+        summary: normalize_summary(&summary),
         content: summary,
         keywords: vec![],
         importance,
@@ -252,7 +256,7 @@ pub fn build_consolidated_from_memories(
         id: ulid::Ulid::new().to_string(),
         layer: importance.auto_layer(),
         topic: canonical_topic,
-        summary: summary.chars().take(100).collect(),
+        summary: normalize_summary(&summary),
         content,
         keywords,
         importance,
@@ -301,7 +305,7 @@ fn build_consolidated_from_extracted(
         .max(Importance::High);
 
     consolidated.topic = canonical_topic;
-    consolidated.summary = extracted.summary.chars().take(100).collect();
+    consolidated.summary = normalize_summary(&extracted.summary);
     consolidated.content = extracted.content;
     if !extracted.keywords.is_empty() {
         consolidated.keywords = extracted.keywords;
@@ -1054,6 +1058,39 @@ mod tests {
             report.consolidation.groups_processed
         );
         assert!(!report.dry_run);
+    }
+
+    #[test]
+    fn test_build_consolidated_from_extracted_preserves_llm_summary_length() {
+        let config = ReinConfig::default();
+        let memories = vec![test_memory(
+            "rust-testing",
+            "unit tests",
+            "Write unit tests with #[test] attribute",
+            vec!["rust"],
+        )];
+        let extracted = ExtractedMemory {
+            topic: "rust-testing".to_string(),
+            summary: "This is a deliberately long LLM-generated summary that should remain intact instead of being mechanically truncated to one hundred characters after consolidation.".to_string(),
+            content: "Detailed consolidated content".to_string(),
+            keywords: vec!["rust".to_string()],
+            importance: "high".to_string(),
+            should_store: true,
+            quality_confidence: 0.9,
+        };
+
+        let consolidated = build_consolidated_from_extracted(
+            &config,
+            "rust-testing".to_string(),
+            &["rust-testing".to_string()],
+            &memories,
+            extracted,
+        );
+
+        assert!(
+            consolidated.summary.len() > 100,
+            "LLM summary should no longer be mechanically truncated"
+        );
     }
 
     #[tokio::test]
