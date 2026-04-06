@@ -149,13 +149,15 @@ pub fn store_extracted_report(
     }
 
     let mut stats = StoreExtractedStats::default();
+    // Compute threshold once per batch to avoid N redundant DB queries.
+    // The threshold (avg of last 100 strengths) shifts negligibly as items are added.
+    let threshold = adaptive_admission_threshold(store);
     for item in items {
         if looks_like_secret(&item.content) {
             stats.secret_filtered_count += 1;
             continue;
         }
 
-        let threshold = adaptive_admission_threshold(store);
         let admission = multi_factor_admission_score(store, &item);
         if admission < threshold {
             tracing::debug!(
