@@ -6,8 +6,14 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 use super::adaptive::run_adaptive_pipeline;
-use super::consolidation::load_group_memories;
+use super::consolidation::{load_group_memories, TopicGroup};
 use super::stronger_tier;
+
+const VEC_DEDUP_PENDING_LIMIT: usize = 50;
+const VEC_DEDUP_STRONG_MATCH_THRESHOLD: f64 = 0.85;
+const VEC_DEDUP_WEAK_MATCH_THRESHOLD: f64 = 0.70;
+
+type VecDedupItem = (String, String, String, String);
 
 pub(crate) fn emit_cleanup_event(
     store: &SqliteStore,
@@ -335,20 +341,69 @@ pub(crate) fn record_deleted_memory_as_evidence(store: &SqliteStore, canonical_i
     });
 }
 
+fn vec_dedup_run_limit(config: &ReinConfig) -> usize {
+    config.async_memory.batch_size.max(1).saturating_mul(2)
+}
+
+fn vec_dedup_embed_batch_size(config: &ReinConfig) -> usize {
+    config.async_memory.batch_size.max(1)
+}
+
+fn vec_dedup_llm_budget(config: &ReinConfig) -> usize {
+    config.async_memory.batch_size.max(1)
+}
+
+fn vec_dedup_pending_limit(config: &ReinConfig) -> usize {
+    config
+        .async_memory
+        .max_jobs_per_run
+        .max(1)
+        .min(VEC_DEDUP_PENDING_LIMIT)
+}
+
+fn take_vec_dedup_window(mut pending: Vec<VecDedupItem>, config: &ReinConfig) -> (Vec<VecDedupItem>, usize) {
+    let run_limit = vec_dedup_run_limit(config);
+    let skipped = pending.len().saturating_sub(run_limit);
+    if pending.len() > run_limit {
+        pending.truncate(run_limit);
+    }
+    (pending, skipped)
+}
+
+fn embed_vec_dedup_batch(
+    embedder: &crate::embed::EmbedderKind,
+    texts: &[String],
+) -> Option<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use crate::types::traits::Embedder;
+                embedder.embed_batch(&text_refs).await
+            })
+        })
+    }));
+
+    result.ok().and_then(|value| value.ok())
+}
+
 /// Embedding-based dedup sweep for memories marked `needs_vec_dedup`.
 /// Computes embeddings (if missing), searches vec_memories for near-duplicates,
 /// and merges/supersedes matches. Runs in the GC slow channel (zero hot-path cost).
 pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
     let conn = store.conn();
-
-    // Fetch memories needing vec dedup (batch limit to avoid holding resources too long)
-    let pending: Vec<(String, String, String, String)> = match conn.prepare(
+    let pending_limit = vec_dedup_pending_limit(config);
+    let pending: Vec<VecDedupItem> = match conn.prepare(
         "SELECT id, topic, summary, content FROM memories
          WHERE needs_vec_dedup = 1 AND status = 'active' AND superseded_by IS NULL
-         LIMIT 50",
+         LIMIT ?1",
     ) {
         Ok(mut stmt) => stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params![pending_limit as i64], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .ok()
@@ -361,9 +416,13 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
         return;
     }
 
-    tracing::debug!("vec_dedup: processing {} memories", pending.len());
+    let (pending, deferred) = take_vec_dedup_window(pending, config);
+    tracing::debug!(
+        "vec_dedup: processing {} memories ({} deferred)",
+        pending.len(),
+        deferred
+    );
 
-    // Create embedder (needed for computing embeddings of new memories)
     let embedder = match crate::embed::create_embedder(config) {
         Some(e) => e,
         None => {
@@ -376,46 +435,58 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
 
     let model_name = config.embedding_model();
     let mut merged = 0u32;
+    let mut llm_verdicts_used = 0usize;
+    let mut embeddings_by_id: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::new();
+    let mut pending_embeddings: Vec<(String, String)> = Vec::new();
 
     for (id, topic, summary, content) in &pending {
-        // Step 1: Get or compute embedding for this memory
         let enriched = crate::embed::prepend_metadata(topic, summary, content);
-        let embedding = match crate::embed::EmbedCache::get(conn, &enriched, &model_name) {
+        match crate::embed::EmbedCache::get(conn, &enriched, &model_name) {
             Ok(Some(cached)) => {
-                // Ensure this memory is also in vec_memories (cache may exist from warmup
-                // without a corresponding vec_memories row)
                 let _ = crate::store::vec::insert_embedding(conn, id, &cached);
-                cached
+                embeddings_by_id.insert(id.clone(), cached);
             }
-            _ => {
-                // Compute embedding (async → sync bridge)
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            use crate::types::traits::Embedder;
-                            embedder.embed(&enriched).await
-                        })
-                    })
-                })) {
-                    Ok(Ok(emb)) => {
-                        // Cache + store in vec_memories
-                        let _ = crate::embed::EmbedCache::put(conn, &enriched, &model_name, &emb);
-                        let _ = crate::store::vec::insert_embedding(conn, id, &emb);
-                        emb
-                    }
-                    _ => {
-                        tracing::debug!("vec_dedup: failed to compute embedding for {id}");
-                        let _ = conn.execute(
-                            "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
-                            rusqlite::params![id],
-                        );
-                        continue;
-                    }
-                }
-            }
+            _ => pending_embeddings.push((id.clone(), enriched)),
+        }
+    }
+
+    for chunk in pending_embeddings.chunks(vec_dedup_embed_batch_size(config)) {
+        let chunk_texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
+        let Some(batch_embeddings) = embed_vec_dedup_batch(&embedder, &chunk_texts) else {
+            tracing::debug!(
+                "vec_dedup: failed to batch-embed {} pending memories",
+                chunk.len()
+            );
+            continue;
         };
 
-        // Step 2: Search vec_memories for near-duplicates (excluding self)
+        if batch_embeddings.len() != chunk.len() {
+            tracing::debug!(
+                "vec_dedup: batch embedding returned {} embeddings for {} inputs",
+                batch_embeddings.len(),
+                chunk.len()
+            );
+            continue;
+        }
+
+        for ((id, enriched), emb) in chunk.iter().zip(batch_embeddings.into_iter()) {
+            let _ = crate::embed::EmbedCache::put(conn, enriched, &model_name, &emb);
+            let _ = crate::store::vec::insert_embedding(conn, id, &emb);
+            embeddings_by_id.insert(id.clone(), emb);
+        }
+    }
+
+    for (id, _topic, _summary, content) in &pending {
+        let Some(embedding) = embeddings_by_id.get(id).cloned() else {
+            tracing::debug!("vec_dedup: failed to compute embedding for {id}");
+            let _ = conn.execute(
+                "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                rusqlite::params![id],
+            );
+            continue;
+        };
+
         let vec_results = match crate::store::vec::search_vec(conn, &embedding, 10) {
             Ok(r) => r,
             Err(_) => {
@@ -433,11 +504,10 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 continue;
             }
 
-            // cosine distance → similarity
             let sim = 1.0 - (*distance as f64);
-            if sim < 0.70 {
+            if sim < VEC_DEDUP_WEAK_MATCH_THRESHOLD {
                 break;
-            } // Results are sorted by distance; no point continuing
+            }
 
             let candidate = match store.get(candidate_id) {
                 Ok(m) => m,
@@ -449,8 +519,7 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 continue;
             }
 
-            if sim > 0.85 {
-                // Strong semantic match — provenance-preserving merge
+            if sim > VEC_DEDUP_STRONG_MATCH_THRESHOLD {
                 let (keep_id, discard_id, discard_content, discard_created) =
                     if candidate.access_count >= 1
                         || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1)
@@ -470,7 +539,6 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                         )
                     };
 
-                // Extract unique lines from the loser and append to winner
                 if let Ok(mut kept) = store.get(keep_id) {
                     let unique = extract_unique_lines(&discard_content, &kept.content);
                     if !unique.is_empty() {
@@ -503,60 +571,66 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 merged += 1;
                 found_dup = true;
                 break;
-            } else if sim > 0.70 {
-                // Moderate match — use LLM to confirm (if available)
-                let relation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            crate::extract::llm::llm_dedup_verdict(
-                                config,
-                                content,
-                                &candidate.content,
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|verdict| verdict.relation)
-                            .unwrap_or(DedupRelation::Distinct)
-                        })
-                    })
-                }))
-                .unwrap_or(DedupRelation::Distinct);
+            }
 
-                if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
-                    let _ = store.mark_superseded(id, &candidate.id);
-                    if let Ok(discard_memory) = store.get(id) {
-                        record_dedup_artifacts(
-                            store,
-                            &candidate.id,
-                            &discard_memory,
-                            relation,
-                            None,
-                            Some(sim as f32),
-                            "vec_dedup_llm",
-                            Some(serde_json::json!({ "cosine_similarity": sim })),
-                        );
-                    }
-                    tracing::info!(
-                        "vec_dedup: LLM verdict {} superseded {id} by {} (cosine_sim={sim:.3})",
+            if llm_verdicts_used >= vec_dedup_llm_budget(config) {
+                tracing::debug!(
+                    "vec_dedup: LLM budget exhausted for {id}, skipping gray-zone verdict"
+                );
+                continue;
+            }
+
+            let relation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        crate::extract::llm::llm_dedup_verdict(
+                            config,
+                            content,
+                            &candidate.content,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|verdict| verdict.relation)
+                        .unwrap_or(DedupRelation::Distinct)
+                    })
+                })
+            }))
+            .unwrap_or(DedupRelation::Distinct);
+            llm_verdicts_used += 1;
+
+            if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
+                let _ = store.mark_superseded(id, &candidate.id);
+                if let Ok(discard_memory) = store.get(id) {
+                    record_dedup_artifacts(
+                        store,
+                        &candidate.id,
+                        &discard_memory,
                         relation,
-                        candidate.id
+                        None,
+                        Some(sim as f32),
+                        "vec_dedup_llm",
+                        Some(serde_json::json!({ "cosine_similarity": sim })),
                     );
-                    merged += 1;
-                    found_dup = true;
-                    break;
                 }
+                tracing::info!(
+                    "vec_dedup: LLM verdict {} superseded {id} by {} (cosine_sim={sim:.3})",
+                    relation,
+                    candidate.id
+                );
+                merged += 1;
+                found_dup = true;
+                break;
             }
         }
 
-        // Clear the flag whether or not we found a dup
         let _ = conn.execute(
             "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
             rusqlite::params![id],
         );
-        // If this memory was merged away, also clear the other's flag
+
         if found_dup {
-            // Already handled above via superseded_by
+            // Already handled above via superseded_by.
         }
     }
 
@@ -565,25 +639,25 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
     }
 }
 
-/// Run dedup scan across all topics with provenance-preserving merge.
+/// Run dedup scan across the provided topic groups with provenance-preserving merge.
 ///
 /// Instead of hard-deleting duplicates (which loses temporal anchors and unique
 /// details), this extracts unique lines from the "loser" and appends them to the
 /// "winner" with a provenance marker. The loser is then superseded, not deleted.
 ///
 /// Returns (duplicates_found, duplicates_merged).
-pub fn run_dedup(
+pub fn run_dedup_scoped(
     store: &SqliteStore,
     config: &ReinConfig,
+    groups: &[TopicGroup],
     threshold: f32,
     dry_run: bool,
     merge_variants: bool,
 ) -> ReinResult<(u32, u32)> {
-    let groups = super::resolve_topic_groups(store, None, &[], None, true, merge_variants)?;
     let mut dups_found = 0u32;
     let mut dups_merged = 0u32;
     let mut changed = false;
-    for group in &groups {
+    for group in groups {
         let mems: Vec<_> = load_group_memories(store, group)?
             .into_iter()
             .filter(|m| m.superseded_by.is_none())
@@ -783,6 +857,17 @@ pub fn run_dedup(
     Ok((dups_found, dups_merged))
 }
 
+pub fn run_dedup(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    threshold: f32,
+    dry_run: bool,
+    merge_variants: bool,
+) -> ReinResult<(u32, u32)> {
+    let groups = super::resolve_topic_groups(store, None, &[], None, true, merge_variants)?;
+    run_dedup_scoped(store, config, &groups, threshold, dry_run, merge_variants)
+}
+
 /// Extract lines from `source` that are not present in `target`.
 /// Used for provenance-preserving merge: keeps unique temporal anchors and details.
 pub fn extract_unique_lines(source: &str, target: &str) -> String {
@@ -917,9 +1002,9 @@ mod tests {
 
         // Neither should be superseded
         let m1 = store.get(&id1).unwrap();
-        let m2 = store.get(&id2).unwrap();
+        let _m2 = store.get(&id2).unwrap();
         assert!(m1.superseded_by.is_none(), "m1 should not be superseded");
-        assert!(m2.superseded_by.is_none(), "m2 should not be superseded");
+        assert!(_m2.superseded_by.is_none(), "m2 should not be superseded");
     }
 
     #[test]
@@ -966,6 +1051,77 @@ mod tests {
     }
 
     #[test]
+    fn test_take_vec_dedup_window_caps_processing() {
+        let config = ReinConfig::default();
+        let pending: Vec<VecDedupItem> = (0..20)
+            .map(|i| {
+                (
+                    format!("id-{i}"),
+                    "topic".to_string(),
+                    format!("summary-{i}"),
+                    format!("content-{i}"),
+                )
+            })
+            .collect();
+
+        let (window, skipped) = take_vec_dedup_window(pending, &config);
+        assert_eq!(window.len(), 16);
+        assert_eq!(skipped, 4);
+    }
+
+    #[test]
+    fn test_run_dedup_scoped_limits_to_selected_group() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        let left_1 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production config",
+            ))
+            .unwrap();
+        let left_2 = store
+            .store(test_memory(
+                "docker",
+                "deploy the application using docker compose up with the production configuration",
+            ))
+            .unwrap();
+        let right_1 = store
+            .store(test_memory(
+                "kubernetes",
+                "scale the kubernetes deployment to three replicas",
+            ))
+            .unwrap();
+        let right_2 = store
+            .store(test_memory(
+                "kubernetes",
+                "scale the kubernetes deployment to 3 replicas",
+            ))
+            .unwrap();
+
+        let groups = vec![TopicGroup {
+            canonical_topic: "docker".to_string(),
+            topics: vec!["docker".to_string()],
+        }];
+
+        let (found, merged) =
+            run_dedup_scoped(&store, &config, &groups, 0.70, false, false).unwrap();
+        assert_eq!(found, 1);
+        assert_eq!(merged, 1);
+
+        let left_superseded = [store.get(&left_1).unwrap(), store.get(&left_2).unwrap()]
+            .into_iter()
+            .filter(|memory| memory.superseded_by.is_some())
+            .count();
+        let right_superseded = [store.get(&right_1).unwrap(), store.get(&right_2).unwrap()]
+            .into_iter()
+            .filter(|memory| memory.superseded_by.is_some())
+            .count();
+        assert_eq!(left_superseded, 1, "selected group should be deduplicated");
+        assert_eq!(right_superseded, 0, "non-selected group must remain untouched");
+    }
+
+    #[test]
     fn test_run_dedup_savepoint_atomicity() {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
@@ -988,7 +1144,6 @@ mod tests {
 
         // Determine winner and loser
         let m1 = store.get(&id1).unwrap();
-        let m2 = store.get(&id2).unwrap();
         let (winner_id, _loser_id) = if m1.superseded_by.is_some() {
             (&id2, &id1)
         } else {

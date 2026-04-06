@@ -62,6 +62,14 @@ Canonical state is tracked separately from the `memories` row itself:
 
 This allows the winning memory to stay searchable while evidence and audit history remain queryable.
 
+Canonical state is now the default read model across the stack:
+
+- hot-path store can reuse an existing canonical for gray-zone writes when evidence already exists
+- admission / novelty scoring works on the current canonical view
+- working-set and always-on surfaces are refreshed from canonical memories
+- recall ranks canonicals using support/diversity-aware reranking and returns lightweight evidence previews
+- REST / GUI detail views expand full evidence on demand
+
 ## Resolution Semantics
 
 Current relations:
@@ -129,5 +137,5 @@ The next architectural steps after this baseline are:
 
 1. cross-topic candidate generation using cluster blocking and ANN-first retrieval
 2. richer structured LLM merge outputs for every warm-path resolution
-3. MCP cleanup endpoints mirroring the CLI cleanup flow
-4. canonical-first read models that use evidence as the primary compression source
+3. adaptive learning loops that use canonical evidence features beyond reranker/alpha updates
+4. broader GUI surfaces that expose canonical/evidence density without opening detail panels

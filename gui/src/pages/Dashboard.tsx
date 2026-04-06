@@ -130,6 +130,19 @@ export default function Dashboard() {
             <div className="flex-1 min-w-0">
               <div className="text-sm truncate">{m.summary}</div>
               <div className="text-xs text-[var(--text-muted)] mt-1">{m.topic} · {new Date(m.created_at).toLocaleDateString()}</div>
+              <div className="flex items-center gap-2 mt-2 text-[10px]">
+                <span className="rounded bg-[var(--border)] px-2 py-0.5 font-mono text-[var(--text-muted)]">
+                  sup {m.support_count}
+                </span>
+                {m.support_count > 1 && (
+                  <span className="rounded bg-[var(--accent)]/12 px-2 py-0.5 text-[var(--accent)]">
+                    ev {m.support_count - 1}
+                  </span>
+                )}
+                <span className="rounded bg-[var(--success)]/12 px-2 py-0.5 font-mono text-[var(--success)]">
+                  div {m.source_diversity.toFixed(1)}
+                </span>
+              </div>
             </div>
             <div className="text-xs text-[var(--text-muted)] font-mono">{m.strength.toFixed(2)}</div>
           </div>

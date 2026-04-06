@@ -124,8 +124,9 @@ rein serve
 
 Batch consolidation fans out LLM synthesis asynchronously and in parallel, then commits SQLite writes sequentially. Cleanup actions also emit adaptive feedback and refresh M1-M6 state after the batch completes.
 
-For a full-store terminal cleanup without an agent:
-- `rein cleanup` runs across the whole store by default
+Cleanup is now scoped-first:
+- `rein cleanup --topic X`, `--topics ...`, or `--pattern ...` only deduplicates the selected groups
+- `rein cleanup` with no scope still runs across the whole store
 - `rein cleanup --dry-run` previews the scope
 - `rein cleanup --async` queues a durable cleanup job and wakes a background cleanup worker
 
@@ -133,6 +134,11 @@ Store-time gray-zone dedup now also uses a dedicated async queue:
 - hot-path store creates the new memory without blocking on remote LLM verdicts
 - a `dedup-queue` worker later resolves gray-zone pairs with structured LLM verdicts
 - you can drain it manually with `rein worker dedup-queue`
+
+Recall is now evidence-aware:
+- canonical memories are ranked with `support_count` and `source_diversity`
+- recall output includes lightweight `evidence_preview`
+- `rein evidence <canonical_id>` or `/api/memories/:id` expands the full evidence list
 
 Operator inspection commands:
 - `rein canonicals` shows canonical memories and their support/merge counters
@@ -233,6 +239,21 @@ rein automatically learns which memories are useful and which are noise, without
 **No manual tuning needed** — cold-starts with LLM judgment, data gradually takes over.
 
 Based on: ICLR 2026 Admission Control, PropMem (Prosus), FActScore, MACLA Bayesian posteriors.
+
+### Canonical-First Recall
+
+rein now treats canonical memories as the default read model:
+
+- store-time dedup tries to merge gray-zone writes into an existing canonical when evidence already exists
+- admission/novelty scoring uses the current canonical view, not raw topic fragments
+- working-set and always-on surfaces are refreshed from persisted canonical memories
+- recall returns canonical memories by default, with `evidence_preview` for absorbed observations
+- detail endpoints and GUI panels expand the full supporting evidence on demand
+
+For API compatibility, `GET /api/memories/:id` returns the legacy top-level memory fields and also includes:
+
+- `memory`: the canonical memory payload
+- `evidence`: supporting evidence snapshots
 
 ### Temporal Knowledge Graph (v0.4.0)
 

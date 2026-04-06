@@ -504,6 +504,14 @@ fn parse_candidates_from_event(
                 memory_id: c.get("id")?.as_str()?.to_string(),
                 bm25_norm: c.get("bm25_norm")?.as_f64()? as f32,
                 vec_norm: c.get("vec_norm")?.as_f64()? as f32,
+                support_count: c
+                    .get("support_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u32,
+                source_diversity: c
+                    .get("source_diversity")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32,
             })
         })
         .collect();
@@ -830,28 +838,66 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
                 .get("kg_norm")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0) as f32;
+            let episode = candidate
+                .get("episode_norm")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            let canonical_support = candidate
+                .get("support_count")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32 / (v as f32 + 1.0))
+                .unwrap_or(0.0);
+            let source_diversity = candidate
+                .get("source_diversity")
+                .and_then(|v| v.as_f64())
+                .map(|v| {
+                    let value = v as f32;
+                    value / (value + 1.0)
+                })
+                .unwrap_or(0.0);
 
             // Target: 1.0 if used by agent, 0.0 if not
             let target = if used_ids.contains(id) { 1.0_f32 } else { 0.0 };
-            let predicted = weights.w_fts * bm25 + weights.w_vec * vec + weights.w_kg * kg;
+            let predicted = weights.w_fts * bm25
+                + weights.w_vec * vec
+                + weights.w_kg * kg
+                + weights.w_episode * episode
+                + weights.w_canonical_support * canonical_support
+                + weights.w_source_diversity * source_diversity;
             let error = target - predicted;
 
-            // Capture pre-update retrieval subtotal BEFORE gradient update
-            let pre_subtotal = weights.w_fts + weights.w_vec + weights.w_kg;
+            // Capture pre-update learned subtotal BEFORE gradient update.
+            let pre_subtotal = weights.w_fts
+                + weights.w_vec
+                + weights.w_kg
+                + weights.w_episode
+                + weights.w_canonical_support
+                + weights.w_source_diversity;
 
-            // Gradient update (only for retrieval features — we have bm25/vec/kg from events)
+            // Gradient update for features present in recall_complete candidate payloads.
             weights.w_fts += lr * error * bm25;
             weights.w_vec += lr * error * vec;
             weights.w_kg += lr * error * kg;
+            weights.w_episode += lr * error * episode;
+            weights.w_canonical_support += lr * error * canonical_support;
+            weights.w_source_diversity += lr * error * source_diversity;
 
-            // Renormalize retrieval weights back to their pre-update subtotal
+            // Renormalize touched weights back to their pre-update subtotal
             // so untouched weights are not affected by the learning step.
-            let post_subtotal = weights.w_fts + weights.w_vec + weights.w_kg;
+            let post_subtotal = weights.w_fts
+                + weights.w_vec
+                + weights.w_kg
+                + weights.w_episode
+                + weights.w_canonical_support
+                + weights.w_source_diversity;
             if post_subtotal > 0.0 && pre_subtotal > 0.0 {
                 let scale = pre_subtotal / post_subtotal;
                 weights.w_fts *= scale;
                 weights.w_vec *= scale;
                 weights.w_kg *= scale;
+                weights.w_episode *= scale;
+                weights.w_canonical_support *= scale;
+                weights.w_source_diversity *= scale;
             }
 
             updates += 1;
@@ -859,7 +905,7 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     }
 
     if updates > 0 {
-        // Now normalize ALL 17 weights (including w_episode) to sum to 1.0
+        // Now normalize ALL weights to sum to 1.0
         let sum = weights.w_fts
             + weights.w_vec
             + weights.w_kg
@@ -871,6 +917,8 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             + weights.w_topic_match
             + weights.w_brevity
             + weights.w_channel_coverage
+            + weights.w_canonical_support
+            + weights.w_source_diversity
             + weights.w_usage_recency
             + weights.w_connectivity
             + weights.w_concept_richness
@@ -889,6 +937,8 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             weights.w_topic_match /= sum;
             weights.w_brevity /= sum;
             weights.w_channel_coverage /= sum;
+            weights.w_canonical_support /= sum;
+            weights.w_source_diversity /= sum;
             weights.w_usage_recency /= sum;
             weights.w_connectivity /= sum;
             weights.w_concept_richness /= sum;
@@ -1484,6 +1534,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_reranker_weight_learning_uses_canonical_features() {
+        let store = SqliteStore::in_memory().unwrap();
+        let before = crate::search::rerank::load_weights(store.conn());
+
+        for i in 0..12 {
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("req-rerank-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("docker".into()),
+                    query_type: Some("semantic".into()),
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "candidates": [
+                            {
+                                "id": format!("used-{i}"),
+                                "bm25_norm": 0.4,
+                                "vec_norm": 0.4,
+                                "kg_norm": 0.1,
+                                "episode_norm": 0.1,
+                                "support_count": 5,
+                                "source_diversity": 3.0
+                            },
+                            {
+                                "id": format!("unused-{i}"),
+                                "bm25_norm": 0.4,
+                                "vec_norm": 0.4,
+                                "kg_norm": 0.1,
+                                "episode_norm": 0.1,
+                                "support_count": 1,
+                                "source_diversity": 1.0
+                            }
+                        ]
+                    })),
+                },
+            );
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallAccess,
+                    request_id: Some(format!("req-rerank-{i}")),
+                    memory_id: Some(format!("used-{i}")),
+                    concept_id: None,
+                    query: None,
+                    query_type: None,
+                    topic: None,
+                    payload: Some(serde_json::json!({ "source": "agent_feedback" })),
+                },
+            );
+        }
+
+        run_reranker_weight_learning(&store);
+        let after = crate::search::rerank::load_weights(store.conn());
+
+        assert!(after.w_canonical_support > before.w_canonical_support);
+        assert!(after.w_source_diversity > before.w_source_diversity);
+    }
+
     // ── Test 5: peek_recall_events ───────────────────────────────────────────
 
     #[test]
@@ -1578,11 +1690,15 @@ mod tests {
                         memory_id: mem_a.clone(),
                         bm25_norm: 0.9,
                         vec_norm: 0.2,
+                        support_count: 1,
+                        source_diversity: 1.0,
                     },
                     crate::search::alpha_optimizer::CandidateLog {
                         memory_id: mem_b.clone(),
                         bm25_norm: 0.1,
                         vec_norm: 0.95,
+                        support_count: 1,
+                        source_diversity: 1.0,
                     },
                 ],
                 // Agent accessed the BM25-dominant candidate

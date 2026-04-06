@@ -114,9 +114,7 @@ impl ReinServer {
 
         match result {
             Ok(results) => {
-                let scored: Vec<(Memory, f32)> =
-                    results.into_iter().map(|r| (r.memory, r.score)).collect();
-                let mut text = compact::format_recall_results(&scored, self.compact());
+                let mut text = compact::format_recall_results(&results, self.compact());
                 if text.is_empty() {
                     text = if self.compact() {
                         "none".to_string()
@@ -124,7 +122,7 @@ impl ReinServer {
                         "No memories found.".to_string()
                     };
                 }
-                if !self.compact() && !scored.is_empty() {
+                if !self.compact() && !results.is_empty() {
                     text = format!(
                         "[route: {} | request_id: {}] {}",
                         route.query_type, request_id, text

@@ -417,6 +417,8 @@ fn api_recall(
                         obj.insert("score".to_string(), json!(r.score));
                         obj.insert("confidence".to_string(), json!(r.confidence));
                         obj.insert("sources_hit".to_string(), json!(r.sources_hit));
+                        obj.insert("evidence_count".to_string(), json!(r.evidence_count));
+                        obj.insert("evidence_preview".to_string(), json!(r.evidence_preview));
                     }
                     m
                 })
@@ -436,7 +438,38 @@ fn api_get_memory(config: &ReinConfig, id: &str) -> BoxedResponse {
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     match store.get(id) {
-        Ok(m) => json_response(StatusCode::OK, memory_to_json(&m)),
+        Ok(m) => {
+            let canonical_id = m
+                .canonical_id
+                .clone()
+                .unwrap_or_else(|| m.id.clone());
+            let mut body = memory_to_json(&m);
+            let evidence = store
+                .list_memory_evidence(&canonical_id, 12)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|item| item.memory_id.as_deref() != Some(canonical_id.as_str()))
+                .map(|item| {
+                    json!({
+                        "id": item.id,
+                        "canonical_id": item.canonical_id,
+                        "memory_id": item.memory_id,
+                        "source_topic": item.source_topic,
+                        "summary": item.summary,
+                        "content": item.content,
+                        "keywords": item.keywords,
+                        "source": format!("{}", item.source),
+                        "created_at": item.created_at.to_rfc3339(),
+                        "imported_at": item.imported_at.to_rfc3339(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("memory".to_string(), memory_to_json(&m));
+                obj.insert("evidence".to_string(), json!(evidence));
+            }
+            json_response(StatusCode::OK, body)
+        }
         Err(e) => error_response(StatusCode::NOT_FOUND, &format!("memory not found: {e}")),
     }
 }
@@ -771,6 +804,12 @@ fn memory_to_json(m: &crate::types::Memory) -> serde_json::Value {
         "tier": format!("{}", m.tier),
         "cluster_id": m.cluster_id,
         "access_count": m.access_count,
+        "canonical_id": m.canonical_id,
+        "support_count": m.support_count,
+        "merge_count": m.merge_count,
+        "dedup_confidence": m.dedup_confidence,
+        "source_diversity": m.source_diversity,
+        "contradiction_score": m.contradiction_score,
         "status": format!("{}", m.status),
         "related_ids": m.related_ids,
         "concept_ids": m.concept_ids,

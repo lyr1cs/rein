@@ -31,6 +31,22 @@ pub struct SqliteStore {
     tantivy_cache: std::cell::RefCell<Option<super::tantivy_fts::TantivyFts>>,
 }
 
+pub(crate) const MEMORY_SELECT_COLUMNS: &str = "m.id, m.layer, m.topic, m.summary, m.content, \
+    m.keywords, m.importance, m.source, m.strength, m.decay_lambda, m.access_count, \
+    m.superseded_by, COALESCE(cs.canonical_id, m.id) AS canonical_id, \
+    COALESCE(cs.support_count, 1) AS support_count, COALESCE(cs.merge_count, 0) AS merge_count, \
+    COALESCE(cs.dedup_confidence, 1.0) AS dedup_confidence, \
+    COALESCE(cs.source_diversity, 1.0) AS source_diversity, \
+    COALESCE(cs.contradiction_score, 0.0) AS contradiction_score, \
+    m.related_ids, m.concept_ids, m.status, m.tier, m.cluster_id, m.created_at, m.updated_at, m.last_accessed";
+
+pub(crate) fn memory_select_base() -> String {
+    format!(
+        "SELECT {MEMORY_SELECT_COLUMNS} FROM memories m \
+         LEFT JOIN memory_canonical_state cs ON cs.memory_id = m.id"
+    )
+}
+
 impl SqliteStore {
     /// Open or create a database at the given path.
     /// Uses SQLITE_OPEN_FULL_MUTEX for thread-safe access via serialized mode.
@@ -125,9 +141,8 @@ impl SqliteStore {
 
     /// Get all memories in a topic (for dedup scanning).
     pub fn get_by_topic(&self, topic: &str) -> ReinResult<Vec<Memory>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM memories WHERE topic = ?1")?;
+        let sql = format!("{} WHERE m.topic = ?1", memory_select_base());
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![topic], |row| {
             row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -157,7 +172,8 @@ impl SqliteStore {
         // SQLite doesn't support array parameters, so build a parameterized IN clause
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
-            "SELECT * FROM memories WHERE id IN ({})",
+            "{} WHERE m.id IN ({})",
+            memory_select_base(),
             placeholders.join(",")
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = ids
@@ -185,9 +201,8 @@ impl SqliteStore {
 
     /// Get the most recently created memories.
     pub fn recent(&self, limit: usize) -> ReinResult<Vec<Memory>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM memories ORDER BY created_at DESC LIMIT ?1")?;
+        let sql = format!("{} ORDER BY m.created_at DESC LIMIT ?1", memory_select_base());
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![limit], |row| {
             row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -210,12 +225,12 @@ impl SqliteStore {
     }
 
     pub fn get_by_cluster(&self, cluster_id: u32, limit: usize) -> ReinResult<Vec<Memory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM memories
-             WHERE cluster_id = ?1 AND superseded_by IS NULL AND status = 'active'
-             ORDER BY updated_at DESC
-             LIMIT ?2",
-        )?;
+        let sql = format!(
+            "{} WHERE m.cluster_id = ?1 AND m.superseded_by IS NULL AND m.status = 'active' \
+             ORDER BY m.updated_at DESC LIMIT ?2",
+            memory_select_base()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![cluster_id, limit as i64], |row| {
             row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -367,15 +382,12 @@ impl SqliteStore {
     }
 
     pub fn list_canonical_memories(&self, limit: usize) -> ReinResult<Vec<Memory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.*
-             FROM memories m
-             LEFT JOIN memory_canonical_state cs ON cs.memory_id = m.id
-             WHERE m.superseded_by IS NULL
-               AND COALESCE(cs.canonical_id, m.id) = m.id
-             ORDER BY m.updated_at DESC
-             LIMIT ?1",
-        )?;
+        let sql = format!(
+            "{} WHERE m.superseded_by IS NULL AND COALESCE(cs.canonical_id, m.id) = m.id \
+             ORDER BY m.updated_at DESC LIMIT ?1",
+            memory_select_base()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
             row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -673,7 +685,8 @@ impl MemoryStore for SqliteStore {
     }
 
     fn get(&self, id: &str) -> ReinResult<Memory> {
-        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+        let sql = format!("{} WHERE m.id = ?1", memory_select_base());
+        let mut stmt = self.conn.prepare(&sql)?;
         let memory = stmt
             .query_row(rusqlite::params![id], |row| {
                 row_to_memory(row).map_err(|e| {
@@ -1169,10 +1182,17 @@ impl SqliteStore {
 
             let resolved_action = match dedup_action {
                 DedupAction::GrayZone(candidate_id, sim) => {
-                    if self.get(&candidate_id).is_ok() {
-                        pending_grayzone = Some((candidate_id, sim));
+                    if let Some(canonical_id) = self.grayzone_canonical_anchor(&candidate_id)? {
+                        tracing::debug!(
+                            "gray-zone dedup: reusing canonical {canonical_id} for candidate {candidate_id} (sim={sim:.2})"
+                        );
+                        DedupAction::MergeInto(canonical_id)
+                    } else {
+                        if self.get(&candidate_id).is_ok() {
+                            pending_grayzone = Some((candidate_id, sim));
+                        }
+                        DedupAction::CreateNew
                     }
-                    DedupAction::CreateNew
                 }
                 other => other,
             };
@@ -1216,6 +1236,35 @@ impl SqliteStore {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(e)
             }
+        }
+    }
+
+    fn grayzone_canonical_anchor(&self, candidate_id: &str) -> ReinResult<Option<String>> {
+        let canonical_id = self.canonical_id_for(candidate_id)?;
+        let Some(canonical) = self.get(&canonical_id).ok() else {
+            return Ok(None);
+        };
+
+        if canonical.superseded_by.is_some()
+            || !matches!(canonical.status, MemoryStatus::Active | MemoryStatus::Updated)
+        {
+            return Ok(None);
+        }
+
+        let has_evidence = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_evidence WHERE canonical_id = ?1)",
+                rusqlite::params![&canonical_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if has_evidence || canonical_id != candidate_id {
+            Ok(Some(canonical_id))
+        } else {
+            Ok(None)
         }
     }
 
@@ -1908,6 +1957,39 @@ mod tests {
     }
 
     #[test]
+    fn test_store_with_dedup_grayzone_reuses_established_canonical() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let canonical = test_memory_with_content(
+            "docker",
+            "docker setup",
+            "docker compose local development stack keeps api database cache queue search metrics logging stable safe deterministic reusable portable observable maintainable candidate old",
+            Importance::High,
+        );
+        let canonical_id = store.store_with_dedup(canonical, 0.95, 7).unwrap();
+
+        let grayzone = test_memory_with_content(
+            "docker",
+            "docker setup variant",
+            "docker compose local development stack keeps api database cache queue search metrics logging stable safe deterministic reusable portable observable maintainable candidate new",
+            Importance::High,
+        );
+        let result_id = store.store_with_dedup(grayzone, 0.95, 7).unwrap();
+
+        assert_eq!(result_id, canonical_id, "gray-zone dedup should reuse canonical");
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_memories, 1, "gray-zone reuse should not create a raw memory");
+
+        let evidence = store.list_memory_evidence(&canonical_id, 10).unwrap();
+        assert_eq!(evidence.len(), 2, "canonical evidence should record both memories");
+        assert!(
+            store.get(&canonical_id).unwrap().content.contains("[merged on"),
+            "canonical content should record provenance from gray-zone merge"
+        );
+    }
+
+    #[test]
     fn test_store_with_dedup_sets_needs_vec_dedup() {
         let store = SqliteStore::in_memory().unwrap();
         let mem = test_memory_with_content(
@@ -2031,6 +2113,24 @@ mod tests {
         assert!(evidence
             .iter()
             .any(|item| item.canonical_id == canonical_id));
+    }
+
+    #[test]
+    fn test_get_reflects_canonical_state_stats() {
+        let store = SqliteStore::in_memory().unwrap();
+        let canonical_id = store
+            .store(test_memory("docker", "compose notes", Importance::High))
+            .unwrap();
+        let fetched = store.get(&canonical_id).unwrap();
+        store
+            .snapshot_memory_as_evidence(&canonical_id, &fetched)
+            .unwrap();
+
+        let refreshed = store.get(&canonical_id).unwrap();
+        assert_eq!(refreshed.canonical_id.as_deref(), Some(canonical_id.as_str()));
+        assert_eq!(refreshed.support_count, 2);
+        assert_eq!(refreshed.merge_count, 1);
+        assert!(refreshed.source_diversity >= 1.0);
     }
 
     #[test]
