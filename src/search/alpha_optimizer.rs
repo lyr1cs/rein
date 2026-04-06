@@ -20,6 +20,8 @@ pub struct CandidateLog {
     pub memory_id: String,
     pub bm25_norm: f32,
     pub vec_norm: f32,
+    pub kg_norm: f32,
+    pub episode_norm: f32,
     pub support_count: u32,
     pub source_diversity: f32,
 }
@@ -50,6 +52,10 @@ pub struct LearnedAlpha {
 const COARSE_STEPS: usize = 21;
 /// Fine grid steps within ±0.05 of coarse best → 11 points at 0.01 resolution.
 const FINE_STEPS: usize = 11;
+const KG_BLEND: f64 = 0.10;
+const EPISODE_BLEND: f64 = 0.12;
+const SUPPORT_BLEND: f64 = 0.05;
+const DIVERSITY_BLEND: f64 = 0.05;
 
 /// Find the alpha that maximizes the rank of accessed memories.
 ///
@@ -79,7 +85,12 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
     let eval_alpha = |alpha: f64, scored: &mut Vec<(f64, usize)>| -> f64 {
         scored.clear();
         for (i, c) in event.candidates.iter().enumerate() {
-            let score = alpha * c.bm25_norm as f64 + (1.0 - alpha) * c.vec_norm as f64;
+            let score = alpha * c.bm25_norm as f64
+                + (1.0 - alpha) * c.vec_norm as f64
+                + KG_BLEND * c.kg_norm as f64
+                + EPISODE_BLEND * c.episode_norm as f64
+                + SUPPORT_BLEND * support_signal(c.support_count)
+                + DIVERSITY_BLEND * diversity_signal(c.source_diversity);
             scored.push((score, i));
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -122,6 +133,23 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
     }
 
     Some(best_alpha)
+}
+
+fn support_signal(support_count: u32) -> f64 {
+    if support_count > 1 {
+        (support_count - 1) as f64 / support_count as f64
+    } else {
+        0.0
+    }
+}
+
+fn diversity_signal(source_diversity: f32) -> f64 {
+    let diversity = source_diversity as f64;
+    if diversity > 1.0 {
+        (diversity - 1.0) / diversity
+    } else {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +284,8 @@ mod tests {
                     memory_id: id.to_string(),
                     bm25_norm: *bm25,
                     vec_norm: *vec,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
                     support_count: 1,
                     source_diversity: 1.0,
                 })
@@ -414,5 +444,37 @@ mod tests {
             learned.value,
             baseline.value
         );
+    }
+
+    #[test]
+    fn test_episode_and_kg_signals_affect_alpha_scoring() {
+        let event = RecallEvent {
+            request_id: "test".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "episodic".to_string(),
+                    bm25_norm: 0.3,
+                    vec_norm: 0.3,
+                    kg_norm: 0.2,
+                    episode_norm: 0.9,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "plain".to_string(),
+                    bm25_norm: 0.3,
+                    vec_norm: 0.3,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["episodic".to_string()],
+            timestamp: Utc::now(),
+        };
+
+        let alpha = optimal_alpha_for_event(&event).unwrap();
+        assert!((0.0..=1.0).contains(&alpha));
     }
 }

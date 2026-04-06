@@ -791,11 +791,13 @@ fn api_artifact_detail(
 // ===========================================================================
 
 fn memory_to_json(m: &crate::types::Memory) -> serde_json::Value {
+    let summary_short: String = m.summary.chars().take(110).collect();
     json!({
         "id": m.id,
         "layer": format!("{}", m.layer),
         "topic": m.topic,
         "summary": m.summary,
+        "summary_short": summary_short,
         "content": m.content,
         "keywords": m.keywords,
         "importance": format!("{}", m.importance),
