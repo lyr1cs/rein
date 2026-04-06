@@ -2,13 +2,13 @@
 
 ## Overview
 
-rein v0.13.x — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 26 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK dedup tokenization (`jieba-rs` + character bigrams), cluster-aware admission and survival-driven STM promotion. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
+rein v0.14.x — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 26 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK dedup tokenization (`jieba-rs` + character bigrams), cluster-aware admission, ANN fallback for large unclustered dedup buckets, and survival-driven STM promotion. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (300+)
+cargo test            # All tests must pass (330+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 docker build -t rein . # Docker image (~165MB)
@@ -95,7 +95,7 @@ gui/                 # Neural Wiki GUI (React 18 + TypeScript + Tailwind + Vite)
 │   ├── hooks/       # TanStack Query hooks with configurable polling
 │   ├── components/  # Layout (icon sidebar + vitals header)
 │   └── pages/       # 8 pages: Dashboard, Brain, Memories, Adaptive, Graph, Timeline, Artifacts, Settings
-└── vite.config.ts   # Dev proxy + Tailwind plugin
+└── vite.config.ts   # Dev proxy + manual chunks for react/charts/graph vendors
 
 Dockerfile           # Multi-stage build (rust:latest → debian:trixie-slim)
 docker-compose.yml   # One-command deployment
@@ -132,6 +132,7 @@ docker-compose.yml   # One-command deployment
 - STM→LTM promotion uses survival-curve-derived thresholds when cluster curves exist, with a fixed fallback otherwise
 - Large `cluster_id=None` dedup buckets use ANN candidate generation before pairwise comparison
 - Summary display is layered: canonical summaries may be longer, while APIs/UI can expose `summary_short` for list views
+- Adaptive status now exposes cluster-level dedup/admission/promotion decisions for the GUI
 - Adaptive status now exposes `cluster_profiles` for per-cluster dedup/admission/promotion inspection
 
 ## Common Pitfalls
