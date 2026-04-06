@@ -21,11 +21,20 @@ pub struct StoreExtractedStats {
     pub superseded_count: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AdmissionContext {
+    cluster_id: Option<u32>,
+    cluster_size: usize,
+    cluster_avg_strength: f64,
+    topic_memories: Vec<Memory>,
+    cluster_memories: Vec<Memory>,
+}
+
 /// Compute adaptive admission threshold from recent quality data.
 /// Base = 0.2. Adjusts up if recent quality is low, down if high.
 fn adaptive_admission_threshold(
     store: &crate::store::SqliteStore,
-    cluster_id: Option<u32>,
+    ctx: &AdmissionContext,
 ) -> f64 {
     let base = 0.2;
     let recent_avg: f64 = store.conn()
@@ -43,7 +52,7 @@ fn adaptive_admission_threshold(
         base
     };
 
-    let Some(cluster_id) = cluster_id else {
+    let Some(cluster_id) = ctx.cluster_id else {
         return global;
     };
     let cluster_avg: Option<f64> = store
@@ -58,21 +67,33 @@ fn adaptive_admission_threshold(
         .flatten();
 
     match cluster_avg {
-        Some(avg) if avg > 0.0 && recent_avg > 0.0 => (global * (recent_avg / avg)).clamp(0.15, 0.60),
+        Some(avg) if avg > 0.0 && recent_avg > 0.0 => {
+            let cluster_threshold = (global * (recent_avg / avg)).clamp(0.15, 0.60);
+            let blend = (ctx.cluster_size as f64 / 8.0).clamp(0.0, 1.0);
+            (global * (1.0 - blend) + cluster_threshold * blend).clamp(0.15, 0.60)
+        }
         _ => global,
     }
 }
 
 /// Multi-factor admission score (A-MAC 2026 inspired).
-fn multi_factor_admission_score(store: &crate::store::SqliteStore, item: &ExtractedMemory) -> f64 {
+fn multi_factor_admission_score(
+    _store: &crate::store::SqliteStore,
+    item: &ExtractedMemory,
+    ctx: &AdmissionContext,
+) -> f64 {
     let llm_conf = item.quality_confidence;
 
-    let novelty = {
-        let existing = current_topic_memories(store, &item.topic);
-        novelty_from_memories(&existing, &item.content)
+    let topic_novelty = novelty_from_memories(&ctx.topic_memories, &item.content);
+    let cluster_novelty = if ctx.cluster_memories.is_empty() {
+        topic_novelty
+    } else {
+        novelty_from_memories(&ctx.cluster_memories, &item.content)
     };
+    let novelty_blend = (ctx.cluster_size as f64 / 8.0).clamp(0.0, 1.0);
+    let novelty = topic_novelty * (1.0 - novelty_blend) + cluster_novelty * novelty_blend;
 
-    let type_prior = {
+    let base_type_prior = {
         let t = item.topic.to_lowercase();
         if ["architecture", "decision", "design"]
             .iter()
@@ -90,6 +111,13 @@ fn multi_factor_admission_score(store: &crate::store::SqliteStore, item: &Extrac
             0.6
         }
     };
+    let type_prior = if ctx.cluster_avg_strength > 0.75 {
+        (base_type_prior + 0.08_f64).min(0.98_f64)
+    } else if ctx.cluster_avg_strength < 0.35 && ctx.cluster_size >= 3 {
+        (base_type_prior - 0.08_f64).max(0.35_f64)
+    } else {
+        base_type_prior
+    };
 
     let recency = 0.7;
 
@@ -97,7 +125,9 @@ fn multi_factor_admission_score(store: &crate::store::SqliteStore, item: &Extrac
         return 0.0;
     }
 
-    0.45 * llm_conf + 0.25 * novelty + 0.15 * type_prior + 0.15 * recency
+    let cold_start_penalty = if ctx.cluster_size == 0 { 0.0 } else { 0.02 };
+    (0.45 * llm_conf + 0.25 * novelty + 0.15 * type_prior + 0.15 * recency - cold_start_penalty)
+        .clamp(0.0, 1.0)
 }
 
 fn novelty_from_memories(existing: &[Memory], content: &str) -> f64 {
@@ -149,6 +179,33 @@ fn dominant_cluster(memories: &[Memory]) -> Option<u32> {
         .map(|(cluster_id, _)| cluster_id)
 }
 
+fn build_admission_context(store: &crate::store::SqliteStore, topic: &str) -> AdmissionContext {
+    let topic_memories = current_topic_memories(store, topic);
+    let cluster_id = dominant_cluster(&topic_memories);
+    let cluster_memories: Vec<Memory> = cluster_id
+        .map(|cid| {
+            topic_memories
+                .iter()
+                .filter(|memory| memory.cluster_id == Some(cid))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let cluster_avg_strength = if cluster_memories.is_empty() {
+        0.0
+    } else {
+        cluster_memories.iter().map(|m| m.strength).sum::<f64>() / cluster_memories.len() as f64
+    };
+
+    AdmissionContext {
+        cluster_id,
+        cluster_size: cluster_memories.len(),
+        cluster_avg_strength,
+        topic_memories,
+        cluster_memories,
+    }
+}
+
 /// Store a list of ExtractedMemory items into the database.
 /// Filters secrets and deduplicates. Returns (count, stored_ids).
 pub fn store_extracted(
@@ -190,10 +247,9 @@ pub fn store_extracted_report(
             continue;
         }
 
-        let current = current_topic_memories(store, &item.topic);
-        let cluster_id = dominant_cluster(&current);
-        let threshold = adaptive_admission_threshold(store, cluster_id);
-        let admission = multi_factor_admission_score(store, &item);
+        let ctx = build_admission_context(store, &item.topic);
+        let threshold = adaptive_admission_threshold(store, &ctx);
+        let admission = multi_factor_admission_score(store, &item, &ctx);
         if admission < threshold {
             tracing::debug!(
                 "skipping low-quality memory (admission={:.2} < threshold={:.2}): {}",
@@ -638,12 +694,41 @@ mod tests {
         weak.strength = 0.2;
         store.store(weak).unwrap();
 
-        let strong_threshold = adaptive_admission_threshold(&store, Some(1));
-        let weak_threshold = adaptive_admission_threshold(&store, Some(2));
+        let strong_ctx = AdmissionContext {
+            cluster_id: Some(1),
+            cluster_size: 1,
+            cluster_avg_strength: 0.9,
+            topic_memories: vec![],
+            cluster_memories: vec![],
+        };
+        let weak_ctx = AdmissionContext {
+            cluster_id: Some(2),
+            cluster_size: 1,
+            cluster_avg_strength: 0.2,
+            topic_memories: vec![],
+            cluster_memories: vec![],
+        };
+        let strong_threshold = adaptive_admission_threshold(&store, &strong_ctx);
+        let weak_threshold = adaptive_admission_threshold(&store, &weak_ctx);
 
         assert!(
             strong_threshold < weak_threshold,
             "high-strength clusters should admit more easily"
         );
+    }
+
+    #[test]
+    fn multi_factor_admission_uses_cluster_novelty_and_type_prior() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut memory = stored_memory("architecture", "existing", "durable design decision");
+        memory.cluster_id = Some(3);
+        memory.strength = 0.9;
+        store.store(memory.clone()).unwrap();
+
+        let item = extracted_memory("architecture", "new", "durable design decision");
+        let ctx = build_admission_context(&store, "architecture");
+        let score = multi_factor_admission_score(&store, &item, &ctx);
+
+        assert!(score > 0.4, "high-value cluster/type should keep a reasonable score");
     }
 }

@@ -36,6 +36,7 @@ function strengthColor(strength: number): string {
 }
 
 type TierFilter = 'all' | 'hot' | 'warm' | 'cold';
+type SortMode = 'recent' | 'support' | 'strength' | 'relevance';
 
 /* ── MemoryCard ──────────────────────────────────────────────────── */
 
@@ -62,7 +63,7 @@ function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClic
 
       {/* Summary (2-line clamp) */}
       <p className="text-sm text-[var(--text-primary)] leading-snug line-clamp-2 mb-3">
-        {memory.summary}
+        {memory.summary_short ?? memory.summary}
       </p>
 
       {/* Bottom row: topic + importance */}
@@ -121,10 +122,12 @@ function DetailPanel({
   onDelete: (id: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showAllEvidence, setShowAllEvidence] = useState(false);
   const display = detail?.memory ?? memory;
   const badge = tierBadge(display.tier);
   const recallMeta = 'score' in memory ? memory as RecallResult : null;
   const evidence = detail?.evidence ?? [];
+  const visibleEvidence = showAllEvidence ? evidence : evidence.slice(0, 3);
 
   return (
     <div className="fixed inset-y-0 right-0 w-[280px] bg-[var(--bg-secondary)] border-l border-[var(--border)] shadow-2xl z-50 flex flex-col animate-slide-in overflow-hidden">
@@ -241,7 +244,13 @@ function DetailPanel({
             <div className="text-xs text-[var(--text-muted)]">Loading detail...</div>
           ) : evidence.length > 0 ? (
             <div className="space-y-2">
-              {evidence.map((item) => (
+              <div className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/5 p-2">
+                <div className="text-[10px] uppercase tracking-wider text-[var(--accent)] mb-1">
+                  Canonical
+                </div>
+                <div className="text-xs text-[var(--text-primary)]">{display.summary}</div>
+              </div>
+              {visibleEvidence.map((item) => (
                 <div key={item.id} className="rounded-lg border border-[var(--border)] bg-[var(--bg)]/50 p-2">
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <span className="text-[10px] uppercase tracking-wider text-[var(--accent)]">{item.source_topic}</span>
@@ -253,6 +262,14 @@ function DetailPanel({
                   </div>
                 </div>
               ))}
+              {evidence.length > 3 && (
+                <button
+                  onClick={() => setShowAllEvidence((v) => !v)}
+                  className="text-xs text-[var(--accent)] hover:text-[var(--accent)]/80 transition-colors"
+                >
+                  {showAllEvidence ? 'Show fewer evidence items' : `Show all ${evidence.length} evidence items`}
+                </button>
+              )}
             </div>
           ) : (
             <div className="text-xs text-[var(--text-muted)]">No supporting evidence beyond the canonical record.</div>
@@ -328,6 +345,7 @@ export default function Memories() {
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [topicFilter, setTopicFilter] = useState('');
   const [tierFilter, setTierFilter] = useState<TierFilter>('all');
+  const [sortMode, setSortMode] = useState<SortMode>('recent');
   const [selected, setSelected] = useState<(Memory | RecallResult) | null>(null);
   const { data: selectedDetail, isLoading: selectedLoading } = useMemoryDetail(selected?.id ?? null);
 
@@ -365,8 +383,21 @@ export default function Memories() {
     if (!isSearching && topicFilter) {
       list = list.filter((m) => m.topic === topicFilter);
     }
+    list = [...list].sort((a, b) => {
+      switch (sortMode) {
+        case 'support':
+          return b.support_count - a.support_count || b.source_diversity - a.source_diversity;
+        case 'strength':
+          return b.strength - a.strength || b.support_count - a.support_count;
+        case 'relevance':
+          return ('score' in b ? b.score : 0) - ('score' in a ? a.score : 0);
+        case 'recent':
+        default:
+          return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+      }
+    });
     return list;
-  }, [isSearching, recallData, recentData, tierFilter, topicFilter]);
+  }, [isSearching, recallData, recentData, tierFilter, topicFilter, sortMode]);
 
   const handleDelete = useCallback(
     async (id: string) => {
@@ -442,6 +473,16 @@ export default function Memories() {
             <span className="text-xs text-[var(--text-muted)] ml-auto">
               {isLoading ? 'Loading...' : `${memories.length} memories`}
             </span>
+            <select
+              value={sortMode}
+              onChange={(e) => setSortMode(e.target.value as SortMode)}
+              className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg px-3 py-1.5 text-xs text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+            >
+              <option value="recent">Sort: Recent</option>
+              <option value="support">Sort: Support</option>
+              <option value="strength">Sort: Strength</option>
+              <option value="relevance">Sort: Relevance</option>
+            </select>
           </div>
         </div>
 
