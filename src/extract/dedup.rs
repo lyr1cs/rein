@@ -24,7 +24,8 @@ pub struct CandidateScore {
 
 /// Normalize text for similarity comparison: lowercase + strip punctuation.
 fn normalize_tokens(text: &str) -> HashSet<String> {
-    text.split_whitespace()
+    let mut tokens: HashSet<String> = text
+        .split_whitespace()
         .map(|t| {
             t.to_lowercase()
                 .chars()
@@ -32,7 +33,43 @@ fn normalize_tokens(text: &str) -> HashSet<String> {
                 .collect::<String>()
         })
         .filter(|t| !t.is_empty())
-        .collect()
+        .collect();
+
+    if contains_cjk(text) {
+        let chars: Vec<char> = text
+            .nfc()
+            .flat_map(char::to_lowercase)
+            .filter(|c| !c.is_whitespace())
+            .filter(|c| c.is_alphanumeric() || is_cjk(*c))
+            .collect();
+
+        if chars.len() < 2 {
+            if !chars.is_empty() {
+                tokens.insert(chars.iter().collect());
+            }
+        } else {
+            for window in chars.windows(2) {
+                tokens.insert(window.iter().collect());
+            }
+        }
+    }
+
+    tokens
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF   // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0x3040..=0x309F // Hiragana
+            | 0x30A0..=0x30FF // Katakana
+            | 0xAC00..=0xD7AF // Hangul syllables
+    )
 }
 
 /// Jaccard similarity between two texts (token-level, punctuation-stripped).
@@ -550,6 +587,28 @@ mod tests {
         assert!(
             matches!(action, DedupAction::CreateNew),
             "weak gray-zone lexical matches should not escalate to LLM"
+        );
+    }
+
+    #[test]
+    fn test_cjk_similarity_uses_bigrams() {
+        let a = "数据库连接池修复";
+        let b = "数据库连接池问题修复";
+        let sim = similarity(a, b);
+        assert!(
+            sim > 0.4,
+            "CJK bigram fallback should produce meaningful similarity, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_cjk_similarity_distinguishes_unrelated_text() {
+        let a = "数据库连接池修复";
+        let b = "图神经网络训练";
+        let sim = similarity(a, b);
+        assert!(
+            sim < 0.3,
+            "unrelated CJK strings should stay low similarity, got {sim}"
         );
     }
 }

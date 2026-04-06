@@ -454,6 +454,12 @@ pub async fn run_consolidation_async(
             non_empty.push((group.clone(), memories));
         }
     }
+    non_empty.sort_by(|(left_group, left_memories), (right_group, right_memories)| {
+        right_memories
+            .len()
+            .cmp(&left_memories.len())
+            .then_with(|| left_group.canonical_topic.cmp(&right_group.canonical_topic))
+    });
 
     let summary_template_owned = summary_template.map(str::to_string);
     let config_owned = config.clone();
@@ -872,6 +878,36 @@ mod tests {
             memories.iter().all(|memory| memory.superseded_by.is_none()),
             "superseded history must not be fed into consolidation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_consolidation_async_prioritizes_larger_groups() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        store
+            .store(test_memory("small-topic", "one", "single memory", vec!["small"]))
+            .unwrap();
+
+        for i in 0..3 {
+            store
+                .store(test_memory(
+                    "large-topic",
+                    &format!("large {i}"),
+                    &format!("large memory {i}"),
+                    vec!["large"],
+                ))
+                .unwrap();
+        }
+
+        let groups = crate::ops::resolve_topic_groups(&store, None, &[], None, true, false)
+            .unwrap();
+        let report = run_consolidation_async(&store, &config, &groups, None, true)
+            .await
+            .unwrap();
+
+        let first_non_empty = report.groups.iter().find(|group| group.memory_count > 0).unwrap();
+        assert_eq!(first_non_empty.canonical_topic, "large-topic");
     }
 
     #[test]
