@@ -15,7 +15,7 @@ description: >
   important context.
 ---
 
-# rein Memory System (v0.13.x+)
+# rein Memory System (v0.14.x)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (25 tools) or via CLI (20+ commands). Features Neural Wiki GUI (`rein serve --gui`),
@@ -24,7 +24,8 @@ autonomous retrieval routing, memory evolution, transparent LLM proxy (record-on
 concept name normalization and dedup, async memory pipeline with file-based queue and
 background worker, project-scoped working set + always-on index for memory surfaces,
 canonical-first recall with evidence previews, and adaptive learning loops that use
-support_count/source_diversity in reranking and alpha optimization.
+support_count/source_diversity in reranking and alpha optimization. The GUI now also exposes
+cluster-level adaptive decisions and evidence-centric detail panels.
 
 ## CLI Commands
 
@@ -125,6 +126,7 @@ OPENAI_BASE_URL=http://127.0.0.1:8690 codex       # Codex CLI
 - **Cluster-Aware Admission**: admission threshold and novelty scoring incorporate cluster strength and cold-start blending
 - **Survival-Driven Promotion**: STM→LTM promotion uses survival curves when cluster data exists
 - **Layered Summaries**: canonical summaries stay detailed while API/UI expose `summary_short` for list views
+- **Adaptive Cluster Decisions**: GUI Adaptive page surfaces dedup/admission/promotion decisions per cluster
 - **ANN None-Bucket Dedup**: large unclustered dedup buckets use vector-neighbor candidate generation before pairwise scanning
 - **Adaptive Cluster Decisions**: Adaptive GUI surfaces cluster-level dedup/admission/promotion signals
 
