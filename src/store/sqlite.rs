@@ -1323,7 +1323,7 @@ impl SqliteStore {
                         }
                         existing.content = existing.content[trim_at..].to_string();
                     }
-                    existing.summary = existing.content.chars().take(100).collect();
+                    existing.summary = existing.content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
                     // Merge keywords (deduplicated)
                     for kw in &memory.keywords {
                         if !existing.keywords.contains(kw) {

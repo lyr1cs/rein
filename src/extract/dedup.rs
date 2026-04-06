@@ -79,54 +79,115 @@ fn normalize_token(text: &str) -> String {
         .collect()
 }
 
-fn contains_cjk(text: &str) -> bool {
+pub fn contains_cjk(text: &str) -> bool {
     text.chars().any(is_cjk)
 }
 
 fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,
-        0x3400..=0x4DBF   // CJK Extension A
+        0x3400..=0x4DBF     // CJK Extension A
             | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0x20000..=0x2A6DF // CJK Extension B
             | 0x3040..=0x309F // Hiragana
             | 0x30A0..=0x30FF // Katakana
+            | 0x31F0..=0x31FF // Katakana Phonetic Extensions
+            | 0xFF65..=0xFF9F // Halfwidth Katakana
             | 0xAC00..=0xD7AF // Hangul syllables
     )
 }
 
-/// Jaccard similarity between two texts (token-level, punctuation-stripped).
-pub fn jaccard_similarity(a: &str, b: &str) -> f32 {
-    let set_a = normalize_tokens(a);
-    let set_b = normalize_tokens(b);
-    let intersection = set_a.intersection(&set_b).count();
-    let union = set_a.union(&set_b).count();
+fn jaccard_from_sets(set_a: &HashSet<String>, set_b: &HashSet<String>) -> f32 {
+    let intersection = set_a.intersection(set_b).count();
+    let union = set_a.union(set_b).count();
     if union == 0 {
         return 0.0;
     }
     intersection as f32 / union as f32
 }
 
-/// Containment similarity: what fraction of the shorter text is covered by the longer.
-/// Better than Jaccard for dedup — a short summary of a longer text scores high.
-pub fn containment_similarity(a: &str, b: &str) -> f32 {
-    let set_a = normalize_tokens(a);
-    let set_b = normalize_tokens(b);
+fn containment_from_sets(set_a: &HashSet<String>, set_b: &HashSet<String>) -> f32 {
     let smaller = set_a.len().min(set_b.len());
     if smaller == 0 {
         return 0.0;
     }
-    set_a.intersection(&set_b).count() as f32 / smaller as f32
+    set_a.intersection(set_b).count() as f32 / smaller as f32
+}
+
+/// Tokenize text for search/FTS purposes. Returns sorted tokens (deterministic order)
+/// suitable for FTS queries. For CJK text, produces jieba segments + bigrams.
+/// Used by Tantivy indexing, keyword extraction, etc.
+pub fn tokenize_for_search(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = normalize_tokens(text).into_iter().collect();
+    tokens.sort(); // deterministic order — HashSet iteration is random
+    tokens
+}
+
+/// Tokenize text and return as a space-joined string suitable for Tantivy queries.
+/// Order is deterministic (sorted).
+pub fn tokenize_for_fts(text: &str) -> String {
+    let tokens = tokenize_for_search(text);
+    tokens.join(" ")
+}
+
+/// Extract meaningful keywords from text using jieba for CJK, whitespace for others.
+/// Returns deduplicated keywords sorted by length (longer = more specific).
+pub fn extract_keywords_from_text(text: &str, max_keywords: usize) -> Vec<String> {
+    let raw: Vec<String> = if contains_cjk(text) {
+        // Use jieba for meaningful word-level segmentation
+        jieba()
+            .cut(text, true) // HMM mode for better unknown word detection
+            .into_iter()
+            .map(normalize_token)
+            .filter(|t| !t.is_empty() && t.chars().count() >= 2)
+            .collect()
+    } else {
+        text.split_whitespace()
+            .map(|t| {
+                t.to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+            })
+            .filter(|t| t.len() >= 3) // skip short words like "the", "is"
+            .collect()
+    };
+    // Deduplicate with HashSet (handles non-adjacent duplicates), then sort by length
+    let mut seen = HashSet::new();
+    let mut keywords: Vec<String> = raw
+        .into_iter()
+        .filter(|kw| seen.insert(kw.clone()))
+        .collect();
+    keywords.sort_by(|a, b| b.len().cmp(&a.len()));
+    keywords.truncate(max_keywords);
+    keywords
+}
+
+/// Jaccard similarity between two texts (token-level, punctuation-stripped).
+pub fn jaccard_similarity(a: &str, b: &str) -> f32 {
+    jaccard_from_sets(&normalize_tokens(a), &normalize_tokens(b))
+}
+
+/// Containment similarity: what fraction of the shorter text is covered by the longer.
+/// Better than Jaccard for dedup — a short summary of a longer text scores high.
+pub fn containment_similarity(a: &str, b: &str) -> f32 {
+    containment_from_sets(&normalize_tokens(a), &normalize_tokens(b))
 }
 
 /// Combined similarity: max of Jaccard and Containment.
-/// Use this for dedup decisions — catches both paraphrases and subsets.
+/// Tokenizes each input once (not 4x) — important for CJK where jieba is expensive.
 pub fn similarity(a: &str, b: &str) -> f32 {
-    jaccard_similarity(a, b).max(containment_similarity(a, b))
+    let set_a = normalize_tokens(a);
+    let set_b = normalize_tokens(b);
+    jaccard_from_sets(&set_a, &set_b).max(containment_from_sets(&set_a, &set_b))
 }
 
 pub fn lexical_score(a: &str, b: &str) -> LexicalDedupScore {
-    let jaccard = jaccard_similarity(a, b);
-    let containment = containment_similarity(a, b);
+    let set_a = normalize_tokens(a);
+    let set_b = normalize_tokens(b);
+    let jaccard = jaccard_from_sets(&set_a, &set_b);
+    let containment = containment_from_sets(&set_a, &set_b);
     LexicalDedupScore {
         jaccard,
         containment,
@@ -244,7 +305,11 @@ pub fn check_dedup(
     time_window_days: i64,
     cluster_id: Option<u32>,
 ) -> ReinResult<DedupAction> {
-    // Extract key tokens from content for FTS query (take first few words)
+    // Extract key tokens from content for FTS query.
+    // NOTE: check_dedup uses SQLite FTS5 (not Tantivy). FTS5's unicode61 tokenizer
+    // does NOT segment CJK text, so we must pass raw content — jieba tokens would
+    // produce no matches. The Tantivy search path (in recall.rs) handles CJK
+    // enrichment separately via enrich_cjk().
     let query_tokens: Vec<&str> = content.split_whitespace().take(20).collect();
     if query_tokens.is_empty() {
         return Ok(DedupAction::CreateNew);
@@ -642,6 +707,49 @@ mod tests {
         assert!(
             tokens.contains("连接池") || tokens.contains("数据库"),
             "jieba-rs tokens should be present alongside n-grams: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_japanese_similarity_via_bigrams() {
+        // jieba is Chinese-specific, but bigrams still work for Japanese
+        let a = "データベース接続プール";
+        let b = "データベース接続の問題";
+        let sim = similarity(a, b);
+        assert!(
+            sim > 0.3,
+            "Japanese text should get meaningful similarity via bigrams, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_korean_similarity_via_bigrams() {
+        let a = "데이터베이스 연결 풀";
+        let b = "데이터베이스 연결 문제";
+        let sim = similarity(a, b);
+        assert!(
+            sim > 0.3,
+            "Korean text should get meaningful similarity via bigrams, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_cjk_ascii_similarity() {
+        let a = "使用 Docker 部署应用程序";
+        let b = "使用 Docker 部署服务";
+        let sim = similarity(a, b);
+        assert!(
+            sim > 0.4,
+            "mixed CJK+ASCII text should produce meaningful similarity, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_single_cjk_char() {
+        let tokens = normalize_tokens("人");
+        assert!(
+            !tokens.is_empty(),
+            "single CJK character should produce at least one token"
         );
     }
 }
