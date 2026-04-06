@@ -67,7 +67,7 @@ impl SupermemoryClient {
                         // Memory entry (from Claude Code plugin conversations)
                         (
                             memory_text.to_string(),
-                            memory_text.chars().take(100).collect::<String>(),
+                            memory_text.chars().take(crate::types::SUMMARY_MAX_CHARS).collect::<String>(),
                         )
                     } else if let Some(chunk_text) = item.get("chunk").and_then(|v| v.as_str()) {
                         // Document chunk (from Notion sync / uploaded files)
@@ -79,7 +79,7 @@ impl SupermemoryClient {
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
                         let summary = if title.is_empty() {
-                            chunk_text.chars().take(100).collect()
+                            chunk_text.chars().take(crate::types::SUMMARY_MAX_CHARS).collect()
                         } else {
                             title.to_string()
                         };
@@ -106,7 +106,7 @@ impl SupermemoryClient {
                             .unwrap_or("")
                             .to_string();
                         let summary = if title.is_empty() {
-                            chunk_content.chars().take(100).collect()
+                            chunk_content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect()
                         } else {
                             title
                         };

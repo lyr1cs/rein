@@ -127,7 +127,7 @@ fn merge_memory_into_winner(
         winner.tier = stronger_tier(winner.tier, loser.tier);
         winner.last_accessed = winner.last_accessed.max(loser.last_accessed);
         winner.updated_at = chrono::Utc::now();
-        winner.summary = winner.content.chars().take(100).collect();
+        winner.summary = winner.content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
         store.update(&winner)?;
         store.mark_superseded(&loser.id, winner_id)?;
         record_dedup_artifacts(
@@ -252,7 +252,7 @@ pub async fn resolve_dedup_job_async(
                     winner.decay_lambda = winner.decay_lambda.min(existing.decay_lambda);
                     winner.strength = (winner.strength + 0.05).min(1.0);
                     if !verdict.merged_summary.trim().is_empty() {
-                        winner.summary = verdict.merged_summary.chars().take(100).collect();
+                        winner.summary = verdict.merged_summary.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
                     }
                     winner.updated_at = chrono::Utc::now();
                     store.update(&winner)?;
@@ -697,7 +697,7 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                         kept.decay_lambda = kept.decay_lambda.min(discard_mem.decay_lambda);
                         kept.tier = stronger_tier(kept.tier, discard_mem.tier);
                         kept.last_accessed = kept.last_accessed.max(discard_mem.last_accessed);
-                        kept.summary = kept.content.chars().take(100).collect();
+                        kept.summary = kept.content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
                         kept.strength = (kept.strength + 0.2).min(1.0);
                         kept.updated_at = chrono::Utc::now();
                         store.update(&kept)?;
