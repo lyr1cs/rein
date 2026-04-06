@@ -72,6 +72,15 @@ export interface AdaptiveStatus {
   event_counts: Record<string, number>;
   survival_curves: Array<{ cluster_id: string; median_survival: number | null; steps?: number[][] }>;
   dedup_thresholds: { per_cluster: Record<string, number>; global: number };
+  cluster_profiles: Array<{
+    cluster_id: number;
+    memory_count: number;
+    avg_strength: number;
+    dedup_threshold: number;
+    admission_threshold: number;
+    promotion_threshold: number;
+    median_survival: number | null;
+  }>;
 }
 
 export interface Episode {
