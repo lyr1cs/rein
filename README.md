@@ -162,6 +162,15 @@ More detailed docs:
 - `docs/guides/evidence-aware-recall.md`
 - `docs/reference/adaptive-learning-signals.md`
 
+Audit / handoff commit chain:
+- `8b9e747`
+- `b358100`
+- `b861a4f`
+- `1b0765a`
+- `45de919`
+- `d92170a`
+- `d7200b3`
+
 Operator inspection commands:
 - `rein canonicals` shows canonical memories and their support/merge counters
 - `rein evidence <canonical_id>` shows absorbed evidence snapshots
