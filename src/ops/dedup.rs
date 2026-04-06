@@ -414,6 +414,114 @@ fn embed_vec_dedup_batch(
     result.ok().and_then(|value| value.ok())
 }
 
+fn none_bucket_ann_threshold(config: &ReinConfig) -> usize {
+    config.async_memory.batch_size.max(1) * 4
+}
+
+fn none_bucket_neighbor_limit(config: &ReinConfig) -> usize {
+    config.async_memory.batch_size.max(4)
+}
+
+fn bucket_embeddings(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    mems: &[Memory],
+    indices: &[usize],
+) -> std::collections::HashMap<usize, Vec<f32>> {
+    let conn = store.conn();
+    let model = config.embedding_model();
+    let mut embeddings = std::collections::HashMap::new();
+    let mut uncached: Vec<(usize, String)> = Vec::new();
+
+    for &idx in indices {
+        if let Some(emb) = crate::store::vec::get_embedding(conn, &mems[idx].id)
+            .ok()
+            .flatten()
+        {
+            embeddings.insert(idx, emb);
+            continue;
+        }
+
+        let enriched =
+            crate::embed::prepend_metadata(&mems[idx].topic, &mems[idx].summary, &mems[idx].content);
+        if let Ok(Some(emb)) = crate::embed::EmbedCache::get(conn, &enriched, &model) {
+            let _ = crate::store::vec::insert_embedding(conn, &mems[idx].id, &emb);
+            embeddings.insert(idx, emb);
+            continue;
+        }
+        uncached.push((idx, enriched));
+    }
+
+    if uncached.is_empty() {
+        return embeddings;
+    }
+
+    let Some(embedder) = crate::embed::create_embedder(config) else {
+        return embeddings;
+    };
+
+    for chunk in uncached.chunks(vec_dedup_embed_batch_size(config)) {
+        let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
+        let Some(batch) = embed_vec_dedup_batch(&embedder, &texts) else {
+            continue;
+        };
+        if batch.len() != chunk.len() {
+            continue;
+        }
+        for ((idx, enriched), emb) in chunk.iter().zip(batch.into_iter()) {
+            let _ = crate::embed::EmbedCache::put(conn, enriched, &model, &emb);
+            let _ = crate::store::vec::insert_embedding(conn, &mems[*idx].id, &emb);
+            embeddings.insert(*idx, emb);
+        }
+    }
+
+    embeddings
+}
+
+fn build_none_bucket_ann_candidates(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    mems: &[Memory],
+    indices: &[usize],
+) -> std::collections::HashMap<usize, Vec<usize>> {
+    if indices.len() <= none_bucket_ann_threshold(config) {
+        return std::collections::HashMap::new();
+    }
+
+    let embeddings = bucket_embeddings(store, config, mems, indices);
+    if embeddings.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let index_by_id: std::collections::HashMap<&str, usize> =
+        indices.iter().map(|&idx| (mems[idx].id.as_str(), idx)).collect();
+    let mut neighbors: std::collections::HashMap<usize, std::collections::BTreeSet<usize>> =
+        std::collections::HashMap::new();
+
+    for (&idx, embedding) in &embeddings {
+        let Ok(results) =
+            crate::store::vec::search_vec(store.conn(), embedding, none_bucket_neighbor_limit(config) + 1)
+        else {
+            continue;
+        };
+        for (neighbor_id, _) in results {
+            let Some(&j) = index_by_id.get(neighbor_id.as_str()) else {
+                continue;
+            };
+            if j == idx {
+                continue;
+            }
+            neighbors.entry(idx).or_default().insert(j);
+            neighbors.entry(j).or_default().insert(idx);
+        }
+    }
+
+    neighbors
+        .into_iter()
+        .map(|(idx, set)| (idx, set.into_iter().collect()))
+        .collect()
+}
+
 /// Embedding-based dedup sweep for memories marked `needs_vec_dedup`.
 /// Computes embeddings (if missing), searches vec_memories for near-duplicates,
 /// and merges/supersedes matches. Runs in the GC slow channel (zero hot-path cost).
@@ -722,15 +830,31 @@ pub fn run_dedup_scoped(
             cluster_groups.entry(mem.cluster_id).or_default().push(idx);
         }
 
+        let none_bucket_ann = cluster_groups
+            .get(&None)
+            .map(|indices| build_none_bucket_ann_candidates(store, config, &mems, indices))
+            .unwrap_or_default();
+
         // Compare within each cluster group (much smaller than full pairwise)
-        for (_cluster_id, indices) in &cluster_groups {
+        for (cluster_id, indices) in &cluster_groups {
         for ii in 0..indices.len() {
             let i = indices[ii];
             if processed.contains(&mems[i].id) {
                 continue;
             }
-            for jj in (ii + 1)..indices.len() {
-                let j = indices[jj];
+            let candidate_js: Vec<usize> = if cluster_id.is_none() && !none_bucket_ann.is_empty() {
+                none_bucket_ann
+                    .get(&i)
+                    .cloned()
+                    .filter(|neighbors| !neighbors.is_empty())
+                    .unwrap_or_else(|| indices[(ii + 1)..].to_vec())
+            } else {
+                indices[(ii + 1)..].to_vec()
+            };
+            for j in candidate_js {
+                if j <= i {
+                    continue;
+                }
                 if processed.contains(&mems[j].id) {
                     continue;
                 }
@@ -1168,6 +1292,38 @@ mod tests {
             .count();
         assert_eq!(left_superseded, 1, "selected group should be deduplicated");
         assert_eq!(right_superseded, 0, "non-selected group must remain untouched");
+    }
+
+    #[test]
+    fn test_build_none_bucket_ann_candidates_uses_vector_neighbors() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let mut mems = Vec::new();
+
+        for i in 0..40 {
+            let id = store
+                .store(test_memory("docker", &format!("docker note {i}")))
+                .unwrap();
+            let memory = store.get(&id).unwrap();
+            mems.push(memory);
+
+            let mut embedding = vec![0.0f32; 3072];
+            if i < 2 {
+                embedding[0] = 1.0;
+                embedding[1] = 1.0;
+            } else {
+                embedding[(i % 32) + 2] = 10.0 + i as f32;
+            }
+            crate::store::vec::insert_embedding(store.conn(), &id, &embedding).unwrap();
+        }
+
+        let indices: Vec<usize> = (0..mems.len()).collect();
+        let neighbors = build_none_bucket_ann_candidates(&store, &config, &mems, &indices);
+
+        assert!(
+            neighbors.get(&0).map(|ids| ids.contains(&1)).unwrap_or(false),
+            "ANN candidate graph should connect close unclustered memories"
+        );
     }
 
     #[test]

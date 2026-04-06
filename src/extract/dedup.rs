@@ -242,6 +242,7 @@ pub fn check_dedup(
     content: &str,
     similarity_threshold: f32,
     time_window_days: i64,
+    cluster_id: Option<u32>,
 ) -> ReinResult<DedupAction> {
     // Extract key tokens from content for FTS query (take first few words)
     let query_tokens: Vec<&str> = content.split_whitespace().take(20).collect();
@@ -274,7 +275,7 @@ pub fn check_dedup(
     let mut best_candidate_score = None;
 
     for candidate in &candidates {
-        let score = score_candidate(topic, content, candidate, None);
+        let score = score_candidate(topic, content, candidate, cluster_id);
         if score.final_score > best_sim {
             best_sim = score.final_score;
             best_memory = Some(candidate);
@@ -603,6 +604,7 @@ mod tests {
             "alpha beta gamma delta kappa lambda mu nu xi",
             0.70,
             7,
+            None,
         )
         .unwrap();
 

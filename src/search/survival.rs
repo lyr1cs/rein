@@ -241,6 +241,15 @@ pub fn adaptive_strength(
     ebbinghaus_strength * (1.0 - blend) + survival_strength * blend
 }
 
+/// Derive an STM→LTM promotion threshold from a survival curve.
+///
+/// Clusters with longer median survival require more repeated accesses before promotion,
+/// while fast-decaying clusters promote with fewer repeated accesses.
+pub fn promotion_access_threshold(curve: &SurvivalCurve) -> u32 {
+    let median = curve.median_survival.unwrap_or(7.0).clamp(1.0, 28.0);
+    ((median / 7.0).ceil() as u32 + 1).clamp(2, 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +475,24 @@ mod tests {
             strength,
             survival_prob
         );
+    }
+
+    #[test]
+    fn test_promotion_access_threshold_tracks_median_survival() {
+        let fast = SurvivalCurve {
+            steps: vec![(0.0, 1.0), (3.0, 0.4)],
+            event_count: 20,
+            total_count: 25,
+            median_survival: Some(3.0),
+        };
+        let slow = SurvivalCurve {
+            steps: vec![(0.0, 1.0), (14.0, 0.4)],
+            event_count: 20,
+            total_count: 25,
+            median_survival: Some(14.0),
+        };
+
+        assert!(promotion_access_threshold(&fast) < promotion_access_threshold(&slow));
     }
 
     #[test]
