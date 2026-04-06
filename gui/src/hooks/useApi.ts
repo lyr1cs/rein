@@ -1,6 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
 import { apiGet } from '../api/client';
-import type { StoreStats, AdaptiveStatus, Memory, RecallResult, Episode, Artifact } from '../api/types';
+import type {
+  StoreStats,
+  AdaptiveStatus,
+  Memory,
+  RecallResult,
+  Episode,
+  Artifact,
+  MemoryDetailResponse,
+} from '../api/types';
 
 const DEFAULT_INTERVAL = 5000;
 
@@ -42,6 +50,14 @@ export function useRecall(query: string, options?: { topic?: string; limit?: num
       return apiGet<{ results: RecallResult[]; count: number }>(`/api/memories?${params}`);
     },
     enabled: query.length > 0,
+  });
+}
+
+export function useMemoryDetail(id: string | null) {
+  return useQuery({
+    queryKey: ['memory-detail', id],
+    queryFn: () => apiGet<MemoryDetailResponse>(`/api/memories/${id}`),
+    enabled: !!id,
   });
 }
 

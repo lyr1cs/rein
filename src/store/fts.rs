@@ -1,7 +1,7 @@
 use crate::types::{Memory, ReinResult};
 use rusqlite::Connection;
 
-use super::sqlite::row_to_memory;
+use super::sqlite::{memory_select_base, row_to_memory, MEMORY_SELECT_COLUMNS};
 
 /// Sanitize user input for FTS5 queries by quoting each token.
 pub fn sanitize_fts_query(query: &str) -> String {
@@ -31,13 +31,16 @@ pub fn search_fts(
     // Try FTS5 first
     let results = if let Some(topic) = topic {
         let mut stmt = conn.prepare(
-            "SELECT m.*, bm25(memories_fts) as rank
+            &format!(
+            "SELECT {MEMORY_SELECT_COLUMNS}, bm25(memories_fts) as rank
              FROM memories_fts f
              JOIN memories m ON m.id = f.id
+             LEFT JOIN memory_canonical_state cs ON cs.memory_id = m.id
              WHERE memories_fts MATCH ?1
              AND m.topic = ?2
              ORDER BY rank
-             LIMIT ?3",
+             LIMIT ?3"
+            ),
         )?;
         let rows = stmt.query_map(rusqlite::params![sanitized, topic, limit as i64], |row| {
             let memory = row_to_memory(row).map_err(|e| {
@@ -53,12 +56,15 @@ pub fn search_fts(
         rows.collect::<Result<Vec<_>, _>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT m.*, bm25(memories_fts) as rank
+            &format!(
+            "SELECT {MEMORY_SELECT_COLUMNS}, bm25(memories_fts) as rank
              FROM memories_fts f
              JOIN memories m ON m.id = f.id
+             LEFT JOIN memory_canonical_state cs ON cs.memory_id = m.id
              WHERE memories_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?2",
+             LIMIT ?2"
+            ),
         )?;
         let rows = stmt.query_map(rusqlite::params![sanitized, limit as i64], |row| {
             let memory = row_to_memory(row).map_err(|e| {
@@ -83,13 +89,12 @@ pub fn search_fts(
     let escaped = query.replace('%', "\\%").replace('_', "\\_");
     let like_pattern = format!("%{escaped}%");
     let fallback = if let Some(topic) = topic {
-        let mut stmt = conn.prepare(
-            "SELECT * FROM memories
-             WHERE (topic LIKE ?1 ESCAPE '\\' OR summary LIKE ?1 ESCAPE '\\')
-             AND topic = ?2
-             ORDER BY strength DESC
-             LIMIT ?3",
-        )?;
+        let sql = format!(
+            "{} WHERE (m.topic LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\') \
+             AND m.topic = ?2 ORDER BY m.strength DESC LIMIT ?3",
+            memory_select_base()
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params![like_pattern, topic, limit as i64],
             |row| {
@@ -107,12 +112,12 @@ pub fn search_fts(
             .map(|m| (m, 0.0f32))
             .collect()
     } else {
-        let mut stmt = conn.prepare(
-            "SELECT * FROM memories
-             WHERE topic LIKE ?1 ESCAPE '\\' OR summary LIKE ?1 ESCAPE '\\'
-             ORDER BY strength DESC
-             LIMIT ?2",
-        )?;
+        let sql = format!(
+            "{} WHERE m.topic LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\' \
+             ORDER BY m.strength DESC LIMIT ?2",
+            memory_select_base()
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![like_pattern, limit as i64], |row| {
             row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(

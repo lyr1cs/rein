@@ -127,6 +127,17 @@ pub fn gray_zone_lower_bound(best_sim: f32, llm_budget_available: bool) -> f32 {
     }
 }
 
+fn should_escalate_gray_zone(
+    best_score: &CandidateScore,
+    best_sim: f32,
+    llm_budget_available: bool,
+) -> bool {
+    if best_score.lexical.score < 0.50 {
+        return false;
+    }
+    best_sim >= gray_zone_lower_bound(best_sim, llm_budget_available)
+}
+
 fn candidate_topics(store: &SqliteStore, topic: &str) -> ReinResult<Vec<String>> {
     let normalized = normalize_topic_key(topic);
     let mut topics = vec![topic.to_string()];
@@ -230,9 +241,10 @@ pub fn check_dedup(
     // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
     // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
     // Check sim range first to avoid wasting budget on non-candidates
-    let gray_floor = gray_zone_lower_bound(best_sim, m6_has_llm_budget(store));
-    if best_sim >= gray_floor {
-        if let Some(memory) = best_memory {
+    let llm_budget_available = m6_has_llm_budget(store);
+    if let Some(memory) = best_memory {
+        let score = score_candidate(topic, content, memory, None);
+        if should_escalate_gray_zone(&score, best_sim, llm_budget_available) {
             if is_exploration {
                 m6_log_outcome(
                     store,
@@ -483,5 +495,31 @@ mod tests {
         assert!((gray_zone_lower_bound(0.42, true) - 0.35).abs() < f32::EPSILON);
         assert!((gray_zone_lower_bound(0.42, false) - 0.50).abs() < f32::EPSILON);
         assert!((gray_zone_lower_bound(0.60, true) - 0.50).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_gray_zone_requires_stronger_lexical_signal() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        store
+            .store(test_memory(
+                "docker",
+                "alpha beta gamma delta epsilon zeta eta theta iota",
+            ))
+            .unwrap();
+
+        let action = check_dedup(
+            &store,
+            "docker",
+            "alpha beta gamma delta kappa lambda mu nu xi",
+            0.70,
+            7,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(action, DedupAction::CreateNew),
+            "weak gray-zone lexical matches should not escalate to LLM"
+        );
     }
 }

@@ -1,8 +1,10 @@
 //! Durable persistence helpers shared by hooks and async memory worker.
 
 use crate::config::ReinConfig;
+use crate::extract::dedup::normalize_topic_key;
 use crate::extract::llm::{ExtractedMemory, ExtractionResult};
-use crate::types::MemoryTier;
+use crate::types::traits::MemoryStore;
+use crate::types::{Memory, MemoryStatus, MemoryTier};
 
 use super::buffer::store_episode_concept;
 use super::parsing::looks_like_secret;
@@ -44,16 +46,8 @@ fn multi_factor_admission_score(store: &crate::store::SqliteStore, item: &Extrac
     let llm_conf = item.quality_confidence;
 
     let novelty = {
-        let existing = store.get_by_topic(&item.topic).unwrap_or_default();
-        if existing.is_empty() {
-            1.0
-        } else {
-            let max_sim = existing
-                .iter()
-                .map(|m| crate::extract::similarity(&item.content, &m.content))
-                .fold(0.0_f32, f32::max);
-            (1.0 - max_sim as f64).max(0.0)
-        }
+        let existing = current_topic_memories(store, &item.topic);
+        novelty_from_memories(&existing, &item.content)
     };
 
     let type_prior = {
@@ -82,6 +76,42 @@ fn multi_factor_admission_score(store: &crate::store::SqliteStore, item: &Extrac
     }
 
     0.45 * llm_conf + 0.25 * novelty + 0.15 * type_prior + 0.15 * recency
+}
+
+fn novelty_from_memories(existing: &[Memory], content: &str) -> f64 {
+    if existing.is_empty() {
+        return 1.0;
+    }
+    let max_sim = existing
+        .iter()
+        .map(|m| crate::extract::similarity(content, &m.content))
+        .fold(0.0_f32, f32::max);
+    (1.0 - f64::from(max_sim)).max(0.0)
+}
+
+fn current_topic_memories(store: &crate::store::SqliteStore, topic: &str) -> Vec<Memory> {
+    let mut seen = std::collections::HashSet::new();
+    let normalized = normalize_topic_key(topic);
+    let mut memories = Vec::new();
+    for existing_topic in store.list_topics().unwrap_or_default() {
+        if normalize_topic_key(&existing_topic) == normalized {
+            memories.extend(store.get_by_topic(&existing_topic).unwrap_or_default());
+        }
+    }
+
+    memories
+        .into_iter()
+        .filter(|memory| {
+            memory.superseded_by.is_none()
+                && matches!(memory.status, MemoryStatus::Active | MemoryStatus::Updated)
+        })
+        .filter(|memory| {
+            let canonical_key = store
+                .canonical_id_for(&memory.id)
+                .unwrap_or_else(|_| memory.id.clone());
+            seen.insert(canonical_key)
+        })
+        .collect()
 }
 
 /// Store a list of ExtractedMemory items into the database.
@@ -206,6 +236,35 @@ pub fn store_extracted_report(
     stats
 }
 
+fn surface_memories_for_ids(
+    store: &crate::store::SqliteStore,
+    ids: &[String],
+) -> Vec<ExtractedMemory> {
+    let mut seen = std::collections::HashSet::new();
+    let mut memories = Vec::new();
+
+    for id in ids {
+        let Ok(memory) = store.get_canonical(id) else {
+            continue;
+        };
+        if !seen.insert(memory.id.clone()) {
+            continue;
+        }
+
+        memories.push(ExtractedMemory {
+            topic: memory.topic.clone(),
+            summary: memory.summary.clone(),
+            content: memory.content.clone(),
+            keywords: memory.keywords.clone(),
+            importance: format!("{}", memory.importance),
+            should_store: true,
+            quality_confidence: f64::from(memory.dedup_confidence).max(memory.strength),
+        });
+    }
+
+    memories
+}
+
 pub fn process_quick_extraction(
     config: &ReinConfig,
     extracted: Vec<ExtractedMemory>,
@@ -216,11 +275,11 @@ pub fn process_quick_extraction(
         return Ok(0);
     }
     let store = config.open_store()?;
-    let extracted_for_ws = extracted.clone();
-    let (stored, _ids) = store_extracted(&store, config, extracted, agent_label, is_subagent);
+    let (stored, ids) = store_extracted(&store, config, extracted, agent_label, is_subagent);
+    let memories_for_ws = surface_memories_for_ids(&store, &ids);
     let _ = update_working_set(
         config,
-        &extracted_for_ws,
+        &memories_for_ws,
         &[],
         None,
         agent_label,
@@ -228,7 +287,7 @@ pub fn process_quick_extraction(
     );
     let _ = update_always_on_index(
         config,
-        &extracted_for_ws,
+        &memories_for_ws,
         &[],
         None,
         agent_label,
@@ -252,10 +311,10 @@ pub fn process_full_extraction(
 
     let store = config.open_store()?;
     let episode_for_ws = result.episode.clone();
-    let memories_for_ws = result.memories.clone();
     let concepts_for_ws = result.concepts.clone();
     let (mem_count, memory_ids) =
         store_extracted(&store, config, result.memories, agent_label, is_subagent);
+    let memories_for_ws = surface_memories_for_ids(&store, &memory_ids);
     let _ = update_working_set(
         config,
         &memories_for_ws,
@@ -331,4 +390,200 @@ pub fn process_full_extraction(
         (kg_report.concepts_added + kg_report.concepts_refined) as u32,
         kg_report.links_added as u32,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::hooks::working_set::{
+        load_always_on_index, load_working_set,
+    };
+    use crate::types::traits::MemoryStore;
+    use crate::store::SqliteStore;
+    use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
+
+    fn test_config(name: &str) -> ReinConfig {
+        let mut config = ReinConfig::default();
+        let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let base = std::env::temp_dir().join(format!("rein-persist-{name}-{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        config.database.path = base.join("memories.db").display().to_string();
+        config.hooks.buffer_dir = base.join("buffers").display().to_string();
+        config
+    }
+
+    fn extracted_memory(topic: &str, summary: &str, content: &str) -> ExtractedMemory {
+        ExtractedMemory {
+            topic: topic.to_string(),
+            summary: summary.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: "high".to_string(),
+            should_store: true,
+            quality_confidence: 0.9,
+        }
+    }
+
+    fn stored_memory(topic: &str, summary: &str, content: &str) -> crate::types::Memory {
+        crate::types::Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: summary.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::High,
+            source: Source::Hook,
+            strength: 0.9,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 0.9,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn current_topic_memories_excludes_superseded_and_keeps_updated() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let active_id = store
+            .store(stored_memory(
+                "docker",
+                "active memory",
+                "Current canonical docker note",
+            ))
+            .unwrap();
+        let mut active = store.get(&active_id).unwrap();
+        active.summary = "updated summary".to_string();
+        store.update(&active).unwrap();
+
+        let loser_id = store
+            .store(stored_memory(
+                "docker",
+                "duplicate memory",
+                "Current canonical docker note",
+            ))
+            .unwrap();
+        let winner_id = store
+            .store(stored_memory(
+                "docker",
+                "winner memory",
+                "Different docker guidance",
+            ))
+            .unwrap();
+        store.mark_superseded(&loser_id, &winner_id).unwrap();
+
+        let current = current_topic_memories(&store, "docker");
+        assert_eq!(current.len(), 2);
+        assert!(current
+            .iter()
+            .any(|memory| memory.status == MemoryStatus::Updated));
+        assert!(current.iter().all(|memory| memory.superseded_by.is_none()));
+    }
+
+    #[test]
+    fn canonical_view_novelty_ignores_superseded_duplicates() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let duplicate_id = store
+            .store(stored_memory(
+                "docker",
+                "duplicate memory",
+                "Use docker compose for local development",
+            ))
+            .unwrap();
+        let current_id = store
+            .store(stored_memory(
+                "docker",
+                "current memory",
+                "Use docker compose for deployment docs",
+            ))
+            .unwrap();
+        store.mark_superseded(&duplicate_id, &current_id).unwrap();
+
+        let item = extracted_memory(
+            "docker",
+            "new docker note",
+            "Use docker compose for local development",
+        );
+
+        let raw_memories = store.get_by_topic(&item.topic).unwrap_or_default();
+        let raw_novelty = novelty_from_memories(&raw_memories, &item.content);
+        let canonical_novelty =
+            novelty_from_memories(&current_topic_memories(&store, &item.topic), &item.content);
+
+        assert!(
+            canonical_novelty > raw_novelty,
+            "canonical view should be more novel than raw topic view"
+        );
+        assert!(
+            canonical_novelty > 0.0,
+            "canonical view should still leave room for novelty"
+        );
+    }
+
+    #[test]
+    fn quick_extraction_updates_surfaces_from_canonical_memories() {
+        let config = test_config("quick");
+        let extracted = vec![
+            extracted_memory(
+                "docker",
+                "compose setup",
+                "Use docker compose for local development and testing",
+            ),
+            extracted_memory(
+                "docker",
+                "compose setup variant",
+                "Use docker compose for local development and deployment",
+            ),
+        ];
+
+        let stored = process_quick_extraction(&config, extracted, "tester", false).unwrap();
+        assert_eq!(stored, 2, "both extracted memories should be admitted");
+
+        let working = load_working_set(&config);
+        let always_on = load_always_on_index(&config);
+
+        assert_eq!(working.len(), 1, "working set should reflect one canonical memory");
+        assert_eq!(always_on.len(), 1, "always-on index should reflect one canonical memory");
+        assert!(
+            working[0].detail.contains("docker compose"),
+            "surface item should be built from stored canonical content"
+        );
+    }
+
+    #[test]
+    fn current_topic_memories_normalizes_topic_variants() {
+        let config = test_config("variant-topic");
+        let _ = process_quick_extraction(
+            &config,
+            vec![extracted_memory(
+                "docker-deployment",
+                "compose setup",
+                "Use docker compose for local development and testing",
+            )],
+            "tester",
+            false,
+        )
+        .unwrap();
+
+        let store = config.open_store().unwrap();
+        let current = current_topic_memories(&store, "Docker Deployment");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].topic, "docker-deployment");
+    }
 }

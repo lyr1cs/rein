@@ -13,5 +13,23 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('react-force-graph') || id.includes('d3-')) {
+              return 'graph-vendor'
+            }
+            if (id.includes('recharts')) {
+              return 'charts-vendor'
+            }
+            if (id.includes('react') || id.includes('@tanstack')) {
+              return 'react-vendor'
+            }
+            return 'vendor'
+          }
+        },
+      },
+    },
   },
 })

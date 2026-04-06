@@ -31,6 +31,10 @@ pub struct RerankFeatures {
     pub brevity: f32,
     /// Number of channels that found this memory (1-3), normalized to [0.33, 1.0]
     pub channel_coverage: f32,
+    /// Canonical support signal: support_count / (support_count + 1)
+    pub canonical_support: f32,
+    /// Canonical source diversity signal: diversity / (diversity + 1)
+    pub source_diversity: f32,
     /// Days since last accessed (freshness of usage, not creation)
     pub usage_recency: f32,
     // --- Adaptive engine features (v0.9.2) ---
@@ -44,7 +48,7 @@ pub struct RerankFeatures {
     pub is_current: f32,
 }
 
-/// Learned weights for the linear scoring model (17 features).
+/// Learned weights for the linear scoring model (19 features).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankWeights {
     pub w_fts: f32,
@@ -63,6 +67,10 @@ pub struct RerankWeights {
     pub w_brevity: f32,
     #[serde(default = "default_w_channel_coverage")]
     pub w_channel_coverage: f32,
+    #[serde(default = "default_w_small")]
+    pub w_canonical_support: f32,
+    #[serde(default = "default_w_small")]
+    pub w_source_diversity: f32,
     #[serde(default = "default_w_usage_recency")]
     pub w_usage_recency: f32,
     #[serde(default = "default_w_small")]
@@ -97,8 +105,8 @@ fn default_w_small() -> f32 {
 /// Hand-tuned default weights (sum to 1.0). Retrieval signals dominate.
 pub fn default_weights() -> RerankWeights {
     RerankWeights {
-        w_fts: 0.16,
-        w_vec: 0.16,
+        w_fts: 0.14,
+        w_vec: 0.14,
         w_kg: 0.08,
         w_episode: 0.07,
         w_recency: 0.07,
@@ -109,6 +117,8 @@ pub fn default_weights() -> RerankWeights {
         w_topic_match: 0.03,
         w_brevity: 0.02,
         w_channel_coverage: 0.04,
+        w_canonical_support: 0.02,
+        w_source_diversity: 0.02,
         w_usage_recency: 0.03,
         w_connectivity: 0.03,
         w_concept_richness: 0.03,
@@ -141,6 +151,8 @@ pub fn rerank_score(f: &RerankFeatures, w: &RerankWeights) -> f32 {
         + w.w_topic_match * f.topic_match
         + w.w_brevity * f.brevity
         + w.w_channel_coverage * f.channel_coverage
+        + w.w_canonical_support * f.canonical_support
+        + w.w_source_diversity * f.source_diversity
         + w.w_usage_recency * usage_recency_factor
         + w.w_connectivity * f.connectivity
         + w.w_concept_richness * f.concept_richness
@@ -240,6 +252,8 @@ mod tests {
             topic_match: 1.0,
             brevity: 0.5,
             channel_coverage: 0.67,
+            canonical_support: 0.5,
+            source_diversity: 0.5,
             usage_recency: 2.0,
             connectivity: 0.3,
             concept_richness: 0.4,
@@ -267,6 +281,8 @@ mod tests {
             topic_match: 1.0,
             brevity: 1.0,
             channel_coverage: 1.0,
+            canonical_support: 0.8,
+            source_diversity: 0.7,
             usage_recency: 0.5,
             connectivity: 0.8,
             concept_richness: 1.0,
@@ -286,6 +302,8 @@ mod tests {
             topic_match: 0.0,
             brevity: 0.2,
             channel_coverage: 0.33,
+            canonical_support: 0.0,
+            source_diversity: 0.0,
             usage_recency: 30.0,
             connectivity: 0.0,
             concept_richness: 0.0,
@@ -337,6 +355,8 @@ mod tests {
             topic_match: 1.0,
             brevity: 1.0,
             channel_coverage: 1.0,
+            canonical_support: 1.0,
+            source_diversity: 1.0,
             usage_recency: 0.0,
             connectivity: 1.0,
             concept_richness: 1.0,
@@ -363,6 +383,8 @@ mod tests {
             + w.w_topic_match
             + w.w_brevity
             + w.w_channel_coverage
+            + w.w_canonical_support
+            + w.w_source_diversity
             + w.w_usage_recency
             + w.w_connectivity
             + w.w_concept_richness
@@ -472,6 +494,14 @@ mod tests {
         assert!(
             (final_w.w_channel_coverage - initial.w_channel_coverage).abs() < tolerance,
             "w_channel_coverage drifted"
+        );
+        assert!(
+            (final_w.w_canonical_support - initial.w_canonical_support).abs() < tolerance,
+            "w_canonical_support drifted"
+        );
+        assert!(
+            (final_w.w_source_diversity - initial.w_source_diversity).abs() < tolerance,
+            "w_source_diversity drifted"
         );
         assert!(
             (final_w.w_usage_recency - initial.w_usage_recency).abs() < tolerance,

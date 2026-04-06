@@ -236,12 +236,7 @@ pub fn handle_recall(
         keyword.as_deref(),
         limit,
     )?;
-    let scored: Vec<(types::Memory, f32)> =
-        results.into_iter().map(|r| (r.memory, r.score)).collect();
-    println!(
-        "{}",
-        mcp::compact::format_recall_results(&scored, config.server.compact)
-    );
+    println!("{}", mcp::compact::format_recall_results(&results, config.server.compact));
     Ok(())
 }
 

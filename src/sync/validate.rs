@@ -36,7 +36,7 @@ pub fn cross_validate(
             sources_hit += 1;
         }
 
-        let confidence = confidence_from_sources(sources_hit);
+        let confidence = (confidence_from_sources(sources_hit) + local_evidence_bonus(local)).min(0.99);
 
         validated.push(ValidatedResult {
             memory: local.clone(),
@@ -98,6 +98,16 @@ fn confidence_from_sources(sources_hit: usize) -> f32 {
         1 => 0.62,
         _ => 0.0,
     }
+}
+
+fn local_evidence_bonus(memory: &Memory) -> f32 {
+    let support_bonus = if memory.support_count > 1 {
+        ((memory.support_count - 1) as f32).min(4.0) * 0.01
+    } else {
+        0.0
+    };
+    let diversity_bonus = (memory.source_diversity - 1.0).max(0.0).min(3.0) * 0.01;
+    support_bonus + diversity_bonus
 }
 
 /// Check if a memory has a matching result in another source.
@@ -192,6 +202,19 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!((results[0].confidence - 0.62).abs() < f32::EPSILON);
         assert_eq!(results[0].sources_hit, 1);
+    }
+
+    #[test]
+    fn test_local_canonical_evidence_boosts_confidence() {
+        let mut memory = make_memory("local-1", "unique local content only here");
+        memory.support_count = 4;
+        memory.source_diversity = 2.0;
+        let local = vec![(memory, 0.5)];
+
+        let results = cross_validate(&local, &[], &[]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].confidence > 0.62);
+        assert!(results[0].confidence < 0.70);
     }
 
     #[test]
