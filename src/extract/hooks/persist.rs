@@ -139,7 +139,33 @@ fn novelty_from_memories(existing: &[Memory], content: &str) -> f64 {
     if existing.is_empty() {
         return 1.0;
     }
-    let max_sim = existing
+    // For small sets, lexical similarity is fine
+    if existing.len() <= 10 {
+        let max_sim = existing
+            .iter()
+            .map(|m| crate::extract::similarity(content, &m.content))
+            .fold(0.0_f32, f32::max);
+        return (1.0 - f64::from(max_sim)).max(0.0);
+    }
+    // For larger sets, sample top-10 by keyword overlap to avoid O(n) full scan
+    let content_tokens = crate::extract::tokenize_for_search(content);
+    let content_set: std::collections::HashSet<&str> =
+        content_tokens.iter().map(|s| s.as_str()).collect();
+    let mut scored: Vec<(usize, usize)> = existing
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let overlap = m
+                .keywords
+                .iter()
+                .filter(|k| content_set.contains(k.to_lowercase().as_str()))
+                .count();
+            (i, overlap)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_k: Vec<&Memory> = scored.iter().take(10).map(|(i, _)| &existing[*i]).collect();
+    let max_sim = top_k
         .iter()
         .map(|m| crate::extract::similarity(content, &m.content))
         .fold(0.0_f32, f32::max);
@@ -169,6 +195,40 @@ fn current_topic_memories(store: &crate::store::SqliteStore, topic: &str) -> Vec
             seen.insert(canonical_key)
         })
         .collect()
+}
+
+/// Check if the memory content is already captured as a concept definition.
+/// Uses FTS search across all memoirs to find matching concepts.
+fn is_already_a_concept(store: &crate::store::SqliteStore, content: &str) -> bool {
+    // Take first few keywords from content for concept search
+    let keywords = crate::extract::extract_keywords_from_text(content, 5);
+    if keywords.is_empty() {
+        return false;
+    }
+    let query = keywords.join(" ");
+    // Search concepts across all memoirs via FTS
+    let results: Vec<String> = store
+        .conn()
+        .prepare(
+            "SELECT c.definition FROM concepts_fts f
+             JOIN concepts c ON c.id = f.id
+             WHERE concepts_fts MATCH ?1
+             LIMIT 5",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map(
+                rusqlite::params![crate::store::fts::sanitize_fts_query(&query)],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    // Check if any concept definition is highly similar to this memory content
+    results
+        .iter()
+        .any(|def| crate::extract::similarity(content, def) > 0.80)
 }
 
 fn dominant_cluster(memories: &[Memory]) -> Option<u32> {
@@ -254,6 +314,16 @@ pub fn store_extracted_report(
     for item in items {
         if looks_like_secret(&item.content) {
             stats.secret_filtered_count += 1;
+            continue;
+        }
+
+        // Cross-check: skip if the same fact already exists as a concept
+        if is_already_a_concept(store, &item.content) {
+            tracing::debug!(
+                "skipping memory already captured as concept: {}",
+                item.summary
+            );
+            stats.filtered_count += 1;
             continue;
         }
 
