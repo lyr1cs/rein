@@ -793,7 +793,7 @@ This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, whi
 #### Memory Decay Model
 
 - **Critical** memories never decay (strength = 1.0 forever)
-- **STM** (Short-Term Memory): faster decay (beta = 1.2), auto-promoted to LTM after 5 accesses
+- **STM** (Short-Term Memory): faster decay (beta = 1.2), promoted to LTM via cluster survival curve (fallback: 5 accesses)
 - **LTM** (Long-Term Memory): slower decay (beta = 0.8), assigned to high / critical importance
 - Access count slows decay: `lambda_eff = lambda / (1 + access_count * 0.2)`
 
@@ -821,7 +821,7 @@ This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, whi
 | Vector search (API) | < 300 ms |
 | Store (with dedup) | < 5 ms |
 | Memory footprint | 2-5 MB |
-| Binary size (release) | < 10 MB |
+| Binary size (release) | ~13 MB (CLI), ~16 MB (with GUI) |
 
 ### Cost Estimate
 
@@ -849,7 +849,7 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 
 | 特性 | 说明 |
 |------|------|
-| **24 个 MCP 工具** | 12 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 |
+| **26 个 MCP 工具** | 13 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 + 1 个自适应 |
 | **自适应引擎** | M1-M6 六模块：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
 | **反事实 Alpha 优化** | 回放历史 recall，粗细网格搜索最优 CC 融合权重（M2） |
 | **Per-cluster KM 衰减** | Kaplan-Meier 生存曲线替代固定遗忘曲线（数据足够时自动切换，M3） |
@@ -872,6 +872,15 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 | **gemini-embedding-001** | MTEB 排名第一（68.32），3072 维 |
 | **20+ CLI 命令** | MCP 工具的全部功能，另加 init、config、migrate、hooks、recent、gc、organize、upgrade |
 | **自动配置** | `rein init` 自动检测并配置 8 个 MCP 客户端 |
+| **Neural Wiki GUI** | React + Tailwind Web 仪表盘：Brain View、Adaptive Engine、Knowledge Graph、Timeline 等 |
+| **混合 CJK 去重分词** | jieba-rs 中文分词 + 字符 bigrams，覆盖中日韩文本的去重和搜索 |
+| **Per-cluster 准入控制** | 准入阈值和新颖度计算感知 HDBSCAN 聚类上下文 |
+| **Evidence 二次重排** | 低置信度 / 单来源 recall 结果可被 evidence 内容匹配后提升 |
+| **生存曲线驱动 STM 晋升** | STM→LTM 晋升使用聚类生存曲线（可用时） |
+| **嵌入跨 topic 去重** | check_dedup 同时走 FTS + embedding 两路候选，捕捉跨 topic 语义重复 |
+| **Session 分 chunk 提取** | 长会话按自然边界分割，跨 chunk 去重合并，不再截断丢失 |
+| **上下文感知提取** | 提取前注入已有记忆，LLM 只输出增量知识 |
+| **Topic 自动推断** | 规则 fallback 路径从关键词推断 topic 类别，替代 "auto-extracted" |
 | **远程访问** | HTTP / SSE 传输，支持 bearer token 认证 |
 
 ### 安装
@@ -881,7 +890,12 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 ```bash
 git clone https://github.com/lyr1cs/rein.git
 cd rein
+
+# 标准构建（CLI + MCP 服务）
 cargo install --path .
+
+# 完整构建（包含 Neural Wiki GUI，推荐）
+cargo install --path . --features gui
 ```
 
 或使用安装脚本：
@@ -894,6 +908,22 @@ cargo install --path .
 
 - Rust 工具链 (1.75+)
 - Gemini API 密钥（免费额度：1500 请求/天）
+
+#### GUI 服务管理
+
+```bash
+# 后台启动 GUI 服务（监听 :8680）
+rein gui on
+
+# 停止 GUI 服务
+rein gui off
+
+# 或前台运行 MCP + GUI
+rein serve --gui
+
+# 在浏览器打开
+open http://localhost:8680
+```
 
 ### 快速开始
 
@@ -946,6 +976,32 @@ rein serve
 | `dashboard` | 显示服务状态、指标、记忆统计 | `rein dashboard` |
 | `gui on/off` | 后台启动/停止 GUI 服务 | `rein gui on` |
 | `proxy on/off` | 后台启动/停止 proxy 服务 | `rein proxy on` |
+
+### Cleanup 工作原理（保留溯源）
+
+rein 的清理管线是**保留溯源**的：永远不会硬删除信息。流程分三个阶段：
+
+1. **合并（Consolidation）** — 将 topic 变体（如 `Docker Deployment` / `docker-deployment`）归组，每组内所有记忆合并为一条高质量 canonical 记忆。原始记忆作为 evidence 保存到 `memory_evidence` 表，保留原始内容、时间戳和关键词。
+
+2. **去重（Dedup）** — 在每个 topic 组内扫描内容级重复，使用词汇相似度（Jaccard + containment）和可选的嵌入余弦相似度。匹配的"输家"的独特内容被附加到"赢家"上（带溯源标记 `[merged from <id> on <date>]`），然后作为 evidence 记录。
+
+3. **自适应刷新** — 合并和去重完成后，自适应引擎（M1-M6）运行：HDBSCAN 重聚类、生存曲线重建、层级边界更新、alpha/阈值学习处理新事件。
+
+每次合并决策都记录在 `dedup_decisions` append-only 账本中，包含赢家/输家 ID、分数、关系类型、置信度和操作者。这是 rein 的 reflog — 你可以随时追溯一条 canonical 记忆是如何形成的。
+
+```bash
+# 预览清理效果（安全）
+rein cleanup --all --dry-run
+
+# 对特定 topic 清理
+rein cleanup --topic "docker-deployment"
+
+# 全库清理
+rein cleanup --all
+
+# 排队后台清理
+rein cleanup --all --async
+```
 
 `consolidate` 兼容旧用法 `rein consolidate <topic> -s "summary"`，同时新增：
 - `--topics a,b,c`：按显式 topic 列表批量处理
@@ -1317,7 +1373,7 @@ open http://localhost:8680
                             |
                    +--------+--------+
                    |                 |
-              CLI (20 命令)   MCP 服务 (22 工具)
+              CLI (20 命令)   MCP 服务 (26 工具)
                    |                 |
                    +--------+--------+
                             |
@@ -1405,7 +1461,7 @@ OMLX 后端使用 OpenAI `/v1/embeddings` 格式，兼容 OpenRouter、LiteLLM �
 #### 记忆衰减模型
 
 - **Critical** 记忆永不衰减（强度始终为 1.0）
-- **STM**（短期记忆）：衰减较快（beta = 1.2），5 次访问后自动晋升为 LTM
+- **STM**（短期记忆）：衰减较快（beta = 1.2），通过聚类生存曲线驱动晋升为 LTM（回退：5 次访问）
 - **LTM**（长期记忆）：衰减较慢（beta = 0.8），分配给 high / critical 重要度
 - 访问次数减缓衰减：`lambda_eff = lambda / (1 + access_count * 0.2)`
 
@@ -1433,7 +1489,7 @@ OMLX 后端使用 OpenAI `/v1/embeddings` 格式，兼容 OpenRouter、LiteLLM �
 | 向量搜索（API） | < 300 ms |
 | 存储（含去重） | < 5 ms |
 | 内存占用 | 2-5 MB |
-| 二进制大小（release） | < 10 MB |
+| 二进制大小（release） | ~13 MB (CLI), ~16 MB (含 GUI) |
 
 ### 成本估算
 
