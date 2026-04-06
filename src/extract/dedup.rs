@@ -305,22 +305,34 @@ pub fn check_dedup(
     time_window_days: i64,
     cluster_id: Option<u32>,
 ) -> ReinResult<DedupAction> {
-    // Extract key tokens from content for FTS query.
-    // NOTE: check_dedup uses SQLite FTS5 (not Tantivy). FTS5's unicode61 tokenizer
-    // does NOT segment CJK text, so we must pass raw content — jieba tokens would
-    // produce no matches. The Tantivy search path (in recall.rs) handles CJK
-    // enrichment separately via enrich_cjk().
-    let query_tokens: Vec<&str> = content.split_whitespace().take(20).collect();
-    if query_tokens.is_empty() {
-        return Ok(DedupAction::CreateNew);
-    }
-    let query = query_tokens.join(" ");
-
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
-    for candidate_topic in candidate_topics(store, topic)? {
-        for memory in store
-            .search_fts(&query, Some(&candidate_topic), 8)?
+
+    // Channel 1: FTS-based candidates (within topic variants)
+    // NOTE: FTS5 uses unicode61 which does NOT segment CJK, so we pass raw
+    // whitespace tokens. For pure CJK without spaces, FTS may yield nothing —
+    // that's OK because Channel 2 (embedding) covers this case.
+    let query_tokens: Vec<&str> = content.split_whitespace().take(20).collect();
+    if !query_tokens.is_empty() {
+        let query = query_tokens.join(" ");
+        for candidate_topic in candidate_topics(store, topic)? {
+            for memory in store
+                .search_fts(&query, Some(&candidate_topic), 8)?
+                .into_iter()
+                .filter(|m| m.superseded_by.is_none())
+            {
+                if seen.insert(memory.id.clone()) {
+                    candidates.push(memory);
+                }
+            }
+        }
+    }
+
+    // Channel 2: Embedding-based candidates (cross-topic semantic duplicates)
+    // Critical for CJK text where FTS5 may return nothing.
+    // Only uses cached embeddings — no API call on the hot path.
+    if let Some(emb_candidates) = embedding_candidate_lookup(store, content) {
+        for memory in emb_candidates
             .into_iter()
             .filter(|m| m.superseded_by.is_none())
         {
@@ -373,12 +385,28 @@ pub fn check_dedup(
         }
     }
 
-    // Gray zone: 0.5 <= sim < threshold — flag for LLM dedup if available
-    // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
-    // Check sim range first to avoid wasting budget on non-candidates
+    // Gray zone: 0.5 <= sim < threshold — try embedding cosine first, then LLM
+    // This avoids consuming LLM budget when embedding similarity is decisive.
     let llm_budget_available = m6_has_llm_budget(store);
     if let (Some(memory), Some(ref score)) = (best_memory, &best_candidate_score) {
         if should_escalate_gray_zone(score, best_sim, llm_budget_available) {
+            // Try embedding-based resolution first (zero LLM cost)
+            if let Some(embed_sim) = embedding_cosine_check(store, content, &memory.id) {
+                if embed_sim > 0.85 {
+                    // Embedding confirms strong match — treat as dedup
+                    let age_days = (chrono::Utc::now() - memory.created_at).num_days();
+                    if age_days < time_window_days {
+                        return Ok(DedupAction::MergeInto(memory.id.clone()));
+                    } else {
+                        return Ok(DedupAction::Supersede(memory.id.clone()));
+                    }
+                } else if embed_sim < 0.50 {
+                    // Embedding confirms distinct — skip LLM
+                    return Ok(DedupAction::CreateNew);
+                }
+                // 0.50..0.85 — embedding uncertain, fall through to LLM
+            }
+            // Embedding unavailable or uncertain — escalate to LLM
             if is_exploration {
                 m6_log_outcome(
                     store,
@@ -404,6 +432,64 @@ pub fn check_dedup(
     }
 
     Ok(DedupAction::CreateNew)
+}
+
+/// Look up embedding-based candidates for cross-topic dedup (zero API cost).
+/// Only uses cached embeddings — never triggers an embedding API call.
+fn embedding_candidate_lookup(store: &SqliteStore, content: &str) -> Option<Vec<crate::types::Memory>> {
+    let config = crate::config::ReinConfig::load().ok()?;
+    let model = config.embedding_model();
+    let emb = crate::embed::EmbedCache::get(store.conn(), content, &model).ok()??;
+    let results = crate::store::vec::search_vec(store.conn(), &emb, 5).ok()?;
+    let mut memories = Vec::new();
+    for (id, distance) in results {
+        let sim = 1.0 - distance as f64;
+        if sim < 0.70 {
+            break; // Below meaningful similarity
+        }
+        if let Ok(m) = store.get(&id) {
+            memories.push(m);
+        }
+    }
+    if memories.is_empty() {
+        None
+    } else {
+        Some(memories)
+    }
+}
+
+/// Try to resolve gray zone using cached embeddings (zero LLM cost).
+/// Returns cosine similarity if both embeddings are in cache, None otherwise.
+fn embedding_cosine_check(store: &SqliteStore, content: &str, candidate_id: &str) -> Option<f32> {
+    let config = crate::config::ReinConfig::load().ok()?;
+    let model = config.embedding_model();
+    // Check if new content has a cached embedding
+    let new_emb = crate::embed::EmbedCache::get(store.conn(), content, &model).ok()??;
+    // Check if candidate has a stored embedding
+    let cand_emb: Vec<f32> = {
+        let blob: Vec<u8> = store
+            .conn()
+            .query_row(
+                "SELECT embedding FROM vec_memories WHERE id = ?1",
+                rusqlite::params![candidate_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        blob.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    if new_emb.len() != cand_emb.len() || new_emb.is_empty() {
+        return None;
+    }
+    // Cosine similarity
+    let dot: f32 = new_emb.iter().zip(&cand_emb).map(|(a, b)| a * b).sum();
+    let norm_a: f32 = new_emb.iter().map(|a| a * a).sum::<f32>().sqrt();
+    let norm_b: f32 = cand_emb.iter().map(|b| b * b).sum::<f32>().sqrt();
+    if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
+        return None;
+    }
+    Some(dot / (norm_a * norm_b))
 }
 
 /// M6: LLM judgment budget — allow up to 10 LLM dedup calls per hour.
