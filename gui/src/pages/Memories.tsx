@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { useRecent, useRecall, useTopics } from '../hooks/useApi';
+import { useMemoryDetail, useRecent, useRecall, useTopics } from '../hooks/useApi';
 import { apiDelete } from '../api/client';
-import type { Memory, RecallResult } from '../api/types';
+import type { Memory, MemoryDetailResponse, RecallResult } from '../api/types';
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -42,6 +42,8 @@ type TierFilter = 'all' | 'hot' | 'warm' | 'cold';
 function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClick: () => void }) {
   const badge = tierBadge(memory.tier);
   const isCold = memory.tier === 'cold';
+  const recallMeta = 'score' in memory ? memory as RecallResult : null;
+  const evidenceCount = recallMeta?.evidence_count ?? Math.max(memory.support_count - 1, 0);
 
   return (
     <button
@@ -73,6 +75,22 @@ function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClic
         </span>
       </div>
 
+      <div className="flex items-center gap-2 mb-3 text-[10px] text-[var(--text-muted)]">
+        <span className="rounded bg-[var(--border)] px-2 py-0.5 font-mono">
+          sup {memory.support_count}
+        </span>
+        {evidenceCount > 0 && (
+          <span className="rounded bg-[var(--accent)]/12 px-2 py-0.5 text-[var(--accent)]">
+            ev {evidenceCount}
+          </span>
+        )}
+        {recallMeta && (
+          <span className="rounded bg-[var(--success)]/12 px-2 py-0.5 text-[var(--success)]">
+            {(recallMeta.confidence * 100).toFixed(0)}%
+          </span>
+        )}
+      </div>
+
       {/* Strength bar */}
       <div className="w-full h-1.5 rounded-full bg-[var(--border)] overflow-hidden">
         <div
@@ -91,16 +109,22 @@ function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClic
 
 function DetailPanel({
   memory,
+  detail,
+  loading,
   onClose,
   onDelete,
 }: {
   memory: Memory | RecallResult;
+  detail: MemoryDetailResponse | null | undefined;
+  loading: boolean;
   onClose: () => void;
   onDelete: (id: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const badge = tierBadge(memory.tier);
-  const isRecall = 'score' in memory;
+  const display = detail?.memory ?? memory;
+  const badge = tierBadge(display.tier);
+  const recallMeta = 'score' in memory ? memory as RecallResult : null;
+  const evidence = detail?.evidence ?? [];
 
   return (
     <div className="fixed inset-y-0 right-0 w-[280px] bg-[var(--bg-secondary)] border-l border-[var(--border)] shadow-2xl z-50 flex flex-col animate-slide-in overflow-hidden">
@@ -122,31 +146,31 @@ function DetailPanel({
         {/* Summary */}
         <div>
           <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1">Summary</div>
-          <p className="text-sm text-[var(--text-primary)] leading-relaxed">{memory.summary}</p>
+          <p className="text-sm text-[var(--text-primary)] leading-relaxed">{display.summary}</p>
         </div>
 
         {/* Full content */}
         <div>
           <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1">Content</div>
           <p className="text-sm text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap break-words">
-            {memory.content}
+            {display.content}
           </p>
         </div>
 
         {/* Recall score */}
-        {isRecall && (
+        {recallMeta && (
           <div className="grid grid-cols-3 gap-2">
             <div>
               <div className="text-xs text-[var(--text-muted)]">Score</div>
-              <div className="text-sm font-mono text-[var(--new)]">{(memory as RecallResult).score.toFixed(3)}</div>
+              <div className="text-sm font-mono text-[var(--new)]">{recallMeta.score.toFixed(3)}</div>
             </div>
             <div>
               <div className="text-xs text-[var(--text-muted)]">Confidence</div>
-              <div className="text-sm font-mono text-[var(--success)]">{((memory as RecallResult).confidence * 100).toFixed(0)}%</div>
+              <div className="text-sm font-mono text-[var(--success)]">{(recallMeta.confidence * 100).toFixed(0)}%</div>
             </div>
             <div>
               <div className="text-xs text-[var(--text-muted)]">Sources</div>
-              <div className="text-sm font-mono text-[var(--warm)]">{(memory as RecallResult).sources_hit}/3</div>
+              <div className="text-sm font-mono text-[var(--warm)]">{recallMeta.sources_hit}/3</div>
             </div>
           </div>
         )}
@@ -155,46 +179,54 @@ function DetailPanel({
         <div className="grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
           <div>
             <span className="text-[var(--text-muted)]">Layer</span>
-            <div className="text-[var(--text-primary)]">{memory.layer}</div>
+            <div className="text-[var(--text-primary)]">{display.layer}</div>
           </div>
           <div>
             <span className="text-[var(--text-muted)]">Importance</span>
-            <div className="text-[var(--text-primary)] capitalize">{memory.importance}</div>
+            <div className="text-[var(--text-primary)] capitalize">{display.importance}</div>
           </div>
           <div>
             <span className="text-[var(--text-muted)]">Strength</span>
-            <div className="font-mono" style={{ color: strengthColor(memory.strength) }}>
-              {memory.strength.toFixed(3)}
+            <div className="font-mono" style={{ color: strengthColor(display.strength) }}>
+              {display.strength.toFixed(3)}
             </div>
           </div>
           <div>
             <span className="text-[var(--text-muted)]">Accesses</span>
-            <div className="text-[var(--text-primary)] font-mono">{memory.access_count}</div>
+            <div className="text-[var(--text-primary)] font-mono">{display.access_count}</div>
           </div>
           <div>
             <span className="text-[var(--text-muted)]">Source</span>
-            <div className="text-[var(--text-primary)]">{memory.source}</div>
+            <div className="text-[var(--text-primary)]">{display.source}</div>
           </div>
           <div>
             <span className="text-[var(--text-muted)]">Status</span>
-            <div className="text-[var(--text-primary)]">{memory.status}</div>
+            <div className="text-[var(--text-primary)]">{display.status}</div>
+          </div>
+          <div>
+            <span className="text-[var(--text-muted)]">Support</span>
+            <div className="text-[var(--text-primary)] font-mono">{display.support_count}</div>
+          </div>
+          <div>
+            <span className="text-[var(--text-muted)]">Diversity</span>
+            <div className="text-[var(--text-primary)] font-mono">{display.source_diversity.toFixed(2)}</div>
           </div>
           <div className="col-span-2">
             <span className="text-[var(--text-muted)]">Created</span>
-            <div className="text-[var(--text-primary)]">{new Date(memory.created_at).toLocaleString()}</div>
+            <div className="text-[var(--text-primary)]">{new Date(display.created_at).toLocaleString()}</div>
           </div>
           <div className="col-span-2">
             <span className="text-[var(--text-muted)]">Last Accessed</span>
-            <div className="text-[var(--text-primary)]">{new Date(memory.last_accessed).toLocaleString()}</div>
+            <div className="text-[var(--text-primary)]">{new Date(display.last_accessed).toLocaleString()}</div>
           </div>
         </div>
 
         {/* Keywords */}
-        {memory.keywords.length > 0 && (
+        {display.keywords.length > 0 && (
           <div>
             <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1.5">Keywords</div>
             <div className="flex flex-wrap gap-1.5">
-              {memory.keywords.map((kw) => (
+              {display.keywords.map((kw) => (
                 <span key={kw} className="text-xs px-2 py-0.5 rounded bg-[var(--border)] text-[var(--text-secondary)]">
                   {kw}
                 </span>
@@ -203,12 +235,36 @@ function DetailPanel({
           </div>
         )}
 
+        <div>
+          <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1.5">Evidence</div>
+          {loading ? (
+            <div className="text-xs text-[var(--text-muted)]">Loading detail...</div>
+          ) : evidence.length > 0 ? (
+            <div className="space-y-2">
+              {evidence.map((item) => (
+                <div key={item.id} className="rounded-lg border border-[var(--border)] bg-[var(--bg)]/50 p-2">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <span className="text-[10px] uppercase tracking-wider text-[var(--accent)]">{item.source_topic}</span>
+                    <span className="text-[10px] text-[var(--text-muted)]">{new Date(item.imported_at).toLocaleDateString()}</span>
+                  </div>
+                  <div className="text-xs text-[var(--text-primary)] mb-1">{item.summary}</div>
+                  <div className="text-xs text-[var(--text-secondary)] line-clamp-4 whitespace-pre-wrap break-words">
+                    {item.content}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-xs text-[var(--text-muted)]">No supporting evidence beyond the canonical record.</div>
+          )}
+        </div>
+
         {/* Related IDs */}
-        {memory.related_ids.length > 0 && (
+        {display.related_ids.length > 0 && (
           <div>
             <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1.5">Related Memories</div>
             <div className="space-y-1">
-              {memory.related_ids.map((id) => (
+              {display.related_ids.map((id) => (
                 <div key={id} className="text-xs font-mono text-[var(--text-muted)] truncate">{id}</div>
               ))}
             </div>
@@ -216,11 +272,11 @@ function DetailPanel({
         )}
 
         {/* Concept IDs */}
-        {memory.concept_ids.length > 0 && (
+        {display.concept_ids.length > 0 && (
           <div>
             <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1.5">Concepts</div>
             <div className="space-y-1">
-              {memory.concept_ids.map((id) => (
+              {display.concept_ids.map((id) => (
                 <div key={id} className="text-xs font-mono text-[var(--concept)] truncate">{id}</div>
               ))}
             </div>
@@ -240,7 +296,7 @@ function DetailPanel({
         {confirmDelete ? (
           <div className="flex-1 flex gap-1">
             <button
-              onClick={() => onDelete(memory.id)}
+              onClick={() => onDelete(display.id)}
               className="flex-1 text-xs px-2 py-2 rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
             >
               Confirm
@@ -273,6 +329,7 @@ export default function Memories() {
   const [topicFilter, setTopicFilter] = useState('');
   const [tierFilter, setTierFilter] = useState<TierFilter>('all');
   const [selected, setSelected] = useState<(Memory | RecallResult) | null>(null);
+  const { data: selectedDetail, isLoading: selectedLoading } = useMemoryDetail(selected?.id ?? null);
 
   // Debounce search query (300ms)
   useEffect(() => {
@@ -422,6 +479,8 @@ export default function Memories() {
           />
           <DetailPanel
             memory={selected}
+            detail={selectedDetail}
+            loading={selectedLoading}
             onClose={() => setSelected(null)}
             onDelete={handleDelete}
           />

@@ -7,7 +7,7 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 use super::adaptive::run_adaptive_pipeline;
-use super::dedup::{emit_cleanup_event, record_deleted_memory_as_evidence, run_dedup};
+use super::dedup::{emit_cleanup_event, record_deleted_memory_as_evidence, run_dedup_scoped};
 
 /// Build a consolidated Memory from a topic.
 pub fn build_consolidated(
@@ -183,6 +183,14 @@ fn dominant_tier(memories: &[&Memory]) -> MemoryTier {
     } else {
         MemoryTier::Cold
     }
+}
+
+fn is_current_consolidation_memory(memory: &Memory) -> bool {
+    memory.superseded_by.is_none()
+        && matches!(
+            memory.status,
+            MemoryStatus::Active | MemoryStatus::Updated
+        )
 }
 
 pub fn build_consolidated_from_memories(
@@ -367,10 +375,7 @@ pub fn run_consolidation(
     let mut changed = false;
 
     for group in groups {
-        let mut memories = Vec::new();
-        for topic in &group.topics {
-            memories.extend(store.get_by_topic(topic)?);
-        }
+        let memories = load_group_memories(store, group)?;
 
         if memories.is_empty() {
             report.groups.push(ConsolidationGroupReport {
@@ -453,54 +458,58 @@ pub async fn run_consolidation_async(
 
     let summary_template_owned = summary_template.map(str::to_string);
     let config_owned = config.clone();
-    let prepared =
-        futures_util::future::join_all(non_empty.into_iter().map(|(group, memories)| {
-            let config = config_owned.clone();
-            let summary_template = summary_template_owned.clone();
-            async move {
-                let replacement = if dry_run {
-                    None
-                } else {
-                    Some(
-                        build_consolidated_from_memories_async(
-                            &config,
-                            group.canonical_topic.clone(),
-                            &group.topics,
-                            &memories,
-                            summary_template.as_deref(),
+    let llm_batch_size = config.async_memory.batch_size.max(1);
+    for batch in non_empty.chunks(llm_batch_size) {
+        let batch: Vec<_> = batch.to_vec();
+        let prepared =
+            futures_util::future::join_all(batch.into_iter().map(|(group, memories)| {
+                let config = config_owned.clone();
+                let summary_template = summary_template_owned.clone();
+                async move {
+                    let replacement = if dry_run {
+                        None
+                    } else {
+                        Some(
+                            build_consolidated_from_memories_async(
+                                &config,
+                                group.canonical_topic.clone(),
+                                &group.topics,
+                                &memories,
+                                summary_template.as_deref(),
+                            )
+                            .await,
                         )
-                        .await,
-                    )
+                    };
+                    (group, memories, replacement)
+                }
+            }))
+            .await;
+
+        for (group, memories, replacement) in prepared {
+            report.memories_replaced += memories.len();
+            report.groups_processed += 1;
+
+            let created_id = if let Some(replacement) = replacement {
+                let new_id = replacement.id.clone();
+                let old_memories = if group.topics.len() == 1 {
+                    store.consolidate_atomic(&group.topics[0], replacement)?
+                } else {
+                    store.consolidate_topics_atomic(&group.topics, replacement)?
                 };
-                (group, memories, replacement)
-            }
-        }))
-        .await;
-
-    for (group, memories, replacement) in prepared {
-        report.memories_replaced += memories.len();
-        report.groups_processed += 1;
-
-        let created_id = if let Some(replacement) = replacement {
-            let new_id = replacement.id.clone();
-            let old_memories = if group.topics.len() == 1 {
-                store.consolidate_atomic(&group.topics[0], replacement)?
+                emit_consolidation_events(store, &group, &new_id, &old_memories);
+                changed = true;
+                Some(new_id)
             } else {
-                store.consolidate_topics_atomic(&group.topics, replacement)?
+                None
             };
-            emit_consolidation_events(store, &group, &new_id, &old_memories);
-            changed = true;
-            Some(new_id)
-        } else {
-            None
-        };
 
-        report.groups.push(ConsolidationGroupReport {
-            canonical_topic: group.canonical_topic.clone(),
-            source_topics: group.topics.clone(),
-            memory_count: memories.len(),
-            created_id,
-        });
+            report.groups.push(ConsolidationGroupReport {
+                canonical_topic: group.canonical_topic.clone(),
+                source_topics: group.topics.clone(),
+                memory_count: memories.len(),
+                created_id,
+            });
+        }
     }
 
     if changed {
@@ -560,7 +569,7 @@ pub async fn run_cleanup_async(
     let consolidation = run_consolidation_async(store, config, groups, None, dry_run).await?;
     let threshold = config.search.dedup_similarity as f32;
     let (duplicates_found, duplicates_merged) =
-        run_dedup(store, config, threshold, dry_run, merge_variants)?;
+        run_dedup_scoped(store, config, groups, threshold, dry_run, merge_variants)?;
 
     Ok(CleanupReport {
         consolidation,
@@ -608,7 +617,12 @@ pub fn run_cleanup_sync(
 pub(crate) fn load_group_memories(store: &SqliteStore, group: &TopicGroup) -> ReinResult<Vec<Memory>> {
     let mut memories = Vec::new();
     for topic in &group.topics {
-        memories.extend(store.get_by_topic(topic)?);
+        memories.extend(
+            store
+                .get_by_topic(topic)?
+                .into_iter()
+                .filter(is_current_consolidation_memory),
+        );
     }
     Ok(memories)
 }
@@ -673,7 +687,6 @@ mod tests {
     use super::*;
     use crate::config::ReinConfig;
     use crate::store::SqliteStore;
-    use crate::types::*;
     use chrono::Utc;
 
     fn test_memory(topic: &str, summary: &str, content: &str, keywords: Vec<&str>) -> Memory {
@@ -802,6 +815,57 @@ mod tests {
         // Original 3 memories must still exist unchanged
         let remaining = store.get_by_topic("rust-testing").unwrap();
         assert_eq!(remaining.len(), 3, "dry_run must not alter existing memories");
+    }
+
+    #[test]
+    fn test_load_group_memories_prefers_current_memories() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut active = test_memory(
+            "canonical-topic",
+            "active summary",
+            "Current canonical memory",
+            vec!["active"],
+        );
+        active.status = MemoryStatus::Active;
+
+        let mut updated = test_memory(
+            "canonical-topic",
+            "updated summary",
+            "Current updated memory",
+            vec!["updated"],
+        );
+        updated.status = MemoryStatus::Updated;
+
+        let mut superseded = test_memory(
+            "canonical-topic",
+            "superseded summary",
+            "Historical memory that should be ignored",
+            vec!["old"],
+        );
+        superseded.superseded_by = Some("replacement-id".to_string());
+
+        store.store(active).unwrap();
+        store.store(updated).unwrap();
+        store.store(superseded).unwrap();
+
+        let group = TopicGroup {
+            canonical_topic: "canonical-topic".to_string(),
+            topics: vec!["canonical-topic".to_string()],
+        };
+        let memories = load_group_memories(&store, &group).unwrap();
+
+        assert_eq!(memories.len(), 2, "should keep only current memories");
+        assert!(
+            memories
+                .iter()
+                .any(|memory| memory.status == MemoryStatus::Updated),
+            "updated memories must remain eligible for consolidation"
+        );
+        assert!(
+            memories.iter().all(|memory| memory.superseded_by.is_none()),
+            "superseded history must not be fed into consolidation"
+        );
     }
 
     #[test]
@@ -948,6 +1012,76 @@ mod tests {
             report.consolidation.groups_processed
         );
         assert!(!report.dry_run);
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_respects_selected_groups_for_dedup() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        store
+            .store(test_memory(
+                "docker",
+                "compose setup",
+                "Use docker compose for the local development stack",
+                vec!["docker"],
+            ))
+            .unwrap();
+        store
+            .store(test_memory(
+                "docker",
+                "compose setup duplicate",
+                "Use docker compose for the local development stack",
+                vec!["docker"],
+            ))
+            .unwrap();
+        let rust_1 = store
+            .store(test_memory(
+                "rust-testing",
+                "unit tests",
+                "Write unit tests with #[test]",
+                vec!["rust"],
+            ))
+            .unwrap();
+        let rust_2 = store
+            .store(test_memory(
+                "rust-testing",
+                "unit tests duplicate",
+                "Write unit tests with #[test]",
+                vec!["rust"],
+            ))
+            .unwrap();
+
+        let groups = crate::ops::resolve_topic_groups(
+            &store,
+            Some("docker".to_string()).as_deref(),
+            &[],
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let report = run_cleanup_async(&store, &config, &groups, false, false)
+            .await
+            .unwrap();
+        assert_eq!(report.consolidation.groups_processed, 1);
+
+        let rust_superseded = [store.get(&rust_1).unwrap(), store.get(&rust_2).unwrap()]
+            .into_iter()
+            .filter(|memory| memory.superseded_by.is_some())
+            .count();
+        let current_docker = load_group_memories(
+            &store,
+            &TopicGroup {
+                canonical_topic: "docker".to_string(),
+                topics: vec!["docker".to_string()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(current_docker.len(), 1, "selected topic should be consolidated");
+        assert_eq!(rust_superseded, 0, "non-selected topic must remain untouched");
     }
 
     #[test]

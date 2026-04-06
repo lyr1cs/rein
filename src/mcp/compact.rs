@@ -1,4 +1,5 @@
-use crate::types::{HealthReport, Memory, StoreStats};
+use crate::search::recall::RecallResult;
+use crate::types::{HealthReport, StoreStats};
 
 pub fn format_store_result(id: &str, compact: bool) -> String {
     if compact {
@@ -8,24 +9,39 @@ pub fn format_store_result(id: &str, compact: bool) -> String {
     }
 }
 
-pub fn format_recall_results(results: &[(Memory, f32)], compact: bool) -> String {
+pub fn format_recall_results(results: &[RecallResult], compact: bool) -> String {
     if compact {
         results
             .iter()
-            .map(|(m, _)| format!("[{}] {}", m.topic, m.summary))
+            .map(|r| format!("[{}] {}", r.memory.topic, r.memory.summary))
             .collect::<Vec<_>>()
             .join("\n")
     } else {
         results
             .iter()
-            .map(|(m, score)| {
+            .map(|r| {
+                let m = &r.memory;
+                let evidence_block = if r.evidence_preview.is_empty() {
+                    format!("  evidence_count: {}", r.evidence_count)
+                } else {
+                    format!(
+                        "  evidence_count: {}\n  evidence_preview: {}",
+                        r.evidence_count,
+                        r.evidence_preview.join(" | ")
+                    )
+                };
                 format!(
-                    "--- [{topic}] {summary} ---\n{content}\n  score: {score:.3}\n  importance: {imp}\n  strength: {str:.3}\n  keywords: {kw}\n  id: {id}",
+                    "--- [{topic}] {summary} ---\n{content}\n  score: {score:.3}\n  confidence: {confidence:.3}\n  importance: {imp}\n  strength: {str:.3}\n  support: {support}\n  diversity: {diversity:.2}\n{evidence_block}\n  keywords: {kw}\n  id: {id}",
                     topic = m.topic,
                     summary = m.summary,
                     content = m.content,
+                    score = r.score,
+                    confidence = r.confidence,
                     imp = m.importance,
                     str = m.strength,
+                    support = m.support_count,
+                    diversity = m.source_diversity,
+                    evidence_block = evidence_block,
                     kw = if m.keywords.is_empty() { "(none)".to_string() } else { m.keywords.join(", ") },
                     id = m.id,
                 )

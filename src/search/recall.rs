@@ -14,6 +14,29 @@ pub struct RecallResult {
     pub score: f32,
     pub confidence: f32,
     pub sources_hit: usize,
+    pub evidence_count: usize,
+    pub evidence_preview: Vec<String>,
+}
+
+fn sort_recall_results(results: &mut [RecallResult]) {
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.memory.support_count.cmp(&a.memory.support_count))
+            .then_with(|| {
+                b.memory
+                    .source_diversity
+                    .partial_cmp(&a.memory.source_diversity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.memory.updated_at.cmp(&a.memory.updated_at))
+    });
 }
 
 fn collapse_results_to_canonicals(
@@ -63,12 +86,54 @@ fn collapse_results_to_canonicals(
                     score,
                     confidence,
                     sources_hit,
+                    evidence_count: 0,
+                    evidence_preview: vec![],
                 });
             }
         }
     }
     collapsed.extend(passthrough);
     Ok(collapsed)
+}
+
+fn build_evidence_preview(
+    store: &SqliteStore,
+    memory: &Memory,
+    preview_limit: usize,
+) -> (usize, Vec<String>) {
+    if memory.id.starts_with("sm:") || memory.id.starts_with("auto:") {
+        return (0, vec![]);
+    }
+
+    let total = memory.support_count.saturating_sub(1) as usize;
+    if total == 0 || preview_limit == 0 {
+        return (total, vec![]);
+    }
+
+    let evidence = store
+        .list_memory_evidence(&memory.id, preview_limit.saturating_add(1))
+        .unwrap_or_default();
+    let preview = evidence
+        .into_iter()
+        .filter(|item| item.memory_id.as_deref() != Some(memory.id.as_str()))
+        .take(preview_limit)
+        .map(|item| format!("[{}] {}", item.source_topic, item.summary))
+        .collect();
+
+    (total, preview)
+}
+
+fn enrich_results_with_evidence(
+    store: &SqliteStore,
+    results: &mut [RecallResult],
+    preview_limit: usize,
+) {
+    for result in results {
+        let (evidence_count, evidence_preview) =
+            build_evidence_preview(store, &result.memory, preview_limit);
+        result.evidence_count = evidence_count;
+        result.evidence_preview = evidence_preview;
+    }
 }
 
 /// Full recall pipeline: waterfall search + optional cross-validation.
@@ -757,6 +822,8 @@ pub fn recall_temporal_with_request_id(
                 topic_match,
                 brevity: 1.0 / (1.0 + mem.content.len() as f32 / 500.0),
                 channel_coverage,
+                canonical_support: mem.support_count as f32 / (mem.support_count as f32 + 1.0),
+                source_diversity: mem.source_diversity / (mem.source_diversity + 1.0),
                 usage_recency: (chrono::Utc::now() - mem.last_accessed).num_hours() as f32 / 24.0,
                 connectivity: (mem.related_ids.len().min(10) as f32) / 10.0,
                 concept_richness: (mem.concept_ids.len().min(5) as f32) / 5.0,
@@ -848,15 +915,13 @@ pub fn recall_temporal_with_request_id(
             score: v.score,
             confidence: v.confidence,
             sources_hit: v.sources_hit,
+            evidence_count: 0,
+            evidence_preview: vec![],
         })
         .collect();
     results = collapse_results_to_canonicals(store, results)?;
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_recall_results(&mut results);
 
     // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
     if config.adaptive.enabled {
@@ -890,6 +955,10 @@ pub fn recall_temporal_with_request_id(
                     "kg_norm": kg,
                     "episode_norm": episode,
                     "final_score": r.score,
+                    "confidence": r.confidence,
+                    "sources_hit": r.sources_hit,
+                    "support_count": r.memory.support_count,
+                    "source_diversity": r.memory.source_diversity,
                 })
             })
             .collect();
@@ -919,6 +988,7 @@ pub fn recall_temporal_with_request_id(
 
     // Truncate to the caller's requested limit (not effective_limit).
     results.truncate(limit);
+    enrich_results_with_evidence(store, &mut results, 2);
 
     // Record recall hit (NOT access — access should only be counted when
     // the agent/user actually uses the memory, not just when it's returned).
@@ -941,6 +1011,70 @@ pub fn recall_temporal_with_request_id(
         "recall complete"
     );
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
+    use chrono::Utc;
+
+    fn test_memory(id: &str, support_count: u32, source_diversity: f32) -> Memory {
+        Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "docker".to_string(),
+            summary: format!("summary {id}"),
+            content: format!("content {id}"),
+            keywords: vec![],
+            importance: Importance::High,
+            source: Source::Manual,
+            strength: 0.8,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: Some(id.to_string()),
+            support_count,
+            merge_count: support_count.saturating_sub(1),
+            dedup_confidence: 0.9,
+            source_diversity,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn sort_recall_results_prefers_stronger_canonical_support_on_ties() {
+        let mut results = vec![
+            RecallResult {
+                memory: test_memory("low", 1, 1.0),
+                score: 0.8,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+            RecallResult {
+                memory: test_memory("high", 4, 2.0),
+                score: 0.8,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+        ];
+
+        sort_recall_results(&mut results);
+        assert_eq!(results[0].memory.id, "high");
+    }
 }
 
 /// Try vector search: check cache first, then call API if available.

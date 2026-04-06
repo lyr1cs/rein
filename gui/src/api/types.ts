@@ -11,6 +11,12 @@ export interface Memory {
   tier: 'hot' | 'warm' | 'cold';
   cluster_id: number | null;
   access_count: number;
+  canonical_id: string | null;
+  support_count: number;
+  merge_count: number;
+  dedup_confidence: number;
+  source_diversity: number;
+  contradiction_score: number;
   status: string;
   related_ids: string[];
   concept_ids: string[];
@@ -24,6 +30,26 @@ export interface RecallResult extends Memory {
   score: number;
   confidence: number;
   sources_hit: number;
+  evidence_count: number;
+  evidence_preview: string[];
+}
+
+export interface MemoryEvidence {
+  id: string;
+  canonical_id: string;
+  memory_id: string | null;
+  source_topic: string;
+  summary: string;
+  content: string;
+  keywords: string[];
+  source: string;
+  created_at: string;
+  imported_at: string;
+}
+
+export interface MemoryDetailResponse {
+  memory: Memory;
+  evidence: MemoryEvidence[];
 }
 
 export interface StoreStats {
