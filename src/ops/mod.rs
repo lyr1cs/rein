@@ -28,7 +28,7 @@ pub fn build_memory(
 ) -> Memory {
     // Apply rule-based postprocessing for additive keyword enrichment only.
     // User-supplied topic and importance are authoritative — postprocess cannot override them.
-    let summary: String = content.chars().take(100).collect();
+    let summary: String = content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
     let mut extracted = crate::extract::llm::ExtractedMemory {
         topic: topic.clone(),
         summary: summary.clone(),

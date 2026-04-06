@@ -5,8 +5,8 @@ pub mod patterns;
 pub mod postprocess;
 
 pub use dedup::{
-    check_dedup, containment_similarity, jaccard_similarity, similarity, topics_are_variants,
-    DedupAction,
+    check_dedup, containment_similarity, extract_keywords_from_text, jaccard_similarity,
+    similarity, tokenize_for_fts, tokenize_for_search, topics_are_variants, DedupAction,
 };
 pub use hooks::{hook_compact, hook_post, hook_prompt, hook_stop};
 pub use llm::{

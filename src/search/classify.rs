@@ -288,8 +288,30 @@ fn extract_temporal_days(lower: &str) -> i64 {
 
 fn is_exact_keyword(query: &str, lower: &str, word_count: usize) -> bool {
     // Short queries (1-3 ASCII words) without question/exploratory words.
-    // Exclude CJK-heavy queries (few spaces but many chars) to avoid misclassifying Chinese.
     let is_mostly_ascii = query.len() < word_count * 15; // CJK chars are 3 bytes each
+
+    // For CJK queries: use jieba word count instead of whitespace word count.
+    // A short CJK phrase like "数据库" (1 whitespace token but 1 jieba word) is a keyword lookup,
+    // while "数据库连接池怎么修复" (1 whitespace token but 5+ jieba words) is a question.
+    if crate::extract::dedup::contains_cjk(query) {
+        // Use jieba word count only (not bigrams) for routing decisions.
+        // tokenize_for_search includes bigrams which inflate the count.
+        let cjk_word_count = crate::extract::extract_keywords_from_text(query, 50).len();
+        // CJK question markers
+        let has_question = lower.contains('？')
+            || lower.contains("什么")
+            || lower.contains("怎么")
+            || lower.contains("如何")
+            || lower.contains("为什么")
+            || lower.contains("哪里")
+            || lower.contains("哪个");
+        if cjk_word_count <= 3 && !has_question {
+            return true;
+        }
+        // Don't fall through to ASCII logic for CJK queries
+        return false;
+    }
+
     if word_count <= 3
         && is_mostly_ascii
         && !lower.starts_with("what")

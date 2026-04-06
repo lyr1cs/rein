@@ -30,12 +30,13 @@ struct AdmissionContext {
     cluster_memories: Vec<Memory>,
 }
 
-/// Compute adaptive admission threshold from recent quality data.
-/// Base = 0.2. Adjusts up if recent quality is low, down if high.
-fn adaptive_admission_threshold(
-    store: &crate::store::SqliteStore,
-    ctx: &AdmissionContext,
-) -> f64 {
+/// Global admission baseline computed once per batch.
+struct AdmissionBaseline {
+    recent_avg: f64,
+    global_threshold: f64,
+}
+
+fn compute_admission_baseline(store: &crate::store::SqliteStore) -> AdmissionBaseline {
     let base = 0.2;
     let recent_avg: f64 = store.conn()
         .query_row(
@@ -52,33 +53,36 @@ fn adaptive_admission_threshold(
         base
     };
 
-    let Some(cluster_id) = ctx.cluster_id else {
-        return global;
-    };
-    let cluster_avg: Option<f64> = store
-        .conn()
-        .query_row(
-            "SELECT AVG(strength) FROM memories
-             WHERE cluster_id = ?1 AND superseded_by IS NULL AND status IN ('active', 'updated')",
-            rusqlite::params![cluster_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
+    AdmissionBaseline { recent_avg, global_threshold: global }
+}
 
-    match cluster_avg {
-        Some(avg) if avg > 0.0 && recent_avg > 0.0 => {
-            let cluster_threshold = (global * (recent_avg / avg)).clamp(0.15, 0.60);
-            let blend = (ctx.cluster_size as f64 / 8.0).clamp(0.0, 1.0);
-            (global * (1.0 - blend) + cluster_threshold * blend).clamp(0.15, 0.60)
-        }
-        _ => global,
+/// Compute adaptive admission threshold using pre-computed baseline.
+fn adaptive_admission_threshold(
+    baseline: &AdmissionBaseline,
+    ctx: &AdmissionContext,
+) -> f64 {
+    let global = baseline.global_threshold;
+    let recent_avg = baseline.recent_avg;
+
+    if ctx.cluster_id.is_none() {
+        return global;
+    }
+
+    // Use cluster_avg_strength from AdmissionContext (already computed, no extra DB query)
+    let avg = ctx.cluster_avg_strength;
+    if avg > 0.0 && recent_avg > 0.0 {
+        // Clamp avg to prevent near-zero blowup in the ratio
+        let safe_avg = avg.max(0.1);
+        let cluster_threshold = (global * (recent_avg / safe_avg)).clamp(0.15, 0.60);
+        let blend = (ctx.cluster_size as f64 / 8.0).clamp(0.0, 1.0);
+        (global * (1.0 - blend) + cluster_threshold * blend).clamp(0.15, 0.60)
+    } else {
+        global
     }
 }
 
 /// Multi-factor admission score (A-MAC 2026 inspired).
 fn multi_factor_admission_score(
-    _store: &crate::store::SqliteStore,
     item: &ExtractedMemory,
     ctx: &AdmissionContext,
 ) -> f64 {
@@ -125,7 +129,8 @@ fn multi_factor_admission_score(
         return 0.0;
     }
 
-    let cold_start_penalty = if ctx.cluster_size == 0 { 0.0 } else { 0.02 };
+    // Penalize items entering unknown territory (no cluster context = less confidence)
+    let cold_start_penalty = if ctx.cluster_size == 0 { 0.02 } else { 0.0 };
     (0.45 * llm_conf + 0.25 * novelty + 0.15 * type_prior + 0.15 * recency - cold_start_penalty)
         .clamp(0.0, 1.0)
 }
@@ -241,15 +246,23 @@ pub fn store_extracted_report(
     }
 
     let mut stats = StoreExtractedStats::default();
+    // Compute global baseline once per batch (avoids N redundant DB queries)
+    let baseline = compute_admission_baseline(store);
+    // Cache admission contexts per normalized topic (avoids rebuilding for same-topic items)
+    let mut ctx_cache: std::collections::HashMap<String, AdmissionContext> =
+        std::collections::HashMap::new();
     for item in items {
         if looks_like_secret(&item.content) {
             stats.secret_filtered_count += 1;
             continue;
         }
 
-        let ctx = build_admission_context(store, &item.topic);
-        let threshold = adaptive_admission_threshold(store, &ctx);
-        let admission = multi_factor_admission_score(store, &item, &ctx);
+        let topic_key = normalize_topic_key(&item.topic);
+        let ctx = ctx_cache
+            .entry(topic_key)
+            .or_insert_with(|| build_admission_context(store, &item.topic));
+        let threshold = adaptive_admission_threshold(&baseline, ctx);
+        let admission = multi_factor_admission_score(&item, ctx);
         if admission < threshold {
             tracing::debug!(
                 "skipping low-quality memory (admission={:.2} < threshold={:.2}): {}",
@@ -708,8 +721,9 @@ mod tests {
             topic_memories: vec![],
             cluster_memories: vec![],
         };
-        let strong_threshold = adaptive_admission_threshold(&store, &strong_ctx);
-        let weak_threshold = adaptive_admission_threshold(&store, &weak_ctx);
+        let baseline = compute_admission_baseline(&store);
+        let strong_threshold = adaptive_admission_threshold(&baseline, &strong_ctx);
+        let weak_threshold = adaptive_admission_threshold(&baseline, &weak_ctx);
 
         assert!(
             strong_threshold < weak_threshold,
@@ -727,7 +741,7 @@ mod tests {
 
         let item = extracted_memory("architecture", "new", "durable design decision");
         let ctx = build_admission_context(&store, "architecture");
-        let score = multi_factor_admission_score(&store, &item, &ctx);
+        let score = multi_factor_admission_score(&item, &ctx);
 
         assert!(score > 0.4, "high-value cluster/type should keep a reasonable score");
     }

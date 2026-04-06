@@ -79,6 +79,8 @@ impl TantivyFts {
     }
 
     /// Index a memory document. Replaces any existing doc with the same ID.
+    /// For CJK text, content is pre-tokenized with jieba so Tantivy's default
+    /// tokenizer (which splits on whitespace) can index individual Chinese words.
     /// If another process holds the writer lock, mark the index dirty so the next
     /// recall/warmup can rebuild it.
     pub fn insert(
@@ -98,6 +100,13 @@ impl TantivyFts {
             }
             Err(e) => return Err(e),
         };
+
+        // Pre-tokenize CJK fields: append jieba tokens so Tantivy indexes them as
+        // separate terms alongside the original text (which Tantivy will also tokenize
+        // with its default whitespace/punctuation splitter).
+        let enriched_summary = enrich_cjk(summary);
+        let enriched_content = enrich_cjk(content);
+
         // Delete old doc with same ID first
         let id_term = tantivy::Term::from_field_text(self.id_field, id);
         writer.delete_term(id_term);
@@ -105,8 +114,8 @@ impl TantivyFts {
             self.id_field => id,
             self.topic_field => topic,
             self.topic_exact_field => topic,
-            self.summary_field => summary,
-            self.content_field => content,
+            self.summary_field => enriched_summary.as_str(),
+            self.content_field => enriched_content.as_str(),
             self.keywords_field => keywords,
         ))?;
         writer.commit()?;
@@ -114,6 +123,7 @@ impl TantivyFts {
     }
 
     /// Search for documents matching the query string.
+    /// For CJK queries, enriches the query with jieba tokens for better BM25 matching.
     /// When a topic filter is provided, uses BooleanQuery to filter at the index level
     /// instead of post-filtering in memory.
     /// Returns pairs of (memory_id, BM25_score).
@@ -136,8 +146,11 @@ impl TantivyFts {
             ],
         );
 
+        // Enrich CJK queries with jieba tokens for better BM25 matching
+        let enriched_query = enrich_cjk(query_str);
+
         // Try to parse; on failure, escape special chars and retry
-        let text_query = match query_parser.parse_query(query_str) {
+        let text_query = match query_parser.parse_query(&enriched_query) {
             Ok(q) => q,
             Err(_) => {
                 let escaped = query_str
@@ -203,6 +216,20 @@ impl TantivyFts {
     fn mark_dirty(&self) {
         let _ = std::fs::write(&self.dirty_marker_path, b"dirty");
     }
+}
+
+/// If text contains CJK characters, append jieba-segmented tokens so Tantivy's
+/// default tokenizer (whitespace-based) can index individual words.
+/// For pure ASCII text, returns as-is (zero overhead).
+fn enrich_cjk(text: &str) -> String {
+    if !crate::extract::dedup::contains_cjk(text) {
+        return text.to_string();
+    }
+    let extra_tokens = crate::extract::tokenize_for_fts(text);
+    if extra_tokens.is_empty() {
+        return text.to_string();
+    }
+    format!("{text} {extra_tokens}")
 }
 
 #[cfg(test)]
