@@ -648,7 +648,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
                             |
                    +--------+--------+
                    |                 |
-               CLI (20 cmds)  MCP Server (25 tools)
+               CLI (20 cmds)  MCP Server (26 tools)
                    |                 |
                    +--------+--------+
                             |
