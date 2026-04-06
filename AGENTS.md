@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.13.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 26 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
+rein v0.13.x — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 26 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK dedup tokenization (`jieba-rs` + character bigrams), cluster-aware admission and survival-driven STM promotion. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
@@ -48,7 +48,7 @@ src/
 │   ├── omlx.rs      # OMLX local embedding (OpenAI-compatible)
 │   └── cache.rs     # Embedding cache with TTL
 ├── search/
-│   ├── recall.rs    # 3-channel recall pipeline (FTS + Vector + KG) + RRF/CC fusion + R2 rerank
+│   ├── recall.rs    # 3-channel recall pipeline (FTS + Vector + KG) + evidence-aware rerank + RRF/CC fusion + R2 rerank
 │   ├── classify.rs  # Query routing (Episodic/Temporal/Preference/ExactKeyword/Semantic/Exploratory)
 │   ├── kg_search.rs # KG retrieval: concept FTS + BFS "land and expand" with temporal filtering
 │   ├── rerank.rs    # Multi-feature reranker (8 features, learned weights from M1/M2)
@@ -56,7 +56,7 @@ src/
 │   ├── scoring.rs   # Ebbinghaus decay + KM survival curve scoring
 │   ├── warmup.rs    # Background warmup: embeddings + HNSW/Tantivy rebuild
 │   ├── chunker.rs   # Semantic text chunking
-│   ├── alpha_optimizer.rs # Counterfactual offline alpha optimization for CC fusion
+│   ├── alpha_optimizer.rs # Counterfactual offline alpha optimization for CC fusion (now includes KG/episode/support/diversity signals)
 │   └── survival.rs  # Kaplan-Meier non-parametric survival analysis for adaptive decay
 ├── extract/
 │   ├── llm.rs       # LLM extraction (Gemini + OMLX/Ollama), fallback to patterns
@@ -70,7 +70,7 @@ src/
 │   │   ├── parsing.rs # JSON payload extraction, agent detection
 │   │   ├── buffer.rs  # Session buffer I/O
 │   │   └── scoring.rs # Signal scoring and filtering
-│   └── dedup.rs     # Similarity (Jaccard + containment)
+│   └── dedup.rs     # Similarity (hybrid CJK tokenization: jieba-rs + bigrams, Jaccard + containment, hot-path cluster-aware hints)
 ├── sync/
 │   ├── supermemory.rs # Supermemory v4 API client
 │   ├── auto_memory.rs # ~/.claude/ file scanner
@@ -107,11 +107,13 @@ docker-compose.yml   # One-command deployment
 - FTS5 queries sanitized via `sanitize_fts_query()`
 - LIKE queries escape `%` and `_`
 - HTTP server requires REIN_HTTP_TOKEN for non-localhost bind
-- Dedup threshold: 0.70 using max(jaccard, containment)
+- Dedup threshold: 0.70 using max(jaccard, containment) over mixed lexical tokens
+- CJK lexical dedup uses `jieba-rs` word segmentation plus character bigrams
 - Vector dimensions: configurable (default 3072)
 - FTS5 tokenizer: unicode61 (CJK support)
 - Per-request connection model: each MCP request opens its own `SqliteStore` with `SQLITE_OPEN_FULL_MUTEX`
 - `store_with_dedup` uses `BEGIN IMMEDIATE` to prevent concurrent dedup races
+- `store_with_dedup` may infer cluster hints from local embedding cache, but must never trigger remote embedding calls on cache miss
 - HNSW and Tantivy side indexes are updated on every store/update/delete (fire-and-forget)
 - Warmup always rebuilds HNSW and Tantivy indexes before processing new embeddings
 - LLM extraction falls back to rule-based patterns when provider is unavailable
@@ -125,6 +127,11 @@ docker-compose.yml   # One-command deployment
 - hook_prompt is kept as a compatibility no-op; rein no longer auto-injects prompt memory
 - Post-store processing (auto_link, evolve) only runs on newly created memories, not merges
 - postprocess enriches keywords only — caller-supplied topic/importance are authoritative
+- `/api/memories/:id` is backward-compatible: top-level memory fields remain, plus nested `memory` and `evidence`
+- Recall is canonical-first: default result objects are canonicals, while evidence is previewed in recall and expanded on demand
+- STM→LTM promotion uses survival-curve-derived thresholds when cluster curves exist, with a fixed fallback otherwise
+- Large `cluster_id=None` dedup buckets use ANN candidate generation before pairwise comparison
+- Summary display is layered: canonical summaries may be longer, while APIs/UI can expose `summary_short` for list views
 
 ## Common Pitfalls
 

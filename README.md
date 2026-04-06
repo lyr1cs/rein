@@ -37,6 +37,9 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 | **Semantic chunking** | Heading / paragraph / sentence splitting with metadata-prefixed embeddings |
 | **FTS5 unicode61 tokenizer** | Full-text search with CJK support, sub-millisecond latency |
 | **Hybrid CJK dedup tokenization** | jieba-rs word segmentation plus character bigrams for Chinese/Japanese/Korean lexical dedup |
+| **Cluster-aware admission** | admission threshold and novelty scoring incorporate cluster strength, cluster novelty, and cold-start blending |
+| **Evidence second-stage rerank** | low-confidence / single-source recall results can be boosted by matching evidence content |
+| **Survival-driven STM promotion** | STM→LTM promotion uses cluster survival curves when available |
 | **Supermemory v4 API** | Hybrid search via `api.supermemory.ai/v4/search` for cross-validation |
 | **Zero local models** | No GPU required by default; optional OMLX local backend |
 | **~2-5 MB footprint** | Single SQLite file with FTS5 + sqlite-vec |
@@ -140,11 +143,17 @@ Recall is now evidence-aware:
 - canonical memories are ranked with `support_count` and `source_diversity`
 - recall output includes lightweight `evidence_preview`
 - `rein evidence <canonical_id>` or `/api/memories/:id` expands the full evidence list
+- lower-confidence / lower-corroboration results can use evidence second-stage rerank
 
 CJK dedup now uses a hybrid lexical strategy:
 - `jieba-rs` adds Chinese word segmentation
 - character bigrams remain enabled as a fallback for CJK and mixed technical text
 - both token streams are combined before Jaccard / containment scoring
+
+More detailed docs:
+- `docs/guides/canonical-read-model.md`
+- `docs/guides/evidence-aware-recall.md`
+- `docs/reference/adaptive-learning-signals.md`
 
 Operator inspection commands:
 - `rein canonicals` shows canonical memories and their support/merge counters
