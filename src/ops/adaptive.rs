@@ -179,11 +179,14 @@ fn run_hdbscan_clustering(
         );
     }
     let _ = store.conn().execute_batch("COMMIT");
-    // Clear stale per-cluster survival curves (will be rebuilt by M3)
+    // Clear ALL survival curves unconditionally. Cluster IDs are local labels
+    // produced by each HDBSCAN run — they are NOT stable identities across runs.
+    // Targeted deletion by old cluster ID would leave stale curves that get
+    // silently reused by a different cluster assigned the same numeric label.
     let _ = store
         .conn()
         .execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", []);
-    // Clear stale per-cluster dedup thresholds
+    // Clear stale per-cluster dedup thresholds (will be rebuilt by A1)
     state.dedup_thresholds.clear();
 
     // Store new cluster assignments from this run (batched in transaction)
@@ -1191,6 +1194,17 @@ fn compute_per_cluster_dedup_thresholds(
 
     let mut all_sims: Vec<f32> = Vec::new();
 
+    // Pre-fetch content for all sampled members in one batch query to avoid N+1 store.get() calls
+    let all_sample_ids: Vec<String> = clusters
+        .values()
+        .filter(|ids| ids.len() >= 5)
+        .flat_map(|ids| ids.iter().take(20).cloned())
+        .collect();
+    let content_map: std::collections::HashMap<String, String> = all_sample_ids
+        .iter()
+        .filter_map(|id| store.get(id).ok().map(|m| (id.clone(), m.content)))
+        .collect();
+
     for (cluster_id, mem_ids) in &clusters {
         if mem_ids.len() < 5 {
             continue;
@@ -1200,10 +1214,10 @@ fn compute_per_cluster_dedup_thresholds(
         let sample: Vec<&str> = mem_ids.iter().take(20).map(|s| s.as_str()).collect();
         let mut sims: Vec<f32> = Vec::new();
 
-        // Fetch content for sampled members
-        let contents: Vec<String> = sample
+        // Use pre-fetched content
+        let contents: Vec<&String> = sample
             .iter()
-            .filter_map(|id| store.get(id).ok().map(|m| m.content))
+            .filter_map(|id| content_map.get(*id))
             .collect();
 
         // Compute pairwise similarities
