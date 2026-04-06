@@ -790,11 +790,27 @@ fn dedup_quick(
         if job.is_subagent {
             let score = crate::extract::patterns::score_sentence(&item.content)
                 .max(crate::extract::patterns::score_sentence(&item.summary));
-            let strong_topic = ["architecture", "decision", "debug", "config", "workflow"]
+            let topic_lower = item.topic.to_lowercase();
+            // High-value topics from subagents always pass (architectural decisions, etc.)
+            let high_value = ["architecture", "decision", "design", "security", "migration"]
                 .iter()
-                .any(|k| item.topic.to_lowercase().contains(k));
-            if item.quality_confidence < 0.7 && score < 4 && !strong_topic {
-                continue;
+                .any(|k| topic_lower.contains(k));
+            // Medium-value topics get a lower bar
+            let medium_value = ["debug", "config", "workflow", "deployment", "fix"]
+                .iter()
+                .any(|k| topic_lower.contains(k));
+            if high_value {
+                // Always admit high-value subagent items
+            } else if medium_value {
+                // Relaxed threshold for medium-value topics
+                if item.quality_confidence < 0.4 && score < 3 {
+                    continue;
+                }
+            } else {
+                // Strict threshold for low-value subagent noise
+                if item.quality_confidence < 0.7 && score < 4 {
+                    continue;
+                }
             }
         }
         for existing in &unique {
