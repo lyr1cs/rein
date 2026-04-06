@@ -947,6 +947,74 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         "global": state.global_dedup_threshold,
     });
 
+    let recent_avg: f64 = conn
+        .query_row(
+            "SELECT COALESCE(AVG(strength), 0.5) FROM (SELECT strength FROM memories ORDER BY created_at DESC LIMIT 100)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.5);
+    let global_admission = if recent_avg < 0.4 {
+        (0.2_f64 * 1.1_f64).min(0.60)
+    } else if recent_avg > 0.7 {
+        (0.2_f64 * 0.9_f64).max(0.15)
+    } else {
+        0.2_f64
+    };
+    let survival_lookup: std::collections::HashMap<u32, crate::search::survival::SurvivalCurve> =
+        survival_curves
+            .iter()
+            .filter_map(|curve| {
+                let cluster_id = curve.get("cluster_id")?.as_str()?.parse::<u32>().ok()?;
+                let steps = curve.get("steps")?.clone();
+                let median_survival = curve.get("median_survival").and_then(|v| v.as_f64());
+                Some((
+                    cluster_id,
+                    crate::search::survival::SurvivalCurve {
+                        steps: serde_json::from_value(steps).ok()?,
+                        event_count: 0,
+                        total_count: 0,
+                        median_survival,
+                    },
+                ))
+            })
+            .collect();
+    let cluster_profiles: Vec<serde_json::Value> = unique_clusters
+        .iter()
+        .filter_map(|cid| {
+            let stats: Option<(u32, f64)> = conn
+                .query_row(
+                    "SELECT COUNT(*), AVG(strength) FROM memories
+                     WHERE cluster_id = ?1 AND superseded_by IS NULL AND status IN ('active', 'updated')",
+                    rusqlite::params![cid],
+                    |row| Ok((row.get(0)?, row.get::<_, Option<f64>>(1)?.unwrap_or(0.0))),
+                )
+                .ok();
+            let (memory_count, avg_strength) = stats?;
+            let admission_threshold = if avg_strength > 0.0 && recent_avg > 0.0 {
+                let cluster_threshold = (global_admission * (recent_avg / avg_strength)).clamp(0.15, 0.60);
+                let blend = (memory_count as f64 / 8.0).clamp(0.0, 1.0);
+                (global_admission * (1.0 - blend) + cluster_threshold * blend).clamp(0.15, 0.60)
+            } else {
+                global_admission
+            };
+            let promotion_threshold = survival_lookup
+                .get(cid)
+                .map(crate::search::survival::promotion_access_threshold)
+                .unwrap_or(5);
+            let median_survival = survival_lookup.get(cid).and_then(|curve| curve.median_survival);
+            Some(serde_json::json!({
+                "cluster_id": cid,
+                "memory_count": memory_count,
+                "avg_strength": avg_strength,
+                "dedup_threshold": state.get_dedup_threshold(Some(*cid)),
+                "admission_threshold": admission_threshold,
+                "promotion_threshold": promotion_threshold,
+                "median_survival": median_survival,
+            }))
+        })
+        .collect();
+
     serde_json::json!({
         "learned_alphas": learned_alphas,
         "reranker_weights": reranker_weights,
@@ -955,6 +1023,7 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         "event_counts": event_counts,
         "survival_curves": survival_curves,
         "dedup_thresholds": dedup_thresholds,
+        "cluster_profiles": cluster_profiles,
     })
 }
 

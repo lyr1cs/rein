@@ -49,7 +49,7 @@ function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClic
   return (
     <button
       onClick={onClick}
-      className={`bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4 text-left transition-all hover:border-[var(--accent)]/50 hover:shadow-[0_0_16px_var(--accent)/10] cursor-pointer w-full ${
+      className={`group relative bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4 text-left transition-all hover:border-[var(--accent)]/50 hover:shadow-[0_0_16px_var(--accent)/10] cursor-pointer w-full ${
         isCold ? 'opacity-60' : ''
       }`}
     >
@@ -102,6 +102,21 @@ function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClic
           }}
         />
       </div>
+
+      {recallMeta?.evidence_preview?.length ? (
+        <div className="pointer-events-none absolute left-3 right-3 top-full z-20 mt-2 hidden rounded-lg border border-[var(--border)] bg-[#0b1220]/95 p-3 text-xs text-[var(--text-secondary)] shadow-2xl group-hover:block">
+          <div className="mb-1 text-[10px] uppercase tracking-wider text-[var(--accent)]">
+            Evidence Preview
+          </div>
+          <div className="space-y-1">
+            {recallMeta.evidence_preview.map((line) => (
+              <div key={line} className="line-clamp-2 break-words">
+                {line}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </button>
   );
 }

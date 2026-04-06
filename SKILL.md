@@ -7,21 +7,24 @@ description: >
   alpha optimization), survival-based decay (per-cluster Kaplan-Meier replacing fixed Ebbinghaus),
   HDBSCAN semantic clustering, three-tier memory (Hot/Warm/Cold with t-digest boundaries),
   temporal knowledge graph (revision history, episodes, temporal links), autonomous query
-  routing, memory evolution, multi-factor admission control, concept dedup with name
-  normalization, and CC/RRF fusion.
+  routing, memory evolution, canonical-first read model, evidence-aware recall,
+  multi-factor admission control, concept dedup with name normalization, hybrid CJK lexical
+  dedup (`jieba-rs` + bigrams), survival-driven STM promotion, and CC/RRF fusion.
   Triggers when user mentions memory, recall, remember, past sessions, knowledge graph,
   memoir, concepts, timeline, history, export, GUI, dashboard, or wants to save/search
   important context.
 ---
 
-# rein Memory System (v0.11.1)
+# rein Memory System (v0.13.x+)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (25 tools) or via CLI (20+ commands). Features Neural Wiki GUI (`rein serve --gui`),
 LLM-powered extraction (Gemini 3.1 Flash Lite or local models), temporal knowledge graph,
 autonomous retrieval routing, memory evolution, transparent LLM proxy (record-only),
 concept name normalization and dedup, async memory pipeline with file-based queue and
-background worker, project-scoped working set + always-on index for memory surfaces.
+background worker, project-scoped working set + always-on index for memory surfaces,
+canonical-first recall with evidence previews, and adaptive learning loops that use
+support_count/source_diversity in reranking and alpha optimization.
 
 ## CLI Commands
 
@@ -109,6 +112,8 @@ OPENAI_BASE_URL=http://127.0.0.1:8690 codex       # Codex CLI
 - **LLM Extraction**: Gemini 3.1 Flash Lite or local models (Ollama/LM Studio/vLLM)
 - **Knowledge Graph**: Auto-creates concepts + typed links from session transcripts
 - **Memory Evolution**: New memories automatically refine or supersede similar old ones
+- **Canonical-First Read Model**: recall returns canonicals by default; evidence expands on demand
+- **Evidence-Aware Recall**: low-confidence recall can use evidence previews and second-stage evidence rerank
 - **Recency Boost**: 24h memories +50% search score, 7-day linear decay
 - **Bidirectional Links**: Memory ↔ Concept, Memory ↔ Memory, Concept ↔ Concept
 - **Buffer Architecture**: hook_post buffers, hook_stop does batch LLM extraction
@@ -116,6 +121,10 @@ OPENAI_BASE_URL=http://127.0.0.1:8690 codex       # Codex CLI
 - **Admission Control**: Adaptive threshold gates low-quality content from entering storage
 - **Quality Pruning**: Auto-removes low-quality concepts that are recalled but never used
 - **Adaptive Threshold**: Buffer flush adjusts by content signal density
+- **Hybrid CJK Dedup**: Chinese/Japanese/Korean lexical dedup uses jieba-rs plus character bigrams
+- **Cluster-Aware Admission**: admission threshold and novelty scoring incorporate cluster strength and cold-start blending
+- **Survival-Driven Promotion**: STM→LTM promotion uses survival curves when cluster data exists
+- **Layered Summaries**: canonical summaries stay detailed while API/UI expose `summary_short` for list views
 
 ## When to Use
 

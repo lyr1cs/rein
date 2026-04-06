@@ -148,6 +148,9 @@ export default function Adaptive() {
 
   /* Panel 6: Cluster & convergence */
   const { cluster_info, tier_boundaries, dedup_thresholds } = adaptive;
+  const clusterProfiles = [...(adaptive.cluster_profiles ?? [])]
+    .sort((a, b) => b.memory_count - a.memory_count)
+    .slice(0, 8);
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -323,6 +326,38 @@ export default function Adaptive() {
             <Row label="Cold Threshold" value={tier_boundaries.cold_threshold.toFixed(3)} color="var(--cold)" />
           </div>
         </Panel>
+
+        <Panel title="Admission & Promotion Decisions" className="md:col-span-2">
+          {clusterProfiles.length === 0 ? (
+            <div className="text-sm text-[var(--text-muted)]">No cluster decision data yet.</div>
+          ) : (
+            <div className="space-y-3">
+              {clusterProfiles.map((cluster) => (
+                <div key={cluster.cluster_id} className="rounded-lg border border-[#1e293b] bg-[#0b1220] p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-xs uppercase tracking-wider text-[var(--text-secondary)]">
+                      Cluster {cluster.cluster_id}
+                    </div>
+                    <div className="text-[10px] font-mono text-[var(--text-muted)]">
+                      {cluster.memory_count} memories
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                    <Metric label="Avg strength" value={cluster.avg_strength.toFixed(3)} color="var(--success)" />
+                    <Metric label="Dedup" value={cluster.dedup_threshold.toFixed(3)} color="var(--accent)" />
+                    <Metric label="Admission" value={cluster.admission_threshold.toFixed(3)} color="var(--warm)" />
+                    <Metric label="Promote @ access" value={cluster.promotion_threshold} color="var(--hot)" />
+                  </div>
+                  {cluster.median_survival != null && (
+                    <div className="mt-2 text-[10px] text-[var(--text-muted)]">
+                      Median survival: <span className="font-mono text-[var(--text-secondary)]">{cluster.median_survival.toFixed(1)}d</span>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </Panel>
       </div>
     </div>
   );
@@ -341,4 +376,15 @@ function Row({ label, value, color }: { label: string; value: string | number; c
 
 function Divider() {
   return <div className="border-t border-[#1e293b]" />;
+}
+
+function Metric({ label, value, color }: { label: string; value: string | number; color?: string }) {
+  return (
+    <div className="rounded-md bg-[#111827] px-2 py-2">
+      <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">{label}</div>
+      <div className="font-mono text-sm" style={{ color: color ?? 'var(--text-primary)' }}>
+        {value}
+      </div>
+    </div>
+  );
 }
