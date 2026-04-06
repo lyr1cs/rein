@@ -9,8 +9,15 @@ use crate::types::*;
 use super::adaptive::run_adaptive_pipeline;
 use super::dedup::{emit_cleanup_event, record_deleted_memory_as_evidence, run_dedup_scoped};
 
+const CANONICAL_SUMMARY_MAX_CHARS: usize = 240;
+
 fn normalize_summary(summary: &str) -> String {
-    summary.split_whitespace().collect::<Vec<_>>().join(" ")
+    let normalized = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for ch in normalized.chars().take(CANONICAL_SUMMARY_MAX_CHARS) {
+        out.push(ch);
+    }
+    out
 }
 
 /// Build a consolidated Memory from a topic.

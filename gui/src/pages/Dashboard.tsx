@@ -128,7 +128,7 @@ export default function Dashboard() {
               {m.tier}
             </span>
             <div className="flex-1 min-w-0">
-              <div className="text-sm truncate">{m.summary}</div>
+              <div className="text-sm truncate">{m.summary_short ?? m.summary}</div>
               <div className="text-xs text-[var(--text-muted)] mt-1">{m.topic} · {new Date(m.created_at).toLocaleDateString()}</div>
               <div className="flex items-center gap-2 mt-2 text-[10px]">
                 <span className="rounded bg-[var(--border)] px-2 py-0.5 font-mono text-[var(--text-muted)]">

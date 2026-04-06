@@ -10,7 +10,7 @@ const EXTRACT_SYSTEM_PROMPT: &str = r#"You are a memory extraction system. Analy
 
 Output a JSON array of objects. Each object has:
 - "topic": short category (e.g., "architecture", "decision", "debug", "workflow", "config", "learning")
-- "summary": concise summary under 100 characters
+- "summary": concise summary, ideally 80-220 characters, suitable for list display
 - "content": the full fact to remember (1-3 sentences)
 - "keywords": array of 2-5 relevant keywords
 - "importance": one of "low", "medium", "high", "critical"
@@ -29,7 +29,7 @@ const CONSOLIDATE_SYSTEM_PROMPT: &str = r#"You are consolidating multiple existi
 
 Output a JSON array with exactly one object using this schema:
 - "topic": MUST be exactly the target topic provided in the input
-- "summary": concise summary under 100 characters
+- "summary": concise durable summary, ideally 80-220 characters and never just a title fragment
 - "content": 2-5 sentences capturing the durable facts worth keeping
 - "keywords": array of 3-8 relevant keywords
 - "importance": one of "low", "medium", "high", "critical"
@@ -172,7 +172,7 @@ Output a JSON object with these fields:
 - "links": array of relationships between concepts
 - "episode": session summary object, or null if session is too short
 
-Each memory: {"topic", "summary" (under 100 chars), "content" (1-3 sentences), "keywords" (2-5), "importance" ("low"|"medium"|"high"|"critical"), "should_store" (bool), "quality_confidence" (float 0-1)}
+Each memory: {"topic", "summary" (80-220 chars when possible), "content" (1-3 sentences), "keywords" (2-5), "importance" ("low"|"medium"|"high"|"critical"), "should_store" (bool), "quality_confidence" (float 0-1)}
 
 Each concept: {"name" (short identifier, MUST use lowercase-kebab-case e.g. "adaptive-engine", "query-expansion", "sqlite-wal"), "definition" (1-2 sentences), "labels" (tags), "memoir" (category: "architecture", "debugging", "workflow", "config", "learning", "tooling"), "concept_type" ("fact" or "skill"), "quality_confidence" (float 0-1)}
 
