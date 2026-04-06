@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
+use jieba_rs::Jieba;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::store::SqliteStore;
@@ -36,6 +38,14 @@ fn normalize_tokens(text: &str) -> HashSet<String> {
         .collect();
 
     if contains_cjk(text) {
+        let jieba_tokens = jieba()
+            .cut(text, false)
+            .into_iter()
+            .map(normalize_token)
+            .filter(|t| !t.is_empty())
+            .filter(|t| t.chars().count() > 1 || t.chars().any(is_cjk));
+        tokens.extend(jieba_tokens);
+
         let chars: Vec<char> = text
             .nfc()
             .flat_map(char::to_lowercase)
@@ -55,6 +65,18 @@ fn normalize_tokens(text: &str) -> HashSet<String> {
     }
 
     tokens
+}
+
+fn jieba() -> &'static Jieba {
+    static INSTANCE: OnceLock<Jieba> = OnceLock::new();
+    INSTANCE.get_or_init(Jieba::new)
+}
+
+fn normalize_token(text: &str) -> String {
+    text.nfc()
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric() || is_cjk(*c))
+        .collect()
 }
 
 fn contains_cjk(text: &str) -> bool {
@@ -609,6 +631,15 @@ mod tests {
         assert!(
             sim < 0.3,
             "unrelated CJK strings should stay low similarity, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_cjk_tokenization_includes_jieba_words() {
+        let tokens = normalize_tokens("数据库连接池修复");
+        assert!(
+            tokens.contains("连接池") || tokens.contains("数据库"),
+            "jieba-rs tokens should be present alongside n-grams: {tokens:?}"
         );
     }
 }
