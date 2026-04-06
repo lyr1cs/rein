@@ -6,17 +6,17 @@
 
 ```bash
 cargo build
-cargo test            # 242+ tests, all must pass
+cargo test            # 330+ tests, all must pass
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (25 tools, 12-feature reranker). Key modules:
+rein is a multi-source cross-validated memory MCP server (26 tools, evidence-aware canonical-first memory flow). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based
-- `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop)
-- `search/recall.rs` — 3-level waterfall (Tantivy BM25 → HNSW → Gemini API) + RRF/CC fusion + Ebbinghaus decay + parallel pipeline
+- `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop); admission and memory surfaces are cluster/canonical-aware
+- `search/recall.rs` — 3-level waterfall (Tantivy BM25 → HNSW → Gemini API) + evidence-aware rerank + RRF/CC fusion + canonical-first collapse
 - `search/expand.rs` — Query expansion (Gemini Flash Lite / OMLX dual backend)
 - `search/rerank_llm.rs` — LLM reranker (Gemini / OMLX) + strong signal bypass
 - `search/classify.rs` — Autonomous retrieval routing (Temporal/ExactKeyword/Semantic/Exploratory)
@@ -27,8 +27,9 @@ rein is a multi-source cross-validated memory MCP server (25 tools, 12-feature r
 - `store/adaptive.rs` — Feedback event sourcing, AdaptiveState cache, per-consumer offsets
 - `store/hdbscan.rs` — Pure Rust HDBSCAN clustering (dendrogram → condensed tree → EOMBST)
 - `store/tiering.rs` — Three-tier memory (Hot/Warm/Cold) with streaming quantile estimator
-- `search/alpha_optimizer.rs` — Counterfactual offline alpha optimization for CC fusion
+- `search/alpha_optimizer.rs` — Counterfactual offline alpha optimization with KG/episode/support/diversity-aware scoring
 - `search/survival.rs` — Kaplan-Meier non-parametric survival analysis for adaptive decay
+- `extract/dedup.rs` — Hybrid lexical dedup: whitespace tokens + `jieba-rs` + CJK bigrams
 
 ## Temporal Knowledge Graph (v0.4.0)
 
@@ -54,7 +55,7 @@ MCP response includes `[route: type]` prefix for transparency.
 
 3-channel retrieval: FTS (Tantivy BM25) + Vector (HNSW) + KG (concept FTS + BFS land-and-expand).
 **Query expansion** (v0.9.0): LLM rewrites query into 2-3 variants (Gemini Flash Lite or OMLX), multi-query search with score merging.
-Post-fusion multi-feature reranking (8 features, learned weights from M1/M2).
+Post-fusion multi-feature reranking (canonical support/diversity included in learned features).
 **LLM reranker** (v0.9.0): Optional LLM-based rescoring of top N candidates, with strong-signal bypass.
 **M5 tier filtering** (v0.9.0): Cold-tier memories excluded from non-Exploratory queries.
 **Parallel pipeline** (v0.9.0): Supermemory + expansion launched concurrently with original query search.
@@ -66,10 +67,11 @@ Automatic prompt injection is disabled. `hook_prompt` remains as a compatibility
 Self-learning engine that replaces fixed parameters with data-driven adaptation:
 
 - **M1 Event Sourcing**: `feedback_events` table captures all recall/store/click signals; AdaptiveState cache with per-consumer offsets enables replay
-- **M2 Counterfactual Alpha Optimization**: Learns optimal `cc_alpha` from candidate logs — replays past searches with alternative weights to find the alpha that would have maximized relevance
+- **M2 Counterfactual Alpha Optimization**: Learns optimal `cc_alpha` from candidate logs — replays past searches with alternative weights to find the alpha that would have maximized relevance, now with KG/episode/support/diversity-aware candidate scoring
 - **M3 Per-Cluster Kaplan-Meier Decay**: Replaces fixed Ebbinghaus half-lives with non-parametric survival curves estimated per semantic cluster; activates when sufficient data is available
 - **M4 HDBSCAN Clustering**: Groups memories into semantic neighborhoods (dendrogram → condensed tree → EOMBST extraction) for per-cluster learning in M2/M3
 - **M5 Hot/Warm/Cold Tiering**: Three-tier memory with t-digest streaming quantile estimator for adaptive tier boundaries; hot memories get priority in search, cold memories are candidates for archival
+- **Per-cluster admission + promotion**: admission and STM→LTM promotion now use cluster-aware strength/survival signals when available
 
 ## Environment Variables
 
