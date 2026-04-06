@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::store::SqliteStore;
 use crate::types::{Memory, MemoryStore, ReinResult};
 
@@ -74,9 +76,12 @@ pub fn lexical_score(a: &str, b: &str) -> LexicalDedupScore {
 }
 
 pub fn normalize_topic_key(topic: &str) -> String {
-    let mut normalized = String::with_capacity(topic.len());
+    // Apply NFC normalization before lowercasing to handle composed vs decomposed
+    // Unicode forms (e.g., "café" NFC vs "cafe\u{0301}" NFD produce the same key).
+    let nfc: String = topic.trim().nfc().collect();
+    let mut normalized = String::with_capacity(nfc.len());
     let mut prev_sep = false;
-    for ch in topic.trim().to_lowercase().chars() {
+    for ch in nfc.to_lowercase().chars() {
         if ch.is_alphanumeric() {
             normalized.push(ch);
             prev_sep = false;
@@ -132,10 +137,13 @@ fn should_escalate_gray_zone(
     best_sim: f32,
     llm_budget_available: bool,
 ) -> bool {
-    if best_score.lexical.score < 0.50 {
+    let lower = gray_zone_lower_bound(best_sim, llm_budget_available);
+    // Guard: lexical score must meet the dynamic lower bound (0.35 when budget
+    // available and sim is in [0.35, 0.50), otherwise 0.50).
+    if best_score.lexical.score < lower {
         return false;
     }
-    best_sim >= gray_zone_lower_bound(best_sim, llm_budget_available)
+    best_sim >= lower
 }
 
 fn candidate_topics(store: &SqliteStore, topic: &str) -> ReinResult<Vec<String>> {
@@ -204,12 +212,14 @@ pub fn check_dedup(
     // Find best match by Jaccard similarity
     let mut best_sim = 0.0f32;
     let mut best_memory = None;
+    let mut best_candidate_score = None;
 
     for candidate in &candidates {
         let score = score_candidate(topic, content, candidate, None);
         if score.final_score > best_sim {
             best_sim = score.final_score;
             best_memory = Some(candidate);
+            best_candidate_score = Some(score);
         }
     }
 
@@ -242,9 +252,8 @@ pub fn check_dedup(
     // M6 LLM budget: extend gray zone down to 0.35 when budget allows (directed exploration)
     // Check sim range first to avoid wasting budget on non-candidates
     let llm_budget_available = m6_has_llm_budget(store);
-    if let Some(memory) = best_memory {
-        let score = score_candidate(topic, content, memory, None);
-        if should_escalate_gray_zone(&score, best_sim, llm_budget_available) {
+    if let (Some(memory), Some(ref score)) = (best_memory, &best_candidate_score) {
+        if should_escalate_gray_zone(score, best_sim, llm_budget_available) {
             if is_exploration {
                 m6_log_outcome(
                     store,
@@ -311,7 +320,8 @@ fn m6_explore_threshold(base_threshold: f32) -> (f32, bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Start at 1 to avoid count=0 which always hashes to 0 (a multiple of 20)
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     // Deterministic pseudo-random: explore on ~5% of calls
     let hash = count
         .wrapping_mul(0x9e3779b97f4a7c15)
@@ -488,6 +498,26 @@ mod tests {
         assert!(scored.topic_variant_match);
         assert!(scored.cluster_match);
         assert!(scored.final_score >= scored.lexical.score);
+    }
+
+    #[test]
+    fn test_topic_variant_nfc_nfd_equivalence() {
+        // NFC: precomposed "é" (U+00E9)
+        let nfc = "caf\u{00e9}-notes";
+        // NFD: decomposed "e" + combining acute (U+0301)
+        let nfd = "cafe\u{0301}-notes";
+        assert!(
+            topics_are_variants(nfc, nfd),
+            "NFC and NFD forms of the same topic should be treated as variants"
+        );
+        assert_eq!(normalize_topic_key(nfc), normalize_topic_key(nfd));
+    }
+
+    #[test]
+    fn test_topic_variant_non_latin() {
+        assert!(topics_are_variants("记忆管理", "記憶管理") == false,
+            "different CJK characters should not match");
+        assert!(topics_are_variants("メモリ管理", "メモリ管理"));
     }
 
     #[test]
