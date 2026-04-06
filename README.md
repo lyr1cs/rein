@@ -40,6 +40,8 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 | **Cluster-aware admission** | admission threshold and novelty scoring incorporate cluster strength, cluster novelty, and cold-start blending |
 | **Evidence second-stage rerank** | low-confidence / single-source recall results can be boosted by matching evidence content |
 | **Survival-driven STM promotion** | STM→LTM promotion uses cluster survival curves when available |
+| **ANN fallback for unclustered dedup** | large `cluster_id=None` buckets generate vector-neighbor candidates before pairwise dedup |
+| **Adaptive cluster decisions UI** | Adaptive page surfaces per-cluster dedup/admission/promotion decisions |
 | **Supermemory v4 API** | Hybrid search via `api.supermemory.ai/v4/search` for cross-validation |
 | **Zero local models** | No GPU required by default; optional OMLX local backend |
 | **~2-5 MB footprint** | Single SQLite file with FTS5 + sqlite-vec |
@@ -144,6 +146,11 @@ Recall is now evidence-aware:
 - recall output includes lightweight `evidence_preview`
 - `rein evidence <canonical_id>` or `/api/memories/:id` expands the full evidence list
 - lower-confidence / lower-corroboration results can use evidence second-stage rerank
+
+Adaptive learning now sees richer canonical signals:
+- reranker learning uses support / diversity features
+- alpha optimization uses KG / episode / support / diversity-aware candidate scoring
+- Adaptive GUI surfaces cluster-level dedup / admission / promotion decisions
 
 CJK dedup now uses a hybrid lexical strategy:
 - `jieba-rs` adds Chinese word segmentation
