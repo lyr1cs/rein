@@ -24,9 +24,9 @@ src/
 ├── config.rs        # Configuration loading (TOML + env), includes [extract] section
 ├── ops/             # Shared business logic (modularized)
 │   ├── mod.rs       # Ingestion, GC, topic utilities, re-exports
-│   ├── adaptive.rs  # M2-M6 adaptive pipeline, alpha learning, clustering, tiering
-│   ├── dedup.rs     # Dedup strategies, merge, batch dedup (cluster-grouped)
-│   └── consolidation.rs # Topic consolidation, cleanup orchestration
+│   ├── adaptive.rs  # M2-M6 adaptive pipeline, alpha learning, clustering, tiering, cluster profiles for UI
+│   ├── dedup.rs     # Dedup strategies, merge, batch dedup (cluster-grouped, ANN fallback for None bucket)
+│   └── consolidation.rs # Topic consolidation, cleanup orchestration, summary normalization
 ├── init.rs          # Auto-configure MCP clients (JSON + TOML)
 ├── types/           # Memory, Importance, Embedder trait, errors (incl. Extract variant)
 ├── store/
@@ -132,6 +132,7 @@ docker-compose.yml   # One-command deployment
 - STM→LTM promotion uses survival-curve-derived thresholds when cluster curves exist, with a fixed fallback otherwise
 - Large `cluster_id=None` dedup buckets use ANN candidate generation before pairwise comparison
 - Summary display is layered: canonical summaries may be longer, while APIs/UI can expose `summary_short` for list views
+- Adaptive status now exposes `cluster_profiles` for per-cluster dedup/admission/promotion inspection
 
 ## Common Pitfalls
 
