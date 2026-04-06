@@ -125,6 +125,8 @@ OPENAI_BASE_URL=http://127.0.0.1:8690 codex       # Codex CLI
 - **Cluster-Aware Admission**: admission threshold and novelty scoring incorporate cluster strength and cold-start blending
 - **Survival-Driven Promotion**: STM→LTM promotion uses survival curves when cluster data exists
 - **Layered Summaries**: canonical summaries stay detailed while API/UI expose `summary_short` for list views
+- **ANN None-Bucket Dedup**: large unclustered dedup buckets use vector-neighbor candidate generation before pairwise scanning
+- **Adaptive Cluster Decisions**: Adaptive GUI surfaces cluster-level dedup/admission/promotion signals
 
 ## When to Use
 
