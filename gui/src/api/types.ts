@@ -3,6 +3,7 @@ export interface Memory {
   layer: string;
   topic: string;
   summary: string;
+  summary_short?: string;
   content: string;
   keywords: string[];
   importance: string;

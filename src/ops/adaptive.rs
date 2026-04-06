@@ -507,6 +507,14 @@ fn parse_candidates_from_event(
                 memory_id: c.get("id")?.as_str()?.to_string(),
                 bm25_norm: c.get("bm25_norm")?.as_f64()? as f32,
                 vec_norm: c.get("vec_norm")?.as_f64()? as f32,
+                kg_norm: c
+                    .get("kg_norm")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32,
+                episode_norm: c
+                    .get("episode_norm")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32,
                 support_count: c
                     .get("support_count")
                     .and_then(|v| v.as_u64())
@@ -1704,6 +1712,8 @@ mod tests {
                         memory_id: mem_a.clone(),
                         bm25_norm: 0.9,
                         vec_norm: 0.2,
+                        kg_norm: 0.0,
+                        episode_norm: 0.0,
                         support_count: 1,
                         source_diversity: 1.0,
                     },
@@ -1711,6 +1721,8 @@ mod tests {
                         memory_id: mem_b.clone(),
                         bm25_norm: 0.1,
                         vec_norm: 0.95,
+                        kg_norm: 0.0,
+                        episode_norm: 0.0,
                         support_count: 1,
                         source_diversity: 1.0,
                     },

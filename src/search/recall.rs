@@ -136,6 +136,35 @@ fn enrich_results_with_evidence(
     }
 }
 
+fn apply_evidence_rerank(
+    store: &SqliteStore,
+    query: &str,
+    results: &mut [RecallResult],
+    evidence_limit: usize,
+) {
+    for result in results {
+        if result.memory.support_count <= 1 || (result.confidence >= 0.85 && result.sources_hit >= 2) {
+            continue;
+        }
+        let evidence = store
+            .list_memory_evidence(&result.memory.id, evidence_limit.saturating_add(1))
+            .unwrap_or_default();
+        let best_sim = evidence
+            .into_iter()
+            .filter(|item| item.memory_id.as_deref() != Some(result.memory.id.as_str()))
+            .map(|item| {
+                crate::extract::similarity(query, &item.summary)
+                    .max(crate::extract::similarity(query, &item.content))
+            })
+            .fold(0.0f32, f32::max);
+
+        if best_sim > 0.0 {
+            let support_scale = (result.memory.support_count.min(4) as f32 - 1.0).max(0.0) / 3.0;
+            result.score += 0.08 * best_sim * support_scale;
+        }
+    }
+}
+
 /// Full recall pipeline: waterfall search + optional cross-validation.
 ///
 /// This is sync-safe: embedding uses reqwest::blocking if needed.
@@ -920,6 +949,7 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     results = collapse_results_to_canonicals(store, results)?;
+    apply_evidence_rerank(store, query, &mut results, 3);
 
     sort_recall_results(&mut results);
 
@@ -1074,6 +1104,51 @@ mod tests {
 
         sort_recall_results(&mut results);
         assert_eq!(results[0].memory.id, "high");
+    }
+
+    #[test]
+    fn evidence_rerank_boosts_supported_memory() {
+        let store = SqliteStore::in_memory().unwrap();
+        let supported_id = store
+            .store(test_memory("supported", 3, 2.0))
+            .unwrap();
+        let unsupported_id = store
+            .store(test_memory("unsupported", 1, 1.0))
+            .unwrap();
+
+        let supported = store.get(&supported_id).unwrap();
+        store.snapshot_memory_as_evidence(&supported_id, &Memory {
+            id: "ev1".to_string(),
+            content: "database connection pool tuning".to_string(),
+            summary: "connection pool tuning".to_string(),
+            created_at: supported.created_at,
+            updated_at: supported.updated_at,
+            last_accessed: supported.last_accessed,
+            ..supported.clone()
+        }).unwrap();
+
+        let mut results = vec![
+            RecallResult {
+                memory: store.get(&supported_id).unwrap(),
+                score: 0.5,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+            RecallResult {
+                memory: store.get(&unsupported_id).unwrap(),
+                score: 0.52,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+        ];
+
+        apply_evidence_rerank(&store, "connection pool", &mut results, 3);
+        sort_recall_results(&mut results);
+        assert_eq!(results[0].memory.id, supported_id);
     }
 }
 
