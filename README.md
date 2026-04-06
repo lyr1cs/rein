@@ -57,7 +57,12 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 ```bash
 git clone https://github.com/lyr1cs/rein.git
 cd rein
+
+# Standard build (CLI + MCP server only)
 cargo install --path .
+
+# Full build with Neural Wiki GUI (recommended)
+cargo install --path . --features gui
 ```
 
 Or use the install script:
@@ -70,6 +75,24 @@ Or use the install script:
 
 - Rust toolchain (1.75+)
 - A Gemini API key (free tier: 1500 req/day)
+
+#### GUI Service Management
+
+```bash
+# Start GUI server in background (listens on :8680)
+rein gui on
+
+# Stop GUI server
+rein gui off
+
+# Or run in foreground with MCP + GUI
+rein serve --gui
+
+# Open in browser
+open http://localhost:8680
+```
+
+The GUI requires building with `--features gui`. Without it, the `gui` subcommand is available but serves no embedded assets.
 
 ### Quick Start
 
@@ -120,6 +143,32 @@ rein serve
 | `dashboard` | Show service status, metrics, memory stats | `rein dashboard` |
 | `gui on/off` | Start/stop GUI server in background | `rein gui on` |
 | `proxy on/off` | Start/stop proxy in background | `rein proxy on` |
+
+### How Cleanup Works (Provenance-Preserving)
+
+rein's cleanup pipeline is **provenance-preserving**: it never hard-deletes information. The process has three stages:
+
+1. **Consolidation** — Groups topic variants (e.g., `Docker Deployment` / `docker-deployment`) and merges all memories within each group into a single high-quality canonical memory. Source memories become evidence records in the `memory_evidence` table, preserving their original content, timestamps, and keywords.
+
+2. **Dedup** — Scans for content-level duplicates within each topic group using lexical similarity (Jaccard + containment) and optionally embedding cosine similarity. Matches above threshold are merged into the winner; the loser's unique lines are appended with provenance markers (`[merged from <id> on <date>]`) and the loser is recorded as evidence.
+
+3. **Adaptive refresh** — After consolidation and dedup, the adaptive engine (M1-M6) runs: HDBSCAN re-clusters, survival curves rebuild, tier boundaries update, and alpha/threshold learning processes new events.
+
+Every merge decision is logged in the `dedup_decisions` append-only ledger with winner/loser IDs, scores, relation type, confidence, and operator. This is rein's equivalent of Git's reflog — you can always trace how a canonical memory was formed.
+
+```bash
+# Preview what cleanup would do (safe)
+rein cleanup --all --dry-run
+
+# Run cleanup on specific topics
+rein cleanup --topic "docker-deployment"
+
+# Full store cleanup
+rein cleanup --all
+
+# Queue cleanup for background processing
+rein cleanup --all --async
+```
 
 `consolidate` keeps the old `rein consolidate <topic> -s "summary"` flow, but also supports:
 - `--topics a,b,c` to batch a named topic set
