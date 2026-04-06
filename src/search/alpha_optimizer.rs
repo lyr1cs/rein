@@ -20,6 +20,8 @@ pub struct CandidateLog {
     pub memory_id: String,
     pub bm25_norm: f32,
     pub vec_norm: f32,
+    pub support_count: u32,
+    pub source_diversity: f32,
 }
 
 /// A logged recall event with outcome.
@@ -145,7 +147,7 @@ pub fn optimize_alpha(events: &[RecallEvent], base_lambda: f64) -> Option<Learne
     for event in events {
         if let Some(alpha) = optimal_alpha_for_event(event) {
             let age_days = (now - event.timestamp).num_seconds() as f64 / 86400.0;
-            let weight = (-base_lambda * age_days.max(0.0)).exp();
+            let weight = (-base_lambda * age_days.max(0.0)).exp() * event_evidence_weight(event);
             weighted_sum += weight * alpha;
             weight_total += weight;
             count += 1;
@@ -161,6 +163,37 @@ pub fn optimize_alpha(events: &[RecallEvent], base_lambda: f64) -> Option<Learne
         sample_count: count,
         last_updated: now,
     })
+}
+
+fn event_evidence_weight(event: &RecallEvent) -> f64 {
+    let mut total = 0.0_f64;
+    let mut count = 0usize;
+    for candidate in &event.candidates {
+        if event
+            .accessed_ids
+            .iter()
+            .any(|id| *id == candidate.memory_id)
+        {
+            let support_signal = if candidate.support_count > 1 {
+                (candidate.support_count - 1) as f64 / candidate.support_count as f64
+            } else {
+                0.0
+            };
+            let diversity = candidate.source_diversity as f64;
+            let diversity_signal = if diversity > 1.0 {
+                (diversity - 1.0) / diversity
+            } else {
+                0.0
+            };
+            total += 1.0 + support_signal + diversity_signal;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        1.0
+    } else {
+        total / count as f64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +256,8 @@ mod tests {
                     memory_id: id.to_string(),
                     bm25_norm: *bm25,
                     vec_norm: *vec,
+                    support_count: 1,
+                    source_diversity: 1.0,
                 })
                 .collect(),
             accessed_ids: accessed.iter().map(|s| s.to_string()).collect(),
@@ -361,5 +396,23 @@ mod tests {
         let learned = optimize_alpha(&[event], 0.01).unwrap();
         assert!(learned.value >= 0.5);
         assert_eq!(learned.sample_count, 1);
+    }
+
+    #[test]
+    fn test_optimize_alpha_evidence_weighting_favours_high_support_event() {
+        let mut bm25_event = make_event(&[("t", 1.0, 0.0), ("n", 0.0, 1.0)], &["t"], 0);
+        bm25_event.candidates[0].support_count = 5;
+        bm25_event.candidates[0].source_diversity = 3.0;
+
+        let vector_event = make_event(&[("t", 0.0, 1.0), ("n", 1.0, 0.0)], &["t"], 0);
+        let baseline = optimize_alpha(&[make_event(&[("t", 1.0, 0.0), ("n", 0.0, 1.0)], &["t"], 0), vector_event.clone()], 0.01).unwrap();
+
+        let learned = optimize_alpha(&[bm25_event, vector_event], 0.01).unwrap();
+        assert!(
+            learned.value > baseline.value,
+            "higher-support BM25 event should pull alpha upward vs baseline, got {} <= {}",
+            learned.value,
+            baseline.value
+        );
     }
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import { apiGet } from '../api/client';
+import { useMemoryDetail } from '../hooks/useApi';
 import type { Memory, Concept, ConceptLink } from '../api/types';
 
 /* ------------------------------------------------------------------ */
@@ -72,6 +73,9 @@ export default function Brain() {
   const [search, setSearch] = useState('');
   const [timeMax, setTimeMax] = useState<number>(Date.now());
   const [timeSlider, setTimeSlider] = useState<number>(Date.now());
+  const { data: selectedMemoryDetail, isLoading: selectedMemoryLoading } = useMemoryDetail(
+    selectedNode?.type === 'memory' ? selectedNode.id : null,
+  );
 
   /* Refs */
   const fgRef = useRef<any>(null);
@@ -425,8 +429,8 @@ export default function Brain() {
   /* ---- Detail panel: find memory/concept data ---- */
   const selectedMemory = useMemo(() => {
     if (!selectedNode || selectedNode.type !== 'memory') return null;
-    return selectedNode;
-  }, [selectedNode]);
+    return selectedMemoryDetail?.memory ?? null;
+  }, [selectedNode, selectedMemoryDetail]);
 
   const selectedConcept = useMemo(() => {
     if (!selectedNode || selectedNode.type !== 'concept') return null;
@@ -696,6 +700,43 @@ export default function Brain() {
                   <span className="text-[var(--text-secondary)] font-mono">{selectedMemory.cluster_id}</span>
                 </div>
               )}
+
+              <div className="text-xs text-[var(--text-muted)] mb-2">
+                Support:{' '}
+                <span className="text-[var(--text-secondary)] font-mono">{selectedMemory.support_count}</span>
+              </div>
+
+              <div className="text-xs text-[var(--text-muted)] mb-3">
+                Diversity:{' '}
+                <span className="text-[var(--text-secondary)] font-mono">{selectedMemory.source_diversity.toFixed(2)}</span>
+              </div>
+
+              <div className="mb-3">
+                <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider mb-1">
+                  Evidence
+                </div>
+                {selectedMemoryLoading ? (
+                  <div className="text-xs text-[var(--text-muted)]">Loading detail...</div>
+                ) : selectedMemoryDetail?.evidence?.length ? (
+                  <div className="space-y-2">
+                    {selectedMemoryDetail.evidence.slice(0, 4).map((item) => (
+                      <div key={item.id} className="rounded border border-[var(--border)] bg-[var(--bg-secondary)]/40 p-2">
+                        <div className="text-[10px] uppercase tracking-wider text-[var(--accent)] mb-1">
+                          {item.source_topic}
+                        </div>
+                        <div className="text-xs text-[var(--text-primary)] mb-1">{item.summary}</div>
+                        <div className="text-[11px] text-[var(--text-secondary)] line-clamp-3 whitespace-pre-wrap break-words">
+                          {item.content}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-[var(--text-muted)]">
+                    No supporting evidence beyond the canonical record.
+                  </div>
+                )}
+              </div>
             </>
           )}
 
