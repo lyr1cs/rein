@@ -238,49 +238,68 @@ pub async fn resolve_dedup_job_async(
             Ok(DedupRelation::Duplicate)
         }
         DedupRelation::Update => {
-            if let Ok(mut winner) = store.get(new_id) {
-                for kw in &existing.keywords {
-                    if !winner.keywords.contains(kw) {
-                        winner.keywords.push(kw.clone());
+            // Wrap in SAVEPOINT for atomicity (same as Duplicate branch)
+            store.conn().execute_batch("SAVEPOINT dedup_update")?;
+            let update_result = (|| -> ReinResult<()> {
+                if let Ok(mut winner) = store.get(new_id) {
+                    for kw in &existing.keywords {
+                        if !winner.keywords.contains(kw) {
+                            winner.keywords.push(kw.clone());
+                        }
                     }
+                    winner.importance = winner.importance.max(existing.importance);
+                    winner.layer = winner.importance.auto_layer();
+                    winner.decay_lambda = winner.decay_lambda.min(existing.decay_lambda);
+                    winner.strength = (winner.strength + 0.05).min(1.0);
+                    if !verdict.merged_summary.trim().is_empty() {
+                        winner.summary = verdict.merged_summary.chars().take(100).collect();
+                    }
+                    winner.updated_at = chrono::Utc::now();
+                    store.update(&winner)?;
                 }
-                winner.importance = winner.importance.max(existing.importance);
-                winner.layer = winner.importance.auto_layer();
-                winner.decay_lambda = winner.decay_lambda.min(existing.decay_lambda);
-                winner.strength = (winner.strength + 0.05).min(1.0);
-                if !verdict.merged_summary.trim().is_empty() {
-                    winner.summary = verdict.merged_summary.chars().take(100).collect();
+                store.mark_superseded(existing_id, new_id)?;
+                record_dedup_artifacts(
+                    store,
+                    new_id,
+                    &existing,
+                    DedupRelation::Update,
+                    lexical_score,
+                    None,
+                    reason,
+                    payload,
+                );
+                Ok(())
+            })();
+            match update_result {
+                Ok(()) => {
+                    store.conn().execute_batch("RELEASE dedup_update")?;
+                    Ok(DedupRelation::Update)
                 }
-                winner.updated_at = chrono::Utc::now();
-                store.update(&winner)?;
+                Err(e) => {
+                    let _ = store.conn().execute_batch("ROLLBACK TO dedup_update");
+                    let _ = store.conn().execute_batch("RELEASE dedup_update");
+                    Err(e)
+                }
             }
-            store.mark_superseded(existing_id, new_id)?;
-            record_dedup_artifacts(
-                store,
-                new_id,
-                &existing,
-                DedupRelation::Update,
-                lexical_score,
-                None,
-                reason,
-                payload,
-            );
-            Ok(DedupRelation::Update)
         }
         DedupRelation::Related => {
             if let Ok(mut left) = store.get(existing_id) {
                 if !left.related_ids.contains(&new_id.to_string()) {
                     left.related_ids.push(new_id.to_string());
-                    let _ = store.update(&left);
+                    if let Err(e) = store.update(&left) {
+                        tracing::warn!("dedup: failed to update related link on {existing_id}: {e}");
+                    }
                 }
             }
             if let Ok(mut right) = store.get(new_id) {
                 if !right.related_ids.contains(&existing_id.to_string()) {
                     right.related_ids.push(existing_id.to_string());
-                    let _ = store.update(&right);
+                    if let Err(e) = store.update(&right) {
+                        tracing::warn!("dedup: failed to update related link on {new_id}: {e}");
+                    }
                 }
             }
-            let _ = store.record_dedup_decision(DedupDecision {
+            if let Err(e) = store.record_dedup_decision(DedupDecision {
                 id: String::new(),
                 winner_id: None,
                 loser_id: Some(new_id.to_string()),
@@ -298,11 +317,13 @@ pub async fn resolve_dedup_job_async(
                 conflict_detected: verdict.conflict_detected,
                 payload,
                 created_at: chrono::Utc::now(),
-            });
+            }) {
+                tracing::warn!("dedup: failed to record Related decision: {e}");
+            }
             Ok(DedupRelation::Related)
         }
         DedupRelation::Distinct => {
-            let _ = store.record_dedup_decision(DedupDecision {
+            if let Err(e) = store.record_dedup_decision(DedupDecision {
                 id: String::new(),
                 winner_id: None,
                 loser_id: Some(new_id.to_string()),
@@ -320,7 +341,9 @@ pub async fn resolve_dedup_job_async(
                 conflict_detected: verdict.conflict_detected,
                 payload,
                 created_at: chrono::Utc::now(),
-            });
+            }) {
+                tracing::warn!("dedup: failed to record Distinct decision: {e}");
+            }
             Ok(DedupRelation::Distinct)
         }
     }
@@ -498,7 +521,6 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             }
         };
 
-        let mut found_dup = false;
         for (candidate_id, distance) in &vec_results {
             if candidate_id == id {
                 continue;
@@ -539,37 +561,68 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                         )
                     };
 
-                if let Ok(mut kept) = store.get(keep_id) {
-                    let unique = extract_unique_lines(&discard_content, &kept.content);
-                    if !unique.is_empty() {
-                        kept.content.push_str(&format!(
-                            "\n\n[merged from {discard_id} on {discard_created}]\n{unique}"
-                        ));
-                    }
-                    kept.summary = kept.content.chars().take(100).collect();
-                    kept.strength = (kept.strength + 0.2).min(1.0);
-                    kept.updated_at = chrono::Utc::now();
-                    let _ = store.update(&kept);
+                // Wrap in SAVEPOINT for atomicity
+                if store.conn().execute_batch("SAVEPOINT vec_strong").is_err() {
+                    continue;
                 }
-                let _ = store.mark_superseded(discard_id, keep_id);
-                if let Ok(discard_memory) = store.get(discard_id) {
-                    record_dedup_artifacts(
-                        store,
-                        keep_id,
-                        &discard_memory,
-                        DedupRelation::Duplicate,
-                        None,
-                        Some(sim as f32),
-                        "vec_dedup_strong",
-                        Some(serde_json::json!({ "cosine_similarity": sim })),
-                    );
+                let merge_ok = (|| -> ReinResult<()> {
+                    let discard_mem = store.get(discard_id)?;
+                    if let Ok(mut kept) = store.get(keep_id) {
+                        let unique = extract_unique_lines(&discard_content, &kept.content);
+                        if !unique.is_empty() {
+                            kept.content.push_str(&format!(
+                                "\n\n[merged from {discard_id} on {discard_created}]\n{unique}"
+                            ));
+                        }
+                        // Merge metadata (match merge_memory_into_winner behavior)
+                        for kw in &discard_mem.keywords {
+                            if !kept.keywords.contains(kw) {
+                                kept.keywords.push(kw.clone());
+                            }
+                        }
+                        kept.access_count = kept
+                            .access_count
+                            .saturating_add(discard_mem.access_count)
+                            .saturating_add(1);
+                        kept.importance = kept.importance.max(discard_mem.importance);
+                        kept.layer = kept.importance.auto_layer();
+                        kept.decay_lambda = kept.decay_lambda.min(discard_mem.decay_lambda);
+                        kept.tier = stronger_tier(kept.tier, discard_mem.tier);
+                        kept.last_accessed = kept.last_accessed.max(discard_mem.last_accessed);
+                        kept.summary = kept.content.chars().take(100).collect();
+                        kept.strength = (kept.strength + 0.2).min(1.0);
+                        kept.updated_at = chrono::Utc::now();
+                        store.update(&kept)?;
+                    }
+                    store.mark_superseded(discard_id, keep_id)?;
+                    if let Ok(discard_memory) = store.get(discard_id) {
+                        record_dedup_artifacts(
+                            store,
+                            keep_id,
+                            &discard_memory,
+                            DedupRelation::Duplicate,
+                            None,
+                            Some(sim as f32),
+                            "vec_dedup_strong",
+                            Some(serde_json::json!({ "cosine_similarity": sim })),
+                        );
+                    }
+                    Ok(())
+                })();
+                match merge_ok {
+                    Ok(()) => { let _ = store.conn().execute_batch("RELEASE vec_strong"); }
+                    Err(e) => {
+                        tracing::warn!("vec_dedup: strong-match merge failed, rolling back: {e}");
+                        let _ = store.conn().execute_batch("ROLLBACK TO vec_strong");
+                        let _ = store.conn().execute_batch("RELEASE vec_strong");
+                        continue;
+                    }
                 }
 
                 tracing::info!(
                     "vec_dedup: merged {discard_id} into {keep_id} (cosine_sim={sim:.3})"
                 );
                 merged += 1;
-                found_dup = true;
                 break;
             }
 
@@ -619,7 +672,6 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                     candidate.id
                 );
                 merged += 1;
-                found_dup = true;
                 break;
             }
         }
@@ -628,10 +680,6 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
             rusqlite::params![id],
         );
-
-        if found_dup {
-            // Already handled above via superseded_by.
-        }
     }
 
     if merged > 0 {
@@ -657,6 +705,8 @@ pub fn run_dedup_scoped(
     let mut dups_found = 0u32;
     let mut dups_merged = 0u32;
     let mut changed = false;
+    let llm_budget = vec_dedup_llm_budget(config);
+    let mut llm_calls_used = 0usize;
     for group in groups {
         let mems: Vec<_> = load_group_memories(store, group)?
             .into_iter()
@@ -687,7 +737,11 @@ pub fn run_dedup_scoped(
                 let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
                 let relation = if sim >= threshold {
                     DedupRelation::Duplicate
-                } else if !dry_run && sim >= (threshold - 0.15).max(0.50) {
+                } else if !dry_run
+                    && sim >= (threshold - 0.15).max(0.50)
+                    && llm_calls_used < llm_budget
+                {
+                    llm_calls_used += 1;
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
@@ -883,17 +937,12 @@ pub fn extract_unique_lines(source: &str, target: &str) -> String {
             if trimmed.starts_with("[merged from ") || trimmed.starts_with("[merged on ") {
                 return false;
             }
-            // Keep lines that have dates (temporal anchors) or aren't found in target
-            let has_date = trimmed.chars().any(|c| c.is_ascii_digit()) && {
-                // Dynamic date detection: current year ± 10
-                use chrono::Datelike;
-                let year = chrono::Utc::now().year();
-                let has_year =
-                    ((year - 10)..=(year + 10)).any(|y: i32| trimmed.contains(&y.to_string()));
-                has_year || trimmed.contains("月")
-            };
+            // Keep lines that aren't found in target.
+            // For lines with temporal anchors (dates), also keep if they differ
+            // even slightly from target (prevents date-bearing lines from
+            // accumulating via repeated merges when they are exact duplicates).
             let is_unique = !target_lower.contains(&trimmed.to_lowercase());
-            has_date || is_unique
+            is_unique
         })
         .collect();
     unique.join("\n")

@@ -250,6 +250,9 @@ pub fn spawn_memory_worker(config: &ReinConfig) {
     ) {
         return;
     }
+    // Touch spawn marker BEFORE spawning to close TOCTOU race window where two
+    // concurrent hook invocations both see the cooldown as expired.
+    let _ = touch_spawn_marker(config);
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -261,7 +264,6 @@ pub fn spawn_memory_worker(config: &ReinConfig) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = cmd.spawn();
-    let _ = touch_spawn_marker(config);
 }
 
 pub fn queue_cleanup_job(
@@ -313,6 +315,8 @@ pub fn spawn_cleanup_worker(config: &ReinConfig) {
     ) {
         return;
     }
+    // Touch marker BEFORE spawning to close TOCTOU race window
+    let _ = touch_worker_marker(&cleanup_spawn_marker_path(config));
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -324,7 +328,6 @@ pub fn spawn_cleanup_worker(config: &ReinConfig) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = cmd.spawn();
-    let _ = touch_worker_marker(&cleanup_spawn_marker_path(config));
 }
 
 pub fn queue_dedup_job(
@@ -372,6 +375,8 @@ pub fn spawn_dedup_worker(config: &ReinConfig) {
     ) {
         return;
     }
+    // Touch marker BEFORE spawning to close TOCTOU race window
+    let _ = touch_worker_marker(&dedup_spawn_marker_path(config));
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -383,7 +388,6 @@ pub fn spawn_dedup_worker(config: &ReinConfig) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = cmd.spawn();
-    let _ = touch_worker_marker(&dedup_spawn_marker_path(config));
 }
 
 pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
@@ -556,20 +560,21 @@ async fn drain_memory_queue_locked(
     remaining.extend(ready_tail);
     remaining.extend(deferred);
 
-    // Write remaining jobs back to queue BEFORE deleting inflight.
-    // This ensures no data loss if we crash between these two operations:
-    // - If we crash after writing queue but before deleting inflight,
-    //   recover_inflight() will append inflight back (duplicates are harmless
-    //   because jobs have unique IDs and dedup catches them).
+    // Write remaining jobs atomically: write to temp file first, then rename.
+    // This prevents partial writes from panics or crashes from corrupting the queue.
     if !remaining.is_empty() {
         use std::io::Write;
+        let tmp_path = path.with_extension("jsonl.tmp");
         let mut file = std::fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .create(true)
-            .open(path)?;
+            .truncate(true)
+            .open(&tmp_path)?;
         for job in &remaining {
             writeln!(file, "{}", serde_json::to_string(job)?)?;
         }
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
     }
 
     // Safe to delete inflight now — remaining jobs are persisted in queue.
@@ -1007,13 +1012,17 @@ async fn drain_cleanup_queue_locked(
 
     if !remaining.is_empty() {
         use std::io::Write;
+        let tmp_path = path.with_extension("jsonl.tmp");
         let mut file = std::fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .create(true)
-            .open(path)?;
+            .truncate(true)
+            .open(&tmp_path)?;
         for job in &remaining {
             writeln!(file, "{}", serde_json::to_string(job)?)?;
         }
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
     }
 
     let _ = std::fs::remove_file(inflight);
@@ -1122,13 +1131,17 @@ async fn drain_dedup_queue_locked(
 
     if !remaining.is_empty() {
         use std::io::Write;
+        let tmp_path = path.with_extension("jsonl.tmp");
         let mut file = std::fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .create(true)
-            .open(path)?;
+            .truncate(true)
+            .open(&tmp_path)?;
         for job in &remaining {
             writeln!(file, "{}", serde_json::to_string(job)?)?;
         }
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
     }
 
     let _ = std::fs::remove_file(inflight);
@@ -1265,7 +1278,7 @@ fn suppress_duplicate_event(
         .retain(|item| (now - item.created_at).num_milliseconds() <= window_ms);
 
     let normalized = normalized_event_text(source, source_query, text);
-    let preview: String = normalized.chars().take(1000).collect();
+    let preview: String = normalized.chars().take(2000).collect();
     let fingerprint = sha256_hex(&preview);
 
     let duplicate = state.items.iter().any(|item| {

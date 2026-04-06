@@ -401,11 +401,10 @@ pub fn run_consolidation(
                 summary_template,
             );
             let new_id = replacement.id.clone();
-            let old_memories = if group.topics.len() == 1 {
-                store.consolidate_atomic(&group.topics[0], replacement)?
-            } else {
-                store.consolidate_topics_atomic(&group.topics, replacement)?
-            };
+            // Use ID-based deletion to prevent TOCTOU data loss (new memories added
+            // to the topic between load_group_memories and this commit are preserved).
+            let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+            let old_memories = store.consolidate_by_ids_atomic(&memory_ids, replacement)?;
             emit_consolidation_events(store, group, &new_id, &old_memories);
             changed = true;
             Some(new_id)
@@ -459,6 +458,12 @@ pub async fn run_consolidation_async(
     let summary_template_owned = summary_template.map(str::to_string);
     let config_owned = config.clone();
     let llm_batch_size = config.async_memory.batch_size.max(1);
+    if non_empty.len() > llm_batch_size {
+        tracing::info!(
+            "consolidation: processing {} groups in batches of {llm_batch_size}",
+            non_empty.len()
+        );
+    }
     for batch in non_empty.chunks(llm_batch_size) {
         let batch: Vec<_> = batch.to_vec();
         let prepared =
@@ -485,17 +490,18 @@ pub async fn run_consolidation_async(
             }))
             .await;
 
+        // Inter-batch delay: avoid overwhelming LLM API / proxy with rapid sequential batches
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         for (group, memories, replacement) in prepared {
             report.memories_replaced += memories.len();
             report.groups_processed += 1;
 
             let created_id = if let Some(replacement) = replacement {
                 let new_id = replacement.id.clone();
-                let old_memories = if group.topics.len() == 1 {
-                    store.consolidate_atomic(&group.topics[0], replacement)?
-                } else {
-                    store.consolidate_topics_atomic(&group.topics, replacement)?
-                };
+                // Use ID-based deletion to prevent TOCTOU data loss
+                let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+                let old_memories = store.consolidate_by_ids_atomic(&memory_ids, replacement)?;
                 emit_consolidation_events(store, &group, &new_id, &old_memories);
                 changed = true;
                 Some(new_id)

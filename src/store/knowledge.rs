@@ -605,6 +605,58 @@ impl SqliteStore {
         Ok(old_memories)
     }
 
+    /// Atomically consolidate a specific set of memory IDs into a single replacement.
+    /// Unlike `consolidate_atomic` (which deletes by topic), this deletes ONLY the
+    /// specified IDs, preventing TOCTOU data loss if new memories are added to the
+    /// topic between the load and commit phases.
+    pub fn consolidate_by_ids_atomic(
+        &self,
+        memory_ids: &[String],
+        replacement: Memory,
+    ) -> ReinResult<Vec<Memory>> {
+        self.conn
+            .execute_batch("SAVEPOINT consolidate_by_ids")?;
+
+        // Collect old memories by ID
+        let mut old_memories = Vec::new();
+        for id in memory_ids {
+            if let Ok(m) = self.get(id) {
+                old_memories.push(m);
+            }
+        }
+
+        // Delete only the specified IDs
+        for id in memory_ids {
+            if let Err(e) = self.conn.execute(
+                "DELETE FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+            ) {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids",
+                );
+                return Err(e.into());
+            }
+        }
+
+        // Insert replacement
+        if let Err(e) = self.store(replacement) {
+            let _ = self.conn.execute_batch(
+                "ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids",
+            );
+            return Err(e);
+        }
+
+        self.conn
+            .execute_batch("RELEASE consolidate_by_ids")?;
+
+        for memory in &old_memories {
+            self.remove_from_tantivy(&memory.id);
+            self.remove_from_hnsw(&memory.id);
+        }
+
+        Ok(old_memories)
+    }
+
     /// Get all memory (id, topic, summary, content, keywords) tuples for cache warmup.
     pub fn get_all_for_warmup(&self) -> ReinResult<Vec<(String, String, String, String, String)>> {
         let mut stmt = self
