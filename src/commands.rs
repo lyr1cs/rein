@@ -286,7 +286,7 @@ pub fn handle_update(
     let store = config.open_store()?;
     let mut mem = store.get(&id)?;
     mem.content = content.clone();
-    mem.summary = content.chars().take(100).collect();
+    mem.summary = content.chars().take(rein::types::SUMMARY_MAX_CHARS).collect();
     if let Some(imp_str) = importance {
         let imp: types::Importance = imp_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         mem.importance = imp;

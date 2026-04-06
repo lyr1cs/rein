@@ -285,7 +285,7 @@ impl SqliteStore {
                     tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
                 } else if sim > 0.5 {
                     let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
-                    let refined_summary: String = refined_content.chars().take(100).collect();
+                    let refined_summary: String = refined_content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
                     self.conn.execute(
                         "UPDATE memories SET content = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
                         rusqlite::params![refined_content, refined_summary, Utc::now().to_rfc3339(), old.id],
@@ -677,6 +677,9 @@ impl SqliteStore {
     /// Record an access to a memory (bumps access_count and last_accessed).
     /// Call this only when memories are returned to the user via recall, NOT on internal lookups.
     pub fn record_access(&self, id: &str) -> ReinResult<()> {
+        // Wrap increment + promotion in a single savepoint for atomicity
+        self.conn.execute_batch("SAVEPOINT record_access")?;
+        let result = (|| -> ReinResult<()> {
         let now = Utc::now();
         self.conn.execute(
             "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
@@ -693,30 +696,58 @@ impl SqliteStore {
             .ok();
 
         if let Some((access_count, cluster_id)) = promotion_row {
-            let threshold = cluster_id
-                .and_then(|cid| {
-                    let key = format!("survival_curve:{cid}");
-                    self.conn
-                        .query_row(
-                            "SELECT value FROM metadata WHERE key = ?1",
-                            rusqlite::params![key],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .ok()
-                        .and_then(|json| serde_json::from_str::<crate::search::survival::SurvivalCurve>(&json).ok())
-                })
-                .map(|curve| crate::search::survival::promotion_access_threshold(&curve))
+            let curve = cluster_id.and_then(|cid| {
+                let key = format!("survival_curve:{cid}");
+                self.conn
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key = ?1",
+                        rusqlite::params![key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                    .and_then(|json| {
+                        serde_json::from_str::<crate::search::survival::SurvivalCurve>(&json)
+                            .map_err(|e| {
+                                tracing::warn!("malformed survival curve for cluster {cid}: {e}");
+                                e
+                            })
+                            .ok()
+                    })
+            });
+            let threshold = curve
+                .as_ref()
+                .map(crate::search::survival::promotion_access_threshold)
                 .unwrap_or(5);
 
             if access_count > threshold {
+                // Derive decay reduction from survival data when available.
+                // With curve: ratio = min(median / 28, 1) maps to [0.25, 0.75] range.
+                // Without curve: use 0.5 (yields ~20 day LTM half-life, matching docs).
+                let decay_factor = curve
+                    .as_ref()
+                    .and_then(|c| c.median_survival)
+                    .map(|median| (median / 28.0).clamp(0.25, 0.75))
+                    .unwrap_or(0.5);
                 self.conn.execute(
-                    "UPDATE memories SET layer = 'LTM', decay_lambda = decay_lambda * 0.33
-                     WHERE id = ?1 AND layer = 'STM'",
-                    rusqlite::params![id],
+                    "UPDATE memories SET layer = 'LTM', decay_lambda = decay_lambda * ?1
+                     WHERE id = ?2 AND layer = 'STM'",
+                    rusqlite::params![decay_factor, id],
                 )?;
             }
         }
 
         Ok(())
+        })(); // end savepoint closure
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE record_access")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO record_access");
+                let _ = self.conn.execute_batch("RELEASE record_access");
+                Err(e)
+            }
+        }
     }
 }

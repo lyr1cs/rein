@@ -598,11 +598,12 @@ fn facts_to_memories(text: &str, threshold: u32) -> Vec<ExtractedMemory> {
         .into_iter()
         .map(|fact| {
             let qc = crate::extract::hooks::scoring::pattern_quality_confidence(&fact);
+            let keywords = crate::extract::extract_keywords_from_text(&fact, 5);
             ExtractedMemory {
                 topic: "auto-extracted".to_string(),
-                summary: fact.chars().take(100).collect(),
+                summary: fact.chars().take(crate::types::SUMMARY_MAX_CHARS).collect(),
                 content: fact,
-                keywords: vec![],
+                keywords,
                 importance: "medium".to_string(),
                 should_store: true,
                 quality_confidence: qc,

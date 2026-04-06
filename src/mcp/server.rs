@@ -313,7 +313,7 @@ impl ReinServer {
         let result = self.with_store(|store| {
             let mut memory = store.get(&params.id)?;
             memory.content = params.content.clone();
-            memory.summary = params.content.chars().take(100).collect();
+            memory.summary = params.content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
             if let Some(ref imp_str) = params.importance {
                 if let Ok(imp) = imp_str.parse::<Importance>() {
                     memory.importance = imp;

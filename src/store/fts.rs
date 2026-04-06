@@ -4,6 +4,9 @@ use rusqlite::Connection;
 use super::sqlite::{memory_select_base, row_to_memory, MEMORY_SELECT_COLUMNS};
 
 /// Sanitize user input for FTS5 queries by quoting each token.
+/// NOTE: FTS5 uses the unicode61 tokenizer which does NOT segment CJK text.
+/// CJK content is stored as-is, so we pass raw whitespace-split tokens here.
+/// Jieba-based tokenization is only used in the Tantivy search path.
 pub fn sanitize_fts_query(query: &str) -> String {
     query
         .split_whitespace()

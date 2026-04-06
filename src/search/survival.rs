@@ -246,7 +246,9 @@ pub fn adaptive_strength(
 /// Clusters with longer median survival require more repeated accesses before promotion,
 /// while fast-decaying clusters promote with fewer repeated accesses.
 pub fn promotion_access_threshold(curve: &SurvivalCurve) -> u32 {
-    let median = curve.median_survival.unwrap_or(7.0).clamp(1.0, 28.0);
+    // Default to 28.0 when median is None (insufficient data), which maps to
+    // threshold=5, preserving backward compatibility with the legacy fixed threshold.
+    let median = curve.median_survival.unwrap_or(28.0).clamp(1.0, 28.0);
     ((median / 7.0).ceil() as u32 + 1).clamp(2, 8)
 }
 
