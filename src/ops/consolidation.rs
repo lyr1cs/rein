@@ -396,6 +396,21 @@ pub fn run_consolidation(
             continue;
         }
 
+        // Skip single-memory groups: prevents recursive "consolidated 1 memories" nesting.
+        if memories.len() == 1 && config.cleanup.skip_single_memory {
+            tracing::debug!(
+                "consolidation(sync): skipping single-memory topic '{}'",
+                group.canonical_topic
+            );
+            report.groups.push(ConsolidationGroupReport {
+                canonical_topic: group.canonical_topic.clone(),
+                source_topics: group.topics.clone(),
+                memory_count: 1,
+                created_id: None,
+            });
+            continue;
+        }
+
         report.memories_replaced += memories.len();
         report.groups_processed += 1;
 
@@ -459,9 +474,26 @@ pub async fn run_consolidation_async(
                 memory_count: 0,
                 created_id: None,
             });
-        } else {
-            non_empty.push((group.clone(), memories));
+            continue;
         }
+
+        // Skip single-memory groups: no consolidation needed, prevents recursive
+        // "consolidated 1 memories" nesting on repeated cleanup runs.
+        if memories.len() == 1 && config.cleanup.skip_single_memory {
+            tracing::debug!(
+                "consolidation: skipping single-memory topic '{}'",
+                group.canonical_topic
+            );
+            report.groups.push(ConsolidationGroupReport {
+                canonical_topic: group.canonical_topic.clone(),
+                source_topics: group.topics.clone(),
+                memory_count: 1,
+                created_id: None,
+            });
+            continue;
+        }
+
+        non_empty.push((group.clone(), memories));
     }
     non_empty.sort_by(|(left_group, left_memories), (right_group, right_memories)| {
         right_memories
@@ -472,15 +504,19 @@ pub async fn run_consolidation_async(
 
     let summary_template_owned = summary_template.map(str::to_string);
     let config_owned = config.clone();
-    let llm_batch_size = config.async_memory.batch_size.max(1);
+    let llm_batch_size = config.cleanup.llm_batch_size.max(1);
     if non_empty.len() > llm_batch_size {
         tracing::info!(
             "consolidation: processing {} groups in batches of {llm_batch_size}",
             non_empty.len()
         );
     }
-    for batch in non_empty.chunks(llm_batch_size) {
+    let skip_short_chars = config.cleanup.skip_short_content_chars;
+    let all_batches: Vec<_> = non_empty.chunks(llm_batch_size).collect();
+    let total_batches = all_batches.len();
+    for (batch_idx, batch) in all_batches.into_iter().enumerate() {
         let batch: Vec<_> = batch.to_vec();
+        let mut used_llm = false;
         let prepared =
             futures_util::future::join_all(batch.into_iter().map(|(group, memories)| {
                 let config = config_owned.clone();
@@ -489,30 +525,64 @@ pub async fn run_consolidation_async(
                     let replacement = if dry_run {
                         None
                     } else {
-                        Some(
-                            build_consolidated_from_memories_async(
+                        // Skip LLM for short-content groups: total chars below threshold
+                        // get rule-based merge only (no LLM summarization).
+                        let total_chars: usize =
+                            memories.iter().map(|m| m.content.chars().count()).sum();
+                        if total_chars < skip_short_chars {
+                            tracing::debug!(
+                                "consolidation: short content ({total_chars} chars) for '{}', skipping LLM",
+                                group.canonical_topic
+                            );
+                            Some((build_consolidated_from_memories(
                                 &config,
                                 group.canonical_topic.clone(),
                                 &group.topics,
                                 &memories,
                                 summary_template.as_deref(),
-                            )
-                            .await,
-                        )
+                            ), false))
+                        } else {
+                            Some((
+                                build_consolidated_from_memories_async(
+                                    &config,
+                                    group.canonical_topic.clone(),
+                                    &group.topics,
+                                    &memories,
+                                    summary_template.as_deref(),
+                                )
+                                .await,
+                                true,
+                            ))
+                        }
                     };
                     (group, memories, replacement)
                 }
             }))
             .await;
 
-        // Inter-batch delay: avoid overwhelming LLM API / proxy with rapid sequential batches
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Track whether any item in this batch used LLM
+        for (_, _, replacement) in &prepared {
+            if let Some((_, did_llm)) = replacement {
+                if *did_llm {
+                    used_llm = true;
+                }
+            }
+        }
+
+        // Inter-batch delay: only between non-final batches that actually used LLM
+        let is_last = batch_idx + 1 >= total_batches;
+        if !is_last && used_llm && !dry_run {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                config.cleanup.inter_batch_delay_ms,
+            ))
+            .await;
+        }
 
         for (group, memories, replacement) in prepared {
             report.memories_replaced += memories.len();
             report.groups_processed += 1;
 
-            let created_id = if let Some(replacement) = replacement {
+            let created_id = if let Some((replacement, _)) = replacement {
                 let new_id = replacement.id.clone();
                 // Use ID-based deletion to prevent TOCTOU data loss
                 let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
@@ -915,8 +985,14 @@ mod tests {
             .await
             .unwrap();
 
-        let first_non_empty = report.groups.iter().find(|group| group.memory_count > 0).unwrap();
-        assert_eq!(first_non_empty.canonical_topic, "large-topic");
+        // Single-memory groups are skipped (not consolidated), so find the first
+        // group that was actually processed (memory_count > 1).
+        let first_processed = report
+            .groups
+            .iter()
+            .find(|group| group.memory_count > 1)
+            .unwrap();
+        assert_eq!(first_processed.canonical_topic, "large-topic");
     }
 
     #[test]

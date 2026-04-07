@@ -51,6 +51,8 @@ pub struct ReinConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub async_memory: AsyncMemoryConfig,
+    #[serde(default)]
+    pub cleanup: CleanupConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +224,72 @@ impl Default for AdaptiveConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cleanup / consolidation / dedup config
+// ---------------------------------------------------------------------------
+
+/// Configuration for cleanup, consolidation, and dedup operations.
+/// Controls LLM usage and thresholds during `rein cleanup` and `rein dedup`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct CleanupConfig {
+    /// Skip LLM consolidation for single-memory topic groups. Default: true.
+    #[serde(default = "default_true")]
+    pub skip_single_memory: bool,
+    /// Skip LLM consolidation for groups with total content under this char count. Default: 500.
+    #[serde(default = "default_skip_short_content_chars")]
+    pub skip_short_content_chars: usize,
+    /// Batch size for LLM calls during consolidation. Default: 8.
+    #[serde(default = "default_cleanup_llm_batch_size")]
+    pub llm_batch_size: usize,
+    /// Max LLM calls per dedup run (gray zone verdicts). Default: 8.
+    #[serde(default = "default_cleanup_llm_budget")]
+    pub llm_budget: usize,
+    /// Embedding-based dedup: above this cosine similarity, merge directly without LLM. Default: 0.80.
+    #[serde(default = "default_vec_dedup_strong_threshold")]
+    pub vec_dedup_strong_threshold: f64,
+    /// Embedding-based dedup: below this cosine similarity, ignore. Default: 0.70.
+    #[serde(default = "default_vec_dedup_weak_threshold")]
+    pub vec_dedup_weak_threshold: f64,
+    /// Delay (ms) between LLM consolidation batches. Default: 200.
+    #[serde(default = "default_inter_batch_delay_ms")]
+    pub inter_batch_delay_ms: u64,
+}
+
+fn default_skip_short_content_chars() -> usize {
+    500
+}
+fn default_cleanup_llm_batch_size() -> usize {
+    8
+}
+fn default_cleanup_llm_budget() -> usize {
+    8
+}
+fn default_vec_dedup_strong_threshold() -> f64 {
+    0.80
+}
+fn default_vec_dedup_weak_threshold() -> f64 {
+    0.70
+}
+fn default_inter_batch_delay_ms() -> u64 {
+    200
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            skip_single_memory: true,
+            skip_short_content_chars: default_skip_short_content_chars(),
+            llm_batch_size: default_cleanup_llm_batch_size(),
+            llm_budget: default_cleanup_llm_budget(),
+            vec_dedup_strong_threshold: default_vec_dedup_strong_threshold(),
+            vec_dedup_weak_threshold: default_vec_dedup_weak_threshold(),
+            inter_batch_delay_ms: default_inter_batch_delay_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecayConfig {
@@ -281,6 +349,10 @@ pub struct ExtractConfig {
     pub provider: String,
     pub google: GoogleExtractConfig,
     pub omlx: OmlxExtractConfig,
+    /// Inject existing memory summaries into extraction prompts to reduce duplicates.
+    /// Default: false (opt-in to avoid sending memory content to remote providers).
+    #[serde(default)]
+    pub inject_existing_context: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -634,6 +706,7 @@ impl Default for ExtractConfig {
             provider: "google".to_string(),
             google: GoogleExtractConfig::default(),
             omlx: OmlxExtractConfig::default(),
+            inject_existing_context: false,
         }
     }
 }
@@ -873,6 +946,32 @@ impl ReinConfig {
             }
             Provider::None => {}
         }
+
+        // Validate cleanup config
+        let c = &self.cleanup;
+        if c.vec_dedup_strong_threshold < 0.0 || c.vec_dedup_strong_threshold > 1.0 {
+            anyhow::bail!(
+                "cleanup.vec_dedup_strong_threshold must be in [0.0, 1.0], got {}",
+                c.vec_dedup_strong_threshold
+            );
+        }
+        if c.vec_dedup_weak_threshold < 0.0 || c.vec_dedup_weak_threshold > 1.0 {
+            anyhow::bail!(
+                "cleanup.vec_dedup_weak_threshold must be in [0.0, 1.0], got {}",
+                c.vec_dedup_weak_threshold
+            );
+        }
+        if c.vec_dedup_weak_threshold > c.vec_dedup_strong_threshold {
+            anyhow::bail!(
+                "cleanup.vec_dedup_weak_threshold ({}) must be <= vec_dedup_strong_threshold ({})",
+                c.vec_dedup_weak_threshold,
+                c.vec_dedup_strong_threshold
+            );
+        }
+        if c.llm_batch_size == 0 {
+            anyhow::bail!("cleanup.llm_batch_size must be >= 1");
+        }
+
         Ok(())
     }
 

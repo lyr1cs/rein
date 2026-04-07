@@ -10,8 +10,6 @@ use super::consolidation::{load_group_memories, TopicGroup};
 use super::stronger_tier;
 
 const VEC_DEDUP_PENDING_LIMIT: usize = 50;
-const VEC_DEDUP_STRONG_MATCH_THRESHOLD: f64 = 0.85;
-const VEC_DEDUP_WEAK_MATCH_THRESHOLD: f64 = 0.70;
 
 type VecDedupItem = (String, String, String, String);
 
@@ -373,7 +371,15 @@ fn vec_dedup_embed_batch_size(config: &ReinConfig) -> usize {
 }
 
 fn vec_dedup_llm_budget(config: &ReinConfig) -> usize {
-    config.async_memory.batch_size.max(1)
+    config.cleanup.llm_budget.max(1)
+}
+
+fn vec_dedup_strong_threshold(config: &ReinConfig) -> f64 {
+    config.cleanup.vec_dedup_strong_threshold
+}
+
+fn vec_dedup_weak_threshold(config: &ReinConfig) -> f64 {
+    config.cleanup.vec_dedup_weak_threshold
 }
 
 fn vec_dedup_pending_limit(config: &ReinConfig) -> usize {
@@ -635,7 +641,7 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             }
 
             let sim = 1.0 - (*distance as f64);
-            if sim < VEC_DEDUP_WEAK_MATCH_THRESHOLD {
+            if sim < vec_dedup_weak_threshold(config) {
                 break;
             }
 
@@ -649,7 +655,7 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 continue;
             }
 
-            if sim > VEC_DEDUP_STRONG_MATCH_THRESHOLD {
+            if sim > vec_dedup_strong_threshold(config) {
                 let (keep_id, discard_id, discard_content, discard_created) =
                     if candidate.access_count >= 1
                         || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1)
