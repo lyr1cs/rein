@@ -305,6 +305,11 @@ pub fn check_dedup(
     time_window_days: i64,
     cluster_id: Option<u32>,
 ) -> ReinResult<DedupAction> {
+    // Resolve embedding model name once per call to avoid repeated config reloads.
+    let embed_model = crate::config::ReinConfig::load()
+        .map(|c| c.embedding_model())
+        .unwrap_or_default();
+
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
@@ -331,7 +336,7 @@ pub fn check_dedup(
     // Channel 2: Embedding-based candidates (cross-topic semantic duplicates)
     // Critical for CJK text where FTS5 may return nothing.
     // Only uses cached embeddings — no API call on the hot path.
-    if let Some(emb_candidates) = embedding_candidate_lookup(store, content) {
+    if let Some(emb_candidates) = embedding_candidate_lookup(store, content, &embed_model, topic) {
         for memory in emb_candidates
             .into_iter()
             .filter(|m| m.superseded_by.is_none())
@@ -346,7 +351,7 @@ pub fn check_dedup(
         return Ok(DedupAction::CreateNew);
     }
 
-    // Find best match by Jaccard similarity
+    // Find best match by lexical similarity
     let mut best_sim = 0.0f32;
     let mut best_memory = None;
     let mut best_candidate_score = None;
@@ -360,9 +365,43 @@ pub fn check_dedup(
         }
     }
 
+    // Also check embedding-based similarity for candidates that scored low lexically
+    // but may be paraphrased duplicates (high vector, low lexical overlap).
+    // Track best vector-only candidate separately to avoid auto-merging at low thresholds.
+    let mut best_vec_sim = 0.0f32;
+    let mut best_vec_memory: Option<&crate::types::Memory> = None;
+    if !embed_model.is_empty() {
+        for candidate in &candidates {
+            if let Some(cosine) = embedding_cosine_check(store, content, &candidate.id, &embed_model, topic) {
+                if cosine > best_vec_sim {
+                    best_vec_sim = cosine;
+                    best_vec_memory = Some(candidate);
+                }
+            }
+        }
+    }
+
     // M6: Randomized threshold exploration (5% of the time, offset threshold by ±0.1)
     // This creates A/B test data for causal inference on optimal thresholds.
     let (effective_threshold, is_exploration) = m6_explore_threshold(similarity_threshold);
+
+    // Vector-only candidates only auto-merge at a strong threshold (> 0.85).
+    // Below that, they route to GrayZone for LLM review to avoid false-positive merges.
+    if best_vec_sim > 0.85 {
+        if let Some(memory) = best_vec_memory {
+            let age_days = (chrono::Utc::now() - memory.created_at).num_days();
+            if age_days < time_window_days {
+                return Ok(DedupAction::MergeInto(memory.id.clone()));
+            } else {
+                return Ok(DedupAction::Supersede(memory.id.clone()));
+            }
+        }
+    } else if best_vec_sim > 0.60 && best_sim < effective_threshold {
+        // Vector suggests similarity but lexical doesn't confirm — route to LLM
+        if let Some(memory) = best_vec_memory {
+            return Ok(DedupAction::GrayZone(memory.id.clone(), best_vec_sim));
+        }
+    }
 
     if best_sim > effective_threshold {
         if let Some(memory) = best_memory {
@@ -391,7 +430,7 @@ pub fn check_dedup(
     if let (Some(memory), Some(ref score)) = (best_memory, &best_candidate_score) {
         if should_escalate_gray_zone(score, best_sim, llm_budget_available) {
             // Try embedding-based resolution first (zero LLM cost)
-            if let Some(embed_sim) = embedding_cosine_check(store, content, &memory.id) {
+            if let Some(embed_sim) = embedding_cosine_check(store, content, &memory.id, &embed_model, topic) {
                 if embed_sim > 0.85 {
                     // Embedding confirms strong match — treat as dedup
                     let age_days = (chrono::Utc::now() - memory.created_at).num_days();
@@ -436,10 +475,12 @@ pub fn check_dedup(
 
 /// Look up embedding-based candidates for cross-topic dedup (zero API cost).
 /// Only uses cached embeddings — never triggers an embedding API call.
-fn embedding_candidate_lookup(store: &SqliteStore, content: &str) -> Option<Vec<crate::types::Memory>> {
-    let config = crate::config::ReinConfig::load().ok()?;
-    let model = config.embedding_model();
-    let emb = crate::embed::EmbedCache::get(store.conn(), content, &model).ok()??;
+/// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
+fn embedding_candidate_lookup(store: &SqliteStore, content: &str, model: &str, _topic: &str) -> Option<Vec<crate::types::Memory>> {
+    // Look up cached embedding by raw content. The EmbedCache key depends on what text
+    // was originally embedded — we can't reconstruct the exact enriched key without the
+    // real summary, so we check raw content which may match older cache entries.
+    let emb = crate::embed::EmbedCache::get(store.conn(), content, model).ok().flatten()?;
     let results = crate::store::vec::search_vec(store.conn(), &emb, 5).ok()?;
     let mut memories = Vec::new();
     for (id, distance) in results {
@@ -460,11 +501,10 @@ fn embedding_candidate_lookup(store: &SqliteStore, content: &str) -> Option<Vec<
 
 /// Try to resolve gray zone using cached embeddings (zero LLM cost).
 /// Returns cosine similarity if both embeddings are in cache, None otherwise.
-fn embedding_cosine_check(store: &SqliteStore, content: &str, candidate_id: &str) -> Option<f32> {
-    let config = crate::config::ReinConfig::load().ok()?;
-    let model = config.embedding_model();
-    // Check if new content has a cached embedding
-    let new_emb = crate::embed::EmbedCache::get(store.conn(), content, &model).ok()??;
+/// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
+fn embedding_cosine_check(store: &SqliteStore, content: &str, candidate_id: &str, model: &str, _topic: &str) -> Option<f32> {
+    // Check if new content has a cached embedding (raw content key)
+    let new_emb = crate::embed::EmbedCache::get(store.conn(), content, model).ok().flatten()?;
     // Check if candidate has a stored embedding
     let cand_emb: Vec<f32> = {
         let blob: Vec<u8> = store

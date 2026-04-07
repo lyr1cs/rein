@@ -147,7 +147,9 @@ fn novelty_from_memories(existing: &[Memory], content: &str) -> f64 {
             .fold(0.0_f32, f32::max);
         return (1.0 - f64::from(max_sim)).max(0.0);
     }
-    // For larger sets, sample top-10 by keyword overlap to avoid O(n) full scan
+    // For larger sets, sample top-20 by keyword overlap to avoid O(n) full scan.
+    // When keyword overlap is weak (all scores tied at 0), fall back to a content-
+    // based lexical scan of a larger sample to avoid missing near-duplicates.
     let content_tokens = crate::extract::tokenize_for_search(content);
     let content_set: std::collections::HashSet<&str> =
         content_tokens.iter().map(|s| s.as_str()).collect();
@@ -164,7 +166,16 @@ fn novelty_from_memories(existing: &[Memory], content: &str) -> f64 {
         })
         .collect();
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    let top_k: Vec<&Memory> = scored.iter().take(10).map(|(i, _)| &existing[*i]).collect();
+
+    // Check if keyword overlap is meaningful (at least one candidate has overlap > 0)
+    let has_meaningful_overlap = scored.first().is_some_and(|(_, overlap)| *overlap > 0);
+    let sample_size = if has_meaningful_overlap { 20 } else { 30 };
+
+    let top_k: Vec<&Memory> = scored
+        .iter()
+        .take(sample_size)
+        .map(|(i, _)| &existing[*i])
+        .collect();
     let max_sim = top_k
         .iter()
         .map(|m| crate::extract::similarity(content, &m.content))
@@ -197,16 +208,17 @@ fn current_topic_memories(store: &crate::store::SqliteStore, topic: &str) -> Vec
         .collect()
 }
 
-/// Check if the memory content is already captured as a concept definition.
-/// Uses FTS search across all memoirs to find matching concepts.
-fn is_already_a_concept(store: &crate::store::SqliteStore, content: &str) -> bool {
-    // Take first few keywords from content for concept search
+/// Measure how much of this memory's content overlaps with existing concept definitions.
+/// Returns a similarity score in [0.0, 1.0]. A high score means the fact is already
+/// well-captured by the knowledge graph. Used as a soft signal in admission scoring
+/// (reduces novelty) rather than a hard rejection — memories still provide evidence,
+/// support counts, and timeline anchors even when a concept already captures the fact.
+fn concept_overlap_score(store: &crate::store::SqliteStore, content: &str) -> f32 {
     let keywords = crate::extract::extract_keywords_from_text(content, 5);
     if keywords.is_empty() {
-        return false;
+        return 0.0;
     }
     let query = keywords.join(" ");
-    // Search concepts across all memoirs via FTS
     let results: Vec<String> = store
         .conn()
         .prepare(
@@ -225,10 +237,10 @@ fn is_already_a_concept(store: &crate::store::SqliteStore, content: &str) -> boo
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
-    // Check if any concept definition is highly similar to this memory content
     results
         .iter()
-        .any(|def| crate::extract::similarity(content, def) > 0.80)
+        .map(|def| crate::extract::similarity(content, def))
+        .fold(0.0_f32, f32::max)
 }
 
 fn dominant_cluster(memories: &[Memory]) -> Option<u32> {
@@ -317,22 +329,25 @@ pub fn store_extracted_report(
             continue;
         }
 
-        // Cross-check: skip if the same fact already exists as a concept
-        if is_already_a_concept(store, &item.content) {
-            tracing::debug!(
-                "skipping memory already captured as concept: {}",
-                item.summary
-            );
-            stats.filtered_count += 1;
-            continue;
-        }
-
         let topic_key = normalize_topic_key(&item.topic);
         let ctx = ctx_cache
             .entry(topic_key)
             .or_insert_with(|| build_admission_context(store, &item.topic));
         let threshold = adaptive_admission_threshold(&baseline, ctx);
-        let admission = multi_factor_admission_score(&item, ctx);
+        let mut admission = multi_factor_admission_score(&item, ctx);
+
+        // Soft penalty when the fact is already captured as a concept definition.
+        // Reduces admission score but does NOT hard-reject — memories still provide
+        // evidence, support counts, and timeline anchors.
+        let concept_sim = concept_overlap_score(store, &item.content);
+        if concept_sim > 0.80 {
+            let penalty = (concept_sim as f64 - 0.80) * 0.5; // 0.80→0, 1.0→0.1
+            admission = (admission - penalty).max(0.0);
+            tracing::debug!(
+                "concept overlap ({concept_sim:.2}) reduces admission to {admission:.2}: {}",
+                item.summary
+            );
+        }
         if admission < threshold {
             tracing::debug!(
                 "skipping low-quality memory (admission={:.2} < threshold={:.2}): {}",
