@@ -611,10 +611,17 @@ pub async fn llm_dedup_verdict(
 /// mid-sentence. Returns chunks in order.
 /// `effective_max_chars` should come from the provider that will actually process
 /// the chunks (may differ from config.extract when async_memory.provider is set).
-fn chunk_for_extraction(text: &str, effective_max_chars: usize) -> Vec<String> {
-    // Leave room for system prompt (~2k chars) and response
+/// `prefix_chars` is the length of any context prefix that will be prepended to
+/// each chunk by the caller, so the budget accounts for it.
+fn chunk_for_extraction(text: &str, effective_max_chars: usize, prefix_chars: usize) -> Vec<String> {
+    // Leave room for system prompt (~2k chars), response, and context prefix
+    let overhead = 3000 + prefix_chars;
     let chunk_budget = if effective_max_chars > 0 {
-        effective_max_chars.saturating_sub(3000).max(4000)
+        // Cap at actual limit minus overhead. Use at least 500 chars to avoid
+        // degenerate empty chunks, but do NOT inflate beyond the true budget
+        // (clamp_input will drop the prefix if it exceeds the limit).
+        let real_budget = effective_max_chars.saturating_sub(overhead);
+        real_budget.max(500)
     } else {
         // Large context model — single chunk is fine unless text is extremely long
         if text.len() < 200_000 {
@@ -687,9 +694,25 @@ fn merge_chunk_results(results: Vec<ExtractionResult>) -> ExtractionResult {
                 merged.memories.push(mem);
             }
         }
-        // Dedup concepts by name
+        // Dedup concepts by (memoir, name). When the same concept appears in
+        // multiple chunks, keep the richer definition (longer = more detail).
         for concept in result.concepts {
-            if !merged.concepts.iter().any(|c| c.name == concept.name) {
+            if let Some(existing) = merged
+                .concepts
+                .iter_mut()
+                .find(|c| c.name == concept.name && c.memoir == concept.memoir)
+            {
+                // Prefer richer definition
+                if concept.definition.len() > existing.definition.len() {
+                    existing.definition = concept.definition;
+                }
+                // Merge labels
+                for label in concept.labels {
+                    if !existing.labels.contains(&label) {
+                        existing.labels.push(label);
+                    }
+                }
+            } else {
                 merged.concepts.push(concept);
             }
         }
@@ -718,12 +741,64 @@ fn merge_chunk_results(results: Vec<ExtractionResult>) -> ExtractionResult {
 }
 
 /// Truncate input text based on config (safe default for unknown models).
-fn prepare_input(config: &ReinConfig, text: &str) -> String {
+/// Combine prefix and chunk, clamping to `max_chars` if set (> 0).
+/// If the prefix alone exceeds the budget, the prefix is dropped entirely
+/// and only the chunk (truncated to `max_chars`) is returned — degrading
+/// gracefully rather than sending an oversize or empty payload.
+fn clamp_input(prefix: &str, chunk: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return format!("{prefix}{chunk}");
+    }
+    let prefix_len = prefix.chars().count();
+    if prefix_len >= max_chars {
+        // Prefix alone exceeds budget — drop it to preserve actual content
+        tracing::debug!(
+            "context prefix ({prefix_len} chars) exceeds budget ({max_chars}), dropping prefix"
+        );
+        return chunk.chars().take(max_chars).collect();
+    }
+    let budget = max_chars - prefix_len;
+    let truncated: String = chunk.chars().take(budget).collect();
+    format!("{prefix}{truncated}")
+}
+
+/// Build context prefix only if injection is enabled in config.
+fn build_context_prefix_if_enabled(config: &ReinConfig, text: &str) -> String {
+    if !config.extract.inject_existing_context {
+        return String::new();
+    }
+    let existing = fetch_existing_context(config, text);
+    build_context_prefix(&existing)
+}
+
+/// Prepare input with optional context prefix, reserving headroom for the prefix
+/// so the total never exceeds `max_input_chars`.
+fn prepare_with_context(config: &ReinConfig, text: &str) -> String {
+    let prefix = build_context_prefix_if_enabled(config, text);
     let max_chars = resolve_max_input_chars(config);
     if max_chars > 0 {
-        text.chars().take(max_chars).collect()
+        let headroom = max_chars.saturating_sub(prefix.chars().count());
+        let truncated: String = text.chars().take(headroom).collect();
+        format!("{prefix}{truncated}")
     } else {
-        text.to_string()
+        format!("{prefix}{text}")
+    }
+}
+
+/// Like `prepare_with_context` but for a specific extractor kind.
+fn prepare_with_context_for_kind(
+    config: &ReinConfig,
+    text: &str,
+    extractor: &ExtractorKind,
+) -> String {
+    let prefix = build_context_prefix_if_enabled(config, text);
+    let max_chars = resolve_max_input_for_kind(config, extractor);
+    if max_chars > 0 {
+        let headroom = max_chars.saturating_sub(prefix.chars().count());
+        let truncated: String = text.chars().take(headroom).collect();
+        format!("{prefix}{truncated}")
+    } else {
+        format!("{prefix}{text}")
     }
 }
 
@@ -837,11 +912,7 @@ pub async fn extract_with_fallback(
     pattern_threshold: u32,
 ) -> Vec<ExtractedMemory> {
     if let Some(extractor) = create_extractor(config) {
-        let input = prepare_input(config, text);
-        // Prepend existing memory context as escaped data in user payload
-        let existing = fetch_existing_context(config, text);
-        let prefix = build_context_prefix(&existing);
-        let contextual_input = format!("{prefix}{input}");
+        let contextual_input = prepare_with_context(config, text);
         match extractor.extract(&contextual_input).await {
             Ok(memories) if !memories.is_empty() => return memories,
             Ok(_) => {}
@@ -858,10 +929,7 @@ pub async fn extract_with_worker_preference(
     pattern_threshold: u32,
 ) -> Vec<ExtractedMemory> {
     if let Some(extractor) = create_memory_worker_extractor(config) {
-        let input = prepare_input_for_kind(config, text, &extractor);
-        let existing = fetch_existing_context(config, text);
-        let prefix = build_context_prefix(&existing);
-        let contextual_input = format!("{prefix}{input}");
+        let contextual_input = prepare_with_context_for_kind(config, text, &extractor);
         match extractor.extract(&contextual_input).await {
             Ok(memories) if !memories.is_empty() => return memories,
             Ok(_) => {}
@@ -887,17 +955,20 @@ pub async fn llm_is_duplicate(config: &ReinConfig, text_a: &str, text_b: &str) -
 /// For long sessions, splits into chunks and merges results with cross-chunk dedup.
 pub async fn extract_full_with_fallback(config: &ReinConfig, text: &str) -> ExtractionResult {
     if let Some(extractor) = create_extractor(config) {
-        let chunks = chunk_for_extraction(text, resolve_max_input_chars(config));
+        let max_chars = resolve_max_input_chars(config);
+        let context_prefix = build_context_prefix_if_enabled(config, text);
+        let chunks = chunk_for_extraction(text, max_chars, context_prefix.len());
         if chunks.len() > 1 {
             tracing::info!("session chunking: {} chunks for extraction", chunks.len());
         }
         let mut chunk_results = Vec::new();
         for chunk in &chunks {
-            match extractor.extract_full(chunk).await {
+            let input = clamp_input(&context_prefix, chunk, max_chars);
+            match extractor.extract_full(&input).await {
                 Ok(result) => chunk_results.push(result),
                 Err(e) => {
                     tracing::warn!("LLM full extraction failed for chunk, trying simple: {e}");
-                    if let Ok(memories) = extractor.extract(chunk).await {
+                    if let Ok(memories) = extractor.extract(&input).await {
                         if !memories.is_empty() {
                             chunk_results.push(ExtractionResult {
                                 memories,
@@ -929,7 +1000,8 @@ pub async fn extract_full_with_worker_preference(
     if let Some(extractor) = create_memory_worker_extractor(config) {
         // Use the worker extractor's actual context limit (may differ from main provider)
         let worker_max = resolve_max_input_for_kind(config, &extractor);
-        let chunks = chunk_for_extraction(text, worker_max);
+        let context_prefix = build_context_prefix_if_enabled(config, text);
+        let chunks = chunk_for_extraction(text, worker_max, context_prefix.len());
         if chunks.len() > 1 {
             tracing::info!(
                 "session chunking (worker): {} chunks for extraction",
@@ -938,7 +1010,7 @@ pub async fn extract_full_with_worker_preference(
         }
         let mut chunk_results = Vec::new();
         for chunk in &chunks {
-            let input = prepare_input_for_kind(config, chunk, &extractor);
+            let input = clamp_input(&context_prefix, chunk, worker_max);
             match extractor.extract_full(&input).await {
                 Ok(result) => chunk_results.push(result),
                 Err(e) => {

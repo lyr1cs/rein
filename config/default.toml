@@ -80,6 +80,7 @@ signal_keywords = [
 
 [extract]
 provider = "google"
+inject_existing_context = false  # inject prior memory summaries into extraction prompts (opt-in)
 
 [extract.google]
 model = "gemini-3.1-flash-lite-preview"
@@ -134,6 +135,15 @@ max_always_on_items = 24   # cap the per-project stable always-on surface
 selection_limit = 5        # max injected items selected across both surfaces
 fingerprint_window_ms = 120000 # suppress near-duplicate queued events for 2 minutes
 recent_event_cache_size = 256  # number of recent event fingerprints tracked per project
+
+[cleanup]
+skip_single_memory = true       # skip LLM for single-memory topic groups (prevents recursive nesting)
+skip_short_content_chars = 500  # skip LLM for groups with total content under this char count
+llm_batch_size = 8              # concurrent LLM calls per consolidation batch
+llm_budget = 8                  # max LLM calls per dedup run (gray zone verdicts)
+vec_dedup_strong_threshold = 0.80  # cosine sim above this → rule merge, no LLM
+vec_dedup_weak_threshold = 0.70    # cosine sim below this → ignore
+inter_batch_delay_ms = 200      # delay between LLM consolidation batches (ms)
 
 [adaptive]
 enabled = true                    # Adaptive engine: event logging active, learning loop pending closure
