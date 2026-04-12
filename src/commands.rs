@@ -270,6 +270,16 @@ pub fn handle_health(config: &ReinConfig, topic: Option<String>) -> anyhow::Resu
     Ok(())
 }
 
+pub async fn handle_doctor(config: &ReinConfig, json: bool, network: bool) -> anyhow::Result<()> {
+    let report = rein::doctor::run(config, rein::doctor::DoctorOptions { network }).await;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", rein::doctor::format_human(&report));
+    }
+    std::process::exit(report.exit_code());
+}
+
 pub fn handle_forget(config: &ReinConfig, id: String) -> anyhow::Result<()> {
     let store = config.open_store()?;
     store.delete(&id)?;
