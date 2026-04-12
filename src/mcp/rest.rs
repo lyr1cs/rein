@@ -225,6 +225,9 @@ fn api_stats(config: &ReinConfig) -> BoxedResponse {
                 "memoir_count": stats.memoir_count,
                 "concept_count": stats.concept_count,
                 "link_count": stats.link_count,
+                "hot_count": stats.hot_count,
+                "warm_count": stats.warm_count,
+                "cold_count": stats.cold_count,
             }),
         ),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -399,18 +402,32 @@ fn api_doctor(
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    let report = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(crate::doctor::run(
+                config,
+                crate::doctor::DoctorOptions { network, fix },
+            ))
+        }),
+        Err(_) => {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &e.to_string(),
+                    )
+                }
+            };
+            rt.block_on(crate::doctor::run(
+                config,
+                crate::doctor::DoctorOptions { network, fix },
+            ))
+        }
     };
-
-    let report = rt.block_on(crate::doctor::run(
-        config,
-        crate::doctor::DoctorOptions { network, fix },
-    ));
     json_response(StatusCode::OK, serde_json::to_value(report).unwrap_or_else(|_| json!({})))
 }
 

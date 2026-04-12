@@ -237,7 +237,11 @@ pub fn adaptive_strength(
     }
 
     // Linear blend: weight increases from 0.0 at cold_start_min to 1.0 at cold_start_max
-    let blend = (n - cold_start_min) as f64 / (cold_start_max - cold_start_min) as f64;
+    let denom = cold_start_max.saturating_sub(cold_start_min);
+    if denom == 0 {
+        return survival_strength;
+    }
+    let blend = (n - cold_start_min) as f64 / denom as f64;
     ebbinghaus_strength * (1.0 - blend) + survival_strength * blend
 }
 

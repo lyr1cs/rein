@@ -967,7 +967,7 @@ impl MemoryStore for SqliteStore {
         let memories: Vec<Memory> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT * FROM memories WHERE topic = ?1")?;
+                .prepare("SELECT * FROM memories WHERE topic = ?1 AND status = 'active' AND superseded_by IS NULL")?;
             let rows = stmt.query_map(rusqlite::params![topic], |row| {
                 row_to_memory(row).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -1038,6 +1038,30 @@ impl MemoryStore for SqliteStore {
             .conn
             .query_row("SELECT COUNT(*) FROM concept_links", [], |row| row.get(0))
             .unwrap_or(0);
+        let hot_count: usize = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE tier = 'hot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let warm_count: usize = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE tier = 'warm'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let cold_count: usize = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE tier = 'cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
         Ok(StoreStats {
             total_memories,
@@ -1048,6 +1072,9 @@ impl MemoryStore for SqliteStore {
             memoir_count,
             concept_count,
             link_count,
+            hot_count,
+            warm_count,
+            cold_count,
         })
     }
 
@@ -1320,17 +1347,13 @@ impl SqliteStore {
                         ));
                     }
                     // Cap content length to prevent unbounded growth from repeated merges.
-                    // Trim older content (front) to preserve newly merged tail.
+                    // Trim from the end (newest additions) to preserve original core content.
                     if existing.content.len() > 10_000 {
-                        let excess = existing.content.len() - 10_000;
-                        // Find safe UTF-8 boundary at or after the trim point
-                        let mut trim_at = excess;
-                        while trim_at < existing.content.len()
-                            && !existing.content.is_char_boundary(trim_at)
-                        {
-                            trim_at += 1;
+                        let mut trim_at = 10_000;
+                        while trim_at > 0 && !existing.content.is_char_boundary(trim_at) {
+                            trim_at -= 1;
                         }
-                        existing.content = existing.content[trim_at..].to_string();
+                        existing.content.truncate(trim_at);
                     }
                     existing.summary = existing
                         .content
