@@ -83,6 +83,22 @@ export interface AdaptiveStatus {
   }>;
 }
 
+export interface DoctorCheck {
+  name: string;
+  category: 'configuration' | 'runtime' | 'storage' | 'index' | 'queue' | 'network';
+  severity: 'info' | 'warning' | 'error';
+  status: 'ok' | 'warn' | 'fail';
+  fixable: boolean;
+  message: string;
+  repair_hint?: string;
+}
+
+export interface DoctorReport {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  checks: DoctorCheck[];
+  fixes_applied?: string[];
+}
+
 export interface Episode {
   id: string;
   title: string;
