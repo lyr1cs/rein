@@ -400,22 +400,37 @@ fn runtime_status_check(
     port_open: bool,
     probe: RuntimeProbe,
 ) -> DoctorCheck {
+    let probe_suffix = match &probe {
+        RuntimeProbe::None => None,
+        RuntimeProbe::Ok(extra) | RuntimeProbe::Warn(extra) => Some(extra.as_str()),
+    };
     match (pid, port_open) {
         (Some(pid), true) => match probe {
             RuntimeProbe::None => ok(name, format!("running on :{port} with PID {pid}")),
-            RuntimeProbe::Ok(extra) => ok(name, format!("running on :{port} with PID {pid}; {extra}")),
+            RuntimeProbe::Ok(extra) => {
+                ok(name, format!("running on :{port} with PID {pid}; {extra}"))
+            }
             RuntimeProbe::Warn(extra) => {
                 warn(name, format!("running on :{port} with PID {pid}; {extra}"))
             }
         },
-        (None, true) => warn(
-            name,
-            format!("port :{port} is open but no PID file is present; external listener?"),
-        ),
-        (Some(pid), false) => warn(
-            name,
-            format!("PID {pid} recorded for :{port}, but the port is closed"),
-        ),
+        (None, true) => {
+            let mut msg =
+                format!("port :{port} is open but no PID file is present; external listener?");
+            if let Some(extra) = probe_suffix {
+                msg.push_str("; ");
+                msg.push_str(extra);
+            }
+            warn(name, msg)
+        }
+        (Some(pid), false) => {
+            let mut msg = format!("PID {pid} recorded for :{port}, but the port is closed");
+            if let Some(extra) = probe_suffix {
+                msg.push_str("; ");
+                msg.push_str(extra);
+            }
+            warn(name, msg)
+        }
         (None, false) => ok(name, format!("stopped on :{port}")),
     }
 }
@@ -474,7 +489,9 @@ fn probe_gui_health(port: u16) -> anyhow::Result<u16> {
 
 fn probe_proxy_metrics(port: u16) -> anyhow::Result<Option<(u64, u64, u64)>> {
     let mut headers = Vec::new();
-    if let Ok(token) = std::env::var("REIN_PROXY_TOKEN").or_else(|_| std::env::var("REIN_HTTP_TOKEN")) {
+    if let Ok(token) =
+        std::env::var("REIN_PROXY_TOKEN").or_else(|_| std::env::var("REIN_HTTP_TOKEN"))
+    {
         headers.push(("x-rein-token".to_string(), token));
     }
     let (status, body) = http_get_local(port, "/rein/metrics", &headers)?;
@@ -488,7 +505,10 @@ fn probe_proxy_metrics(port: u16) -> anyhow::Result<Option<(u64, u64, u64)>> {
     let requests = json.get("request_count").and_then(|v| v.as_u64());
     let errors = json.get("error_count").and_then(|v| v.as_u64());
     let extractions = json.get("extraction_count").and_then(|v| v.as_u64());
-    Ok(requests.zip(errors).zip(extractions).map(|((r, e), x)| (r, e, x)))
+    Ok(requests
+        .zip(errors)
+        .zip(extractions)
+        .map(|((r, e), x)| (r, e, x)))
 }
 
 fn http_get_local(
@@ -496,12 +516,15 @@ fn http_get_local(
     path: &str,
     headers: &[(String, String)],
 ) -> anyhow::Result<(u16, String)> {
-    let mut stream =
-        TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
+    let mut stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    )?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;
 
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    let mut request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
     for (name, value) in headers {
         request.push_str(name);
         request.push_str(": ");
@@ -515,7 +538,9 @@ fn http_get_local(
     stream.read_to_string(&mut response)?;
 
     let mut lines = response.lines();
-    let status_line = lines.next().ok_or_else(|| anyhow::anyhow!("empty response"))?;
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty response"))?;
     let status = status_line
         .split_whitespace()
         .nth(1)
@@ -772,8 +797,11 @@ fn is_loopback_bind(bind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+    use std::thread;
 
     use crate::extract::hooks::buffer;
     use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, Source};
@@ -908,6 +936,19 @@ provider = "inherit"
         std::fs::write(path, format!("{body}\n")).unwrap();
     }
 
+    fn spawn_http_server(response: String) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -937,6 +978,40 @@ provider = "inherit"
         assert!(text.contains("[OK] database: connected"));
         assert!(text.contains("[WARN] queues: pending jobs"));
         assert!(text.contains("Overall: degraded"));
+    }
+
+    #[test]
+    fn test_runtime_status_check_surfaces_probe_details_for_external_listener() {
+        let check = runtime_status_check(
+            "gui_runtime",
+            None,
+            8765,
+            true,
+            RuntimeProbe::Warn("/api/health returned 401".to_string()),
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("external listener"));
+        assert!(check.message.contains("401"));
+    }
+
+    #[test]
+    fn test_probe_gui_health_reads_http_status() {
+        let port = spawn_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+                .to_string(),
+        );
+        let status = probe_gui_health(port).unwrap();
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_probe_proxy_metrics_parses_counts() {
+        let port = spawn_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 58\r\n\r\n{\"request_count\":12,\"error_count\":1,\"extraction_count\":5}"
+                .to_string(),
+        );
+        let metrics = probe_proxy_metrics(port).unwrap();
+        assert_eq!(metrics, Some((12, 1, 5)));
     }
 
     #[tokio::test]
