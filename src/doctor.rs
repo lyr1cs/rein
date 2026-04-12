@@ -33,6 +33,25 @@ impl CheckStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCategory {
+    Configuration,
+    Runtime,
+    Storage,
+    Index,
+    Queue,
+    Network,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportStatus {
     Healthy,
@@ -43,7 +62,10 @@ pub enum ReportStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorCheck {
     pub name: &'static str,
+    pub category: DoctorCategory,
+    pub severity: DoctorSeverity,
     pub status: CheckStatus,
+    pub fixable: bool,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair_hint: Option<String>,
@@ -93,7 +115,8 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
             let stats = store.stats();
             match stats {
                 Ok(stats) => {
-                    checks.push(ok(
+                    checks.push(ok_in(
+                        DoctorCategory::Storage,
                         "database",
                         format!(
                             "{} memories, {} topics, {} memoirs at {}",
@@ -115,13 +138,17 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_tantivy(&store, snapshot.active_memories));
                             checks.push(hnsw_check);
                         }
-                        Err(e) => checks.push(fail("database_snapshot", e.to_string())),
+                        Err(e) => checks.push(fail_in(
+                            DoctorCategory::Storage,
+                            "database_snapshot",
+                            e.to_string(),
+                        )),
                     }
                 }
-                Err(e) => checks.push(fail("database", e.to_string())),
+                Err(e) => checks.push(fail_in(DoctorCategory::Storage, "database", e.to_string())),
             }
         }
-        Err(e) => checks.push(fail("database", e.to_string())),
+        Err(e) => checks.push(fail_in(DoctorCategory::Storage, "database", e.to_string())),
     }
 
     let queue_diag = collect_queue_diagnostics(config);
@@ -197,54 +224,83 @@ fn overall_label(status: ReportStatus) -> &'static str {
     }
 }
 
-fn ok(name: &'static str, message: impl Into<String>) -> DoctorCheck {
+fn ok_in(
+    category: DoctorCategory,
+    name: &'static str,
+    message: impl Into<String>,
+) -> DoctorCheck {
     DoctorCheck {
         name,
+        category,
+        severity: DoctorSeverity::Info,
         status: CheckStatus::Ok,
+        fixable: false,
         message: message.into(),
         repair_hint: None,
     }
 }
 
-fn warn(name: &'static str, message: impl Into<String>) -> DoctorCheck {
+fn warn_in(
+    category: DoctorCategory,
+    name: &'static str,
+    message: impl Into<String>,
+) -> DoctorCheck {
     DoctorCheck {
         name,
+        category,
+        severity: DoctorSeverity::Warning,
         status: CheckStatus::Warn,
+        fixable: false,
         message: message.into(),
         repair_hint: None,
     }
 }
 
-fn fail(name: &'static str, message: impl Into<String>) -> DoctorCheck {
+fn fail_in(
+    category: DoctorCategory,
+    name: &'static str,
+    message: impl Into<String>,
+) -> DoctorCheck {
     DoctorCheck {
         name,
+        category,
+        severity: DoctorSeverity::Error,
         status: CheckStatus::Fail,
+        fixable: false,
         message: message.into(),
         repair_hint: None,
     }
 }
 
 fn warn_with_hint(
+    category: DoctorCategory,
     name: &'static str,
     message: impl Into<String>,
     repair_hint: impl Into<String>,
 ) -> DoctorCheck {
     DoctorCheck {
         name,
+        category,
+        severity: DoctorSeverity::Warning,
         status: CheckStatus::Warn,
+        fixable: true,
         message: message.into(),
         repair_hint: Some(repair_hint.into()),
     }
 }
 
 fn fail_with_hint(
+    category: DoctorCategory,
     name: &'static str,
     message: impl Into<String>,
     repair_hint: impl Into<String>,
 ) -> DoctorCheck {
     DoctorCheck {
         name,
+        category,
+        severity: DoctorSeverity::Error,
         status: CheckStatus::Fail,
+        fixable: false,
         message: message.into(),
         repair_hint: Some(repair_hint.into()),
     }
@@ -253,19 +309,22 @@ fn fail_with_hint(
 fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
     match config.embedding_provider() {
         Provider::Google => match config.embedding.google.api_key.as_ref() {
-            Some(_) => ok(
+            Some(_) => ok_in(
+                DoctorCategory::Configuration,
                 "embedding_provider",
                 format!(
                     "google:{} configured ({}d)",
                     config.embedding.google.model, config.embedding.dimensions
                 ),
             ),
-            None => warn(
+            None => warn_in(
+                DoctorCategory::Configuration,
                 "embedding_provider",
                 "google configured but GEMINI_API_KEY is missing; vector embedding is disabled",
             ),
         },
-        Provider::Omlx => ok(
+        Provider::Omlx => ok_in(
+            DoctorCategory::Configuration,
             "embedding_provider",
             format!(
                 "omlx:{} at {} ({}d)",
@@ -274,72 +333,81 @@ fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
                 config.embedding.dimensions
             ),
         ),
-        Provider::None => ok("embedding_provider", "disabled"),
+        Provider::None => ok_in(DoctorCategory::Configuration, "embedding_provider", "disabled"),
     }
 }
 
 fn check_extract_provider(config: &ReinConfig) -> DoctorCheck {
     match config.extract_provider() {
         Provider::Google => match config.extract.google.api_key.as_ref() {
-            Some(_) => ok(
+            Some(_) => ok_in(
+                DoctorCategory::Configuration,
                 "extract_provider",
                 format!("google:{} configured", config.extract.google.model),
             ),
-            None => warn(
+            None => warn_in(
+                DoctorCategory::Configuration,
                 "extract_provider",
                 "google configured but GEMINI_API_KEY is missing; LLM extraction is disabled",
             ),
         },
-        Provider::Omlx => ok(
+        Provider::Omlx => ok_in(
+            DoctorCategory::Configuration,
             "extract_provider",
             format!(
                 "omlx:{} at {}",
                 config.extract.omlx.model, config.extract.omlx.endpoint
             ),
         ),
-        Provider::None => ok("extract_provider", "disabled"),
+        Provider::None => ok_in(DoctorCategory::Configuration, "extract_provider", "disabled"),
     }
 }
 
 fn check_query_expansion_provider(config: &ReinConfig) -> DoctorCheck {
     match config.expand_provider() {
         Provider::Google => match config.query_expansion.google.api_key.as_ref() {
-            Some(_) => ok(
+            Some(_) => ok_in(
+                DoctorCategory::Configuration,
                 "query_expansion",
                 format!("google:{} configured", config.query_expansion.google.model),
             ),
-            None => warn(
+            None => warn_in(
+                DoctorCategory::Configuration,
                 "query_expansion",
                 "google configured but GEMINI_API_KEY is missing; expansion is disabled",
             ),
         },
-        Provider::Omlx => ok(
+        Provider::Omlx => ok_in(
+            DoctorCategory::Configuration,
             "query_expansion",
             format!(
                 "omlx:{} at {}",
                 config.query_expansion.omlx.model, config.query_expansion.omlx.endpoint
             ),
         ),
-        Provider::None => ok("query_expansion", "disabled"),
+        Provider::None => ok_in(DoctorCategory::Configuration, "query_expansion", "disabled"),
     }
 }
 
 fn check_reranker_provider(config: &ReinConfig) -> DoctorCheck {
     match config.reranker_provider() {
         Provider::Google => match config.query_expansion.google.api_key.as_ref() {
-            Some(_) => ok(
+            Some(_) => ok_in(
+                DoctorCategory::Configuration,
                 "llm_reranker",
                 format!(
                     "google:{} configured (top_n={})",
                     config.query_expansion.google.model, config.search.llm_reranker_top_n
                 ),
             ),
-            None => warn(
+            None => warn_in(
+                DoctorCategory::Configuration,
                 "llm_reranker",
                 "google reranker configured but GEMINI_API_KEY is missing; reranker will be skipped",
             ),
         },
-        Provider::Omlx => ok(
+        Provider::Omlx => ok_in(
+            DoctorCategory::Configuration,
             "llm_reranker",
             format!(
                 "omlx:{} at {} (top_n={})",
@@ -348,20 +416,22 @@ fn check_reranker_provider(config: &ReinConfig) -> DoctorCheck {
                 config.search.llm_reranker_top_n
             ),
         ),
-        Provider::None => ok("llm_reranker", "disabled"),
+        Provider::None => ok_in(DoctorCategory::Configuration, "llm_reranker", "disabled"),
     }
 }
 
 fn check_supermemory(config: &ReinConfig) -> DoctorCheck {
     if !config.sync.supermemory_enabled {
-        return ok("supermemory", "disabled");
+        return ok_in(DoctorCategory::Configuration, "supermemory", "disabled");
     }
     match config.sync.api_key.as_ref() {
-        Some(_) => ok(
+        Some(_) => ok_in(
+            DoctorCategory::Configuration,
             "supermemory",
             format!("enabled via {}", config.sync.endpoint),
         ),
-        None => warn(
+        None => warn_in(
+            DoctorCategory::Configuration,
             "supermemory",
             "enabled but SUPERMEMORY_CC_API_KEY is missing; cross-validation will be partial",
         ),
@@ -370,7 +440,7 @@ fn check_supermemory(config: &ReinConfig) -> DoctorCheck {
 
 fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
     if !config.server.sse_enabled && !config.server.gui_enabled {
-        return ok("http_auth", "HTTP/SSE disabled");
+        return ok_in(DoctorCategory::Configuration, "http_auth", "HTTP/SSE disabled");
     }
 
     let token_present = std::env::var("REIN_HTTP_TOKEN").ok().is_some();
@@ -378,7 +448,8 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
     let allow_unauth = config.server.allow_unauthenticated_loopback && is_loopback;
 
     if token_present {
-        ok(
+        ok_in(
+            DoctorCategory::Configuration,
             "http_auth",
             format!(
                 "token configured for {}:{}",
@@ -386,7 +457,8 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
             ),
         )
     } else if allow_unauth {
-        ok(
+        ok_in(
+            DoctorCategory::Configuration,
             "http_auth",
             format!(
                 "loopback-only unauthenticated access allowed for {}:{}",
@@ -395,6 +467,7 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
         )
     } else {
         fail_with_hint(
+            DoctorCategory::Configuration,
             "http_auth",
             format!(
                 "HTTP/SSE is enabled on {}:{} without REIN_HTTP_TOKEN",
@@ -414,7 +487,8 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
     let allow_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
 
     if token_present {
-        ok(
+        ok_in(
+            DoctorCategory::Configuration,
             "proxy_auth",
             format!(
                 "token configured for {}:{}",
@@ -422,7 +496,8 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
             ),
         )
     } else if allow_unauth {
-        ok(
+        ok_in(
+            DoctorCategory::Configuration,
             "proxy_auth",
             format!(
                 "loopback-only unauthenticated access allowed for {}:{}",
@@ -431,6 +506,7 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
         )
     } else {
         fail_with_hint(
+            DoctorCategory::Configuration,
             "proxy_auth",
             format!(
                 "proxy cannot start on {}:{} without REIN_PROXY_TOKEN or REIN_HTTP_TOKEN",
@@ -461,13 +537,23 @@ fn runtime_status_check(
     };
     match (pid, port_open) {
         (Some(pid), true) => match probe {
-            RuntimeProbe::None => ok(name, format!("running on :{port} with PID {pid}")),
+            RuntimeProbe::None => ok_in(
+                DoctorCategory::Runtime,
+                name,
+                format!("running on :{port} with PID {pid}"),
+            ),
             RuntimeProbe::Ok(extra) => {
-                ok(name, format!("running on :{port} with PID {pid}; {extra}"))
+                ok_in(
+                    DoctorCategory::Runtime,
+                    name,
+                    format!("running on :{port} with PID {pid}; {extra}"),
+                )
             }
-            RuntimeProbe::Warn(extra) => {
-                warn(name, format!("running on :{port} with PID {pid}; {extra}"))
-            }
+            RuntimeProbe::Warn(extra) => warn_in(
+                DoctorCategory::Runtime,
+                name,
+                format!("running on :{port} with PID {pid}; {extra}"),
+            ),
         },
         (None, true) => {
             let mut msg =
@@ -476,7 +562,7 @@ fn runtime_status_check(
                 msg.push_str("; ");
                 msg.push_str(extra);
             }
-            warn(name, msg)
+            warn_in(DoctorCategory::Runtime, name, msg)
         }
         (Some(pid), false) => {
             let mut msg = format!("PID {pid} recorded for :{port}, but the port is closed");
@@ -484,9 +570,9 @@ fn runtime_status_check(
                 msg.push_str("; ");
                 msg.push_str(extra);
             }
-            warn(name, msg)
+            warn_in(DoctorCategory::Runtime, name, msg)
         }
-        (None, false) => ok(name, format!("stopped on :{port}")),
+        (None, false) => ok_in(DoctorCategory::Runtime, name, format!("stopped on :{port}")),
     }
 }
 
@@ -635,7 +721,7 @@ fn check_vector_coverage(
     indexed_vectors: Option<usize>,
 ) -> DoctorCheck {
     if snapshot.total_memories == 0 {
-        return ok("vector_store", "0 memories");
+        return ok_in(DoctorCategory::Index, "vector_store", "0 memories");
     }
 
     let Some(indexed_vectors) = indexed_vectors else {
@@ -647,6 +733,7 @@ fn check_vector_coverage(
             _ => "run `rein warmup` or `rein migrate --reindex`",
         };
         return warn_with_hint(
+            DoctorCategory::Index,
             "vector_store",
             format!(
                 "vector index unavailable for {} memories ({} active, cache={}, artifacts={}); {}",
@@ -671,9 +758,10 @@ fn check_vector_coverage(
         snapshot.artifact_rows
     );
     if coverage >= 0.9 {
-        ok("vector_store", message)
+        ok_in(DoctorCategory::Index, "vector_store", message)
     } else {
         warn_with_hint(
+            DoctorCategory::Index,
             "vector_store",
             message,
             "run `rein warmup` to fill missing cached embeddings",
@@ -687,10 +775,11 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
     let dirty = warmup::tantivy_dirty_path(db_path).exists();
 
     if active_memories == 0 && !index_path.exists() {
-        return ok("tantivy", "not built yet (0 active memories)");
+        return ok_in(DoctorCategory::Index, "tantivy", "not built yet (0 active memories)");
     }
     if !index_path.exists() {
         return warn_with_hint(
+            DoctorCategory::Index,
             "tantivy",
             format!("index directory missing at {}", index_path.display()),
             "run `rein doctor --fix` or `rein warmup`",
@@ -698,15 +787,18 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
     }
     match TantivyFts::open(&index_path) {
         Ok(_) if dirty => warn_with_hint(
+            DoctorCategory::Index,
             "tantivy",
             format!("index opened at {} but dirty marker is present", index_path.display()),
             "run `rein doctor --fix` or `rein warmup`",
         ),
-        Ok(_) => ok(
+        Ok(_) => ok_in(
+            DoctorCategory::Index,
             "tantivy",
             format!("index opened at {}", index_path.display()),
         ),
-        Err(e) => fail(
+        Err(e) => fail_in(
+            DoctorCategory::Index,
             "tantivy",
             format!("failed to open {}: {e}", index_path.display()),
         ),
@@ -720,11 +812,15 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
     let dirty = HnswIndex::is_dirty(&base_path);
 
     if total_memories == 0 && !index_path.exists() {
-        return (ok("hnsw", "not built yet (0 memories)"), Some(0));
+        return (
+            ok_in(DoctorCategory::Index, "hnsw", "not built yet (0 memories)"),
+            Some(0),
+        );
     }
     if !index_path.exists() {
         return (
             warn_with_hint(
+                DoctorCategory::Index,
                 "hnsw",
                 format!("index file missing at {}", index_path.display()),
                 "run `rein doctor --fix` or `rein warmup`",
@@ -735,6 +831,7 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
     if !meta_path.exists() {
         return (
             warn_with_hint(
+                DoctorCategory::Index,
                 "hnsw",
                 format!(
                     "index file exists at {} but metadata is missing at {}",
@@ -757,6 +854,7 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
             if dirty {
                 (
                     warn_with_hint(
+                        DoctorCategory::Index,
                         "hnsw",
                         format!("{message}; dirty marker is present"),
                         "run `rein doctor --fix` or `rein warmup`",
@@ -764,11 +862,12 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
                     Some(index.len()),
                 )
             } else {
-                (ok("hnsw", message), Some(index.len()))
+                (ok_in(DoctorCategory::Index, "hnsw", message), Some(index.len()))
             }
         }
         Err(e) => (
-            fail(
+            fail_in(
+                DoctorCategory::Index,
                 "hnsw",
                 format!("failed to open {}: {e}", index_path.display()),
             ),
@@ -806,43 +905,49 @@ fn check_queues(diag: &QueueGroupDiagnostics) -> DoctorCheck {
             .cloned()
             .unwrap_or_else(|| "queue diagnostics failed".to_string());
         warn_with_hint(
+            DoctorCategory::Queue,
             "queues",
             format!("{message}; {first_issue}"),
             "inspect and recover the affected queue files before draining workers",
         )
     } else if dead > 0 {
         warn_with_hint(
+            DoctorCategory::Queue,
             "queues",
             format!("{message}; dead letters present"),
             "inspect dead-letter files before retrying jobs",
         )
     } else if inflight > 0 {
         warn_with_hint(
+            DoctorCategory::Queue,
             "queues",
             format!("{message}; inflight jobs need a worker to finish"),
             "run `rein doctor --fix` or the relevant `rein worker ...` command",
         )
     } else if pending > 0 {
         warn_with_hint(
+            DoctorCategory::Queue,
             "queues",
             format!("{message}; pending jobs are waiting to be drained"),
             "run the corresponding `rein worker ...` command",
         )
     } else {
-        ok("queues", message)
+        ok_in(DoctorCategory::Queue, "queues", message)
     }
 }
 
 async fn check_embedding_network(config: &ReinConfig) -> DoctorCheck {
     let Some(embedder) = embed::create_embedder(config) else {
-        return ok(
+        return ok_in(
+            DoctorCategory::Network,
             "embedding_network",
             "skipped (embedding provider unavailable)",
         );
     };
 
     match embedder.embed("rein doctor ping").await {
-        Ok(vector) => ok(
+        Ok(vector) => ok_in(
+            DoctorCategory::Network,
             "embedding_network",
             format!(
                 "{} responded with {} dimensions",
@@ -850,7 +955,7 @@ async fn check_embedding_network(config: &ReinConfig) -> DoctorCheck {
                 vector.len()
             ),
         ),
-        Err(e) => fail("embedding_network", e.to_string()),
+        Err(e) => fail_in(DoctorCategory::Network, "embedding_network", e.to_string()),
     }
 }
 
@@ -1121,8 +1226,13 @@ provider = "inherit"
         let report = DoctorReport {
             status: ReportStatus::Degraded,
             checks: vec![
-                ok("database", "connected"),
-                warn_with_hint("queues", "pending jobs", "run `rein worker memory`"),
+                ok_in(DoctorCategory::Storage, "database", "connected"),
+                warn_with_hint(
+                    DoctorCategory::Queue,
+                    "queues",
+                    "pending jobs",
+                    "run `rein worker memory`",
+                ),
             ],
             fixes_applied: vec![],
         };
@@ -1138,14 +1248,37 @@ provider = "inherit"
         let report = DoctorReport {
             status: ReportStatus::Degraded,
             checks: vec![
-                ok("database", "connected"),
-                warn_with_hint("queues", "pending jobs", "run `rein worker memory`"),
+                ok_in(DoctorCategory::Storage, "database", "connected"),
+                warn_with_hint(
+                    DoctorCategory::Queue,
+                    "queues",
+                    "pending jobs",
+                    "run `rein worker memory`",
+                ),
             ],
             fixes_applied: vec![],
         };
         let json = serde_json::to_value(&report).unwrap();
         let checks = json.get("checks").and_then(|v| v.as_array()).unwrap();
         assert!(checks[0].get("repair_hint").is_none());
+        assert_eq!(
+            checks[0].get("category").and_then(|v| v.as_str()),
+            Some("storage")
+        );
+        assert_eq!(
+            checks[0].get("severity").and_then(|v| v.as_str()),
+            Some("info")
+        );
+        assert_eq!(checks[0].get("fixable").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            checks[1].get("category").and_then(|v| v.as_str()),
+            Some("queue")
+        );
+        assert_eq!(
+            checks[1].get("severity").and_then(|v| v.as_str()),
+            Some("warning")
+        );
+        assert_eq!(checks[1].get("fixable").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             checks[1].get("repair_hint").and_then(|v| v.as_str()),
             Some("run `rein worker memory`")
