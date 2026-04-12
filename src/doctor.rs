@@ -45,6 +45,8 @@ pub struct DoctorCheck {
     pub name: &'static str,
     pub status: CheckStatus,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +147,9 @@ pub fn format_human(report: &DoctorReport) -> String {
             check.name,
             check.message
         ));
+        if let Some(repair_hint) = &check.repair_hint {
+            lines.push(format!("  repair: {repair_hint}"));
+        }
     }
     if !report.fixes_applied.is_empty() {
         lines.push(String::new());
@@ -197,6 +202,7 @@ fn ok(name: &'static str, message: impl Into<String>) -> DoctorCheck {
         name,
         status: CheckStatus::Ok,
         message: message.into(),
+        repair_hint: None,
     }
 }
 
@@ -205,6 +211,7 @@ fn warn(name: &'static str, message: impl Into<String>) -> DoctorCheck {
         name,
         status: CheckStatus::Warn,
         message: message.into(),
+        repair_hint: None,
     }
 }
 
@@ -213,6 +220,33 @@ fn fail(name: &'static str, message: impl Into<String>) -> DoctorCheck {
         name,
         status: CheckStatus::Fail,
         message: message.into(),
+        repair_hint: None,
+    }
+}
+
+fn warn_with_hint(
+    name: &'static str,
+    message: impl Into<String>,
+    repair_hint: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: CheckStatus::Warn,
+        message: message.into(),
+        repair_hint: Some(repair_hint.into()),
+    }
+}
+
+fn fail_with_hint(
+    name: &'static str,
+    message: impl Into<String>,
+    repair_hint: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: CheckStatus::Fail,
+        message: message.into(),
+        repair_hint: Some(repair_hint.into()),
     }
 }
 
@@ -360,12 +394,13 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
             ),
         )
     } else {
-        fail(
+        fail_with_hint(
             "http_auth",
             format!(
                 "HTTP/SSE is enabled on {}:{} without REIN_HTTP_TOKEN",
                 config.server.sse_bind, config.server.sse_port
             ),
+            "set REIN_HTTP_TOKEN=<secret> or enable [server].allow_unauthenticated_loopback for loopback-only access",
         )
     }
 }
@@ -395,12 +430,13 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
             ),
         )
     } else {
-        fail(
+        fail_with_hint(
             "proxy_auth",
             format!(
                 "proxy cannot start on {}:{} without REIN_PROXY_TOKEN or REIN_HTTP_TOKEN",
                 config.proxy.bind, config.proxy.port
             ),
+            "set REIN_PROXY_TOKEN=<secret> or enable [proxy].allow_unauthenticated_loopback for loopback-only access",
         )
     }
 }
@@ -610,16 +646,17 @@ fn check_vector_coverage(
             }
             _ => "run `rein warmup` or `rein migrate --reindex`",
         };
-        return warn(
+        return warn_with_hint(
             "vector_store",
             format!(
-                "vector index unavailable for {} memories ({} active, cache={}, artifacts={}); {}. repair_hint: rein doctor --fix or rein warmup",
+                "vector index unavailable for {} memories ({} active, cache={}, artifacts={}); {}",
                 snapshot.total_memories,
                 snapshot.active_memories,
                 snapshot.embed_cache_rows,
                 snapshot.artifact_rows,
                 hint
             ),
+            "run `rein doctor --fix` for local side-index rebuilds, or `rein warmup` / `rein migrate --reindex` if embeddings are missing",
         );
     };
 
@@ -636,7 +673,11 @@ fn check_vector_coverage(
     if coverage >= 0.9 {
         ok("vector_store", message)
     } else {
-        warn("vector_store", format!("{message}; consider `rein warmup`"))
+        warn_with_hint(
+            "vector_store",
+            message,
+            "run `rein warmup` to fill missing cached embeddings",
+        )
     }
 }
 
@@ -649,21 +690,17 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
         return ok("tantivy", "not built yet (0 active memories)");
     }
     if !index_path.exists() {
-        return warn(
+        return warn_with_hint(
             "tantivy",
-            format!(
-                "index directory missing at {}; repair_hint: rein doctor --fix or rein warmup",
-                index_path.display()
-            ),
+            format!("index directory missing at {}", index_path.display()),
+            "run `rein doctor --fix` or `rein warmup`",
         );
     }
     match TantivyFts::open(&index_path) {
-        Ok(_) if dirty => warn(
+        Ok(_) if dirty => warn_with_hint(
             "tantivy",
-            format!(
-                "index opened at {} but dirty marker is present; repair_hint: rein doctor --fix or rein warmup",
-                index_path.display()
-            ),
+            format!("index opened at {} but dirty marker is present", index_path.display()),
+            "run `rein doctor --fix` or `rein warmup`",
         ),
         Ok(_) => ok(
             "tantivy",
@@ -687,25 +724,24 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
     }
     if !index_path.exists() {
         return (
-            warn(
+            warn_with_hint(
                 "hnsw",
-                format!(
-                    "index file missing at {}; repair_hint: rein doctor --fix or rein warmup",
-                    index_path.display()
-                ),
+                format!("index file missing at {}", index_path.display()),
+                "run `rein doctor --fix` or `rein warmup`",
             ),
             None,
         );
     }
     if !meta_path.exists() {
         return (
-            warn(
+            warn_with_hint(
                 "hnsw",
                 format!(
-                    "index file exists at {} but metadata is missing at {}; repair_hint: rein doctor --fix or rein warmup",
+                    "index file exists at {} but metadata is missing at {}",
                     index_path.display(),
                     meta_path.display()
                 ),
+                "run `rein doctor --fix` or `rein warmup`",
             ),
             None,
         );
@@ -720,11 +756,10 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
             );
             if dirty {
                 (
-                    warn(
+                    warn_with_hint(
                         "hnsw",
-                        format!(
-                            "{message}; dirty marker is present; repair_hint: rein doctor --fix or rein warmup"
-                        ),
+                        format!("{message}; dirty marker is present"),
+                        "run `rein doctor --fix` or `rein warmup`",
                     ),
                     Some(index.len()),
                 )
@@ -770,30 +805,28 @@ fn check_queues(diag: &QueueGroupDiagnostics) -> DoctorCheck {
             .next()
             .cloned()
             .unwrap_or_else(|| "queue diagnostics failed".to_string());
-        warn(
+        warn_with_hint(
             "queues",
-            format!("{message}; {first_issue}; repair_hint: inspect and recover the affected queue files"),
+            format!("{message}; {first_issue}"),
+            "inspect and recover the affected queue files before draining workers",
         )
     } else if dead > 0 {
-        warn(
+        warn_with_hint(
             "queues",
-            format!(
-                "{message}; dead letters present; repair_hint: inspect dead-letter files before retrying"
-            ),
+            format!("{message}; dead letters present"),
+            "inspect dead-letter files before retrying jobs",
         )
     } else if inflight > 0 {
-        warn(
+        warn_with_hint(
             "queues",
-            format!(
-                "{message}; inflight jobs need a worker to finish; repair_hint: rein doctor --fix or run the relevant worker command"
-            ),
+            format!("{message}; inflight jobs need a worker to finish"),
+            "run `rein doctor --fix` or the relevant `rein worker ...` command",
         )
     } else if pending > 0 {
-        warn(
+        warn_with_hint(
             "queues",
-            format!(
-                "{message}; pending jobs are waiting to be drained; repair_hint: run the corresponding worker command"
-            ),
+            format!("{message}; pending jobs are waiting to be drained"),
+            "run the corresponding `rein worker ...` command",
         )
     } else {
         ok("queues", message)
@@ -1087,13 +1120,36 @@ provider = "inherit"
     fn test_format_human_reports_overall_status() {
         let report = DoctorReport {
             status: ReportStatus::Degraded,
-            checks: vec![ok("database", "connected"), warn("queues", "pending jobs")],
+            checks: vec![
+                ok("database", "connected"),
+                warn_with_hint("queues", "pending jobs", "run `rein worker memory`"),
+            ],
             fixes_applied: vec![],
         };
         let text = format_human(&report);
         assert!(text.contains("[OK] database: connected"));
         assert!(text.contains("[WARN] queues: pending jobs"));
+        assert!(text.contains("repair: run `rein worker memory`"));
         assert!(text.contains("Overall: degraded"));
+    }
+
+    #[test]
+    fn test_json_serializes_repair_hint_only_when_present() {
+        let report = DoctorReport {
+            status: ReportStatus::Degraded,
+            checks: vec![
+                ok("database", "connected"),
+                warn_with_hint("queues", "pending jobs", "run `rein worker memory`"),
+            ],
+            fixes_applied: vec![],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let checks = json.get("checks").and_then(|v| v.as_array()).unwrap();
+        assert!(checks[0].get("repair_hint").is_none());
+        assert_eq!(
+            checks[1].get("repair_hint").and_then(|v| v.as_str()),
+            Some("run `rein worker memory`")
+        );
     }
 
     #[test]
