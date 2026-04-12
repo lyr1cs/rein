@@ -83,6 +83,22 @@ pub struct WorkerStats {
     pub last_run_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueueDiagnostics {
+    pub pending: usize,
+    pub inflight: usize,
+    pub dead_letters: usize,
+    pub stats: WorkerStats,
+    pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueueGroupDiagnostics {
+    pub memory: QueueDiagnostics,
+    pub cleanup: QueueDiagnostics,
+    pub dedup: QueueDiagnostics,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RecentEventEntry {
     fingerprint: String,
@@ -264,6 +280,74 @@ pub fn spawn_memory_worker(config: &ReinConfig) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = cmd.spawn();
+}
+
+pub(crate) fn collect_queue_diagnostics(config: &ReinConfig) -> QueueGroupDiagnostics {
+    let (memory_pending, memory_pending_issue) =
+        diagnostic_count(&queue_path(config), "memory_queue");
+    let (memory_inflight, memory_inflight_issue) =
+        diagnostic_count(&inflight_path(config), "memory_queue_inflight");
+    let (memory_dead, memory_dead_issue) =
+        diagnostic_count(&dead_letter_path(config), "memory_queue_dead");
+    let (memory_stats, memory_stats_issue) =
+        diagnostic_stats(&stats_path(config), "memory_worker_stats");
+
+    let (cleanup_pending, cleanup_pending_issue) =
+        diagnostic_count(&cleanup_queue_path(config), "cleanup_queue");
+    let (cleanup_inflight, cleanup_inflight_issue) =
+        diagnostic_count(&cleanup_inflight_path(config), "cleanup_queue_inflight");
+    let (cleanup_dead, cleanup_dead_issue) =
+        diagnostic_count(&cleanup_dead_letter_path(config), "cleanup_queue_dead");
+    let (cleanup_stats, cleanup_stats_issue) =
+        diagnostic_stats(&cleanup_stats_path(config), "cleanup_worker_stats");
+
+    let (dedup_pending, dedup_pending_issue) =
+        diagnostic_count(&dedup_queue_path(config), "dedup_queue");
+    let (dedup_inflight, dedup_inflight_issue) =
+        diagnostic_count(&dedup_inflight_path(config), "dedup_queue_inflight");
+    let (dedup_dead, dedup_dead_issue) =
+        diagnostic_count(&dedup_dead_letter_path(config), "dedup_queue_dead");
+    let (dedup_stats, dedup_stats_issue) =
+        diagnostic_stats(&dedup_stats_path(config), "dedup_worker_stats");
+
+    QueueGroupDiagnostics {
+        memory: QueueDiagnostics {
+            pending: memory_pending,
+            inflight: memory_inflight,
+            dead_letters: memory_dead,
+            stats: memory_stats,
+            issues: collect_issues([
+                memory_pending_issue,
+                memory_inflight_issue,
+                memory_dead_issue,
+                memory_stats_issue,
+            ]),
+        },
+        cleanup: QueueDiagnostics {
+            pending: cleanup_pending,
+            inflight: cleanup_inflight,
+            dead_letters: cleanup_dead,
+            stats: cleanup_stats,
+            issues: collect_issues([
+                cleanup_pending_issue,
+                cleanup_inflight_issue,
+                cleanup_dead_issue,
+                cleanup_stats_issue,
+            ]),
+        },
+        dedup: QueueDiagnostics {
+            pending: dedup_pending,
+            inflight: dedup_inflight,
+            dead_letters: dedup_dead,
+            stats: dedup_stats,
+            issues: collect_issues([
+                dedup_pending_issue,
+                dedup_inflight_issue,
+                dedup_dead_issue,
+                dedup_stats_issue,
+            ]),
+        },
+    }
 }
 
 pub fn queue_cleanup_job(
@@ -736,6 +820,40 @@ fn project_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf 
     let queue_dir = base.join("queue").join(&db_tag);
     let _ = std::fs::create_dir_all(&queue_dir);
     queue_dir.join(format!("{prefix}.jsonl"))
+}
+
+fn count_jsonl_lines_checked(path: &std::path::Path) -> anyhow::Result<usize> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text.lines().filter(|line| !line.trim().is_empty()).count()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn load_worker_stats_checked(path: &std::path::Path) -> anyhow::Result<WorkerStats> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WorkerStats::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn diagnostic_count(path: &std::path::Path, label: &str) -> (usize, Option<String>) {
+    match count_jsonl_lines_checked(path) {
+        Ok(count) => (count, None),
+        Err(e) => (0, Some(format!("{label}: {e}"))),
+    }
+}
+
+fn diagnostic_stats(path: &std::path::Path, label: &str) -> (WorkerStats, Option<String>) {
+    match load_worker_stats_checked(path) {
+        Ok(stats) => (stats, None),
+        Err(e) => (WorkerStats::default(), Some(format!("{label}: {e}"))),
+    }
+}
+
+fn collect_issues(entries: [Option<String>; 4]) -> Vec<String> {
+    entries.into_iter().flatten().collect()
 }
 
 fn should_spawn_worker(path: &std::path::Path, cooldown_ms: u64) -> bool {

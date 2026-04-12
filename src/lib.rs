@@ -14,6 +14,7 @@
 #![allow(clippy::cloned_ref_to_slice_refs)]
 
 pub mod config;
+pub mod doctor;
 pub mod embed;
 pub mod extract;
 pub mod init;
