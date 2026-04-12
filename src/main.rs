@@ -84,6 +84,15 @@ enum Commands {
     Stats,
     /// Health check
     Health { topic: Option<String> },
+    /// System diagnostics for database, indexes, queues, and provider readiness
+    Doctor {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Probe the embedding backend with a real network request
+        #[arg(long)]
+        network: bool,
+    },
     /// Consolidate a topic into a single memory
     Consolidate {
         /// Single topic to consolidate (legacy mode)
@@ -326,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Topics) => commands::handle_topics(&config)?,
         Some(Commands::Stats) => commands::handle_stats(&config)?,
         Some(Commands::Health { topic }) => commands::handle_health(&config, topic)?,
+        Some(Commands::Doctor { json, network }) => {
+            commands::handle_doctor(&config, json, network).await?
+        }
         Some(Commands::Forget { id }) => commands::handle_forget(&config, id)?,
         Some(Commands::Update {
             id,
@@ -453,4 +465,21 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parses_doctor_flags() {
+        let cli = Cli::try_parse_from(["rein", "doctor", "--json", "--network"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor { json, network }) => {
+                assert!(json);
+                assert!(network);
+            }
+            _ => panic!("expected doctor command"),
+        }
+    }
 }
