@@ -12,6 +12,9 @@ pub struct StoreStats {
     pub memoir_count: usize,
     pub concept_count: usize,
     pub link_count: usize,
+    pub hot_count: usize,
+    pub warm_count: usize,
+    pub cold_count: usize,
 }
 
 /// Health report for a single topic.

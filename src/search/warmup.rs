@@ -124,10 +124,10 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            tracing::warn!(
-                "hnsw: failed to acquire rebuild lock: {}",
+            tracing::debug!(
+                "hnsw: rebuild lock held by another process, skipping: {}",
                 std::io::Error::last_os_error()
             );
             return;

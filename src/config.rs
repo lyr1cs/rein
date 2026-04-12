@@ -947,6 +947,25 @@ impl ReinConfig {
             Provider::None => {}
         }
 
+        // Validate search config
+        if self.search.cc_alpha < 0.0 || self.search.cc_alpha > 1.0 {
+            anyhow::bail!("search.cc_alpha must be in [0.0, 1.0], got {}", self.search.cc_alpha);
+        }
+        if self.search.dedup_similarity < 0.0 || self.search.dedup_similarity > 1.0 {
+            anyhow::bail!("search.dedup_similarity must be in [0.0, 1.0], got {}", self.search.dedup_similarity);
+        }
+        // Validate decay config
+        if self.decay.base_lambda <= 0.0 {
+            anyhow::bail!("decay.base_lambda must be positive, got {}", self.decay.base_lambda);
+        }
+        if self.decay.prune_threshold < 0.0 {
+            anyhow::bail!("decay.prune_threshold must be non-negative, got {}", self.decay.prune_threshold);
+        }
+        // Validate embedding dimensions
+        if self.embedding.dimensions == 0 {
+            anyhow::bail!("embedding.dimensions must be > 0");
+        }
+
         // Validate cleanup config
         let c = &self.cleanup;
         if c.vec_dedup_strong_threshold < 0.0 || c.vec_dedup_strong_threshold > 1.0 {

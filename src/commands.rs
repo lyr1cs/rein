@@ -117,7 +117,8 @@ pub async fn handle_serve(
         config.server.sse_enabled = true;
     }
     if proxy {
-        std::env::set_var("REIN_PROXY_ACTIVE", "1");
+        // Note: REIN_PROXY_ACTIVE env var is set externally by shell aliases (claudep, codexp),
+        // not here. Setting it here would be UB since tokio workers are already running.
         rein::proxy::run_proxy(config).await?;
     } else if sse || gui {
         config.server.sse_enabled = true;

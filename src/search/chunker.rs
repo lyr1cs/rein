@@ -128,9 +128,13 @@ fn split_by_sentences(text: &str, max_chars: usize) -> Vec<String> {
         chunks.push(current);
     }
 
-    // If no chunks were produced (e.g., single very long sentence), force-split
+    // If no chunks were produced (e.g., single very long sentence), force-split at char boundary
     if chunks.is_empty() && !text.is_empty() {
-        chunks.push(text.to_string());
+        let chars: Vec<char> = text.chars().collect();
+        for chunk_start in (0..chars.len()).step_by(max_chars) {
+            let end = (chunk_start + max_chars).min(chars.len());
+            chunks.push(chars[chunk_start..end].iter().collect());
+        }
     }
 
     chunks
