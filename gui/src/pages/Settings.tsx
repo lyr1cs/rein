@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
+import { apiGet } from '../api/client';
 import { useDoctor } from '../hooks/useApi';
-import type { DoctorCheck } from '../api/types';
+import type { DoctorCheck, DoctorReport } from '../api/types';
 
 const CATEGORY_LABELS: Record<DoctorCheck['category'], string> = {
   configuration: 'Configuration',
@@ -36,6 +37,8 @@ export default function Settings() {
   });
 
   const [showToken, setShowToken] = useState(false);
+  const [fixRunning, setFixRunning] = useState(false);
+  const [fixError, setFixError] = useState<string | null>(null);
   const { data: doctor, isLoading: doctorLoading, error: doctorError, refetch } = useDoctor();
 
   // Persist polling interval on change
@@ -47,6 +50,19 @@ export default function Settings() {
   useEffect(() => {
     localStorage.setItem('rein_token', token);
   }, [token]);
+
+  async function runFix() {
+    setFixRunning(true);
+    setFixError(null);
+    try {
+      await apiGet<DoctorReport>('/api/doctor?fix=true');
+      await refetch();
+    } catch (error) {
+      setFixError(error instanceof Error ? error.message : 'Failed to run doctor fix');
+    } finally {
+      setFixRunning(false);
+    }
+  }
 
   return (
     <div className="flex flex-col h-full overflow-y-auto">
@@ -157,6 +173,20 @@ export default function Settings() {
             </button>
           </div>
 
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={runFix}
+              disabled={fixRunning}
+              className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-1.5 text-xs text-[var(--accent)] transition-colors hover:bg-[var(--accent)]/15 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {fixRunning ? 'Running Fix…' : 'Run Fix'}
+            </button>
+            <div className="text-[10px] text-[var(--text-muted)]">
+              Applies safe local repairs only.
+            </div>
+          </div>
+
           {doctorLoading && (
             <div className="text-sm text-[var(--text-muted)]">Loading diagnostics...</div>
           )}
@@ -164,6 +194,12 @@ export default function Settings() {
           {doctorError && (
             <div className="rounded-lg border border-[var(--hot)]/20 bg-[var(--hot)]/10 px-3 py-2 text-xs text-[var(--hot)]">
               Failed to load diagnostics: {doctorError instanceof Error ? doctorError.message : 'Unknown error'}
+            </div>
+          )}
+
+          {fixError && (
+            <div className="rounded-lg border border-[var(--hot)]/20 bg-[var(--hot)]/10 px-3 py-2 text-xs text-[var(--hot)]">
+              Fix failed: {fixError}
             </div>
           )}
 
