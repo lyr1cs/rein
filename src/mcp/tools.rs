@@ -1,5 +1,73 @@
 use rmcp::schemars;
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
+
+fn deserialize_option_usize_from_string<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UsizeValue {
+        Number(u64),
+        String(String),
+    }
+
+    match Option::<UsizeValue>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(UsizeValue::Number(value)) => usize::try_from(value)
+            .map(Some)
+            .map_err(|_| de::Error::custom(format!("value {value} exceeds usize range"))),
+        Some(UsizeValue::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed
+                .parse::<usize>()
+                .map(Some)
+                .map_err(de::Error::custom)
+        }
+    }
+}
+
+fn normalize_string_list(mut values: Vec<String>) -> Option<Vec<String>> {
+    values = values
+        .drain(..)
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn deserialize_option_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringListValue {
+        Many(Vec<String>),
+        One(String),
+    }
+
+    match Option::<StringListValue>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(StringListValue::Many(values)) => Ok(normalize_string_list(values)),
+        Some(StringListValue::One(value)) => Ok(normalize_string_list(vec![value])),
+    }
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionTurnParams {
@@ -19,6 +87,7 @@ pub struct RecallParams {
     /// Optional keyword filter.
     pub keyword: Option<String>,
     /// Maximum number of results to return (default 10).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub limit: Option<usize>,
     /// Filter memories created after this date (YYYY-MM-DD or RFC3339).
     pub from: Option<String>,
@@ -112,6 +181,7 @@ pub struct ConsolidateParams {
     /// Single topic to consolidate.
     pub topic: Option<String>,
     /// Optional comma-separated topic list to consolidate.
+    #[serde(default, deserialize_with = "deserialize_option_string_list")]
     pub topics: Option<Vec<String>>,
     /// Optional glob pattern for matching topics.
     pub pattern: Option<String>,
@@ -140,6 +210,7 @@ pub struct CleanupParams {
     /// Optional single topic to clean.
     pub topic: Option<String>,
     /// Optional topic list to clean.
+    #[serde(default, deserialize_with = "deserialize_option_string_list")]
     pub topics: Option<Vec<String>>,
     /// Optional glob pattern for matching topics.
     pub pattern: Option<String>,
@@ -155,6 +226,7 @@ pub struct CleanupParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecentParams {
     /// Maximum number of recent memories to return (default 10).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub limit: Option<usize>,
 }
 
@@ -169,6 +241,7 @@ pub struct GcParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OrganizeParams {
     /// Maximum links per memory (default 5).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub max_links: Option<usize>,
 }
 
@@ -220,6 +293,7 @@ pub struct ConceptSearchParams {
     /// Search query string.
     pub query: String,
     /// Maximum number of results (default 10).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub limit: Option<usize>,
 }
 
@@ -229,6 +303,7 @@ pub struct ConceptSearchAllParams {
     /// Search query string.
     pub query: String,
     /// Maximum number of results (default 10).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub limit: Option<usize>,
 }
 
@@ -253,6 +328,7 @@ pub struct InspectParams {
     /// Name of the concept to inspect.
     pub name: String,
     /// BFS depth (default 1).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub depth: Option<usize>,
 }
 
@@ -273,6 +349,7 @@ pub struct TimelineParams {
     /// End date (YYYY-MM-DD or RFC3339).
     pub to: Option<String>,
     /// Maximum entries (default 20).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub limit: Option<usize>,
 }
 
@@ -284,5 +361,57 @@ pub struct ConceptHistoryParams {
     /// Name of the concept.
     pub name: String,
     /// Maximum revisions to return (default 10).
+    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
     pub limit: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recall_params_accept_numeric_string_limit() {
+        let params: RecallParams = serde_json::from_value(json!({
+            "query": "release history",
+            "limit": "100"
+        }))
+        .unwrap();
+
+        assert_eq!(params.limit, Some(100));
+    }
+
+    #[test]
+    fn consolidate_params_accept_comma_separated_topics() {
+        let params: ConsolidateParams = serde_json::from_value(json!({
+            "topics": "rein-release, rein-architecture , rein-devlog"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            params.topics,
+            Some(vec![
+                "rein-release".to_string(),
+                "rein-architecture".to_string(),
+                "rein-devlog".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn cleanup_params_accept_topic_array_with_commas() {
+        let params: CleanupParams = serde_json::from_value(json!({
+            "topics": ["alpha, beta", "gamma", " "]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            params.topics,
+            Some(vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string()
+            ])
+        );
+    }
 }

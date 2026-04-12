@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useStats, useRecent, useTopics, useActivity } from '../hooks/useApi';
+import { useStats, useRecent, useActivity } from '../hooks/useApi';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from 'recharts';
@@ -38,7 +38,6 @@ export default function Dashboard() {
   const [activityDays, setActivityDays] = useState(14);
   const { data: stats, isLoading } = useStats();
   const { data: recentData } = useRecent(5);
-  const { data: _topicsData } = useTopics();
   const { data: activityData } = useActivity(activityDays);
 
   if (isLoading || !stats) {

@@ -453,9 +453,7 @@ fn run_tiering(
 
 /// Fetch pending recall_complete events from feedback_events table
 /// without consuming them (offset is not advanced yet).
-fn peek_recall_events(
-    conn: &rusqlite::Connection,
-) -> Vec<crate::store::adaptive::StoredEvent> {
+fn peek_recall_events(conn: &rusqlite::Connection) -> Vec<crate::store::adaptive::StoredEvent> {
     let last_offset: i64 = conn
         .query_row(
             "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'alpha_optimizer'",
@@ -507,18 +505,12 @@ fn parse_candidates_from_event(
                 memory_id: c.get("id")?.as_str()?.to_string(),
                 bm25_norm: c.get("bm25_norm")?.as_f64()? as f32,
                 vec_norm: c.get("vec_norm")?.as_f64()? as f32,
-                kg_norm: c
-                    .get("kg_norm")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32,
+                kg_norm: c.get("kg_norm").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                 episode_norm: c
                     .get("episode_norm")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0) as f32,
-                support_count: c
-                    .get("support_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32,
+                support_count: c.get("support_count").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
                 source_diversity: c
                     .get("source_diversity")
                     .and_then(|v| v.as_f64())
@@ -1231,7 +1223,7 @@ fn compute_per_cluster_dedup_thresholds(
         // Compute pairwise similarities
         for i in 0..contents.len() {
             for j in (i + 1)..contents.len() {
-                let sim = crate::extract::similarity(&contents[i], &contents[j]);
+                let sim = crate::extract::similarity(contents[i], contents[j]);
                 sims.push(sim);
                 all_sims.push(sim);
             }
@@ -1326,8 +1318,8 @@ mod tests {
         for i in 0..12u32 {
             let (ac, days_ago) = match i {
                 0..=3 => (100 + i * 20, 5i64), // very high access rate
-                4..=7 => (5, 30),               // moderate
-                _ => (1, 120),                  // very low rate: 1/120 ≈ 0.008
+                4..=7 => (5, 30),              // moderate
+                _ => (1, 120),                 // very low rate: 1/120 ≈ 0.008
             };
             let mut mem = test_memory("test", &format!("memory {i}"), ac);
             mem.created_at = Utc::now() - chrono::Duration::days(days_ago);
@@ -1384,8 +1376,7 @@ mod tests {
             .unwrap();
 
         // With widely varying access rates, tiering should produce at least two tiers
-        let tiers_used =
-            (if hot_count > 0 { 1 } else { 0 })
+        let tiers_used = (if hot_count > 0 { 1 } else { 0 })
             + (if warm_count > 0 { 1 } else { 0 })
             + (if cold_count > 0 { 1 } else { 0 });
         assert!(
@@ -1421,10 +1412,7 @@ mod tests {
         // Build state with cluster assignments
         let mut state = AdaptiveState::default();
         // Read back memory IDs and assign clusters in state
-        let mut stmt = store
-            .conn()
-            .prepare("SELECT id FROM memories")
-            .unwrap();
+        let mut stmt = store.conn().prepare("SELECT id FROM memories").unwrap();
         let ids: Vec<String> = stmt
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -1761,10 +1749,7 @@ mod tests {
             "global alpha should be in [0, 1], got {}",
             global.value
         );
-        assert!(
-            global.sample_count > 0,
-            "sample_count should be positive"
-        );
+        assert!(global.sample_count > 0, "sample_count should be positive");
     }
 
     // ── Test 7: run_m6_threshold_learning ────────────────────────────────────
@@ -1818,8 +1803,10 @@ mod tests {
             );
         }
 
-        let mut state = AdaptiveState::default();
-        state.global_dedup_threshold = 0.70; // mirror serde default
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70, // mirror serde default
+            ..AdaptiveState::default()
+        };
 
         // Should not panic
         run_m6_threshold_learning(&store, &mut state);

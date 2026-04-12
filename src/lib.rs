@@ -12,7 +12,6 @@
 #![allow(clippy::redundant_slicing)]
 #![allow(clippy::collapsible_match)]
 #![allow(clippy::cloned_ref_to_slice_refs)]
-
 pub mod config;
 pub mod doctor;
 pub mod embed;

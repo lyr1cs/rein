@@ -143,7 +143,9 @@ fn apply_evidence_rerank(
     evidence_limit: usize,
 ) {
     for result in results {
-        if result.memory.support_count <= 1 || (result.confidence >= 0.85 && result.sources_hit >= 2) {
+        if result.memory.support_count <= 1
+            || (result.confidence >= 0.85 && result.sources_hit >= 2)
+        {
             continue;
         }
         let evidence = store
@@ -1109,23 +1111,24 @@ mod tests {
     #[test]
     fn evidence_rerank_boosts_supported_memory() {
         let store = SqliteStore::in_memory().unwrap();
-        let supported_id = store
-            .store(test_memory("supported", 3, 2.0))
-            .unwrap();
-        let unsupported_id = store
-            .store(test_memory("unsupported", 1, 1.0))
-            .unwrap();
+        let supported_id = store.store(test_memory("supported", 3, 2.0)).unwrap();
+        let unsupported_id = store.store(test_memory("unsupported", 1, 1.0)).unwrap();
 
         let supported = store.get(&supported_id).unwrap();
-        store.snapshot_memory_as_evidence(&supported_id, &Memory {
-            id: "ev1".to_string(),
-            content: "database connection pool tuning".to_string(),
-            summary: "connection pool tuning".to_string(),
-            created_at: supported.created_at,
-            updated_at: supported.updated_at,
-            last_accessed: supported.last_accessed,
-            ..supported.clone()
-        }).unwrap();
+        store
+            .snapshot_memory_as_evidence(
+                &supported_id,
+                &Memory {
+                    id: "ev1".to_string(),
+                    content: "database connection pool tuning".to_string(),
+                    summary: "connection pool tuning".to_string(),
+                    created_at: supported.created_at,
+                    updated_at: supported.updated_at,
+                    last_accessed: supported.last_accessed,
+                    ..supported.clone()
+                },
+            )
+            .unwrap();
 
         let mut results = vec![
             RecallResult {
@@ -1263,7 +1266,10 @@ fn try_vector_search_batch(
 
 /// Batch-fetch topic for a set of memory IDs in a single query.
 /// Returns a map from memory ID to topic string.
-fn batch_topic_map(store: &SqliteStore, ids: &[String]) -> std::collections::HashMap<String, String> {
+fn batch_topic_map(
+    store: &SqliteStore,
+    ids: &[String],
+) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     if ids.is_empty() {
         return map;
@@ -1301,11 +1307,15 @@ fn matches_topic_from_map(
 ) -> bool {
     match topic {
         None => true,
-        Some(t) => topic_map.get(id).map(|mt| {
-            // Compare both raw and normalized forms so user-supplied filters
-            // match even after store-time topic normalization.
-            mt == t || crate::ops::normalize_topic_name(mt) == crate::ops::normalize_topic_name(t)
-        }).unwrap_or(false),
+        Some(t) => topic_map
+            .get(id)
+            .map(|mt| {
+                // Compare both raw and normalized forms so user-supplied filters
+                // match even after store-time topic normalization.
+                mt == t
+                    || crate::ops::normalize_topic_name(mt) == crate::ops::normalize_topic_name(t)
+            })
+            .unwrap_or(false),
     }
 }
 
