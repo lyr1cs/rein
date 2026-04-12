@@ -92,6 +92,9 @@ enum Commands {
         /// Probe the embedding backend with a real network request
         #[arg(long)]
         network: bool,
+        /// Apply safe local fixes such as side-index rebuilds
+        #[arg(long)]
+        fix: bool,
     },
     /// Consolidate a topic into a single memory
     Consolidate {
@@ -342,8 +345,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Topics) => commands::handle_topics(&config)?,
         Some(Commands::Stats) => commands::handle_stats(&config)?,
         Some(Commands::Health { topic }) => commands::handle_health(&config, topic)?,
-        Some(Commands::Doctor { json, network }) => {
-            commands::handle_doctor(&config, json, network).await?
+        Some(Commands::Doctor { json, network, fix }) => {
+            commands::handle_doctor(&config, json, network, fix).await?
         }
         Some(Commands::Forget { id }) => commands::handle_forget(&config, id)?,
         Some(Commands::Update {
@@ -480,11 +483,12 @@ mod tests {
 
     #[test]
     fn test_cli_parses_doctor_flags() {
-        let cli = Cli::try_parse_from(["rein", "doctor", "--json", "--network"]).unwrap();
+        let cli = Cli::try_parse_from(["rein", "doctor", "--json", "--network", "--fix"]).unwrap();
         match cli.command {
-            Some(Commands::Doctor { json, network }) => {
+            Some(Commands::Doctor { json, network, fix }) => {
                 assert!(json);
                 assert!(network);
+                assert!(fix);
             }
             _ => panic!("expected doctor command"),
         }
