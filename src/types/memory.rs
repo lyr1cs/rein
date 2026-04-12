@@ -169,10 +169,7 @@ impl FromStr for MemoryStatus {
             "active" => Ok(Self::Active),
             "updated" => Ok(Self::Updated),
             "deprecated" => Ok(Self::Deprecated),
-            other => {
-                tracing::warn!("unknown MemoryStatus '{}', defaulting to Active", other);
-                Ok(Self::Active)
-            }
+            other => Err(format!("unknown MemoryStatus: '{other}'")),
         }
     }
 }

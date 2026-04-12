@@ -7,7 +7,9 @@ use std::time::Duration;
 
 /// Directory for PID files and runtime state.
 fn pid_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".rein")
 }
 

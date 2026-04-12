@@ -215,10 +215,19 @@ pub fn load_weights(conn: &rusqlite::Connection) -> RerankWeights {
         rusqlite::params![],
         |row| row.get(0),
     );
-    match result {
+    let weights = match result {
         Ok(json) => serde_json::from_str(&json).unwrap_or_else(|_| default_weights()),
         Err(_) => default_weights(),
+    };
+    // Sanity check: weights should not be wildly out of range (catch corruption)
+    let sum: f32 = weights.w_fts + weights.w_vec + weights.w_kg + weights.w_episode
+        + weights.w_recency + weights.w_access + weights.w_strength + weights.w_importance
+        + weights.w_keyword + weights.w_topic_match + weights.w_brevity + weights.w_channel_coverage;
+    if sum <= 0.0 || sum > 5.0 || sum.is_nan() {
+        tracing::warn!("rerank weights sum is {sum:.3} (out of valid range), using defaults");
+        return default_weights();
     }
+    weights
 }
 
 /// Persist rerank weights to the metadata table.

@@ -137,7 +137,7 @@ export default function Settings() {
           <div className="text-sm font-medium text-[var(--text-primary)]">About</div>
           <div className="space-y-2">
             <div className="text-sm text-[var(--text-secondary)]">
-              rein Neural Wiki v0.10.3
+              rein Neural Wiki v0.16.0
             </div>
             <div className="text-xs text-[var(--text-muted)]">
               Multi-source cross-validated memory MCP server with adaptive engine,
