@@ -144,6 +144,7 @@ async fn handle_api(
         (&Method::GET, "/api/recent") => api_recent(config, &query),
         (&Method::GET, "/api/adaptive") => api_adaptive(config),
         (&Method::GET, "/api/health") => api_health(config, &query),
+        (&Method::GET, "/api/doctor") => api_doctor(config, &query),
         (&Method::GET, p)
             if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" =>
         {
@@ -383,6 +384,34 @@ fn api_health(
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+fn api_doctor(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
+    let network = query
+        .get("network")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let fix = query
+        .get("fix")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let report = rt.block_on(crate::doctor::run(
+        config,
+        crate::doctor::DoctorOptions { network, fix },
+    ));
+    json_response(StatusCode::OK, serde_json::to_value(report).unwrap_or_else(|_| json!({})))
 }
 
 fn api_recall(
