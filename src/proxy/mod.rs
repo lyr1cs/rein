@@ -836,7 +836,10 @@ async fn connect_upstream_websocket(
         .get("sec-websocket-key")
         .and_then(|v| v.to_str().ok())
     {
-        request.push_str(&format!("Sec-WebSocket-Key: {}\r\n", sanitize_header_value(key)));
+        request.push_str(&format!(
+            "Sec-WebSocket-Key: {}\r\n",
+            sanitize_header_value(key)
+        ));
     }
     for (name, value) in headers.iter() {
         let name_str = name.as_str();

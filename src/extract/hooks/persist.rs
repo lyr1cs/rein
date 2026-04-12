@@ -53,14 +53,14 @@ fn compute_admission_baseline(store: &crate::store::SqliteStore) -> AdmissionBas
         base
     };
 
-    AdmissionBaseline { recent_avg, global_threshold: global }
+    AdmissionBaseline {
+        recent_avg,
+        global_threshold: global,
+    }
 }
 
 /// Compute adaptive admission threshold using pre-computed baseline.
-fn adaptive_admission_threshold(
-    baseline: &AdmissionBaseline,
-    ctx: &AdmissionContext,
-) -> f64 {
+fn adaptive_admission_threshold(baseline: &AdmissionBaseline, ctx: &AdmissionContext) -> f64 {
     let global = baseline.global_threshold;
     let recent_avg = baseline.recent_avg;
 
@@ -82,10 +82,7 @@ fn adaptive_admission_threshold(
 }
 
 /// Multi-factor admission score (A-MAC 2026 inspired).
-fn multi_factor_admission_score(
-    item: &ExtractedMemory,
-    ctx: &AdmissionContext,
-) -> f64 {
+fn multi_factor_admission_score(item: &ExtractedMemory, ctx: &AdmissionContext) -> f64 {
     let llm_conf = item.quality_confidence;
 
     let topic_novelty = novelty_from_memories(&ctx.topic_memories, &item.content);
@@ -586,11 +583,9 @@ pub fn process_full_extraction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::hooks::working_set::{
-        load_always_on_index, load_working_set,
-    };
-    use crate::types::traits::MemoryStore;
+    use crate::extract::hooks::working_set::{load_always_on_index, load_working_set};
     use crate::store::SqliteStore;
+    use crate::types::traits::MemoryStore;
     use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
 
     fn test_config(name: &str) -> ReinConfig {
@@ -749,8 +744,16 @@ mod tests {
         let working = load_working_set(&config);
         let always_on = load_always_on_index(&config);
 
-        assert_eq!(working.len(), 1, "working set should reflect one canonical memory");
-        assert_eq!(always_on.len(), 1, "always-on index should reflect one canonical memory");
+        assert_eq!(
+            working.len(),
+            1,
+            "working set should reflect one canonical memory"
+        );
+        assert_eq!(
+            always_on.len(),
+            1,
+            "always-on index should reflect one canonical memory"
+        );
         assert!(
             working[0].detail.contains("docker compose"),
             "surface item should be built from stored canonical content"
@@ -828,6 +831,9 @@ mod tests {
         let ctx = build_admission_context(&store, "architecture");
         let score = multi_factor_admission_score(&item, &ctx);
 
-        assert!(score > 0.4, "high-value cluster/type should keep a reasonable score");
+        assert!(
+            score > 0.4,
+            "high-value cluster/type should keep a reasonable score"
+        );
     }
 }

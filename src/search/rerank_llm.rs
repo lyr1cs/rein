@@ -485,10 +485,7 @@ mod tests {
     #[test]
     fn test_strong_signal_weak_single_positive() {
         // Single positive score but too low → not a strong signal
-        let ranked = vec![
-            ("a".to_string(), 1.5),
-            ("b".to_string(), -1.0),
-        ];
+        let ranked = vec![("a".to_string(), 1.5), ("b".to_string(), -1.0)];
         assert!(!detect_strong_signal(&ranked));
     }
 }

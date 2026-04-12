@@ -33,8 +33,7 @@ pub fn search_fts(
 
     // Try FTS5 first
     let results = if let Some(topic) = topic {
-        let mut stmt = conn.prepare(
-            &format!(
+        let mut stmt = conn.prepare(&format!(
             "SELECT {MEMORY_SELECT_COLUMNS}, bm25(memories_fts) as rank
              FROM memories_fts f
              JOIN memories m ON m.id = f.id
@@ -43,8 +42,7 @@ pub fn search_fts(
              AND m.topic = ?2
              ORDER BY rank
              LIMIT ?3"
-            ),
-        )?;
+        ))?;
         let rows = stmt.query_map(rusqlite::params![sanitized, topic, limit as i64], |row| {
             let memory = row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -58,8 +56,7 @@ pub fn search_fts(
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare(
-            &format!(
+        let mut stmt = conn.prepare(&format!(
             "SELECT {MEMORY_SELECT_COLUMNS}, bm25(memories_fts) as rank
              FROM memories_fts f
              JOIN memories m ON m.id = f.id
@@ -67,8 +64,7 @@ pub fn search_fts(
              WHERE memories_fts MATCH ?1
              ORDER BY rank
              LIMIT ?2"
-            ),
-        )?;
+        ))?;
         let rows = stmt.query_map(rusqlite::params![sanitized, limit as i64], |row| {
             let memory = row_to_memory(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(

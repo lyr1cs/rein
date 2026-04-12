@@ -163,6 +163,7 @@ enum Commands {
         proxy: bool,
     },
     /// Show most recently created memories
+    #[command(visible_alias = "list")]
     Recent {
         #[arg(short, long, default_value = "10")]
         limit: usize,
@@ -322,7 +323,13 @@ async fn main() -> anyhow::Result<()> {
             subagent,
         }) => {
             commands::handle_ingest(
-                &config, content, file, json_file, asynchronous, agent_label, subagent,
+                &config,
+                content,
+                file,
+                json_file,
+                asynchronous,
+                agent_label,
+                subagent,
             )
             .await?
         }

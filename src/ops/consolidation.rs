@@ -196,10 +196,7 @@ fn dominant_tier(memories: &[&Memory]) -> MemoryTier {
 
 fn is_current_consolidation_memory(memory: &Memory) -> bool {
     memory.superseded_by.is_none()
-        && matches!(
-            memory.status,
-            MemoryStatus::Active | MemoryStatus::Updated
-        )
+        && matches!(memory.status, MemoryStatus::Active | MemoryStatus::Updated)
 }
 
 pub fn build_consolidated_from_memories(
@@ -495,12 +492,14 @@ pub async fn run_consolidation_async(
 
         non_empty.push((group.clone(), memories));
     }
-    non_empty.sort_by(|(left_group, left_memories), (right_group, right_memories)| {
-        right_memories
-            .len()
-            .cmp(&left_memories.len())
-            .then_with(|| left_group.canonical_topic.cmp(&right_group.canonical_topic))
-    });
+    non_empty.sort_by(
+        |(left_group, left_memories), (right_group, right_memories)| {
+            right_memories
+                .len()
+                .cmp(&left_memories.len())
+                .then_with(|| left_group.canonical_topic.cmp(&right_group.canonical_topic))
+        },
+    );
 
     let summary_template_owned = summary_template.map(str::to_string);
     let config_owned = config.clone();
@@ -705,7 +704,10 @@ pub fn run_cleanup_sync(
     }
 }
 
-pub(crate) fn load_group_memories(store: &SqliteStore, group: &TopicGroup) -> ReinResult<Vec<Memory>> {
+pub(crate) fn load_group_memories(
+    store: &SqliteStore,
+    group: &TopicGroup,
+) -> ReinResult<Vec<Memory>> {
     let mut memories = Vec::new();
     for topic in &group.topics {
         memories.extend(
@@ -842,8 +844,8 @@ mod tests {
             ))
             .unwrap();
 
-        let groups = crate::ops::resolve_topic_groups(&store, None, &[], None, true, false)
-            .unwrap();
+        let groups =
+            crate::ops::resolve_topic_groups(&store, None, &[], None, true, false).unwrap();
         let report = run_consolidation(&store, &config, &groups, None, false).unwrap();
 
         assert_eq!(report.groups_processed, 1, "should process 1 group");
@@ -892,8 +894,8 @@ mod tests {
             ))
             .unwrap();
 
-        let groups = crate::ops::resolve_topic_groups(&store, None, &[], None, true, false)
-            .unwrap();
+        let groups =
+            crate::ops::resolve_topic_groups(&store, None, &[], None, true, false).unwrap();
         let report = run_consolidation(&store, &config, &groups, None, true).unwrap();
 
         assert!(report.dry_run);
@@ -905,7 +907,11 @@ mod tests {
 
         // Original 3 memories must still exist unchanged
         let remaining = store.get_by_topic("rust-testing").unwrap();
-        assert_eq!(remaining.len(), 3, "dry_run must not alter existing memories");
+        assert_eq!(
+            remaining.len(),
+            3,
+            "dry_run must not alter existing memories"
+        );
     }
 
     #[test]
@@ -965,7 +971,12 @@ mod tests {
         let config = ReinConfig::default();
 
         store
-            .store(test_memory("small-topic", "one", "single memory", vec!["small"]))
+            .store(test_memory(
+                "small-topic",
+                "one",
+                "single memory",
+                vec!["small"],
+            ))
             .unwrap();
 
         for i in 0..3 {
@@ -979,8 +990,8 @@ mod tests {
                 .unwrap();
         }
 
-        let groups = crate::ops::resolve_topic_groups(&store, None, &[], None, true, false)
-            .unwrap();
+        let groups =
+            crate::ops::resolve_topic_groups(&store, None, &[], None, true, false).unwrap();
         let report = run_consolidation_async(&store, &config, &groups, None, true)
             .await
             .unwrap();
@@ -1116,8 +1127,7 @@ mod tests {
             ))
             .unwrap();
 
-        let groups =
-            crate::ops::resolve_topic_groups(&store, None, &[], None, true, true).unwrap();
+        let groups = crate::ops::resolve_topic_groups(&store, None, &[], None, true, true).unwrap();
 
         // Use the sync run_consolidation + run_dedup directly to avoid needing
         // the full async cleanup pipeline (which tries LLM synthesis).
@@ -1240,8 +1250,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(current_docker.len(), 1, "selected topic should be consolidated");
-        assert_eq!(rust_superseded, 0, "non-selected topic must remain untouched");
+        assert_eq!(
+            current_docker.len(),
+            1,
+            "selected topic should be consolidated"
+        );
+        assert_eq!(
+            rust_superseded, 0,
+            "non-selected topic must remain untouched"
+        );
     }
 
     #[test]
@@ -1268,8 +1285,8 @@ mod tests {
 
         let before_count = crate::store::adaptive::event_count(store.conn());
 
-        let groups = crate::ops::resolve_topic_groups(&store, None, &[], None, true, false)
-            .unwrap();
+        let groups =
+            crate::ops::resolve_topic_groups(&store, None, &[], None, true, false).unwrap();
         // Run actual consolidation (not dry_run) which internally calls emit_consolidation_events
         let report = run_consolidation(&store, &config, &groups, None, false).unwrap();
         assert!(report.groups_processed >= 1);

@@ -114,7 +114,7 @@ impl ReinServer {
 
         match result {
             Ok(results) => {
-                let mut text = compact::format_recall_results(&results, self.compact());
+                let mut text = compact::format_recall_results_mcp(&results, self.compact());
                 if text.is_empty() {
                     text = if self.compact() {
                         "none".to_string()
@@ -313,7 +313,11 @@ impl ReinServer {
         let result = self.with_store(|store| {
             let mut memory = store.get(&params.id)?;
             memory.content = params.content.clone();
-            memory.summary = params.content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
+            memory.summary = params
+                .content
+                .chars()
+                .take(crate::types::SUMMARY_MAX_CHARS)
+                .collect();
             if let Some(ref imp_str) = params.importance {
                 if let Ok(imp) = imp_str.parse::<Importance>() {
                     memory.importance = imp;
