@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
+import type { ForceGraphMethods, LinkObject, NodeObject } from 'react-force-graph-2d';
 import { apiGet } from '../api/client';
 import { useMemoryDetail } from '../hooks/useApi';
 import type { Memory, Concept, ConceptLink } from '../api/types';
@@ -46,6 +47,27 @@ interface GraphData {
   links: GraphLink[];
 }
 
+type BrainNode = NodeObject<GraphNode>;
+type BrainLink = LinkObject<GraphNode, GraphLink>;
+type GraphHandle = ForceGraphMethods<GraphNode, GraphLink> & { refresh?: () => void };
+type LinkEndpoint = string | number | BrainNode | undefined;
+
+function endpointId(endpoint: LinkEndpoint): string | null {
+  if (endpoint == null) return null;
+  if (typeof endpoint === 'object') {
+    return endpoint.id == null ? null : String(endpoint.id);
+  }
+  return String(endpoint);
+}
+
+function endpointNode(endpoint: LinkEndpoint): BrainNode | null {
+  return typeof endpoint === 'object' && endpoint !== null ? endpoint : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Failed to load data';
+}
+
 /* ------------------------------------------------------------------ */
 /*  Tier colors                                                        */
 /* ------------------------------------------------------------------ */
@@ -71,14 +93,14 @@ export default function Brain() {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [search, setSearch] = useState('');
-  const [timeMax, setTimeMax] = useState<number>(Date.now());
-  const [timeSlider, setTimeSlider] = useState<number>(Date.now());
+  const [timeMax, setTimeMax] = useState(0);
+  const [timeSlider, setTimeSlider] = useState(0);
   const { data: selectedMemoryDetail, isLoading: selectedMemoryLoading } = useMemoryDetail(
     selectedNode?.type === 'memory' ? selectedNode.id : null,
   );
 
   /* Refs */
-  const fgRef = useRef<any>(null);
+  const fgRef = useRef<GraphHandle | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: window.innerWidth - 48, height: window.innerHeight - 40 });
 
@@ -173,21 +195,15 @@ export default function Brain() {
 
         const nodes = Array.from(nodeMap.values());
 
-        /* Compute time range */
-        let oldest = Date.now();
-        for (const n of nodes) {
-          const t = new Date(n.created_at).getTime();
-          if (t < oldest) oldest = t;
-        }
         const now = Date.now();
 
         setGraphData({ nodes, links });
         setTimeMax(now);
         setTimeSlider(now);
         setLoading(false);
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (!cancelled) {
-          setError(err.message || 'Failed to load data');
+          setError(errorMessage(err));
           setLoading(false);
         }
       }
@@ -238,7 +254,7 @@ export default function Brain() {
 
   /* ---- Time-filtered data ---- */
   const filteredData = useMemo(() => {
-    const cutoff = timeSlider;
+    const cutoff = timeSlider || Number.POSITIVE_INFINITY;
     const visibleIds = new Set<string>();
     const nodes = graphData.nodes.filter((n) => {
       const t = new Date(n.created_at).getTime();
@@ -249,9 +265,9 @@ export default function Brain() {
       return false;
     });
     const links = graphData.links.filter((l) => {
-      const src = typeof l.source === 'object' ? (l.source as any).id : l.source;
-      const tgt = typeof l.target === 'object' ? (l.target as any).id : l.target;
-      return visibleIds.has(src) && visibleIds.has(tgt);
+      const src = endpointId(l.source);
+      const tgt = endpointId(l.target);
+      return src !== null && tgt !== null && visibleIds.has(src) && visibleIds.has(tgt);
     });
     return { nodes, links };
   }, [graphData, timeSlider]);
@@ -273,28 +289,29 @@ export default function Brain() {
     const ids = new Set<string>();
     ids.add(hoveredNode.id);
     for (const l of filteredData.links) {
-      const src = typeof l.source === 'object' ? (l.source as any).id : l.source;
-      const tgt = typeof l.target === 'object' ? (l.target as any).id : l.target;
-      if (src === hoveredNode.id) ids.add(tgt);
-      if (tgt === hoveredNode.id) ids.add(src);
+      const src = endpointId(l.source);
+      const tgt = endpointId(l.target);
+      if (src === hoveredNode.id && tgt !== null) ids.add(tgt);
+      if (tgt === hoveredNode.id && src !== null) ids.add(src);
     }
     return ids;
   }, [hoveredNode, filteredData.links]);
 
   /* ---- Time range ---- */
   const timeMin = useMemo(() => {
-    let oldest = Date.now();
+    if (graphData.nodes.length === 0) return timeMax;
+    let oldest = Number.POSITIVE_INFINITY;
     for (const n of graphData.nodes) {
       const t = new Date(n.created_at).getTime();
       if (t < oldest) oldest = t;
     }
-    return oldest;
-  }, [graphData.nodes]);
+    return Number.isFinite(oldest) ? oldest : timeMax;
+  }, [graphData.nodes, timeMax]);
 
   /* ---- Node canvas renderer ---- */
   const paintNode = useCallback(
-    (node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      const n = node as GraphNode;
+    (node: BrainNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const n = node;
       const x = node.x as number;
       const y = node.y as number;
       if (x == null || y == null) return;
@@ -396,11 +413,11 @@ export default function Brain() {
 
   /* ---- Pointer area ---- */
   const paintNodeArea = useCallback(
-    (node: any, color: string, ctx: CanvasRenderingContext2D) => {
-      const n = node as GraphNode;
+    (node: BrainNode, color: string, ctx: CanvasRenderingContext2D) => {
+      const n = node;
       const r = 2 + ((n.type === 'memory' ? n.strength : n.confidence) ?? 0.5) * 3 + 2;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+      ctx.arc(node.x ?? 0, node.y ?? 0, r, 0, 2 * Math.PI);
       ctx.fillStyle = color;
       ctx.fill();
     },
@@ -409,15 +426,20 @@ export default function Brain() {
 
   /* ---- Link renderer ---- */
   const paintLink = useCallback(
-    (link: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      const l = link as GraphLink & { source: any; target: any };
-      const src = l.source;
-      const tgt = l.target;
-      if (!src || !tgt || src.x == null || tgt.x == null) return;
+    (link: BrainLink, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const l = link;
+      const src = endpointNode(l.source);
+      const tgt = endpointNode(l.target);
+      if (!src || !tgt) return;
+      const srcX = src.x;
+      const srcY = src.y;
+      const tgtX = tgt.x;
+      const tgtY = tgt.y;
+      if (srcX == null || srcY == null || tgtX == null || tgtY == null) return;
 
       ctx.beginPath();
-      ctx.moveTo(src.x, src.y);
-      ctx.lineTo(tgt.x, tgt.y);
+      ctx.moveTo(srcX, srcY);
+      ctx.lineTo(tgtX, tgtY);
       const alpha = l.type === 'memory_concept' ? 0.4 : 0.3;
       ctx.strokeStyle = `rgba(124, 58, 237, ${alpha})`;
       ctx.lineWidth = 0.5 / globalScale;
@@ -440,14 +462,14 @@ export default function Brain() {
   /* ---- Zoom controls ---- */
   const handleZoomIn = useCallback(() => {
     if (!fgRef.current) return;
-    const { k } = fgRef.current.zoom?.() ?? {};
-    fgRef.current.zoom?.(Math.min((k ?? 1) * 1.4, 20));
+    const scale = fgRef.current.zoom?.() ?? 1;
+    fgRef.current.zoom?.(Math.min(scale * 1.4, 20));
   }, []);
 
   const handleZoomOut = useCallback(() => {
     if (!fgRef.current) return;
-    const { k } = fgRef.current.zoom?.() ?? {};
-    fgRef.current.zoom?.(Math.max((k ?? 1) / 1.4, 0.1));
+    const scale = fgRef.current.zoom?.() ?? 1;
+    fgRef.current.zoom?.(Math.max(scale / 1.4, 0.1));
   }, []);
 
   const handleReset = useCallback(() => {
@@ -505,7 +527,7 @@ export default function Brain() {
     <div className="relative w-full h-full overflow-hidden">
       {/* Graph container */}
       <div ref={containerRef} className="absolute inset-0">
-        <ForceGraph2D
+        <ForceGraph2D<GraphNode, GraphLink>
           ref={fgRef}
           width={dimensions.width}
           height={dimensions.height}
@@ -516,8 +538,8 @@ export default function Brain() {
           nodePointerAreaPaint={paintNodeArea}
           linkCanvasObject={paintLink}
           linkCanvasObjectMode={() => 'replace'}
-          onNodeClick={(node: any) => setSelectedNode(node as GraphNode)}
-          onNodeHover={(node: any) => setHoveredNode(node as GraphNode | null)}
+          onNodeClick={(node) => setSelectedNode(node)}
+          onNodeHover={(node) => setHoveredNode(node)}
           onBackgroundClick={() => setSelectedNode(null)}
           d3AlphaDecay={0.02}
           d3VelocityDecay={0.3}

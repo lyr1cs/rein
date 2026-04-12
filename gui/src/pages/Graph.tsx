@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
+import type { LinkObject, NodeObject } from 'react-force-graph-2d';
 import { apiGet } from '../api/client';
 import type { Concept, ConceptLink } from '../api/types';
 
@@ -50,6 +51,26 @@ interface GraphData {
   links: GraphLink[];
 }
 
+type ConceptNode = NodeObject<GraphNode>;
+type ConceptLinkObject = LinkObject<GraphNode, GraphLink>;
+type LinkEndpoint = string | number | ConceptNode | undefined;
+
+function endpointId(endpoint: LinkEndpoint): string | null {
+  if (endpoint == null) return null;
+  if (typeof endpoint === 'object') {
+    return endpoint.id == null ? null : String(endpoint.id);
+  }
+  return String(endpoint);
+}
+
+function endpointNode(endpoint: LinkEndpoint): ConceptNode | null {
+  return typeof endpoint === 'object' && endpoint !== null ? endpoint : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Failed to load graph data';
+}
+
 /* ------------------------------------------------------------------ */
 /*  Relation-type colors                                              */
 /* ------------------------------------------------------------------ */
@@ -91,7 +112,6 @@ export default function Graph() {
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [search, setSearch] = useState('');
 
-  const graphRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState(() => ({
     width: typeof window !== 'undefined' ? window.innerWidth - 96 : 800,
@@ -105,10 +125,14 @@ export default function Graph() {
       .then((res) => {
         if (cancelled) return;
         setMemoirs(res.memoirs);
-        if (res.memoirs.length > 0) setSelectedMemoir(res.memoirs[0].name);
+        if (res.memoirs.length > 0) {
+          setGraphLoading(true);
+          setSelectedNode(null);
+          setSelectedMemoir(res.memoirs[0].name);
+        }
       })
-      .catch((err) => {
-        if (!cancelled) setMemoirError(err.message);
+      .catch((err: unknown) => {
+        if (!cancelled) setMemoirError(errorMessage(err));
       })
       .finally(() => {
         if (!cancelled) setMemoirLoading(false);
@@ -120,8 +144,6 @@ export default function Graph() {
   useEffect(() => {
     if (!selectedMemoir) return;
     let cancelled = false;
-    setGraphLoading(true);
-    setSelectedNode(null);
 
     apiGet<MemoirExport>(`/api/memoirs/${encodeURIComponent(selectedMemoir)}/export?format=json`)
       .then((res) => {
@@ -197,25 +219,28 @@ export default function Graph() {
     const ids = new Set<string>();
     ids.add(hoveredNode.id);
     for (const l of graphData.links) {
-      const src = typeof l.source === 'object' ? (l.source as any).id : l.source;
-      const tgt = typeof l.target === 'object' ? (l.target as any).id : l.target;
-      if (src === hoveredNode.id) ids.add(tgt);
-      if (tgt === hoveredNode.id) ids.add(src);
+      const src = endpointId(l.source);
+      const tgt = endpointId(l.target);
+      if (src === hoveredNode.id && tgt !== null) ids.add(tgt);
+      if (tgt === hoveredNode.id && src !== null) ids.add(src);
     }
     return ids;
   }, [hoveredNode, graphData.links]);
 
   /* ---- Node canvas renderer ---- */
   const paintNode = useCallback(
-    (node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      const n = node as GraphNode;
+    (node: ConceptNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const n = node;
       const r = Math.sqrt(n.val) * 3;
       const isMatch = matchingIds === null || matchingIds.has(n.id);
       const isHoverConnected = connectedIds === null || connectedIds.has(n.id);
       const dimmed = (matchingIds !== null && !isMatch) || (connectedIds !== null && !isHoverConnected);
+      const x = node.x;
+      const y = node.y;
+      if (x == null || y == null) return;
 
       ctx.beginPath();
-      ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+      ctx.arc(x, y, r, 0, 2 * Math.PI);
 
       if (matchingIds !== null && isMatch) {
         /* Glow for search matches */
@@ -237,7 +262,7 @@ export default function Graph() {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
         ctx.fillStyle = dimmed ? 'rgba(148,163,184,0.3)' : '#e2e8f0';
-        ctx.fillText(n.name, node.x, node.y + r + 1);
+        ctx.fillText(n.name, x, y + r + 1);
       }
     },
     [matchingIds, connectedIds],
@@ -245,10 +270,10 @@ export default function Graph() {
 
   /* ---- Pointer area for click detection ---- */
   const paintNodeArea = useCallback(
-    (node: any, color: string, ctx: CanvasRenderingContext2D) => {
-      const r = Math.sqrt((node as GraphNode).val) * 3;
+    (node: ConceptNode, color: string, ctx: CanvasRenderingContext2D) => {
+      const r = Math.sqrt(node.val) * 3;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+      ctx.arc(node.x ?? 0, node.y ?? 0, r, 0, 2 * Math.PI);
       ctx.fillStyle = color;
       ctx.fill();
     },
@@ -257,18 +282,23 @@ export default function Graph() {
 
   /* ---- Link renderer ---- */
   const paintLink = useCallback(
-    (link: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      const l = link as GraphLink & { source: any; target: any };
-      const src = l.source;
-      const tgt = l.target;
-      if (!src || !tgt || src.x == null || tgt.x == null) return;
+    (link: ConceptLinkObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const l = link;
+      const src = endpointNode(l.source);
+      const tgt = endpointNode(l.target);
+      if (!src || !tgt) return;
+      const srcX = src.x;
+      const srcY = src.y;
+      const tgtX = tgt.x;
+      const tgtY = tgt.y;
+      if (srcX == null || srcY == null || tgtX == null || tgtY == null) return;
 
       const expired = l.valid_until != null;
       const color = relationColor(l.relation);
 
       ctx.beginPath();
-      ctx.moveTo(src.x, src.y);
-      ctx.lineTo(tgt.x, tgt.y);
+      ctx.moveTo(srcX, srcY);
+      ctx.lineTo(tgtX, tgtY);
       ctx.strokeStyle = expired ? `${color}66` : color;
       ctx.lineWidth = 0.5 / globalScale;
       if (expired) ctx.setLineDash([4 / globalScale, 4 / globalScale]);
@@ -283,7 +313,7 @@ export default function Graph() {
   const linksFrom = useMemo(() => {
     if (!selectedNode) return [];
     return graphData.links.filter((l) => {
-      const src = typeof l.source === 'object' ? (l.source as any).id : l.source;
+      const src = endpointId(l.source);
       return src === selectedNode.id;
     });
   }, [selectedNode, graphData.links]);
@@ -291,7 +321,7 @@ export default function Graph() {
   const linksTo = useMemo(() => {
     if (!selectedNode) return [];
     return graphData.links.filter((l) => {
-      const tgt = typeof l.target === 'object' ? (l.target as any).id : l.target;
+      const tgt = endpointId(l.target);
       return tgt === selectedNode.id;
     });
   }, [selectedNode, graphData.links]);
@@ -302,9 +332,12 @@ export default function Graph() {
     return map;
   }, [graphData.nodes]);
 
-  function resolveName(idOrObj: any): string {
-    if (typeof idOrObj === 'object' && idOrObj !== null) return idOrObj.name ?? idOrObj.id ?? '?';
-    return nodeNameById.get(idOrObj) ?? idOrObj;
+  function resolveName(idOrObj: LinkEndpoint): string {
+    if (typeof idOrObj === 'object' && idOrObj !== null) {
+      return idOrObj.name ?? endpointId(idOrObj) ?? '?';
+    }
+    if (idOrObj == null) return '?';
+    return nodeNameById.get(String(idOrObj)) ?? String(idOrObj);
   }
 
   /* ---------------------------------------------------------------- */
@@ -342,7 +375,11 @@ export default function Graph() {
         <label className="text-xs text-[var(--text-muted)] uppercase tracking-wider mr-1">Memoir</label>
         <select
           value={selectedMemoir}
-          onChange={(e) => setSelectedMemoir(e.target.value)}
+          onChange={(e) => {
+            setGraphLoading(true);
+            setSelectedNode(null);
+            setSelectedMemoir(e.target.value);
+          }}
           className="bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
         >
           {memoirs.map((m) => (
@@ -388,8 +425,7 @@ export default function Graph() {
           )}
 
           {graphData.nodes.length > 0 && (
-            <ForceGraph2D
-              ref={graphRef}
+            <ForceGraph2D<GraphNode, GraphLink>
               width={dimensions.width}
               height={dimensions.height}
               graphData={graphData}
@@ -399,9 +435,9 @@ export default function Graph() {
               nodePointerAreaPaint={paintNodeArea}
               linkCanvasObject={paintLink}
               linkCanvasObjectMode={() => 'replace'}
-              linkLabel={(l: any) => `${l.relation} (w=${(l as GraphLink).weight.toFixed(2)})`}
-              onNodeClick={(node: any) => setSelectedNode(node as GraphNode)}
-              onNodeHover={(node: any) => setHoveredNode(node as GraphNode | null)}
+              linkLabel={(l: ConceptLinkObject) => `${l.relation} (w=${l.weight.toFixed(2)})`}
+              onNodeClick={(node) => setSelectedNode(node)}
+              onNodeHover={(node) => setHoveredNode(node)}
               onBackgroundClick={() => setSelectedNode(null)}
               cooldownTime={3000}
               enableNodeDrag

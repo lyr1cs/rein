@@ -910,9 +910,15 @@ fn dedup_quick(
                 .max(crate::extract::patterns::score_sentence(&item.summary));
             let topic_lower = item.topic.to_lowercase();
             // High-value topics from subagents always pass (architectural decisions, etc.)
-            let high_value = ["architecture", "decision", "design", "security", "migration"]
-                .iter()
-                .any(|k| topic_lower.contains(k));
+            let high_value = [
+                "architecture",
+                "decision",
+                "design",
+                "security",
+                "migration",
+            ]
+            .iter()
+            .any(|k| topic_lower.contains(k));
             // Medium-value topics get a lower bar
             let medium_value = ["debug", "config", "workflow", "deployment", "fix"]
                 .iter()

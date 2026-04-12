@@ -1,3 +1,7 @@
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::config::{Provider, ReinConfig};
@@ -71,6 +75,8 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_supermemory(config));
     checks.push(check_http_auth(config));
     checks.push(check_proxy_auth(config));
+    checks.push(check_gui_runtime(config));
+    checks.push(check_proxy_runtime(config));
 
     match config.open_store() {
         Ok(store) => {
@@ -378,6 +384,149 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
             ),
         )
     }
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeProbe {
+    None,
+    Ok(String),
+    Warn(String),
+}
+
+fn runtime_status_check(
+    name: &'static str,
+    pid: Option<u32>,
+    port: u16,
+    port_open: bool,
+    probe: RuntimeProbe,
+) -> DoctorCheck {
+    match (pid, port_open) {
+        (Some(pid), true) => match probe {
+            RuntimeProbe::None => ok(name, format!("running on :{port} with PID {pid}")),
+            RuntimeProbe::Ok(extra) => ok(name, format!("running on :{port} with PID {pid}; {extra}")),
+            RuntimeProbe::Warn(extra) => {
+                warn(name, format!("running on :{port} with PID {pid}; {extra}"))
+            }
+        },
+        (None, true) => warn(
+            name,
+            format!("port :{port} is open but no PID file is present; external listener?"),
+        ),
+        (Some(pid), false) => warn(
+            name,
+            format!("PID {pid} recorded for :{port}, but the port is closed"),
+        ),
+        (None, false) => ok(name, format!("stopped on :{port}")),
+    }
+}
+
+fn check_gui_runtime(config: &ReinConfig) -> DoctorCheck {
+    let port = config.server.sse_port;
+    let pid = crate::service::is_running("gui");
+    let port_open = localhost_port_open(port);
+    let probe = if port_open {
+        match probe_gui_health(port) {
+            Ok(200) => RuntimeProbe::Ok("/api/health returned 200".to_string()),
+            Ok(401) => RuntimeProbe::Warn("/api/health returned 401 (token mismatch?)".to_string()),
+            Ok(status) => RuntimeProbe::Warn(format!("/api/health returned {status}")),
+            Err(e) => RuntimeProbe::Warn(format!("/api/health probe failed: {e}")),
+        }
+    } else {
+        RuntimeProbe::None
+    };
+    runtime_status_check("gui_runtime", pid, port, port_open, probe)
+}
+
+fn check_proxy_runtime(config: &ReinConfig) -> DoctorCheck {
+    let port = config.proxy.port;
+    let pid = crate::service::is_running("proxy");
+    let port_open = localhost_port_open(port);
+    let probe = if port_open {
+        match probe_proxy_metrics(port) {
+            Ok(Some((requests, errors, extractions))) => RuntimeProbe::Ok(format!(
+                "metrics requests={requests} errors={errors} extractions={extractions}"
+            )),
+            Ok(None) => RuntimeProbe::Warn("/rein/metrics returned malformed JSON".to_string()),
+            Err(e) => RuntimeProbe::Warn(format!("/rein/metrics probe failed: {e}")),
+        }
+    } else {
+        RuntimeProbe::None
+    };
+    runtime_status_check("proxy_runtime", pid, port, port_open, probe)
+}
+
+fn localhost_port_open(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+fn probe_gui_health(port: u16) -> anyhow::Result<u16> {
+    let mut headers = Vec::new();
+    if let Ok(token) = std::env::var("REIN_HTTP_TOKEN") {
+        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+    }
+    let (status, _) = http_get_local(port, "/api/health?limit=1", &headers)?;
+    Ok(status)
+}
+
+fn probe_proxy_metrics(port: u16) -> anyhow::Result<Option<(u64, u64, u64)>> {
+    let mut headers = Vec::new();
+    if let Ok(token) = std::env::var("REIN_PROXY_TOKEN").or_else(|_| std::env::var("REIN_HTTP_TOKEN")) {
+        headers.push(("x-rein-token".to_string(), token));
+    }
+    let (status, body) = http_get_local(port, "/rein/metrics", &headers)?;
+    if status == 401 {
+        anyhow::bail!("401 unauthorized");
+    }
+    if status != 200 {
+        anyhow::bail!("HTTP {status}");
+    }
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    let requests = json.get("request_count").and_then(|v| v.as_u64());
+    let errors = json.get("error_count").and_then(|v| v.as_u64());
+    let extractions = json.get("extraction_count").and_then(|v| v.as_u64());
+    Ok(requests.zip(errors).zip(extractions).map(|((r, e), x)| (r, e, x)))
+}
+
+fn http_get_local(
+    port: u16,
+    path: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<(u16, String)> {
+    let mut stream =
+        TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300))?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    let mut lines = response.lines();
+    let status_line = lines.next().ok_or_else(|| anyhow::anyhow!("empty response"))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("missing HTTP status"))?
+        .parse::<u16>()?;
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    Ok((status, body))
 }
 
 fn collect_store_snapshot(store: &SqliteStore) -> anyhow::Result<StoreSnapshot> {

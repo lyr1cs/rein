@@ -197,11 +197,7 @@ fn event_evidence_weight(event: &RecallEvent) -> f64 {
     let mut total = 0.0_f64;
     let mut count = 0usize;
     for candidate in &event.candidates {
-        if event
-            .accessed_ids
-            .iter()
-            .any(|id| *id == candidate.memory_id)
-        {
+        if event.accessed_ids.contains(&candidate.memory_id) {
             let support_signal = if candidate.support_count > 1 {
                 (candidate.support_count - 1) as f64 / candidate.support_count as f64
             } else {
@@ -435,7 +431,14 @@ mod tests {
         bm25_event.candidates[0].source_diversity = 3.0;
 
         let vector_event = make_event(&[("t", 0.0, 1.0), ("n", 1.0, 0.0)], &["t"], 0);
-        let baseline = optimize_alpha(&[make_event(&[("t", 1.0, 0.0), ("n", 0.0, 1.0)], &["t"], 0), vector_event.clone()], 0.01).unwrap();
+        let baseline = optimize_alpha(
+            &[
+                make_event(&[("t", 1.0, 0.0), ("n", 0.0, 1.0)], &["t"], 0),
+                vector_event.clone(),
+            ],
+            0.01,
+        )
+        .unwrap();
 
         let learned = optimize_alpha(&[bm25_event, vector_event], 0.01).unwrap();
         assert!(

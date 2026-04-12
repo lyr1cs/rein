@@ -369,13 +369,15 @@ fn api_health(
         Ok(reports) => {
             let items: Vec<serde_json::Value> = reports
                 .iter()
-                .map(|r| json!({
-                    "topic": r.topic,
-                    "count": r.count,
-                    "avg_strength": r.avg_strength,
-                    "stale_count": r.stale_count,
-                    "needs_consolidation": r.needs_consolidation,
-                }))
+                .map(|r| {
+                    json!({
+                        "topic": r.topic,
+                        "count": r.count,
+                        "avg_strength": r.avg_strength,
+                        "stale_count": r.stale_count,
+                        "needs_consolidation": r.needs_consolidation,
+                    })
+                })
                 .collect();
             json_response(StatusCode::OK, json!({ "health": items }))
         }
@@ -439,10 +441,7 @@ fn api_get_memory(config: &ReinConfig, id: &str) -> BoxedResponse {
     };
     match store.get(id) {
         Ok(m) => {
-            let canonical_id = m
-                .canonical_id
-                .clone()
-                .unwrap_or_else(|| m.id.clone());
+            let canonical_id = m.canonical_id.clone().unwrap_or_else(|| m.id.clone());
             let mut body = memory_to_json(&m);
             let evidence = store
                 .list_memory_evidence(&canonical_id, 12)

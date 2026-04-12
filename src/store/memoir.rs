@@ -10,11 +10,7 @@ use super::sqlite::SqliteStore;
 /// Normalize a concept name for dedup-safe lookup.
 /// Lowercases, replaces underscores and spaces with hyphens, collapses runs of hyphens.
 pub fn normalize_concept_name(name: &str) -> String {
-    let s: String = name
-        .trim()
-        .to_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-");
+    let s: String = name.trim().to_lowercase().replace(['_', ' '], "-");
     // Collapse consecutive hyphens
     let mut result = String::with_capacity(s.len());
     let mut prev_hyphen = false;

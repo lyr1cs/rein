@@ -36,7 +36,8 @@ pub fn cross_validate(
             sources_hit += 1;
         }
 
-        let confidence = (confidence_from_sources(sources_hit) + local_evidence_bonus(local)).min(0.99);
+        let confidence =
+            (confidence_from_sources(sources_hit) + local_evidence_bonus(local)).min(0.99);
 
         validated.push(ValidatedResult {
             memory: local.clone(),
@@ -106,7 +107,7 @@ fn local_evidence_bonus(memory: &Memory) -> f32 {
     } else {
         0.0
     };
-    let diversity_bonus = (memory.source_diversity - 1.0).max(0.0).min(3.0) * 0.01;
+    let diversity_bonus = (memory.source_diversity - 1.0).clamp(0.0, 3.0) * 0.01;
     support_bonus + diversity_bonus
 }
 

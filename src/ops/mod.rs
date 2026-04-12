@@ -7,7 +7,6 @@ use crate::extract::llm::ExtractedMemory;
 use crate::store::SqliteStore;
 use crate::types::*;
 
-
 pub mod adaptive;
 pub mod consolidation;
 pub mod dedup;
@@ -28,7 +27,10 @@ pub fn build_memory(
 ) -> Memory {
     // Apply rule-based postprocessing for additive keyword enrichment only.
     // User-supplied topic and importance are authoritative — postprocess cannot override them.
-    let summary: String = content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
+    let summary: String = content
+        .chars()
+        .take(crate::types::SUMMARY_MAX_CHARS)
+        .collect();
     let mut extracted = crate::extract::llm::ExtractedMemory {
         topic: topic.clone(),
         summary: summary.clone(),
@@ -655,7 +657,6 @@ pub fn queue_ingest_session(
     })
 }
 
-
 /// Normalize topic names for variant grouping.
 /// Lowercases and collapses all non-alphanumeric runs into `-`.
 pub fn normalize_topic_name(name: &str) -> String {
@@ -787,7 +788,6 @@ pub fn resolve_topic_groups(
     }
     Ok(groups)
 }
-
 
 pub(crate) fn stronger_tier(left: MemoryTier, right: MemoryTier) -> MemoryTier {
     match (left, right) {
@@ -1026,7 +1026,6 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         "cluster_profiles": cluster_profiles,
     })
 }
-
 
 /// Upgrade report returned by run_upgrade.
 #[derive(Debug, Default)]
