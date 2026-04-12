@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { useStats } from '../hooks/useApi';
+import { useDoctor, useStats } from '../hooks/useApi';
 
 const NAV_ITEMS = [
   { path: '/', icon: '\u{1F3E0}', label: 'Dashboard' },
@@ -16,6 +16,23 @@ export default function Layout() {
   const [expanded, setExpanded] = useState(false);
   const location = useLocation();
   const { data: stats } = useStats();
+  const { data: doctor } = useDoctor();
+
+  const doctorDotClass = doctor?.status === 'healthy'
+    ? 'bg-[var(--success)]'
+    : doctor?.status === 'degraded'
+      ? 'bg-[var(--warm)]'
+      : doctor?.status === 'unhealthy'
+        ? 'bg-[var(--hot)]'
+        : 'bg-[var(--text-muted)]';
+
+  const doctorTextClass = doctor?.status === 'healthy'
+    ? 'text-[var(--success)]'
+    : doctor?.status === 'degraded'
+      ? 'text-[var(--warm)]'
+      : doctor?.status === 'unhealthy'
+        ? 'text-[var(--hot)]'
+        : 'text-[var(--text-muted)]';
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -83,6 +100,16 @@ export default function Layout() {
                 <span className="text-[var(--success)] font-mono">{stats.memoir_count}</span>
                 <span className="text-[var(--text-muted)]">memoirs</span>
               </span>
+              {doctor && (
+                <Link
+                  to="/settings"
+                  className="ml-auto flex items-center gap-1.5 rounded-full border border-[var(--border)] px-2.5 py-1 transition-colors hover:bg-[var(--bg-secondary)]"
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full ${doctorDotClass}`} />
+                  <span className={`font-mono ${doctorTextClass}`}>{doctor.status}</span>
+                  <span className="text-[var(--text-muted)]">doctor</span>
+                </Link>
+              )}
             </>
           )}
         </header>
