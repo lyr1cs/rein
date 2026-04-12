@@ -630,28 +630,31 @@ pub fn recall_temporal_with_request_id(
         let alpha = adaptive_alpha
             .or(strategy.cc_alpha)
             .unwrap_or(config.search.cc_alpha as f32);
-        // For CC mode, boost vec scores with supplementary channels (2-stage fusion)
-        let vec_for_cc = if use_kg || use_episode {
-            let mut boosted = vec_for_fusion.clone();
+        // Run CC normalization on clean vec/fts channels first, then boost with KG/episode
+        let mut fused = crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha);
+        // Post-fusion KG/episode boost (applied after normalization to avoid distorting score distributions)
+        if use_kg || use_episode {
+            let fused_map: std::collections::HashMap<String, f32> =
+                fused.iter().cloned().collect();
             for (id, kg_score) in &kg_ranked {
-                if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
-                    boosted[pos].1 += *kg_score * 0.5; // additive boost — KG signal adds evidence
+                if let Some(pos) = fused.iter().position(|(fid, _)| fid == id) {
+                    fused[pos].1 += *kg_score * 0.5;
                 } else {
-                    boosted.push((id.clone(), *kg_score * 0.5));
+                    fused.push((id.clone(), *kg_score * 0.5));
                 }
             }
             for (id, episode_score) in &episode_ranked {
-                if let Some(pos) = boosted.iter().position(|(vid, _)| vid == id) {
-                    boosted[pos].1 += *episode_score * 0.65; // additive boost
+                if let Some(pos) = fused.iter().position(|(fid, _)| fid == id) {
+                    fused[pos].1 += *episode_score * 0.65;
                 } else {
-                    boosted.push((id.clone(), *episode_score * 0.65));
+                    fused.push((id.clone(), *episode_score * 0.65));
                 }
             }
-            boosted
-        } else {
-            vec_for_fusion
-        };
-        crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_cc, alpha)
+            let _ = fused_map; // consumed above
+            // Re-sort after boost so boosted items are not stuck at the tail
+            fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        fused
     } else {
         let rrf_k = config.search.rrf_k as f32;
         // Map strategy alpha to RRF weights (alpha=high → FTS dominant)
@@ -1242,9 +1245,18 @@ fn try_vector_search_batch(
     };
 
     let texts: Vec<&str> = uncached.iter().map(|(_, q)| *q).collect();
-    let embeddings = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(embedder.embed_batch(&texts))
-    });
+    let embeddings = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(embedder.embed_batch(&texts)))
+        }
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(embedder.embed_batch(&texts)),
+            Err(_) => return merged,
+        },
+    };
 
     match embeddings {
         Ok(embs) => {

@@ -241,14 +241,21 @@ export default function Brain() {
     return () => ro.disconnect();
   }, []);
 
-  /* ---- Animation loop for hot node pulse ---- */
+  /* ---- Animation loop for hot node pulse (paused when tab is hidden) ---- */
   useEffect(() => {
-    /* Throttle to ~20fps to avoid burning CPU */
-    const interval = setInterval(() => {
-      fgRef.current?.refresh?.();
-    }, 50);
+    let raf: number;
+    let running = true;
+    const tick = () => {
+      if (!running) return;
+      if (document.visibilityState === 'visible') {
+        fgRef.current?.refresh?.();
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
     return () => {
-      clearInterval(interval);
+      running = false;
+      cancelAnimationFrame(raf);
     };
   }, []);
 

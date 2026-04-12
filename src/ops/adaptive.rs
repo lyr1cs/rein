@@ -170,7 +170,8 @@ fn run_hdbscan_clustering(
     // Memories outside the input set keep their existing cluster_id (from a previous run).
     let clustered_ids: std::collections::HashSet<&str> =
         embeddings.iter().map(|(id, _)| id.as_str()).collect();
-    // Batch clear cluster assignments in a transaction (avoid N+1 UPDATEs)
+
+    // Wrap clear + reassign in a single transaction to prevent crash leaving all clusters NULL
     let _ = store.conn().execute_batch("BEGIN");
     for id in &clustered_ids {
         let _ = store.conn().execute(
@@ -178,7 +179,6 @@ fn run_hdbscan_clustering(
             rusqlite::params![id],
         );
     }
-    let _ = store.conn().execute_batch("COMMIT");
     // Clear ALL survival curves unconditionally. Cluster IDs are local labels
     // produced by each HDBSCAN run — they are NOT stable identities across runs.
     // Targeted deletion by old cluster ID would leave stale curves that get
@@ -189,9 +189,8 @@ fn run_hdbscan_clustering(
     // Clear stale per-cluster dedup thresholds (will be rebuilt by A1)
     state.dedup_thresholds.clear();
 
-    // Store new cluster assignments from this run (batched in transaction)
+    // Store new cluster assignments from this run (same transaction)
     state.memory_clusters.clear();
-    let _ = store.conn().execute_batch("BEGIN");
     for (i, label) in result.labels.iter().enumerate() {
         let mem_id = &embeddings[i].0;
         if let Some(cluster_id) = label {

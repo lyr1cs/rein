@@ -112,6 +112,7 @@ pub fn adaptive_flush_threshold(base: usize, buf_path: &std::path::Path) -> usiz
 /// Clean up stale buffer files older than 24 hours.
 pub fn cleanup_stale_buffers(config: &ReinConfig) {
     let buf_dir = resolve_buffer_dir(config);
+    // Clean stale buffer files
     let pattern = buf_dir.join("buffer_*.jsonl");
     if let Ok(entries) = glob::glob(&pattern.to_string_lossy()) {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
@@ -122,6 +123,34 @@ pub fn cleanup_stale_buffers(config: &ReinConfig) {
                     if modified_utc < cutoff {
                         tracing::info!("cleaning stale buffer: {}", entry.display());
                         let _ = std::fs::remove_file(&entry);
+                        // Also remove associated lock file
+                        let lock = buffer_lock_path(&entry);
+                        let _ = std::fs::remove_file(&lock);
+                    }
+                }
+            }
+        }
+    }
+    // Clean orphaned lock files (no matching buffer) — only if not currently held
+    #[cfg(unix)]
+    {
+        let lock_pattern = buf_dir.join("buffer_*.jsonl.lock");
+        if let Ok(entries) = glob::glob(&lock_pattern.to_string_lossy()) {
+            for entry in entries.flatten() {
+                let buf_path = entry.with_extension(""); // strip .lock
+                if !buf_path.exists() {
+                    // Try non-blocking lock to verify nobody holds this lock file
+                    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&entry) {
+                        use std::os::unix::io::AsRawFd;
+                        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                        if rc == 0 {
+                            // We got the lock — nobody else holds it, safe to remove
+                            let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+                            drop(f);
+                            tracing::debug!("cleaning orphaned lock: {}", entry.display());
+                            let _ = std::fs::remove_file(&entry);
+                        }
+                        // rc != 0 means someone holds it — skip
                     }
                 }
             }

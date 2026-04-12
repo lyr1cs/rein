@@ -62,6 +62,9 @@ export interface StoreStats {
   memoir_count: number;
   concept_count: number;
   link_count: number;
+  hot_count: number;
+  warm_count: number;
+  cold_count: number;
 }
 
 export interface AdaptiveStatus {

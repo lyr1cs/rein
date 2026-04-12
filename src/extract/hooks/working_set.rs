@@ -79,11 +79,10 @@ pub fn update_working_set(
         if err.raw_os_error() == Some(libc::EINTR) {
             continue; // interrupted by signal, retry
         }
-        tracing::warn!(
-            "working_set: flock failed: {}, proceeding without lock",
+        return Err(anyhow::anyhow!(
+            "working_set: flock failed: {}, aborting to prevent corruption",
             err
-        );
-        break;
+        ));
     }
 
     let mut current = load_working_set(config);
@@ -145,11 +144,10 @@ pub fn update_always_on_index(
         if err.raw_os_error() == Some(libc::EINTR) {
             continue;
         }
-        tracing::warn!(
-            "always_on_index: flock failed: {}, proceeding without lock",
+        return Err(anyhow::anyhow!(
+            "always_on_index: flock failed: {}, aborting to prevent corruption",
             err
-        );
-        break;
+        ));
     }
 
     let mut current = load_always_on_index(config);

@@ -7,6 +7,9 @@ use std::path::Path;
 
 pub fn auto_configure(dry_run: bool) -> anyhow::Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        anyhow::bail!("HOME environment variable is not set");
+    }
 
     let clients: Vec<(&str, String, &str)> = vec![
         ("Claude Code", format!("{home}/.claude.json"), "json"),
@@ -61,12 +64,64 @@ fn configure_client(path: &Path, format: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Strip JSONC extensions (// comments, /* */ block comments, trailing commas) to valid JSON.
+fn strip_jsonc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    out.push(next);
+                    chars.next();
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ch == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    // Strip trailing commas before } or ]
+    let re = regex::Regex::new(r",\s*([}\]])").unwrap();
+    re.replace_all(&out, "$1").into_owned()
+}
+
 fn configure_json_client(path: &Path) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
     // Create a backup before modifying
     let backup = path.with_extension("json.bak");
     std::fs::copy(path, &backup).ok();
-    let mut root: serde_json::Value = serde_json::from_str(&content)?;
+    // Support JSONC (comments + trailing commas) used by VS Code / Cursor
+    let cleaned = strip_jsonc(&content);
+    let mut root: serde_json::Value = serde_json::from_str(&cleaned)?;
 
     let servers = root
         .as_object_mut()

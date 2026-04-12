@@ -80,7 +80,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                         MemoryJobMode::Full
                     };
                     let priority = if is_subagent { 10 } else { 40 };
-                    let _ = queue_memory_job(
+                    if let Err(e) = queue_memory_job(
                         config,
                         mode,
                         "hook_post",
@@ -94,7 +94,9 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                         priority,
                         None,
                         combined,
-                    );
+                    ) {
+                        eprintln!("rein: failed to queue memory job: {e}");
+                    }
                     spawn_memory_worker(config);
                 }
             }
@@ -208,7 +210,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
             }
 
             let priority = if is_subagent { 35 } else { 100 };
-            let _ = queue_memory_job(
+            if let Err(e) = queue_memory_job(
                 config,
                 MemoryJobMode::Full,
                 "hook_stop",
@@ -222,7 +224,10 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
                 priority,
                 None,
                 combined,
-            );
+            ) {
+                eprintln!("rein: failed to queue session memory: {e}");
+                return Ok(());
+            }
             spawn_memory_worker(config);
         }
         eprintln!("rein: queued session memory processing");
@@ -245,7 +250,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
         }
 
         let priority = if is_subagent { 30 } else { 95 };
-        let _ = queue_memory_job(
+        if let Err(e) = queue_memory_job(
             config,
             MemoryJobMode::Quick,
             "hook_stop_fallback",
@@ -259,7 +264,10 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
             priority,
             None,
             combined,
-        );
+        ) {
+            eprintln!("rein: failed to queue session memory: {e}");
+            return Ok(());
+        }
         spawn_memory_worker(config);
         eprintln!("rein: queued session memory processing");
     }

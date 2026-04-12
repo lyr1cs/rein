@@ -241,13 +241,24 @@ fn is_temporal(lower: &str) -> bool {
         }
     }
 
-    // Date pattern: any YYYY-MM-DD like string (not just 202x)
-    let has_date = lower
-        .chars()
-        .zip(lower.chars().skip(4))
-        .any(|(a, b)| a.is_ascii_digit() && b == '-');
-    if has_date {
-        return true;
+    // Date pattern: validate full YYYY-MM-DD structure (not just digit-gap-hyphen)
+    let chars: Vec<char> = lower.chars().collect();
+    if chars.len() >= 10 {
+        for i in 0..=chars.len() - 10 {
+            if chars[i].is_ascii_digit()
+                && chars[i + 1].is_ascii_digit()
+                && chars[i + 2].is_ascii_digit()
+                && chars[i + 3].is_ascii_digit()
+                && chars[i + 4] == '-'
+                && chars[i + 5].is_ascii_digit()
+                && chars[i + 6].is_ascii_digit()
+                && chars[i + 7] == '-'
+                && chars[i + 8].is_ascii_digit()
+                && chars[i + 9].is_ascii_digit()
+            {
+                return true;
+            }
+        }
     }
 
     false

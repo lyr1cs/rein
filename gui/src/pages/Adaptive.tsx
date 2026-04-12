@@ -79,20 +79,12 @@ export default function Adaptive() {
     return { name: key.replace('ExactKeyword', 'ExactKW'), value: entry?.value ?? 0, samples: entry?.sample_count ?? 0 };
   });
 
-  /* Panel 2: Tier distribution from stats */
-  const totalMemories = stats?.total_memories ?? 0;
-  // We don't have exact tier counts from stats, so derive from tier_boundaries + total
-  // Rough heuristic: hot > hot_threshold, cold < cold_threshold, rest warm
-  const tierData = (() => {
-    const hot = Math.round(totalMemories * 0.2);
-    const cold = Math.round(totalMemories * 0.3);
-    const warm = totalMemories - hot - cold;
-    return [
-      { name: 'Hot', value: hot, color: TIER_COLORS.hot },
-      { name: 'Warm', value: warm, color: TIER_COLORS.warm },
-      { name: 'Cold', value: cold, color: TIER_COLORS.cold },
-    ];
-  })();
+  /* Panel 2: Tier distribution from stats (real counts from backend) */
+  const tierData = [
+    { name: 'Hot', value: stats?.hot_count ?? 0, color: TIER_COLORS.hot },
+    { name: 'Warm', value: stats?.warm_count ?? 0, color: TIER_COLORS.warm },
+    { name: 'Cold', value: stats?.cold_count ?? 0, color: TIER_COLORS.cold },
+  ];
 
   /* Panel 3: Reranker weights */
   const weightData = Object.entries(adaptive.reranker_weights)
