@@ -190,18 +190,21 @@ export default function Adaptive() {
               </PieChart>
             </ResponsiveContainer>
             <div className="text-2xl font-mono font-semibold -mt-2 mb-2" style={{ color: 'var(--text-primary)' }}>
-              {totalMemories}
+              {stats?.total_memories ?? 0}
             </div>
             <div className="flex gap-4 text-xs">
-              {tierData.map((t) => (
+              {tierData.map((t) => {
+                const total = stats?.total_memories ?? 0;
+                return (
                 <div key={t.name} className="flex items-center gap-1.5">
                   <span className="w-2.5 h-2.5 rounded-full" style={{ background: t.color }} />
                   <span className="text-[var(--text-secondary)]">{t.name}</span>
                   <span className="font-mono text-[var(--text-muted)]">
-                    {t.value} ({totalMemories > 0 ? Math.round((t.value / totalMemories) * 100) : 0}%)
+                    {t.value} ({total > 0 ? Math.round((t.value / total) * 100) : 0}%)
                   </span>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </Panel>
