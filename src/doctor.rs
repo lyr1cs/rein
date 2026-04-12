@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::config::{Provider, ReinConfig};
 use crate::embed;
+use crate::extract::hooks::buffer;
 use crate::extract::hooks::queue::{collect_queue_diagnostics, QueueGroupDiagnostics};
 use crate::search::warmup;
 use crate::store::hnsw::HnswIndex;
@@ -50,11 +51,14 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub status: ReportStatus,
     pub checks: Vec<DoctorCheck>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixes_applied: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DoctorOptions {
     pub network: bool,
+    pub fix: bool,
 }
 
 #[derive(Debug)]
@@ -67,6 +71,7 @@ struct StoreSnapshot {
 
 pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     let mut checks = Vec::new();
+    let mut fixes_applied = Vec::new();
 
     checks.push(check_embedding_provider(config));
     checks.push(check_extract_provider(config));
@@ -77,6 +82,9 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_proxy_auth(config));
     checks.push(check_gui_runtime(config));
     checks.push(check_proxy_runtime(config));
+    if options.fix {
+        fixes_applied.extend(apply_queue_fixes(config));
+    }
 
     match config.open_store() {
         Ok(store) => {
@@ -96,6 +104,9 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
 
                     match collect_store_snapshot(&store) {
                         Ok(snapshot) => {
+                            if options.fix {
+                                fixes_applied.extend(apply_local_fixes(config, &store));
+                            }
                             let (hnsw_check, indexed_vectors) =
                                 inspect_hnsw(&store, snapshot.total_memories);
                             checks.push(check_vector_coverage(config, &snapshot, indexed_vectors));
@@ -121,6 +132,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     DoctorReport {
         status: overall_status(&checks),
         checks,
+        fixes_applied,
     }
 }
 
@@ -133,6 +145,13 @@ pub fn format_human(report: &DoctorReport) -> String {
             check.name,
             check.message
         ));
+    }
+    if !report.fixes_applied.is_empty() {
+        lines.push(String::new());
+        lines.push("Fixes Applied:".to_string());
+        for fix in &report.fixes_applied {
+            lines.push(format!("- {fix}"));
+        }
     }
     lines.push(String::new());
     lines.push(format!("Overall: {}", overall_label(report.status)));
@@ -594,7 +613,7 @@ fn check_vector_coverage(
         return warn(
             "vector_store",
             format!(
-                "vector index unavailable for {} memories ({} active, cache={}, artifacts={}); {}",
+                "vector index unavailable for {} memories ({} active, cache={}, artifacts={}); {}. repair_hint: rein doctor --fix or rein warmup",
                 snapshot.total_memories,
                 snapshot.active_memories,
                 snapshot.embed_cache_rows,
@@ -633,7 +652,7 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
         return warn(
             "tantivy",
             format!(
-                "index directory missing at {}; next recall/warmup will rebuild it",
+                "index directory missing at {}; repair_hint: rein doctor --fix or rein warmup",
                 index_path.display()
             ),
         );
@@ -642,7 +661,7 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
         Ok(_) if dirty => warn(
             "tantivy",
             format!(
-                "index opened at {} but dirty marker is present; next recall/warmup should rebuild",
+                "index opened at {} but dirty marker is present; repair_hint: rein doctor --fix or rein warmup",
                 index_path.display()
             ),
         ),
@@ -671,7 +690,7 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
             warn(
                 "hnsw",
                 format!(
-                    "index file missing at {}; next vector recall/warmup will rebuild it",
+                    "index file missing at {}; repair_hint: rein doctor --fix or rein warmup",
                     index_path.display()
                 ),
             ),
@@ -683,7 +702,7 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
             warn(
                 "hnsw",
                 format!(
-                    "index file exists at {} but metadata is missing at {}",
+                    "index file exists at {} but metadata is missing at {}; repair_hint: rein doctor --fix or rein warmup",
                     index_path.display(),
                     meta_path.display()
                 ),
@@ -704,7 +723,7 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
                     warn(
                         "hnsw",
                         format!(
-                            "{message}; dirty marker is present and next vector recall/warmup should rebuild"
+                            "{message}; dirty marker is present; repair_hint: rein doctor --fix or rein warmup"
                         ),
                     ),
                     Some(index.len()),
@@ -751,18 +770,30 @@ fn check_queues(diag: &QueueGroupDiagnostics) -> DoctorCheck {
             .next()
             .cloned()
             .unwrap_or_else(|| "queue diagnostics failed".to_string());
-        warn("queues", format!("{message}; {first_issue}"))
+        warn(
+            "queues",
+            format!("{message}; {first_issue}; repair_hint: inspect and recover the affected queue files"),
+        )
     } else if dead > 0 {
-        warn("queues", format!("{message}; dead letters present"))
+        warn(
+            "queues",
+            format!(
+                "{message}; dead letters present; repair_hint: inspect dead-letter files before retrying"
+            ),
+        )
     } else if inflight > 0 {
         warn(
             "queues",
-            format!("{message}; inflight jobs need a worker to finish"),
+            format!(
+                "{message}; inflight jobs need a worker to finish; repair_hint: rein doctor --fix or run the relevant worker command"
+            ),
         )
     } else if pending > 0 {
         warn(
             "queues",
-            format!("{message}; pending jobs are waiting to be drained"),
+            format!(
+                "{message}; pending jobs are waiting to be drained; repair_hint: run the corresponding worker command"
+            ),
         )
     } else {
         ok("queues", message)
@@ -792,6 +823,90 @@ async fn check_embedding_network(config: &ReinConfig) -> DoctorCheck {
 
 fn is_loopback_bind(bind: &str) -> bool {
     matches!(bind, "127.0.0.1" | "::1" | "localhost")
+}
+
+fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
+    let mut fixes = Vec::new();
+
+    let tantivy_path = store.db_path().with_extension("tantivy");
+    let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
+    if !tantivy_path.exists() || tantivy_dirty.exists() {
+        warmup::populate_tantivy(store);
+        fixes.push(format!(
+            "triggered Tantivy rebuild at {}",
+            tantivy_path.display()
+        ));
+    }
+
+    let hnsw_base = store.db_path().with_extension("");
+    let hnsw_path = hnsw_base.with_extension("usearch");
+    let hnsw_meta = hnsw_base.with_extension("usearch.meta");
+    if !hnsw_path.exists() || !hnsw_meta.exists() || HnswIndex::is_dirty(&hnsw_base) {
+        warmup::populate_hnsw(store, config);
+        fixes.push(format!("triggered HNSW rebuild at {}", hnsw_path.display()));
+    }
+
+    fixes
+}
+
+fn apply_queue_fixes(config: &ReinConfig) -> Vec<String> {
+    let mut fixes = Vec::new();
+    for (queue_name, prefix) in [
+        ("memory", "memory_queue"),
+        ("cleanup", "cleanup_queue"),
+        ("dedup", "dedup_queue"),
+    ] {
+        let queue = queue_scoped_path(config, prefix);
+        let inflight = queue_scoped_path(config, &format!("{prefix}_inflight"));
+        if let Ok(Some(recovered)) = recover_inflight_file(&queue, &inflight) {
+            fixes.push(format!("recovered {recovered} {queue_name} inflight jobs"));
+        }
+    }
+    fixes
+}
+
+fn queue_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
+    let base = buffer::resolve_buffer_dir(config);
+    let db_tag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        config.resolve_db_path().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let queue_dir = base.join("queue").join(db_tag);
+    let _ = std::fs::create_dir_all(&queue_dir);
+    queue_dir.join(format!("{prefix}.jsonl"))
+}
+
+fn recover_inflight_file(
+    queue_path: &std::path::Path,
+    inflight_path: &std::path::Path,
+) -> anyhow::Result<Option<usize>> {
+    let content = match std::fs::read_to_string(inflight_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let recovered = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if recovered > 0 {
+        if let Some(parent) = queue_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(queue_path)?;
+        file.write_all(content.as_bytes())?;
+        if !content.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+    }
+    let _ = std::fs::remove_file(inflight_path);
+    Ok(Some(recovered))
 }
 
 #[cfg(test)]
@@ -973,6 +1088,7 @@ provider = "inherit"
         let report = DoctorReport {
             status: ReportStatus::Degraded,
             checks: vec![ok("database", "connected"), warn("queues", "pending jobs")],
+            fixes_applied: vec![],
         };
         let text = format_human(&report);
         assert!(text.contains("[OK] database: connected"));
@@ -1014,9 +1130,85 @@ provider = "inherit"
         assert_eq!(metrics, Some((12, 1, 5)));
     }
 
+    #[test]
+    fn test_recover_inflight_file_moves_jobs_back_to_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("memory_queue.jsonl");
+        let inflight = dir.path().join("memory_queue_inflight.jsonl");
+        std::fs::write(&inflight, "{\"job\":1}\n{\"job\":2}\n").unwrap();
+
+        let recovered = recover_inflight_file(&queue, &inflight).unwrap();
+        assert_eq!(recovered, Some(2));
+        assert!(!inflight.exists());
+        let queue_text = std::fs::read_to_string(&queue).unwrap();
+        assert!(queue_text.contains("{\"job\":1}"));
+        assert!(queue_text.contains("{\"job\":2}"));
+    }
+
+    #[tokio::test]
+    async fn test_doctor_fix_reports_applied_repairs() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        std::env::set_var("REIN_PROXY_TOKEN", "doctor-test-token");
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        let memory = test_memory("doctor", "doctor memory", "doctor content");
+        let enriched =
+            crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
+        let model = config.embedding_model();
+        let vector = vec![0.1f32; config.embedding.dimensions];
+        crate::embed::EmbedCache::put(store.conn(), &enriched, &model, &vector).unwrap();
+        store.store(memory).unwrap();
+
+        let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(tantivy_dirty.parent().unwrap()).unwrap();
+        std::fs::write(&tantivy_dirty, b"dirty").unwrap();
+        let hnsw_dirty = store
+            .db_path()
+            .with_extension("")
+            .with_extension("usearch.dirty");
+        std::fs::write(&hnsw_dirty, b"dirty").unwrap();
+        let inflight = queue_file(&config, "memory_queue_inflight");
+        std::fs::create_dir_all(inflight.parent().unwrap()).unwrap();
+        std::fs::write(&inflight, "{\"job\":1}\n").unwrap();
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("Tantivy")));
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("HNSW")));
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("memory inflight")));
+        assert!(!report.has_failures());
+        assert_eq!(report.status, ReportStatus::Degraded);
+    }
+
     #[tokio::test]
     async fn test_doctor_flags_auth_and_queue_warnings() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore_http = EnvRestore {
             key: "REIN_HTTP_TOKEN",
             value: std::env::var("REIN_HTTP_TOKEN").ok(),

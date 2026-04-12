@@ -273,8 +273,13 @@ pub fn handle_health(config: &ReinConfig, topic: Option<String>) -> anyhow::Resu
     Ok(())
 }
 
-pub async fn handle_doctor(config: &ReinConfig, json: bool, network: bool) -> anyhow::Result<()> {
-    let report = rein::doctor::run(config, rein::doctor::DoctorOptions { network }).await;
+pub async fn handle_doctor(
+    config: &ReinConfig,
+    json: bool,
+    network: bool,
+    fix: bool,
+) -> anyhow::Result<()> {
+    let report = rein::doctor::run(config, rein::doctor::DoctorOptions { network, fix }).await;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
