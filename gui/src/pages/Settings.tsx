@@ -1,4 +1,27 @@
 import { useState, useEffect } from 'react';
+import { useDoctor } from '../hooks/useApi';
+import type { DoctorCheck } from '../api/types';
+
+const CATEGORY_LABELS: Record<DoctorCheck['category'], string> = {
+  configuration: 'Configuration',
+  runtime: 'Runtime',
+  storage: 'Storage',
+  index: 'Index',
+  queue: 'Queue',
+  network: 'Network',
+};
+
+const SEVERITY_STYLES: Record<DoctorCheck['severity'], string> = {
+  info: 'text-[var(--success)] bg-[var(--success)]/10 border-[var(--success)]/20',
+  warning: 'text-[var(--warm)] bg-[var(--warm)]/10 border-[var(--warm)]/20',
+  error: 'text-[var(--hot)] bg-[var(--hot)]/10 border-[var(--hot)]/20',
+};
+
+const STATUS_STYLES: Record<'healthy' | 'degraded' | 'unhealthy', string> = {
+  healthy: 'text-[var(--success)]',
+  degraded: 'text-[var(--warm)]',
+  unhealthy: 'text-[var(--hot)]',
+};
 
 /* ── Settings page ──────────────────────────────────────────────── */
 
@@ -13,6 +36,7 @@ export default function Settings() {
   });
 
   const [showToken, setShowToken] = useState(false);
+  const { data: doctor, isLoading: doctorLoading, error: doctorError, refetch } = useDoctor();
 
   // Persist polling interval on change
   useEffect(() => {
@@ -113,6 +137,98 @@ export default function Settings() {
               <span className="text-[10px]">{'\u2197'}</span>
             </a>
           </div>
+        </div>
+
+        {/* Diagnostics */}
+        <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-5 space-y-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-medium text-[var(--text-primary)]">Diagnostics</div>
+              <div className="text-xs text-[var(--text-muted)] mt-0.5">
+                Live output from <span className="font-mono">rein doctor</span>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => refetch()}
+              className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] transition-colors"
+            >
+              Refresh
+            </button>
+          </div>
+
+          {doctorLoading && (
+            <div className="text-sm text-[var(--text-muted)]">Loading diagnostics...</div>
+          )}
+
+          {doctorError && (
+            <div className="rounded-lg border border-[var(--hot)]/20 bg-[var(--hot)]/10 px-3 py-2 text-xs text-[var(--hot)]">
+              Failed to load diagnostics: {doctorError instanceof Error ? doctorError.message : 'Unknown error'}
+            </div>
+          )}
+
+          {doctor && (
+            <>
+              <div className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] px-4 py-3">
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">Overall</div>
+                  <div className={`text-sm font-medium mt-1 ${STATUS_STYLES[doctor.status]}`}>
+                    {doctor.status}
+                  </div>
+                </div>
+                <div className="text-xs text-[var(--text-muted)]">
+                  {doctor.checks.length} checks
+                </div>
+              </div>
+
+              {doctor.fixes_applied && doctor.fixes_applied.length > 0 && (
+                <div className="rounded-lg border border-[var(--accent)]/20 bg-[var(--accent)]/8 px-4 py-3 space-y-2">
+                  <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">Fixes Applied</div>
+                  <div className="space-y-1">
+                    {doctor.fixes_applied.map((fix, index) => (
+                      <div key={`${fix}-${index}`} className="text-xs text-[var(--text-secondary)]">
+                        {fix}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                {doctor.checks.map((check) => (
+                  <div
+                    key={check.name}
+                    className="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] px-4 py-3"
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <div className="text-sm font-medium text-[var(--text-primary)]">
+                        {check.name}
+                      </div>
+                      <span className="rounded-full border border-[var(--border)] px-2 py-0.5 text-[10px] uppercase tracking-wider text-[var(--text-muted)]">
+                        {CATEGORY_LABELS[check.category]}
+                      </span>
+                      <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider ${SEVERITY_STYLES[check.severity]}`}>
+                        {check.severity}
+                      </span>
+                      {check.fixable && (
+                        <span className="rounded-full border border-[var(--accent)]/20 bg-[var(--accent)]/10 px-2 py-0.5 text-[10px] uppercase tracking-wider text-[var(--accent)]">
+                          fixable
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-2 text-xs text-[var(--text-secondary)]">
+                      {check.message}
+                    </div>
+                    {check.repair_hint && (
+                      <div className="mt-2 rounded-md border border-[var(--border)] bg-[var(--bg-secondary)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        Repair: <span className="text-[var(--text-secondary)]">{check.repair_hint}</span>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

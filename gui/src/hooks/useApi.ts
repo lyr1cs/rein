@@ -3,6 +3,7 @@ import { apiGet } from '../api/client';
 import type {
   StoreStats,
   AdaptiveStatus,
+  DoctorReport,
   Memory,
   RecallResult,
   Episode,
@@ -66,6 +67,21 @@ export function useAdaptive() {
     queryKey: ['adaptive'],
     queryFn: () => apiGet<AdaptiveStatus>('/api/adaptive'),
     refetchInterval: getPollingInterval(),
+  });
+}
+
+export function useDoctor(options?: { network?: boolean; fix?: boolean }) {
+  return useQuery({
+    queryKey: ['doctor', options],
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (options?.network) params.set('network', 'true');
+      if (options?.fix) params.set('fix', 'true');
+      const qs = params.toString();
+      return apiGet<DoctorReport>(`/api/doctor${qs ? `?${qs}` : ''}`);
+    },
+    refetchInterval: false,
+    staleTime: 1000,
   });
 }
 
