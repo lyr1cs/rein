@@ -7,7 +7,6 @@ use crate::extract::llm::{EpisodeSummary, ExtractedConcept, ExtractedMemory};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-
 const MIN_SELECT_SCORE: f32 = 0.32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

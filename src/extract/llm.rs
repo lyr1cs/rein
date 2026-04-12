@@ -67,11 +67,9 @@ fn fetch_existing_context(config: &crate::config::ReinConfig, text: &str) -> Vec
             if sanitized.is_empty() {
                 return None;
             }
-            stmt.query_map(rusqlite::params![sanitized], |row| {
-                row.get::<_, String>(0)
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            stmt.query_map(rusqlite::params![sanitized], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
     results
@@ -613,7 +611,11 @@ pub async fn llm_dedup_verdict(
 /// the chunks (may differ from config.extract when async_memory.provider is set).
 /// `prefix_chars` is the length of any context prefix that will be prepended to
 /// each chunk by the caller, so the budget accounts for it.
-fn chunk_for_extraction(text: &str, effective_max_chars: usize, prefix_chars: usize) -> Vec<String> {
+fn chunk_for_extraction(
+    text: &str,
+    effective_max_chars: usize,
+    prefix_chars: usize,
+) -> Vec<String> {
     // Leave room for system prompt (~2k chars), response, and context prefix
     let overhead = 3000 + prefix_chars;
     let chunk_budget = if effective_max_chars > 0 {
@@ -687,9 +689,10 @@ fn merge_chunk_results(results: Vec<ExtractionResult>) -> ExtractionResult {
     for result in results {
         // Dedup memories across chunks
         for mem in result.memories {
-            let is_dup = merged.memories.iter().any(|existing| {
-                crate::extract::similarity(&mem.content, &existing.content) > 0.80
-            });
+            let is_dup = merged
+                .memories
+                .iter()
+                .any(|existing| crate::extract::similarity(&mem.content, &existing.content) > 0.80);
             if !is_dup {
                 merged.memories.push(mem);
             }
@@ -731,7 +734,7 @@ fn merge_chunk_results(results: Vec<ExtractionResult>) -> ExtractionResult {
             if merged
                 .episode
                 .as_ref()
-                .map_or(true, |e| ep.outcome.len() > e.outcome.len())
+                .is_none_or(|e| ep.outcome.len() > e.outcome.len())
             {
                 merged.episode = Some(ep);
             }
@@ -878,16 +881,31 @@ fn facts_to_memories(text: &str, threshold: u32) -> Vec<ExtractedMemory> {
 /// Falls back to the most specific keyword if no category matches.
 fn infer_topic_from_keywords(keywords: &[String]) -> String {
     const TOPIC_CATEGORIES: &[(&[&str], &str)] = &[
-        (&["architecture", "design", "pattern", "system"], "architecture"),
+        (
+            &["architecture", "design", "pattern", "system"],
+            "architecture",
+        ),
         (&["debug", "error", "bug", "fix", "crash"], "debugging"),
-        (&["deploy", "docker", "kubernetes", "ci", "cd"], "deployment"),
+        (
+            &["deploy", "docker", "kubernetes", "ci", "cd"],
+            "deployment",
+        ),
         (&["config", "settings", "env", "environment"], "config"),
         (&["test", "testing", "spec", "assertion"], "testing"),
         (&["security", "auth", "token", "permission"], "security"),
-        (&["database", "sql", "query", "migration", "数据库"], "database"),
+        (
+            &["database", "sql", "query", "migration", "数据库"],
+            "database",
+        ),
         (&["api", "endpoint", "rest", "graphql", "grpc"], "api"),
-        (&["workflow", "process", "pipeline", "automation"], "workflow"),
-        (&["performance", "latency", "optimization", "cache"], "performance"),
+        (
+            &["workflow", "process", "pipeline", "automation"],
+            "workflow",
+        ),
+        (
+            &["performance", "latency", "optimization", "cache"],
+            "performance",
+        ),
         (&["学习", "learning", "tutorial", "guide"], "learning"),
     ];
     for kw in keywords {

@@ -236,7 +236,10 @@ pub fn handle_recall(
         keyword.as_deref(),
         limit,
     )?;
-    println!("{}", mcp::compact::format_recall_results(&results, config.server.compact));
+    println!(
+        "{}",
+        mcp::compact::format_recall_results(&results, config.server.compact)
+    );
     Ok(())
 }
 
@@ -296,7 +299,10 @@ pub fn handle_update(
     let store = config.open_store()?;
     let mut mem = store.get(&id)?;
     mem.content = content.clone();
-    mem.summary = content.chars().take(rein::types::SUMMARY_MAX_CHARS).collect();
+    mem.summary = content
+        .chars()
+        .take(rein::types::SUMMARY_MAX_CHARS)
+        .collect();
     if let Some(imp_str) = importance {
         let imp: types::Importance = imp_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         mem.importance = imp;
@@ -361,8 +367,7 @@ pub fn handle_recent(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
 pub fn handle_gc(config: &ReinConfig, dry_run: bool) -> anyhow::Result<()> {
     let store = config.open_store()?;
     let threshold = config.decay.prune_threshold;
-    let (decayed, pruned, concepts) =
-        ops::run_gc_adaptive(&store, config, threshold, dry_run)?;
+    let (decayed, pruned, concepts) = ops::run_gc_adaptive(&store, config, threshold, dry_run)?;
     if dry_run {
         let mut msg = format!(
             "Would decay {decayed} and prune {pruned} weak STM memories (threshold: {threshold})"
@@ -448,7 +453,8 @@ pub fn handle_export(
                 topics.len()
             )];
             let mut current_topic = String::new();
-            all_memories.sort_by(|a, b| a.topic.cmp(&b.topic).then(b.created_at.cmp(&a.created_at)));
+            all_memories
+                .sort_by(|a, b| a.topic.cmp(&b.topic).then(b.created_at.cmp(&a.created_at)));
             for m in &all_memories {
                 if m.topic != current_topic {
                     current_topic = m.topic.clone();
@@ -513,6 +519,7 @@ pub async fn handle_warmup(config: &ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_consolidate(
     config: &ReinConfig,
     topic: Option<String>,
@@ -568,6 +575,7 @@ pub fn handle_dedup(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_cleanup(
     config: &ReinConfig,
     topic: Option<String>,
@@ -579,8 +587,7 @@ pub async fn handle_cleanup(
     asynchronous: bool,
 ) -> anyhow::Result<()> {
     let selected_topics = topics.unwrap_or_default();
-    let scope_all =
-        all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
+    let scope_all = all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
     if asynchronous {
         let job_id = extract::hooks::queue::queue_cleanup_job(
             config,

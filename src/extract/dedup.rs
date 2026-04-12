@@ -159,7 +159,7 @@ pub fn extract_keywords_from_text(text: &str, max_keywords: usize) -> Vec<String
         .into_iter()
         .filter(|kw| seen.insert(kw.clone()))
         .collect();
-    keywords.sort_by(|a, b| b.len().cmp(&a.len()));
+    keywords.sort_by_key(|keyword| std::cmp::Reverse(keyword.len()));
     keywords.truncate(max_keywords);
     keywords
 }
@@ -372,7 +372,9 @@ pub fn check_dedup(
     let mut best_vec_memory: Option<&crate::types::Memory> = None;
     if !embed_model.is_empty() {
         for candidate in &candidates {
-            if let Some(cosine) = embedding_cosine_check(store, content, &candidate.id, &embed_model, topic) {
+            if let Some(cosine) =
+                embedding_cosine_check(store, content, &candidate.id, &embed_model, topic)
+            {
                 if cosine > best_vec_sim {
                     best_vec_sim = cosine;
                     best_vec_memory = Some(candidate);
@@ -430,7 +432,9 @@ pub fn check_dedup(
     if let (Some(memory), Some(ref score)) = (best_memory, &best_candidate_score) {
         if should_escalate_gray_zone(score, best_sim, llm_budget_available) {
             // Try embedding-based resolution first (zero LLM cost)
-            if let Some(embed_sim) = embedding_cosine_check(store, content, &memory.id, &embed_model, topic) {
+            if let Some(embed_sim) =
+                embedding_cosine_check(store, content, &memory.id, &embed_model, topic)
+            {
                 if embed_sim > 0.85 {
                     // Embedding confirms strong match — treat as dedup
                     let age_days = (chrono::Utc::now() - memory.created_at).num_days();
@@ -476,11 +480,18 @@ pub fn check_dedup(
 /// Look up embedding-based candidates for cross-topic dedup (zero API cost).
 /// Only uses cached embeddings — never triggers an embedding API call.
 /// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
-fn embedding_candidate_lookup(store: &SqliteStore, content: &str, model: &str, _topic: &str) -> Option<Vec<crate::types::Memory>> {
+fn embedding_candidate_lookup(
+    store: &SqliteStore,
+    content: &str,
+    model: &str,
+    _topic: &str,
+) -> Option<Vec<crate::types::Memory>> {
     // Look up cached embedding by raw content. The EmbedCache key depends on what text
     // was originally embedded — we can't reconstruct the exact enriched key without the
     // real summary, so we check raw content which may match older cache entries.
-    let emb = crate::embed::EmbedCache::get(store.conn(), content, model).ok().flatten()?;
+    let emb = crate::embed::EmbedCache::get(store.conn(), content, model)
+        .ok()
+        .flatten()?;
     let results = crate::store::vec::search_vec(store.conn(), &emb, 5).ok()?;
     let mut memories = Vec::new();
     for (id, distance) in results {
@@ -502,9 +513,17 @@ fn embedding_candidate_lookup(store: &SqliteStore, content: &str, model: &str, _
 /// Try to resolve gray zone using cached embeddings (zero LLM cost).
 /// Returns cosine similarity if both embeddings are in cache, None otherwise.
 /// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
-fn embedding_cosine_check(store: &SqliteStore, content: &str, candidate_id: &str, model: &str, _topic: &str) -> Option<f32> {
+fn embedding_cosine_check(
+    store: &SqliteStore,
+    content: &str,
+    candidate_id: &str,
+    model: &str,
+    _topic: &str,
+) -> Option<f32> {
     // Check if new content has a cached embedding (raw content key)
-    let new_emb = crate::embed::EmbedCache::get(store.conn(), content, model).ok().flatten()?;
+    let new_emb = crate::embed::EmbedCache::get(store.conn(), content, model)
+        .ok()
+        .flatten()?;
     // Check if candidate has a stored embedding
     let cand_emb: Vec<f32> = {
         let blob: Vec<u8> = store
@@ -766,8 +785,10 @@ mod tests {
 
     #[test]
     fn test_topic_variant_non_latin() {
-        assert!(topics_are_variants("记忆管理", "記憶管理") == false,
-            "different CJK characters should not match");
+        assert!(
+            !topics_are_variants("记忆管理", "記憶管理"),
+            "different CJK characters should not match"
+        );
         assert!(topics_are_variants("メモリ管理", "メモリ管理"));
     }
 

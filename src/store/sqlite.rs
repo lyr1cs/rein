@@ -51,7 +51,8 @@ impl SqliteStore {
     fn infer_cluster_from_cache(&self, memory: &Memory) -> Option<u32> {
         let config = crate::config::ReinConfig::load().ok()?;
         let model = config.embedding_model();
-        let enriched = crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
+        let enriched =
+            crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
         let embedding = crate::embed::EmbedCache::get(self.conn(), &enriched, &model)
             .ok()
             .flatten()?;
@@ -214,7 +215,10 @@ impl SqliteStore {
 
     /// Get the most recently created memories.
     pub fn recent(&self, limit: usize) -> ReinResult<Vec<Memory>> {
-        let sql = format!("{} ORDER BY m.created_at DESC LIMIT ?1", memory_select_base());
+        let sql = format!(
+            "{} ORDER BY m.created_at DESC LIMIT ?1",
+            memory_select_base()
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![limit], |row| {
             row_to_memory(row).map_err(|e| {
@@ -1159,7 +1163,9 @@ impl SqliteStore {
         let mut pending_grayzone: Option<(String, f32)> = None;
 
         let decision = (|| -> ReinResult<String> {
-            let inferred_cluster = memory.cluster_id.or_else(|| self.infer_cluster_from_cache(&memory));
+            let inferred_cluster = memory
+                .cluster_id
+                .or_else(|| self.infer_cluster_from_cache(&memory));
             let dedup_action = crate::extract::check_dedup(
                 self,
                 &memory.topic,
@@ -1262,7 +1268,10 @@ impl SqliteStore {
         };
 
         if canonical.superseded_by.is_some()
-            || !matches!(canonical.status, MemoryStatus::Active | MemoryStatus::Updated)
+            || !matches!(
+                canonical.status,
+                MemoryStatus::Active | MemoryStatus::Updated
+            )
         {
             return Ok(None);
         }
@@ -1323,7 +1332,11 @@ impl SqliteStore {
                         }
                         existing.content = existing.content[trim_at..].to_string();
                     }
-                    existing.summary = existing.content.chars().take(crate::types::SUMMARY_MAX_CHARS).collect();
+                    existing.summary = existing
+                        .content
+                        .chars()
+                        .take(crate::types::SUMMARY_MAX_CHARS)
+                        .collect();
                     // Merge keywords (deduplicated)
                     for kw in &memory.keywords {
                         if !existing.keywords.contains(kw) {
@@ -1992,15 +2005,29 @@ mod tests {
         );
         let result_id = store.store_with_dedup(grayzone, 0.95, 7).unwrap();
 
-        assert_eq!(result_id, canonical_id, "gray-zone dedup should reuse canonical");
+        assert_eq!(
+            result_id, canonical_id,
+            "gray-zone dedup should reuse canonical"
+        );
 
         let stats = store.stats().unwrap();
-        assert_eq!(stats.total_memories, 1, "gray-zone reuse should not create a raw memory");
+        assert_eq!(
+            stats.total_memories, 1,
+            "gray-zone reuse should not create a raw memory"
+        );
 
         let evidence = store.list_memory_evidence(&canonical_id, 10).unwrap();
-        assert_eq!(evidence.len(), 2, "canonical evidence should record both memories");
+        assert_eq!(
+            evidence.len(),
+            2,
+            "canonical evidence should record both memories"
+        );
         assert!(
-            store.get(&canonical_id).unwrap().content.contains("[merged on"),
+            store
+                .get(&canonical_id)
+                .unwrap()
+                .content
+                .contains("[merged on"),
             "canonical content should record provenance from gray-zone merge"
         );
     }
@@ -2028,9 +2055,14 @@ mod tests {
             "docker compose local development stack service api database cache queue search metrics logging stable deterministic reusable maintainable portable observable testing staged portable observable efficient",
             Importance::High,
         );
-        let enriched =
-            crate::embed::prepend_metadata(&candidate.topic, &candidate.summary, &candidate.content);
-        let model = crate::config::ReinConfig::load().unwrap_or_default().embedding_model();
+        let enriched = crate::embed::prepend_metadata(
+            &candidate.topic,
+            &candidate.summary,
+            &candidate.content,
+        );
+        let model = crate::config::ReinConfig::load()
+            .unwrap_or_default()
+            .embedding_model();
         let _ = crate::embed::EmbedCache::put(store.conn(), &enriched, &model, &embedding);
 
         let inferred_cluster = store.infer_cluster_from_cache(&candidate);
@@ -2134,12 +2166,7 @@ mod tests {
         };
 
         let old = store
-            .consolidate_topics_atomic(
-                &[
-                    "docker-deployment".to_string(),
-                ],
-                replacement,
-            )
+            .consolidate_topics_atomic(&["docker-deployment".to_string()], replacement)
             .unwrap();
 
         // Both original memories were stored with normalized topic "docker-deployment"
@@ -2181,7 +2208,10 @@ mod tests {
             .unwrap();
 
         let refreshed = store.get(&canonical_id).unwrap();
-        assert_eq!(refreshed.canonical_id.as_deref(), Some(canonical_id.as_str()));
+        assert_eq!(
+            refreshed.canonical_id.as_deref(),
+            Some(canonical_id.as_str())
+        );
         assert_eq!(refreshed.support_count, 2);
         assert_eq!(refreshed.merge_count, 1);
         assert!(refreshed.source_diversity >= 1.0);
@@ -2273,10 +2303,13 @@ mod tests {
             total_count: 25,
             median_survival: Some(14.0),
         };
-        store.conn().execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
-            rusqlite::params!["survival_curve:7", serde_json::to_string(&curve).unwrap()],
-        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params!["survival_curve:7", serde_json::to_string(&curve).unwrap()],
+            )
+            .unwrap();
 
         for _ in 0..4 {
             store.record_access(&id).unwrap();
