@@ -1052,10 +1052,38 @@ fn validate_provider_name_or_inherit(field: &str, value: &str) -> anyhow::Result
 }
 
 /// Default config file location: `~/.config/rein/config.toml`
+/// Locate the config file. First existing path wins:
+///   1. ~/.rein/config.toml          (alongside the database)
+///   2. ~/.config/rein/config.toml   (XDG standard, works cross-platform)
+///   3. ~/Library/Application Support/rein/config.toml  (macOS native via `directories`)
+/// If none exist, return the XDG path so that new users get the conventional location.
 fn dirs_config_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "rein")
-        .map(|d| d.config_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("config.toml"))
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+
+    let candidates = [
+        // ~/.rein/config.toml — single home alongside the database
+        PathBuf::from(&home).join(".rein/config.toml"),
+        // XDG standard (Linux default, also common on macOS)
+        PathBuf::from(&home).join(".config/rein/config.toml"),
+    ];
+
+    // Check dotfile paths first
+    for path in &candidates {
+        if path.exists() {
+            return path.clone();
+        }
+    }
+
+    // macOS native path via `directories` crate
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "rein") {
+        let native = dirs.config_dir().join("config.toml");
+        if native.exists() {
+            return native;
+        }
+    }
+
+    // Nothing found — default to XDG so new users get the conventional location
+    candidates[1].clone()
 }
 
 /// Merge a TOML string over an existing config by deserializing into a
@@ -1237,5 +1265,52 @@ unknown_knob = true
         let mut cfg = ReinConfig::default();
         cfg.embedding.provider = "bogus".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_path_prefers_xdg_over_native() {
+        // dirs_config_path() should return a path ending in config.toml
+        let path = super::dirs_config_path();
+        assert!(
+            path.to_string_lossy().ends_with("config.toml"),
+            "Expected path ending in config.toml, got: {}",
+            path.display()
+        );
+        // On a clean machine with no config file, should default to XDG
+        // (~/.config/rein/config.toml), not macOS native.
+        // Skip the assertion if any config file already exists (XDG, dot-rein,
+        // or macOS native via ProjectDirs) — the test is only meaningful on a
+        // machine with no pre-existing config.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let xdg = std::path::PathBuf::from(&home).join(".config/rein/config.toml");
+        let dot_rein = std::path::PathBuf::from(&home).join(".rein/config.toml");
+        let native_exists = directories::ProjectDirs::from("", "", "rein")
+            .map(|d| d.config_dir().join("config.toml").exists())
+            .unwrap_or(false);
+        if !xdg.exists() && !dot_rein.exists() && !native_exists {
+            assert_eq!(path, xdg, "Default should be XDG path when no config exists");
+        }
+    }
+
+    #[test]
+    fn test_merge_all_four_api_keys() {
+        let toml_str = r#"
+[embedding.google]
+api_key = "test-embed-key"
+
+[extract.google]
+api_key = "test-extract-key"
+
+[query_expansion.google]
+api_key = "test-expand-key"
+
+[sync]
+api_key = "test-sync-key"
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).expect("merge should succeed");
+        assert_eq!(cfg.embedding.google.api_key.as_deref(), Some("test-embed-key"), "embedding api_key lost");
+        assert_eq!(cfg.extract.google.api_key.as_deref(), Some("test-extract-key"), "extract api_key lost");
+        assert_eq!(cfg.query_expansion.google.api_key.as_deref(), Some("test-expand-key"), "expand api_key lost");
+        assert_eq!(cfg.sync.api_key.as_deref(), Some("test-sync-key"), "sync api_key lost");
     }
 }
