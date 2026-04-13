@@ -1,0 +1,10 @@
+name: rein
+description: >-
+  Cross-validated memory with adaptive engine, temporal knowledge graph,
+  and multi-level search fusion. Replaces built-in memory with rein's
+  28-tool MCP server for persistent recall across sessions.
+version: 0.1.0
+author: lyr1cs
+url: https://github.com/lyr1cs/rein
+requires:
+  - rein  # must be on PATH (cargo install --path . or release binary)
