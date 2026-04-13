@@ -2,13 +2,13 @@
 
 ## Overview
 
-rein v0.15.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 26 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
+rein v0.16.1 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 28 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
 ```bash
 cargo build           # Debug build
-cargo test            # All tests must pass (353+)
+cargo test            # All tests must pass (666+)
 cargo build --release # Optimized binary (~7MB)
 cargo install --path . # Install to ~/.cargo/bin/rein
 docker build -t rein . # Docker image (~165MB)

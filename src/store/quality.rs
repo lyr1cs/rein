@@ -299,6 +299,18 @@ impl SqliteStore {
                 let majority_weak = !concept.source_memory_ids.is_empty()
                     && weak_count > concept.source_memory_ids.len() / 2;
 
+                // JSON-quoted match with LIKE wildcard escaping
+                let escaped_cid = concept.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                let external_ref_count: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE concept_ids LIKE ?1 ESCAPE '\\'",
+                    rusqlite::params![format!("%\"{}\"%", escaped_cid)],
+                    |r| r.get(0),
+                ).unwrap_or(0);
+                let external_refs = external_ref_count as usize > concept.source_memory_ids.len();
+                if external_refs {
+                    continue;
+                }
+
                 if score < 0.2 && majority_weak {
                     let _ = self.conn.execute(
                         "DELETE FROM concept_links WHERE source_id = ?1 OR target_id = ?1",

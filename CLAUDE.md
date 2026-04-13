@@ -6,13 +6,13 @@
 
 ```bash
 cargo build
-cargo test            # 353+ tests, all must pass
+cargo test            # 666+ tests, all must pass
 cargo install --path . # Install to ~/.cargo/bin/rein
 ```
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (26 tools, evidence-aware canonical-first memory flow). Key modules:
+rein is a multi-source cross-validated memory MCP server (28 tools, evidence-aware canonical-first memory flow). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop); admission and memory surfaces are cluster/canonical-aware
