@@ -3,21 +3,52 @@ use crate::types::error::{ReinError, ReinResult};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-const EXPAND_SYSTEM_PROMPT: &str = r#"Given a memory search query, generate alternative phrasings that would help find relevant stored memories.
+const EXPAND_SYSTEM_PROMPT: &str = r#"Given a memory search query, generate alternative phrasings to improve recall of stored memories.
 
-Focus on:
-- Synonym substitution (different words, same meaning)
-- Language switching (if query is Chinese, add an English variant and vice versa)
-- Specificity adjustment (more general OR more specific phrasing)
+For CHINESE queries:
+- Generate 1-2 Chinese-native rewrites using different vocabulary (NOT just paraphrasing)
+  - Synonym substitution: 实现→完成/落地, 问题→bug/报错/异常, 方案→方法/思路
+  - Register shift: formal→colloquial or vice versa
+  - Convert question form to declarative: "如何做X" → "X的实现方式"
+  - Expand technical abbreviations: "接口" → "API接口", "数据库" → "SQLite数据库"
+- Add 1 English translation for cross-lingual vector search
 
-Output a JSON array of strings. Example:
-["alternative phrasing 1", "alternative phrasing 2"]
+For ENGLISH queries:
+- Generate 2 synonym-substitution variants (different words, same meaning)
+- Add 1 Chinese translation only if the query clearly refers to Chinese-language content
 
-Rules:
-- Each alternative must be meaningfully different from the original
-- Keep alternatives concise (under 100 characters each)
-- If the query is already very specific (e.g., a function name or exact ID), return []
-- Support both English and Chinese"#;
+Common rules:
+- Return [] for exact identifiers (function names, IDs, filenames, version numbers)
+- Each alternative must be meaningfully different from the original AND from each other
+- Keep each alternative under 100 characters
+- Output a JSON array of strings only, no explanation
+
+Examples:
+Input (Chinese): "怎么实现增量索引"
+Output: ["增量HNSW更新方法", "索引增量构建实现", "incremental index implementation"]
+
+Input (English): "memory decay algorithm"
+Output: ["forgetting curve implementation", "memory strength reduction over time"]"#;
+
+/// Returns true if more than 30% of the characters in the query are Chinese ideographs.
+///
+/// Deliberately excludes Hiragana/Katakana (Japanese) and Hangul (Korean) so that
+/// Japanese/Korean queries do not receive Chinese-specific expansion strategies.
+/// Uses CJK Unified Ideographs + Extension A/B which are the core Chinese character blocks.
+fn is_chinese_query(query: &str) -> bool {
+    let total = query.chars().count();
+    if total == 0 {
+        return false;
+    }
+    let cjk_count = query.chars().filter(|c| {
+        matches!(*c as u32,
+            0x4E00..=0x9FFF |   // CJK Unified Ideographs
+            0x3400..=0x4DBF |   // CJK Extension A
+            0x20000..=0x2A6DF   // CJK Extension B
+        )
+    }).count();
+    cjk_count * 10 > total * 3 // > 30%, integer arithmetic avoids float
+}
 
 // ---------------------------------------------------------------------------
 // Gemini expander
@@ -41,9 +72,14 @@ impl GeminiExpander {
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
+        let lang_hint = if is_chinese_query(query) {
+            "Language hint: Chinese query — prioritize Chinese-native alternatives first.\n\n"
+        } else {
+            "Language hint: English query.\n\n"
+        };
         let prompt = format!(
-            "{}\n\nGenerate up to {} alternatives.\n\nInput query: \"{}\"",
-            EXPAND_SYSTEM_PROMPT, max, query
+            "{}\n\n{}Generate up to {} alternatives.\n\nInput query: \"{}\"",
+            EXPAND_SYSTEM_PROMPT, lang_hint, max, query
         );
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
@@ -110,9 +146,14 @@ impl OmlxExpander {
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
+        let lang_hint = if is_chinese_query(query) {
+            "Language hint: Chinese query — prioritize Chinese-native alternatives first.\n\n"
+        } else {
+            "Language hint: English query.\n\n"
+        };
         let user_msg = format!(
-            "Generate up to {} alternatives.\n\nInput query: \"{}\"",
-            max, query
+            "{}Generate up to {} alternatives.\n\nInput query: \"{}\"",
+            lang_hint, max, query
         );
         let url = format!("{}/chat/completions", self.endpoint);
         let disable_thinking = self.disable_thinking;
@@ -365,6 +406,14 @@ mod tests {
         let input = r#"["a", "b", "c", "d", "e"]"#;
         let result = parse_expansion_response(input, 2).unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_is_chinese_query() {
+        assert!(is_chinese_query("怎么实现增量索引"));
+        assert!(is_chinese_query("记忆衰减 decay"));  // mixed but >30% CJK
+        assert!(!is_chinese_query("memory decay algorithm"));
+        assert!(!is_chinese_query(""));
     }
 
     #[test]
