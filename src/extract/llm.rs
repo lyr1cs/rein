@@ -601,6 +601,46 @@ pub async fn llm_dedup_verdict(
 }
 
 // ---------------------------------------------------------------------------
+// Async post-merge synthesis
+// ---------------------------------------------------------------------------
+
+const MERGE_REFINEMENT_SYSTEM_PROMPT: &str = r#"You are synthesizing a memory that has accumulated merged fragments over time.
+
+The input contains a base memory followed by one or more "[merged from ...]" or "[merged on ...]" sections.
+Your task is to produce a single, coherent, deduplicated narrative that preserves all distinct facts.
+
+Rules:
+- Do NOT repeat the same fact twice
+- Keep all unique facts, names, versions, dates, and decisions
+- Remove the "[merged from ...]" and "[merged on ...]" markers — integrate everything naturally
+- Preserve the original language (English or Chinese) of each fact
+- Return only the synthesized text, no JSON, no preamble"#;
+
+/// Async post-merge LLM synthesis pass.
+/// Reads the winner's content (which contains "[merged from ...]" blocks), asks the LLM to
+/// produce a single coherent narrative, and returns it. Returns `None` if LLM is unavailable.
+pub async fn llm_refine_merged_content(
+    config: &ReinConfig,
+    content: &str,
+) -> ReinResult<Option<String>> {
+    let Some(extractor) = create_extractor(config) else {
+        return Ok(None);
+    };
+
+    let input = content.chars().take(4000).collect::<String>();
+    let prepared = prepare_input_for_kind(config, &input, &extractor);
+    let refined = extractor
+        .raw_with_prompt(MERGE_REFINEMENT_SYSTEM_PROMPT, &prepared)
+        .await?;
+
+    let trimmed = refined.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed))
+}
+
+// ---------------------------------------------------------------------------
 // Fallback: LLM extraction with pattern-based fallback
 // ---------------------------------------------------------------------------
 

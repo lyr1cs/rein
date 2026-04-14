@@ -67,7 +67,7 @@ fn normalize_tokens(text: &str) -> HashSet<String> {
     tokens
 }
 
-fn jieba() -> &'static Jieba {
+pub(crate) fn jieba() -> &'static Jieba {
     static INSTANCE: OnceLock<Jieba> = OnceLock::new();
     INSTANCE.get_or_init(Jieba::new)
 }
@@ -493,10 +493,16 @@ fn embedding_candidate_lookup(
         .ok()
         .flatten()?;
     let results = crate::store::vec::search_vec(store.conn(), &emb, 5).ok()?;
+    // A1: use adaptive global threshold minus margin as pre-filter floor.
+    // This ensures candidates below the fixed 0.70 are not silently dropped
+    // when the per-cluster dedup threshold is lower.
+    let floor = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+        .map(|s| (s.get_dedup_threshold(None) as f64 - 0.10).max(0.40))
+        .unwrap_or(0.60);
     let mut memories = Vec::new();
     for (id, distance) in results {
         let sim = 1.0 - distance as f64;
-        if sim < 0.70 {
+        if sim < floor {
             break; // Below meaningful similarity
         }
         if let Ok(m) = store.get(&id) {

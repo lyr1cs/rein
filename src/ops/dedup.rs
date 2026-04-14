@@ -82,6 +82,7 @@ fn record_dedup_artifacts(
 
 fn merge_memory_into_winner(
     store: &SqliteStore,
+    config: Option<&ReinConfig>,
     winner_id: &str,
     loser: &Memory,
     lexical_score: Option<f32>,
@@ -101,15 +102,48 @@ fn merge_memory_into_winner(
                 return Err(e);
             }
         };
-        let unique = extract_unique_lines(&loser.content, &winner.content);
-        if !unique.is_empty() {
+        // Prefer LLM-computed novel_facts over mechanical unique-lines extraction.
+        // novel_facts are produced by llm_dedup_verdict and stored in payload JSON.
+        let llm_novel: Option<Vec<String>> = payload
+            .as_ref()
+            .and_then(|p| p.get("novel_facts"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .filter(|facts: &Vec<String>| !facts.is_empty());
+
+        if let Some(facts) = llm_novel {
             winner.content.push_str(&format!(
                 "\n\n[merged from {} on {}]\n{}",
                 loser.id,
                 loser.created_at.format("%Y-%m-%d"),
-                unique,
+                facts.join("\n"),
             ));
+        } else {
+            let unique = extract_unique_lines(&loser.content, &winner.content);
+            if !unique.is_empty() {
+                winner.content.push_str(&format!(
+                    "\n\n[merged from {} on {}]\n{}",
+                    loser.id,
+                    loser.created_at.format("%Y-%m-%d"),
+                    unique,
+                ));
+            }
         }
+
+        // Use LLM merged_summary for the winner's summary if provided.
+        let llm_summary = payload
+            .as_ref()
+            .and_then(|p| p.get("merged_summary"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         for kw in &loser.keywords {
             if !winner.keywords.contains(kw) {
                 winner.keywords.push(kw.clone());
@@ -126,11 +160,13 @@ fn merge_memory_into_winner(
         winner.tier = stronger_tier(winner.tier, loser.tier);
         winner.last_accessed = winner.last_accessed.max(loser.last_accessed);
         winner.updated_at = chrono::Utc::now();
-        winner.summary = winner
-            .content
-            .chars()
-            .take(crate::types::SUMMARY_MAX_CHARS)
-            .collect();
+        winner.summary = llm_summary.unwrap_or_else(|| {
+            winner
+                .content
+                .chars()
+                .take(crate::types::SUMMARY_MAX_CHARS)
+                .collect()
+        });
         store.update(&winner)?;
         store.mark_superseded(&loser.id, winner_id)?;
         record_dedup_artifacts(
@@ -148,6 +184,13 @@ fn merge_memory_into_winner(
     match result {
         Ok(()) => {
             store.conn().execute_batch("RELEASE merge_winner")?;
+            // Queue async LLM synthesis pass to collapse merged blocks into coherent prose.
+            if let Some(cfg) = config {
+                crate::extract::hooks::queue::queue_merge_refinement_job(
+                    cfg,
+                    winner_id.to_string(),
+                );
+            }
             Ok(())
         }
         Err(e) => {
@@ -229,6 +272,7 @@ pub async fn resolve_dedup_job_async(
         DedupRelation::Duplicate => {
             merge_memory_into_winner(
                 store,
+                Some(config),
                 existing_id,
                 &new_memory,
                 lexical_score,
@@ -555,6 +599,8 @@ fn build_none_bucket_ann_candidates(
 /// and merges/supersedes matches. Runs in the GC slow channel (zero hot-path cost).
 pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
     let conn = store.conn();
+    // A1: Load per-cluster dedup thresholds once for this run.
+    let adaptive = crate::store::adaptive::AdaptiveState::restore_snapshot(conn);
     let pending_limit = vec_dedup_pending_limit(config);
     let pending: Vec<VecDedupItem> = match conn.prepare(
         "SELECT id, topic, summary, content FROM memories
@@ -657,13 +703,34 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             }
         };
 
+        // A1: weak floor = minimum adaptive threshold minus margin (never below 0.40).
+        // Uses the minimum across all per-cluster thresholds so that candidates in
+        // low-threshold clusters are not prematurely skipped by the break below.
+        let weak_floor = adaptive
+            .as_ref()
+            .map(|s| {
+                let global = s.get_dedup_threshold(None);
+                let min_threshold = s
+                    .dedup_thresholds
+                    .values()
+                    .copied()
+                    .fold(global, f32::min);
+                (min_threshold as f64 - 0.10).max(0.40)
+            })
+            .unwrap_or_else(|| vec_dedup_weak_threshold(config));
+
+        // A1: source cluster for fallback threshold resolution
+        let source_cluster = adaptive
+            .as_ref()
+            .and_then(|s| s.memory_clusters.get(id).copied());
+
         for (candidate_id, distance) in &vec_results {
             if candidate_id == id {
                 continue;
             }
 
             let sim = 1.0 - (*distance as f64);
-            if sim < vec_dedup_weak_threshold(config) {
+            if sim < weak_floor {
                 break;
             }
 
@@ -677,7 +744,18 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 continue;
             }
 
-            if sim > vec_dedup_strong_threshold(config) {
+            // A1: strong merge threshold — per candidate cluster, with fallback chain
+            let candidate_cluster = adaptive
+                .as_ref()
+                .and_then(|s| s.memory_clusters.get(candidate_id).copied())
+                .or(candidate.cluster_id)
+                .or(source_cluster);
+            let strong_threshold = adaptive
+                .as_ref()
+                .map(|s| s.get_dedup_threshold(candidate_cluster) as f64)
+                .unwrap_or_else(|| vec_dedup_strong_threshold(config));
+
+            if sim > strong_threshold {
                 let (keep_id, discard_id, discard_content, discard_created) =
                     if candidate.access_count >= 1
                         || candidate.created_at < chrono::Utc::now() - chrono::Duration::hours(1)
@@ -845,6 +923,12 @@ pub fn run_dedup_scoped(
     let mut changed = false;
     let llm_budget = vec_dedup_llm_budget(config);
     let mut llm_calls_used = 0usize;
+    // A1: load adaptive thresholds once for the whole batch
+    let adaptive_state = if config.adaptive.enabled {
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+    } else {
+        None
+    };
     for group in groups {
         let mems: Vec<_> = load_group_memories(store, group)?
             .into_iter()
@@ -867,6 +951,11 @@ pub fn run_dedup_scoped(
 
         // Compare within each cluster group (much smaller than full pairwise)
         for (cluster_id, indices) in &cluster_groups {
+            // A1: use per-cluster adaptive dedup threshold when available
+            let cluster_threshold = adaptive_state
+                .as_ref()
+                .map(|s| s.get_dedup_threshold(*cluster_id))
+                .unwrap_or(threshold);
             for ii in 0..indices.len() {
                 let i = indices[ii];
                 if processed.contains(&mems[i].id) {
@@ -890,10 +979,12 @@ pub fn run_dedup_scoped(
                         continue;
                     }
                     let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
-                    let relation = if sim >= threshold {
+                    let gray_zone_floor =
+                        (cluster_threshold - 0.15).max(0.50).min(cluster_threshold);
+                    let relation = if sim >= cluster_threshold {
                         DedupRelation::Duplicate
                     } else if !dry_run
-                        && sim >= (threshold - 0.15).max(0.50)
+                        && sim >= gray_zone_floor
                         && llm_calls_used < llm_budget
                     {
                         llm_calls_used += 1;
@@ -1442,6 +1533,7 @@ mod tests {
 
         merge_memory_into_winner(
             &store,
+            None,
             &winner_id,
             &loser,
             Some(0.85),
@@ -1491,6 +1583,7 @@ mod tests {
         // Attempt to merge with a non-existent winner
         let result = merge_memory_into_winner(
             &store,
+            None,
             "nonexistent-winner-id",
             &loser,
             Some(0.85),

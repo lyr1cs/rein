@@ -314,7 +314,15 @@ impl SqliteStore {
                     continue;
                 }
 
-                if score < 0.2 && majority_weak {
+                // A concept is orphaned when prune_memories_only has already removed
+                // all its source memories (leaving source_memory_ids = []) but the
+                // concept itself was never cascade-pruned.  majority_weak is always
+                // false for empty source_memory_ids, so without this explicit check
+                // orphaned concepts would leak indefinitely.
+                let is_orphaned =
+                    concept.source_memory_ids.is_empty() && external_ref_count == 0;
+
+                if score < 0.2 && (majority_weak || is_orphaned) {
                     let _ = self.conn.execute(
                         "DELETE FROM concept_links WHERE source_id = ?1 OR target_id = ?1",
                         rusqlite::params![concept.id],

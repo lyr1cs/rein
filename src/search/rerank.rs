@@ -46,6 +46,12 @@ pub struct RerankFeatures {
     pub tier_score: f32,
     /// Whether memory has been superseded (0 or 1, penalty for outdated)
     pub is_current: f32,
+    // --- M3 survival feature (v0.17) ---
+    /// Cluster-level Kaplan-Meier survival probability at current days-since-last-access.
+    /// Ranges [0, 1]; 0.5 when no cluster curve is available (neutral fallback).
+    /// Distinct from `strength` (individual decay): captures whether memories in
+    /// this semantic cluster tend to remain relevant at this age.
+    pub cluster_survival: f32,
 }
 
 /// Learned weights for the linear scoring model (19 features).
@@ -81,6 +87,9 @@ pub struct RerankWeights {
     pub w_tier_score: f32,
     #[serde(default = "default_w_small")]
     pub w_is_current: f32,
+    /// M3 cluster survival weight. Defaults to 0.02.
+    #[serde(default = "default_w_small")]
+    pub w_cluster_survival: f32,
 }
 
 fn default_w_topic_match() -> f32 {
@@ -111,7 +120,7 @@ pub fn default_weights() -> RerankWeights {
         w_episode: 0.07,
         w_recency: 0.07,
         w_access: 0.05,
-        w_strength: 0.07,
+        w_strength: 0.05,
         w_importance: 0.05,
         w_keyword: 0.05,
         w_topic_match: 0.03,
@@ -124,6 +133,7 @@ pub fn default_weights() -> RerankWeights {
         w_concept_richness: 0.03,
         w_tier_score: 0.03,
         w_is_current: 0.03,
+        w_cluster_survival: 0.02,
     }
 }
 
@@ -157,7 +167,8 @@ pub fn rerank_score(f: &RerankFeatures, w: &RerankWeights) -> f32 {
         + w.w_connectivity * f.connectivity
         + w.w_concept_richness * f.concept_richness
         + w.w_tier_score * f.tier_score
-        + w.w_is_current * f.is_current;
+        + w.w_is_current * f.is_current
+        + w.w_cluster_survival * f.cluster_survival;
 
     score.clamp(0.0, 2.0)
 }
@@ -268,6 +279,7 @@ mod tests {
             concept_richness: 0.4,
             tier_score: 1.0,
             is_current: 1.0,
+            cluster_survival: 0.8,
         };
         let w = default_weights();
         let score = rerank_score(&f, &w);
@@ -297,6 +309,7 @@ mod tests {
             concept_richness: 1.0,
             tier_score: 1.0,
             is_current: 1.0,
+            cluster_survival: 0.8,
         };
         let low = RerankFeatures {
             fts_score: 0.1,
@@ -318,6 +331,7 @@ mod tests {
             concept_richness: 0.0,
             tier_score: 0.0,
             is_current: 0.0,
+            cluster_survival: 0.2,
         };
         assert!(rerank_score(&high, &w) > rerank_score(&low, &w));
     }
@@ -371,6 +385,7 @@ mod tests {
             concept_richness: 1.0,
             tier_score: 1.0,
             is_current: 1.0,
+            cluster_survival: 1.0,
         };
         let w = default_weights();
         let score = rerank_score(&f, &w);
@@ -398,7 +413,8 @@ mod tests {
             + w.w_connectivity
             + w.w_concept_richness
             + w.w_tier_score
-            + w.w_is_current;
+            + w.w_is_current
+            + w.w_cluster_survival;
         assert!(
             (sum - 1.0).abs() < 1e-6,
             "Default weights should sum to 1.0, got {sum}"
