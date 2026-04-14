@@ -34,7 +34,7 @@ Output: ["forgetting curve implementation", "memory strength reduction over time
 ///
 /// Deliberately excludes Hiragana/Katakana (Japanese) and Hangul (Korean) so that
 /// Japanese/Korean queries do not receive Chinese-specific expansion strategies.
-/// Uses CJK Unified Ideographs + Extension A/B which are the core Chinese character blocks.
+/// Uses CJK Unified Ideographs + Extensions A-F which are the core Chinese character blocks.
 fn is_chinese_query(query: &str) -> bool {
     let total = query.chars().count();
     if total == 0 {
@@ -44,7 +44,11 @@ fn is_chinese_query(query: &str) -> bool {
         matches!(*c as u32,
             0x4E00..=0x9FFF |   // CJK Unified Ideographs
             0x3400..=0x4DBF |   // CJK Extension A
-            0x20000..=0x2A6DF   // CJK Extension B
+            0x20000..=0x2A6DF | // CJK Extension B
+            0x2A700..=0x2B73F | // CJK Extension C
+            0x2B740..=0x2B81F | // CJK Extension D
+            0x2B820..=0x2CEAF | // CJK Extension E
+            0x2CEB0..=0x2EBEF   // CJK Extension F
         )
     }).count();
     cjk_count * 10 > total * 3 // > 30%, integer arithmetic avoids float
@@ -75,7 +79,7 @@ impl GeminiExpander {
         let lang_hint = if is_chinese_query(query) {
             "Language hint: Chinese query — prioritize Chinese-native alternatives first.\n\n"
         } else {
-            "Language hint: English query.\n\n"
+            ""
         };
         let prompt = format!(
             "{}\n\n{}Generate up to {} alternatives.\n\nInput query: \"{}\"",
@@ -149,7 +153,7 @@ impl OmlxExpander {
         let lang_hint = if is_chinese_query(query) {
             "Language hint: Chinese query — prioritize Chinese-native alternatives first.\n\n"
         } else {
-            "Language hint: English query.\n\n"
+            ""
         };
         let user_msg = format!(
             "{}Generate up to {} alternatives.\n\nInput query: \"{}\"",
