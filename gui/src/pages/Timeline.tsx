@@ -72,8 +72,17 @@ export default function Timeline() {
     queryKey: ['timeline', from, to, limit],
     queryFn: () => {
       const params = new URLSearchParams();
-      if (from) params.set('from', from);
-      if (to) params.set('to', to);
+      // Send RFC3339 timestamps with the browser's UTC offset so the server
+      // interprets range boundaries in the user's local time regardless of
+      // server timezone. `from` spans from 00:00:00 local; `to` spans to 23:59:59.999 local.
+      if (from) {
+        const start = new Date(`${from}T00:00:00`);
+        if (!isNaN(start.getTime())) params.set('from', start.toISOString());
+      }
+      if (to) {
+        const end = new Date(`${to}T23:59:59.999`);
+        if (!isNaN(end.getTime())) params.set('to', end.toISOString());
+      }
       params.set('limit', String(limit));
       return apiGet<TimelineResponse>(`/api/timeline?${params}`);
     },
