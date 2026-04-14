@@ -473,15 +473,17 @@ pub fn recall_temporal_with_request_id(
     }
 
     let kg_is_episodic = strategy.query_type == crate::search::classify::QueryType::Episodic;
-    let kg_state: KgState = if fast {
-        // Fast mode: run synchronously on main thread (no extra connection, no thread overhead)
+    let is_memory_db = store.db_path().to_str() == Some(":memory:");
+    let kg_state: KgState = if fast || is_memory_db {
+        // Fast mode or in-memory DB: run synchronously on main thread.
+        // In-memory DBs cannot be shared across threads (each new connection gets an empty DB).
         let kg_start = std::time::Instant::now();
         let (kg_scores, episode_scores) =
             run_kg_search(store, query, effective_limit, kg_is_episodic, time_from, time_to);
         tracing::debug!(
             elapsed_ms = kg_start.elapsed().as_millis() as u64,
             kg_hits = kg_scores.len(),
-            "kg search (fast mode, sync)"
+            "kg search (sync)"
         );
         KgState::Sync(kg_scores, episode_scores)
     } else {
@@ -536,7 +538,8 @@ pub fn recall_temporal_with_request_id(
             rx.recv_timeout(budget).unwrap_or_else(|_| {
                 tracing::warn!(
                     kg_elapsed_ms = elapsed.as_millis() as u64,
-                    "KG search timed out, using empty results"
+                    budget_ms = budget.as_millis() as u64,
+                    "KG search budget exhausted (time measured from spawn), using empty results"
                 );
                 (std::collections::HashMap::new(), std::collections::HashMap::new())
             })
@@ -609,39 +612,57 @@ pub fn recall_temporal_with_request_id(
             }
         }
 
-        // KG: parallel per expanded query (each opens its own SqliteStore)
-        // For 2-3 expanded queries this cuts latency from O(n * kg_time) to O(kg_time).
-        let kg_handles: Vec<_> = deduped_queries
-            .iter()
-            .map(|eq| {
-                let eq_str = (*eq).clone();
-                let db_path = store.db_path().to_path_buf();
-                let model = config.embedding_model();
-                let dims = config.embedding.dimensions;
-                let limit = effective_limit;
-                let is_ep = kg_is_episodic;
-                let t_from = time_from;
-                let t_to = time_to;
-                std::thread::spawn(move || {
-                    let Ok(s) = SqliteStore::new(&db_path, &model, dims) else {
-                        return (
-                            std::collections::HashMap::<String, f32>::new(),
-                            std::collections::HashMap::<String, f32>::new(),
-                        );
-                    };
-                    run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to)
-                })
-            })
-            .collect();
-        for handle in kg_handles {
-            let (kg, ep) = handle.join().unwrap_or_default();
-            for (id, score) in kg {
-                let entry = kg_scores.entry(id).or_default();
-                *entry = entry.max(score);
+        // KG: per expanded query.
+        // In-memory DBs cannot be opened from a new thread (each gets its own empty DB),
+        // so we run sequentially on the main thread in that case.
+        // For file-backed DBs with 2-3 expanded queries, parallel threads cut latency from
+        // O(n * kg_time) to O(kg_time).
+        if is_memory_db {
+            for eq in &deduped_queries {
+                let (kg, ep) =
+                    run_kg_search(store, eq, effective_limit, kg_is_episodic, time_from, time_to);
+                for (id, score) in kg {
+                    let entry = kg_scores.entry(id).or_default();
+                    *entry = entry.max(score);
+                }
+                for (id, score) in ep {
+                    let entry = episode_scores.entry(id).or_default();
+                    *entry = entry.max(score);
+                }
             }
-            for (id, score) in ep {
-                let entry = episode_scores.entry(id).or_default();
-                *entry = entry.max(score);
+        } else {
+            let kg_handles: Vec<_> = deduped_queries
+                .iter()
+                .map(|eq| {
+                    let eq_str = (*eq).clone();
+                    let db_path = store.db_path().to_path_buf();
+                    let model = config.embedding_model();
+                    let dims = config.embedding.dimensions;
+                    let limit = effective_limit;
+                    let is_ep = kg_is_episodic;
+                    let t_from = time_from;
+                    let t_to = time_to;
+                    std::thread::spawn(move || {
+                        let Ok(s) = SqliteStore::new(&db_path, &model, dims) else {
+                            return (
+                                std::collections::HashMap::<String, f32>::new(),
+                                std::collections::HashMap::<String, f32>::new(),
+                            );
+                        };
+                        run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to)
+                    })
+                })
+                .collect();
+            for handle in kg_handles {
+                let (kg, ep) = handle.join().unwrap_or_default();
+                for (id, score) in kg {
+                    let entry = kg_scores.entry(id).or_default();
+                    *entry = entry.max(score);
+                }
+                for (id, score) in ep {
+                    let entry = episode_scores.entry(id).or_default();
+                    *entry = entry.max(score);
+                }
             }
         }
     }
