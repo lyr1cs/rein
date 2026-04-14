@@ -481,6 +481,19 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     )
     .ok();
 
+    // M4 incremental: cluster centroids table (separate from AdaptiveState JSON to avoid bloat).
+    // `dims` is stored so load_cluster_centroids can reject stale centroids after a model change.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS cluster_centroids (
+            cluster_id INTEGER PRIMARY KEY,
+            centroid BLOB NOT NULL,
+            cluster_version INTEGER NOT NULL DEFAULT 0,
+            dims INTEGER NOT NULL DEFAULT 0
+        );
+    ",
+    )?;
+
     Ok(())
 }
 

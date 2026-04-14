@@ -74,6 +74,18 @@ pub struct DedupJob {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeRefinementJob {
+    pub id: String,
+    /// ID of the winner memory whose merged content should be refined.
+    pub winner_id: String,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerStats {
     pub processed: u64,
@@ -97,6 +109,7 @@ pub struct QueueGroupDiagnostics {
     pub memory: QueueDiagnostics,
     pub cleanup: QueueDiagnostics,
     pub dedup: QueueDiagnostics,
+    pub merge_refinement: QueueDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +360,23 @@ pub(crate) fn collect_queue_diagnostics(config: &ReinConfig) -> QueueGroupDiagno
                 dedup_stats_issue,
             ]),
         },
+        merge_refinement: {
+            let (mr_pending, mr_pending_issue) =
+                diagnostic_count(&merge_refinement_queue_path(config), "merge_refinement_queue");
+            let (mr_inflight, mr_inflight_issue) =
+                diagnostic_count(&merge_refinement_inflight_path(config), "merge_refinement_queue_inflight");
+            let (mr_dead, mr_dead_issue) =
+                diagnostic_count(&merge_refinement_dead_letter_path(config), "merge_refinement_queue_dead");
+            let (mr_stats, mr_stats_issue) =
+                diagnostic_stats(&merge_refinement_stats_path(config), "merge_refinement_worker_stats");
+            QueueDiagnostics {
+                pending: mr_pending,
+                inflight: mr_inflight,
+                dead_letters: mr_dead,
+                stats: mr_stats,
+                issues: collect_issues([mr_pending_issue, mr_inflight_issue, mr_dead_issue, mr_stats_issue]),
+            }
+        },
     }
 }
 
@@ -472,6 +502,297 @@ pub fn spawn_dedup_worker(config: &ReinConfig) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let _ = cmd.spawn();
+}
+
+// ---------------------------------------------------------------------------
+// Merge-refinement queue
+// ---------------------------------------------------------------------------
+
+/// Queue an async LLM synthesis pass on a winner memory after a merge.
+/// Fire-and-forget: errors are logged and suppressed so the hot store path is unaffected.
+pub fn queue_merge_refinement_job(config: &ReinConfig, winner_id: String) {
+    let job = MergeRefinementJob {
+        id: ulid::Ulid::new().to_string(),
+        winner_id: winner_id.clone(),
+        attempts: 0,
+        next_attempt_at: None,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    let path = merge_refinement_queue_path(config);
+    let inflight = merge_refinement_inflight_path(config);
+    let lock = merge_refinement_lock_path(config);
+    let fingerprint = winner_id.clone();
+    let result = with_advisory_lock(&lock, true, || {
+        // Deduplicate: skip if a job for this winner_id is already pending or in-flight.
+        for queued in read_merge_refinement_jobs(&path)
+            .into_iter()
+            .chain(read_merge_refinement_jobs(&inflight).into_iter())
+        {
+            if queued.winner_id == fingerprint {
+                return Ok(queued.id);
+            }
+        }
+        append_jsonl(&path, &serde_json::to_string(&job)?)?;
+        Ok(job.id.clone())
+    });
+    if let Err(e) = result {
+        tracing::debug!("queue_merge_refinement_job failed for {winner_id}: {e}");
+    }
+    spawn_merge_refinement_worker(config);
+}
+
+pub fn spawn_merge_refinement_worker(config: &ReinConfig) {
+    if std::env::var("REIN_MERGE_REFINEMENT_WORKER").as_deref() == Ok("1") {
+        return;
+    }
+    if !should_spawn_worker(
+        &merge_refinement_spawn_marker_path(config),
+        config.async_memory.spawn_cooldown_ms,
+    ) {
+        return;
+    }
+    let _ = touch_worker_marker(&merge_refinement_spawn_marker_path(config));
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("worker")
+        .arg("merge-refinement-queue")
+        .env("REIN_MERGE_REFINEMENT_WORKER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
+}
+
+pub async fn drain_merge_refinement_queue(config: &ReinConfig) -> anyhow::Result<u32> {
+    let path = merge_refinement_queue_path(config);
+    let inflight = merge_refinement_inflight_path(config);
+    let lock = merge_refinement_lock_path(config);
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            tracing::warn!("merge_refinement flock failed: {}", err);
+        }
+        return Ok(0);
+    }
+    let result = drain_merge_refinement_queue_locked(config, &path, &inflight).await;
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    drop(lock_file);
+    result
+}
+
+async fn drain_merge_refinement_queue_locked(
+    config: &ReinConfig,
+    path: &std::path::Path,
+    inflight: &std::path::Path,
+) -> anyhow::Result<u32> {
+    recover_inflight(path, inflight)?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let meta = std::fs::metadata(path)?;
+    if meta.len() == 0 {
+        return Ok(0);
+    }
+
+    std::fs::rename(path, inflight)?;
+    let content = std::fs::read_to_string(inflight).unwrap_or_default();
+    let jobs = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<MergeRefinementJob>(line).ok())
+        .collect::<Vec<_>>();
+
+    let now = Utc::now();
+    let mut deferred = Vec::new();
+    let mut ready = Vec::new();
+    for job in jobs {
+        if job.next_attempt_at.is_some_and(|ts| ts > now) {
+            deferred.push(job);
+        } else {
+            ready.push(job);
+        }
+    }
+    ready.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let mut processed = 0u32;
+    let mut remaining = Vec::new();
+    let mut stats = load_merge_refinement_worker_stats(config);
+
+    let split_at = config.async_memory.batch_size.min(ready.len());
+    let ready_tail = ready.split_off(split_at);
+    let to_process = ready;
+
+    for job in to_process {
+        match process_merge_refinement_job(config, job.clone()).await {
+            Ok(done) => {
+                processed += done;
+                stats.processed += done as u64;
+            }
+            Err(e) => {
+                tracing::warn!("merge_refinement worker job failed: {e}");
+                if job.attempts + 1 >= config.async_memory.max_retries {
+                    let _ = append_merge_refinement_dead_letter(config, &job, &e.to_string());
+                    stats.dead_lettered += 1;
+                } else {
+                    remaining.push(reschedule_merge_refinement_job(config, job));
+                    stats.requeued += 1;
+                }
+            }
+        }
+    }
+
+    remaining.extend(ready_tail);
+    remaining.extend(deferred);
+
+    if !remaining.is_empty() {
+        use std::io::Write;
+        let tmp_path = path.with_extension("jsonl.tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        for job in &remaining {
+            writeln!(file, "{}", serde_json::to_string(job)?)?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+    }
+
+    let _ = std::fs::remove_file(inflight);
+    stats.last_run_at = Some(Utc::now().to_rfc3339());
+    let _ = save_merge_refinement_worker_stats(config, &stats);
+    Ok(processed)
+}
+
+async fn process_merge_refinement_job(
+    config: &ReinConfig,
+    job: MergeRefinementJob,
+) -> anyhow::Result<u32> {
+    use crate::types::MemoryStore as _;
+    let store = config.open_store()?;
+    let memory = match store.get(&job.winner_id) {
+        Ok(m) => m,
+        Err(_) => {
+            // Memory may have been deleted — treat as success to avoid dead-letter spam.
+            tracing::debug!("merge_refinement: winner {} not found, skipping", job.winner_id);
+            return Ok(1);
+        }
+    };
+
+    // Only refine if the content actually contains merge markers.
+    if !memory.content.contains("[merged") {
+        return Ok(1);
+    }
+
+    let refined = crate::extract::llm::llm_refine_merged_content(config, &memory.content).await?;
+    if let Some(new_content) = refined {
+        if new_content != memory.content {
+            let mut updated = memory;
+            updated.content = new_content;
+            updated.summary = updated
+                .content
+                .chars()
+                .take(crate::types::SUMMARY_MAX_CHARS)
+                .collect();
+            updated.updated_at = chrono::Utc::now();
+            store.update(&updated)?;
+            tracing::info!(
+                "merge_refinement: synthesized memory {}",
+                job.winner_id
+            );
+        }
+    }
+    Ok(1)
+}
+
+fn read_merge_refinement_jobs(path: &std::path::Path) -> Vec<MergeRefinementJob> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn reschedule_merge_refinement_job(config: &ReinConfig, mut job: MergeRefinementJob) -> MergeRefinementJob {
+    let attempts = job.attempts + 1;
+    let exp = job.attempts.min(10);
+    let backoff = config
+        .async_memory
+        .base_backoff_ms
+        .saturating_mul(2u64.saturating_pow(exp));
+    job.attempts = attempts;
+    job.next_attempt_at = Some(Utc::now() + chrono::Duration::milliseconds(backoff as i64));
+    job
+}
+
+fn append_merge_refinement_dead_letter(
+    config: &ReinConfig,
+    job: &MergeRefinementJob,
+    error: &str,
+) -> anyhow::Result<()> {
+    let entry = serde_json::json!({
+        "job": job,
+        "error": error,
+        "failed_at": Utc::now().to_rfc3339(),
+    });
+    append_jsonl(&merge_refinement_dead_letter_path(config), &entry.to_string())
+}
+
+fn load_merge_refinement_worker_stats(config: &ReinConfig) -> WorkerStats {
+    let path = merge_refinement_stats_path(config);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return WorkerStats::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_merge_refinement_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result<()> {
+    let path = merge_refinement_stats_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(stats)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn merge_refinement_queue_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "merge_refinement_queue")
+}
+
+fn merge_refinement_inflight_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "merge_refinement_queue_inflight")
+}
+
+fn merge_refinement_lock_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "merge_refinement_queue_lock")
+}
+
+fn merge_refinement_dead_letter_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "merge_refinement_queue_dead")
+}
+
+fn merge_refinement_stats_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "merge_refinement_worker_stats")
+}
+
+fn merge_refinement_spawn_marker_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "merge_refinement_worker_spawn")
 }
 
 pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {

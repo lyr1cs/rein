@@ -200,9 +200,15 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
             }
             if incremental_mode {
                 // Bulk of this session's content was already extracted incrementally.
-                // Clear turns so we don't re-extract the full transcript again;
-                // episode synthesis will use the session summary + remaining tool_outputs.
-                session.turns.clear();
+                // Only clear turns when there is fallback content for episode synthesis
+                // (buffered tool outputs OR a compact_summary from Claude's compaction).
+                // If neither exists, keeping the turns prevents silently losing the episode
+                // record and any stop-time memories on sessions with no summary fields.
+                let has_fallback =
+                    !buffered.is_empty() || session.compact_summary.is_some();
+                if has_fallback {
+                    session.turns.clear();
+                }
             }
             let _ =
                 crate::ops::queue_ingest_session(config, &session, Some(&agent_label), is_subagent);

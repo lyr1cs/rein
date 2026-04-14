@@ -223,6 +223,11 @@ pub struct AdaptiveState {
     #[serde(default = "default_global_dedup_threshold")]
     pub global_dedup_threshold: f32,
 
+    /// M4 incremental: version stamp for cluster centroids stored in `cluster_centroids` table.
+    /// Callers compare this against what they last loaded to detect staleness.
+    #[serde(default)]
+    pub centroid_version: u64,
+
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
 }
@@ -332,17 +337,92 @@ impl AdaptiveState {
                     rusqlite::params![&json],
                 )?;
             } else {
-                // Version conflict — log warning, re-read and merge would be ideal,
-                // but for now just force-write (the concurrent writer already committed)
-                tracing::warn!(
-                    "adaptive state version conflict (expected v{}), force-saving v{}",
-                    self.version.saturating_sub(1),
-                    self.version
-                );
-                conn.execute(
-                    "UPDATE metadata SET value = ?1 WHERE key = 'adaptive_state'",
-                    rusqlite::params![&json],
-                )?;
+                // Version conflict — CAS retry loop: re-read, merge, write with
+                // version predicate.  Caps at 3 attempts to avoid infinite spin.
+                const MAX_CAS_RETRIES: u32 = 3;
+                for attempt in 0..MAX_CAS_RETRIES {
+                    let Some(mut current) = Self::restore_snapshot(conn) else {
+                        // Row vanished between existence check and read — insert ours
+                        let _ = conn.execute(
+                            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+                            rusqlite::params![&json],
+                        );
+                        break;
+                    };
+                    let db_version = current.version;
+
+                    tracing::warn!(
+                        "adaptive state version conflict (expected v{}, found v{db_version}), merge attempt {}",
+                        self.version.saturating_sub(1),
+                        attempt + 1,
+                    );
+
+                    // Cluster-scoped state: if we ran a recluster at the same or newer
+                    // version, replace wholesale to avoid resurrecting entries deleted
+                    // during recluster.  Two concurrent reclusters at the same version
+                    // would each increment once, so >= catches both cases.
+                    if self.cluster_version >= current.cluster_version {
+                        current.memory_clusters = self.memory_clusters.clone();
+                        current.dedup_thresholds = self.dedup_thresholds.clone();
+                        // Replace all cluster-scoped alpha keys (contain ':') with ours
+                        current.learned_alpha.retain(|k, _| !k.contains(':'));
+                        for (key, entry) in &self.learned_alpha {
+                            if key.contains(':') {
+                                current.learned_alpha.insert(key.clone(), entry.clone());
+                            }
+                        }
+                    } else {
+                        // Additive merge for memory_clusters and dedup_thresholds
+                        for (mid, &cid) in &self.memory_clusters {
+                            current.memory_clusters.insert(mid.clone(), cid);
+                        }
+                        for (&cid, &threshold) in &self.dedup_thresholds {
+                            current.dedup_thresholds.insert(cid, threshold);
+                        }
+                    }
+
+                    // Merge learned_alpha (non-cluster keys): prefer newer timestamp
+                    for (key, our_entry) in &self.learned_alpha {
+                        if key.contains(':') {
+                            continue; // handled above based on cluster_version
+                        }
+                        let dominated = current.learned_alpha.get(key).is_some_and(|theirs| {
+                            theirs.last_updated >= our_entry.last_updated
+                        });
+                        if !dominated {
+                            current.learned_alpha.insert(key.clone(), our_entry.clone());
+                        }
+                    }
+
+                    // Scalar fields
+                    current.cluster_version = current.cluster_version.max(self.cluster_version);
+                    current.centroid_version = current.centroid_version.max(self.centroid_version);
+                    current.hot_threshold = self.hot_threshold;
+                    current.cold_threshold = self.cold_threshold;
+                    current.global_dedup_threshold = self.global_dedup_threshold;
+                    current.version = db_version + 1;
+
+                    let merged_json = serde_json::to_string(&current)
+                        .map_err(ReinError::Serialization)?;
+
+                    // CAS write: only succeed if nobody else wrote since our read
+                    let cas_rows = conn.execute(
+                        "UPDATE metadata SET value = ?1
+                         WHERE key = 'adaptive_state'
+                         AND json_extract(value, '$.version') = ?2",
+                        rusqlite::params![&merged_json, db_version],
+                    )?;
+
+                    if cas_rows > 0 {
+                        break; // success
+                    }
+                    // Another writer snuck in — retry
+                    if attempt == MAX_CAS_RETRIES - 1 {
+                        return Err(crate::types::error::ReinError::Config(format!(
+                            "adaptive state: CAS failed after {MAX_CAS_RETRIES} attempts"
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -358,6 +438,109 @@ impl AdaptiveState {
             )
             .ok()?;
         serde_json::from_str(&json).ok()
+    }
+}
+
+// ── Cluster Centroid Persistence ─────────────────────────────────────────────
+
+/// Save cluster centroids to the `cluster_centroids` table (raw f32 LE bytes).
+/// Replaces all existing rows (full rewrite on each HDBSCAN run).
+pub fn save_cluster_centroids(
+    conn: &Connection,
+    centroids: &HashMap<u32, Vec<f32>>,
+    version: u64,
+    dims: usize,
+) -> ReinResult<()> {
+    // Atomic rewrite: delete + insert in a single transaction so concurrent readers
+    // never see a partially-written or empty centroid table.
+    conn.execute_batch("BEGIN")?;
+    conn.execute_batch("DELETE FROM cluster_centroids")?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO cluster_centroids (cluster_id, centroid, cluster_version, dims) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (&cluster_id, vec) in centroids {
+        let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        stmt.execute(rusqlite::params![cluster_id, blob, version as i64, dims as i64])?;
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok(())
+}
+
+/// Load cluster centroids from `cluster_centroids` table.
+/// `expected_dims`: if > 0, rows with a different `dims` value are silently skipped
+/// (prevents stale centroids from a prior embedding model from corrupting assignments).
+/// Returns empty map if table is missing, has no rows, or all rows have mismatched dims.
+pub fn load_cluster_centroids(conn: &Connection, expected_dims: usize) -> HashMap<u32, Vec<f32>> {
+    let mut out = HashMap::new();
+    let Ok(mut stmt) = conn
+        .prepare("SELECT cluster_id, centroid, dims FROM cluster_centroids")
+    else {
+        return out;
+    };
+    let _ = stmt
+        .query_map([], |row| {
+            let cid: u32 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let stored_dims: i64 = row.get(2)?;
+            Ok((cid, blob, stored_dims as usize))
+        })
+        .ok()
+        .map(|rows| {
+            for row in rows.flatten() {
+                let (cid, blob, stored_dims) = row;
+                // Skip centroids from a different embedding model / dimension
+                if expected_dims > 0 && stored_dims != expected_dims {
+                    tracing::debug!(
+                        "skipping cluster {cid} centroid: dims {stored_dims} != expected {expected_dims}"
+                    );
+                    continue;
+                }
+                let floats: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                out.insert(cid, floats);
+            }
+        });
+    out
+}
+
+/// Cosine similarity between two equal-length vectors. Returns 0.0 on zero-norm inputs.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Assign an embedding to the nearest stored cluster centroid.
+/// Requires `centroids` from `load_cluster_centroids`. Returns `None` if:
+/// - `centroids` is empty, or
+/// - best cosine similarity is ≤ 0.45 (embedding is an outlier / noise point).
+pub fn assign_to_nearest_centroid(
+    centroids: &HashMap<u32, Vec<f32>>,
+    embedding: &[f32],
+) -> Option<u32> {
+    if centroids.is_empty() {
+        return None;
+    }
+    let mut best_id = None;
+    let mut best_sim = f32::NEG_INFINITY;
+    for (&cluster_id, centroid) in centroids {
+        let sim = cosine_similarity(embedding, centroid);
+        if sim > best_sim {
+            best_sim = sim;
+            best_id = Some(cluster_id);
+        }
+    }
+    if best_sim > 0.45 {
+        best_id
+    } else {
+        None
     }
 }
 
