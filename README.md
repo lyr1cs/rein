@@ -555,17 +555,24 @@ Add to `~/.zshrc` or `~/.bashrc` for convenience:
 ```bash
 alias rein-proxy="rein serve --proxy &"
 alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
-alias codexp="codex -c 'openai_base_url=\"http://127.0.0.1:8690\"'"
+codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_proxy"' "$@"; }
 ```
 
 Then: `rein-proxy` to start, `claudep` or `codexp` to use.
 
 #### Codex CLI Config (alternative)
 
-Instead of environment variables, you can configure Codex CLI permanently in `~/.codex/config.toml`:
+Configure Codex CLI permanently in `~/.codex/config.toml` using a custom provider:
 
 ```toml
-openai_base_url = "http://127.0.0.1:8690"
+[model_providers.rein_proxy]
+name = "Rein Proxy"
+base_url = "http://127.0.0.1:8690/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+
+model_provider = "rein_proxy"
 ```
 
 This makes all Codex calls go through the rein proxy by default (requires proxy to be running).
@@ -575,7 +582,7 @@ This makes all Codex calls go through the rein proxy by default (requires proxy 
 | Agent | Configuration | Format |
 |-------|--------------|--------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
-| **Codex CLI** | `openai_base_url` in `~/.codex/config.toml` or `codex -c 'openai_base_url=\"...\"'` | OpenAI `/responses` |
+| **Codex CLI** | `codexp` shell function or custom `model_provider` in `~/.codex/config.toml` | OpenAI `/responses` |
 | **Cursor** | Settings > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | Settings > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **Any OpenAI-compatible** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
@@ -1281,17 +1288,24 @@ codex -c 'openai_base_url="http://127.0.0.1:8690"' "hello"   # Codex CLI
 ```bash
 alias rein-proxy="rein serve --proxy &"
 alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
-alias codexp="codex -c 'openai_base_url=\"http://127.0.0.1:8690\"'"
+codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_proxy"' "$@"; }
 ```
 
 然后：`rein-proxy` 启动代理，`claudep` 或 `codexp` 使用。
 
 #### Codex CLI 配置（替代方案）
 
-也可以直接在 `~/.codex/config.toml` 中永久配置，无需环境变量：
+也可以直接在 `~/.codex/config.toml` 中使用自定义 provider 永久配置：
 
 ```toml
-openai_base_url = "http://127.0.0.1:8690"
+[model_providers.rein_proxy]
+name = "Rein Proxy"
+base_url = "http://127.0.0.1:8690/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+
+model_provider = "rein_proxy"
 ```
 
 这样所有 Codex 调用默认走 rein proxy（需先启动 proxy）。
@@ -1301,7 +1315,7 @@ openai_base_url = "http://127.0.0.1:8690"
 | Agent | 配置方式 | API 格式 |
 |-------|---------|----------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
-| **Codex CLI** | `~/.codex/config.toml` 中 `openai_base_url` 或 `codex -c 'openai_base_url=\"...\"'` | OpenAI `/responses` |
+| **Codex CLI** | `codexp` shell 函数或 `~/.codex/config.toml` 中自定义 `model_provider` | OpenAI `/responses` |
 | **Cursor** | 设置 > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | 设置 > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **任何 OpenAI 兼容工具** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |

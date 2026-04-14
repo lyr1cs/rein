@@ -164,7 +164,7 @@ const PROXY_ALIASES: &[(&str, &str)] = &[
     ),
     (
         "codexp",
-        r#"alias codexp="REIN_PROXY_ACTIVE=1 codex -c 'openai_base_url=\"http://127.0.0.1:8690\"'""#,
+        r#"codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_proxy"' "$@"; }"#,
     ),
 ];
 
@@ -212,11 +212,16 @@ fn configure_shell_aliases(rc_path: &Path, dry_run: bool) -> anyhow::Result<()> 
 
     for (name, expected_line) in PROXY_ALIASES {
         let alias_prefix = format!("alias {name}=");
+        let fn_prefix = format!("{name}()");
 
-        // Find existing alias line
+        // Find existing alias or function definition line (handles old alias format too).
+        // Note: all rein proxy definitions are single-line (alias or function body on one line).
+        // Multi-line function bodies are not supported by this updater; users with multi-line
+        // definitions should edit their shell rc manually.
         let existing_idx = lines.iter().position(|l| {
             let trimmed = l.trim();
-            !trimmed.starts_with('#') && trimmed.starts_with(&alias_prefix)
+            !trimmed.starts_with('#')
+                && (trimmed.starts_with(&alias_prefix) || trimmed.starts_with(&fn_prefix))
         });
 
         match existing_idx {
