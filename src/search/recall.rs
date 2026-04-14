@@ -609,39 +609,39 @@ pub fn recall_temporal_with_request_id(
             }
         }
 
-        // KG: per-query (local concept FTS + BFS)
-        for eq in &deduped_queries {
-            let seed_concepts = store.search_all_concepts(eq, 5).unwrap_or_default();
-            let concept_results = crate::search::kg_search::search_concepts_ranked_from(
-                &seed_concepts,
-                effective_limit,
-            );
-            let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
-            let bfs_expanded = if !seed_ids.is_empty() {
-                crate::search::kg_search::bfs_expand_memories_by_id(
-                    store,
-                    &seed_ids,
-                    2,
-                    effective_limit,
-                )
-            } else {
-                vec![]
-            };
-            for (id, score) in concept_results.into_iter().chain(bfs_expanded.into_iter()) {
+        // KG: parallel per expanded query (each opens its own SqliteStore)
+        // For 2-3 expanded queries this cuts latency from O(n * kg_time) to O(kg_time).
+        let kg_handles: Vec<_> = deduped_queries
+            .iter()
+            .map(|eq| {
+                let eq_str = (*eq).clone();
+                let db_path = store.db_path().to_path_buf();
+                let model = config.embedding_model();
+                let dims = config.embedding.dimensions;
+                let limit = effective_limit;
+                let is_ep = kg_is_episodic;
+                let t_from = time_from;
+                let t_to = time_to;
+                std::thread::spawn(move || {
+                    let Ok(s) = SqliteStore::new(&db_path, &model, dims) else {
+                        return (
+                            std::collections::HashMap::<String, f32>::new(),
+                            std::collections::HashMap::<String, f32>::new(),
+                        );
+                    };
+                    run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to)
+                })
+            })
+            .collect();
+        for handle in kg_handles {
+            let (kg, ep) = handle.join().unwrap_or_default();
+            for (id, score) in kg {
                 let entry = kg_scores.entry(id).or_default();
                 *entry = entry.max(score);
             }
-
-            if strategy.query_type == crate::search::classify::QueryType::Episodic
-                || time_from.is_some()
-                || time_to.is_some()
-            {
-                for (id, score) in
-                    collect_episode_memory_scores(store, eq, effective_limit, time_from, time_to)
-                {
-                    let entry = episode_scores.entry(id).or_default();
-                    *entry = entry.max(score);
-                }
+            for (id, score) in ep {
+                let entry = episode_scores.entry(id).or_default();
+                *entry = entry.max(score);
             }
         }
     }
