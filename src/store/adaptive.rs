@@ -313,11 +313,13 @@ impl AdaptiveState {
         let json = serde_json::to_string(self).map_err(ReinError::Serialization)?;
 
         // Optimistic concurrency: only update if version hasn't changed since we loaded
+        // COALESCE so malformed/missing JSON reads as -1 rather than NULL
+        // (NULL = ?2 would be untrue, forcing a spurious retry).
         let rows = conn.execute(
             "UPDATE metadata SET value = ?1
              WHERE key = 'adaptive_state'
-             AND (value IS NULL OR json_extract(value, '$.version') = ?2 OR json_extract(value, '$.version') IS NULL)",
-            rusqlite::params![&json, self.version.saturating_sub(1)],
+             AND (value IS NULL OR COALESCE(json_extract(value, '$.version'), -1) = ?2)",
+            rusqlite::params![&json, self.version.saturating_sub(1) as i64],
         )?;
 
         if rows == 0 {
@@ -386,9 +388,10 @@ impl AdaptiveState {
                         if key.contains(':') {
                             continue; // handled above based on cluster_version
                         }
-                        let dominated = current.learned_alpha.get(key).is_some_and(|theirs| {
-                            theirs.last_updated >= our_entry.last_updated
-                        });
+                        let dominated = current
+                            .learned_alpha
+                            .get(key)
+                            .is_some_and(|theirs| theirs.last_updated >= our_entry.last_updated);
                         if !dominated {
                             current.learned_alpha.insert(key.clone(), our_entry.clone());
                         }
@@ -402,15 +405,16 @@ impl AdaptiveState {
                     current.global_dedup_threshold = self.global_dedup_threshold;
                     current.version = db_version + 1;
 
-                    let merged_json = serde_json::to_string(&current)
-                        .map_err(ReinError::Serialization)?;
+                    let merged_json =
+                        serde_json::to_string(&current).map_err(ReinError::Serialization)?;
 
-                    // CAS write: only succeed if nobody else wrote since our read
+                    // CAS write: only succeed if nobody else wrote since our read.
+                    // COALESCE so a malformed JSON in the row doesn't silently skip the update.
                     let cas_rows = conn.execute(
                         "UPDATE metadata SET value = ?1
                          WHERE key = 'adaptive_state'
-                         AND json_extract(value, '$.version') = ?2",
-                        rusqlite::params![&merged_json, db_version],
+                         AND COALESCE(json_extract(value, '$.version'), -1) = ?2",
+                        rusqlite::params![&merged_json, db_version as i64],
                     )?;
 
                     if cas_rows > 0 {
@@ -418,8 +422,14 @@ impl AdaptiveState {
                     }
                     // Another writer snuck in — retry
                     if attempt == MAX_CAS_RETRIES - 1 {
+                        tracing::error!(
+                            attempts = MAX_CAS_RETRIES,
+                            db_version,
+                            our_version = self.version,
+                            "adaptive state: CAS failed — last observed db_version shown"
+                        );
                         return Err(crate::types::error::ReinError::Config(format!(
-                            "adaptive state: CAS failed after {MAX_CAS_RETRIES} attempts"
+                            "adaptive state: CAS failed after {MAX_CAS_RETRIES} attempts (last db_version={db_version})"
                         )));
                     }
                 }
@@ -460,7 +470,12 @@ pub fn save_cluster_centroids(
     )?;
     for (&cluster_id, vec) in centroids {
         let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
-        stmt.execute(rusqlite::params![cluster_id, blob, version as i64, dims as i64])?;
+        stmt.execute(rusqlite::params![
+            cluster_id,
+            blob,
+            version as i64,
+            dims as i64
+        ])?;
     }
     conn.execute_batch("COMMIT")?;
     Ok(())
@@ -472,8 +487,7 @@ pub fn save_cluster_centroids(
 /// Returns empty map if table is missing, has no rows, or all rows have mismatched dims.
 pub fn load_cluster_centroids(conn: &Connection, expected_dims: usize) -> HashMap<u32, Vec<f32>> {
     let mut out = HashMap::new();
-    let Ok(mut stmt) = conn
-        .prepare("SELECT cluster_id, centroid, dims FROM cluster_centroids")
+    let Ok(mut stmt) = conn.prepare("SELECT cluster_id, centroid, dims FROM cluster_centroids")
     else {
         return out;
     };

@@ -386,7 +386,7 @@ pub fn detect_strong_signal(fts_ranked: &[(String, f32)]) -> bool {
     let top2 = scores[1];
 
     // Strong signal: top1 is at least 1.5x the runner-up
-    if top2 > 0.0 && top1 / top2 >= 1.5 {
+    if top2.is_finite() && top1.is_finite() && top2 > 0.0 && top1 / top2 >= 1.5 {
         tracing::debug!(
             top1,
             top2,

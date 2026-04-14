@@ -1,12 +1,14 @@
 const BASE = '';
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = localStorage.getItem('rein_token') || '';
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const needsMutationMarker = !['GET', 'HEAD'].includes(method);
   const res = await fetch(`${BASE}${path}`, {
     ...init,
+    credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(needsMutationMarker ? { 'x-rein-action': '1' } : {}),
       ...init?.headers,
     },
   });
@@ -17,7 +19,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
-export const apiGet = <T>(path: string) => api<T>(path);
+export const apiGet = <T>(path: string, init?: RequestInit) => api<T>(path, init);
 export const apiPost = <T>(path: string, body: unknown) =>
   api<T>(path, { method: 'POST', body: JSON.stringify(body) });
 export const apiPut = <T>(path: string, body: unknown) =>

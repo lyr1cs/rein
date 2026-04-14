@@ -965,17 +965,29 @@ impl ReinConfig {
 
         // Validate search config
         if self.search.cc_alpha < 0.0 || self.search.cc_alpha > 1.0 {
-            anyhow::bail!("search.cc_alpha must be in [0.0, 1.0], got {}", self.search.cc_alpha);
+            anyhow::bail!(
+                "search.cc_alpha must be in [0.0, 1.0], got {}",
+                self.search.cc_alpha
+            );
         }
         if self.search.dedup_similarity < 0.0 || self.search.dedup_similarity > 1.0 {
-            anyhow::bail!("search.dedup_similarity must be in [0.0, 1.0], got {}", self.search.dedup_similarity);
+            anyhow::bail!(
+                "search.dedup_similarity must be in [0.0, 1.0], got {}",
+                self.search.dedup_similarity
+            );
         }
         // Validate decay config
         if self.decay.base_lambda <= 0.0 {
-            anyhow::bail!("decay.base_lambda must be positive, got {}", self.decay.base_lambda);
+            anyhow::bail!(
+                "decay.base_lambda must be positive, got {}",
+                self.decay.base_lambda
+            );
         }
         if self.decay.prune_threshold < 0.0 {
-            anyhow::bail!("decay.prune_threshold must be non-negative, got {}", self.decay.prune_threshold);
+            anyhow::bail!(
+                "decay.prune_threshold must be non-negative, got {}",
+                self.decay.prune_threshold
+            );
         }
         // Validate embedding dimensions
         if self.embedding.dimensions == 0 {
@@ -1304,7 +1316,10 @@ unknown_knob = true
             .map(|d| d.config_dir().join("config.toml").exists())
             .unwrap_or(false);
         if !xdg.exists() && !dot_rein.exists() && !native_exists {
-            assert_eq!(path, xdg, "Default should be XDG path when no config exists");
+            assert_eq!(
+                path, xdg,
+                "Default should be XDG path when no config exists"
+            );
         }
     }
 
@@ -1324,9 +1339,25 @@ api_key = "test-expand-key"
 api_key = "test-sync-key"
 "#;
         let cfg = ReinConfig::load_from_str(toml_str).expect("merge should succeed");
-        assert_eq!(cfg.embedding.google.api_key.as_deref(), Some("test-embed-key"), "embedding api_key lost");
-        assert_eq!(cfg.extract.google.api_key.as_deref(), Some("test-extract-key"), "extract api_key lost");
-        assert_eq!(cfg.query_expansion.google.api_key.as_deref(), Some("test-expand-key"), "expand api_key lost");
-        assert_eq!(cfg.sync.api_key.as_deref(), Some("test-sync-key"), "sync api_key lost");
+        assert_eq!(
+            cfg.embedding.google.api_key.as_deref(),
+            Some("test-embed-key"),
+            "embedding api_key lost"
+        );
+        assert_eq!(
+            cfg.extract.google.api_key.as_deref(),
+            Some("test-extract-key"),
+            "extract api_key lost"
+        );
+        assert_eq!(
+            cfg.query_expansion.google.api_key.as_deref(),
+            Some("test-expand-key"),
+            "expand api_key lost"
+        );
+        assert_eq!(
+            cfg.sync.api_key.as_deref(),
+            Some("test-sync-key"),
+            "sync api_key lost"
+        );
     }
 }

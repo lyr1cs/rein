@@ -40,17 +40,20 @@ fn is_chinese_query(query: &str) -> bool {
     if total == 0 {
         return false;
     }
-    let cjk_count = query.chars().filter(|c| {
-        matches!(*c as u32,
-            0x4E00..=0x9FFF |   // CJK Unified Ideographs
-            0x3400..=0x4DBF |   // CJK Extension A
-            0x20000..=0x2A6DF | // CJK Extension B
-            0x2A700..=0x2B73F | // CJK Extension C
-            0x2B740..=0x2B81F | // CJK Extension D
-            0x2B820..=0x2CEAF | // CJK Extension E
-            0x2CEB0..=0x2EBEF   // CJK Extension F
-        )
-    }).count();
+    let cjk_count = query
+        .chars()
+        .filter(|c| {
+            matches!(*c as u32,
+                0x4E00..=0x9FFF |   // CJK Unified Ideographs
+                0x3400..=0x4DBF |   // CJK Extension A
+                0x20000..=0x2A6DF | // CJK Extension B
+                0x2A700..=0x2B73F | // CJK Extension C
+                0x2B740..=0x2B81F | // CJK Extension D
+                0x2B820..=0x2CEAF | // CJK Extension E
+                0x2CEB0..=0x2EBEF   // CJK Extension F
+            )
+        })
+        .count();
     cjk_count * 10 > total * 3 // > 30%, integer arithmetic avoids float
 }
 
@@ -353,9 +356,13 @@ fn parse_expansion_response(content: &str, max: usize) -> ReinResult<Vec<String>
 
 /// Strip thinking tags and markdown code fences from LLM output.
 fn strip_code_fences(s: &str) -> String {
-    // Strip Qwen3 <think>...</think> reasoning blocks
-    let s = if let Some(idx) = s.find("</think>") {
-        s[idx + 8..].trim()
+    // Strip Qwen3 <think>...</think> reasoning blocks (handle possibly multiple blocks).
+    // Use rfind to take content after the LAST </think>, which is safe for nested/repeated tags.
+    // "</think>" is pure ASCII so byte-offset slicing is UTF-8 safe, but we still use
+    // strip_prefix on the remaining suffix defensively.
+    let s = if let Some(idx) = s.rfind("</think>") {
+        const TAG_LEN: usize = "</think>".len();
+        s.get(idx + TAG_LEN..).unwrap_or("").trim()
     } else {
         s.trim()
     };
@@ -415,7 +422,7 @@ mod tests {
     #[test]
     fn test_is_chinese_query() {
         assert!(is_chinese_query("怎么实现增量索引"));
-        assert!(is_chinese_query("记忆衰减 decay"));  // mixed but >30% CJK
+        assert!(is_chinese_query("记忆衰减 decay")); // mixed but >30% CJK
         assert!(!is_chinese_query("memory decay algorithm"));
         assert!(!is_chinese_query(""));
     }

@@ -86,9 +86,7 @@ impl TantivyFts {
         };
 
         // Register the jieba tokenizer so the index (and QueryParser) can use it
-        index
-            .tokenizers()
-            .register(TOKENIZER_NAME, JiebaTokenizer);
+        index.tokenizers().register(TOKENIZER_NAME, JiebaTokenizer);
 
         // Re-derive field handles from the opened index's schema
         let opened_schema = index.schema();

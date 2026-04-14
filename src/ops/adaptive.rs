@@ -139,14 +139,11 @@ fn run_hdbscan_clustering(
     // Read all embeddings — hdbscan() internally handles sampling for n > 3000
     // Cap at 10000 to avoid excessive memory use even with sampling
     let load_limit = count.min(10_000);
-    let embeddings: Vec<(String, Vec<f32>)> = match store
-        .conn()
-        .prepare(
-            "SELECT vm.id, vm.embedding FROM vec_memories vm
+    let embeddings: Vec<(String, Vec<f32>)> = match store.conn().prepare(
+        "SELECT vm.id, vm.embedding FROM vec_memories vm
              JOIN memories m ON m.id = vm.id
              LIMIT ?1",
-        )
-    {
+    ) {
         Ok(mut stmt) => stmt
             .query_map(rusqlite::params![load_limit as i64], |row| {
                 let id: String = row.get(0)?;
@@ -222,8 +219,7 @@ fn run_hdbscan_clustering(
                 cluster_points.entry(*cluster_id).or_default().push(i);
             }
         }
-        let mut c: std::collections::HashMap<u32, Vec<f32>> =
-            std::collections::HashMap::new();
+        let mut c: std::collections::HashMap<u32, Vec<f32>> = std::collections::HashMap::new();
         for (cluster_id, indices) in &cluster_points {
             let centroid = compute_cluster_centroid(indices, &embeddings, dim);
             c.insert(*cluster_id, centroid);
@@ -256,23 +252,19 @@ fn run_hdbscan_clustering(
 
         // NULL out stale cluster_ids for non-sampled memories only.
         // Build a temp table from the known sampled IDs for an exact match.
-        if let Err(e) = store.conn().execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _hdbscan_sampled (id TEXT PRIMARY KEY)",
-        ) {
-            tracing::warn!("M4: failed to create temp table: {e}");
-        }
         if let Err(e) = store
             .conn()
-            .execute("DELETE FROM _hdbscan_sampled", [])
+            .execute_batch("CREATE TEMP TABLE IF NOT EXISTS _hdbscan_sampled (id TEXT PRIMARY KEY)")
         {
+            tracing::warn!("M4: failed to create temp table: {e}");
+        }
+        if let Err(e) = store.conn().execute("DELETE FROM _hdbscan_sampled", []) {
             tracing::warn!("M4: failed to clear temp table: {e}");
         }
         {
             let mut ins = store
                 .conn()
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO _hdbscan_sampled (id) VALUES (?1)",
-                )
+                .prepare_cached("INSERT OR IGNORE INTO _hdbscan_sampled (id) VALUES (?1)")
                 .ok();
             if let Some(ref mut stmt) = ins {
                 for id in &clustered_ids {
@@ -310,18 +302,15 @@ fn run_hdbscan_clustering(
                 )
                 .ok()
                 .and_then(|mut stmt| {
-                    stmt.query_map(
-                        rusqlite::params![&cursor, reassign_batch_size],
-                        |row| {
-                            let id: String = row.get(0)?;
-                            let blob: Vec<u8> = row.get(1)?;
-                            let floats: Vec<f32> = blob
-                                .chunks_exact(4)
-                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                .collect();
-                            Ok((id, floats))
-                        },
-                    )
+                    stmt.query_map(rusqlite::params![&cursor, reassign_batch_size], |row| {
+                        let id: String = row.get(0)?;
+                        let blob: Vec<u8> = row.get(1)?;
+                        let floats: Vec<f32> = blob
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        Ok((id, floats))
+                    })
                     .ok()
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 })
@@ -366,9 +355,7 @@ fn run_hdbscan_clustering(
         }
 
         if reassigned > 0 {
-            tracing::info!(
-                "M4: reassigned {reassigned} non-sampled memories via nearest centroid"
-            );
+            tracing::info!("M4: reassigned {reassigned} non-sampled memories via nearest centroid");
         }
     }
 
@@ -818,7 +805,14 @@ fn compute_counterfactual_alphas(
         .filter_map(|se| se.request_id.as_deref().zip(se.query_type.as_deref()))
         .collect();
 
-    for qt in &["episodic", "temporal", "preference", "exact", "semantic", "exploratory"] {
+    for qt in &[
+        "episodic",
+        "temporal",
+        "preference",
+        "exact",
+        "semantic",
+        "exploratory",
+    ] {
         let qt_events: Vec<_> = events_with_access
             .iter()
             .filter(|e| qt_map.get(e.request_id.as_str()).copied() == Some(qt))
@@ -890,8 +884,7 @@ fn compute_counterfactual_alphas(
         if events.len() < config.adaptive.min_samples_alpha {
             continue;
         }
-        if let Some(learned) =
-            crate::search::alpha_optimizer::optimize_alpha(events, decay_lambda)
+        if let Some(learned) = crate::search::alpha_optimizer::optimize_alpha(events, decay_lambda)
         {
             // Shrink toward the query-type level alpha (or global as fallback)
             let parent_alpha = state

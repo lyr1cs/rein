@@ -3,6 +3,7 @@
 //! Also serves the embedded SPA when the `gui` feature is enabled.
 
 use bytes::Bytes;
+use chrono::TimeZone;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode};
@@ -12,6 +13,7 @@ use crate::config::ReinConfig;
 use crate::types::MemoryStore; // for store.delete()
 
 type BoxedResponse = Response<BoxBody<Bytes, std::convert::Infallible>>;
+const HTTP_SESSION_COOKIE: &str = "rein_http_token";
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> BoxedResponse {
     let json_bytes = serde_json::to_vec(&body).unwrap_or_default();
@@ -34,6 +36,38 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> BoxedResponse {
 
 fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
     json_response(status, json!({ "error": msg }))
+}
+
+fn session_cookie_value(token: &str) -> String {
+    format!("{HTTP_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/api/")
+}
+
+fn clear_session_cookie_value() -> String {
+    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=0")
+}
+
+fn json_response_with_cookie(
+    status: StatusCode,
+    body: serde_json::Value,
+    cookie: &str,
+) -> BoxedResponse {
+    let json_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("set-cookie", cookie)
+        .body(
+            Full::new(Bytes::from(json_bytes))
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed(),
+        )
+        .unwrap_or_else(|_| {
+            Response::new(
+                Full::new(Bytes::from(r#"{"error":"internal"}"#))
+                    .map_err(|never: std::convert::Infallible| match never {})
+                    .boxed(),
+            )
+        })
 }
 
 fn parse_bounded_usize(
@@ -120,7 +154,7 @@ pub async fn handle_rest_request<B>(
 
     // Only intercept /api/* and GUI asset paths
     if path.starts_with("/api/") {
-        Some(handle_api(method, path, req.uri(), config).await)
+        Some(handle_api(req, method, path, req.uri(), config).await)
     } else if config.server.gui_enabled && !path.starts_with("/mcp") {
         Some(serve_gui(path))
     } else {
@@ -128,7 +162,24 @@ pub async fn handle_rest_request<B>(
     }
 }
 
-async fn handle_api(
+fn require_mutation_marker<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
+    let marker = req
+        .headers()
+        .get("x-rein-action")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if marker == "1" {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "mutation requests require x-rein-action: 1",
+        ))
+    }
+}
+
+async fn handle_api<B>(
+    req: &Request<B>,
     method: &Method,
     path: &str,
     uri: &hyper::Uri,
@@ -144,15 +195,40 @@ async fn handle_api(
         (&Method::GET, "/api/recent") => api_recent(config, &query),
         (&Method::GET, "/api/adaptive") => api_adaptive(config),
         (&Method::GET, "/api/health") => api_health(config, &query),
-        (&Method::GET, "/api/doctor") => api_doctor(config, &query),
+        (&Method::GET, "/api/doctor") => {
+            if query
+                .get("fix")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false)
+            {
+                error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "doctor fixes require POST /api/doctor?fix=true",
+                )
+            } else {
+                api_doctor(config, &query)
+            }
+        }
+        (&Method::POST, "/api/doctor") => match require_mutation_marker(req) {
+            Ok(()) => api_doctor(config, &query),
+            Err(response) => response,
+        },
+        (&Method::POST, "/api/session") => match require_mutation_marker(req) {
+            Ok(()) => api_create_session(),
+            Err(response) => response,
+        },
+        (&Method::DELETE, "/api/session") => match require_mutation_marker(req) {
+            Ok(()) => api_clear_session(),
+            Err(response) => response,
+        },
         (&Method::GET, p)
             if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" =>
         {
             api_recall(config, &query)
         }
         (&Method::GET, p) if p.starts_with("/api/memories/") => {
-            let id = &p["/api/memories/".len()..];
-            api_get_memory(config, id)
+            let id = percent_decode(&p["/api/memories/".len()..]);
+            api_get_memory(config, &id)
         }
         (&Method::GET, "/api/memoirs") => api_memoirs(config),
         (&Method::GET, p) if p.starts_with("/api/memoirs/") => {
@@ -162,14 +238,19 @@ async fn handle_api(
         (&Method::GET, "/api/episodes") => api_episodes(config, &query),
         (&Method::GET, "/api/artifacts") => api_artifacts(config, &query),
         (&Method::GET, p) if p.starts_with("/api/artifacts/") => {
-            let id = &p["/api/artifacts/".len()..];
-            api_artifact_detail(config, id, &query)
+            let id = percent_decode(&p["/api/artifacts/".len()..]);
+            api_artifact_detail(config, &id, &query)
         }
 
         // --- Mutation endpoints (placeholder for Phase 2) ---
         (&Method::DELETE, p) if p.starts_with("/api/memories/") => {
-            let id = &p["/api/memories/".len()..];
-            api_forget(config, id)
+            match require_mutation_marker(req) {
+                Ok(()) => {
+                    let id = percent_decode(&p["/api/memories/".len()..]);
+                    api_forget(config, &id)
+                }
+                Err(response) => response,
+            }
         }
 
         _ => error_response(StatusCode::NOT_FOUND, "unknown API endpoint"),
@@ -197,7 +278,7 @@ fn handle_memoir_path(
             };
             return api_memoir_inspect(config, name, &concept, depth);
         }
-        api_memoir_show(config, name)
+        error_response(StatusCode::NOT_FOUND, "unknown memoir API endpoint")
     } else {
         let decoded = percent_decode(rest);
         api_memoir_show(config, &decoded)
@@ -415,12 +496,7 @@ fn api_doctor(
                 .build()
             {
                 Ok(rt) => rt,
-                Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &e.to_string(),
-                    )
-                }
+                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             };
             rt.block_on(crate::doctor::run(
                 config,
@@ -428,7 +504,35 @@ fn api_doctor(
             ))
         }
     };
-    json_response(StatusCode::OK, serde_json::to_value(report).unwrap_or_else(|_| json!({})))
+    json_response(
+        StatusCode::OK,
+        serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+    )
+}
+
+fn api_create_session() -> BoxedResponse {
+    let token = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    match token {
+        Some(token) => json_response_with_cookie(
+            StatusCode::OK,
+            json!({ "authenticated": true }),
+            &session_cookie_value(&token),
+        ),
+        None => error_response(
+            StatusCode::BAD_REQUEST,
+            "REIN_HTTP_TOKEN is not configured on this server",
+        ),
+    }
+}
+
+fn api_clear_session() -> BoxedResponse {
+    json_response_with_cookie(
+        StatusCode::OK,
+        json!({ "authenticated": false }),
+        &clear_session_cookie_value(),
+    )
 }
 
 fn api_recall(
@@ -564,6 +668,9 @@ fn api_memoir_show(config: &ReinConfig, name: &str) -> BoxedResponse {
 }
 
 fn api_memoir_export(config: &ReinConfig, name: &str, format: &str) -> BoxedResponse {
+    if !matches!(format, "json" | "ascii" | "dot") {
+        return error_response(StatusCode::BAD_REQUEST, "invalid export format");
+    }
     let store = match config.open_store() {
         Ok(s) => s,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -875,7 +982,13 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .ok()
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .map(|dt| dt.and_utc())
+                .and_then(|dt| {
+                    chrono::Local
+                        .from_local_datetime(&dt)
+                        .single()
+                        .or_else(|| chrono::Local.from_local_datetime(&dt).earliest())
+                })
+                .map(|dt| dt.with_timezone(&chrono::Utc))
         })
 }
 
@@ -887,7 +1000,13 @@ fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .ok()
                 .and_then(|d| d.and_hms_opt(23, 59, 59))
-                .map(|dt| dt.and_utc())
+                .and_then(|dt| {
+                    chrono::Local
+                        .from_local_datetime(&dt)
+                        .single()
+                        .or_else(|| chrono::Local.from_local_datetime(&dt).latest())
+                })
+                .map(|dt| dt.with_timezone(&chrono::Utc))
         })
 }
 
