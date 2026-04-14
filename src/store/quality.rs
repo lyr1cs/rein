@@ -301,13 +301,16 @@ impl SqliteStore {
 
                 // JSON-quoted match with LIKE wildcard escaping
                 let escaped_cid = concept.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                // Count all active memories that reference this concept via concept_ids.
+                // We protect any concept with at least one active reference, regardless of
+                // how many source_memory_ids the concept tracks — those may be stale after
+                // STM prune removed memories without updating concept.source_memory_ids.
                 let external_ref_count: i64 = self.conn.query_row(
                     "SELECT COUNT(*) FROM memories WHERE concept_ids LIKE ?1 ESCAPE '\\'",
                     rusqlite::params![format!("%\"{}\"%", escaped_cid)],
                     |r| r.get(0),
                 ).unwrap_or(0);
-                let external_refs = external_ref_count as usize > concept.source_memory_ids.len();
-                if external_refs {
+                if external_ref_count > 0 {
                     continue;
                 }
 

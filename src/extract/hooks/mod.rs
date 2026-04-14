@@ -17,7 +17,10 @@ pub mod working_set;
 
 use crate::config::ReinConfig;
 
-use self::buffer::*;
+use self::buffer::{
+    adaptive_flush_threshold, append_to_buffer, cleanup_stale_buffers, clear_flush_marker,
+    flush_count, mark_flushed, read_and_clear_buffer, session_buffer_path,
+};
 use self::parsing::*;
 use self::queue::*;
 use self::scoring::{extract_signal_windows, worth_extracting};
@@ -96,6 +99,8 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                         combined,
                     ) {
                         eprintln!("rein: failed to queue memory job: {e}");
+                    } else {
+                        mark_flushed(&buf_path);
                     }
                     spawn_memory_worker(config);
                 }
@@ -178,15 +183,61 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
     }
 
     let buf_path = session_buffer_path(config, &input);
+    let prior_flushes = flush_count(&buf_path);
     let buffered = read_and_clear_buffer(&buf_path);
+    clear_flush_marker(&buf_path);
+
+    // When mid-session flushes already extracted the bulk of this session's content,
+    // skip re-extracting the full transcript to avoid duplication.
+    // Instead: only process the remaining buffered content (since last flush) +
+    // episode synthesis (which reads session metadata, not raw transcript text).
+    let incremental_mode = prior_flushes > 0;
 
     if has_llm {
         if let Some(mut session) = extract_hook_session_ingest(&input) {
             if !buffered.is_empty() {
                 session.tool_outputs = buffered.clone();
             }
+            if incremental_mode {
+                // Bulk of this session's content was already extracted incrementally.
+                // Clear turns so we don't re-extract the full transcript again;
+                // episode synthesis will use the session summary + remaining tool_outputs.
+                session.turns.clear();
+            }
             let _ =
                 crate::ops::queue_ingest_session(config, &session, Some(&agent_label), is_subagent);
+        } else if incremental_mode {
+            // Session was already extracted incrementally; only process remaining buffer.
+            if !buffered.is_empty() {
+                let combined = buffered
+                    .iter()
+                    .filter(|t| !looks_like_secret(t))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+                if !combined.is_empty() {
+                    let priority = if is_subagent { 25 } else { 60 };
+                    if let Err(e) = queue_memory_job(
+                        config,
+                        MemoryJobMode::Quick,
+                        "hook_stop_incremental",
+                        if is_subagent {
+                            "source:subagent"
+                        } else {
+                            "source:main-agent"
+                        },
+                        agent_label.clone(),
+                        is_subagent,
+                        priority,
+                        None,
+                        combined,
+                    ) {
+                        eprintln!("rein: failed to queue incremental session tail: {e}");
+                    } else {
+                        spawn_memory_worker(config);
+                    }
+                }
+            }
         } else {
             let combined = if buffered.is_empty() {
                 text.lines()
