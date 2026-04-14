@@ -224,11 +224,7 @@ fn overall_label(status: ReportStatus) -> &'static str {
     }
 }
 
-fn ok_in(
-    category: DoctorCategory,
-    name: &'static str,
-    message: impl Into<String>,
-) -> DoctorCheck {
+fn ok_in(category: DoctorCategory, name: &'static str, message: impl Into<String>) -> DoctorCheck {
     DoctorCheck {
         name,
         category,
@@ -333,7 +329,11 @@ fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
                 config.embedding.dimensions
             ),
         ),
-        Provider::None => ok_in(DoctorCategory::Configuration, "embedding_provider", "disabled"),
+        Provider::None => ok_in(
+            DoctorCategory::Configuration,
+            "embedding_provider",
+            "disabled",
+        ),
     }
 }
 
@@ -359,7 +359,11 @@ fn check_extract_provider(config: &ReinConfig) -> DoctorCheck {
                 config.extract.omlx.model, config.extract.omlx.endpoint
             ),
         ),
-        Provider::None => ok_in(DoctorCategory::Configuration, "extract_provider", "disabled"),
+        Provider::None => ok_in(
+            DoctorCategory::Configuration,
+            "extract_provider",
+            "disabled",
+        ),
     }
 }
 
@@ -440,10 +444,16 @@ fn check_supermemory(config: &ReinConfig) -> DoctorCheck {
 
 fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
     if !config.server.sse_enabled && !config.server.gui_enabled {
-        return ok_in(DoctorCategory::Configuration, "http_auth", "HTTP/SSE disabled");
+        return ok_in(
+            DoctorCategory::Configuration,
+            "http_auth",
+            "HTTP/SSE disabled",
+        );
     }
 
-    let token_present = std::env::var("REIN_HTTP_TOKEN").ok().is_some();
+    let token_present = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .is_some_and(|token| !token.trim().is_empty());
     let is_loopback = is_loopback_bind(&config.server.sse_bind);
     let allow_unauth = config.server.allow_unauthenticated_loopback && is_loopback;
 
@@ -481,7 +491,12 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
 fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
     let token_present = std::env::var("REIN_PROXY_TOKEN")
         .ok()
-        .or_else(|| std::env::var("REIN_HTTP_TOKEN").ok())
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            std::env::var("REIN_HTTP_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        })
         .is_some();
     let is_loopback = is_loopback_bind(&config.proxy.bind);
     let allow_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
@@ -542,13 +557,11 @@ fn runtime_status_check(
                 name,
                 format!("running on :{port} with PID {pid}"),
             ),
-            RuntimeProbe::Ok(extra) => {
-                ok_in(
-                    DoctorCategory::Runtime,
-                    name,
-                    format!("running on :{port} with PID {pid}; {extra}"),
-                )
-            }
+            RuntimeProbe::Ok(extra) => ok_in(
+                DoctorCategory::Runtime,
+                name,
+                format!("running on :{port} with PID {pid}; {extra}"),
+            ),
             RuntimeProbe::Warn(extra) => warn_in(
                 DoctorCategory::Runtime,
                 name,
@@ -775,7 +788,11 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
     let dirty = warmup::tantivy_dirty_path(db_path).exists();
 
     if active_memories == 0 && !index_path.exists() {
-        return ok_in(DoctorCategory::Index, "tantivy", "not built yet (0 active memories)");
+        return ok_in(
+            DoctorCategory::Index,
+            "tantivy",
+            "not built yet (0 active memories)",
+        );
     }
     if !index_path.exists() {
         return warn_with_hint(
@@ -789,7 +806,10 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
         Ok(_) if dirty => warn_with_hint(
             DoctorCategory::Index,
             "tantivy",
-            format!("index opened at {} but dirty marker is present", index_path.display()),
+            format!(
+                "index opened at {} but dirty marker is present",
+                index_path.display()
+            ),
             "run `rein doctor --fix` or `rein warmup`",
         ),
         Ok(_) => ok_in(
@@ -862,7 +882,10 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
                     Some(index.len()),
                 )
             } else {
-                (ok_in(DoctorCategory::Index, "hnsw", message), Some(index.len()))
+                (
+                    ok_in(DoctorCategory::Index, "hnsw", message),
+                    Some(index.len()),
+                )
             }
         }
         Err(e) => (
@@ -1269,7 +1292,10 @@ provider = "inherit"
             checks[0].get("severity").and_then(|v| v.as_str()),
             Some("info")
         );
-        assert_eq!(checks[0].get("fixable").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            checks[0].get("fixable").and_then(|v| v.as_bool()),
+            Some(false)
+        );
         assert_eq!(
             checks[1].get("category").and_then(|v| v.as_str()),
             Some("queue")
@@ -1278,7 +1304,10 @@ provider = "inherit"
             checks[1].get("severity").and_then(|v| v.as_str()),
             Some("warning")
         );
-        assert_eq!(checks[1].get("fixable").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            checks[1].get("fixable").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(
             checks[1].get("repair_hint").and_then(|v| v.as_str()),
             Some("run `rein worker memory`")
@@ -1451,5 +1480,37 @@ provider = "inherit"
 
         let tantivy = report.checks.iter().find(|c| c.name == "tantivy").unwrap();
         assert_eq!(tantivy.status, CheckStatus::Warn);
+    }
+
+    #[tokio::test]
+    async fn test_doctor_treats_empty_tokens_as_missing() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "");
+        std::env::set_var("REIN_PROXY_TOKEN", "   ");
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let report = run(&config, DoctorOptions::default()).await;
+
+        let http = report
+            .checks
+            .iter()
+            .find(|check| check.name == "http_auth")
+            .unwrap();
+        let proxy = report
+            .checks
+            .iter()
+            .find(|check| check.name == "proxy_auth")
+            .unwrap();
+        assert_eq!(http.status, CheckStatus::Fail);
+        assert_eq!(proxy.status, CheckStatus::Fail);
     }
 }

@@ -135,8 +135,14 @@ mod tests {
     #[test]
     fn test_ascii_tokenization() {
         let tokens = collect_tokens("Rust ownership and borrowing");
-        assert!(tokens.iter().any(|t| t == "rust"), "expected 'rust' in {tokens:?}");
-        assert!(tokens.iter().any(|t| t == "ownership"), "expected 'ownership' in {tokens:?}");
+        assert!(
+            tokens.iter().any(|t| t == "rust"),
+            "expected 'rust' in {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "ownership"),
+            "expected 'ownership' in {tokens:?}"
+        );
     }
 
     #[test]
@@ -145,10 +151,15 @@ mod tests {
         // jieba should split "机器学习" as a word, not individual characters
         let joined = tokens.join("|");
         assert!(
-            tokens.iter().any(|t| t == "机器学习" || t == "机器" || t == "学习"),
+            tokens
+                .iter()
+                .any(|t| t == "机器学习" || t == "机器" || t == "学习"),
             "expected CJK segmentation in {joined}"
         );
-        assert!(tokens.len() > 1, "should produce multiple tokens from CJK text");
+        assert!(
+            tokens.len() > 1,
+            "should produce multiple tokens from CJK text"
+        );
     }
 
     #[test]
@@ -173,11 +184,26 @@ mod tests {
     fn test_ascii_punctuation_splitting() {
         // "foo-bar" should yield ["foo", "bar"], not ["foo-bar"]
         let tokens = collect_tokens("foo-bar node.js C++");
-        assert!(tokens.iter().any(|t| t == "foo"), "expected 'foo' in {tokens:?}");
-        assert!(tokens.iter().any(|t| t == "bar"), "expected 'bar' in {tokens:?}");
-        assert!(tokens.iter().any(|t| t == "node"), "expected 'node' in {tokens:?}");
-        assert!(tokens.iter().any(|t| t == "js"), "expected 'js' in {tokens:?}");
-        assert!(tokens.iter().any(|t| t == "c"), "expected 'c' in {tokens:?}");
+        assert!(
+            tokens.iter().any(|t| t == "foo"),
+            "expected 'foo' in {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "bar"),
+            "expected 'bar' in {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "node"),
+            "expected 'node' in {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "js"),
+            "expected 'js' in {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "c"),
+            "expected 'c' in {tokens:?}"
+        );
     }
 
     #[test]

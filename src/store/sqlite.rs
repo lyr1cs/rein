@@ -134,7 +134,9 @@ impl SqliteStore {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for memory in memories {
-            if memory.superseded_by.is_some() || memory.status != MemoryStatus::Active {
+            if memory.superseded_by.is_some()
+                || !matches!(memory.status, MemoryStatus::Active | MemoryStatus::Updated)
+            {
                 continue;
             }
             let canonical_id = self
@@ -148,7 +150,12 @@ impl SqliteStore {
             } else {
                 self.get(&canonical_id).unwrap_or(memory)
             };
-            if canonical.superseded_by.is_none() && canonical.status == MemoryStatus::Active {
+            if canonical.superseded_by.is_none()
+                && matches!(
+                    canonical.status,
+                    MemoryStatus::Active | MemoryStatus::Updated
+                )
+            {
                 out.push(canonical);
             }
             if out.len() >= limit {
@@ -253,7 +260,8 @@ impl SqliteStore {
 
     pub fn get_by_cluster(&self, cluster_id: u32, limit: usize) -> ReinResult<Vec<Memory>> {
         let sql = format!(
-            "{} WHERE m.cluster_id = ?1 AND m.superseded_by IS NULL AND m.status = 'active' \
+            "{} WHERE m.cluster_id = ?1 AND m.superseded_by IS NULL \
+             AND m.status IN ('active', 'updated') \
              ORDER BY m.updated_at DESC LIMIT ?2",
             memory_select_base()
         );
@@ -1186,7 +1194,9 @@ impl SqliteStore {
                 ids.iter().map(|s| s.as_str()).collect();
             let all_concepts: Vec<(String, String)> = self
                 .conn
-                .prepare("SELECT id, source_memory_ids FROM concepts WHERE source_memory_ids != '[]'")
+                .prepare(
+                    "SELECT id, source_memory_ids FROM concepts WHERE source_memory_ids != '[]'",
+                )
                 .and_then(|mut stmt| {
                     stmt.query_map([], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1200,10 +1210,10 @@ impl SqliteStore {
                     mids.retain(|mid| !pruned_set.contains(mid.as_str()));
                     if mids.len() != before {
                         let updated = serde_json::to_string(&mids).unwrap_or_default();
-                        let _ = self.conn.execute(
+                        self.conn.execute(
                             "UPDATE concepts SET source_memory_ids = ?1 WHERE id = ?2",
                             rusqlite::params![updated, concept_id],
-                        );
+                        )?;
                     }
                 }
             }
@@ -1247,6 +1257,7 @@ impl SqliteStore {
             let dedup_action = crate::extract::check_dedup(
                 self,
                 &memory.topic,
+                &memory.summary,
                 &memory.content,
                 similarity_threshold,
                 time_window_days,
@@ -1268,6 +1279,7 @@ impl SqliteStore {
                     crate::extract::check_dedup(
                         self,
                         &memory.topic,
+                        &memory.summary,
                         &memory.content,
                         effective,
                         time_window_days,
@@ -1579,11 +1591,27 @@ impl SqliteStore {
     }
 
     /// Fire-and-forget: update HNSW index after a write (if embedding available).
+    ///
+    /// If the lock can't be acquired (contention, flock failure) the index is
+    /// marked dirty so the next rebuild will pick up the missed write, rather
+    /// than silently serving a stale index.
     fn update_hnsw(&self, id: &str, embedding: Option<&[f32]>) {
         if let Some(emb) = embedding {
-            self.with_hnsw_lock(emb.len(), |index| {
-                let _ = index.insert(id, emb);
-            });
+            match self.with_hnsw_lock(emb.len(), |index| index.insert(id, emb)) {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    tracing::warn!("HNSW insert failed for {id}: {error}");
+                    crate::store::hnsw::HnswIndex::mark_dirty(&self.hnsw_path());
+                }
+                None => {
+                    // Could not acquire lock / :memory: / open failed.
+                    // :memory: path legitimately has no side-index; skip silently.
+                    if self.db_path.to_str() != Some(":memory:") {
+                        tracing::warn!("HNSW insert skipped for {id} (lock unavailable); marking dirty");
+                        crate::store::hnsw::HnswIndex::mark_dirty(&self.hnsw_path());
+                    }
+                }
+            }
         }
     }
 
@@ -1642,24 +1670,42 @@ impl SqliteStore {
     }
 
     /// Mark an old memory as superseded by a new one.
+    ///
+    /// Wrapped in a SAVEPOINT so that if the canonical_state update fails after the
+    /// memories row has been updated, both changes roll back together — preventing
+    /// a superseded memory from pointing at a dangling canonical reference.
     pub fn mark_superseded(&self, old_id: &str, new_id: &str) -> ReinResult<()> {
         let canonical_id = self.canonical_id_for(new_id)?;
-        let rows = self.conn.execute(
-            "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
-            rusqlite::params![new_id, old_id],
-        )?;
-        if rows == 0 {
-            return Err(ReinError::NotFound(format!("memory {old_id} not found")));
+        self.conn.execute("SAVEPOINT mark_superseded", [])?;
+        let result: ReinResult<()> = (|| {
+            let rows = self.conn.execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                rusqlite::params![new_id, old_id],
+            )?;
+            if rows == 0 {
+                return Err(ReinError::NotFound(format!("memory {old_id} not found")));
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id) VALUES (?1, ?2)",
+                rusqlite::params![old_id, canonical_id],
+            )?;
+            self.conn.execute(
+                "UPDATE memory_canonical_state SET canonical_id = ?1 WHERE memory_id = ?2",
+                rusqlite::params![canonical_id, old_id],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("RELEASE mark_superseded", [])?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK TO mark_superseded", []);
+                let _ = self.conn.execute("RELEASE mark_superseded", []);
+                Err(e)
+            }
         }
-        let _ = self.conn.execute(
-            "INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id) VALUES (?1, ?2)",
-            rusqlite::params![old_id, canonical_id],
-        );
-        let _ = self.conn.execute(
-            "UPDATE memory_canonical_state SET canonical_id = ?1 WHERE memory_id = ?2",
-            rusqlite::params![canonical_id, old_id],
-        );
-        Ok(())
     }
 }
 
@@ -1742,6 +1788,17 @@ mod tests {
 
         let updated = store.get(&id).unwrap();
         assert_eq!(updated.content, "Updated content about lifetimes");
+        assert_eq!(updated.status, MemoryStatus::Updated);
+        assert!(store
+            .recent(10)
+            .unwrap()
+            .iter()
+            .any(|memory| memory.id == id));
+        assert!(store
+            .search_fts("Updated content", None, 10)
+            .unwrap()
+            .iter()
+            .any(|memory| memory.id == id));
     }
 
     #[test]

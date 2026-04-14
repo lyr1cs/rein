@@ -289,11 +289,13 @@ impl SqliteStore {
         if !concept_ids.is_empty() {
             let deleted_set: std::collections::HashSet<&str> =
                 concept_ids.iter().map(|s| s.as_str()).collect();
-            let mut stmt = self.conn().prepare(
-                "SELECT id, concept_ids FROM memories WHERE concept_ids != '[]'",
-            )?;
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT id, concept_ids FROM memories WHERE concept_ids != '[]'")?;
             let rows: Vec<(String, String)> = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .filter_map(|r| r.ok())
                 .collect();
             for (mem_id, cids_json) in rows {
@@ -304,10 +306,10 @@ impl SqliteStore {
                         .collect();
                     let new_json = serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".into());
                     if new_json != cids_json {
-                        let _ = self.conn().execute(
+                        self.conn().execute(
                             "UPDATE memories SET concept_ids = ?1 WHERE id = ?2",
                             rusqlite::params![new_json, mem_id],
-                        );
+                        )?;
                     }
                 }
             }

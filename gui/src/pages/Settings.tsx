@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { apiGet } from '../api/client';
+import { apiPost } from '../api/client';
 import { useDoctor } from '../hooks/useApi';
 import type { DoctorCheck, DoctorReport } from '../api/types';
 
@@ -32,11 +32,12 @@ export default function Settings() {
     return saved ? parseInt(saved, 10) : 5;
   });
 
-  const [token, setToken] = useState(() => {
-    return localStorage.getItem('rein_token') || '';
-  });
+  const [token, setToken] = useState('');
 
   const [showToken, setShowToken] = useState(false);
+  const [authRunning, setAuthRunning] = useState(false);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [fixRunning, setFixRunning] = useState(false);
   const [fixError, setFixError] = useState<string | null>(null);
   const { data: doctor, isLoading: doctorLoading, error: doctorError, refetch } = useDoctor();
@@ -46,16 +47,78 @@ export default function Settings() {
     localStorage.setItem('rein_polling_interval', String(pollingInterval));
   }, [pollingInterval]);
 
-  // Persist token on change
+  // Clear legacy client-side token storage; GUI now uses an HttpOnly cookie session.
   useEffect(() => {
-    localStorage.setItem('rein_token', token);
-  }, [token]);
+    sessionStorage.removeItem('rein_token');
+    localStorage.removeItem('rein_token');
+  }, []);
+
+  async function applySessionToken() {
+    if (!token.trim()) {
+      setAuthError('Enter a token first.');
+      return;
+    }
+    setAuthRunning(true);
+    setAuthMessage(null);
+    setAuthError(null);
+    try {
+      const res = await fetch('/api/session', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-rein-action': '1',
+          Authorization: `Bearer ${token.trim()}`,
+        },
+        body: '{}',
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      setToken('');
+      setAuthMessage('Browser session established.');
+      await refetch();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Failed to apply token');
+    } finally {
+      setAuthRunning(false);
+    }
+  }
+
+  async function clearSessionToken() {
+    setAuthRunning(true);
+    setAuthMessage(null);
+    setAuthError(null);
+    try {
+      const res = await fetch('/api/session', {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-rein-action': '1',
+          ...(token.trim() ? { Authorization: `Bearer ${token.trim()}` } : {}),
+        },
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      setToken('');
+      setAuthMessage('Browser session cleared.');
+      await refetch();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Failed to clear session');
+    } finally {
+      setAuthRunning(false);
+    }
+  }
 
   async function runFix() {
     setFixRunning(true);
     setFixError(null);
     try {
-      await apiGet<DoctorReport>('/api/doctor?fix=true');
+      await apiPost<DoctorReport>('/api/doctor?fix=true', {});
       await refetch();
     } catch (error) {
       setFixError(error instanceof Error ? error.message : 'Failed to run doctor fix');
@@ -71,7 +134,7 @@ export default function Settings() {
         <div>
           <h2 className="text-lg font-medium text-[var(--text-primary)]">Settings</h2>
           <p className="text-xs text-[var(--text-muted)] mt-1">
-            Changes are saved automatically to localStorage.
+            Polling is saved to localStorage. API auth is stored in a browser session cookie.
           </p>
         </div>
 
@@ -111,7 +174,7 @@ export default function Settings() {
           <div>
             <div className="text-sm font-medium text-[var(--text-primary)]">Auth Token</div>
             <div className="text-xs text-[var(--text-muted)] mt-0.5">
-              Bearer token for authenticating with the rein HTTP API
+              Apply your `REIN_HTTP_TOKEN` once to establish an HttpOnly browser session.
             </div>
           </div>
           <div className="relative">
@@ -130,6 +193,34 @@ export default function Settings() {
               {showToken ? 'Hide' : 'Show'}
             </button>
           </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={applySessionToken}
+              disabled={authRunning}
+              className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-1.5 text-xs text-[var(--accent)] transition-colors hover:bg-[var(--accent)]/15 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {authRunning ? 'Working…' : 'Apply Token'}
+            </button>
+            <button
+              type="button"
+              onClick={clearSessionToken}
+              disabled={authRunning}
+              className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Clear Session
+            </button>
+          </div>
+          {authMessage && (
+            <div className="rounded-lg border border-[var(--success)]/20 bg-[var(--success)]/10 px-3 py-2 text-xs text-[var(--success)]">
+              {authMessage}
+            </div>
+          )}
+          {authError && (
+            <div className="rounded-lg border border-[var(--hot)]/20 bg-[var(--hot)]/10 px-3 py-2 text-xs text-[var(--hot)]">
+              {authError}
+            </div>
+          )}
         </div>
 
         {/* About */}
@@ -137,7 +228,7 @@ export default function Settings() {
           <div className="text-sm font-medium text-[var(--text-primary)]">About</div>
           <div className="space-y-2">
             <div className="text-sm text-[var(--text-secondary)]">
-              rein Neural Wiki v0.16.0
+              rein Neural Wiki v0.17.0
             </div>
             <div className="text-xs text-[var(--text-muted)]">
               Multi-source cross-validated memory MCP server with adaptive engine,

@@ -167,6 +167,26 @@ fn apply_evidence_rerank(
     }
 }
 
+fn matches_external_filters(memory: &Memory, topic: Option<&str>, keyword: Option<&str>) -> bool {
+    if let Some(topic) = topic {
+        if memory.topic != topic {
+            return false;
+        }
+    }
+    if let Some(keyword) = keyword {
+        let keyword_lower = keyword.to_lowercase();
+        if !memory
+            .keywords
+            .iter()
+            .any(|value| value.to_lowercase().contains(&keyword_lower))
+            && !memory.content.to_lowercase().contains(&keyword_lower)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Full recall pipeline: waterfall search + optional cross-validation.
 ///
 /// This is sync-safe: embedding uses reqwest::blocking if needed.
@@ -411,7 +431,13 @@ pub fn recall_temporal_with_request_id(
             let Ok(s) = SqliteStore::new(&vec_db_path, &vec_model, vec_dims) else {
                 return vec![];
             };
-            try_vector_search(&s, &vec_config, &vec_query_str, vec_topic_str.as_deref(), vec_limit)
+            try_vector_search(
+                &s,
+                &vec_config,
+                &vec_query_str,
+                vec_topic_str.as_deref(),
+                vec_limit,
+            )
         }))
     } else {
         // Fast mode (cache miss) or strong FTS signal: skip remote API call
@@ -478,8 +504,14 @@ pub fn recall_temporal_with_request_id(
         // Fast mode or in-memory DB: run synchronously on main thread.
         // In-memory DBs cannot be shared across threads (each new connection gets an empty DB).
         let kg_start = std::time::Instant::now();
-        let (kg_scores, episode_scores) =
-            run_kg_search(store, query, effective_limit, kg_is_episodic, time_from, time_to);
+        let (kg_scores, episode_scores) = run_kg_search(
+            store,
+            query,
+            effective_limit,
+            kg_is_episodic,
+            time_from,
+            time_to,
+        );
         tracing::debug!(
             elapsed_ms = kg_start.elapsed().as_millis() as u64,
             kg_hits = kg_scores.len(),
@@ -505,8 +537,14 @@ pub fn recall_temporal_with_request_id(
                 ));
                 return;
             };
-            let result =
-                run_kg_search(&s, &kg_query_str, kg_effective_limit, kg_is_episodic, kg_time_from, kg_time_to);
+            let result = run_kg_search(
+                &s,
+                &kg_query_str,
+                kg_effective_limit,
+                kg_is_episodic,
+                kg_time_from,
+                kg_time_to,
+            );
             let _ = kg_tx.send(result);
         });
         KgState::Thread(kg_spawn_time, kg_rx)
@@ -518,7 +556,10 @@ pub fn recall_temporal_with_request_id(
         VecSearchState::Sync(results) => results.into_iter().collect(),
         VecSearchState::Thread(h) => {
             let join_start = std::time::Instant::now();
-            let results = h.join().unwrap_or_default();
+            let results = h.join().unwrap_or_else(|e| {
+                tracing::error!(?e, "vector search thread panicked");
+                vec![]
+            });
             tracing::debug!(
                 elapsed_ms = join_start.elapsed().as_millis() as u64,
                 hits = results.len(),
@@ -541,7 +582,10 @@ pub fn recall_temporal_with_request_id(
                     budget_ms = budget.as_millis() as u64,
                     "KG search budget exhausted (time measured from spawn), using empty results"
                 );
-                (std::collections::HashMap::new(), std::collections::HashMap::new())
+                (
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
             })
         }
     };
@@ -619,8 +663,14 @@ pub fn recall_temporal_with_request_id(
         // O(n * kg_time) to O(kg_time).
         if is_memory_db {
             for eq in &deduped_queries {
-                let (kg, ep) =
-                    run_kg_search(store, eq, effective_limit, kg_is_episodic, time_from, time_to);
+                let (kg, ep) = run_kg_search(
+                    store,
+                    eq,
+                    effective_limit,
+                    kg_is_episodic,
+                    time_from,
+                    time_to,
+                );
                 for (id, score) in kg {
                     let entry = kg_scores.entry(id).or_default();
                     *entry = entry.max(score);
@@ -654,7 +704,13 @@ pub fn recall_temporal_with_request_id(
                 })
                 .collect();
             for handle in kg_handles {
-                let (kg, ep) = handle.join().unwrap_or_default();
+                let (kg, ep) = handle.join().unwrap_or_else(|e| {
+                    tracing::error!(?e, "Phase 2 KG thread panicked");
+                    (
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    )
+                });
                 for (id, score) in kg {
                     let entry = kg_scores.entry(id).or_default();
                     *entry = entry.max(score);
@@ -758,7 +814,7 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     let fts_max = fts_norm_log.values().copied().fold(0.0f32, f32::max);
-    let fts_norm_log: std::collections::HashMap<String, f32> = if fts_max > 1.0 {
+    let fts_norm_log: std::collections::HashMap<String, f32> = if fts_max.is_finite() && fts_max > 1.0 {
         fts_norm_log
             .into_iter()
             .map(|(id, s)| (id, s / fts_max))
@@ -774,7 +830,7 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     let vec_max = vec_norm_log.values().copied().fold(0.0f32, f32::max);
-    let vec_norm_log: std::collections::HashMap<String, f32> = if vec_max > 1.0 {
+    let vec_norm_log: std::collections::HashMap<String, f32> = if vec_max.is_finite() && vec_max > 1.0 {
         vec_norm_log
             .into_iter()
             .map(|(id, s)| (id, s / vec_max))
@@ -791,11 +847,11 @@ pub fn recall_temporal_with_request_id(
             .or(strategy.cc_alpha)
             .unwrap_or(config.search.cc_alpha as f32);
         // Run CC normalization on clean vec/fts channels first, then boost with KG/episode
-        let mut fused = crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha);
+        let mut fused =
+            crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha);
         // Post-fusion KG/episode boost (applied after normalization to avoid distorting score distributions)
         if use_kg || use_episode {
-            let fused_map: std::collections::HashMap<String, f32> =
-                fused.iter().cloned().collect();
+            let fused_map: std::collections::HashMap<String, f32> = fused.iter().cloned().collect();
             for (id, kg_score) in &kg_ranked {
                 if let Some(pos) = fused.iter().position(|(fid, _)| fid == id) {
                     fused[pos].1 += *kg_score * 0.5;
@@ -811,7 +867,7 @@ pub fn recall_temporal_with_request_id(
                 }
             }
             let _ = fused_map; // consumed above
-            // Re-sort after boost so boosted items are not stuck at the tail
+                               // Re-sort after boost so boosted items are not stuck at the tail
             fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         }
         fused
@@ -1047,8 +1103,8 @@ pub fn recall_temporal_with_request_id(
                     .and_then(|cid| survival_cache.get(&cid))
                     .or(global_prior.as_ref())
                     .map(|curve| {
-                        let days = (chrono::Utc::now() - mem.last_accessed).num_hours() as f64
-                            / 24.0;
+                        let days =
+                            (chrono::Utc::now() - mem.last_accessed).num_hours() as f64 / 24.0;
                         curve.probability_at(days) as f32
                     })
                     .unwrap_or(0.5),
@@ -1075,50 +1131,45 @@ pub fn recall_temporal_with_request_id(
     // Snapshot positional id list and candidates for background thread.
     // `candidate_ids` lets us rebuild an id→score map after the thread joins.
     // When `llm_reranker_timeout_ms = 0`, use legacy synchronous mode (blocks in-place).
-    let llm_rerank_state: Option<(Vec<String>, std::sync::mpsc::Receiver<Vec<f32>>)> =
-        if !fast
-            && !strong_signal
-            && !linear_clear
-            && config.reranker_provider() != crate::config::Provider::None
-            && local_results.len() > 1
-        {
-            let candidate_ids: Vec<String> =
-                local_results.iter().map(|(m, _)| m.id.clone()).collect();
+    let llm_rerank_state: Option<(Vec<String>, std::sync::mpsc::Receiver<Vec<f32>>)> = if !fast
+        && !strong_signal
+        && !linear_clear
+        && config.reranker_provider() != crate::config::Provider::None
+        && local_results.len() > 1
+    {
+        let candidate_ids: Vec<String> = local_results.iter().map(|(m, _)| m.id.clone()).collect();
 
-            if config.search.llm_reranker_timeout_ms == 0 {
-                // Synchronous legacy mode: block in-place, apply scores immediately
-                let llm_scores = crate::search::rerank_llm::rerank_with_llm(
-                    config,
-                    query,
-                    &local_results,
-                );
-                for (i, (_, score)) in local_results.iter_mut().enumerate() {
-                    if let Some(&s) = llm_scores.get(i) {
-                        *score = s;
-                    }
+        if config.search.llm_reranker_timeout_ms == 0 {
+            // Synchronous legacy mode: block in-place, apply scores immediately
+            let llm_scores =
+                crate::search::rerank_llm::rerank_with_llm(config, query, &local_results);
+            for (i, (_, score)) in local_results.iter_mut().enumerate() {
+                if let Some(&s) = llm_scores.get(i) {
+                    *score = s;
                 }
-                local_results
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                None // no async state needed
-            } else {
-                let candidates_clone: Vec<(Memory, f32)> = local_results.clone();
-                let config_clone = config.clone();
-                let query_clone = query.to_string();
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let scores = crate::search::rerank_llm::rerank_with_llm(
-                        &config_clone,
-                        &query_clone,
-                        &candidates_clone,
-                    );
-                    let _ = tx.send(scores);
-                });
-                tracing::debug!("llm reranker launched in background thread");
-                Some((candidate_ids, rx))
             }
+            local_results
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            None // no async state needed
         } else {
-            None
-        };
+            let candidates_clone: Vec<(Memory, f32)> = local_results.clone();
+            let config_clone = config.clone();
+            let query_clone = query.to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let scores = crate::search::rerank_llm::rerank_with_llm(
+                    &config_clone,
+                    &query_clone,
+                    &candidates_clone,
+                );
+                let _ = tx.send(scores);
+            });
+            tracing::debug!("llm reranker launched in background thread");
+            Some((candidate_ids, rx))
+        }
+    } else {
+        None
+    };
 
     // === Optional keyword filter ===
     if let Some(kw) = keyword {
@@ -1144,10 +1195,18 @@ pub fn recall_temporal_with_request_id(
         scanner.scan(&q_am)
     } else {
         vec![]
-    };
+    }
+    .into_iter()
+    .filter(|memory| matches_external_filters(memory, topic, keyword))
+    .collect::<Vec<_>>();
 
     // Join early-launched Supermemory thread (has been running since pipeline start)
-    let supermemory_results = sm_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let supermemory_results = sm_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|memory| matches_external_filters(memory, topic, keyword))
+        .collect::<Vec<_>>();
     tracing::debug!(
         elapsed_ms = total_start.elapsed().as_millis() as u64,
         hits = supermemory_results.len(),
@@ -1295,8 +1354,10 @@ pub fn recall_temporal_with_request_id(
             .collect();
         let selected = crate::search::mmr::apply_mmr(candidates, limit, mmr_lambda);
         // Reassemble RecallResults by id lookup (preserves confidence/sources_hit)
-        let mut result_map: std::collections::HashMap<String, RecallResult> =
-            results.into_iter().map(|r| (r.memory.id.clone(), r)).collect();
+        let mut result_map: std::collections::HashMap<String, RecallResult> = results
+            .into_iter()
+            .map(|r| (r.memory.id.clone(), r))
+            .collect();
         results = selected
             .into_iter()
             .filter_map(|(m, _)| result_map.remove(&m.id))
@@ -1391,6 +1452,30 @@ mod tests {
 
         sort_recall_results(&mut results);
         assert_eq!(results[0].memory.id, "high");
+    }
+
+    #[test]
+    fn external_filters_require_matching_topic_and_keyword() {
+        let mut memory = test_memory("filtered", 1, 1.0);
+        memory.topic = "rust".to_string();
+        memory.keywords = vec!["borrow".to_string()];
+        memory.content = "borrow checker details".to_string();
+
+        assert!(matches_external_filters(
+            &memory,
+            Some("rust"),
+            Some("borrow")
+        ));
+        assert!(!matches_external_filters(
+            &memory,
+            Some("python"),
+            Some("borrow")
+        ));
+        assert!(!matches_external_filters(
+            &memory,
+            Some("rust"),
+            Some("decorator")
+        ));
     }
 
     #[test]
@@ -1528,9 +1613,7 @@ fn try_vector_search_batch(
 
     let texts: Vec<&str> = uncached.iter().map(|(_, q)| *q).collect();
     let embeddings = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(embedder.embed_batch(&texts)))
-        }
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(embedder.embed_batch(&texts))),
         Err(_) => match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1655,7 +1738,9 @@ fn vec_search_direct(
         // Atomically claim the dirty marker. Only one concurrent caller wins;
         // others fall through to sqlite-vec immediately (no duplicate rebuilds).
         if crate::store::hnsw::HnswIndex::take_dirty_for_rebuild(&hnsw_path) {
-            tracing::info!("hnsw index dirty — spawning background rebuild, using sqlite-vec for this request");
+            tracing::info!(
+                "hnsw index dirty — spawning background rebuild, using sqlite-vec for this request"
+            );
             let rebuild_path = hnsw_path.clone();
             let rebuild_cfg = config.cloned().unwrap_or_else(|| {
                 let mut fb = crate::config::ReinConfig::load().unwrap_or_default();
@@ -1677,7 +1762,8 @@ fn vec_search_direct(
                 } else {
                     // Failed or skipped: restore `.dirty` so a future request retries
                     let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&rebuild_path);
-                    let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&rebuild_path);
+                    let rebuilding =
+                        crate::store::hnsw::HnswIndex::rebuilding_marker_path(&rebuild_path);
                     if rebuilding.exists() {
                         let _ = std::fs::rename(&rebuilding, &dirty);
                     }

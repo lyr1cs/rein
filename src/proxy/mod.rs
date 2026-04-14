@@ -79,7 +79,12 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
         || config.proxy.bind == "::1";
     let auth_token = std::env::var("REIN_PROXY_TOKEN")
         .ok()
-        .or_else(|| std::env::var("REIN_HTTP_TOKEN").ok());
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            std::env::var("REIN_HTTP_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        });
     let allow_loopback_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
     if auth_token.is_none() && !allow_loopback_unauth {
         anyhow::bail!(
@@ -169,6 +174,19 @@ where
 
 fn full_body(data: Bytes) -> BoxBody {
     box_body(Full::new(data).map_err(|never| match never {}))
+}
+
+/// Constant-time byte equality for proxy token comparison.
+/// Prevents timing side channels that would otherwise leak the expected token
+/// one byte at a time based on how quickly the comparison short-circuits.
+fn proxy_token_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn error_response(status: u16, msg: &str) -> hyper::Response<BoxBody> {
@@ -273,13 +291,14 @@ async fn handle_request(
     state.metrics.request_count.fetch_add(1, Ordering::Relaxed);
 
     // Auth check for non-localhost binds.
+    // Constant-time compare to prevent timing side channels that would leak the token byte by byte.
     if let Some(expected) = expected_token {
         let auth_header = req
             .headers()
             .get("x-rein-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if auth_header != expected {
+        if !proxy_token_eq(auth_header, expected) {
             state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(401, "unauthorized"));
         }
@@ -484,7 +503,14 @@ async fn handle_request(
         }
 
         // Non-streaming: read full response, extract, forward.
-        let resp_body = upstream_resp.bytes().await.unwrap_or_default();
+        let resp_body = match upstream_resp.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!("failed to read upstream response body: {error}");
+                state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(error_response(502, "bad gateway"));
+            }
+        };
 
         // Async extract from non-streaming response (with backpressure).
         if config.proxy.extract_enabled {
@@ -554,7 +580,15 @@ async fn stream_response(
         const MAX_EXTRACT_BUF: usize = 200_000; // ~50K tokens, prevent OOM
 
         use futures_util::StreamExt;
-        while let Some(chunk_result) = stream.next().await {
+        let mut clean_completion = false;
+        loop {
+            let chunk_result = match stream.next().await {
+                Some(chunk_result) => chunk_result,
+                None => {
+                    clean_completion = true;
+                    break;
+                }
+            };
             match chunk_result {
                 Ok(chunk) => {
                     // Parse SSE chunks for assistant text extraction.
@@ -603,7 +637,8 @@ async fn stream_response(
         drop(tx); // Signal end of stream.
 
         // After stream completes, extract memories (with backpressure).
-        if extract_enabled
+        if clean_completion
+            && extract_enabled
             && policy::should_extract_response(
                 &config_clone,
                 query_clone.as_deref(),
