@@ -16,18 +16,21 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 | Feature | Description |
 |---------|-------------|
-| **26 MCP tools** | 13 core memory tools + 10 knowledge graph tools + 2 temporal tools + 1 adaptive |
+| **28 MCP tools** | 13 core memory tools + 10 knowledge graph tools + 2 temporal tools + 2 adaptive + 1 session ingest |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
-| **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights per query type (M2) |
-| **Per-cluster survival decay** | Kaplan-Meier curves replace fixed Ebbinghaus when sufficient data exists (M3) |
+| **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights — global, per-query-type, and per-cluster (M2) |
+| **Per-cluster survival decay** | Kaplan-Meier curves replace fixed Ebbinghaus per-cluster; global prior bridges cold-start (M3) |
 | **HDBSCAN clustering** | Pure Rust semantic clustering with sampling for large datasets (M4) |
 | **Hot/Warm/Cold tiering** | Streaming quantile estimator + cold_archive migration (M5) |
 | **Adaptive dedup thresholds** | Per-cluster P90 similarity thresholds (SemDeDup-inspired, M6/A1) |
 | **Provenance-preserving dedup** | Merges preserve temporal anchors and unique details instead of hard-deleting |
 | **Embedding semantic dedup** | Catches paraphrases Jaccard misses, runs in GC slow channel (zero hot-path cost) |
 | **Temporal knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, revision history, episode nodes, temporal validity windows, BFS traversal (skips expired links) |
-| **Autonomous retrieval routing** | Query classifier routes to Temporal/ExactKeyword/Semantic/Exploratory strategy |
+| **Autonomous retrieval routing** | Rule-based query classifier routes to 6 strategies: Episodic / Temporal / Preference / ExactKeyword / Semantic / Exploratory (zero LLM calls) |
+| **Query expansion** | LLM rewrites query into 2-3 variants (Gemini Flash Lite / OMLX); multi-query results merged before fusion |
+| **LLM reranker** | Optional Gemini / OMLX rescoring of top-N candidates; strong-signal bypass skips LLM when confidence is already high |
+| **Maximal Marginal Relevance** | MMR post-rerank diversity pass — balances relevance and variety in final result set |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
 | **Dual-layer decay** | LTM / STM layers with KM survival curves (data-driven) or Ebbinghaus (cold-start) |
 | **Dual-path search** | FTS (Tantivy BM25 → FTS5 fallback) + Vector (HNSW cache → API embed) → RRF/CC fusion |
@@ -227,7 +230,7 @@ Operator inspection commands:
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 26 tools are exposed.
+When running as an MCP server (`rein serve`), 28 tools are exposed.
 
 #### Core Tools (13)
 
@@ -268,6 +271,14 @@ When running as an MCP server (`rein serve`), 26 tools are exposed.
 |------|-----------|-------------|
 | `rein_timeline` | `from?`, `to?`, `limit?` | Chronological timeline of episodes, concept changes, and memory events |
 | `rein_concept_history` | `memoir`, `name`, `limit?` | Revision history of a concept: when/how it changed over time |
+
+#### Adaptive & Session Tools (3)
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `rein_adaptive_status` | *(none)* | Inspect learned alpha weights, cluster profiles, dedup thresholds, survival curve stats |
+| `rein_feedback` | `memory_ids`, `request_id?`, `query?`, `helpful?` | Report which recalled memories were used — drives M1 event sourcing and future recall quality |
+| `rein_ingest_session` | `content?`, `turns?`, `title?`, `session_id?` | Ingest a full session transcript through the full extraction pipeline (memories + concepts + episode) |
 
 #### Knowledge Graph Relation Types
 
@@ -370,21 +381,87 @@ Classification is rule-based (zero LLM calls, sub-microsecond). MCP responses in
 
 rein's core philosophy: **zero subjective parameters** — all parameters are data-driven and self-adaptive. The adaptive engine runs during GC in a slow channel (zero recall latency impact).
 
-**Pipeline: M4 → M3 → M5 → M2 → M6**
+**Pipeline: M4 → A1 → M3 → M5 → M2 → M6**
 
 | Module | What it learns | How |
 |--------|---------------|-----|
 | **M1** Event Sourcing | *(foundation)* | Append-only feedback log + per-consumer offsets |
-| **M2** Alpha Optimizer | CC fusion weights | Counterfactual replay of past recalls with coarse-fine grid search |
-| **M3** Survival Analysis | Per-cluster decay curves | Kaplan-Meier estimator from access interval data |
-| **M4** HDBSCAN Clustering | Semantic neighborhoods | Pure Rust HDBSCAN (dendrogram → condensed tree → EOMBST) |
+| **M2** Alpha Optimizer | CC fusion weights — global, per-query-type, **and per-cluster** | Counterfactual replay; hierarchical Bayesian shrinkage; `apply_max_step` damping |
+| **M3** Survival Analysis | Per-cluster decay curves + **global cold-start prior** | Kaplan-Meier estimator; global prior (capped at blend-zone) for new clusters |
+| **M4** HDBSCAN Clustering | Semantic neighborhoods | Pure Rust HDBSCAN (dendrogram → condensed tree → EOMBST); centroid reassignment on recluster |
 | **M5** Tiering | Hot/Warm/Cold boundaries | Streaming quantile estimator (P25/P75) + cold_archive migration |
 | **M6** Threshold Explorer | Dedup thresholds | Randomized A/B exploration + causal inference + co-recall signal |
+| **A1** Per-cluster dedup thresholds | Similarity cutoffs per cluster | P90 of intra-cluster pairwise similarity; full pipeline (store, batch, vec dedup) |
 
 **Also:**
-- **A1** Per-cluster adaptive dedup thresholds from intra-cluster similarity P90
-- **Embedding-based semantic dedup** in GC slow channel (catches paraphrases)
+- **Embedding-based semantic dedup** in GC slow channel (catches paraphrases Jaccard misses)
 - **Provenance-preserving merge** — temporal anchors and unique details never lost
+- **Snapshot CAS** — adaptive state saved with read-merge-write on version conflict
+
+### Architecture Diagrams
+
+#### Memory Storage Flow
+
+```mermaid
+flowchart TD
+    A[Input text / tool output] --> B[hook_post or rein_store]
+    B --> C[LLM Extraction\nGemini Flash Lite / OMLX]
+    C -->|LLM unavailable| D[Rule-based fallback\ntopic · summary · keywords · importance]
+    C --> D2[postprocess\ndate detection · preference tagging]
+    D --> D2
+    D2 --> E{store_with_dedup\nBEGIN IMMEDIATE}
+    E -->|sim ≥ cluster_threshold A1| F[Provenance-preserving merge\nloser → evidence record]
+    E -->|sim in gray-zone| G[LLM dedup verdict\nasync dedup-queue]
+    E -->|new memory| H[INSERT memories]
+    H --> I[auto_link\nbidirectional related_ids]
+    I --> J[evolve\nknowledge evolution]
+    J --> K[HNSW + Tantivy index update\nfire-and-forget]
+    K --> L[needs_vec_dedup flag\nfor GC slow-channel embedding dedup]
+    F --> M[dedup_decisions ledger]
+    G --> M
+```
+
+#### Recall Pipeline
+
+```mermaid
+flowchart TD
+    Q[Query] --> CL[Query Classifier\n6 strategies · rule-based · 0 LLM calls]
+    CL -->|strategy + alpha| EX[Query Expansion\nGemini / OMLX → 2-3 variants]
+    EX --> P1[Channel 1: Tantivy BM25\nlocal · <1ms]
+    EX --> P2[Channel 2: HNSW vector\nlocal ~5ms / Gemini API ~255ms]
+    EX --> P3[Channel 3: KG FTS + BFS\nconcept land-and-expand]
+    P1 --> FU[RRF / CC Fusion\nlearned alpha M2]
+    P2 --> FU
+    P3 --> FU
+    FU --> TF[M5 Tier Filter\nCold excluded for non-Exploratory]
+    TF --> SW[Strength Weighting\nper-cluster KM curve M3 → global prior → Ebbinghaus]
+    SW --> RF[Multi-feature Rerank\n8 features · learned weights]
+    RF -->|optional| LR[LLM Reranker\nGemini / OMLX · strong-signal bypass]
+    RF --> CC[Canonical-first collapse\nevidence_preview attached]
+    LR --> CC
+    CC --> CV[Cross-validate\nSupermemory + auto-memory files]
+    CV --> RES[Final results\nconfidence 95%/85%/62% by source count]
+```
+
+#### Compression (PreCompact Hook)
+
+```mermaid
+flowchart TD
+    T[PreCompact trigger\nContext window approaching limit] --> HC[hook_compact\nrecord compact context]
+    HC --> SB[Read session buffer\naccumulated tool outputs + turns]
+    SB --> LE[LLM extraction\nmemories + concepts + links]
+    LE --> WQ[Async memory queue\n~/.rein/memory_queue_<project>.jsonl]
+    WQ --> BW[Background worker\nrein worker memory]
+    BW --> SD[store_with_dedup\nper-memory dedup + merge]
+    SD --> EP[Episode node created\nsession → concept_ids + memory_ids]
+    EP --> TL[ConceptLink temporal validity updated\nvalid_from / valid_until]
+    TL --> CL[Session buffer cleared\nready for next context window]
+
+    style T fill:#f96,color:#000
+    style EP fill:#6af,color:#000
+```
+
+---
 
 ### Configuration
 
@@ -406,6 +483,8 @@ rein loads configuration with the following priority (highest wins):
 | `REIN_LOG` | Log level filter (e.g. `debug`, `info`, `warn`) |
 | `REIN_PROXY_BIND` | Override proxy bind address |
 | `REIN_PROXY_PORT` | Override proxy port |
+| `REIN_SSE_BIND` | Override SSE/HTTP bind address (default `127.0.0.1`) |
+| `REIN_SSE_PORT` | Override SSE/HTTP port (default `8680`) |
 | `REIN_PROXY_TOKEN` | Bearer token for non-localhost proxy access |
 
 #### config.toml
@@ -704,7 +783,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
                             |
                    +--------+--------+
                    |                 |
-               CLI (20 cmds)  MCP Server (26 tools)
+               CLI (20 cmds)  MCP Server (28 tools)
                    |                 |
                    +--------+--------+
                             |
@@ -856,17 +935,20 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 
 | 特性 | 说明 |
 |------|------|
-| **26 个 MCP 工具** | 13 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 + 1 个自适应 |
-| **自适应引擎** | M1-M6 六模块：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
-| **反事实 Alpha 优化** | 回放历史 recall，粗细网格搜索最优 CC 融合权重（M2） |
-| **Per-cluster KM 衰减** | Kaplan-Meier 生存曲线替代固定遗忘曲线（数据足够时自动切换，M3） |
+| **28 个 MCP 工具** | 13 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 + 3 个自适应/会话 |
+| **自适应引擎** | M1-M6 + A1：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
+| **反事实 Alpha 优化** | 回放历史 recall，学习全局 / 按查询类型 / **按聚类** 的最优 CC 融合权重（M2） |
+| **Per-cluster KM 衰减 + 全局先验** | Kaplan-Meier 生存曲线替代固定遗忘曲线；全局先验曲线覆盖冷启动新聚类（M3） |
 | **HDBSCAN 语义聚类** | 纯 Rust 实现，dendrogram → 凝聚树 → EOMBST，大数据自动采样（M4） |
 | **Hot/Warm/Cold 分层** | 流式分位数估计器 + cold_archive 迁移（M5） |
-| **自适应去重阈值** | 基于簇内相似度 P90 计算（SemDeDup 风格，M6/A1） |
+| **自适应去重阈值（A1）** | 全链路落地：store / batch / vec dedup 均使用 per-cluster P90 阈值，0.70 全局兜底 |
 | **保留来源的去重** | 合并时保留时间锚点和独特细节，不丢失信息 |
 | **嵌入语义去重** | 向量相似度捕捉文本相似度遗漏的改写，GC 慢通道执行 |
 | **时序知识图谱** | Memoir / Concept / ConceptLink，9 种关系类型，修订历史，Episode 节点，时间窗口 |
-| **自主检索路由** | 查询自动分类（时序/精确/语义/探索），自适应融合权重（TA-Mem 2026） |
+| **自主检索路由** | 规则分类器，6 种策略：Episodic / Temporal / Preference / ExactKeyword / Semantic / Exploratory（零 LLM 调用） |
+| **查询扩写** | LLM 将查询改写为 2-3 个变体（Gemini Flash Lite / OMLX），多路结果融合前合并 |
+| **LLM 重排序** | Gemini / OMLX 对 top-N 候选再评分，高置信度时绕过（strong-signal bypass） |
+| **最大边际相关性（MMR）** | 重排序后多样性 pass，平衡相关性与结果多样性 |
 | **OMLX 本地嵌入** | 可选本地嵌入后端（Google / OMLX） |
 | **双路搜索** | Tantivy BM25 + HNSW ANN → RRF/CC 融合（学到的权重） |
 | **多源交叉验证** | 3 个来源（本地、Hook 提取、Supermemory）+ 置信度评分 |
@@ -1036,7 +1118,7 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），共暴露 26 个工具。
+以 MCP 服务运行时（`rein serve`），共暴露 28 个工具。
 
 #### 核心工具（13 个）
 
@@ -1070,6 +1152,21 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 | `rein_memoir_link` | `memoir`, `from`, `to`, `relation` | 链接两个概念 |
 | `rein_memoir_inspect` | `memoir`, `name`, `depth?` | BFS 邻域遍历 |
 | `rein_memoir_export` | `memoir`, `format?` | 导出图谱（json / ascii / dot） |
+
+#### 时序工具（2 个）
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `rein_timeline` | `from?`, `to?`, `limit?` | 按时间线浏览 Episode、概念变更、记忆事件 |
+| `rein_concept_history` | `memoir`, `name`, `limit?` | 查看概念定义的历史修订记录 |
+
+#### 自适应与会话工具（3 个）
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `rein_adaptive_status` | *(无)* | 查看学到的 alpha 权重、聚类 profile、去重阈值、生存曲线统计 |
+| `rein_feedback` | `memory_ids`, `request_id?`, `query?`, `helpful?` | 上报哪些记忆被采用 — 驱动 M1 事件溯源和后续 recall 质量 |
+| `rein_ingest_session` | `content?`, `turns?`, `title?`, `session_id?` | 将完整会话 transcript 送入提取管线（记忆 + 概念 + Episode） |
 
 #### 知识图谱关系类型
 
@@ -1141,6 +1238,8 @@ rein 按以下优先级加载配置（高优先级覆盖低优先级）：
 | `REIN_LOG` | 日志级别过滤（如 `debug`、`info`、`warn`） |
 | `REIN_PROXY_BIND` | 覆盖 proxy 绑定地址 |
 | `REIN_PROXY_PORT` | 覆盖 proxy 端口 |
+| `REIN_SSE_BIND` | 覆盖 SSE/HTTP 绑定地址（默认 `127.0.0.1`） |
+| `REIN_SSE_PORT` | 覆盖 SSE/HTTP 端口（默认 `8680`） |
 | `REIN_PROXY_TOKEN` | 非 localhost proxy 的 bearer token |
 
 #### config.toml
@@ -1380,6 +1479,92 @@ open http://localhost:8680
 
 设置 `REIN_HTTP_TOKEN` 后，API 端点需要 Bearer 令牌认证。GUI 页面本身无需认证，可以在设置页面输入令牌。
 
+### 自适应引擎 (v0.6.0+)
+
+核心理念：**零主观参数** — 所有参数由数据驱动自动学习，不需要人工调参。自适应引擎在 GC 慢通道运行，对 recall 延迟零影响。
+
+**管线顺序：M4 → A1 → M3 → M5 → M2 → M6**
+
+| 模块 | 学习内容 | 方式 |
+|------|----------|------|
+| **M1** 事件溯源 | *（基础）* | append-only 反馈日志 + per-consumer 偏移量 |
+| **M2** Alpha 优化 | CC 融合权重 — 全局 / 按查询类型 / **按聚类** | 反事实回放；贝叶斯收缩分层先验；`apply_max_step` 阻尼 |
+| **M3** 生存分析 | Per-cluster 衰减曲线 + **全局冷启动先验** | Kaplan-Meier 估计器；全局先验（capped 在 blend zone）覆盖新聚类 |
+| **M4** HDBSCAN 聚类 | 语义邻域 | 纯 Rust HDBSCAN（dendrogram → 凝聚树 → EOMBST）；recluster 时基于质心重分配 |
+| **M5** 分层 | Hot/Warm/Cold 边界 | 流式分位数估计器（P25/P75）+ cold_archive 迁移 |
+| **M6** 阈值探索 | 去重阈值 | 随机化 A/B 探索 + 因果推断 + 共同召回信号 |
+| **A1** Per-cluster 去重阈值 | 每聚类相似度截止值 | 簇内 pairwise 相似度 P90；全链路落地（store / batch / vec dedup） |
+
+**另外：**
+- **嵌入语义去重** — GC 慢通道，捕捉 Jaccard 遗漏的改写
+- **保留溯源的合并** — 时间锚点和独特细节永不丢失
+- **Snapshot CAS** — 自适应状态保存使用 read-merge-write + 版本冲突重试
+
+### 架构图
+
+#### 记忆存储流程
+
+```mermaid
+flowchart TD
+    A[输入文本 / 工具输出] --> B[hook_post 或 rein_store]
+    B --> C[LLM 提取\nGemini Flash Lite / OMLX]
+    C -->|LLM 不可用| D[规则兜底\ntopic · summary · keywords · importance]
+    C --> D2[postprocess\n日期检测 · 偏好标注]
+    D --> D2
+    D2 --> E{store_with_dedup\nBEGIN IMMEDIATE}
+    E -->|sim ≥ 聚类阈值 A1| F[保留溯源合并\n输家 → evidence 记录]
+    E -->|sim 在灰区| G[LLM 去重裁决\nasync dedup-queue]
+    E -->|全新记忆| H[INSERT memories]
+    H --> I[auto_link\n双向 related_ids]
+    I --> J[evolve\n知识演进]
+    J --> K[HNSW + Tantivy 索引更新\nfire-and-forget]
+    K --> L[needs_vec_dedup 标记\nGC 慢通道嵌入去重]
+    F --> M[dedup_decisions 账本]
+    G --> M
+```
+
+#### 召回管线
+
+```mermaid
+flowchart TD
+    Q[查询] --> CL[查询分类器\n6 种策略 · 规则驱动 · 0 LLM 调用]
+    CL -->|策略 + alpha| EX[查询扩写\nGemini / OMLX → 2-3 个变体]
+    EX --> P1[通道 1：Tantivy BM25\n本地 · <1ms]
+    EX --> P2[通道 2：HNSW 向量\n本地 ~5ms / Gemini API ~255ms]
+    EX --> P3[通道 3：KG FTS + BFS\n概念落点扩展]
+    P1 --> FU[RRF / CC 融合\n学到的 alpha M2]
+    P2 --> FU
+    P3 --> FU
+    FU --> TF[M5 层级过滤\nCold 记忆在非 Exploratory 查询中排除]
+    TF --> SW[强度加权\nper-cluster KM 曲线 M3 → 全局先验 → 艾宾浩斯]
+    SW --> RF[多特征重排序\n8 特征 · 学到的权重]
+    RF -->|可选| LR[LLM 重排序\nGemini / OMLX · 高置信度绕过]
+    RF --> CC[Canonical 优先折叠\nevidence_preview 附加]
+    LR --> CC
+    CC --> CV[交叉验证\nSupermemory + auto-memory 文件]
+    CV --> RES[最终结果\n置信度 95%/85%/62% 按来源数]
+```
+
+#### 压缩（PreCompact Hook）
+
+```mermaid
+flowchart TD
+    T[PreCompact 触发\n上下文窗口接近上限] --> HC[hook_compact\n记录 compact 上下文]
+    HC --> SB[读取 session buffer\n累积的工具输出 + 对话轮次]
+    SB --> LE[LLM 提取\n记忆 + 概念 + 关系]
+    LE --> WQ[异步记忆队列\n~/.rein/memory_queue_<project>.jsonl]
+    WQ --> BW[后台 worker\nrein worker memory]
+    BW --> SD[store_with_dedup\nper-memory 去重 + 合并]
+    SD --> EP[创建 Episode 节点\n会话 → concept_ids + memory_ids]
+    EP --> TL[更新 ConceptLink 时间窗口\nvalid_from / valid_until]
+    TL --> CL[清空 session buffer\n准备好迎接下一个上下文窗口]
+
+    style T fill:#f96,color:#000
+    style EP fill:#6af,color:#000
+```
+
+---
+
 ### 架构
 
 ```
@@ -1387,7 +1572,7 @@ open http://localhost:8680
                             |
                    +--------+--------+
                    |                 |
-              CLI (20 命令)   MCP 服务 (26 工具)
+              CLI (20 命令)   MCP 服务 (28 工具)
                    |                 |
                    +--------+--------+
                             |
