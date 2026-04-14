@@ -421,23 +421,42 @@ pub fn recall_temporal_with_request_id(
         VecSearchState::Skip
     };
 
-    // Step 3: KG search runs on the main thread while background Vec (if any) is in flight
-    let mut kg_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let mut episode_scores: std::collections::HashMap<String, f32> =
-        std::collections::HashMap::new();
-    {
-        let kg_start = std::time::Instant::now();
-        let seed_concepts = store.search_all_concepts(query, 5).unwrap_or_default();
+    // Step 3: KG search.
+    // - fast mode: synchronous on main thread using existing store (no extra connection cost)
+    // - normal mode: background thread parallel with Vec; timeout budget measured from spawn
+    enum KgState {
+        Sync(
+            std::collections::HashMap<String, f32>,
+            std::collections::HashMap<String, f32>,
+        ),
+        Thread(
+            std::time::Instant,
+            std::sync::mpsc::Receiver<(
+                std::collections::HashMap<String, f32>,
+                std::collections::HashMap<String, f32>,
+            )>,
+        ),
+    }
+
+    fn run_kg_search(
+        s: &SqliteStore,
+        query: &str,
+        effective_limit: usize,
+        is_episodic: bool,
+        time_from: Option<chrono::DateTime<chrono::Utc>>,
+        time_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (
+        std::collections::HashMap<String, f32>,
+        std::collections::HashMap<String, f32>,
+    ) {
+        let mut kg_scores: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        let seed_concepts = s.search_all_concepts(query, 5).unwrap_or_default();
         let concept_results =
             crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
         let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
         let bfs_expanded = if !seed_ids.is_empty() {
-            crate::search::kg_search::bfs_expand_memories_by_id(
-                store,
-                &seed_ids,
-                2,
-                effective_limit,
-            )
+            crate::search::kg_search::bfs_expand_memories_by_id(s, &seed_ids, 2, effective_limit)
         } else {
             vec![]
         };
@@ -445,24 +464,51 @@ pub fn recall_temporal_with_request_id(
             let entry = kg_scores.entry(id).or_default();
             *entry = entry.max(score);
         }
+        let episode_scores = if is_episodic || time_from.is_some() || time_to.is_some() {
+            collect_episode_memory_scores(s, query, effective_limit, time_from, time_to)
+        } else {
+            std::collections::HashMap::new()
+        };
+        (kg_scores, episode_scores)
+    }
 
-        if strategy.query_type == crate::search::classify::QueryType::Episodic
-            || time_from.is_some()
-            || time_to.is_some()
-        {
-            for (id, score) in
-                collect_episode_memory_scores(store, query, effective_limit, time_from, time_to)
-            {
-                let entry = episode_scores.entry(id).or_default();
-                *entry = entry.max(score);
-            }
-        }
+    let kg_is_episodic = strategy.query_type == crate::search::classify::QueryType::Episodic;
+    let kg_state: KgState = if fast {
+        // Fast mode: run synchronously on main thread (no extra connection, no thread overhead)
+        let kg_start = std::time::Instant::now();
+        let (kg_scores, episode_scores) =
+            run_kg_search(store, query, effective_limit, kg_is_episodic, time_from, time_to);
         tracing::debug!(
             elapsed_ms = kg_start.elapsed().as_millis() as u64,
-            hits = kg_scores.len(),
-            "kg search (original)"
+            kg_hits = kg_scores.len(),
+            "kg search (fast mode, sync)"
         );
-    }
+        KgState::Sync(kg_scores, episode_scores)
+    } else {
+        // Normal mode: background thread, budget measured from spawn time
+        let kg_db_path = store.db_path().to_path_buf();
+        let kg_query_str = query.to_string();
+        let kg_model = config.embedding_model();
+        let kg_dims = config.embedding.dimensions;
+        let kg_effective_limit = effective_limit;
+        let kg_time_from = time_from;
+        let kg_time_to = time_to;
+        let (kg_tx, kg_rx) = std::sync::mpsc::channel();
+        let kg_spawn_time = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let Ok(s) = SqliteStore::new(&kg_db_path, &kg_model, kg_dims) else {
+                let _ = kg_tx.send((
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                ));
+                return;
+            };
+            let result =
+                run_kg_search(&s, &kg_query_str, kg_effective_limit, kg_is_episodic, kg_time_from, kg_time_to);
+            let _ = kg_tx.send(result);
+        });
+        KgState::Thread(kg_spawn_time, kg_rx)
+    };
 
     // Step 4: collect Vec results (join background thread if it was launched)
     let mut vec_scores: std::collections::HashMap<String, f32> = match vec_state {
@@ -479,6 +525,28 @@ pub fn recall_temporal_with_request_id(
             results.into_iter().collect()
         }
     };
+
+    // Step 5: join KG results.
+    // Budget is computed from spawn time so the timeout is meaningful even if Step 4 was slow.
+    let (mut kg_scores, mut episode_scores) = match kg_state {
+        KgState::Sync(kg, ep) => (kg, ep),
+        KgState::Thread(spawn_time, rx) => {
+            let elapsed = spawn_time.elapsed();
+            let budget = std::time::Duration::from_millis(80).saturating_sub(elapsed);
+            rx.recv_timeout(budget).unwrap_or_else(|_| {
+                tracing::warn!(
+                    kg_elapsed_ms = elapsed.as_millis() as u64,
+                    "KG search timed out, using empty results"
+                );
+                (std::collections::HashMap::new(), std::collections::HashMap::new())
+            })
+        }
+    };
+    tracing::debug!(
+        kg_hits = kg_scores.len(),
+        ep_hits = episode_scores.len(),
+        "kg search joined (parallel with Vec)"
+    );
 
     // === Phase 2: Join expansion thread, search with expanded queries, merge ===
     // Skip entirely if strong signal detected (BM25 top1 is dominant, expansion won't help)
