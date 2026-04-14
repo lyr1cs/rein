@@ -135,18 +135,24 @@ export default function Graph() {
     return () => window.clearInterval(intervalId);
   }, [refreshGraph]);
 
-  /* ---- Fetch memoirs on mount ---- */
+  /* ---- Fetch memoirs on mount and on each refresh (polling / manual Refresh) ----
+   *
+   * Keyed on reloadVersion so creating/renaming/deleting a memoir elsewhere is
+   * reflected next poll tick. On subsequent fetches we preserve the current
+   * selection instead of auto-selecting the first memoir.
+   */
   useEffect(() => {
     let cancelled = false;
     apiGet<{ memoirs: Memoir[] }>('/api/memoirs')
       .then((res) => {
         if (cancelled) return;
         setMemoirs(res.memoirs);
-        if (res.memoirs.length > 0) {
+        if (res.memoirs.length > 0 && !selectedMemoir) {
           setGraphLoading(true);
           setSelectedNode(null);
           setSelectedMemoir(res.memoirs[0].name);
         }
+        setMemoirError('');
       })
       .catch((err: unknown) => {
         if (!cancelled) setMemoirError(errorMessage(err));
@@ -155,7 +161,8 @@ export default function Graph() {
         if (!cancelled) setMemoirLoading(false);
       });
     return () => { cancelled = true; };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadVersion]);
 
   /* ---- Fetch graph data when memoir changes ---- */
   useEffect(() => {

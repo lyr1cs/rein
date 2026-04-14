@@ -1737,9 +1737,17 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         let cfg = rest_config.clone();
         async move {
             // Check bearer token for API/MCP paths only (GUI static assets are public
-            // so the SPA can bootstrap and show a token input dialog)
+            // so the SPA can bootstrap and show a token input dialog).
+            //
+            // DELETE /api/session is exempted so a browser holding a stale/invalid
+            // cookie can clear it without being 401-blocked — otherwise the SPA
+            // would be stuck resending the bad cookie until manual browser-data wipe.
             let path = req.uri().path();
-            let needs_auth = path.starts_with("/api/") || path.starts_with("/mcp");
+            let method = req.method();
+            let is_clear_session =
+                method == hyper::Method::DELETE && path == "/api/session";
+            let needs_auth = !is_clear_session
+                && (path.starts_with("/api/") || path.starts_with("/mcp"));
             if needs_auth {
                 if let Some(ref expected) = token {
                     if !request_has_valid_http_auth(req.headers(), expected) {
