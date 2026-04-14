@@ -109,6 +109,37 @@ pub fn adaptive_flush_threshold(base: usize, buf_path: &std::path::Path) -> usiz
     }
 }
 
+/// Path for the flush-count marker file for a given session buffer.
+pub fn flush_marker_path(buf_path: &std::path::Path) -> std::path::PathBuf {
+    buf_path.with_extension("flushed")
+}
+
+/// Record that a mid-session flush occurred for this session.
+/// Atomically increments the flush count stored in the marker file.
+pub fn mark_flushed(buf_path: &std::path::Path) {
+    let marker = flush_marker_path(buf_path);
+    let count = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(&marker, (count + 1).to_string());
+}
+
+/// Read the number of mid-session flushes recorded for this session.
+/// Returns 0 if the marker file does not exist.
+pub fn flush_count(buf_path: &std::path::Path) -> u32 {
+    let marker = flush_marker_path(buf_path);
+    std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Delete the flush marker for this session (call at hook_stop end).
+pub fn clear_flush_marker(buf_path: &std::path::Path) {
+    let _ = std::fs::remove_file(flush_marker_path(buf_path));
+}
+
 /// Clean up stale buffer files older than 24 hours.
 pub fn cleanup_stale_buffers(config: &ReinConfig) {
     let buf_dir = resolve_buffer_dir(config);
@@ -123,9 +154,11 @@ pub fn cleanup_stale_buffers(config: &ReinConfig) {
                     if modified_utc < cutoff {
                         tracing::info!("cleaning stale buffer: {}", entry.display());
                         let _ = std::fs::remove_file(&entry);
-                        // Also remove associated lock file
+                        // Also remove associated lock and flush marker files
                         let lock = buffer_lock_path(&entry);
                         let _ = std::fs::remove_file(&lock);
+                        let marker = flush_marker_path(&entry);
+                        let _ = std::fs::remove_file(&marker);
                     }
                 }
             }
