@@ -289,6 +289,8 @@ enum WorkerAction {
     },
     /// Drain queued cleanup jobs for the current project
     CleanupQueue,
+    /// Drain queued post-merge LLM synthesis jobs for the current project
+    MergeRefinementQueue,
 }
 
 #[tokio::main]
@@ -373,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
             WorkerAction::Memory => commands::handle_worker_memory(&config).await?,
             WorkerAction::DedupQueue => commands::handle_worker_dedup_queue(&config).await?,
             WorkerAction::CleanupQueue => commands::handle_worker_cleanup_queue(&config).await?,
+            WorkerAction::MergeRefinementQueue => commands::handle_worker_merge_refinement_queue(&config).await?,
             WorkerAction::Cleanup {
                 topic,
                 topics,

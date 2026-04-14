@@ -159,12 +159,35 @@ impl HnswIndex {
         path.with_extension("usearch.dirty")
     }
 
+    pub fn rebuilding_marker_path(path: &Path) -> PathBuf {
+        path.with_extension("usearch.rebuilding")
+    }
+
     pub fn mark_dirty(path: &Path) {
         let _ = std::fs::write(Self::dirty_marker_path(path), b"dirty");
     }
 
+    /// Returns true if either the `.dirty` or `.rebuilding` marker exists.
     pub fn is_dirty(path: &Path) -> bool {
-        Self::dirty_marker_path(path).exists()
+        Self::dirty_marker_path(path).exists() || Self::rebuilding_marker_path(path).exists()
+    }
+
+    /// Atomically claim the dirty marker for rebuild: renames `.dirty` → `.rebuilding`.
+    /// Returns `true` if this caller won the race and should proceed with the rebuild.
+    /// Returns `false` if another thread already claimed it (`.dirty` was gone).
+    pub fn take_dirty_for_rebuild(path: &Path) -> bool {
+        let dirty = Self::dirty_marker_path(path);
+        let rebuilding = Self::rebuilding_marker_path(path);
+        if dirty.exists() {
+            std::fs::rename(&dirty, &rebuilding).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Remove the `.rebuilding` marker after a background rebuild completes or fails.
+    pub fn clear_rebuilding(path: &Path) {
+        let _ = std::fs::remove_file(Self::rebuilding_marker_path(path));
     }
 }
 

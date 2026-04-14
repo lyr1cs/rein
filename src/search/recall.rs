@@ -360,26 +360,68 @@ pub fn recall_temporal_with_request_id(
         None
     };
 
-    // === Phase 1b: Vec + KG search with ORIGINAL query (runs while expansion is in flight) ===
+    // === Phase 1b: Vec + KG search with ORIGINAL query ===
+    //
+    // Speculative execution for Vec search:
+    //   - Cache HIT (any mode) → sync HNSW search on the main thread (~5ms, no extra connection)
+    //   - Cache MISS + fast mode → skip (no remote API calls in fast mode)
+    //   - Cache MISS + no strong FTS signal → background thread does API call while KG runs
+    //   - Cache MISS + strong FTS signal → skip embedding API (FTS already dominant)
+    //   - skip_vec strategy → skip entirely
 
-    // In fast mode, skip vector search entirely — it may call remote embedding API on cache miss.
-    // Fast recall uses FTS + KG only (both fully local).
-    let mut vec_scores: std::collections::HashMap<String, f32> = if fast || strategy.skip_vec {
-        std::collections::HashMap::new()
+    // Step 1: check embedding cache on the main thread (fast, no I/O).
+    // Done even in fast mode so cached embeddings get HNSW search without any API call.
+    let maybe_cached_emb: Option<Vec<f32>> = if !strategy.skip_vec {
+        let model = config.embedding_model();
+        crate::embed::EmbedCache::get(store.conn(), query, &model)
+            .ok()
+            .flatten()
     } else {
-        let vec_start = std::time::Instant::now();
-        let r: std::collections::HashMap<String, f32> =
-            try_vector_search(store, config, query, topic, effective_limit)
-                .into_iter()
-                .collect();
-        tracing::debug!(
-            elapsed_ms = vec_start.elapsed().as_millis() as u64,
-            hits = r.len(),
-            "vector search (original)"
-        );
-        r
+        None
     };
 
+    // Step 2: launch Vec search — sync for cache hit, background thread for miss
+    enum VecSearchState {
+        Skip,
+        Sync(Vec<(String, f32)>),
+        Thread(std::thread::JoinHandle<Vec<(String, f32)>>),
+    }
+    let vec_state: VecSearchState = if strategy.skip_vec {
+        VecSearchState::Skip
+    } else if let Some(emb) = maybe_cached_emb {
+        // Cache hit: synchronous HNSW search (no new connection, no API call)
+        let vec_start = std::time::Instant::now();
+        let results = vec_search_direct(store, &emb, topic, effective_limit, Some(config));
+        tracing::debug!(
+            elapsed_ms = vec_start.elapsed().as_millis() as u64,
+            hits = results.len(),
+            "vector search (cache hit, sync)"
+        );
+        VecSearchState::Sync(results)
+    } else if !fast && !strong_signal {
+        // Cache miss + normal mode + no strong FTS signal: background thread overlaps with KG
+        let vec_db_path = store.db_path().to_path_buf();
+        let vec_config = config.clone();
+        let vec_query_str = query.to_string();
+        let vec_topic_str = topic.map(|s| s.to_string());
+        let vec_model = config.embedding_model();
+        let vec_dims = config.embedding.dimensions;
+        let vec_limit = effective_limit;
+        VecSearchState::Thread(std::thread::spawn(move || {
+            let Ok(s) = SqliteStore::new(&vec_db_path, &vec_model, vec_dims) else {
+                return vec![];
+            };
+            try_vector_search(&s, &vec_config, &vec_query_str, vec_topic_str.as_deref(), vec_limit)
+        }))
+    } else {
+        // Fast mode (cache miss) or strong FTS signal: skip remote API call
+        if !fast {
+            tracing::debug!("strong FTS signal + embedding cache miss — skipping vec API search");
+        }
+        VecSearchState::Skip
+    };
+
+    // Step 3: KG search runs on the main thread while background Vec (if any) is in flight
     let mut kg_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
     let mut episode_scores: std::collections::HashMap<String, f32> =
         std::collections::HashMap::new();
@@ -421,6 +463,22 @@ pub fn recall_temporal_with_request_id(
             "kg search (original)"
         );
     }
+
+    // Step 4: collect Vec results (join background thread if it was launched)
+    let mut vec_scores: std::collections::HashMap<String, f32> = match vec_state {
+        VecSearchState::Skip => std::collections::HashMap::new(),
+        VecSearchState::Sync(results) => results.into_iter().collect(),
+        VecSearchState::Thread(h) => {
+            let join_start = std::time::Instant::now();
+            let results = h.join().unwrap_or_default();
+            tracing::debug!(
+                elapsed_ms = join_start.elapsed().as_millis() as u64,
+                hits = results.len(),
+                "vector search join (cache-miss path, overlapped with KG)"
+            );
+            results.into_iter().collect()
+        }
+    };
 
     // === Phase 2: Join expansion thread, search with expanded queries, merge ===
     // Skip entirely if strong signal detected (BM25 top1 is dominant, expansion won't help)
@@ -577,10 +635,23 @@ pub fn recall_temporal_with_request_id(
     let vec_for_fusion = if use_vec { vec_ranked } else { vec![] };
 
     // === Adaptive alpha (M2): read from AdaptiveState if available ===
+    // Use the dominant cluster from vector-search top candidate as a proxy for the
+    // current query's semantic neighborhood, enabling per-cluster alpha lookup.
+    let query_cluster_id: Option<u32> = vec_for_fusion.first().and_then(|(id, _)| {
+        store
+            .conn()
+            .query_row(
+                "SELECT cluster_id FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get::<_, Option<u32>>(0),
+            )
+            .ok()
+            .flatten()
+    });
     let adaptive_alpha = if config.adaptive.enabled {
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).and_then(|s| {
             let qt = format!("{}", strategy.query_type);
-            s.get_alpha(&qt, None) // cluster_id: None until M4 integration
+            s.get_alpha(&qt, query_cluster_id)
         })
     } else {
         None
@@ -732,6 +803,7 @@ pub fn recall_temporal_with_request_id(
     // Load cached per-cluster survival curves from M3 (if available)
     let mut survival_cache: std::collections::HashMap<u32, crate::search::survival::SurvivalCurve> =
         std::collections::HashMap::new();
+    let mut global_prior: Option<crate::search::survival::SurvivalCurve> = None;
     if config.adaptive.enabled {
         if let Ok(mut stmt) = store
             .conn()
@@ -747,7 +819,12 @@ pub fn recall_temporal_with_request_id(
                 .map(|rows| {
                     for row in rows.flatten() {
                         if let Some(id_str) = row.0.strip_prefix("survival_curve:") {
-                            if let (Ok(cid), Ok(curve)) =
+                            if id_str == "global" {
+                                // M3 cold-start: global prior for clusters without enough data
+                                if let Ok(curve) = serde_json::from_str(&row.1) {
+                                    global_prior = Some(curve);
+                                }
+                            } else if let (Ok(cid), Ok(curve)) =
                                 (id_str.parse::<u32>(), serde_json::from_str(&row.1))
                             {
                                 survival_cache.insert(cid, curve);
@@ -774,8 +851,11 @@ pub fn recall_temporal_with_request_id(
                     continue;
                 }
             }
-            // Use per-cluster survival curve if available (M3), else Ebbinghaus
-            let curve = memory.cluster_id.and_then(|cid| survival_cache.get(&cid));
+            // Use per-cluster survival curve if available (M3), else global prior, else Ebbinghaus
+            let curve = memory
+                .cluster_id
+                .and_then(|cid| survival_cache.get(&cid))
+                .or(global_prior.as_ref());
             let final_score = crate::search::scoring::apply_strength_weighting_with_curve(
                 rrf_score, &memory, curve,
             );
@@ -871,14 +951,28 @@ pub fn recall_temporal_with_request_id(
                 } else {
                     0.0
                 },
+                // M3: cluster-level KM survival probability at current days-since-last-access.
+                // Fallback to global prior, then 0.5 (neutral) when no curve exists.
+                cluster_survival: mem
+                    .cluster_id
+                    .and_then(|cid| survival_cache.get(&cid))
+                    .or(global_prior.as_ref())
+                    .map(|curve| {
+                        let days = (chrono::Utc::now() - mem.last_accessed).num_hours() as f64
+                            / 24.0;
+                        curve.probability_at(days) as f32
+                    })
+                    .unwrap_or(0.5),
             };
             *score = crate::search::rerank::rerank_score(&features, &weights);
         }
         local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    // === R2+: LLM reranker — override linear scores with LLM judgement ===
-    // Skip if: strong BM25 signal, or linear rerank already shows clear separation (top1 >> top2)
+    // === R2+: LLM reranker — launched in background, joined after cross-validation ===
+    // Skip if: strong BM25 signal, or linear rerank already shows clear separation (top1 >> top2).
+    // The thread runs concurrently with AutoMemory scan + Supermemory join + cross-validate,
+    // so its latency largely overlaps with work the pipeline must do anyway.
     let linear_clear = if local_results.len() >= 2 {
         let top1 = local_results[0].1;
         let top2 = local_results[1].1;
@@ -889,20 +983,53 @@ pub fn recall_temporal_with_request_id(
     if linear_clear {
         tracing::debug!("linear rerank scores well-separated, skipping LLM reranker");
     }
-    if !fast
-        && !strong_signal
-        && !linear_clear
-        && config.reranker_provider() != crate::config::Provider::None
-        && local_results.len() > 1
-    {
-        let llm_scores = crate::search::rerank_llm::rerank_with_llm(config, query, &local_results);
-        for (i, (_, score)) in local_results.iter_mut().enumerate() {
-            if let Some(&llm_s) = llm_scores.get(i) {
-                *score = llm_s;
+    // Snapshot positional id list and candidates for background thread.
+    // `candidate_ids` lets us rebuild an id→score map after the thread joins.
+    // When `llm_reranker_timeout_ms = 0`, use legacy synchronous mode (blocks in-place).
+    let llm_rerank_state: Option<(Vec<String>, std::sync::mpsc::Receiver<Vec<f32>>)> =
+        if !fast
+            && !strong_signal
+            && !linear_clear
+            && config.reranker_provider() != crate::config::Provider::None
+            && local_results.len() > 1
+        {
+            let candidate_ids: Vec<String> =
+                local_results.iter().map(|(m, _)| m.id.clone()).collect();
+
+            if config.search.llm_reranker_timeout_ms == 0 {
+                // Synchronous legacy mode: block in-place, apply scores immediately
+                let llm_scores = crate::search::rerank_llm::rerank_with_llm(
+                    config,
+                    query,
+                    &local_results,
+                );
+                for (i, (_, score)) in local_results.iter_mut().enumerate() {
+                    if let Some(&s) = llm_scores.get(i) {
+                        *score = s;
+                    }
+                }
+                local_results
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                None // no async state needed
+            } else {
+                let candidates_clone: Vec<(Memory, f32)> = local_results.clone();
+                let config_clone = config.clone();
+                let query_clone = query.to_string();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let scores = crate::search::rerank_llm::rerank_with_llm(
+                        &config_clone,
+                        &query_clone,
+                        &candidates_clone,
+                    );
+                    let _ = tx.send(scores);
+                });
+                tracing::debug!("llm reranker launched in background thread");
+                Some((candidate_ids, rx))
             }
-        }
-        local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    }
+        } else {
+            None
+        };
 
     // === Optional keyword filter ===
     if let Some(kw) = keyword {
@@ -957,6 +1084,51 @@ pub fn recall_temporal_with_request_id(
     apply_evidence_rerank(store, query, &mut results, 3);
 
     sort_recall_results(&mut results);
+
+    // === R2+ async join: apply LLM reranker scores if they arrived within budget ===
+    if let Some((candidate_ids, rx)) = llm_rerank_state {
+        let timeout_ms = config.search.llm_reranker_timeout_ms;
+        let elapsed = total_start.elapsed();
+        let budget = std::time::Duration::from_millis(timeout_ms);
+        let remaining = budget.saturating_sub(elapsed);
+        match rx.recv_timeout(remaining) {
+            Ok(llm_scores) => {
+                tracing::info!(
+                    elapsed_ms = total_start.elapsed().as_millis() as u64,
+                    count = llm_scores.len(),
+                    "llm reranker scores arrived (async)"
+                );
+                // `candidate_ids` are raw IDs from before canonical collapse.
+                // After collapse, result.memory.id is the canonical ID which may differ.
+                // Build canonical_id → max(llm_score) so the lookup works correctly.
+                // Multiple raw IDs may share a canonical — take the max score.
+                let mut llm_score_map: std::collections::HashMap<String, f32> =
+                    std::collections::HashMap::new();
+                for (raw_id, &s) in candidate_ids.iter().zip(llm_scores.iter()) {
+                    let canonical = store
+                        .canonical_id_for(raw_id)
+                        .unwrap_or_else(|_| raw_id.clone());
+                    let entry = llm_score_map.entry(canonical).or_insert(f32::NEG_INFINITY);
+                    if s > *entry {
+                        *entry = s;
+                    }
+                }
+                // Apply to final results (sm:/auto: memories have no entry — unchanged)
+                for r in &mut results {
+                    if let Some(&llm_s) = llm_score_map.get(&r.memory.id) {
+                        r.score = llm_s;
+                    }
+                }
+                sort_recall_results(&mut results);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    elapsed_ms = total_start.elapsed().as_millis() as u64,
+                    "llm reranker exceeded budget, keeping linear scores"
+                );
+            }
+        }
+    }
 
     // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
     if config.adaptive.enabled {
@@ -1021,8 +1193,29 @@ pub fn recall_temporal_with_request_id(
         );
     }
 
-    // Truncate to the caller's requested limit (not effective_limit).
-    results.truncate(limit);
+    // === MMR diversity reranking (lambda < 1.0 activates diversity pressure) ===
+    // Applied after M1 emission so the full candidate set is logged for counterfactual replay.
+    let mmr_lambda = config.search.mmr_lambda as f32;
+    if mmr_lambda < 1.0 && results.len() > limit {
+        // Build candidates from the already-sorted results (sort_recall_results applied
+        // multi-key ordering: score → support_count → source_diversity → confidence).
+        // This preserves tie-break determinism when MMR scores are equal.
+        let candidates: Vec<(Memory, f32)> = results
+            .iter()
+            .map(|r| (r.memory.clone(), r.score))
+            .collect();
+        let selected = crate::search::mmr::apply_mmr(candidates, limit, mmr_lambda);
+        // Reassemble RecallResults by id lookup (preserves confidence/sources_hit)
+        let mut result_map: std::collections::HashMap<String, RecallResult> =
+            results.into_iter().map(|r| (r.memory.id.clone(), r)).collect();
+        results = selected
+            .into_iter()
+            .filter_map(|(m, _)| result_map.remove(&m.id))
+            .collect();
+    } else {
+        // Truncate to the caller's requested limit (not effective_limit).
+        results.truncate(limit);
+    }
     enrich_results_with_evidence(store, &mut results, 2);
 
     // Record recall hit (NOT access — access should only be counted when
@@ -1370,14 +1563,45 @@ fn vec_search_direct(
     // Try HNSW first (O(log n) approximate nearest neighbor)
     let hnsw_path = store.db_path().with_extension("");
     if crate::store::hnsw::HnswIndex::is_dirty(&hnsw_path) {
-        tracing::info!("hnsw index marked dirty, rebuilding before vector search");
-        if let Some(cfg) = config {
-            crate::search::warmup::populate_hnsw(store, cfg);
+        // Atomically claim the dirty marker. Only one concurrent caller wins;
+        // others fall through to sqlite-vec immediately (no duplicate rebuilds).
+        if crate::store::hnsw::HnswIndex::take_dirty_for_rebuild(&hnsw_path) {
+            tracing::info!("hnsw index dirty — spawning background rebuild, using sqlite-vec for this request");
+            let rebuild_path = hnsw_path.clone();
+            let rebuild_cfg = config.cloned().unwrap_or_else(|| {
+                let mut fb = crate::config::ReinConfig::load().unwrap_or_default();
+                fb.embedding.dimensions = embedding.len();
+                fb
+            });
+            let db_path = store.db_path().to_path_buf();
+            let model = rebuild_cfg.embedding_model();
+            let dims = rebuild_cfg.embedding.dimensions;
+            std::thread::spawn(move || {
+                let rebuilt = if let Ok(s) = SqliteStore::new(&db_path, &model, dims) {
+                    crate::search::warmup::populate_hnsw(&s, &rebuild_cfg)
+                } else {
+                    false
+                };
+                if rebuilt {
+                    // Success: clear `.rebuilding` — index is ready
+                    crate::store::hnsw::HnswIndex::clear_rebuilding(&rebuild_path);
+                } else {
+                    // Failed or skipped: restore `.dirty` so a future request retries
+                    let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&rebuild_path);
+                    let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&rebuild_path);
+                    if rebuilding.exists() {
+                        let _ = std::fs::rename(&rebuilding, &dirty);
+                    }
+                }
+            });
         } else {
-            let mut fallback = crate::config::ReinConfig::load().unwrap_or_default();
-            fallback.embedding.dimensions = embedding.len();
-            crate::search::warmup::populate_hnsw(store, &fallback);
+            tracing::debug!("hnsw rebuild already in progress, using sqlite-vec for this request");
         }
+        // Fall through to sqlite-vec fallback immediately — do not block.
+        return match crate::store::vec::search_vec(store.conn(), embedding, limit) {
+            Ok(results) => rank_and_filter(results, store, topic, limit),
+            Err(_) => vec![],
+        };
     }
     if let Ok(index) = crate::store::hnsw::HnswIndex::open(&hnsw_path, embedding.len()) {
         if !index.is_empty() {
