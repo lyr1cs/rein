@@ -71,6 +71,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load graph data';
 }
 
+function getPollingIntervalMs(): number {
+  const saved = localStorage.getItem('rein_polling_interval');
+  const seconds = saved ? parseInt(saved, 10) : 5;
+  return Number.isFinite(seconds) ? seconds * 1000 : 5000;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Relation-type colors                                              */
 /* ------------------------------------------------------------------ */
@@ -111,12 +117,23 @@ export default function Graph() {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [search, setSearch] = useState('');
+  const [reloadVersion, setReloadVersion] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState(() => ({
     width: typeof window !== 'undefined' ? window.innerWidth - 96 : 800,
     height: typeof window !== 'undefined' ? window.innerHeight - 120 : 600,
   }));
+
+  const refreshGraph = useCallback(() => {
+    setGraphLoading(true);
+    setReloadVersion((version) => version + 1);
+  }, []);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(refreshGraph, getPollingIntervalMs());
+    return () => window.clearInterval(intervalId);
+  }, [refreshGraph]);
 
   /* ---- Fetch memoirs on mount ---- */
   useEffect(() => {
@@ -182,7 +199,7 @@ export default function Graph() {
       });
 
     return () => { cancelled = true; };
-  }, [selectedMemoir]);
+  }, [selectedMemoir, reloadVersion]);
 
   /* ---- Resize observer ---- */
   useEffect(() => {
@@ -404,6 +421,12 @@ export default function Graph() {
             Clear
           </button>
         )}
+        <button
+          onClick={refreshGraph}
+          className="rounded border border-[var(--border)] px-2 py-1 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--accent)]"
+        >
+          Refresh
+        </button>
       </div>
 
       {/* Main area: graph + optional detail panel */}

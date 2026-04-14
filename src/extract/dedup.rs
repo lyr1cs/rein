@@ -38,8 +38,11 @@ fn normalize_tokens(text: &str) -> HashSet<String> {
         .collect();
 
     if contains_cjk(text) {
+        // HMM=true for better OOV recognition (matches extract_keywords_from_text);
+        // aligning the two paths prevents threshold drift between dedup similarity
+        // and keyword extraction on novel terminology (e.g. product names).
         let jieba_tokens = jieba()
-            .cut(text, false)
+            .cut(text, true)
             .into_iter()
             .map(normalize_token)
             .filter(|t| !t.is_empty())
@@ -300,6 +303,7 @@ pub enum DedupAction {
 pub fn check_dedup(
     store: &SqliteStore,
     topic: &str,
+    summary: &str,
     content: &str,
     similarity_threshold: f32,
     time_window_days: i64,
@@ -336,7 +340,9 @@ pub fn check_dedup(
     // Channel 2: Embedding-based candidates (cross-topic semantic duplicates)
     // Critical for CJK text where FTS5 may return nothing.
     // Only uses cached embeddings — no API call on the hot path.
-    if let Some(emb_candidates) = embedding_candidate_lookup(store, content, &embed_model, topic) {
+    if let Some(emb_candidates) =
+        embedding_candidate_lookup(store, summary, content, &embed_model, topic)
+    {
         for memory in emb_candidates
             .into_iter()
             .filter(|m| m.superseded_by.is_none())
@@ -373,7 +379,7 @@ pub fn check_dedup(
     if !embed_model.is_empty() {
         for candidate in &candidates {
             if let Some(cosine) =
-                embedding_cosine_check(store, content, &candidate.id, &embed_model, topic)
+                embedding_cosine_check(store, summary, content, &candidate.id, &embed_model, topic)
             {
                 if cosine > best_vec_sim {
                     best_vec_sim = cosine;
@@ -433,7 +439,7 @@ pub fn check_dedup(
         if should_escalate_gray_zone(score, best_sim, llm_budget_available) {
             // Try embedding-based resolution first (zero LLM cost)
             if let Some(embed_sim) =
-                embedding_cosine_check(store, content, &memory.id, &embed_model, topic)
+                embedding_cosine_check(store, summary, content, &memory.id, &embed_model, topic)
             {
                 if embed_sim > 0.85 {
                     // Embedding confirms strong match — treat as dedup
@@ -482,14 +488,13 @@ pub fn check_dedup(
 /// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
 fn embedding_candidate_lookup(
     store: &SqliteStore,
+    summary: &str,
     content: &str,
     model: &str,
-    _topic: &str,
+    topic: &str,
 ) -> Option<Vec<crate::types::Memory>> {
-    // Look up cached embedding by raw content. The EmbedCache key depends on what text
-    // was originally embedded — we can't reconstruct the exact enriched key without the
-    // real summary, so we check raw content which may match older cache entries.
-    let emb = crate::embed::EmbedCache::get(store.conn(), content, model)
+    let enriched = crate::embed::prepend_metadata(topic, summary, content);
+    let emb = crate::embed::EmbedCache::get(store.conn(), &enriched, model)
         .ok()
         .flatten()?;
     let results = crate::store::vec::search_vec(store.conn(), &emb, 5).ok()?;
@@ -521,13 +526,14 @@ fn embedding_candidate_lookup(
 /// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
 fn embedding_cosine_check(
     store: &SqliteStore,
+    summary: &str,
     content: &str,
     candidate_id: &str,
     model: &str,
-    _topic: &str,
+    topic: &str,
 ) -> Option<f32> {
-    // Check if new content has a cached embedding (raw content key)
-    let new_emb = crate::embed::EmbedCache::get(store.conn(), content, model)
+    let enriched = crate::embed::prepend_metadata(topic, summary, content);
+    let new_emb = crate::embed::EmbedCache::get(store.conn(), &enriched, model)
         .ok()
         .flatten()?;
     // Check if candidate has a stored embedding
@@ -819,6 +825,7 @@ mod tests {
         let action = check_dedup(
             &store,
             "docker",
+            "alpha beta gamma delta kappa lambda mu nu xi",
             "alpha beta gamma delta kappa lambda mu nu xi",
             0.70,
             7,

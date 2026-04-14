@@ -36,14 +36,26 @@ impl HnswIndex {
             index
                 .load(index_path.to_str().unwrap_or(""))
                 .map_err(|e| ReinError::Config(format!("hnsw load: {e}")))?;
-            // Load metadata
-            if meta_path.exists() {
-                let meta = std::fs::read_to_string(&meta_path)
-                    .map_err(|e| ReinError::Config(format!("hnsw meta read: {e}")))?;
-                deserialize_meta(&meta)
-            } else {
-                (HashMap::new(), HashMap::new(), 0)
+            if !meta_path.exists() {
+                Self::mark_dirty(path);
+                return Err(ReinError::Config(
+                    "hnsw metadata missing; rebuild required".to_string(),
+                ));
             }
+            let meta = std::fs::read_to_string(&meta_path)
+                .map_err(|e| ReinError::Config(format!("hnsw meta read: {e}")))?;
+            let (id_to_key, key_to_id, next_key) = deserialize_meta(&meta);
+            let index_size = index.size();
+            if (index_size > 0 && key_to_id.is_empty())
+                || key_to_id.len() != id_to_key.len()
+                || key_to_id.len() != index_size
+            {
+                Self::mark_dirty(path);
+                return Err(ReinError::Config(
+                    "hnsw metadata corrupt or out of sync; rebuild required".to_string(),
+                ));
+            }
+            (id_to_key, key_to_id, next_key)
         } else {
             // Reserve capacity for initial use
             index
@@ -75,13 +87,7 @@ impl HnswIndex {
     /// Insert a vector for the given memory ID.
     pub fn insert(&mut self, id: &str, vector: &[f32]) -> ReinResult<()> {
         let key = self.next_key;
-        self.next_key += 1;
-
-        // Remove old entry if exists
-        if let Some(&old_key) = self.id_to_key.get(id) {
-            let _ = self.index.remove(old_key);
-            self.key_to_id.remove(&old_key);
-        }
+        let old_key = self.id_to_key.get(id).copied();
 
         // Ensure capacity
         if self.index.size() >= self.index.capacity() {
@@ -94,6 +100,11 @@ impl HnswIndex {
         self.index
             .add(key, vector)
             .map_err(|e| ReinError::Config(format!("hnsw add: {e}")))?;
+        self.next_key += 1;
+        if let Some(old_key) = old_key {
+            let _ = self.index.remove(old_key);
+            self.key_to_id.remove(&old_key);
+        }
         self.id_to_key.insert(id.to_string(), key);
         self.key_to_id.insert(key, id.to_string());
 
@@ -275,6 +286,25 @@ mod tests {
         let index = HnswIndex::open(&path, 3).unwrap();
         let results = index.search(&[1.0, 0.0, 0.0], 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_hnsw_open_requires_metadata_for_populated_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_meta_missing");
+
+        let mut index = HnswIndex::open(&path, 3).unwrap();
+        index.insert("mem1", &[1.0, 0.0, 0.0]).unwrap();
+        index.save().unwrap();
+
+        std::fs::remove_file(path.with_extension("usearch.meta")).unwrap();
+
+        let err = match HnswIndex::open(&path, 3) {
+            Ok(_) => panic!("expected metadata-missing open to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("metadata"));
+        assert!(HnswIndex::is_dirty(&path));
     }
 
     #[test]

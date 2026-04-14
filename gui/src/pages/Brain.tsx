@@ -68,6 +68,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load data';
 }
 
+function getPollingIntervalMs(): number {
+  const saved = localStorage.getItem('rein_polling_interval');
+  const seconds = saved ? parseInt(saved, 10) : 5;
+  return Number.isFinite(seconds) ? seconds * 1000 : 5000;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Tier colors                                                        */
 /* ------------------------------------------------------------------ */
@@ -95,6 +101,7 @@ export default function Brain() {
   const [search, setSearch] = useState('');
   const [timeMax, setTimeMax] = useState(0);
   const [timeSlider, setTimeSlider] = useState(0);
+  const [reloadVersion, setReloadVersion] = useState(0);
   const { data: selectedMemoryDetail, isLoading: selectedMemoryLoading } = useMemoryDetail(
     selectedNode?.type === 'memory' ? selectedNode.id : null,
   );
@@ -102,7 +109,17 @@ export default function Brain() {
   /* Refs */
   const fgRef = useRef<GraphHandle | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement>(null);
+  const hasLoadedGraphRef = useRef(false);
   const [dimensions, setDimensions] = useState({ width: window.innerWidth - 48, height: window.innerHeight - 40 });
+
+  const refreshGraph = useCallback(() => {
+    setReloadVersion((version) => version + 1);
+  }, []);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(refreshGraph, getPollingIntervalMs());
+    return () => window.clearInterval(intervalId);
+  }, [refreshGraph]);
 
 
   /* ---- Fetch all data on mount ---- */
@@ -110,6 +127,12 @@ export default function Brain() {
     let cancelled = false;
 
     async function load() {
+      if (!cancelled) {
+        if (!hasLoadedGraphRef.current) {
+          setLoading(true);
+        }
+        setError('');
+      }
       try {
         /* Fetch memories and memoirs in parallel */
         const [recentRes, memoirsRes] = await Promise.all([
@@ -201,6 +224,7 @@ export default function Brain() {
         setTimeMax(now);
         setTimeSlider(now);
         setLoading(false);
+        hasLoadedGraphRef.current = true;
       } catch (err: unknown) {
         if (!cancelled) {
           setError(errorMessage(err));
@@ -211,7 +235,7 @@ export default function Brain() {
 
     load();
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadVersion]);
 
   /* ---- Fit view on first render ---- */
   useEffect(() => {
@@ -581,6 +605,12 @@ export default function Brain() {
             Clear
           </button>
         )}
+        <button
+          onClick={refreshGraph}
+          className="text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] bg-[#0f172a]/80 backdrop-blur border border-[var(--border)] rounded-lg px-2 py-1.5"
+        >
+          Refresh
+        </button>
       </div>
 
       {/* Zoom controls (bottom-right) */}

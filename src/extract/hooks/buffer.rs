@@ -175,7 +175,8 @@ pub fn cleanup_stale_buffers(config: &ReinConfig) {
                     // Try non-blocking lock to verify nobody holds this lock file
                     if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&entry) {
                         use std::os::unix::io::AsRawFd;
-                        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                        let rc =
+                            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                         if rc == 0 {
                             // We got the lock — nobody else holds it, safe to remove
                             let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };

@@ -37,13 +37,21 @@ pub fn remove_pid(name: &str) {
     let _ = std::fs::remove_file(pid_path(name));
 }
 
-/// Check whether the process at `pid` is actually a rein binary.
+fn matches_recorded_executable(running: &std::path::Path, saved_exe: &str) -> bool {
+    let saved_path = std::path::Path::new(saved_exe);
+    if saved_exe.trim().is_empty() {
+        return running.file_name().is_some_and(|name| name == "rein");
+    }
+    running == saved_path || running.file_name() == saved_path.file_name()
+}
+
+/// Check whether the process at `pid` is actually the recorded rein binary.
 /// Uses OS-specific introspection to guard against PID recycling.
-fn is_process_rein(pid: u32) -> bool {
+fn is_process_rein(pid: u32, saved_exe: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
         if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
-            return exe.to_string_lossy().contains("rein");
+            return matches_recorded_executable(&exe, saved_exe);
         }
     }
     #[cfg(target_os = "macos")]
@@ -53,7 +61,11 @@ fn is_process_rein(pid: u32) -> bool {
             .output()
         {
             if output.status.success() {
-                return String::from_utf8_lossy(&output.stdout).contains("rein");
+                let command = String::from_utf8_lossy(&output.stdout);
+                return matches_recorded_executable(
+                    std::path::Path::new(command.trim()),
+                    saved_exe,
+                );
             }
         }
     }
@@ -66,7 +78,7 @@ pub fn is_running(name: &str) -> Option<u32> {
     let content = std::fs::read_to_string(pid_path(name)).ok()?;
     let mut lines = content.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
-    let _saved_exe = lines.next().unwrap_or("");
+    let saved_exe = lines.next().unwrap_or("");
 
     #[cfg(unix)]
     {
@@ -77,7 +89,7 @@ pub fn is_running(name: &str) -> Option<u32> {
             return None;
         }
         // Verify the running process is actually rein (guards against PID recycling)
-        if !is_process_rein(pid) {
+        if !is_process_rein(pid, saved_exe) {
             remove_pid(name);
             return None;
         }
@@ -201,8 +213,13 @@ fn fetch_proxy_metrics(port: u16) -> Option<(u64, u64, u64)> {
     // Include auth token if configured (proxy requires x-rein-token when token is set)
     // Prefer REIN_PROXY_TOKEN (matches proxy auth) then REIN_HTTP_TOKEN as fallback
     let token = std::env::var("REIN_PROXY_TOKEN")
-        .or_else(|_| std::env::var("REIN_HTTP_TOKEN"))
-        .ok();
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            std::env::var("REIN_HTTP_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        });
     let auth_header = token
         .map(|t| format!("x-rein-token: {t}\r\n"))
         .unwrap_or_default();

@@ -300,16 +300,23 @@ impl SqliteStore {
                     && weak_count > concept.source_memory_ids.len() / 2;
 
                 // JSON-quoted match with LIKE wildcard escaping
-                let escaped_cid = concept.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                let escaped_cid = concept
+                    .id
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
                 // Count all active memories that reference this concept via concept_ids.
                 // We protect any concept with at least one active reference, regardless of
                 // how many source_memory_ids the concept tracks — those may be stale after
                 // STM prune removed memories without updating concept.source_memory_ids.
-                let external_ref_count: i64 = self.conn.query_row(
-                    "SELECT COUNT(*) FROM memories WHERE concept_ids LIKE ?1 ESCAPE '\\'",
-                    rusqlite::params![format!("%\"{}\"%", escaped_cid)],
-                    |r| r.get(0),
-                ).unwrap_or(0);
+                let external_ref_count: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE concept_ids LIKE ?1 ESCAPE '\\'",
+                        rusqlite::params![format!("%\"{}\"%", escaped_cid)],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
                 if external_ref_count > 0 {
                     continue;
                 }
@@ -319,8 +326,7 @@ impl SqliteStore {
                 // concept itself was never cascade-pruned.  majority_weak is always
                 // false for empty source_memory_ids, so without this explicit check
                 // orphaned concepts would leak indefinitely.
-                let is_orphaned =
-                    concept.source_memory_ids.is_empty() && external_ref_count == 0;
+                let is_orphaned = concept.source_memory_ids.is_empty() && external_ref_count == 0;
 
                 if score < 0.2 && (majority_weak || is_orphaned) {
                     let _ = self.conn.execute(

@@ -24,11 +24,7 @@ use crate::types::Memory;
 ///
 /// When `lambda == 1.0` or `candidates.len() <= limit`, returns the first
 /// `limit` candidates unchanged — zero overhead for the common case.
-pub fn apply_mmr(
-    candidates: Vec<(Memory, f32)>,
-    limit: usize,
-    lambda: f32,
-) -> Vec<(Memory, f32)> {
+pub fn apply_mmr(candidates: Vec<(Memory, f32)>, limit: usize, lambda: f32) -> Vec<(Memory, f32)> {
     if candidates.is_empty() || limit == 0 {
         return vec![];
     }
@@ -119,12 +115,22 @@ fn topic_keyword_similarity(a: &Memory, b: &Memory) -> f32 {
 /// Return a similarity score [0, 0.7] based on how much of the topic prefix
 /// the two strings share (split on `-`, `_`, `/`, or whitespace).
 fn topic_prefix_similarity(a: &str, b: &str) -> f32 {
-    let seg_a: Vec<&str> = a.split(['-', '_', '/', ' ']).filter(|s| !s.is_empty()).collect();
-    let seg_b: Vec<&str> = b.split(['-', '_', '/', ' ']).filter(|s| !s.is_empty()).collect();
+    let seg_a: Vec<&str> = a
+        .split(['-', '_', '/', ' '])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let seg_b: Vec<&str> = b
+        .split(['-', '_', '/', ' '])
+        .filter(|s| !s.is_empty())
+        .collect();
     if seg_a.is_empty() || seg_b.is_empty() {
         return 0.0;
     }
-    let shared = seg_a.iter().zip(seg_b.iter()).take_while(|(a, b)| a == b).count();
+    let shared = seg_a
+        .iter()
+        .zip(seg_b.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
     let max_len = seg_a.len().max(seg_b.len());
     // Cap at 0.7: never reach 1.0 here since equal topics are handled above
     (shared as f32 / max_len as f32) * 0.7
@@ -133,8 +139,8 @@ fn topic_prefix_similarity(a: &str, b: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, Source};
     use crate::store::tiering::MemoryTier;
+    use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, Source};
 
     fn make_memory(id: &str, topic: &str, keywords: &[&str]) -> Memory {
         Memory {

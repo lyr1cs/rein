@@ -71,6 +71,44 @@ impl ReinServer {
     }
 }
 
+const HTTP_SESSION_COOKIE: &str = "rein_http_token";
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+fn cookie_value(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get("cookie")?.to_str().ok()?;
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        if key.trim() == name {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn request_has_valid_http_auth(headers: &hyper::HeaderMap, expected: &str) -> bool {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let expected_str = format!("Bearer {expected}");
+    if constant_time_eq(auth_header, &expected_str) {
+        return true;
+    }
+    cookie_value(headers, HTTP_SESSION_COOKIE)
+        .map(|value| constant_time_eq(&value, expected))
+        .unwrap_or(false)
+}
+
 #[tool_router]
 impl ReinServer {
     /// Search memories by query, topic, or keyword.
@@ -1636,7 +1674,9 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     let config_clone = config.clone();
 
     // Bearer token authentication
-    let auth_token = std::env::var("REIN_HTTP_TOKEN").ok();
+    let auth_token = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
     let allow_loopback_unauth = config.server.allow_unauthenticated_loopback
         && (config.server.sse_bind == "127.0.0.1"
             || config.server.sse_bind == "::1"
@@ -1702,22 +1742,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             let needs_auth = path.starts_with("/api/") || path.starts_with("/mcp");
             if needs_auth {
                 if let Some(ref expected) = token {
-                    let auth_header = req
-                        .headers()
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let expected_str = format!("Bearer {expected}");
-                    let auth_match = if auth_header.len() != expected_str.len() {
-                        false
-                    } else {
-                        auth_header
-                            .bytes()
-                            .zip(expected_str.bytes())
-                            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-                            == 0
-                    };
-                    if !auth_match {
+                    if !request_has_valid_http_auth(req.headers(), expected) {
                         return Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
                                 .status(401)
@@ -1753,5 +1778,30 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                 tracing::warn!("connection error: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_auth_accepts_matching_cookie() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            hyper::header::HeaderValue::from_static("rein_http_token=secret-token"),
+        );
+        assert!(request_has_valid_http_auth(&headers, "secret-token"));
+    }
+
+    #[test]
+    fn request_auth_rejects_empty_cookie_value() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            hyper::header::HeaderValue::from_static("rein_http_token="),
+        );
+        assert!(!request_has_valid_http_auth(&headers, "secret-token"));
     }
 }

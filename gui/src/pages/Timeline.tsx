@@ -44,14 +44,21 @@ function formatDateTime(iso: string): { date: string; time: string } {
   };
 }
 
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function defaultFrom(): string {
   const d = new Date();
   d.setDate(d.getDate() - 30);
-  return d.toISOString().slice(0, 10);
+  return formatLocalDate(d);
 }
 
 function defaultTo(): string {
-  return new Date().toISOString().slice(0, 10);
+  return formatLocalDate(new Date());
 }
 
 /* ── Timeline page ──────────────────────────────────────────────── */
@@ -66,7 +73,7 @@ export default function Timeline() {
     queryFn: () => {
       const params = new URLSearchParams();
       if (from) params.set('from', from);
-      if (to) params.set('to', `${to}T23:59:59Z`);
+      if (to) params.set('to', to);
       params.set('limit', String(limit));
       return apiGet<TimelineResponse>(`/api/timeline?${params}`);
     },

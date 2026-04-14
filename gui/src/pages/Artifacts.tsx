@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useArtifacts } from '../hooks/useApi';
 import { apiGet } from '../api/client';
 import type { Artifact } from '../api/types';
@@ -64,27 +64,48 @@ export default function Artifacts() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ArtifactDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const detailRequestRef = useRef(0);
 
   const { data, isLoading } = useArtifacts(limit);
   const artifacts = data?.artifacts ?? [];
 
+  useEffect(() => () => detailAbortRef.current?.abort(), []);
+
   const handleRowClick = useCallback(
     async (artifact: Artifact) => {
       if (expandedId === artifact.id) {
+        detailAbortRef.current?.abort();
+        detailRequestRef.current += 1;
         setExpandedId(null);
         setDetail(null);
+        setDetailLoading(false);
         return;
       }
+      detailAbortRef.current?.abort();
+      const controller = new AbortController();
+      detailAbortRef.current = controller;
+      detailRequestRef.current += 1;
+      const requestId = detailRequestRef.current;
       setExpandedId(artifact.id);
       setDetail(null);
       setDetailLoading(true);
       try {
-        const d = await apiGet<ArtifactDetail>(`/api/artifacts/${artifact.id}?include_transcript=true`);
-        setDetail(d);
+        const d = await apiGet<ArtifactDetail>(
+          `/api/artifacts/${artifact.id}?include_transcript=true`,
+          { signal: controller.signal },
+        );
+        if (detailRequestRef.current === requestId && !controller.signal.aborted) {
+          setDetail(d);
+        }
       } catch (err) {
-        console.error('Failed to fetch artifact detail:', err);
+        if (!(err instanceof DOMException && err.name === 'AbortError')) {
+          console.error('Failed to fetch artifact detail:', err);
+        }
       } finally {
-        setDetailLoading(false);
+        if (detailRequestRef.current === requestId) {
+          setDetailLoading(false);
+        }
       }
     },
     [expandedId],

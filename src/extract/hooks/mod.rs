@@ -204,8 +204,7 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
                 // (buffered tool outputs OR a compact_summary from Claude's compaction).
                 // If neither exists, keeping the turns prevents silently losing the episode
                 // record and any stop-time memories on sessions with no summary fields.
-                let has_fallback =
-                    !buffered.is_empty() || session.compact_summary.is_some();
+                let has_fallback = !buffered.is_empty() || session.compact_summary.is_some();
                 if has_fallback {
                     session.turns.clear();
                 }
