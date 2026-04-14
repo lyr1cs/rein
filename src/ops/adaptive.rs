@@ -141,7 +141,11 @@ fn run_hdbscan_clustering(
     let load_limit = count.min(10_000);
     let embeddings: Vec<(String, Vec<f32>)> = match store
         .conn()
-        .prepare("SELECT id, embedding FROM vec_memories LIMIT ?1")
+        .prepare(
+            "SELECT vm.id, vm.embedding FROM vec_memories vm
+             JOIN memories m ON m.id = vm.id
+             LIMIT ?1",
+        )
     {
         Ok(mut stmt) => stmt
             .query_map(rusqlite::params![load_limit as i64], |row| {
@@ -188,6 +192,10 @@ fn run_hdbscan_clustering(
         .execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", []);
     // Clear stale per-cluster dedup thresholds (will be rebuilt by A1)
     state.dedup_thresholds.clear();
+    // Clear per-cluster alpha entries (M2 extension): keys like "semantic:5" are
+    // meaningless after recluster because cluster IDs are reassigned.
+    // Keep only bare query-type keys (no colon separator).
+    state.learned_alpha.retain(|k, _| !k.contains(':'));
 
     // Store new cluster assignments from this run (same transaction)
     state.memory_clusters.clear();
@@ -203,27 +211,169 @@ fn run_hdbscan_clustering(
     }
     let _ = store.conn().execute_batch("COMMIT");
 
-    // Load persisted cluster assignments for memories NOT in this clustering input
-    // (keeps DB and in-memory state synchronized for capped/sampled runs)
-    if let Ok(mut stmt) = store
-        .conn()
-        .prepare("SELECT id, cluster_id FROM memories WHERE cluster_id IS NOT NULL")
-    {
-        let _ = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let cid: u32 = row.get(1)?;
-                Ok((id, cid))
-            })
-            .ok()
-            .map(|rows| {
-                for row in rows.flatten() {
-                    state.memory_clusters.entry(row.0).or_insert(row.1);
+    // Compute and persist cluster centroids BEFORE reassigning non-sampled memories,
+    // so we can use nearest-centroid instead of keeping stale cluster_id labels.
+    let dim = embeddings.first().map(|(_, v)| v.len()).unwrap_or(0);
+    let centroids: std::collections::HashMap<u32, Vec<f32>> = if dim > 0 {
+        let mut cluster_points: std::collections::HashMap<u32, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, label) in result.labels.iter().enumerate() {
+            if let Some(cluster_id) = label {
+                cluster_points.entry(*cluster_id).or_default().push(i);
+            }
+        }
+        let mut c: std::collections::HashMap<u32, Vec<f32>> =
+            std::collections::HashMap::new();
+        for (cluster_id, indices) in &cluster_points {
+            let centroid = compute_cluster_centroid(indices, &embeddings, dim);
+            c.insert(*cluster_id, centroid);
+        }
+        if let Err(e) = crate::store::adaptive::save_cluster_centroids(
+            store.conn(),
+            &c,
+            state.cluster_version + 1,
+            dim,
+        ) {
+            tracing::warn!("M4: failed to save cluster centroids: {e}");
+        }
+        c
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Reassign non-sampled memories via nearest centroid instead of keeping stale
+    // cluster_id labels from the previous HDBSCAN run.  Cluster IDs are local
+    // labels — reusing old IDs from a different run would silently corrupt
+    // per-cluster adaptive state (M2 alpha, M3 survival, A1 dedup thresholds).
+    //
+    // Use the in-memory `clustered_ids` set (derived from the actual HDBSCAN input)
+    // to identify non-sampled memories — avoids a second LIMIT query whose row set
+    // could differ from the first due to non-deterministic ordering.
+    if !centroids.is_empty() {
+        if let Err(e) = store.conn().execute_batch("BEGIN") {
+            tracing::warn!("M4: failed to begin reassignment transaction: {e}");
+        }
+
+        // NULL out stale cluster_ids for non-sampled memories only.
+        // Build a temp table from the known sampled IDs for an exact match.
+        if let Err(e) = store.conn().execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _hdbscan_sampled (id TEXT PRIMARY KEY)",
+        ) {
+            tracing::warn!("M4: failed to create temp table: {e}");
+        }
+        if let Err(e) = store
+            .conn()
+            .execute("DELETE FROM _hdbscan_sampled", [])
+        {
+            tracing::warn!("M4: failed to clear temp table: {e}");
+        }
+        {
+            let mut ins = store
+                .conn()
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO _hdbscan_sampled (id) VALUES (?1)",
+                )
+                .ok();
+            if let Some(ref mut stmt) = ins {
+                for id in &clustered_ids {
+                    let _ = stmt.execute(rusqlite::params![id]);
                 }
-            });
+            }
+        }
+        let _ = store.conn().execute(
+            "UPDATE memories SET cluster_id = NULL
+             WHERE cluster_id IS NOT NULL
+               AND id NOT IN (SELECT id FROM _hdbscan_sampled)",
+            [],
+        );
+
+        // Batch-load non-sampled embeddings and reassign via nearest centroid.
+        // Process in batches of 2000 to bound peak memory (the initial sample is
+        // already capped at 10 000 for the same reason).
+        // Cursor-based pagination: use `vm.id > ?last_id ORDER BY vm.id` instead
+        // of OFFSET, because the loop mutates `cluster_id` from NULL → value,
+        // which shifts the result set and causes OFFSET to skip rows.
+        let reassign_batch_size = 2000i64;
+        let mut reassigned = 0u32;
+        let mut cursor = String::new(); // empty string sorts before all UUIDs
+        loop {
+            let batch: Vec<(String, Vec<f32>)> = store
+                .conn()
+                .prepare(
+                    "SELECT vm.id, vm.embedding FROM vec_memories vm
+                     JOIN memories m ON m.id = vm.id
+                     WHERE m.cluster_id IS NULL
+                       AND vm.id NOT IN (SELECT id FROM _hdbscan_sampled)
+                       AND vm.id > ?1
+                     ORDER BY vm.id
+                     LIMIT ?2",
+                )
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(
+                        rusqlite::params![&cursor, reassign_batch_size],
+                        |row| {
+                            let id: String = row.get(0)?;
+                            let blob: Vec<u8> = row.get(1)?;
+                            let floats: Vec<f32> = blob
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            Ok((id, floats))
+                        },
+                    )
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len() as i64;
+
+            // Advance cursor to the last ID in this batch
+            if let Some((last_id, _)) = batch.last() {
+                cursor = last_id.clone();
+            }
+
+            for (mem_id, emb) in &batch {
+                if let Some(cid) =
+                    crate::store::adaptive::assign_to_nearest_centroid(&centroids, emb)
+                {
+                    let _ = store.conn().execute(
+                        "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
+                        rusqlite::params![cid, mem_id],
+                    );
+                    state.memory_clusters.insert(mem_id.clone(), cid);
+                    reassigned += 1;
+                }
+            }
+
+            if batch_len < reassign_batch_size {
+                break;
+            }
+        }
+
+        if let Err(e) = store
+            .conn()
+            .execute("DROP TABLE IF EXISTS _hdbscan_sampled", [])
+        {
+            tracing::warn!("M4: failed to drop temp table: {e}");
+        }
+        if let Err(e) = store.conn().execute_batch("COMMIT") {
+            tracing::error!("M4: failed to commit reassignment transaction: {e}");
+        }
+
+        if reassigned > 0 {
+            tracing::info!(
+                "M4: reassigned {reassigned} non-sampled memories via nearest centroid"
+            );
+        }
     }
 
     state.cluster_version += 1;
+    state.centroid_version = state.cluster_version;
     tracing::info!(
         "M4: {} clusters, {} noise points, {} assigned (v{})",
         result.clusters.len(),
@@ -231,6 +381,27 @@ fn run_hdbscan_clustering(
         state.memory_clusters.len(),
         state.cluster_version,
     );
+}
+
+/// Element-wise mean of the given embedding indices.
+fn compute_cluster_centroid(
+    indices: &[usize],
+    embeddings: &[(String, Vec<f32>)],
+    dim: usize,
+) -> Vec<f32> {
+    let mut centroid = vec![0.0f64; dim];
+    let count = indices.len();
+    for &idx in indices {
+        if idx < embeddings.len() {
+            for (j, &v) in embeddings[idx].1.iter().enumerate().take(dim) {
+                centroid[j] += v as f64;
+            }
+        }
+    }
+    centroid
+        .into_iter()
+        .map(|c| (c / count.max(1) as f64) as f32)
+        .collect()
 }
 
 // ===========================================================================
@@ -273,7 +444,17 @@ fn build_survival_curves(store: &SqliteStore, state: &crate::store::adaptive::Ad
         if access_count > 0 {
             // Approximate access intervals: spread access_count evenly between created_at and last_accessed
             let total_days = (last_accessed - created).num_seconds() as f64 / 86400.0;
-            if total_days > 0.0 && access_count > 1 {
+            if access_count == 1 {
+                // Single access: one observed event at total_days since creation.
+                // Skip near-zero durations (created_at ≈ last_accessed) to avoid
+                // flooding the KM estimator with zero-duration events.
+                if total_days > 0.01 {
+                    intervals.push(crate::search::survival::SurvivalInterval {
+                        duration_days: total_days,
+                        is_event: true,
+                    });
+                }
+            } else if total_days > 0.0 {
                 let interval = total_days / access_count as f64;
                 for _ in 0..access_count.min(20) {
                     intervals.push(crate::search::survival::SurvivalInterval {
@@ -321,6 +502,31 @@ fn build_survival_curves(store: &SqliteStore, state: &crate::store::adaptive::Ad
 
     if curves_built > 0 {
         tracing::info!("M3: built {curves_built} per-cluster survival curves");
+    }
+
+    // M3 cold-start: build global prior from all cluster observations combined
+    let all_intervals: Vec<crate::search::survival::SurvivalInterval> =
+        cluster_intervals.values().flatten().cloned().collect();
+    if all_intervals.len() >= 20 {
+        if let Some(mut global_curve) = crate::search::survival::kaplan_meier(&all_intervals) {
+            // Cap total_count to keep the global prior in the cold-start blend zone
+            // (between cold_start_min=20 and cold_start_max=50). This ensures
+            // adaptive_strength() still blends with Ebbinghaus rather than trusting
+            // the global curve 100%, preserving its role as a prior, not an oracle.
+            global_curve.total_count = global_curve.total_count.min(35);
+            let key = "survival_curve:global";
+            if let Ok(json) = serde_json::to_string(&global_curve) {
+                let _ = store.conn().execute(
+                    "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = ?2",
+                    rusqlite::params![key, json],
+                );
+                tracing::info!(
+                    "M3: built global prior survival curve ({} observations)",
+                    global_curve.total_count
+                );
+            }
+        }
     }
 }
 
@@ -606,15 +812,16 @@ fn compute_counterfactual_alphas(
     }
 
     // Per-query-type alphas
-    for qt in &["temporal", "exact", "semantic", "exploratory"] {
+    // Build request_id → query_type map once to avoid O(n²) lookups
+    let qt_map: std::collections::HashMap<&str, &str> = stored_events
+        .iter()
+        .filter_map(|se| se.request_id.as_deref().zip(se.query_type.as_deref()))
+        .collect();
+
+    for qt in &["episodic", "temporal", "preference", "exact", "semantic", "exploratory"] {
         let qt_events: Vec<_> = events_with_access
             .iter()
-            .filter(|e| {
-                stored_events.iter().any(|se| {
-                    se.request_id.as_deref() == Some(&e.request_id)
-                        && se.query_type.as_deref() == Some(qt)
-                })
-            })
+            .filter(|e| qt_map.get(e.request_id.as_str()).copied() == Some(qt))
             .cloned()
             .collect();
 
@@ -648,6 +855,82 @@ fn compute_counterfactual_alphas(
 
             tracing::info!(
                 "M2: learned {qt} alpha = {shrunk:.3} ({} events)",
+                learned.sample_count
+            );
+        }
+    }
+
+    // M2 extension: per-cluster per-query-type alpha learning
+    // Bucket events by (query_type, dominant_cluster_id)
+    let mut cluster_buckets: std::collections::HashMap<
+        (String, u32),
+        Vec<crate::search::alpha_optimizer::RecallEvent>,
+    > = std::collections::HashMap::new();
+    for re in events_with_access {
+        let qt = qt_map
+            .get(re.request_id.as_str())
+            .copied()
+            .unwrap_or("semantic");
+        // Vote for dominant cluster among accessed memories
+        let mut votes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for id in &re.accessed_ids {
+            if let Some(&cid) = state.memory_clusters.get(id) {
+                *votes.entry(cid).or_default() += 1;
+            }
+        }
+        if let Some((&cid, _)) = votes.iter().max_by_key(|(_, &c)| c) {
+            cluster_buckets
+                .entry((qt.to_string(), cid))
+                .or_default()
+                .push(re.clone());
+        }
+    }
+
+    for ((qt, cluster_id), events) in &cluster_buckets {
+        if events.len() < config.adaptive.min_samples_alpha {
+            continue;
+        }
+        if let Some(learned) =
+            crate::search::alpha_optimizer::optimize_alpha(events, decay_lambda)
+        {
+            // Shrink toward the query-type level alpha (or global as fallback)
+            let parent_alpha = state
+                .learned_alpha
+                .get(qt.as_str())
+                .or_else(|| state.learned_alpha.get("global"))
+                .map(|e| e.value)
+                .unwrap_or(0.5);
+            // Dampen step size to prevent volatile swings with small sample counts
+            let current = state
+                .learned_alpha
+                .get(&crate::store::adaptive::AdaptiveState::bucket_key(
+                    qt,
+                    Some(*cluster_id),
+                ))
+                .map(|e| e.value)
+                .unwrap_or(parent_alpha);
+            let stepped = crate::search::alpha_optimizer::apply_max_step(
+                current,
+                learned.value,
+                config.adaptive.alpha_max_step,
+            );
+            let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
+                stepped,
+                parent_alpha,
+                learned.sample_count,
+                config.adaptive.shrinkage_prior,
+            );
+            let key = crate::store::adaptive::AdaptiveState::bucket_key(qt, Some(*cluster_id));
+            state.learned_alpha.insert(
+                key,
+                crate::store::adaptive::LearnedAlphaEntry {
+                    value: shrunk,
+                    sample_count: learned.sample_count,
+                    last_updated: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+            tracing::info!(
+                "M2: learned {qt}:{cluster_id} alpha = {shrunk:.3} ({} events)",
                 learned.sample_count
             );
         }

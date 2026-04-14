@@ -419,6 +419,7 @@ fn test_rerank_changes_ordering() {
         concept_richness: 0.0,
         tier_score: 0.0,
         is_current: 0.0,
+        cluster_survival: 0.2,
     };
 
     // Candidate B: low FTS but very recent, high access, high strength
@@ -442,6 +443,7 @@ fn test_rerank_changes_ordering() {
         concept_richness: 0.8,
         tier_score: 1.0,
         is_current: 1.0,
+        cluster_survival: 0.8,
     };
 
     let score_a = rerank_score(&a, &w);

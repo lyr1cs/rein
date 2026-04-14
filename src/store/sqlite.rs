@@ -56,6 +56,16 @@ impl SqliteStore {
         let embedding = crate::embed::EmbedCache::get(self.conn(), &enriched, &model)
             .ok()
             .flatten()?;
+
+        // Prefer centroid-based assignment (accurate, no N+1 queries).
+        // Pass embedding dims so stale centroids from a prior model are automatically rejected.
+        let centroids =
+            crate::store::adaptive::load_cluster_centroids(self.conn(), embedding.len());
+        if !centroids.is_empty() {
+            return crate::store::adaptive::assign_to_nearest_centroid(&centroids, &embedding);
+        }
+
+        // Fallback: nearest-neighbor heuristic (used before first full HDBSCAN run).
         crate::store::vec::search_vec(self.conn(), &embedding, 8)
             .ok()?
             .into_iter()
@@ -1145,26 +1155,28 @@ impl SqliteStore {
             return Ok(count);
         }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM memories WHERE layer = 'STM' AND strength < ?1
-             AND importance NOT IN ('critical', 'high')",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map(rusqlite::params![threshold], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
+        // Acquire a write lock upfront so the SELECT and DELETE operate on the same
+        // candidate set.  Without this, another writer can insert or decay a memory
+        // between the two statements, making side-index cleanup incorrect.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM memories WHERE layer = 'STM' AND strength < ?1
+                 AND importance NOT IN ('critical', 'high')",
+            )?;
+            let result: Vec<String> = stmt
+                .query_map(rusqlite::params![threshold], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            result
+        };
 
         let rows = self.conn.execute(
             "DELETE FROM memories WHERE layer = 'STM' AND strength < ?1
              AND importance NOT IN ('critical', 'high')",
             rusqlite::params![threshold],
         )?;
-
-        for id in &ids {
-            self.remove_from_tantivy(id);
-            self.remove_from_hnsw(id);
-        }
 
         // Remove pruned memory IDs from concept.source_memory_ids in a single pass.
         // We load all concepts once, filter to those with any pruned ID, and update them.
@@ -1195,6 +1207,14 @@ impl SqliteStore {
                     }
                 }
             }
+        }
+
+        self.conn.execute_batch("COMMIT")?;
+
+        // Side-index cleanup runs outside the transaction (non-SQL, fire-and-forget)
+        for id in &ids {
+            self.remove_from_tantivy(id);
+            self.remove_from_hnsw(id);
         }
 
         Ok(rows as u64)

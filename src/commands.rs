@@ -755,6 +755,14 @@ pub async fn handle_worker_cleanup_queue(config: &ReinConfig) -> anyhow::Result<
     Ok(())
 }
 
+pub async fn handle_worker_merge_refinement_queue(config: &ReinConfig) -> anyhow::Result<()> {
+    let processed = extract::hooks::queue::drain_merge_refinement_queue(config).await?;
+    if processed > 0 {
+        eprintln!("rein worker: processed {processed} merge-refinement jobs");
+    }
+    Ok(())
+}
+
 pub async fn handle_worker_cleanup(
     config: &ReinConfig,
     topic: Option<String>,

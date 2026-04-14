@@ -98,10 +98,12 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
 
 /// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
 /// Clears the existing index first to remove stale entries.
-pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
+/// Returns `true` if the index is now in a clean, usable state (success or intentionally empty).
+/// Returns `false` if the rebuild was skipped or failed (caller should restore the dirty marker).
+pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
     let db_path = store.db_path();
     if db_path.to_str() == Some(":memory:") {
-        return; // skip for in-memory test databases
+        return true; // in-memory test databases need no index
     }
     let hnsw_path = db_path.with_extension("");
     let lock_path = hnsw_path.with_extension("usearch.lock");
@@ -118,7 +120,7 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!("hnsw: failed to open rebuild lock: {e}");
-            return;
+            return false;
         }
     };
     #[cfg(unix)]
@@ -130,7 +132,7 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
                 "hnsw: rebuild lock held by another process, skipping: {}",
                 std::io::Error::last_os_error()
             );
-            return;
+            return false;
         }
     }
 
@@ -142,7 +144,12 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         Ok(idx) => idx,
         Err(e) => {
             tracing::warn!("hnsw: failed to open index: {e}");
-            return;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+            }
+            return false;
         }
     };
 
@@ -151,7 +158,12 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("hnsw: failed to list memories: {e}");
-            return;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+            }
+            return false;
         }
     };
 
@@ -175,14 +187,15 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
             Err(e) => tracing::warn!("hnsw: failed to save index: {e}"),
         }
     } else if memories.is_empty() {
-        rebuild_ok = true; // no memories at all, empty index is correct
+        rebuild_ok = true; // no memories at all, empty index is intentionally correct
     } else {
         tracing::debug!(
             "hnsw: {} memories but 0 cached embeddings, keeping dirty marker",
             memories.len()
         );
     }
-    // Only clear dirty marker on successful rebuild
+    // Clear the legacy `.dirty` marker on success (no-op when called from async path
+    // since `.dirty` was already renamed to `.rebuilding` before this function was called).
     if rebuild_ok {
         let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path));
     }
@@ -192,6 +205,7 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) {
         use std::os::unix::io::AsRawFd;
         let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
     }
+    rebuild_ok
 }
 
 /// Populate the Tantivy FTS index from all memories in SQLite.

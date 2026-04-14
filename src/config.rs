@@ -119,6 +119,14 @@ pub struct SearchConfig {
     /// Number of top candidates to send to LLM reranker. Default: 15.
     #[serde(default = "default_llm_reranker_top_n")]
     pub llm_reranker_top_n: usize,
+    /// Max ms to wait for background LLM reranker before returning linear scores.
+    /// The reranker runs concurrently with cross-validation; this budget starts from the
+    /// beginning of the recall pipeline. Default: 1500ms (0 = synchronous legacy mode).
+    #[serde(default = "default_llm_reranker_timeout_ms")]
+    pub llm_reranker_timeout_ms: u64,
+    /// MMR lambda: relevance-diversity tradeoff. 1.0 = off (pure relevance), 0.3 = strong diversity.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f64,
 }
 
 fn default_fusion_method() -> String {
@@ -132,6 +140,12 @@ fn default_llm_reranker() -> String {
 }
 fn default_llm_reranker_top_n() -> usize {
     15
+}
+fn default_llm_reranker_timeout_ms() -> u64 {
+    1500
+}
+fn default_mmr_lambda() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -534,6 +548,8 @@ impl Default for SearchConfig {
             dedup_time_window_days: 7,
             llm_reranker: default_llm_reranker(),
             llm_reranker_top_n: default_llm_reranker_top_n(),
+            llm_reranker_timeout_ms: default_llm_reranker_timeout_ms(),
+            mmr_lambda: default_mmr_lambda(),
         }
     }
 }

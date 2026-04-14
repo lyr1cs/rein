@@ -5,6 +5,8 @@ use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, TantivyDocument};
 
+use crate::store::jieba_tokenizer::{JiebaTokenizer, TOKENIZER_NAME};
+
 /// Tantivy-based full-text search with BM25 scoring.
 /// Falls back gracefully — callers should handle errors and use FTS5 as backup.
 pub struct TantivyFts {
@@ -19,28 +21,74 @@ pub struct TantivyFts {
     keywords_field: Field,
 }
 
+/// Marker file: presence means the index was built with the jieba tokenizer schema.
+/// Absence triggers a full rebuild on next open.
+const TOKENIZER_MARKER: &str = ".tokenizer_v2";
+
 impl TantivyFts {
     /// Open or create a Tantivy index at the given directory.
-    /// The path is used directly as the index directory (e.g. `~/.rein/memories.tantivy/`).
+    /// If an old index exists without the jieba tokenizer marker, it is deleted
+    /// and recreated so searches use proper CJK segmentation. Data is repopulated
+    /// by the warmup path (which reads from SQLite).
     pub fn open(path: &Path) -> Result<Self, tantivy::TantivyError> {
         let index_path = path.to_path_buf();
         std::fs::create_dir_all(&index_path)
             .map_err(|e| tantivy::TantivyError::SystemError(format!("mkdir: {e}")))?;
 
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("id", STRING | STORED);
-        schema_builder.add_text_field("topic", TEXT | STORED);
-        schema_builder.add_text_field("topic_exact", STRING);
-        schema_builder.add_text_field("summary", TEXT);
-        schema_builder.add_text_field("content", TEXT);
-        schema_builder.add_text_field("keywords", TEXT);
-        let schema = schema_builder.build();
+        // Migration: if old index exists without the tokenizer marker, wipe it so
+        // it gets rebuilt with the jieba tokenizer schema.
+        let marker_path = index_path.join(TOKENIZER_MARKER);
+        let needs_rebuild = index_path.join("meta.json").exists() && !marker_path.exists();
+        if needs_rebuild {
+            tracing::info!(
+                "tantivy index at {} missing jieba marker — rebuilding for CJK tokenizer",
+                index_path.display()
+            );
+            // Remove old index files (best-effort; errors are logged but not fatal —
+            // Tantivy's create_in_dir will fail if conflicting meta.json remains)
+            if let Ok(entries) = std::fs::read_dir(&index_path) {
+                for entry in entries.flatten() {
+                    if let Err(e) = std::fs::remove_file(entry.path()) {
+                        tracing::warn!(
+                            "tantivy migration: could not remove {}: {e}",
+                            entry.path().display()
+                        );
+                    }
+                }
+            }
+        }
 
-        // Try to open existing, otherwise create new
+        let schema = Self::build_schema();
+
         let index = match Index::open_in_dir(&index_path) {
             Ok(idx) => idx,
-            Err(_) => Index::create_in_dir(&index_path, schema)?,
+            Err(_) => {
+                // Attempt to create a fresh index.  If another process is racing the
+                // same migration and holds the Tantivy writer lock, wait briefly and
+                // retry the open (by then the winner will have created the index).
+                match Index::create_in_dir(&index_path, schema) {
+                    Ok(idx) => {
+                        // Write marker only after confirmed successful creation
+                        let _ = std::fs::write(&marker_path, b"jieba");
+                        idx
+                    }
+                    Err(tantivy::TantivyError::LockFailure(..)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        Index::open_in_dir(&index_path).map_err(|e| {
+                            tantivy::TantivyError::SystemError(format!(
+                                "tantivy open after concurrent migration: {e}"
+                            ))
+                        })?
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
+
+        // Register the jieba tokenizer so the index (and QueryParser) can use it
+        index
+            .tokenizers()
+            .register(TOKENIZER_NAME, JiebaTokenizer);
 
         // Re-derive field handles from the opened index's schema
         let opened_schema = index.schema();
@@ -52,7 +100,7 @@ impl TantivyFts {
             .map_err(|e| tantivy::TantivyError::SchemaError(format!("{e}")))?;
         let topic_exact_field = opened_schema
             .get_field("topic_exact")
-            .unwrap_or(topic_field); // fallback for old indexes without topic_exact
+            .unwrap_or(topic_field); // fallback for indexes without topic_exact
         let summary_field = opened_schema
             .get_field("summary")
             .map_err(|e| tantivy::TantivyError::SchemaError(format!("{e}")))?;
@@ -79,10 +127,7 @@ impl TantivyFts {
     }
 
     /// Index a memory document. Replaces any existing doc with the same ID.
-    /// For CJK text, content is pre-tokenized with jieba so Tantivy's default
-    /// tokenizer (which splits on whitespace) can index individual Chinese words.
-    /// If another process holds the writer lock, mark the index dirty so the next
-    /// recall/warmup can rebuild it.
+    /// CJK segmentation is handled natively by the jieba tokenizer — no pre-processing needed.
     pub fn insert(
         &self,
         id: &str,
@@ -101,12 +146,6 @@ impl TantivyFts {
             Err(e) => return Err(e),
         };
 
-        // Pre-tokenize CJK fields: append jieba tokens so Tantivy indexes them as
-        // separate terms alongside the original text (which Tantivy will also tokenize
-        // with its default whitespace/punctuation splitter).
-        let enriched_summary = enrich_cjk(summary);
-        let enriched_content = enrich_cjk(content);
-
         // Delete old doc with same ID first
         let id_term = tantivy::Term::from_field_text(self.id_field, id);
         writer.delete_term(id_term);
@@ -114,8 +153,8 @@ impl TantivyFts {
             self.id_field => id,
             self.topic_field => topic,
             self.topic_exact_field => topic,
-            self.summary_field => enriched_summary.as_str(),
-            self.content_field => enriched_content.as_str(),
+            self.summary_field => summary,
+            self.content_field => content,
             self.keywords_field => keywords,
         ))?;
         writer.commit()?;
@@ -123,9 +162,8 @@ impl TantivyFts {
     }
 
     /// Search for documents matching the query string.
-    /// For CJK queries, enriches the query with jieba tokens for better BM25 matching.
-    /// When a topic filter is provided, uses BooleanQuery to filter at the index level
-    /// instead of post-filtering in memory.
+    /// CJK queries are segmented by the jieba tokenizer registered on this index.
+    /// When a topic filter is provided, uses BooleanQuery to filter at the index level.
     /// Returns pairs of (memory_id, BM25_score).
     pub fn search(
         &self,
@@ -146,11 +184,8 @@ impl TantivyFts {
             ],
         );
 
-        // Enrich CJK queries with jieba tokens for better BM25 matching
-        let enriched_query = enrich_cjk(query_str);
-
-        // Try to parse; on failure, escape special chars and retry
-        let text_query = match query_parser.parse_query(&enriched_query) {
+        // Try to parse; on failure, strip special chars and retry
+        let text_query = match query_parser.parse_query(query_str) {
             Ok(q) => q,
             Err(_) => {
                 let escaped = query_str
@@ -195,8 +230,6 @@ impl TantivyFts {
     }
 
     /// Delete a document by memory ID.
-    /// If another process holds the writer lock, mark the index dirty so it can
-    /// be rebuilt later.
     pub fn delete(&self, id: &str) -> Result<(), tantivy::TantivyError> {
         let mut writer: IndexWriter = match self.index.writer(15_000_000) {
             Ok(w) => w,
@@ -216,20 +249,24 @@ impl TantivyFts {
     fn mark_dirty(&self) {
         let _ = std::fs::write(&self.dirty_marker_path, b"dirty");
     }
-}
 
-/// If text contains CJK characters, append jieba-segmented tokens so Tantivy's
-/// default tokenizer (whitespace-based) can index individual words.
-/// For pure ASCII text, returns as-is (zero overhead).
-fn enrich_cjk(text: &str) -> String {
-    if !crate::extract::dedup::contains_cjk(text) {
-        return text.to_string();
+    /// Build the schema using the jieba tokenizer for all TEXT fields.
+    fn build_schema() -> Schema {
+        let jieba_text = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(TOKENIZER_NAME)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("id", STRING | STORED);
+        schema_builder.add_text_field("topic", jieba_text.clone() | STORED);
+        schema_builder.add_text_field("topic_exact", STRING);
+        schema_builder.add_text_field("summary", jieba_text.clone());
+        schema_builder.add_text_field("content", jieba_text.clone());
+        schema_builder.add_text_field("keywords", jieba_text);
+        schema_builder.build()
     }
-    let extra_tokens = crate::extract::tokenize_for_fts(text);
-    if extra_tokens.is_empty() {
-        return text.to_string();
-    }
-    format!("{text} {extra_tokens}")
 }
 
 #[cfg(test)]
@@ -280,7 +317,7 @@ mod tests {
             fts.insert("m1", "rust", "traits", "Rust traits and generics", "rust")
                 .unwrap();
         }
-        // Reopen
+        // Reopen — jieba tokenizer must be re-registered
         let fts = TantivyFts::open(dir.path()).unwrap();
         let results = fts.search("traits", None, 10).unwrap();
         assert!(!results.is_empty());
@@ -299,5 +336,49 @@ mod tests {
 
         let results = fts.search("***^^^", None, 10);
         assert!(results.is_ok());
+    }
+
+    #[test]
+    fn test_tantivy_cjk_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let fts = TantivyFts::open(dir.path()).unwrap();
+
+        fts.insert(
+            "m1",
+            "ai",
+            "机器学习基础",
+            "机器学习是人工智能的核心技术",
+            "机器学习,人工智能",
+        )
+        .unwrap();
+        fts.insert(
+            "m2",
+            "programming",
+            "Rust programming",
+            "Rust ownership model",
+            "rust,ownership",
+        )
+        .unwrap();
+
+        // CJK query should find the CJK document
+        let results = fts.search("机器学习", None, 10).unwrap();
+        assert!(!results.is_empty(), "CJK query should return results");
+        assert_eq!(results[0].0, "m1");
+
+        // ASCII query should not find the CJK document
+        let results = fts.search("ownership", None, 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, "m2");
+    }
+
+    #[test]
+    fn test_tantivy_migration_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        // First open creates the marker
+        let _fts = TantivyFts::open(dir.path()).unwrap();
+        assert!(
+            dir.path().join(TOKENIZER_MARKER).exists(),
+            "marker file should be created on first open"
+        );
     }
 }

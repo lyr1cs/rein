@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod classify;
 pub mod expand;
 pub mod kg_search;
+pub mod mmr;
 pub mod recall;
 pub mod rerank;
 pub mod rerank_llm;
