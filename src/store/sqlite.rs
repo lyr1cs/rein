@@ -1166,6 +1166,37 @@ impl SqliteStore {
             self.remove_from_hnsw(id);
         }
 
+        // Remove pruned memory IDs from concept.source_memory_ids in a single pass.
+        // We load all concepts once, filter to those with any pruned ID, and update them.
+        // This avoids one LIKE full-table scan per pruned memory (O(n*m) → O(m)).
+        if !ids.is_empty() {
+            let pruned_set: std::collections::HashSet<&str> =
+                ids.iter().map(|s| s.as_str()).collect();
+            let all_concepts: Vec<(String, String)> = self
+                .conn
+                .prepare("SELECT id, source_memory_ids FROM concepts WHERE source_memory_ids != '[]'")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map(|mapped| mapped.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+            for (concept_id, raw_ids) in all_concepts {
+                if let Ok(mut mids) = serde_json::from_str::<Vec<String>>(&raw_ids) {
+                    let before = mids.len();
+                    mids.retain(|mid| !pruned_set.contains(mid.as_str()));
+                    if mids.len() != before {
+                        let updated = serde_json::to_string(&mids).unwrap_or_default();
+                        let _ = self.conn.execute(
+                            "UPDATE concepts SET source_memory_ids = ?1 WHERE id = ?2",
+                            rusqlite::params![updated, concept_id],
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(rows as u64)
     }
 
