@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useMemoryDetail, useRecent, useRecall, useTopics } from '../hooks/useApi';
 import { apiDelete } from '../api/client';
 import type { Memory, MemoryDetailResponse, RecallResult } from '../api/types';
@@ -356,6 +357,7 @@ function DetailPanel({
 /* ── Memories page ───────────────────────────────────────────────── */
 
 export default function Memories() {
+  const queryClient = useQueryClient();
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [topicFilter, setTopicFilter] = useState('');
@@ -419,12 +421,17 @@ export default function Memories() {
       try {
         await apiDelete(`/api/memories/${id}`);
         setSelected(null);
-        refetchRecent();
+        await Promise.all([
+          refetchRecent(),
+          queryClient.invalidateQueries({ queryKey: ['recent'] }),
+          queryClient.invalidateQueries({ queryKey: ['recall'] }),
+          queryClient.invalidateQueries({ queryKey: ['memory-detail'] }),
+        ]);
       } catch (err) {
         console.error('Delete failed:', err);
       }
     },
-    [refetchRecent],
+    [queryClient, refetchRecent],
   );
 
   return (

@@ -1373,7 +1373,8 @@ mod tests {
                     .filter(|&j| j != i)
                     .map(|j| (j, dist_matrix[i][j]))
                     .collect();
-                neighbors.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                neighbors
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 neighbors
             })
             .collect();

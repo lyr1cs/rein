@@ -7,7 +7,7 @@ services:
       - rein-data:/data
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - REIN_HTTP_TOKEN=${REIN_HTTP_TOKEN}
+      - REIN_HTTP_TOKEN=${REIN_HTTP_TOKEN:?set REIN_HTTP_TOKEN}
       - REIN_LOG=info
     restart: unless-stopped
 

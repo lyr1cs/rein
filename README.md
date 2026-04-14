@@ -74,9 +74,12 @@ Or use the install script:
 ./scripts/install.sh
 ```
 
+The install script builds the embedded GUI by default when `npm` is available. Set `REIN_INSTALL_GUI=0` for a CLI-only install.
+
 #### Prerequisites
 
 - Rust toolchain (1.75+)
+- Node.js + npm (for GUI builds or the default install script path)
 - A Gemini API key (free tier: 1500 req/day)
 
 #### GUI Service Management

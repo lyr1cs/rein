@@ -710,11 +710,7 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             .as_ref()
             .map(|s| {
                 let global = s.get_dedup_threshold(None);
-                let min_threshold = s
-                    .dedup_thresholds
-                    .values()
-                    .copied()
-                    .fold(global, f32::min);
+                let min_threshold = s.dedup_thresholds.values().copied().fold(global, f32::min);
                 (min_threshold as f64 - 0.10).max(0.40)
             })
             .unwrap_or_else(|| vec_dedup_weak_threshold(config));
@@ -983,10 +979,7 @@ pub fn run_dedup_scoped(
                         (cluster_threshold - 0.15).max(0.50).min(cluster_threshold);
                     let relation = if sim >= cluster_threshold {
                         DedupRelation::Duplicate
-                    } else if !dry_run
-                        && sim >= gray_zone_floor
-                        && llm_calls_used < llm_budget
-                    {
+                    } else if !dry_run && sim >= gray_zone_floor && llm_calls_used < llm_budget {
                         llm_calls_used += 1;
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             tokio::task::block_in_place(|| {

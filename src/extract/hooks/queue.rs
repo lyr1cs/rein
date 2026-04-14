@@ -361,20 +361,33 @@ pub(crate) fn collect_queue_diagnostics(config: &ReinConfig) -> QueueGroupDiagno
             ]),
         },
         merge_refinement: {
-            let (mr_pending, mr_pending_issue) =
-                diagnostic_count(&merge_refinement_queue_path(config), "merge_refinement_queue");
-            let (mr_inflight, mr_inflight_issue) =
-                diagnostic_count(&merge_refinement_inflight_path(config), "merge_refinement_queue_inflight");
-            let (mr_dead, mr_dead_issue) =
-                diagnostic_count(&merge_refinement_dead_letter_path(config), "merge_refinement_queue_dead");
-            let (mr_stats, mr_stats_issue) =
-                diagnostic_stats(&merge_refinement_stats_path(config), "merge_refinement_worker_stats");
+            let (mr_pending, mr_pending_issue) = diagnostic_count(
+                &merge_refinement_queue_path(config),
+                "merge_refinement_queue",
+            );
+            let (mr_inflight, mr_inflight_issue) = diagnostic_count(
+                &merge_refinement_inflight_path(config),
+                "merge_refinement_queue_inflight",
+            );
+            let (mr_dead, mr_dead_issue) = diagnostic_count(
+                &merge_refinement_dead_letter_path(config),
+                "merge_refinement_queue_dead",
+            );
+            let (mr_stats, mr_stats_issue) = diagnostic_stats(
+                &merge_refinement_stats_path(config),
+                "merge_refinement_worker_stats",
+            );
             QueueDiagnostics {
                 pending: mr_pending,
                 inflight: mr_inflight,
                 dead_letters: mr_dead,
                 stats: mr_stats,
-                issues: collect_issues([mr_pending_issue, mr_inflight_issue, mr_dead_issue, mr_stats_issue]),
+                issues: collect_issues([
+                    mr_pending_issue,
+                    mr_inflight_issue,
+                    mr_dead_issue,
+                    mr_stats_issue,
+                ]),
             }
         },
     }
@@ -688,7 +701,10 @@ async fn process_merge_refinement_job(
         Ok(m) => m,
         Err(_) => {
             // Memory may have been deleted — treat as success to avoid dead-letter spam.
-            tracing::debug!("merge_refinement: winner {} not found, skipping", job.winner_id);
+            tracing::debug!(
+                "merge_refinement: winner {} not found, skipping",
+                job.winner_id
+            );
             return Ok(1);
         }
     };
@@ -710,10 +726,7 @@ async fn process_merge_refinement_job(
                 .collect();
             updated.updated_at = chrono::Utc::now();
             store.update(&updated)?;
-            tracing::info!(
-                "merge_refinement: synthesized memory {}",
-                job.winner_id
-            );
+            tracing::info!("merge_refinement: synthesized memory {}", job.winner_id);
         }
     }
     Ok(1)
@@ -727,7 +740,10 @@ fn read_merge_refinement_jobs(path: &std::path::Path) -> Vec<MergeRefinementJob>
         .collect()
 }
 
-fn reschedule_merge_refinement_job(config: &ReinConfig, mut job: MergeRefinementJob) -> MergeRefinementJob {
+fn reschedule_merge_refinement_job(
+    config: &ReinConfig,
+    mut job: MergeRefinementJob,
+) -> MergeRefinementJob {
     let attempts = job.attempts + 1;
     let exp = job.attempts.min(10);
     let backoff = config
@@ -749,7 +765,10 @@ fn append_merge_refinement_dead_letter(
         "error": error,
         "failed_at": Utc::now().to_rfc3339(),
     });
-    append_jsonl(&merge_refinement_dead_letter_path(config), &entry.to_string())
+    append_jsonl(
+        &merge_refinement_dead_letter_path(config),
+        &entry.to_string(),
+    )
 }
 
 fn load_merge_refinement_worker_stats(config: &ReinConfig) -> WorkerStats {
@@ -760,7 +779,10 @@ fn load_merge_refinement_worker_stats(config: &ReinConfig) -> WorkerStats {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-fn save_merge_refinement_worker_stats(config: &ReinConfig, stats: &WorkerStats) -> anyhow::Result<()> {
+fn save_merge_refinement_worker_stats(
+    config: &ReinConfig,
+    stats: &WorkerStats,
+) -> anyhow::Result<()> {
     let path = merge_refinement_stats_path(config);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1215,6 +1237,15 @@ fn recover_inflight(path: &std::path::Path, inflight: &std::path::Path) -> anyho
             .create(true)
             .open(path)?;
         file.write_all(content.as_bytes())?;
+        // fsync before deleting the inflight source: the append may only live in
+        // the page cache, so a crash between write and remove would orphan the jobs.
+        file.sync_all()?;
+        // Also sync the directory entry so the append is durable across fs crashes.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
     }
     let _ = std::fs::remove_file(inflight);
     Ok(())

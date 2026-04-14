@@ -652,14 +652,19 @@ impl SqliteStore {
         for old_id in memory_ids {
             // JSON-quoted match with LIKE wildcard escaping to avoid
             // prefix collisions and IDs containing % or _
-            let escaped = old_id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let escaped = old_id
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             let mut stmt = self.conn.prepare(
                 "SELECT id, source_memory_ids FROM concepts WHERE source_memory_ids LIKE ?1 ESCAPE '\\'"
             )?;
-            let rows: Vec<(String, String)> = stmt.query_map(
-                rusqlite::params![format!("%\"{}\"%", escaped)],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?.filter_map(|r| r.ok()).collect();
+            let rows: Vec<(String, String)> = stmt
+                .query_map(rusqlite::params![format!("%\"{}\"%", escaped)], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
             drop(stmt);
             for (concept_id, raw_ids) in rows {
                 if let Ok(mut ids) = serde_json::from_str::<Vec<String>>(&raw_ids) {
@@ -668,10 +673,10 @@ impl SqliteStore {
                         ids.push(replacement_id.clone());
                     }
                     let updated = serde_json::to_string(&ids).unwrap_or_default();
-                    let _ = self.conn.execute(
+                    self.conn.execute(
                         "UPDATE concepts SET source_memory_ids = ?1 WHERE id = ?2",
                         rusqlite::params![updated, concept_id],
-                    );
+                    )?;
                 }
             }
         }
