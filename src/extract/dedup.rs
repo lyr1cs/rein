@@ -83,7 +83,7 @@ pub fn contains_cjk(text: &str) -> bool {
     text.chars().any(is_cjk)
 }
 
-fn is_cjk(ch: char) -> bool {
+pub(crate) fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,
         0x3400..=0x4DBF     // CJK Extension A
