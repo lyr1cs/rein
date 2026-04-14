@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.16.1 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 28 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
+rein v0.17.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 28 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
@@ -40,6 +40,7 @@ src/
 │   ├── vec.rs       # sqlite-vec operations
 │   ├── hnsw.rs      # HNSW approximate nearest neighbor (usearch)
 │   ├── tantivy_fts.rs # Tantivy BM25 full-text search (BooleanQuery topic filter)
+│   ├── jieba_tokenizer.rs # Custom Tantivy tokenizer: jieba-rs word segmentation + CJK bigrams
 │   ├── adaptive.rs  # Feedback event sourcing, AdaptiveState cache, per-consumer offsets
 │   ├── hdbscan.rs   # Pure Rust HDBSCAN clustering (dendrogram → condensed tree → EOMBST)
 │   └── tiering.rs   # Three-tier memory (Hot/Warm/Cold) with streaming quantile estimator
@@ -57,6 +58,9 @@ src/
 │   ├── warmup.rs    # Background warmup: embeddings + HNSW/Tantivy rebuild
 │   ├── chunker.rs   # Semantic text chunking
 │   ├── alpha_optimizer.rs # Counterfactual offline alpha optimization for CC fusion (now includes KG/episode/support/diversity signals)
+│   ├── expand.rs    # Query expansion (Gemini Flash Lite / OMLX dual backend) → 2-3 query variants
+│   ├── rerank_llm.rs # LLM reranker (Gemini / OMLX) + strong-signal bypass
+│   ├── mmr.rs       # Maximal Marginal Relevance re-ranking for result diversity
 │   └── survival.rs  # Kaplan-Meier non-parametric survival analysis for adaptive decay
 ├── extract/
 │   ├── llm.rs       # LLM extraction (Gemini + OMLX/Ollama), fallback to patterns
@@ -83,7 +87,7 @@ src/
 │   ├── policy.rs    # Extraction policy decisions
 │   └── extract.rs   # Async response extraction + queue integration
 └── mcp/
-    ├── server.rs    # MCP server (26 tools, stdio + HTTP/SSE + GUI)
+    ├── server.rs    # MCP server (28 tools, stdio + HTTP/SSE + GUI)
     ├── rest.rs      # REST API layer (21 JSON endpoints for GUI)
     ├── tools.rs     # Tool parameter structs
     └── compact.rs   # Output formatters
@@ -107,7 +111,7 @@ docker-compose.yml   # One-command deployment
 - FTS5 queries sanitized via `sanitize_fts_query()`
 - LIKE queries escape `%` and `_`
 - HTTP server requires REIN_HTTP_TOKEN for non-localhost bind
-- Dedup threshold: 0.70 using max(jaccard, containment) over mixed lexical tokens
+- Dedup threshold: per-cluster adaptive via A1 (P90 intra-cluster similarity); 0.70 global fallback. All paths (store, batch, vec dedup) use `get_dedup_threshold(cluster_id)`
 - CJK lexical dedup uses `jieba-rs` word segmentation plus character bigrams
 - Vector dimensions: configurable (default 3072)
 - FTS5 tokenizer: unicode61 (CJK support)
@@ -134,6 +138,9 @@ docker-compose.yml   # One-command deployment
 - Summary display is layered: canonical summaries may be longer, while APIs/UI can expose `summary_short` for list views
 - Adaptive status now exposes cluster-level dedup/admission/promotion decisions for the GUI
 - Adaptive status now exposes `cluster_profiles` for per-cluster dedup/admission/promotion inspection
+- M2 per-cluster alpha keys use format `"<query_type>:<cluster_id>"` (e.g. `"semantic:5"`); these are cleared on recluster via `retain(|k, _| !k.contains(':'))`
+- M3 global prior survival curve stored as `"survival_curve:global"` in adaptive snapshot; `recall.rs` must skip `parse::<u32>()` for this key and branch on string `"global"` first
+- AdaptiveState `save_snapshot` uses CAS retry (max 3 attempts): read-merge-write with version predicate; fails with `ReinError::Config` after exhaustion — do not swallow this error
 
 ## Common Pitfalls
 
