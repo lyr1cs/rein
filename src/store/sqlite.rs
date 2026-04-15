@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::extract::intelligent_merge::{InsertionVerdict, VerdictResult};
 use crate::extract::DedupAction;
 use crate::types::*;
 
@@ -1265,6 +1266,16 @@ impl SqliteStore {
         // Normalize topic to prevent fragmentation (case, hyphen, underscore variants)
         memory.topic = crate::ops::normalize_topic_name(&memory.topic);
 
+        // Pre-flight intelligent classification: run the LLM call BEFORE grabbing
+        // the write lock to avoid holding BEGIN IMMEDIATE for 1-2s. If the pre-flight
+        // candidate still matches the in-transaction dedup decision, we apply the
+        // pre-computed verdict; otherwise we fall back to mechanical behavior.
+        let preflight = self.preflight_intelligent_classify(
+            &memory,
+            similarity_threshold,
+            time_window_days,
+        );
+
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut pending_grayzone: Option<(String, f32)> = None;
 
@@ -1311,20 +1322,46 @@ impl SqliteStore {
                 dedup_action
             };
 
-            // Gray-zone resolution. When intelligent_merge is enabled and we have
-            // a live candidate, consult the LLM classifier for a verdict BEFORE
-            // falling back to the canonical anchor / pending-queue path.
-            // NOTE: The LLM call happens inside BEGIN IMMEDIATE — accepted trade-off
-            //       for this opt-in feature (1-2s write lock hold per gray-zone store).
+            // Gray-zone resolution. Apply pre-flight intelligent_merge verdict
+            // when its candidate matches the in-transaction candidate; otherwise
+            // fall back to the mechanical canonical-anchor → pending-queue chain.
             let mut synth_override: Option<String> = None;
+            let mut im_verdict_for_provenance: Option<(String, f32, InsertionVerdict, Option<String>)> = None;
+            let mut evidence_snapshot: Option<Memory> = None;
+
             let resolved_action = match dedup_action {
                 DedupAction::GrayZone(candidate_id, sim) => {
-                    let im = self
-                        .try_intelligent_merge(&memory, &candidate_id, sim)
-                        .unwrap_or(None);
+                    // Try the pre-flight verdict first (no LLM call under lock).
+                    let applied = preflight
+                        .as_ref()
+                        .filter(|(pf_id, _)| pf_id == &candidate_id)
+                        .map(|(_, v)| v.clone());
 
-                    if let Some((action, synth)) = im {
+                    if let Some(v) = applied {
+                        // Snapshot existing memory BEFORE mutating — needed for both
+                        // evidence preservation and provenance recording.
+                        let existing = self.get(&candidate_id).ok();
+
+                        let (action, synth) = match v.verdict {
+                            InsertionVerdict::Ignore => {
+                                (DedupAction::MergeInto(candidate_id.clone()), None)
+                            }
+                            InsertionVerdict::Update | InsertionVerdict::Merge => (
+                                DedupAction::MergeInto(candidate_id.clone()),
+                                v.synthesized.clone(),
+                            ),
+                            InsertionVerdict::CreateNew => (DedupAction::CreateNew, None),
+                        };
+                        if synth.is_some() {
+                            evidence_snapshot = existing;
+                        }
                         synth_override = synth;
+                        im_verdict_for_provenance = Some((
+                            candidate_id.clone(),
+                            sim,
+                            v.verdict,
+                            v.reasoning.clone(),
+                        ));
                         action
                     } else if let Some(canonical_id) =
                         self.grayzone_canonical_anchor(&candidate_id)?
@@ -1348,7 +1385,72 @@ impl SqliteStore {
             if let Some(synth) = synth_override {
                 memory.content = synth;
             }
-            self.store_with_dedup_resolved(memory, resolved_action)
+            let result_id = self.store_with_dedup_resolved(memory, resolved_action)?;
+
+            // (#3) Preserve the pre-merge existing memory as evidence so Update/Merge
+            // doesn't discard the prior version — it can be surfaced on demand.
+            if let Some(existing) = evidence_snapshot {
+                let canonical_id = self.canonical_id_for(&result_id).unwrap_or(result_id.clone());
+                let _ = self.conn.execute(
+                    "INSERT OR IGNORE INTO memory_evidence
+                     (id, canonical_id, memory_id, source_topic, summary, content,
+                      keywords, source, created_at, imported_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        ulid::Ulid::new().to_string(),
+                        canonical_id,
+                        existing.id,
+                        existing.topic,
+                        existing.summary,
+                        existing.content,
+                        serde_json::to_string(&existing.keywords).unwrap_or_else(|_| "[]".into()),
+                        match existing.source {
+                            crate::types::Source::Manual => "manual",
+                            crate::types::Source::Hook => "hook",
+                            crate::types::Source::Migration => "migration",
+                            crate::types::Source::Supermemory => "supermemory",
+                            crate::types::Source::Proxy => "proxy",
+                        },
+                        existing.created_at.to_rfc3339(),
+                        chrono::Utc::now().to_rfc3339(),
+                    ],
+                );
+            }
+
+            // (#2) Provenance: record the LLM verdict in dedup_decisions so future
+            // introspection can explain why this canonical exists in its current form.
+            if let Some((cand_id, sim, verdict, reasoning)) = im_verdict_for_provenance {
+                let (relation, merged_summary, conflict) = match verdict {
+                    InsertionVerdict::Ignore => ("duplicate", None, false),
+                    InsertionVerdict::Update => ("update", memory_content_snapshot(self, &result_id), false),
+                    InsertionVerdict::Merge => ("update", memory_content_snapshot(self, &result_id), false),
+                    InsertionVerdict::CreateNew => ("distinct", None, false),
+                };
+                let _ = self.conn.execute(
+                    "INSERT INTO dedup_decisions
+                     (id, winner_id, loser_id, canonical_id, lexical_score, embedding_score,
+                      relation, confidence, reason, operator, reversible,
+                      merged_summary, novel_facts, conflict_detected, payload, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'llm_verdict', 0,
+                             ?10, '[]', ?11, NULL, ?12)",
+                    rusqlite::params![
+                        ulid::Ulid::new().to_string(),
+                        &result_id,
+                        &cand_id,
+                        self.canonical_id_for(&result_id).unwrap_or_else(|_| result_id.clone()),
+                        Option::<f64>::None,
+                        sim as f64,
+                        relation,
+                        0.8f64,
+                        reasoning.as_deref().unwrap_or(""),
+                        merged_summary,
+                        conflict as i64,
+                        chrono::Utc::now().to_rfc3339(),
+                    ],
+                );
+            }
+
+            Ok(result_id)
         })();
 
         match decision {
@@ -1390,31 +1492,53 @@ impl SqliteStore {
         }
     }
 
-    /// If intelligent_merge is enabled and an LLM is available, classify the
-    /// relationship between `memory` and the gray-zone candidate, then map the
-    /// verdict onto a concrete `DedupAction` and an optional synthesized content
-    /// override.
+    /// Pre-flight intelligent-merge classification.
     ///
-    /// Returns `None` when the feature is disabled, the candidate is missing,
-    /// or the LLM call fails — callers then fall back to the mechanical path.
+    /// Runs a read-only dedup check outside the write transaction. If the
+    /// result is GrayZone AND intelligent_merge is enabled AND an LLM is
+    /// reachable, classifies the pair and returns `(candidate_id, verdict)`.
     ///
-    /// Verdict mapping:
-    /// - Ignore      → MergeInto(candidate) with no content override (strength boost only)
-    /// - Update/Merge → MergeInto(candidate) with synthesized content override
-    /// - CreateNew   → CreateNew (distinct memory, caller will auto_link)
-    fn try_intelligent_merge(
+    /// Keeping this call OUTSIDE `BEGIN IMMEDIATE` prevents the LLM latency
+    /// (1-2s) from holding the write lock. The in-transaction path re-checks
+    /// dedup and only applies the pre-flight verdict when the candidate id
+    /// matches — otherwise it falls back to the mechanical route.
+    ///
+    /// Returns None when:
+    /// - feature disabled
+    /// - no gray-zone candidate detected in read-only check
+    /// - LLM unreachable, failed, or parse error
+    fn preflight_intelligent_classify(
         &self,
         memory: &Memory,
-        candidate_id: &str,
-        sim: f32,
-    ) -> ReinResult<Option<(DedupAction, Option<String>)>> {
+        similarity_threshold: f32,
+        time_window_days: i64,
+    ) -> Option<(String, VerdictResult)> {
         let config = crate::config::ReinConfig::load().unwrap_or_default();
         if !config.intelligent_merge.enabled {
-            return Ok(None);
+            return None;
         }
-        let Ok(existing) = self.get(candidate_id) else {
-            return Ok(None);
+
+        // Read-only dedup preview — state may shift before the real write, but
+        // the match-or-fallback safeguard inside the transaction handles races.
+        let inferred_cluster = memory
+            .cluster_id
+            .or_else(|| self.infer_cluster_from_cache(memory));
+        let preview = crate::extract::check_dedup(
+            self,
+            &memory.topic,
+            &memory.summary,
+            &memory.content,
+            similarity_threshold,
+            time_window_days,
+            inferred_cluster,
+        )
+        .ok()?;
+
+        let DedupAction::GrayZone(candidate_id, _sim) = preview else {
+            return None;
         };
+
+        let existing = self.get(&candidate_id).ok()?;
         let existing_snippet = crate::extract::intelligent_merge::MemorySnippet::from(&existing);
         let incoming_snippet = crate::extract::intelligent_merge::MemorySnippet {
             topic: memory.topic.clone(),
@@ -1422,32 +1546,19 @@ impl SqliteStore {
             content: memory.content.clone(),
         };
 
-        let Some(verdict) = crate::extract::intelligent_merge::classify_insertion(
+        let verdict = crate::extract::intelligent_merge::classify_insertion(
             &config,
             &existing_snippet,
             &incoming_snippet,
-        ) else {
-            return Ok(None);
-        };
+        )?;
 
         tracing::info!(
             candidate_id,
-            sim,
             verdict = ?verdict.verdict,
             reasoning = verdict.reasoning.as_deref().unwrap_or(""),
-            "intelligent_merge verdict"
+            "intelligent_merge preflight verdict"
         );
-
-        use crate::extract::intelligent_merge::InsertionVerdict;
-        let (action, synth) = match verdict.verdict {
-            InsertionVerdict::Ignore => (DedupAction::MergeInto(candidate_id.to_string()), None),
-            InsertionVerdict::Update | InsertionVerdict::Merge => (
-                DedupAction::MergeInto(candidate_id.to_string()),
-                verdict.synthesized,
-            ),
-            InsertionVerdict::CreateNew => (DedupAction::CreateNew, None),
-        };
-        Ok(Some((action, synth)))
+        Some((candidate_id, verdict))
     }
 
     fn grayzone_canonical_anchor(&self, candidate_id: &str) -> ReinResult<Option<String>> {
@@ -1808,6 +1919,12 @@ impl SqliteStore {
     }
 }
 
+/// Fetch a short summary/content snapshot for provenance logging.
+/// Returns just the content string if the id exists, None otherwise.
+fn memory_content_snapshot(store: &SqliteStore, id: &str) -> Option<String> {
+    store.get(id).ok().map(|m| m.content)
+}
+
 /// Remove a memory ID from every JSON array across the schema that might reference it.
 ///
 /// Must be called inside an open transaction. Targets:
@@ -1984,6 +2101,16 @@ mod tests {
         let result = store.get(&id);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ReinError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_preflight_classify_returns_none_without_grayzone() {
+        // With no stored memories there's no candidate for dedup, so preflight
+        // must return None regardless of the feature flag — no LLM call attempted.
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = test_memory("rust", "unique content", Importance::Medium);
+        let result = store.preflight_intelligent_classify(&mem, 0.7, 7);
+        assert!(result.is_none(), "empty store → no gray zone → no classification");
     }
 
     #[test]
