@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.17.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 28 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
+rein v0.17.2 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 28 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only). Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed).
 
 ## Build & Test
 
@@ -74,7 +74,8 @@ src/
 │   │   ├── parsing.rs # JSON payload extraction, agent detection
 │   │   ├── buffer.rs  # Session buffer I/O
 │   │   └── scoring.rs # Signal scoring and filtering
-│   └── dedup.rs     # Similarity (hybrid CJK tokenization: jieba-rs + bigrams, Jaccard + containment, hot-path cluster-aware hints)
+│   ├── dedup.rs     # Similarity (hybrid CJK tokenization: jieba-rs + bigrams, Jaccard + containment, hot-path cluster-aware hints)
+│   └── intelligent_merge.rs # LLM-driven semantic verdict classifier (opt-in: ignore/update/merge/create_new for gray-zone cases)
 ├── sync/
 │   ├── supermemory.rs # Supermemory v4 API client
 │   ├── auto_memory.rs # ~/.claude/ file scanner
@@ -111,7 +112,9 @@ docker-compose.yml   # One-command deployment
 - FTS5 queries sanitized via `sanitize_fts_query()`
 - LIKE queries escape `%` and `_`
 - HTTP server requires REIN_HTTP_TOKEN for non-localhost bind
-- Dedup threshold: per-cluster adaptive via A1 (P90 intra-cluster similarity); 0.70 global fallback. All paths (store, batch, vec dedup) use `get_dedup_threshold(cluster_id)`
+- Dedup threshold: per-cluster adaptive via A1 (P90 intra-cluster similarity); 0.70 global fallback. All paths (store, batch, vec dedup, CLI, MCP) use `get_dedup_threshold(cluster_id)` via `ops::effective_dedup_threshold()`
+- Intelligent merge (opt-in via `[intelligent_merge] enabled = true`): LLM pre-flight classification of gray-zone (0.50–0.85 sim) pairs chooses ignore/update/merge/create_new. Pre-flight runs OUTSIDE `BEGIN IMMEDIATE` to avoid holding the write lock. Every verdict is logged to `dedup_decisions` with `operator='llm_verdict'`; Update/Merge snapshot the pre-merge existing memory into `memory_evidence` so the prior version is recoverable.
+- Single-memory deletion (`SqliteStore::delete`, `rein_forget`, CLI delete) wraps row delete + JSON-array ref cleanup (`concept.source_memory_ids`, `memory.related_ids`, `episodes.memory_ids`) in one `BEGIN IMMEDIATE` so partial failure rolls back atomically
 - CJK lexical dedup uses `jieba-rs` word segmentation plus character bigrams
 - Vector dimensions: configurable (default 3072)
 - FTS5 tokenizer: unicode61 (CJK support)
