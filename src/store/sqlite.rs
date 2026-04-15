@@ -1332,10 +1332,25 @@ impl SqliteStore {
             let resolved_action = match dedup_action {
                 DedupAction::GrayZone(candidate_id, sim) => {
                     // Try the pre-flight verdict first (no LLM call under lock).
-                    let applied = preflight
-                        .as_ref()
-                        .filter(|(pf_id, _)| pf_id == &candidate_id)
-                        .map(|(_, v)| v.clone());
+                    // Two race guards: candidate id must match, AND the existing
+                    // memory's content hash must be unchanged since pre-flight
+                    // (otherwise someone mutated it and the verdict is stale).
+                    let applied = preflight.as_ref().and_then(|(pf_id, pf_hash, v)| {
+                        if pf_id != &candidate_id {
+                            crate::extract::intelligent_merge::note_stale_race();
+                            return None;
+                        }
+                        let current = self.get(&candidate_id).ok()?;
+                        if content_hash(&current.content) != *pf_hash {
+                            crate::extract::intelligent_merge::note_stale_race();
+                            tracing::debug!(
+                                candidate_id,
+                                "intelligent_merge: stale verdict — content changed since pre-flight"
+                            );
+                            return None;
+                        }
+                        Some(v.clone())
+                    });
 
                     if let Some(v) = applied {
                         // Snapshot existing memory BEFORE mutating — needed for both
@@ -1512,7 +1527,7 @@ impl SqliteStore {
         memory: &Memory,
         similarity_threshold: f32,
         time_window_days: i64,
-    ) -> Option<(String, VerdictResult)> {
+    ) -> Option<(String, u64, VerdictResult)> {
         let config = crate::config::ReinConfig::load().unwrap_or_default();
         if !config.intelligent_merge.enabled {
             return None;
@@ -1539,6 +1554,7 @@ impl SqliteStore {
         };
 
         let existing = self.get(&candidate_id).ok()?;
+        let existing_hash = content_hash(&existing.content);
         let existing_snippet = crate::extract::intelligent_merge::MemorySnippet::from(&existing);
         let incoming_snippet = crate::extract::intelligent_merge::MemorySnippet {
             topic: memory.topic.clone(),
@@ -1558,7 +1574,7 @@ impl SqliteStore {
             reasoning = verdict.reasoning.as_deref().unwrap_or(""),
             "intelligent_merge preflight verdict"
         );
-        Some((candidate_id, verdict))
+        Some((candidate_id, existing_hash, verdict))
     }
 
     fn grayzone_canonical_anchor(&self, candidate_id: &str) -> ReinResult<Option<String>> {
@@ -1917,6 +1933,16 @@ impl SqliteStore {
             }
         }
     }
+}
+
+/// Stable 64-bit hash of a memory content string, used as a race guard so a
+/// pre-flight LLM verdict can be discarded if the existing memory's content
+/// was mutated between pre-flight and the write transaction.
+fn content_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Fetch a short summary/content snapshot for provenance logging.

@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { path: '/graph', icon: '\u{1F578}\uFE0F', label: 'Graph' },
   { path: '/timeline', icon: '\u23F1\uFE0F', label: 'Timeline' },
   { path: '/artifacts', icon: '\u{1F4C4}', label: 'Artifacts' },
+  { path: '/provenance', icon: '\u{1F50F}', label: 'Provenance' },
 ];
 
 export default function Layout() {
