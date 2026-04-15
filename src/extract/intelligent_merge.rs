@@ -1,4 +1,4 @@
-//! Intelligent memory insertion classifier (POC — shadow mode only).
+//! Intelligent memory insertion classifier.
 //!
 //! Given two memory candidates (an existing one and an incoming one) whose
 //! raw lexical similarity falls into a gray zone, ask an LLM to classify
@@ -16,6 +16,78 @@ use crate::types::error::{ReinError, ReinResult};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Lightweight process-wide metrics for observability. Counters only — no
+/// histograms or percentiles. Exposed via `metrics_snapshot()`.
+pub struct ClassifyMetrics {
+    pub attempted: AtomicU64,
+    pub success: AtomicU64,
+    pub parse_err: AtomicU64,
+    pub http_err: AtomicU64,
+    pub stale_race: AtomicU64,
+}
+
+static METRICS: ClassifyMetrics = ClassifyMetrics {
+    attempted: AtomicU64::new(0),
+    success: AtomicU64::new(0),
+    parse_err: AtomicU64::new(0),
+    http_err: AtomicU64::new(0),
+    stale_race: AtomicU64::new(0),
+};
+
+/// Snapshot the process-wide classifier metrics as (attempted, success, parse_err, http_err, stale_race).
+pub fn metrics_snapshot() -> (u64, u64, u64, u64, u64) {
+    (
+        METRICS.attempted.load(Ordering::Relaxed),
+        METRICS.success.load(Ordering::Relaxed),
+        METRICS.parse_err.load(Ordering::Relaxed),
+        METRICS.http_err.load(Ordering::Relaxed),
+        METRICS.stale_race.load(Ordering::Relaxed),
+    )
+}
+
+/// Called by callers when a pre-flight verdict was discarded because the
+/// in-transaction dedup decision pointed at a different candidate.
+pub fn note_stale_race() {
+    METRICS.stale_race.fetch_add(1, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Test-only injection hook — lets integration tests replace the real LLM
+// call with a canned verdict without wiring a whole provider stack.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use super::*;
+    use std::sync::Mutex;
+
+    pub(crate) type MockFn =
+        Box<dyn Fn(&MemorySnippet, &MemorySnippet) -> Option<VerdictResult> + Send + Sync>;
+
+    static MOCK: Mutex<Option<MockFn>> = Mutex::new(None);
+
+    /// Install a mock classifier. Returned guard uninstalls on drop so tests
+    /// can't leak state to each other.
+    pub(crate) struct MockGuard;
+    impl Drop for MockGuard {
+        fn drop(&mut self) {
+            *MOCK.lock().unwrap() = None;
+        }
+    }
+    pub(crate) fn install(f: MockFn) -> MockGuard {
+        *MOCK.lock().unwrap() = Some(f);
+        MockGuard
+    }
+
+    pub(crate) fn dispatch(
+        existing: &MemorySnippet,
+        incoming: &MemorySnippet,
+    ) -> Option<Option<VerdictResult>> {
+        MOCK.lock().unwrap().as_ref().map(|f| f(existing, incoming))
+    }
+}
 
 /// The LLM's classification of how the incoming memory relates to the existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,7 +199,19 @@ pub fn classify_insertion(
     existing: &MemorySnippet,
     incoming: &MemorySnippet,
 ) -> Option<VerdictResult> {
+    // Test-only: short-circuit to mock classifier if one is installed.
+    #[cfg(test)]
+    {
+        if let Some(mock_result) = test_hook::dispatch(existing, incoming) {
+            METRICS.attempted.fetch_add(1, Ordering::Relaxed);
+            if mock_result.is_some() {
+                METRICS.success.fetch_add(1, Ordering::Relaxed);
+            }
+            return mock_result;
+        }
+    }
     let classifier = build_classifier(config)?;
+    METRICS.attempted.fetch_add(1, Ordering::Relaxed);
     let user_msg = build_user_message(existing, incoming);
 
     let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -141,8 +225,17 @@ pub fn classify_insertion(
     };
 
     match result {
-        Ok(v) => Some(v),
+        Ok(v) => {
+            METRICS.success.fetch_add(1, Ordering::Relaxed);
+            Some(v)
+        }
         Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("JSON parse") || msg.contains("missing ") {
+                METRICS.parse_err.fetch_add(1, Ordering::Relaxed);
+            } else {
+                METRICS.http_err.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::debug!("intelligent_merge classify failed: {e}");
             None
         }
@@ -409,6 +502,49 @@ mod tests {
         let truncated = truncate_chars(&s, 100);
         // 100 chars + ellipsis
         assert_eq!(truncated.chars().count(), 101);
+    }
+
+    #[test]
+    fn classify_insertion_mock_end_to_end() {
+        // Single test that exercises both Some and None mock paths back-to-back.
+        // Combined into one test function because the mock hook is a global
+        // Mutex — parallel test execution would race with each other's guards.
+        let cfg = ReinConfig::default();
+        let a = MemorySnippet {
+            topic: "t".into(),
+            summary: "existing-sum".into(),
+            content: "existing-content".into(),
+        };
+        let b = MemorySnippet {
+            topic: "t".into(),
+            summary: "incoming-sum".into(),
+            content: "incoming-content".into(),
+        };
+
+        // Path 1: mock returns Some(Merge, synthesized).
+        {
+            let _guard = test_hook::install(Box::new(|_existing, incoming| {
+                Some(VerdictResult {
+                    verdict: InsertionVerdict::Merge,
+                    synthesized: Some(format!("synthesized for: {}", incoming.summary)),
+                    reasoning: Some("mocked for test".into()),
+                })
+            }));
+            let v = classify_insertion(&cfg, &a, &b).expect("mock should return Some");
+            assert_eq!(v.verdict, InsertionVerdict::Merge);
+            assert_eq!(
+                v.synthesized,
+                Some("synthesized for: incoming-sum".to_string())
+            );
+            assert_eq!(v.reasoning.as_deref(), Some("mocked for test"));
+        } // guard drops → mock uninstalled
+
+        // Path 2: mock returns None → classifier reports failure.
+        {
+            let _guard = test_hook::install(Box::new(|_a, _b| None));
+            let result = classify_insertion(&cfg, &a, &b);
+            assert!(result.is_none());
+        }
     }
 
     #[test]
