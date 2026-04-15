@@ -8,6 +8,7 @@ use crate::config::{Provider, ReinConfig};
 use crate::embed;
 use crate::extract::hooks::buffer;
 use crate::extract::hooks::queue::{collect_queue_diagnostics, QueueGroupDiagnostics};
+use crate::ops::registry;
 use crate::search::warmup;
 use crate::store::hnsw::HnswIndex;
 use crate::store::sqlite::SqliteStore;
@@ -41,6 +42,7 @@ pub enum DoctorCategory {
     Index,
     Queue,
     Network,
+    Architecture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -106,6 +108,10 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_proxy_auth(config));
     checks.push(check_gui_runtime(config));
     checks.push(check_proxy_runtime(config));
+    checks.push(check_overview_version());
+    checks.push(check_cli_registry());
+    checks.push(check_mcp_registry());
+    checks.push(check_rest_registry());
     if options.fix {
         fixes_applied.extend(apply_queue_fixes(config));
     }
@@ -300,6 +306,167 @@ fn fail_with_hint(
         message: message.into(),
         repair_hint: Some(repair_hint.into()),
     }
+}
+
+fn check_overview_version() -> DoctorCheck {
+    let cargo_version = env!("CARGO_PKG_VERSION");
+    match parse_agents_overview_version(include_str!("../AGENTS.md")) {
+        Some(version) if version == cargo_version => ok_in(
+            DoctorCategory::Architecture,
+            "overview_version",
+            format!("AGENTS overview version matches Cargo v{cargo_version}"),
+        ),
+        Some(version) => warn_in(
+            DoctorCategory::Architecture,
+            "overview_version",
+            format!("AGENTS overview says v{version} but Cargo.toml is v{cargo_version}"),
+        ),
+        None => warn_in(
+            DoctorCategory::Architecture,
+            "overview_version",
+            "could not parse AGENTS overview version",
+        ),
+    }
+}
+
+fn check_cli_registry() -> DoctorCheck {
+    let registry_count = registry::cli_operations().len();
+    let source_count = count_cli_operations_in_source(include_str!("main.rs"));
+    if registry_count != source_count {
+        return fail_in(
+            DoctorCategory::Architecture,
+            "cli_registry",
+            format!(
+                "registry has {registry_count} CLI operations but main.rs exposes {source_count}"
+            ),
+        );
+    }
+    ok_in(
+        DoctorCategory::Architecture,
+        "cli_registry",
+        format!("{registry_count} CLI operations match main.rs"),
+    )
+}
+
+fn check_mcp_registry() -> DoctorCheck {
+    let registry_count = registry::mcp_operations().len();
+    let source_count = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
+    if registry_count != source_count {
+        return fail_in(
+            DoctorCategory::Architecture,
+            "mcp_registry",
+            format!(
+                "registry has {registry_count} MCP tools but src/mcp/server.rs exposes {source_count}"
+            ),
+        );
+    }
+
+    let doc_counts = documented_mcp_tool_counts();
+    if !doc_counts.is_empty() && doc_counts.iter().any(|(_, count)| *count != registry_count) {
+        let doc_summary = doc_counts
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return warn_in(
+            DoctorCategory::Architecture,
+            "mcp_registry",
+            format!("{registry_count} MCP tools match source, but docs still say {doc_summary}"),
+        );
+    }
+
+    ok_in(
+        DoctorCategory::Architecture,
+        "mcp_registry",
+        format!("{registry_count} MCP tools match source"),
+    )
+}
+
+fn check_rest_registry() -> DoctorCheck {
+    let registry_count = registry::rest_operations().len();
+    let source_count = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
+    if registry_count != source_count {
+        return fail_in(
+            DoctorCategory::Architecture,
+            "rest_registry",
+            format!(
+                "registry has {registry_count} REST operations but src/mcp/rest.rs exposes {source_count}"
+            ),
+        );
+    }
+    ok_in(
+        DoctorCategory::Architecture,
+        "rest_registry",
+        format!("{registry_count} REST operations match src/mcp/rest.rs"),
+    )
+}
+
+fn parse_agents_overview_version(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let version = line.strip_prefix("rein v")?;
+        let version = version.split_whitespace().next()?;
+        Some(version.to_string())
+    })
+}
+
+fn parse_documented_mcp_tool_count(text: &str) -> Option<usize> {
+    text.lines()
+        .find_map(|line| parse_documented_mcp_tool_count_line(line))
+}
+
+fn parse_documented_mcp_tool_count_line(line: &str) -> Option<usize> {
+    let idx = line.find("MCP tools")?;
+    let prefix = line[..idx].trim_end();
+    let digits: String = prefix
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+fn documented_mcp_tool_counts() -> Vec<(&'static str, usize)> {
+    let mut counts = Vec::new();
+    for (name, text) in [
+        ("AGENTS.md", include_str!("../AGENTS.md")),
+        ("README.md", include_str!("../README.md")),
+    ] {
+        if let Some(count) = parse_documented_mcp_tool_count(text) {
+            counts.push((name, count));
+        }
+    }
+    counts
+}
+
+fn count_cli_operations_in_source(source: &str) -> usize {
+    let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+    source
+        .lines()
+        .filter(|line| line.contains("Some(Commands::"))
+        .count()
+}
+
+fn count_mcp_tools_in_source(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("#[tool("))
+        .count()
+}
+
+fn count_rest_operations_in_source(source: &str) -> usize {
+    // Only count lines that open a route arm — i.e. the `(&Method::` appears at
+    // the start of the (trimmed) line. This excludes comments, string literals,
+    // and code that merely references the pattern in a helper.
+    // Also strip #[cfg(test)] and later so test fixtures don't inflate the count.
+    let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("(&Method::"))
+        .count()
 }
 
 fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
@@ -1512,5 +1679,29 @@ provider = "inherit"
             .unwrap();
         assert_eq!(http.status, CheckStatus::Fail);
         assert_eq!(proxy.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn test_architecture_drift_helpers_match_source_counts() {
+        assert_eq!(
+            count_cli_operations_in_source(include_str!("main.rs")),
+            registry::cli_operations().len()
+        );
+        assert_eq!(
+            count_mcp_tools_in_source(include_str!("mcp/server.rs")),
+            registry::mcp_operations().len()
+        );
+        assert_eq!(
+            count_rest_operations_in_source(include_str!("mcp/rest.rs")),
+            registry::rest_operations().len()
+        );
+        assert_eq!(
+            parse_agents_overview_version("rein v1.2.3 — demo release"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            parse_documented_mcp_tool_count_line("| **28 MCP tools** | 13 core"),
+            Some(28)
+        );
     }
 }

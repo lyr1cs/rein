@@ -626,8 +626,8 @@ rein can run as a transparent HTTP proxy that records LLM conversations without 
 rein serve --proxy &
 
 # 2. Use with your agent
-ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code (login mode works)
-codex -c 'openai_base_url="http://127.0.0.1:8690"' "hello"   # Codex CLI
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code
+codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"'
 ```
 
 #### Shell Aliases (recommended)
@@ -636,8 +636,8 @@ Add to `~/.zshrc` or `~/.bashrc` for convenience:
 
 ```bash
 alias rein-proxy="rein serve --proxy &"
-alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
-codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_proxy"' "$@"; }
+claudep() { REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${REIN_PROXY_TOKEN:-}" claude "$@"; }
+codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"' "$@"; }
 ```
 
 Then: `rein-proxy` to start, `claudep` or `codexp` to use.
@@ -653,6 +653,7 @@ base_url = "http://127.0.0.1:8690/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 supports_websockets = false
+env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" }
 
 model_provider = "rein_proxy"
 ```
@@ -669,7 +670,7 @@ This makes all Codex calls go through the rein proxy by default (requires proxy 
 | **Windsurf** | Settings > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **Any OpenAI-compatible** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
 
-> **Note:** Claude Code login mode (no API key) works — auth tokens are forwarded transparently.
+> **Note:** Codex subscription/OAuth login proxying is not the same as the API-key Responses API proxy above. The supported Codex path today is `OPENAI_API_KEY` + custom `model_provider` + `wire_api="responses"` + `supports_websockets=false`. Subscription-login proxying requires a separate first-party backend proxy track.
 
 #### How it works
 
@@ -1379,8 +1380,8 @@ rein 可以作为透明 HTTP 代理运行，记录 LLM 对话而不修改请求�
 rein serve --proxy &
 
 # 2. 配合你的 agent 使用
-ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code（登录模式也可用）
-codex -c 'openai_base_url="http://127.0.0.1:8690"' "hello"   # Codex CLI
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude       # Claude Code
+codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"'
 ```
 
 #### Shell 别名（推荐）
@@ -1389,8 +1390,8 @@ codex -c 'openai_base_url="http://127.0.0.1:8690"' "hello"   # Codex CLI
 
 ```bash
 alias rein-proxy="rein serve --proxy &"
-alias claudep="ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude"
-codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_proxy"' "$@"; }
+claudep() { REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${REIN_PROXY_TOKEN:-}" claude "$@"; }
+codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"' "$@"; }
 ```
 
 然后：`rein-proxy` 启动代理，`claudep` 或 `codexp` 使用。
@@ -1406,6 +1407,7 @@ base_url = "http://127.0.0.1:8690/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 supports_websockets = false
+env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" }
 
 model_provider = "rein_proxy"
 ```
@@ -1422,7 +1424,7 @@ model_provider = "rein_proxy"
 | **Windsurf** | 设置 > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **任何 OpenAI 兼容工具** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
 
-> **注意：** Claude Code 登录模式（无需 API key）可正常工作 — auth token 会被透明转发。
+> **注意：** Codex 订阅/OAuth 登录态 proxy 与上面的 API-key Responses API proxy 不是同一个实现。当前支持的 Codex 路线是 `OPENAI_API_KEY` + 自定义 `model_provider` + `wire_api="responses"` + `supports_websockets=false`。订阅登录态 proxy 需要单独的 first-party backend proxy 开发线。
 
 #### 工作原理
 

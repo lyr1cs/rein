@@ -5,6 +5,8 @@ target/
 reviews/
 scripts/
 *.md
+!AGENTS.md
+!README.md
 LICENSE
 .DS_Store
 .gitignore

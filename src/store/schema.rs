@@ -898,9 +898,8 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
         conn.execute_batch(&vec_sql)?;
         {
             let mut read = conn.prepare("SELECT id, embedding FROM embed_staging")?;
-            let mut write = conn.prepare(
-                "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)",
-            )?;
+            let mut write =
+                conn.prepare("INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)")?;
             let mut rows = read.query([])?;
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
