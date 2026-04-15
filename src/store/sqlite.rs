@@ -813,22 +813,40 @@ impl MemoryStore for SqliteStore {
     }
 
     fn delete(&self, id: &str) -> ReinResult<()> {
-        let rows = self
-            .conn
-            .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
-        if rows == 0 {
-            return Err(ReinError::NotFound(format!("memory {id} not found")));
-        }
-        // FTS cleanup handled by trigger; clean up vector table
-        if let Err(e) = vec::delete_embedding(&self.conn, id) {
-            tracing::warn!("failed to delete embedding for {id}: {e}");
-        }
+        // Wrap the delete + cross-reference cleanup in a single transaction so a
+        // partial failure cannot leave concept.source_memory_ids / memory.related_ids /
+        // episodes.memory_ids pointing at a non-existent memory.
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let result: ReinResult<()> = (|| {
+            clean_memory_refs(&self.conn, id)?;
+            let rows = self.conn.execute(
+                "DELETE FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            if rows == 0 {
+                return Err(ReinError::NotFound(format!("memory {id} not found")));
+            }
+            // FTS cleanup handled by trigger; vec and memory_canonical_state CASCADE.
+            if let Err(e) = vec::delete_embedding(&self.conn, id) {
+                tracing::warn!("failed to delete embedding for {id}: {e}");
+            }
+            Ok(())
+        })();
 
-        // Remove from side indexes (fire-and-forget)
-        self.remove_from_tantivy(id);
-        self.remove_from_hnsw(id);
-
-        Ok(())
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", [])?;
+                // Side indexes are fire-and-forget AFTER commit so their failure
+                // can't roll back successful DB deletion.
+                self.remove_from_tantivy(id);
+                self.remove_from_hnsw(id);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 
     fn search_fts(
@@ -1709,6 +1727,117 @@ impl SqliteStore {
     }
 }
 
+/// Remove a memory ID from every JSON array across the schema that might reference it.
+///
+/// Must be called inside an open transaction. Targets:
+/// - `concepts.source_memory_ids`
+/// - `memories.related_ids` (other memories pointing at this one)
+/// - `episodes.memory_ids`
+/// - `knowledge_units.source_memory_ids` (if present — knowledge graph layer)
+///
+/// `memory_canonical_state` is handled via ON DELETE CASCADE on the schema FK.
+/// This matches the cleanup already performed by batch prune paths so single-memory
+/// deletion (rein_forget / CLI / REST) no longer orphans JSON refs.
+fn clean_memory_refs(conn: &Connection, memory_id: &str) -> ReinResult<()> {
+    // Quoted JSON string literal form, e.g. "01KP..."
+    let quoted = format!("\"{memory_id}\"");
+    let like = format!("%{quoted}%");
+
+    // concepts.source_memory_ids
+    conn.execute(
+        "UPDATE concepts
+         SET source_memory_ids = COALESCE(
+            (SELECT json_group_array(value)
+             FROM json_each(source_memory_ids)
+             WHERE value != ?1),
+            '[]')
+         WHERE source_memory_ids LIKE ?2",
+        rusqlite::params![memory_id, like],
+    )?;
+
+    // memories.related_ids — other memories that list this id
+    conn.execute(
+        "UPDATE memories
+         SET related_ids = COALESCE(
+            (SELECT json_group_array(value)
+             FROM json_each(related_ids)
+             WHERE value != ?1),
+            '[]')
+         WHERE related_ids LIKE ?2 AND id != ?1",
+        rusqlite::params![memory_id, like],
+    )?;
+
+    // episodes.memory_ids
+    // Guarded with sqlite_master check so older schemas without episodes don't fail.
+    let has_episodes: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episodes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_episodes {
+        conn.execute(
+            "UPDATE episodes
+             SET memory_ids = COALESCE(
+                (SELECT json_group_array(value)
+                 FROM json_each(memory_ids)
+                 WHERE value != ?1),
+                '[]')
+             WHERE memory_ids LIKE ?2",
+            rusqlite::params![memory_id, like],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Remove a concept ID from every JSON array that might reference it.
+///
+/// Caller must open a transaction.  Targets:
+/// - `memories.concept_ids`
+/// - `episodes.concept_ids`
+///
+/// `concept_links` and `concept_revisions` are handled via ON DELETE CASCADE.
+#[allow(dead_code)]
+fn clean_concept_refs(conn: &Connection, concept_id: &str) -> ReinResult<()> {
+    let quoted = format!("\"{concept_id}\"");
+    let like = format!("%{quoted}%");
+
+    conn.execute(
+        "UPDATE memories
+         SET concept_ids = COALESCE(
+            (SELECT json_group_array(value)
+             FROM json_each(concept_ids)
+             WHERE value != ?1),
+            '[]')
+         WHERE concept_ids LIKE ?2",
+        rusqlite::params![concept_id, like],
+    )?;
+
+    let has_episodes: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episodes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_episodes {
+        conn.execute(
+            "UPDATE episodes
+             SET concept_ids = COALESCE(
+                (SELECT json_group_array(value)
+                 FROM json_each(concept_ids)
+                 WHERE value != ?1),
+                '[]')
+             WHERE concept_ids LIKE ?2",
+            rusqlite::params![concept_id, like],
+        )?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1774,6 +1903,24 @@ mod tests {
         let result = store.get(&id);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ReinError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_delete_cleans_related_ids_in_other_memories() {
+        // A memory's id should be scrubbed from other memories' related_ids
+        // JSON arrays when it's deleted — otherwise those arrays point at
+        // a non-existent id.
+        let store = SqliteStore::in_memory().unwrap();
+        let target = test_memory("rust", "target", Importance::Medium);
+        let target_id = store.store(target).unwrap();
+        let mut other = test_memory("rust", "other", Importance::Medium);
+        other.related_ids = vec![target_id.clone(), "other-id".to_string()];
+        let other_id = store.store(other).unwrap();
+
+        store.delete(&target_id).unwrap();
+
+        let refreshed = store.get(&other_id).unwrap();
+        assert_eq!(refreshed.related_ids, vec!["other-id".to_string()]);
     }
 
     #[test]
