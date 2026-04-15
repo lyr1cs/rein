@@ -61,19 +61,51 @@ pub struct ReinConfig {
 ///
 /// When `enabled = true`, store_with_dedup consults an LLM on gray-zone
 /// similarity cases and chooses among ignore / update / merge / create_new
-/// instead of the mechanical jaccard/containment threshold. Disabled by
-/// default because it adds 1-2s latency per gray-zone store and requires
-/// an LLM provider configured via `query_expansion`.
+/// instead of the mechanical jaccard/containment threshold.
+///
+/// `provider` is optional override — when "none" (default) the classifier
+/// falls back to the provider configured under `[query_expansion]`. Set
+/// to "google" or "omlx" to use an independent provider configured in the
+/// nested blocks below.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntelligentMergeConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// "google" | "omlx" | "none" — default "none" means reuse query_expansion.
+    #[serde(default = "default_im_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub google: GoogleExpandConfig,
+    #[serde(default)]
+    pub omlx: OmlxExpandConfig,
+}
+
+fn default_im_provider() -> String {
+    "none".to_string()
 }
 
 impl Default for IntelligentMergeConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            provider: default_im_provider(),
+            google: GoogleExpandConfig::default(),
+            omlx: OmlxExpandConfig::default(),
+        }
+    }
+}
+
+impl IntelligentMergeConfig {
+    /// Returns the resolved provider for the classifier. "none" means
+    /// "fall back to query_expansion" — callers should consult that when
+    /// this returns Provider::None.
+    pub fn resolved_provider(&self) -> Provider {
+        match self.provider.to_lowercase().as_str() {
+            "google" | "gemini" => Provider::Google,
+            "omlx" | "local" => Provider::Omlx,
+            _ => Provider::None,
+        }
     }
 }
 

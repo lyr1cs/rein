@@ -168,23 +168,52 @@ impl ClassifierKind {
 }
 
 fn build_classifier(config: &ReinConfig) -> Option<ClassifierKind> {
-    // Reuse the query_expansion provider configuration for now. A dedicated
-    // classifier block in config can be added once the POC proves useful.
-    match config.expand_provider() {
+    // Prefer the dedicated `[intelligent_merge]` provider block when set;
+    // otherwise fall back to `[query_expansion]` so existing setups keep working.
+    let (provider, google, omlx) = match config.intelligent_merge.resolved_provider() {
+        Provider::None => (
+            config.expand_provider(),
+            (
+                config.query_expansion.google.api_key.clone(),
+                config.query_expansion.google.endpoint.clone(),
+                config.query_expansion.google.model.clone(),
+            ),
+            (
+                config.query_expansion.omlx.endpoint.clone(),
+                config.query_expansion.omlx.model.clone(),
+                config.query_expansion.omlx.disable_thinking,
+            ),
+        ),
+        own => (
+            own,
+            (
+                config.intelligent_merge.google.api_key.clone(),
+                config.intelligent_merge.google.endpoint.clone(),
+                config.intelligent_merge.google.model.clone(),
+            ),
+            (
+                config.intelligent_merge.omlx.endpoint.clone(),
+                config.intelligent_merge.omlx.model.clone(),
+                config.intelligent_merge.omlx.disable_thinking,
+            ),
+        ),
+    };
+
+    match provider {
         Provider::Google => {
-            let api_key = config.query_expansion.google.api_key.as_ref()?.clone();
+            let api_key = google.0?;
             Some(ClassifierKind::Gemini(GeminiClassifier {
                 client: crate::search::cache::http_client_15s(),
                 api_key,
-                endpoint: config.query_expansion.google.endpoint.clone(),
-                model: config.query_expansion.google.model.clone(),
+                endpoint: google.1,
+                model: google.2,
             }))
         }
         Provider::Omlx => Some(ClassifierKind::Omlx(OmlxClassifier {
             client: crate::search::cache::http_client_15s(),
-            endpoint: config.query_expansion.omlx.endpoint.clone(),
-            model: config.query_expansion.omlx.model.clone(),
-            disable_thinking: config.query_expansion.omlx.disable_thinking,
+            endpoint: omlx.0,
+            model: omlx.1,
+            disable_thinking: omlx.2,
         })),
         Provider::None => None,
     }
