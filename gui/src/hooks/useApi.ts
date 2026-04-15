@@ -6,6 +6,7 @@ import type {
   DoctorReport,
   Memory,
   RecallResult,
+  RecallPageResponse,
   Episode,
   Artifact,
   MemoryDetailResponse,
@@ -49,6 +50,24 @@ export function useRecall(query: string, options?: { topic?: string; limit?: num
       if (options?.topic) params.set('topic', options.topic);
       if (options?.limit) params.set('limit', String(options.limit));
       return apiGet<{ results: RecallResult[]; count: number }>(`/api/memories?${params}`);
+    },
+    enabled: query.length > 0,
+  });
+}
+
+export function useRecallStream(
+  query: string,
+  options?: { topic?: string; keyword?: string; limit?: number; offset?: number },
+) {
+  return useQuery({
+    queryKey: ['recall-stream', query, options],
+    queryFn: () => {
+      const params = new URLSearchParams({ q: query });
+      if (options?.topic) params.set('topic', options.topic);
+      if (options?.keyword) params.set('keyword', options.keyword);
+      if (options?.limit) params.set('limit', String(options.limit));
+      if (options?.offset) params.set('offset', String(options.offset));
+      return apiGet<RecallPageResponse>(`/api/recall_stream?${params}`);
     },
     enabled: query.length > 0,
   });
