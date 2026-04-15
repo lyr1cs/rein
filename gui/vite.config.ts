@@ -2,12 +2,15 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
+const reinBackend = process.env.REIN_GUI_PROXY_TARGET
+  ?? `http://localhost:${process.env.REIN_SSE_PORT ?? '8680'}`
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api': 'http://localhost:8680',
-      '/mcp': 'http://localhost:8680',
+      '/api': reinBackend,
+      '/mcp': reinBackend,
     },
   },
   build: {

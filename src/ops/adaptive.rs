@@ -167,46 +167,16 @@ fn run_hdbscan_clustering(
     let min_cluster_size = 5.max(embeddings.len() / 50); // adaptive: ~2% of dataset
     let result = crate::store::hdbscan::hdbscan(&embeddings, min_cluster_size);
 
-    // Clear stale cluster assignments ONLY for memories that were part of this clustering input.
-    // Memories outside the input set keep their existing cluster_id (from a previous run).
     let clustered_ids: std::collections::HashSet<&str> =
         embeddings.iter().map(|(id, _)| id.as_str()).collect();
-
-    // Wrap clear + reassign in a single transaction to prevent crash leaving all clusters NULL
-    let _ = store.conn().execute_batch("BEGIN");
-    for id in &clustered_ids {
-        let _ = store.conn().execute(
-            "UPDATE memories SET cluster_id = NULL WHERE id = ?1",
-            rusqlite::params![id],
-        );
-    }
-    // Clear ALL survival curves unconditionally. Cluster IDs are local labels
-    // produced by each HDBSCAN run — they are NOT stable identities across runs.
-    // Targeted deletion by old cluster ID would leave stale curves that get
-    // silently reused by a different cluster assigned the same numeric label.
-    let _ = store
-        .conn()
-        .execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", []);
-    // Clear stale per-cluster dedup thresholds (will be rebuilt by A1)
-    state.dedup_thresholds.clear();
-    // Clear per-cluster alpha entries (M2 extension): keys like "semantic:5" are
-    // meaningless after recluster because cluster IDs are reassigned.
-    // Keep only bare query-type keys (no colon separator).
-    state.learned_alpha.retain(|k, _| !k.contains(':'));
-
-    // Store new cluster assignments from this run (same transaction)
-    state.memory_clusters.clear();
+    let mut sampled_clusters: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     for (i, label) in result.labels.iter().enumerate() {
         let mem_id = &embeddings[i].0;
         if let Some(cluster_id) = label {
-            state.memory_clusters.insert(mem_id.clone(), *cluster_id);
-            let _ = store.conn().execute(
-                "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
-                rusqlite::params![*cluster_id, mem_id],
-            );
+            sampled_clusters.insert(mem_id.clone(), *cluster_id);
         }
     }
-    let _ = store.conn().execute_batch("COMMIT");
 
     // Compute and persist cluster centroids BEFORE reassigning non-sampled memories,
     // so we can use nearest-centroid instead of keeping stale cluster_id labels.
@@ -224,14 +194,6 @@ fn run_hdbscan_clustering(
             let centroid = compute_cluster_centroid(indices, &embeddings, dim);
             c.insert(*cluster_id, centroid);
         }
-        if let Err(e) = crate::store::adaptive::save_cluster_centroids(
-            store.conn(),
-            &c,
-            state.cluster_version + 1,
-            dim,
-        ) {
-            tracing::warn!("M4: failed to save cluster centroids: {e}");
-        }
         c
     } else {
         std::collections::HashMap::new()
@@ -245,118 +207,125 @@ fn run_hdbscan_clustering(
     // Use the in-memory `clustered_ids` set (derived from the actual HDBSCAN input)
     // to identify non-sampled memories — avoids a second LIMIT query whose row set
     // could differ from the first due to non-deterministic ordering.
-    if !centroids.is_empty() {
-        if let Err(e) = store.conn().execute_batch("BEGIN") {
-            tracing::warn!("M4: failed to begin reassignment transaction: {e}");
-        }
-
-        // NULL out stale cluster_ids for non-sampled memories only.
-        // Build a temp table from the known sampled IDs for an exact match.
-        if let Err(e) = store
-            .conn()
-            .execute_batch("CREATE TEMP TABLE IF NOT EXISTS _hdbscan_sampled (id TEXT PRIMARY KEY)")
-        {
-            tracing::warn!("M4: failed to create temp table: {e}");
-        }
-        if let Err(e) = store.conn().execute("DELETE FROM _hdbscan_sampled", []) {
-            tracing::warn!("M4: failed to clear temp table: {e}");
-        }
-        {
-            let mut ins = store
-                .conn()
-                .prepare_cached("INSERT OR IGNORE INTO _hdbscan_sampled (id) VALUES (?1)")
-                .ok();
-            if let Some(ref mut stmt) = ins {
+    let persist_result =
+        (|| -> crate::types::ReinResult<(std::collections::HashMap<String, u32>, u32)> {
+            let mut new_clusters = sampled_clusters.clone();
+            let mut reassigned = 0u32;
+            store.conn().execute_batch("SAVEPOINT hdbscan_recluster")?;
+            store.conn().execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _hdbscan_sampled (id TEXT PRIMARY KEY)",
+            )?;
+            store.conn().execute("DELETE FROM _hdbscan_sampled", [])?;
+            {
+                let mut ins = store
+                    .conn()
+                    .prepare_cached("INSERT OR IGNORE INTO _hdbscan_sampled (id) VALUES (?1)")?;
                 for id in &clustered_ids {
-                    let _ = stmt.execute(rusqlite::params![id]);
+                    ins.execute(rusqlite::params![id])?;
                 }
             }
-        }
-        let _ = store.conn().execute(
-            "UPDATE memories SET cluster_id = NULL
-             WHERE cluster_id IS NOT NULL
-               AND id NOT IN (SELECT id FROM _hdbscan_sampled)",
-            [],
-        );
 
-        // Batch-load non-sampled embeddings and reassign via nearest centroid.
-        // Process in batches of 2000 to bound peak memory (the initial sample is
-        // already capped at 10 000 for the same reason).
-        // Cursor-based pagination: use `vm.id > ?last_id ORDER BY vm.id` instead
-        // of OFFSET, because the loop mutates `cluster_id` from NULL → value,
-        // which shifts the result set and causes OFFSET to skip rows.
-        let reassign_batch_size = 2000i64;
-        let mut reassigned = 0u32;
-        let mut cursor = String::new(); // empty string sorts before all UUIDs
-        loop {
-            let batch: Vec<(String, Vec<f32>)> = store
+            for id in &clustered_ids {
+                store.conn().execute(
+                    "UPDATE memories SET cluster_id = NULL WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+            }
+            for (mem_id, cluster_id) in &sampled_clusters {
+                store.conn().execute(
+                    "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
+                    rusqlite::params![cluster_id, mem_id],
+                )?;
+            }
+
+            store
                 .conn()
-                .prepare(
-                    "SELECT vm.id, vm.embedding FROM vec_memories vm
-                     JOIN memories m ON m.id = vm.id
-                     WHERE m.cluster_id IS NULL
-                       AND vm.id NOT IN (SELECT id FROM _hdbscan_sampled)
-                       AND vm.id > ?1
-                     ORDER BY vm.id
-                     LIMIT ?2",
-                )
-                .ok()
-                .and_then(|mut stmt| {
-                    stmt.query_map(rusqlite::params![&cursor, reassign_batch_size], |row| {
-                        let id: String = row.get(0)?;
-                        let blob: Vec<u8> = row.get(1)?;
-                        let floats: Vec<f32> = blob
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        Ok((id, floats))
-                    })
-                    .ok()
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default();
+                .execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", [])?;
+            crate::store::adaptive::save_cluster_centroids(
+                store.conn(),
+                &centroids,
+                state.cluster_version + 1,
+                dim,
+            )?;
 
-            if batch.is_empty() {
-                break;
-            }
-            let batch_len = batch.len() as i64;
+            if !centroids.is_empty() {
+                store.conn().execute(
+                    "UPDATE memories SET cluster_id = NULL
+                 WHERE cluster_id IS NOT NULL
+                   AND id NOT IN (SELECT id FROM _hdbscan_sampled)",
+                    [],
+                )?;
 
-            // Advance cursor to the last ID in this batch
-            if let Some((last_id, _)) = batch.last() {
-                cursor = last_id.clone();
-            }
-
-            for (mem_id, emb) in &batch {
-                if let Some(cid) =
-                    crate::store::adaptive::assign_to_nearest_centroid(&centroids, emb)
-                {
-                    let _ = store.conn().execute(
-                        "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
-                        rusqlite::params![cid, mem_id],
-                    );
-                    state.memory_clusters.insert(mem_id.clone(), cid);
-                    reassigned += 1;
+                let reassign_batch_size = 2000i64;
+                let mut cursor = String::new();
+                loop {
+                    let batch: Vec<(String, Vec<f32>)> = {
+                        let mut stmt = store.conn().prepare(
+                            "SELECT vm.id, vm.embedding FROM vec_memories vm
+                         WHERE vm.id NOT IN (SELECT id FROM _hdbscan_sampled)
+                           AND vm.id > ?1
+                         ORDER BY vm.id
+                         LIMIT ?2",
+                        )?;
+                        let rows = stmt.query_map(
+                            rusqlite::params![&cursor, reassign_batch_size],
+                            |row| {
+                                let id: String = row.get(0)?;
+                                let blob: Vec<u8> = row.get(1)?;
+                                let floats: Vec<f32> = blob
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect();
+                                Ok((id, floats))
+                            },
+                        )?;
+                        rows.collect::<Result<Vec<_>, _>>()?
+                    };
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let batch_len = batch.len() as i64;
+                    if let Some((last_id, _)) = batch.last() {
+                        cursor = last_id.clone();
+                    }
+                    for (mem_id, emb) in &batch {
+                        if let Some(cid) =
+                            crate::store::adaptive::assign_to_nearest_centroid(&centroids, emb)
+                        {
+                            store.conn().execute(
+                                "UPDATE memories SET cluster_id = ?1 WHERE id = ?2",
+                                rusqlite::params![cid, mem_id],
+                            )?;
+                            new_clusters.insert(mem_id.clone(), cid);
+                            reassigned += 1;
+                        }
+                    }
+                    if batch_len < reassign_batch_size {
+                        break;
+                    }
                 }
             }
 
-            if batch_len < reassign_batch_size {
-                break;
-            }
+            store
+                .conn()
+                .execute("DROP TABLE IF EXISTS _hdbscan_sampled", [])?;
+            store.conn().execute_batch("RELEASE hdbscan_recluster")?;
+            Ok((new_clusters, reassigned))
+        })();
+    let (new_clusters, reassigned) = match persist_result {
+        Ok(result) => result,
+        Err(e) => {
+            let _ = store.conn().execute_batch("ROLLBACK TO hdbscan_recluster");
+            let _ = store.conn().execute_batch("RELEASE hdbscan_recluster");
+            tracing::error!("M4: failed to persist recluster atomically: {e}");
+            return;
         }
-
-        if let Err(e) = store
-            .conn()
-            .execute("DROP TABLE IF EXISTS _hdbscan_sampled", [])
-        {
-            tracing::warn!("M4: failed to drop temp table: {e}");
-        }
-        if let Err(e) = store.conn().execute_batch("COMMIT") {
-            tracing::error!("M4: failed to commit reassignment transaction: {e}");
-        }
-
-        if reassigned > 0 {
-            tracing::info!("M4: reassigned {reassigned} non-sampled memories via nearest centroid");
-        }
+    };
+    state.memory_clusters = new_clusters;
+    state.dedup_thresholds.clear();
+    state.learned_alpha.retain(|k, _| !k.contains(':'));
+    if reassigned > 0 {
+        tracing::info!("M4: reassigned {reassigned} non-sampled memories via nearest centroid");
     }
 
     state.cluster_version += 1;

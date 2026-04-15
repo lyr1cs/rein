@@ -30,6 +30,11 @@ impl AutoMemoryScanner {
 
                     if overlap > 0 {
                         let (title, body) = parse_frontmatter(&content);
+                        let timestamp = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|meta| meta.modified().ok())
+                            .map(chrono::DateTime::<chrono::Utc>::from)
+                            .unwrap_or_else(chrono::Utc::now);
                         results.push(Memory {
                             id: format!("auto:{}", path.display()),
                             layer: MemoryLayer::LTM,
@@ -59,9 +64,9 @@ impl AutoMemoryScanner {
                             embedding: None,
                             tier: MemoryTier::Warm,
                             cluster_id: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                            last_accessed: chrono::Utc::now(),
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                            last_accessed: timestamp,
                         });
                     }
                 }

@@ -796,14 +796,64 @@ pub fn check_embedding_model(conn: &Connection, model: &str, dims: usize) -> Rei
 /// Drops vec_memories and embed_cache, recreates with new dimensions.
 pub fn rebuild_vector_index(conn: &Connection, dims: usize) -> ReinResult<()> {
     tracing::warn!("embedding model changed — rebuilding vector index (dims={dims})");
-    conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
-    conn.execute_batch("DELETE FROM embed_cache;")?;
     let vec_sql = format!(
         "CREATE VIRTUAL TABLE vec_memories USING vec0(
             id TEXT PRIMARY KEY,
             embedding float[{dims}] distance_metric=cosine
         );"
     );
-    conn.execute_batch(&vec_sql)?;
-    Ok(())
+    let result = (|| -> ReinResult<()> {
+        conn.execute_batch("SAVEPOINT rebuild_vector_index")?;
+        conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
+        conn.execute_batch("DELETE FROM embed_cache;")?;
+        conn.execute_batch(&vec_sql)?;
+        conn.execute_batch("RELEASE rebuild_vector_index")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK TO rebuild_vector_index");
+        let _ = conn.execute_batch("RELEASE rebuild_vector_index");
+    }
+    result
+}
+
+/// Atomically replace vec_memories and embed_cache after new embeddings were
+/// successfully computed.  The old index remains visible if table creation or
+/// any insert fails before the savepoint is released.
+pub fn replace_vector_index(
+    conn: &Connection,
+    dims: usize,
+    embeddings: &[(String, Vec<f32>)],
+) -> ReinResult<()> {
+    tracing::warn!(
+        "replacing vector index atomically (dims={dims}, rows={})",
+        embeddings.len()
+    );
+    let vec_sql = format!(
+        "CREATE VIRTUAL TABLE vec_memories USING vec0(
+            id TEXT PRIMARY KEY,
+            embedding float[{dims}] distance_metric=cosine
+        );"
+    );
+    let result = (|| -> ReinResult<()> {
+        conn.execute_batch("SAVEPOINT replace_vector_index")?;
+        conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
+        conn.execute_batch("DELETE FROM embed_cache;")?;
+        conn.execute_batch(&vec_sql)?;
+        {
+            let mut stmt =
+                conn.prepare("INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)")?;
+            for (id, embedding) in embeddings {
+                let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(rusqlite::params![id, bytes])?;
+            }
+        }
+        conn.execute_batch("RELEASE replace_vector_index")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK TO replace_vector_index");
+        let _ = conn.execute_batch("RELEASE replace_vector_index");
+    }
+    result
 }

@@ -155,7 +155,17 @@ fn configure_json_client(path: &Path) -> anyhow::Result<()> {
 // Proxy alias configuration
 // ---------------------------------------------------------------------------
 
-fn proxy_aliases(port: u16) -> Vec<(String, String)> {
+fn proxy_url_host(bind: &str) -> String {
+    match bind {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        "::1" => "[::1]".to_string(),
+        other if other.contains(':') && !other.starts_with('[') => format!("[{other}]"),
+        other => other.to_string(),
+    }
+}
+
+fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
+    let host = proxy_url_host(bind);
     vec![
         (
             "rein-proxy".to_string(),
@@ -164,13 +174,13 @@ fn proxy_aliases(port: u16) -> Vec<(String, String)> {
         (
             "claudep".to_string(),
             format!(
-                r#"alias claudep="REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:{port} claude""#
+                r#"alias claudep="REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_CUSTOM_HEADERS=\"x-rein-token: ${{REIN_PROXY_TOKEN:-}}\" claude""#
             ),
         ),
         (
             "codexp".to_string(),
             format!(
-                r#"codexp() {{ REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={{ name = "Rein Proxy", base_url = "http://127.0.0.1:{port}/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = {{ "x-rein-token" = "REIN_PROXY_TOKEN" }} }}' -c 'model_provider="rein_proxy"' "$@"; }}"#
+                r#"codexp() {{ REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={{ name = "Rein Proxy", base_url = "http://{host}:{port}/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = {{ "x-rein-token" = "REIN_PROXY_TOKEN" }} }}' -c 'model_provider="rein_proxy"' "$@"; }}"#
             ),
         ),
     ]
@@ -178,9 +188,11 @@ fn proxy_aliases(port: u16) -> Vec<(String, String)> {
 
 /// Configure shell aliases for rein proxy and clean up Codex config.
 pub fn proxy_configure(dry_run: bool) -> anyhow::Result<()> {
-    let port = crate::config::ReinConfig::load()
-        .map(|config| config.proxy.port)
-        .unwrap_or(8690);
+    let proxy = crate::config::ReinConfig::load()
+        .map(|config| config.proxy)
+        .unwrap_or_default();
+    let port = proxy.port;
+    let bind = proxy.bind;
     let home = std::env::var("HOME").unwrap_or_default();
 
     println!("\n--- Proxy Configuration ---");
@@ -194,7 +206,7 @@ pub fn proxy_configure(dry_run: bool) -> anyhow::Result<()> {
     let rc_path = Path::new(&shell_rc);
 
     if rc_path.exists() {
-        configure_shell_aliases(rc_path, port, dry_run)?;
+        configure_shell_aliases(rc_path, &bind, port, dry_run)?;
     } else {
         println!("  Shell rc not found ({shell_rc}), skipping aliases");
     }
@@ -203,7 +215,7 @@ pub fn proxy_configure(dry_run: bool) -> anyhow::Result<()> {
     let codex_config = format!("{home}/.codex/config.toml");
     let codex_path = Path::new(&codex_config);
     if codex_path.exists() {
-        clean_codex_proxy_config(codex_path, port, dry_run)?;
+        clean_codex_proxy_config(codex_path, &bind, port, dry_run)?;
     }
 
     println!("\nProxy setup complete. Usage:");
@@ -216,11 +228,16 @@ pub fn proxy_configure(dry_run: bool) -> anyhow::Result<()> {
 }
 
 /// Add/update/skip proxy aliases in a shell rc file.
-fn configure_shell_aliases(rc_path: &Path, port: u16, dry_run: bool) -> anyhow::Result<()> {
+fn configure_shell_aliases(
+    rc_path: &Path,
+    bind: &str,
+    port: u16,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(rc_path)?;
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let mut modified = false;
-    let aliases = proxy_aliases(port);
+    let aliases = proxy_aliases(bind, port);
 
     for (name, expected_line) in &aliases {
         let alias_prefix = format!("alias {name}=");
@@ -284,8 +301,14 @@ fn configure_shell_aliases(rc_path: &Path, port: u16, dry_run: bool) -> anyhow::
 }
 
 /// Remove openai_base_url from Codex config.toml if it points to rein proxy.
-fn clean_codex_proxy_config(path: &Path, port: u16, dry_run: bool) -> anyhow::Result<()> {
+fn clean_codex_proxy_config(
+    path: &Path,
+    bind: &str,
+    port: u16,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
+    let host_port = format!("{}:{port}", proxy_url_host(bind));
     let loopback_port = format!("127.0.0.1:{port}");
     let localhost_port = format!("localhost:{port}");
 
@@ -293,7 +316,9 @@ fn clean_codex_proxy_config(path: &Path, port: u16, dry_run: bool) -> anyhow::Re
     let has_proxy_url = content.lines().any(|line| {
         let trimmed = line.trim();
         trimmed.starts_with("openai_base_url")
-            && (trimmed.contains(&loopback_port) || trimmed.contains(&localhost_port))
+            && (trimmed.contains(&host_port)
+                || trimmed.contains(&loopback_port)
+                || trimmed.contains(&localhost_port))
     });
 
     if !has_proxy_url {
@@ -312,7 +337,9 @@ fn clean_codex_proxy_config(path: &Path, port: u16, dry_run: bool) -> anyhow::Re
         .filter(|line| {
             let trimmed = line.trim();
             !(trimmed.starts_with("openai_base_url")
-                && (trimmed.contains(&loopback_port) || trimmed.contains(&localhost_port)))
+                && (trimmed.contains(&host_port)
+                    || trimmed.contains(&loopback_port)
+                    || trimmed.contains(&localhost_port)))
         })
         .collect::<Vec<_>>()
         .join("\n");

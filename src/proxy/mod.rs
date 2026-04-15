@@ -385,9 +385,8 @@ async fn handle_request(
     }
     let body_bytes = Bytes::from(body_buf);
 
-    // Log request details.
     let body_size = body_bytes.len();
-    eprintln!("rein proxy: {method} {path_and_query} ({body_size} bytes)");
+    tracing::debug!(%method, path = %path_and_query, body_size, "proxy request");
 
     // If not a known sampling endpoint, passthrough unmodified.
     let provider = match provider {
@@ -406,10 +405,10 @@ async fn handle_request(
     };
 
     let query = extract_query_for_recording(&provider, &body_bytes);
-    eprintln!(
-        "rein proxy: injected=false query={:?} orig={body_size} modified={}",
-        query.as_deref().unwrap_or(""),
-        body_size
+    tracing::debug!(
+        query_len = query.as_deref().map(str::len).unwrap_or(0),
+        orig_bytes = body_size,
+        "proxy record-only request"
     );
 
     // Build upstream URL (rewrite path if needed, e.g. /responses → /v1/responses).

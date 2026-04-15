@@ -856,6 +856,13 @@ impl Default for OmlxExpandConfig {
 // Loading
 // ---------------------------------------------------------------------------
 
+fn nonempty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl ReinConfig {
     /// Load configuration with the following priority (highest wins):
     /// 1. Environment variable overrides
@@ -876,48 +883,48 @@ impl ReinConfig {
         }
 
         // Environment variable overrides
-        if let Ok(db) = std::env::var("REIN_DB") {
+        if let Some(db) = nonempty_env("REIN_DB") {
             config.database.path = db;
         }
-        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        if let Some(key) = nonempty_env("GEMINI_API_KEY") {
             config.embedding.google.api_key = Some(key);
         }
-        if let Ok(key) = std::env::var("SUPERMEMORY_CC_API_KEY") {
+        if let Some(key) = nonempty_env("SUPERMEMORY_CC_API_KEY") {
             config.sync.api_key = Some(key);
         }
         // Reuse GEMINI_API_KEY for extract if not set separately
         if config.extract.google.api_key.is_none() {
-            if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            if let Some(key) = nonempty_env("GEMINI_API_KEY") {
                 config.extract.google.api_key = Some(key);
             }
         }
         // Reuse GEMINI_API_KEY for query expansion if not set separately
         if config.query_expansion.google.api_key.is_none() {
-            if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            if let Some(key) = nonempty_env("GEMINI_API_KEY") {
                 config.query_expansion.google.api_key = Some(key);
             }
         }
         // Server overrides (useful for Docker: REIN_SSE_BIND=0.0.0.0)
-        if let Ok(bind) = std::env::var("REIN_SSE_BIND") {
+        if let Some(bind) = nonempty_env("REIN_SSE_BIND") {
             config.server.sse_bind = bind;
         }
-        if let Ok(port) = std::env::var("REIN_SSE_PORT") {
+        if let Some(port) = nonempty_env("REIN_SSE_PORT") {
             match port.parse::<u16>() {
                 Ok(p) => config.server.sse_port = p,
                 Err(_) => eprintln!("rein: WARNING — REIN_SSE_PORT='{port}' is not a valid port number, using default {}", config.server.sse_port),
             }
         }
         // Proxy overrides
-        if let Ok(bind) = std::env::var("REIN_PROXY_BIND") {
+        if let Some(bind) = nonempty_env("REIN_PROXY_BIND") {
             config.proxy.bind = bind;
         }
-        if let Ok(port) = std::env::var("REIN_PROXY_PORT") {
+        if let Some(port) = nonempty_env("REIN_PROXY_PORT") {
             match port.parse::<u16>() {
                 Ok(p) => config.proxy.port = p,
                 Err(_) => eprintln!("rein: WARNING — REIN_PROXY_PORT='{port}' is not a valid port number, using default {}", config.proxy.port),
             }
         }
-        if let Ok(provider) = std::env::var("REIN_ASYNC_MEMORY_PROVIDER") {
+        if let Some(provider) = nonempty_env("REIN_ASYNC_MEMORY_PROVIDER") {
             config.async_memory.provider = provider;
         }
 
@@ -969,6 +976,22 @@ impl ReinConfig {
         validate_provider_name("query_expansion.provider", &self.query_expansion.provider)?;
         validate_provider_name("search.llm_reranker", &self.search.llm_reranker)?;
         validate_provider_name_or_inherit("async_memory.provider", &self.async_memory.provider)?;
+
+        if self.database.path.trim().is_empty() {
+            anyhow::bail!("database.path must not be empty");
+        }
+        if self.server.sse_bind.trim().is_empty() {
+            anyhow::bail!("server.sse_bind must not be empty");
+        }
+        if self.server.sse_port == 0 {
+            anyhow::bail!("server.sse_port must be in 1..=65535");
+        }
+        if self.proxy.bind.trim().is_empty() {
+            anyhow::bail!("proxy.bind must not be empty");
+        }
+        if self.proxy.port == 0 {
+            anyhow::bail!("proxy.port must be in 1..=65535");
+        }
 
         match self.embedding_provider() {
             Provider::Google => {

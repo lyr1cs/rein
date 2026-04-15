@@ -200,17 +200,8 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
         ));
     }
 
-    // 3. Now safe to rebuild vector index
-    schema::rebuild_vector_index(store.conn(), config.embedding.dimensions)?;
-
-    // Delete stale HNSW and Tantivy side indexes (will be rebuilt after re-embedding)
-    let hnsw_path = store.db_path().with_extension("");
-    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
-    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));
-    let tantivy_path = store.db_path().with_extension("tantivy");
-    let _ = std::fs::remove_dir_all(&tantivy_path);
-
-    // 4. Get all memories
+    // 3. Get all memories.  Do not touch the existing vector index until every
+    // replacement embedding has been computed successfully.
     let mut stmt = store
         .conn()
         .prepare("SELECT id, topic, summary, content FROM memories")?;
@@ -230,9 +221,11 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
         });
     }
 
-    // 5. Batch embed and insert vectors
+    // 4. Batch embed into memory first.  If any provider call fails, leave the
+    // existing vec_memories table and cache untouched so recall is not degraded.
     let mut embedded = 0usize;
     let mut errors = 0usize;
+    let mut pending_embeddings: Vec<(String, Vec<f32>)> = Vec::with_capacity(total);
 
     for chunk in rows.chunks(50) {
         let texts: Vec<String> = chunk
@@ -256,10 +249,15 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
                 }
                 for (i, emb) in embs.iter().enumerate() {
                     let id = &chunk[i].0;
-                    if let Err(e) = crate::store::vec::insert_embedding(store.conn(), id, emb) {
-                        tracing::warn!("failed to insert embedding for {id}: {e}");
+                    if emb.len() != config.embedding.dimensions {
+                        tracing::warn!(
+                            "embedding for {id} has {} dims, expected {}",
+                            emb.len(),
+                            config.embedding.dimensions
+                        );
                         errors += 1;
                     } else {
+                        pending_embeddings.push((id.clone(), emb.clone()));
                         embedded += 1;
                     }
                 }
@@ -273,10 +271,24 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
         eprintln!("[{}/{}] Reindexing...", embedded + errors, total);
     }
 
-    // 5. Clear embed_cache (old model's cache)
-    store.conn().execute("DELETE FROM embed_cache", [])?;
+    if errors > 0 {
+        anyhow::bail!("embedding failed for {errors}/{total} memories; vector index NOT modified");
+    }
+
+    // 5. Atomically replace vec_memories + embed_cache only after all embeddings
+    // are ready. A failure here rolls back to the old index.
+    schema::replace_vector_index(
+        store.conn(),
+        config.embedding.dimensions,
+        &pending_embeddings,
+    )?;
 
     // 6. Rebuild HNSW and Tantivy side indexes from fresh data
+    let hnsw_path = store.db_path().with_extension("");
+    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
+    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));
+    let tantivy_path = store.db_path().with_extension("tantivy");
+    let _ = std::fs::remove_dir_all(&tantivy_path);
     crate::search::warmup::populate_hnsw(store, config);
     crate::search::warmup::populate_tantivy(store);
 
