@@ -377,26 +377,44 @@ impl OmlxClassifier {
             CLASSIFY_SYSTEM_PROMPT.to_string()
         };
         let url = format!("{}/chat/completions", self.endpoint);
-        let body = json!({
-            "model": &self.model,
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
-            ],
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"}
-        });
+        let make_body = |use_json_mode: bool| {
+            let mut body = json!({
+                "model": &self.model,
+                "messages": [
+                    {"role": "system", "content": &system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                "temperature": 0.1
+            });
+            if use_json_mode {
+                body["response_format"] = json!({"type": "json_object"});
+            }
+            body
+        };
 
-        let resp = self.client.post(&url).json(&body).send().await?;
-        let status = resp.status();
-        let text_body = resp.text().await?;
-        if !status.is_success() {
-            return Err(ReinError::Extract(format!(
-                "OMLX classify API returned {}: {}",
-                status,
-                crate::types::truncate_for_error(&text_body, 500)
-            )));
-        }
+        // Mirror expand.rs/rerank_llm.rs: try with JSON mode first; some local
+        // models (llama.cpp, older vLLM, Ollama variants) reject response_format
+        // and would otherwise send the classifier silently to the fallback path.
+        let text_body = match self.client.post(&url).json(&make_body(true)).send().await {
+            Ok(resp) if resp.status().is_success() => resp.text().await?,
+            _ => {
+                tracing::info!(
+                    "intelligent_merge OMLX JSON mode failed, retrying without response_format"
+                );
+                let resp = self.client.post(&url).json(&make_body(false)).send().await?;
+                let status = resp.status();
+                let body = resp.text().await?;
+                if !status.is_success() {
+                    return Err(ReinError::Extract(format!(
+                        "OMLX classify API returned {}: {}",
+                        status,
+                        crate::types::truncate_for_error(&body, 500)
+                    )));
+                }
+                body
+            }
+        };
+
         let parsed: Value =
             serde_json::from_str(&text_body).map_err(|e| ReinError::Extract(e.to_string()))?;
         let content = parsed["choices"][0]["message"]["content"]
