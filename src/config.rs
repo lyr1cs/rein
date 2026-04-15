@@ -53,6 +53,28 @@ pub struct ReinConfig {
     pub async_memory: AsyncMemoryConfig,
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    #[serde(default)]
+    pub intelligent_merge: IntelligentMergeConfig,
+}
+
+/// Config for the LLM-driven intelligent-merge classifier (opt-in).
+///
+/// When `enabled = true`, store_with_dedup consults an LLM on gray-zone
+/// similarity cases and chooses among ignore / update / merge / create_new
+/// instead of the mechanical jaccard/containment threshold. Disabled by
+/// default because it adds 1-2s latency per gray-zone store and requires
+/// an LLM provider configured via `query_expansion`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntelligentMergeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for IntelligentMergeConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
