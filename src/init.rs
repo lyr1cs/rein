@@ -173,8 +173,12 @@ fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
         ),
         (
             "claudep".to_string(),
+            // Use a shell function (not alias) so $REIN_PROXY_TOKEN is expanded
+            // at invocation time instead of at rc-sourcing time. Otherwise a
+            // token set or rotated after the shell starts would be captured as
+            // empty/stale in the alias definition, and the proxy would 401.
             format!(
-                r#"alias claudep="REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_CUSTOM_HEADERS=\"x-rein-token: ${{REIN_PROXY_TOKEN:-}}\" claude""#
+                r#"claudep() {{ REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://{host}:{port} ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${{REIN_PROXY_TOKEN:-}}" claude "$@"; }}"#
             ),
         ),
         (

@@ -1,6 +1,7 @@
 use crate::config::ReinConfig;
 use crate::search::chunker::semantic_chunk;
 use crate::store::SqliteStore;
+use crate::types::error::ReinResult;
 use crate::types::{
     Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
 };
@@ -221,11 +222,13 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
         });
     }
 
-    // 4. Batch embed into memory first.  If any provider call fails, leave the
-    // existing vec_memories table and cache untouched so recall is not degraded.
+    // 4. Batch embed and STREAM each batch to a staging table so memory usage
+    // stays O(batch) rather than O(total). At 3072-dim floats, 100k memories
+    // would otherwise buffer >1GB before the swap — the staging table keeps
+    // it on disk and lets us drop batches as they're persisted.
+    schema::create_embed_staging(store.conn())?;
     let mut embedded = 0usize;
     let mut errors = 0usize;
-    let mut pending_embeddings: Vec<(String, Vec<f32>)> = Vec::with_capacity(total);
 
     for chunk in rows.chunks(50) {
         let texts: Vec<String> = chunk
@@ -247,19 +250,38 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
                     errors += chunk.len();
                     continue;
                 }
-                for (i, emb) in embs.iter().enumerate() {
-                    let id = &chunk[i].0;
-                    if emb.len() != config.embedding.dimensions {
-                        tracing::warn!(
-                            "embedding for {id} has {} dims, expected {}",
-                            emb.len(),
-                            config.embedding.dimensions
-                        );
-                        errors += 1;
-                    } else {
-                        pending_embeddings.push((id.clone(), emb.clone()));
-                        embedded += 1;
+                // Persist this batch into the staging table inside its own short
+                // transaction — fast sequential appends, no buffered state across batches.
+                let tx_result: ReinResult<()> = (|| {
+                    store.conn().execute_batch("BEGIN")?;
+                    {
+                        let mut stmt = store.conn().prepare(
+                            "INSERT OR REPLACE INTO embed_staging(id, embedding) VALUES (?1, ?2)",
+                        )?;
+                        for (i, emb) in embs.iter().enumerate() {
+                            let id = &chunk[i].0;
+                            if emb.len() != config.embedding.dimensions {
+                                tracing::warn!(
+                                    "embedding for {id} has {} dims, expected {}",
+                                    emb.len(),
+                                    config.embedding.dimensions
+                                );
+                                errors += 1;
+                                continue;
+                            }
+                            let bytes: Vec<u8> =
+                                emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                            stmt.execute(rusqlite::params![id, bytes])?;
+                            embedded += 1;
+                        }
                     }
+                    store.conn().execute_batch("COMMIT")?;
+                    Ok(())
+                })();
+                if let Err(e) = tx_result {
+                    let _ = store.conn().execute_batch("ROLLBACK");
+                    tracing::warn!("staging batch failed: {e}");
+                    errors += chunk.len();
                 }
             }
             Err(e) => {
@@ -272,16 +294,16 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
     }
 
     if errors > 0 {
+        // Clean up staging so a subsequent run starts fresh.
+        let _ = store
+            .conn()
+            .execute_batch("DROP TABLE IF EXISTS embed_staging;");
         anyhow::bail!("embedding failed for {errors}/{total} memories; vector index NOT modified");
     }
 
-    // 5. Atomically replace vec_memories + embed_cache only after all embeddings
-    // are ready. A failure here rolls back to the old index.
-    schema::replace_vector_index(
-        store.conn(),
-        config.embedding.dimensions,
-        &pending_embeddings,
-    )?;
+    // 5. Atomically replace vec_memories + embed_cache from the staging table.
+    // A failure here rolls back to the old index (staging is preserved for retry).
+    schema::replace_vector_index_from_staging(store.conn(), config.embedding.dimensions)?;
 
     // 6. Rebuild HNSW and Tantivy side indexes from fresh data
     let hnsw_path = store.db_path().with_extension("");
