@@ -420,6 +420,7 @@ impl SqliteStore {
     pub fn list_canonical_memories(&self, limit: usize) -> ReinResult<Vec<Memory>> {
         let sql = format!(
             "{} WHERE m.superseded_by IS NULL AND COALESCE(cs.canonical_id, m.id) = m.id \
+             AND m.status IN ('active', 'updated') \
              ORDER BY m.updated_at DESC LIMIT ?1",
             memory_select_base()
         );
@@ -820,10 +821,9 @@ impl MemoryStore for SqliteStore {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let result: ReinResult<()> = (|| {
             clean_memory_refs(&self.conn, id)?;
-            let rows = self.conn.execute(
-                "DELETE FROM memories WHERE id = ?1",
-                rusqlite::params![id],
-            )?;
+            let rows = self
+                .conn
+                .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
             if rows == 0 {
                 return Err(ReinError::NotFound(format!("memory {id} not found")));
             }
@@ -1270,11 +1270,8 @@ impl SqliteStore {
         // the write lock to avoid holding BEGIN IMMEDIATE for 1-2s. If the pre-flight
         // candidate still matches the in-transaction dedup decision, we apply the
         // pre-computed verdict; otherwise we fall back to mechanical behavior.
-        let preflight = self.preflight_intelligent_classify(
-            &memory,
-            similarity_threshold,
-            time_window_days,
-        );
+        let preflight =
+            self.preflight_intelligent_classify(&memory, similarity_threshold, time_window_days);
 
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut pending_grayzone: Option<(String, f32)> = None;
@@ -1340,7 +1337,12 @@ impl SqliteStore {
             // MergeInto (which mechanically appends unique lines). Ignore means "drop
             // incoming"; Update/Merge means "replace existing content with synthesis".
             // Only CreateNew falls through to the mechanical path.
-            let mut im_verdict_for_provenance: Option<(String, f32, InsertionVerdict, Option<String>)> = None;
+            let mut im_verdict_for_provenance: Option<(
+                String,
+                f32,
+                InsertionVerdict,
+                Option<String>,
+            )> = None;
             let mut evidence_snapshot: Option<Memory> = None;
             let mut intelligent_result: Option<String> = None;
 
@@ -1407,7 +1409,9 @@ impl SqliteStore {
                                         }
                                         // Merge keywords (dedup + cap).
                                         for kw in &memory.keywords {
-                                            if !updated.keywords.contains(kw) && updated.keywords.len() < 16 {
+                                            if !updated.keywords.contains(kw)
+                                                && updated.keywords.len() < 16
+                                            {
                                                 updated.keywords.push(kw.clone());
                                             }
                                         }
@@ -1419,11 +1423,10 @@ impl SqliteStore {
                                             candidate_id,
                                             "intelligent_merge: existing vanished pre-update, falling back"
                                         );
-                                        return Ok(self
-                                            .store_with_dedup_resolved(
-                                                memory,
-                                                DedupAction::MergeInto(candidate_id.clone()),
-                                            )?);
+                                        return Ok(self.store_with_dedup_resolved(
+                                            memory,
+                                            DedupAction::MergeInto(candidate_id.clone()),
+                                        )?);
                                     }
                                     evidence_snapshot = existing;
                                     im_verdict_for_provenance = Some((
@@ -1482,7 +1485,9 @@ impl SqliteStore {
             // (#3) Preserve the pre-merge existing memory as evidence so Update/Merge
             // doesn't discard the prior version — it can be surfaced on demand.
             if let Some(existing) = evidence_snapshot {
-                let canonical_id = self.canonical_id_for(&result_id).unwrap_or(result_id.clone());
+                let canonical_id = self
+                    .canonical_id_for(&result_id)
+                    .unwrap_or(result_id.clone());
                 let _ = self.conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence
                      (id, canonical_id, memory_id, source_topic, summary, content,
@@ -1514,8 +1519,12 @@ impl SqliteStore {
             if let Some((cand_id, sim, verdict, reasoning)) = im_verdict_for_provenance {
                 let (relation, merged_summary, conflict) = match verdict {
                     InsertionVerdict::Ignore => ("duplicate", None, false),
-                    InsertionVerdict::Update => ("update", memory_content_snapshot(self, &result_id), false),
-                    InsertionVerdict::Merge => ("update", memory_content_snapshot(self, &result_id), false),
+                    InsertionVerdict::Update => {
+                        ("update", memory_content_snapshot(self, &result_id), false)
+                    }
+                    InsertionVerdict::Merge => {
+                        ("update", memory_content_snapshot(self, &result_id), false)
+                    }
                     InsertionVerdict::CreateNew => ("distinct", None, false),
                 };
                 let _ = self.conn.execute(
@@ -1529,7 +1538,8 @@ impl SqliteStore {
                         ulid::Ulid::new().to_string(),
                         &result_id,
                         &cand_id,
-                        self.canonical_id_for(&result_id).unwrap_or_else(|_| result_id.clone()),
+                        self.canonical_id_for(&result_id)
+                            .unwrap_or_else(|_| result_id.clone()),
                         Option::<f64>::None,
                         sim as f64,
                         relation,
@@ -1923,7 +1933,9 @@ impl SqliteStore {
                     // Could not acquire lock / :memory: / open failed.
                     // :memory: path legitimately has no side-index; skip silently.
                     if self.db_path.to_str() != Some(":memory:") {
-                        tracing::warn!("HNSW insert skipped for {id} (lock unavailable); marking dirty");
+                        tracing::warn!(
+                            "HNSW insert skipped for {id} (lock unavailable); marking dirty"
+                        );
                         crate::store::hnsw::HnswIndex::mark_dirty(&self.hnsw_path());
                     }
                 }
@@ -2226,7 +2238,10 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let mem = test_memory("rust", "unique content", Importance::Medium);
         let result = store.preflight_intelligent_classify(&mem, 0.7, 7);
-        assert!(result.is_none(), "empty store → no gray zone → no classification");
+        assert!(
+            result.is_none(),
+            "empty store → no gray zone → no classification"
+        );
     }
 
     #[test]

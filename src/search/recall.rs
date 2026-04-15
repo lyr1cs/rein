@@ -167,9 +167,25 @@ fn apply_evidence_rerank(
     }
 }
 
-fn matches_external_filters(memory: &Memory, topic: Option<&str>, keyword: Option<&str>) -> bool {
+fn matches_external_filters(
+    memory: &Memory,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
     if let Some(topic) = topic {
         if memory.topic != topic {
+            return false;
+        }
+    }
+    if let Some(from) = time_from {
+        if memory.created_at < from {
+            return false;
+        }
+    }
+    if let Some(to) = time_to {
+        if memory.created_at > to {
             return false;
         }
     }
@@ -814,14 +830,15 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     let fts_max = fts_norm_log.values().copied().fold(0.0f32, f32::max);
-    let fts_norm_log: std::collections::HashMap<String, f32> = if fts_max.is_finite() && fts_max > 1.0 {
-        fts_norm_log
-            .into_iter()
-            .map(|(id, s)| (id, s / fts_max))
-            .collect()
-    } else {
-        fts_norm_log
-    };
+    let fts_norm_log: std::collections::HashMap<String, f32> =
+        if fts_max.is_finite() && fts_max > 1.0 {
+            fts_norm_log
+                .into_iter()
+                .map(|(id, s)| (id, s / fts_max))
+                .collect()
+        } else {
+            fts_norm_log
+        };
     let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion
         .iter()
         .map(|(id, s)| {
@@ -830,14 +847,15 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     let vec_max = vec_norm_log.values().copied().fold(0.0f32, f32::max);
-    let vec_norm_log: std::collections::HashMap<String, f32> = if vec_max.is_finite() && vec_max > 1.0 {
-        vec_norm_log
-            .into_iter()
-            .map(|(id, s)| (id, s / vec_max))
-            .collect()
-    } else {
-        vec_norm_log
-    };
+    let vec_norm_log: std::collections::HashMap<String, f32> =
+        if vec_max.is_finite() && vec_max > 1.0 {
+            vec_norm_log
+                .into_iter()
+                .map(|(id, s)| (id, s / vec_max))
+                .collect()
+        } else {
+            vec_norm_log
+        };
     let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
     let episode_norm_log: std::collections::HashMap<String, f32> =
         episode_ranked.iter().cloned().collect();
@@ -1197,7 +1215,7 @@ pub fn recall_temporal_with_request_id(
         vec![]
     }
     .into_iter()
-    .filter(|memory| matches_external_filters(memory, topic, keyword))
+    .filter(|memory| matches_external_filters(memory, topic, keyword, time_from, time_to))
     .collect::<Vec<_>>();
 
     // Join early-launched Supermemory thread (has been running since pipeline start)
@@ -1205,7 +1223,7 @@ pub fn recall_temporal_with_request_id(
         .and_then(|h| h.join().ok())
         .unwrap_or_default()
         .into_iter()
-        .filter(|memory| matches_external_filters(memory, topic, keyword))
+        .filter(|memory| matches_external_filters(memory, topic, keyword, time_from, time_to))
         .collect::<Vec<_>>();
     tracing::debug!(
         elapsed_ms = total_start.elapsed().as_millis() as u64,
@@ -1464,17 +1482,30 @@ mod tests {
         assert!(matches_external_filters(
             &memory,
             Some("rust"),
-            Some("borrow")
+            Some("borrow"),
+            None,
+            None,
         ));
         assert!(!matches_external_filters(
             &memory,
             Some("python"),
-            Some("borrow")
+            Some("borrow"),
+            None,
+            None,
         ));
         assert!(!matches_external_filters(
             &memory,
             Some("rust"),
-            Some("decorator")
+            Some("decorator"),
+            None,
+            None,
+        ));
+        assert!(!matches_external_filters(
+            &memory,
+            Some("rust"),
+            Some("borrow"),
+            Some(memory.created_at + chrono::Duration::days(1)),
+            None,
         ));
     }
 
