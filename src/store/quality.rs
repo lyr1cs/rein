@@ -349,6 +349,32 @@ impl SqliteStore {
                             );
                         }
                     }
+
+                    // Clean episode.concept_ids JSON arrays so deleted concepts don't
+                    // leave dangling references in episode membership (survey flagged
+                    // this as an orphan path in rein-v0.17.2 audit).
+                    let has_episodes: bool = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episodes'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if has_episodes {
+                        let quoted = format!("\"{}\"", concept.id);
+                        let like = format!("%{quoted}%");
+                        let _ = self.conn.execute(
+                            "UPDATE episodes
+                             SET concept_ids = COALESCE(
+                                (SELECT json_group_array(value)
+                                 FROM json_each(concept_ids)
+                                 WHERE value != ?1),
+                                '[]')
+                             WHERE concept_ids LIKE ?2",
+                            rusqlite::params![concept.id, like],
+                        );
+                    }
                 }
             }
         }
