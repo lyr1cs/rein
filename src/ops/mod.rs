@@ -74,6 +74,23 @@ pub fn build_memory(
     }
 }
 
+/// Return the dedup similarity to use for a run.
+///
+/// A1 full rollout: prefer the learned per-cluster / global threshold from
+/// AdaptiveState, fall back to the static config value only when no adaptive
+/// snapshot exists yet (first run, tests). Callers that know a specific
+/// cluster should call `AdaptiveState::get_dedup_threshold(Some(cluster))`
+/// directly; this helper is for "global default" call sites.
+pub fn effective_dedup_threshold(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> f32 {
+    match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
+        Some(state) => state.get_dedup_threshold(None),
+        None => config.search.dedup_similarity as f32,
+    }
+}
+
 /// Store a memory with full post-processing (shared by CLI and MCP paths).
 /// Runs: store_with_dedup → auto_link → activate_related_concepts → apply_evolution.
 pub fn store_memory(
@@ -83,7 +100,10 @@ pub fn store_memory(
 ) -> crate::types::ReinResult<String> {
     let content = memory.content.clone();
     let original_id = memory.id.clone();
-    let dedup_sim = config.search.dedup_similarity as f32;
+    // A1: use adaptive threshold when available, fall back to static config.
+    // store_with_dedup internally resolves per-cluster threshold per candidate;
+    // this is the coarse pre-filter default.
+    let dedup_sim = effective_dedup_threshold(store, config);
     let id = store.store_with_dedup(memory, dedup_sim, config.search.dedup_time_window_days)?;
     // Only run post-processing for newly created memories, not merge-into targets.
     // store_with_dedup returns the existing ID on MergeInto — running evolution
