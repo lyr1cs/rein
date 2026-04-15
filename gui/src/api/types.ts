@@ -35,6 +35,15 @@ export interface RecallResult extends Memory {
   evidence_preview: string[];
 }
 
+export interface RecallPageResponse {
+  results: RecallResult[];
+  count: number;
+  offset: number;
+  limit: number;
+  next_offset: number | null;
+  has_more: boolean;
+}
+
 export interface MemoryEvidence {
   id: string;
   canonical_id: string;

@@ -114,6 +114,25 @@ fn synthesize_consolidation_summary(
     }
 }
 
+fn is_consolidation_boilerplate_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if trimmed.starts_with("[merged from ") || trimmed.starts_with("[merged on ") {
+        return true;
+    }
+
+    if trimmed == "Summaries:" || trimmed == "Details:" || trimmed.starts_with("Source topics:") {
+        return true;
+    }
+
+    trimmed.starts_with("Consolidated ")
+        && trimmed.contains(" memories into topic '")
+        && trimmed.ends_with('.')
+}
+
 fn collect_unique_detail_lines(memories: &[&Memory], max_lines: usize, max_chars: usize) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut lines = Vec::new();
@@ -122,7 +141,7 @@ fn collect_unique_detail_lines(memories: &[&Memory], max_lines: usize, max_chars
     for memory in memories {
         for line in memory.content.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() {
+            if is_consolidation_boilerplate_line(trimmed) {
                 continue;
             }
 
@@ -1076,6 +1095,78 @@ mod tests {
         assert_eq!(consolidated.topic, "rust-testing");
         assert_eq!(consolidated.support_count, 3);
         assert_eq!(consolidated.merge_count, 2);
+    }
+
+    #[test]
+    fn test_build_consolidated_from_memories_flattens_nested_boilerplate() {
+        let config = ReinConfig::default();
+
+        let nested = test_memory(
+            "release-planning",
+            "nested summary",
+            "Consolidated 2 memories into topic 'release-planning'.\nSource topics: release-planning, release-notes\n\nSummaries:\n- [release-planning] add changelog\n- [release-notes] publish v1.2\n\nDetails:\n[merged from 01HXABCD on 2024-01-01]\n- preserve this detail",
+            vec!["release", "notes"],
+        );
+        let merged = test_memory(
+            "release-planning",
+            "merged summary",
+            "Implementation note\n[merged on 2024-01-02]\nImplementation note\n[merged from 01HXWXYZ on 2024-01-03]\nUnique follow-up",
+            vec!["release"],
+        );
+
+        let memories = vec![nested, merged];
+        let source_topics = vec!["release-planning".to_string()];
+        let consolidated = build_consolidated_from_memories(
+            &config,
+            "release-planning".to_string(),
+            &source_topics,
+            &memories,
+            None,
+        );
+
+        assert_eq!(
+            consolidated
+                .content
+                .matches("Consolidated 2 memories into topic")
+                .count(),
+            1,
+            "only the top-level consolidation wrapper should remain"
+        );
+        assert_eq!(
+            consolidated.content.matches("Summaries:").count(),
+            1,
+            "nested summaries headings should be stripped from consolidated content"
+        );
+        assert_eq!(
+            consolidated.content.matches("Details:").count(),
+            1,
+            "nested details headings should be stripped from consolidated content"
+        );
+        assert_eq!(
+            consolidated.content.matches("Source topics:").count(),
+            0,
+            "nested source-topic boilerplate should be stripped from consolidated content"
+        );
+        assert!(
+            !consolidated.content.contains("[merged from"),
+            "merged provenance markers should not be preserved in nested consolidation"
+        );
+        assert!(
+            !consolidated.content.contains("[merged on"),
+            "temporal provenance markers should not be preserved in nested consolidation"
+        );
+        assert!(
+            consolidated.content.contains("add changelog")
+                && consolidated.content.contains("publish v1.2")
+                && consolidated.content.contains("preserve this detail")
+                && consolidated.content.contains("Unique follow-up"),
+            "flattened consolidated content should keep the meaningful source facts"
+        );
+        assert_eq!(
+            consolidated.content.matches("Implementation note").count(),
+            1,
+            "duplicate provenance sections should be deduplicated"
+        );
     }
 
     #[test]

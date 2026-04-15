@@ -269,8 +269,7 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
                                 errors += 1;
                                 continue;
                             }
-                            let bytes: Vec<u8> =
-                                emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                            let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
                             stmt.execute(rusqlite::params![id, bytes])?;
                             embedded += 1;
                         }
