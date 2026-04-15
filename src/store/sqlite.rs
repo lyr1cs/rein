@@ -1301,25 +1301,35 @@ impl SqliteStore {
                 DedupAction::CreateNew => memory.cluster_id,
             };
 
-            let dedup_action = if let Some(state) =
-                crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
-            {
-                let effective = state.get_dedup_threshold(candidate_cluster);
-                if (effective - similarity_threshold).abs() > 0.01 {
-                    crate::extract::check_dedup(
-                        self,
-                        &memory.topic,
-                        &memory.summary,
-                        &memory.content,
-                        effective,
-                        time_window_days,
-                        inferred_cluster,
-                    )?
+            // Per-cluster adaptive threshold recheck — honor [adaptive] enabled=false
+            // so disabling adaptive actually disables it end-to-end (not just in the
+            // outer effective_dedup_threshold helper).
+            let dedup_action = {
+                let loaded_config = crate::config::ReinConfig::load().unwrap_or_default();
+                if loaded_config.adaptive.enabled {
+                    if let Some(state) =
+                        crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
+                    {
+                        let effective = state.get_dedup_threshold(candidate_cluster);
+                        if (effective - similarity_threshold).abs() > 0.01 {
+                            crate::extract::check_dedup(
+                                self,
+                                &memory.topic,
+                                &memory.summary,
+                                &memory.content,
+                                effective,
+                                time_window_days,
+                                inferred_cluster,
+                            )?
+                        } else {
+                            dedup_action
+                        }
+                    } else {
+                        dedup_action
+                    }
                 } else {
                     dedup_action
                 }
-            } else {
-                dedup_action
             };
 
             // Gray-zone resolution. Apply pre-flight intelligent_merge verdict
@@ -1379,19 +1389,43 @@ impl SqliteStore {
                             }
                             InsertionVerdict::Update | InsertionVerdict::Merge => {
                                 if let Some(synth) = v.synthesized.clone() {
+                                    // Go through the full update() path so Tantivy/HNSW
+                                    // side indexes, status=Updated, and updated_at are all
+                                    // refreshed — otherwise list views and recall ranking
+                                    // keep reflecting stale metadata after synthesis.
+                                    // summary stays unchanged unless the incoming summary
+                                    // is materially different; keeping summary steady avoids
+                                    // thrashing summary-based UI labels.
+                                    if let Some(existing_mem) = existing.clone() {
+                                        let mut updated = existing_mem.clone();
+                                        updated.content = synth;
+                                        // If incoming has a different/richer summary, adopt it.
+                                        if !memory.summary.is_empty()
+                                            && memory.summary != existing_mem.summary
+                                        {
+                                            updated.summary = memory.summary.clone();
+                                        }
+                                        // Merge keywords (dedup + cap).
+                                        for kw in &memory.keywords {
+                                            if !updated.keywords.contains(kw) && updated.keywords.len() < 16 {
+                                                updated.keywords.push(kw.clone());
+                                            }
+                                        }
+                                        let _ = self.update(&updated);
+                                    } else {
+                                        // Existing memory vanished between snapshot and write;
+                                        // fall through to mechanical merge to stay safe.
+                                        tracing::warn!(
+                                            candidate_id,
+                                            "intelligent_merge: existing vanished pre-update, falling back"
+                                        );
+                                        return Ok(self
+                                            .store_with_dedup_resolved(
+                                                memory,
+                                                DedupAction::MergeInto(candidate_id.clone()),
+                                            )?);
+                                    }
                                     evidence_snapshot = existing;
-                                    // Replace existing.content with LLM synthesis directly
-                                    // (not an append). updated_at reset so recall ordering
-                                    // reflects the synthesis.
-                                    let _ = self.conn.execute(
-                                        "UPDATE memories SET content = ?1, updated_at = ?2
-                                         WHERE id = ?3",
-                                        rusqlite::params![
-                                            &synth,
-                                            chrono::Utc::now().to_rfc3339(),
-                                            &candidate_id
-                                        ],
-                                    );
                                     im_verdict_for_provenance = Some((
                                         candidate_id.clone(),
                                         sim,
@@ -1583,17 +1617,16 @@ impl SqliteStore {
         let inferred_cluster = memory
             .cluster_id
             .or_else(|| self.infer_cluster_from_cache(memory));
-        let effective_threshold = crate::store::adaptive::AdaptiveState::restore_snapshot(
-            &self.conn,
-        )
-        .map(|s| {
-            // Use the same cluster-aware resolution as store_with_dedup's
-            // second check_dedup pass (which targets the candidate's cluster,
-            // but since we don't yet know the candidate, use the inferred
-            // cluster as a best approximation — matches the FIRST in-tx pass).
-            s.get_dedup_threshold(inferred_cluster)
-        })
-        .unwrap_or(similarity_threshold);
+        // Honor [adaptive] enabled=false throughout — otherwise preflight picks
+        // the learned threshold while in-transaction recheck picks the static one,
+        // creating a mismatch that defeats the content-hash race guard.
+        let effective_threshold = if config.adaptive.enabled {
+            crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
+                .map(|s| s.get_dedup_threshold(inferred_cluster))
+                .unwrap_or(similarity_threshold)
+        } else {
+            similarity_threshold
+        };
 
         let preview = crate::extract::check_dedup(
             self,
