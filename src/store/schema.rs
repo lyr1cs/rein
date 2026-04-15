@@ -857,3 +857,64 @@ pub fn replace_vector_index(
     }
     result
 }
+
+/// Create a staging table for streaming embeddings during reindex.
+/// Stream inserts into `embed_staging(id, embedding BLOB)` chunk by chunk to
+/// keep memory usage O(chunk) instead of O(total) — 100k × 3072-dim floats
+/// is >1GB in the caller's Vec, but the BLOB is persisted to disk here.
+pub fn create_embed_staging(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS embed_staging;
+         CREATE TABLE embed_staging (
+            id TEXT PRIMARY KEY,
+            embedding BLOB NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+/// Drain `embed_staging` into a freshly-built `vec_memories` under one savepoint.
+/// Mirrors `replace_vector_index` but reads from the staging table so the caller
+/// doesn't have to hold the full embedding set in RAM. On success also drops the
+/// staging table; on failure the old index is preserved by rollback and the
+/// staging table remains (caller can retry or clean up).
+pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> ReinResult<()> {
+    let row_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM embed_staging", [], |r| r.get(0))
+        .unwrap_or(0);
+    tracing::warn!(
+        "replacing vector index atomically from staging (dims={dims}, rows={row_count})"
+    );
+    let vec_sql = format!(
+        "CREATE VIRTUAL TABLE vec_memories USING vec0(
+            id TEXT PRIMARY KEY,
+            embedding float[{dims}] distance_metric=cosine
+        );"
+    );
+    let result = (|| -> ReinResult<()> {
+        conn.execute_batch("SAVEPOINT replace_vector_index_staged")?;
+        conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
+        conn.execute_batch("DELETE FROM embed_cache;")?;
+        conn.execute_batch(&vec_sql)?;
+        {
+            let mut read = conn.prepare("SELECT id, embedding FROM embed_staging")?;
+            let mut write = conn.prepare(
+                "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)",
+            )?;
+            let mut rows = read.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let bytes: Vec<u8> = row.get(1)?;
+                write.execute(rusqlite::params![id, bytes])?;
+            }
+        }
+        conn.execute_batch("DROP TABLE embed_staging;")?;
+        conn.execute_batch("RELEASE replace_vector_index_staged")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK TO replace_vector_index_staged");
+        let _ = conn.execute_batch("RELEASE replace_vector_index_staged");
+    }
+    result
+}
