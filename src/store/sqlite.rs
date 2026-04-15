@@ -1269,6 +1269,7 @@ impl SqliteStore {
         let mut pending_grayzone: Option<(String, f32)> = None;
 
         let decision = (|| -> ReinResult<String> {
+            let mut memory = memory;
             let inferred_cluster = memory
                 .cluster_id
                 .or_else(|| self.infer_cluster_from_cache(&memory));
@@ -1310,9 +1311,24 @@ impl SqliteStore {
                 dedup_action
             };
 
+            // Gray-zone resolution. When intelligent_merge is enabled and we have
+            // a live candidate, consult the LLM classifier for a verdict BEFORE
+            // falling back to the canonical anchor / pending-queue path.
+            // NOTE: The LLM call happens inside BEGIN IMMEDIATE — accepted trade-off
+            //       for this opt-in feature (1-2s write lock hold per gray-zone store).
+            let mut synth_override: Option<String> = None;
             let resolved_action = match dedup_action {
                 DedupAction::GrayZone(candidate_id, sim) => {
-                    if let Some(canonical_id) = self.grayzone_canonical_anchor(&candidate_id)? {
+                    let im = self
+                        .try_intelligent_merge(&memory, &candidate_id, sim)
+                        .unwrap_or(None);
+
+                    if let Some((action, synth)) = im {
+                        synth_override = synth;
+                        action
+                    } else if let Some(canonical_id) =
+                        self.grayzone_canonical_anchor(&candidate_id)?
+                    {
                         tracing::debug!(
                             "gray-zone dedup: reusing canonical {canonical_id} for candidate {candidate_id} (sim={sim:.2})"
                         );
@@ -1327,6 +1343,11 @@ impl SqliteStore {
                 other => other,
             };
 
+            // Apply LLM synthesis to the incoming content before the mechanical merge
+            // so the resulting canonical carries the synthesized (not concatenated) text.
+            if let Some(synth) = synth_override {
+                memory.content = synth;
+            }
             self.store_with_dedup_resolved(memory, resolved_action)
         })();
 
@@ -1367,6 +1388,66 @@ impl SqliteStore {
                 Err(e)
             }
         }
+    }
+
+    /// If intelligent_merge is enabled and an LLM is available, classify the
+    /// relationship between `memory` and the gray-zone candidate, then map the
+    /// verdict onto a concrete `DedupAction` and an optional synthesized content
+    /// override.
+    ///
+    /// Returns `None` when the feature is disabled, the candidate is missing,
+    /// or the LLM call fails — callers then fall back to the mechanical path.
+    ///
+    /// Verdict mapping:
+    /// - Ignore      → MergeInto(candidate) with no content override (strength boost only)
+    /// - Update/Merge → MergeInto(candidate) with synthesized content override
+    /// - CreateNew   → CreateNew (distinct memory, caller will auto_link)
+    fn try_intelligent_merge(
+        &self,
+        memory: &Memory,
+        candidate_id: &str,
+        sim: f32,
+    ) -> ReinResult<Option<(DedupAction, Option<String>)>> {
+        let config = crate::config::ReinConfig::load().unwrap_or_default();
+        if !config.intelligent_merge.enabled {
+            return Ok(None);
+        }
+        let Ok(existing) = self.get(candidate_id) else {
+            return Ok(None);
+        };
+        let existing_snippet = crate::extract::intelligent_merge::MemorySnippet::from(&existing);
+        let incoming_snippet = crate::extract::intelligent_merge::MemorySnippet {
+            topic: memory.topic.clone(),
+            summary: memory.summary.clone(),
+            content: memory.content.clone(),
+        };
+
+        let Some(verdict) = crate::extract::intelligent_merge::classify_insertion(
+            &config,
+            &existing_snippet,
+            &incoming_snippet,
+        ) else {
+            return Ok(None);
+        };
+
+        tracing::info!(
+            candidate_id,
+            sim,
+            verdict = ?verdict.verdict,
+            reasoning = verdict.reasoning.as_deref().unwrap_or(""),
+            "intelligent_merge verdict"
+        );
+
+        use crate::extract::intelligent_merge::InsertionVerdict;
+        let (action, synth) = match verdict.verdict {
+            InsertionVerdict::Ignore => (DedupAction::MergeInto(candidate_id.to_string()), None),
+            InsertionVerdict::Update | InsertionVerdict::Merge => (
+                DedupAction::MergeInto(candidate_id.to_string()),
+                verdict.synthesized,
+            ),
+            InsertionVerdict::CreateNew => (DedupAction::CreateNew, None),
+        };
+        Ok(Some((action, synth)))
     }
 
     fn grayzone_canonical_anchor(&self, candidate_id: &str) -> ReinResult<Option<String>> {
