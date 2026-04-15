@@ -3,7 +3,6 @@
 //! Also serves the embedded SPA when the `gui` feature is enabled.
 
 use bytes::Bytes;
-use chrono::TimeZone;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode};
@@ -195,9 +194,7 @@ async fn handle_api<B>(
         (&Method::GET, "/api/recent") => api_recent(config, &query),
         (&Method::GET, "/api/adaptive") => api_adaptive(config),
         (&Method::GET, "/api/dedup_decisions") => api_dedup_decisions(config, &query),
-        (&Method::GET, "/api/intelligent_merge_metrics") => {
-            api_intelligent_merge_metrics()
-        }
+        (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
         (&Method::GET, "/api/health") => api_health(config, &query),
         (&Method::GET, "/api/doctor") => {
             if query
@@ -473,28 +470,25 @@ fn api_dedup_decisions(
              ORDER BY created_at DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![operator_filter, limit],
-            |r| {
-                Ok(json!({
-                    "id": r.get::<_, String>(0)?,
-                    "winner_id": r.get::<_, Option<String>>(1)?,
-                    "loser_id": r.get::<_, Option<String>>(2)?,
-                    "canonical_id": r.get::<_, Option<String>>(3)?,
-                    "lexical_score": r.get::<_, Option<f64>>(4)?,
-                    "embedding_score": r.get::<_, Option<f64>>(5)?,
-                    "relation": r.get::<_, String>(6)?,
-                    "confidence": r.get::<_, f64>(7)?,
-                    "reason": r.get::<_, String>(8)?,
-                    "operator": r.get::<_, String>(9)?,
-                    "reversible": r.get::<_, i64>(10)? != 0,
-                    "merged_summary": r.get::<_, Option<String>>(11)?,
-                    "novel_facts": r.get::<_, String>(12)?,
-                    "conflict_detected": r.get::<_, i64>(13)? != 0,
-                    "created_at": r.get::<_, String>(14)?,
-                }))
-            },
-        )?;
+        let rows = stmt.query_map(rusqlite::params![operator_filter, limit], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "winner_id": r.get::<_, Option<String>>(1)?,
+                "loser_id": r.get::<_, Option<String>>(2)?,
+                "canonical_id": r.get::<_, Option<String>>(3)?,
+                "lexical_score": r.get::<_, Option<f64>>(4)?,
+                "embedding_score": r.get::<_, Option<f64>>(5)?,
+                "relation": r.get::<_, String>(6)?,
+                "confidence": r.get::<_, f64>(7)?,
+                "reason": r.get::<_, String>(8)?,
+                "operator": r.get::<_, String>(9)?,
+                "reversible": r.get::<_, i64>(10)? != 0,
+                "merged_summary": r.get::<_, Option<String>>(11)?,
+                "novel_facts": r.get::<_, String>(12)?,
+                "conflict_detected": r.get::<_, i64>(13)? != 0,
+                "created_at": r.get::<_, String>(14)?,
+            }))
+        })?;
         rows.collect()
     })();
 
@@ -1061,13 +1055,7 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .ok()
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .and_then(|dt| {
-                    chrono::Local
-                        .from_local_datetime(&dt)
-                        .single()
-                        .or_else(|| chrono::Local.from_local_datetime(&dt).earliest())
-                })
-                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map(|dt| dt.and_utc())
         })
 }
 
@@ -1079,13 +1067,7 @@ fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .ok()
                 .and_then(|d| d.and_hms_opt(23, 59, 59))
-                .and_then(|dt| {
-                    chrono::Local
-                        .from_local_datetime(&dt)
-                        .single()
-                        .or_else(|| chrono::Local.from_local_datetime(&dt).latest())
-                })
-                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map(|dt| dt.and_utc())
         })
 }
 

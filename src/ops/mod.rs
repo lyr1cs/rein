@@ -81,10 +81,7 @@ pub fn build_memory(
 /// snapshot exists yet (first run, tests). Callers that know a specific
 /// cluster should call `AdaptiveState::get_dedup_threshold(Some(cluster))`
 /// directly; this helper is for "global default" call sites.
-pub fn effective_dedup_threshold(
-    store: &crate::store::SqliteStore,
-    config: &ReinConfig,
-) -> f32 {
+pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &ReinConfig) -> f32 {
     // Honor [adaptive] enabled=false: when the operator has explicitly disabled
     // the adaptive engine we must not silently keep applying a stale learned
     // threshold from an older snapshot. Fall back to the static config value.
@@ -370,23 +367,34 @@ pub fn ingest_extraction_report(
                 .or(session.started_at)
                 .unwrap_or_else(chrono::Utc::now),
         };
-        if let Ok(created_episode_id) = store.create_episode(episode) {
-            episode_id = Some(created_episode_id.clone());
+        let episode_result = (|| -> crate::types::ReinResult<String> {
+            store.conn().execute_batch("SAVEPOINT episode_linking")?;
+            let created_episode_id = store.create_episode(episode)?;
             let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-            let _ = store.conn().execute_batch("BEGIN");
             for cid in &session_concept_ids {
-                let _ = store.conn().execute(
+                store.conn().execute(
                     "UPDATE concepts SET last_episode_id = ?1 WHERE id = ?2",
                     rusqlite::params![created_episode_id, cid],
-                );
-                let _ = store.conn().execute(
+                )?;
+                store.conn().execute(
                     "UPDATE concept_revisions SET episode_id = ?1 WHERE concept_id = ?2 AND episode_id IS NULL AND created_at >= ?3",
                     rusqlite::params![created_episode_id, cid, cutoff],
-                );
+                )?;
             }
-            let _ = store.conn().execute_batch("COMMIT");
-            if let Err(e) = crate::extract::hooks::buffer::store_episode_concept(&store, ep) {
-                tracing::warn!("failed to store episode concept: {e}");
+            store.conn().execute_batch("RELEASE episode_linking")?;
+            Ok(created_episode_id)
+        })();
+        match episode_result {
+            Ok(created_episode_id) => {
+                episode_id = Some(created_episode_id);
+                if let Err(e) = crate::extract::hooks::buffer::store_episode_concept(&store, ep) {
+                    tracing::warn!("failed to store episode concept: {e}");
+                }
+            }
+            Err(e) => {
+                let _ = store.conn().execute_batch("ROLLBACK TO episode_linking");
+                let _ = store.conn().execute_batch("RELEASE episode_linking");
+                tracing::warn!("failed to create/link episode: {e}");
             }
         }
     }
