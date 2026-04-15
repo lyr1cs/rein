@@ -126,6 +126,13 @@ enum Commands {
         #[arg(long)]
         merge_variants: bool,
     },
+    /// Run intelligent merge classifier on two memory IDs (POC — read-only, prints verdict)
+    IntelligentMergeTry {
+        /// Existing memory ID
+        existing: String,
+        /// Incoming memory ID to compare against
+        incoming: String,
+    },
     /// One-click cleanup: consolidate fragmented topics, deduplicate, refresh adaptive state
     Cleanup {
         /// Optional single topic to clean
@@ -440,6 +447,9 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             merge_variants,
         }) => commands::handle_dedup(&config, dry_run, merge_variants)?,
+        Some(Commands::IntelligentMergeTry { existing, incoming }) => {
+            commands::handle_intelligent_merge_try(&config, &existing, &incoming)?
+        }
         Some(Commands::Cleanup {
             topic,
             topics,

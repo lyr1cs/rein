@@ -1,5 +1,6 @@
 pub mod dedup;
 pub mod hooks;
+pub mod intelligent_merge;
 pub mod llm;
 pub mod patterns;
 pub mod postprocess;
