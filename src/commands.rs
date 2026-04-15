@@ -396,7 +396,8 @@ pub fn handle_gc(config: &ReinConfig, dry_run: bool) -> anyhow::Result<()> {
 
 pub fn handle_organize(config: &ReinConfig) -> anyhow::Result<()> {
     let store = config.open_store()?;
-    let threshold = config.search.dedup_similarity as f32;
+    // A1: prefer adaptive global threshold over static config default.
+    let threshold = ops::effective_dedup_threshold(&store, config);
     let links = store.organize(threshold, 5)?;
     println!("Organized: created {links} new links between related memories");
     Ok(())
@@ -570,7 +571,8 @@ pub fn handle_dedup(
     merge_variants: bool,
 ) -> anyhow::Result<()> {
     let store = config.open_store()?;
-    let threshold = config.search.dedup_similarity as f32;
+    // A1: adaptive threshold drives the dedup run; config remains last-resort fallback.
+    let threshold = ops::effective_dedup_threshold(&store, config);
     let (dups_found, dups_removed) =
         ops::run_dedup(&store, config, threshold, dry_run, merge_variants)?;
     if dry_run {
