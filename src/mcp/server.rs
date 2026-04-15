@@ -1074,10 +1074,11 @@ impl ReinServer {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let dry_run = params.dry_run.unwrap_or(false);
         let merge_variants = params.merge_variants.unwrap_or(false);
-        let threshold = self.config.search.dedup_similarity as f32;
         let compact = self.compact();
 
         let result = self.with_store(|store| {
+            // A1: adaptive threshold with config fallback.
+            let threshold = crate::ops::effective_dedup_threshold(store, &self.config);
             crate::ops::run_dedup(store, &self.config, threshold, dry_run, merge_variants)
         });
 
@@ -1348,10 +1349,13 @@ impl ReinServer {
     fn rein_organize(&self, Parameters(params): Parameters<OrganizeParams>) -> String {
         self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let max_links = params.max_links.unwrap_or(5);
-        let threshold = self.config.search.dedup_similarity as f32;
         let compact = self.compact();
 
-        let result = self.with_store(|store| store.organize(threshold, max_links));
+        let result = self.with_store(|store| {
+            // A1: prefer adaptive threshold over static config.
+            let threshold = crate::ops::effective_dedup_threshold(store, &self.config);
+            store.organize(threshold, max_links)
+        });
 
         match result {
             Ok(links) => {
