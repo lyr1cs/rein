@@ -221,6 +221,10 @@ export default function Brain() {
         const now = Date.now();
 
         setGraphData({ nodes, links });
+        setSelectedNode((current) => {
+          if (!current) return null;
+          return nodeMap.get(current.id) ?? null;
+        });
         setTimeMax(now);
         setTimeSlider(now);
         setLoading(false);

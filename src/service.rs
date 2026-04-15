@@ -1,7 +1,7 @@
 //! Service management: PID files, start/stop, dashboard.
 
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -97,38 +97,60 @@ pub fn is_running(name: &str) -> Option<u32> {
     }
     #[cfg(not(unix))]
     {
-        let _ = saved_exe;
-        Some(pid)
+        let _ = (pid, saved_exe, name);
+        remove_pid(name);
+        None
     }
 }
 
 /// Check if a port is responding.
-fn port_is_open(port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(200),
-    )
-    .is_ok()
+fn probe_host_for_bind(bind: &str) -> &str {
+    match bind {
+        "0.0.0.0" | "::" | "localhost" => "127.0.0.1",
+        "::1" => "[::1]",
+        other => other,
+    }
+}
+
+fn display_host_for_bind(bind: &str) -> &str {
+    match bind {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+}
+
+fn port_is_open(bind: &str, port: u16) -> bool {
+    let addr = format!("{}:{port}", probe_host_for_bind(bind));
+    addr.to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
 }
 
 /// Stop a service by sending SIGTERM.
 pub fn stop_service(name: &str) -> anyhow::Result<()> {
     match is_running(name) {
         Some(pid) => {
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!("service stop is only supported on Unix platforms");
+            }
             #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            // Wait briefly for process to exit
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(100));
-                if is_running(name).is_none() {
-                    break;
+            {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
                 }
+                // Wait briefly for process to exit
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if is_running(name).is_none() {
+                        remove_pid(name);
+                        println!("Stopped {name} (PID {pid})");
+                        return Ok(());
+                    }
+                }
+                anyhow::bail!("{name} did not stop within timeout (PID {pid})");
             }
-            remove_pid(name);
-            println!("Stopped {name} (PID {pid})");
-            Ok(())
         }
         None => {
             // Maybe stale PID file
@@ -249,13 +271,13 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
         name: "GUI",
         pid: is_running("gui"),
         port: gui_port,
-        port_open: port_is_open(gui_port),
+        port_open: port_is_open(&config.server.sse_bind, gui_port),
     };
     let proxy_status = ServiceStatus {
         name: "Proxy",
         pid: is_running("proxy"),
         port: proxy_port,
-        port_open: port_is_open(proxy_port),
+        port_open: port_is_open(&config.proxy.bind, proxy_port),
     };
 
     println!("rein v{version} dashboard\n");
@@ -269,7 +291,7 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
         gui_status.status_text()
     );
     if gui_status.port_open {
-        let bind = &config.server.sse_bind;
+        let bind = display_host_for_bind(&config.server.sse_bind);
         println!("  {:<12}   http://{bind}:{gui_port}/", "");
     }
     println!(

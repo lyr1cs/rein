@@ -1748,10 +1748,9 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             // would be stuck resending the bad cookie until manual browser-data wipe.
             let path = req.uri().path();
             let method = req.method();
-            let is_clear_session =
-                method == hyper::Method::DELETE && path == "/api/session";
-            let needs_auth = !is_clear_session
-                && (path.starts_with("/api/") || path.starts_with("/mcp"));
+            let is_clear_session = method == hyper::Method::DELETE && path == "/api/session";
+            let needs_auth =
+                !is_clear_session && (path.starts_with("/api/") || path.starts_with("/mcp"));
             if needs_auth {
                 if let Some(ref expected) = token {
                     if !request_has_valid_http_auth(req.headers(), expected) {

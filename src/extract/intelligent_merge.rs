@@ -401,7 +401,12 @@ impl OmlxClassifier {
                 tracing::info!(
                     "intelligent_merge OMLX JSON mode failed, retrying without response_format"
                 );
-                let resp = self.client.post(&url).json(&make_body(false)).send().await?;
+                let resp = self
+                    .client
+                    .post(&url)
+                    .json(&make_body(false))
+                    .send()
+                    .await?;
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
@@ -484,10 +489,22 @@ mod tests {
     #[test]
     fn parse_all_four_verdicts() {
         let cases = [
-            (r#"{"verdict":"ignore","reasoning":"duplicate"}"#, InsertionVerdict::Ignore),
-            (r#"{"verdict":"update","synthesized":"new text","reasoning":"newer"}"#, InsertionVerdict::Update),
-            (r#"{"verdict":"merge","synthesized":"combined","reasoning":"complementary"}"#, InsertionVerdict::Merge),
-            (r#"{"verdict":"create_new","reasoning":"different"}"#, InsertionVerdict::CreateNew),
+            (
+                r#"{"verdict":"ignore","reasoning":"duplicate"}"#,
+                InsertionVerdict::Ignore,
+            ),
+            (
+                r#"{"verdict":"update","synthesized":"new text","reasoning":"newer"}"#,
+                InsertionVerdict::Update,
+            ),
+            (
+                r#"{"verdict":"merge","synthesized":"combined","reasoning":"complementary"}"#,
+                InsertionVerdict::Merge,
+            ),
+            (
+                r#"{"verdict":"create_new","reasoning":"different"}"#,
+                InsertionVerdict::CreateNew,
+            ),
         ];
         for (json, expected) in cases {
             let v = parse_verdict(json).unwrap();
@@ -498,7 +515,8 @@ mod tests {
     #[test]
     fn ignore_verdict_drops_synthesized() {
         // LLM sometimes fills synthesized even when verdict is ignore — we clear it.
-        let v = parse_verdict(r#"{"verdict":"ignore","synthesized":"oops","reasoning":"dup"}"#).unwrap();
+        let v = parse_verdict(r#"{"verdict":"ignore","synthesized":"oops","reasoning":"dup"}"#)
+            .unwrap();
         assert!(v.synthesized.is_none());
     }
 

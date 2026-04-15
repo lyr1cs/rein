@@ -93,19 +93,14 @@ impl SqliteStore {
                             if let Ok(old_links) = self.get_links_from(&existing.id) {
                                 for link in &old_links {
                                     if link.valid_until.is_none() {
-                                        let _ = self.expire_link(&link.id, now);
+                                        self.expire_link(&link.id, now)?;
                                     }
                                 }
                             }
                         }
                         // Refine (use existing.name for exact DB match after normalized lookup)
-                        if let Err(e) =
-                            self.refine_concept(memoir_name, &existing.name, &c.definition)
-                        {
-                            tracing::warn!("failed to refine concept '{}': {e}", c.name);
-                        } else {
-                            report.concepts_refined += 1;
-                        }
+                        self.refine_concept(memoir_name, &existing.name, &c.definition)?;
+                        report.concepts_refined += 1;
                         // Merge new source_memory_ids into existing concept
                         if !source_memory_ids.is_empty() {
                             let mut merged = existing.source_memory_ids.clone();
@@ -115,11 +110,11 @@ impl SqliteStore {
                                 }
                             }
                             if merged.len() > existing.source_memory_ids.len() {
-                                let json = serde_json::to_string(&merged).unwrap_or_default();
-                                let _ = self.conn().execute(
+                                let json = serde_json::to_string(&merged)?;
+                                self.conn().execute(
                                     "UPDATE concepts SET source_memory_ids = ?1 WHERE id = ?2",
                                     rusqlite::params![json, existing.id],
-                                );
+                                )?;
                             }
                         }
                     }
@@ -138,11 +133,8 @@ impl SqliteStore {
                             created_at: Utc::now(),
                             updated_at: Utc::now(),
                         };
-                        if let Err(e) = self.add_concept(concept) {
-                            tracing::warn!("failed to add concept '{}': {e}", c.name);
-                        } else {
-                            report.concepts_added += 1;
-                        }
+                        self.add_concept(concept)?;
+                        report.concepts_added += 1;
                     }
                 }
             }
@@ -183,11 +175,8 @@ impl SqliteStore {
                     valid_from: None,
                     valid_until: None,
                 };
-                if let Err(e) = self.add_link(concept_link) {
-                    tracing::warn!("failed to add link {} -> {}: {e}", link.from, link.to);
-                } else {
-                    report.links_added += 1;
-                }
+                self.add_link(concept_link)?;
+                report.links_added += 1;
             }
         }
 
@@ -212,11 +201,11 @@ impl SqliteStore {
                         }
                         if updated {
                             // Use direct SQL to avoid status change
-                            let json = serde_json::to_string(&mem.concept_ids).unwrap_or_default();
-                            let _ = self.conn.execute(
+                            let json = serde_json::to_string(&mem.concept_ids)?;
+                            self.conn.execute(
                                 "UPDATE memories SET concept_ids = ?1 WHERE id = ?2",
                                 rusqlite::params![json, mem_id],
-                            );
+                            )?;
                         }
                     }
                 }
@@ -225,9 +214,7 @@ impl SqliteStore {
 
         // Cross-session linking: connect new concepts to existing related concepts
         for c in concepts {
-            if let Err(e) = self.auto_link_concept(&c.memoir, &c.name) {
-                tracing::debug!("auto_link_concept failed for '{}': {e}", c.name);
-            }
+            self.auto_link_concept(&c.memoir, &c.name)?;
         }
 
         Ok(report)

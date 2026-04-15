@@ -461,24 +461,32 @@ pub fn save_cluster_centroids(
     version: u64,
     dims: usize,
 ) -> ReinResult<()> {
-    // Atomic rewrite: delete + insert in a single transaction so concurrent readers
-    // never see a partially-written or empty centroid table.
-    conn.execute_batch("BEGIN")?;
-    conn.execute_batch("DELETE FROM cluster_centroids")?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO cluster_centroids (cluster_id, centroid, cluster_version, dims) VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    for (&cluster_id, vec) in centroids {
-        let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
-        stmt.execute(rusqlite::params![
-            cluster_id,
-            blob,
-            version as i64,
-            dims as i64
-        ])?;
+    let result = (|| -> ReinResult<()> {
+        // SAVEPOINT is nesting-safe when the caller already owns a larger
+        // recluster transaction.
+        conn.execute_batch("SAVEPOINT cluster_centroids_rewrite")?;
+        conn.execute_batch("DELETE FROM cluster_centroids")?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO cluster_centroids (cluster_id, centroid, cluster_version, dims) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (&cluster_id, vec) in centroids {
+            let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+            stmt.execute(rusqlite::params![
+                cluster_id,
+                blob,
+                version as i64,
+                dims as i64
+            ])?;
+        }
+        drop(stmt);
+        conn.execute_batch("RELEASE cluster_centroids_rewrite")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK TO cluster_centroids_rewrite");
+        let _ = conn.execute_batch("RELEASE cluster_centroids_rewrite");
     }
-    conn.execute_batch("COMMIT")?;
-    Ok(())
+    result
 }
 
 /// Load cluster centroids from `cluster_centroids` table.

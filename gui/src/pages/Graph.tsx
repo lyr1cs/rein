@@ -194,9 +194,13 @@ export default function Graph() {
             relation: l.relation,
             weight: l.weight,
             valid_from: l.valid_from,
-            valid_until: l.valid_until,
+              valid_until: l.valid_until,
           }));
         setGraphData({ nodes, links });
+        setSelectedNode((current) => {
+          if (!current) return null;
+          return nodes.find((node) => node.id === current.id) ?? null;
+        });
       })
       .catch(() => {
         if (!cancelled) setGraphData({ nodes: [], links: [] });
