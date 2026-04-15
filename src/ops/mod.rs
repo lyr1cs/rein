@@ -85,6 +85,12 @@ pub fn effective_dedup_threshold(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
 ) -> f32 {
+    // Honor [adaptive] enabled=false: when the operator has explicitly disabled
+    // the adaptive engine we must not silently keep applying a stale learned
+    // threshold from an older snapshot. Fall back to the static config value.
+    if !config.adaptive.enabled {
+        return config.search.dedup_similarity as f32;
+    }
     match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
         Some(state) => state.get_dedup_threshold(None),
         None => config.search.dedup_similarity as f32,
