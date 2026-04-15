@@ -222,6 +222,7 @@ async fn handle_api<B>(
             Ok(()) => api_clear_session(),
             Err(response) => response,
         },
+        (&Method::GET, "/api/recall_stream") => api_recall_stream(config, &query),
         (&Method::GET, p)
             if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" =>
         {
@@ -612,48 +613,129 @@ fn api_recall(
     config: &ReinConfig,
     query: &std::collections::HashMap<String, String>,
 ) -> BoxedResponse {
+    match run_recall_query(config, query, None) {
+        Ok(results) => recall_results_response(results, 0, None),
+        Err(response) => response,
+    }
+}
+
+fn api_recall_stream(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+) -> BoxedResponse {
+    let offset = match parse_bounded_usize(query, "offset", 0, 0, 10_000) {
+        Ok(offset) => offset,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let page_limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
+        Ok(limit) => limit,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let fetch_limit = offset.saturating_add(page_limit).saturating_add(1);
+    match run_recall_query(config, query, Some(fetch_limit)) {
+        Ok(results) => recall_results_response(results, offset, Some(page_limit)),
+        Err(response) => response,
+    }
+}
+
+fn run_recall_query(
+    config: &ReinConfig,
+    query: &std::collections::HashMap<String, String>,
+    limit_override: Option<usize>,
+) -> Result<Vec<crate::search::recall::RecallResult>, BoxedResponse> {
     let q = match query.get("q") {
         Some(q) if !q.is_empty() => q.clone(),
-        _ => return error_response(StatusCode::BAD_REQUEST, "missing 'q' query parameter"),
+        _ => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "missing 'q' query parameter",
+            ))
+        }
     };
     let topic = query.get("topic").map(|s| s.as_str());
     let keyword = query.get("keyword").map(|s| s.as_str());
-    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
-        Ok(limit) => limit,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    let limit = match limit_override {
+        Some(limit) => limit,
+        None => match parse_bounded_usize(query, "limit", 20, 1, 100) {
+            Ok(limit) => limit,
+            Err(msg) => return Err(error_response(StatusCode::BAD_REQUEST, &msg)),
+        },
     };
     let from = query.get("from").and_then(|s| parse_datetime(s));
     let to = query.get("to").and_then(|s| parse_datetime_end(s));
 
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     };
 
-    match crate::search::recall::recall_temporal(
+    crate::search::recall::recall_temporal(
         &store, config, &q, topic, keyword, limit, from, to, None, false,
-    ) {
-        Ok(results) => {
-            let items: Vec<serde_json::Value> = results
-                .iter()
-                .map(|r| {
-                    let mut m = memory_to_json(&r.memory);
-                    if let Some(obj) = m.as_object_mut() {
-                        obj.insert("score".to_string(), json!(r.score));
-                        obj.insert("confidence".to_string(), json!(r.confidence));
-                        obj.insert("sources_hit".to_string(), json!(r.sources_hit));
-                        obj.insert("evidence_count".to_string(), json!(r.evidence_count));
-                        obj.insert("evidence_preview".to_string(), json!(r.evidence_preview));
-                    }
-                    m
-                })
-                .collect();
-            json_response(
-                StatusCode::OK,
-                json!({ "results": items, "count": items.len() }),
-            )
+    )
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+fn recall_result_to_json(r: &crate::search::recall::RecallResult) -> serde_json::Value {
+    let mut memory = memory_to_json(&r.memory);
+    if let Some(obj) = memory.as_object_mut() {
+        obj.insert("score".to_string(), json!(r.score));
+        obj.insert("confidence".to_string(), json!(r.confidence));
+        obj.insert("sources_hit".to_string(), json!(r.sources_hit));
+        obj.insert("evidence_count".to_string(), json!(r.evidence_count));
+        obj.insert("evidence_preview".to_string(), json!(r.evidence_preview));
+    }
+    memory
+}
+
+fn recall_results_response(
+    results: Vec<crate::search::recall::RecallResult>,
+    offset: usize,
+    page_limit: Option<usize>,
+) -> BoxedResponse {
+    let page = match page_limit {
+        Some(limit) => {
+            let end = offset.saturating_add(limit).min(results.len());
+            if offset >= results.len() {
+                vec![]
+            } else {
+                results[offset..end]
+                    .iter()
+                    .map(recall_result_to_json)
+                    .collect::<Vec<_>>()
+            }
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        None => results
+            .iter()
+            .map(recall_result_to_json)
+            .collect::<Vec<_>>(),
+    };
+
+    if page_limit.is_some() {
+        let end = offset.saturating_add(page.len());
+        let has_more = results.len() > end;
+        let next_offset = if has_more { Some(end) } else { None };
+        json_response(
+            StatusCode::OK,
+            json!({
+                "results": page,
+                "count": page.len(),
+                "offset": offset,
+                "limit": page_limit,
+                "next_offset": next_offset,
+                "has_more": has_more,
+            }),
+        )
+    } else {
+        json_response(
+            StatusCode::OK,
+            json!({ "results": page, "count": page.len() }),
+        )
     }
 }
 
@@ -863,7 +945,11 @@ fn api_timeline(
             Ok(rows) => rows,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
-        rows.filter_map(|r| r.ok()).collect()
+        let memories: Vec<crate::types::Memory> = rows.filter_map(|r| r.ok()).collect();
+        match store.collapse_to_canonicals(memories, limit) {
+            Ok(memories) => memories,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        }
     } else {
         store.recent(limit).unwrap_or_default()
     };
@@ -1151,5 +1237,118 @@ fn mime_from_path(path: &str) -> &'static str {
         "font/woff"
     } else {
         "application/octet-stream"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+    use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source};
+    use chrono::Utc;
+    use hyper::Request;
+    use tempfile::tempdir;
+
+    fn test_memory(id: &str, summary: &str, content: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "streaming".to_string(),
+            summary: summary.to_string(),
+            content: content.to_string(),
+            keywords: vec!["recall".to_string()],
+            importance: Importance::High,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    fn test_config(db_path: &std::path::Path) -> ReinConfig {
+        let mut config = ReinConfig::default();
+        config.database.path = db_path.to_string_lossy().to_string();
+        config.embedding.provider = "none".to_string();
+        config.query_expansion.provider = "none".to_string();
+        config.sync.supermemory_enabled = false;
+        config.sync.auto_memory_enabled = false;
+        config
+    }
+
+    async fn read_json(response: BoxedResponse) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn recall_stream_pages_results_without_changing_legacy_endpoint() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+        let ids: Vec<String> = [
+            ("alpha", "streaming alpha"),
+            ("beta", "streaming beta"),
+            ("gamma", "streaming gamma"),
+        ]
+        .into_iter()
+        .map(|(summary, content)| store.store(test_memory(summary, summary, content)).unwrap())
+        .collect();
+        assert_eq!(ids.len(), 3);
+
+        let page1 = Request::builder()
+            .method("GET")
+            .uri("/api/recall_stream?q=streaming&limit=2&offset=0")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&page1, &config).await.unwrap();
+        let json = read_json(response).await;
+        assert_eq!(json["count"].as_u64(), Some(2));
+        assert_eq!(json["offset"].as_u64(), Some(0));
+        assert_eq!(json["limit"].as_u64(), Some(2));
+        assert_eq!(json["next_offset"].as_u64(), Some(2));
+        assert_eq!(json["has_more"].as_bool(), Some(true));
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
+
+        let page2 = Request::builder()
+            .method("GET")
+            .uri("/api/recall_stream?q=streaming&limit=2&offset=2")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&page2, &config).await.unwrap();
+        let json = read_json(response).await;
+        assert_eq!(json["count"].as_u64(), Some(1));
+        assert_eq!(json["offset"].as_u64(), Some(2));
+        assert_eq!(json["limit"].as_u64(), Some(2));
+        assert!(json["next_offset"].is_null());
+        assert_eq!(json["has_more"].as_bool(), Some(false));
+        assert_eq!(json["results"].as_array().unwrap().len(), 1);
+
+        let legacy = Request::builder()
+            .method("GET")
+            .uri("/api/memories?q=streaming&limit=2")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&legacy, &config).await.unwrap();
+        let json = read_json(response).await;
+        assert_eq!(json["count"].as_u64(), Some(2));
+        assert!(json.get("next_offset").is_none());
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
     }
 }

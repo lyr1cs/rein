@@ -10,10 +10,12 @@ use crate::types::*;
 pub mod adaptive;
 pub mod consolidation;
 pub mod dedup;
+pub mod registry;
 
 pub use adaptive::*;
 pub use consolidation::*;
 pub use dedup::*;
+pub use registry::*;
 
 /// Build a Memory struct from user-provided fields.
 /// Used by both `rein store` CLI and `rein_store` MCP tool.
@@ -94,30 +96,579 @@ pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &Rei
     }
 }
 
+const AUTO_CONCEPT_MEMOIR: &str = "auto-discovered";
+const AUTO_CONCEPT_MAX: usize = 3;
+const AUTO_CONCEPT_MIN_CHARS: usize = 80;
+const AUTO_CONCEPT_MAX_KEYWORDS: usize = 6;
+const AUTO_CONCEPT_MAX_KWS_IN_DEF: usize = 160;
+
+#[derive(Debug, Clone)]
+struct AutoConceptSeed {
+    name: String,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ConflictMarker {
+    score: f32,
+    evidence_keyword: String,
+    matched_concept: String,
+}
+
 /// Store a memory with full post-processing (shared by CLI and MCP paths).
-/// Runs: store_with_dedup → auto_link → activate_related_concepts → apply_evolution.
+/// Runs: store_with_dedup → conflict marking → auto concept discovery → auto_link
+/// → activate_related_concepts → apply_evolution.
 pub fn store_memory(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
     memory: Memory,
 ) -> crate::types::ReinResult<String> {
-    let content = memory.content.clone();
     let original_id = memory.id.clone();
     // A1: use adaptive threshold when available, fall back to static config.
     // store_with_dedup internally resolves per-cluster threshold per candidate;
     // this is the coarse pre-filter default.
     let dedup_sim = effective_dedup_threshold(store, config);
     let id = store.store_with_dedup(memory, dedup_sim, config.search.dedup_time_window_days)?;
+    let stored_memory = store.get(&id)?;
+
+    if let Some(marker) = detect_conflict_marker(store, &stored_memory)? {
+        if let Err(e) = persist_conflict_marker(store, &stored_memory, &marker) {
+            tracing::warn!(
+                memory_id = %stored_memory.id,
+                conflict_score = marker.score,
+                matched_concept = %marker.matched_concept,
+                "failed to persist conflict marker: {e}"
+            );
+        }
+    }
+
+    let auto_concepts = derive_auto_concepts(&stored_memory);
+    if !auto_concepts.is_empty() {
+        let source_memory_ids = vec![id.clone()];
+        if let Err(e) =
+            store.store_knowledge_units_with_sources(&auto_concepts, &[], &source_memory_ids)
+        {
+            tracing::warn!(
+                memory_id = %stored_memory.id,
+                concept_count = auto_concepts.len(),
+                "failed to store auto-discovered concepts: {e}"
+            );
+        }
+    }
+
     // Only run post-processing for newly created memories, not merge-into targets.
     // store_with_dedup returns the existing ID on MergeInto — running evolution
     // against a merged record could corrupt provenance of unrelated memories.
     let is_new = id == original_id;
     if is_new {
+        let content = stored_memory.content.clone();
         let _ = store.auto_link(&id, dedup_sim, 5);
         let _ = store.activate_related_concepts(&content);
         let _ = store.apply_evolution(&id, &content, None);
     }
     Ok(id)
+}
+
+fn derive_auto_concepts(memory: &Memory) -> Vec<crate::extract::llm::ExtractedConcept> {
+    if !should_auto_discover_concepts(memory) {
+        return vec![];
+    }
+
+    let evidence = concept_evidence(memory);
+    let concept_type = infer_auto_concept_type(memory);
+    let mut seeds: Vec<AutoConceptSeed> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (raw, source) in auto_concept_candidates(memory) {
+        let name = normalize_auto_concept_name(&raw);
+        if !is_useful_auto_concept_name(&name) || !seen.insert(name.clone()) {
+            continue;
+        }
+        seeds.push(AutoConceptSeed { name, source });
+        if seeds.len() >= AUTO_CONCEPT_MAX {
+            break;
+        }
+    }
+
+    seeds
+        .into_iter()
+        .map(|seed| crate::extract::llm::ExtractedConcept {
+            name: seed.name.clone(),
+            definition: match seed.source {
+                "topic" => format!(
+                    "{} summarizes the main subject of this memory. Evidence: {}",
+                    seed.name.replace('-', " "),
+                    evidence
+                ),
+                "keyword" => format!(
+                    "{} is a locally discovered keyword from this memory. Evidence: {}",
+                    seed.name.replace('-', " "),
+                    evidence
+                ),
+                _ => format!(
+                    "{} was inferred locally from the stored memory. Evidence: {}",
+                    seed.name.replace('-', " "),
+                    evidence
+                ),
+            },
+            labels: vec!["auto".to_string(), seed.source.to_string()],
+            memoir: AUTO_CONCEPT_MEMOIR.to_string(),
+            concept_type: concept_type.to_string(),
+            quality_confidence: 0.35,
+        })
+        .collect()
+}
+
+fn should_auto_discover_concepts(memory: &Memory) -> bool {
+    let text = format!("{} {} {}", memory.topic, memory.summary, memory.content);
+    if text.chars().count() < AUTO_CONCEPT_MIN_CHARS {
+        return false;
+    }
+
+    !memory.topic.trim().is_empty() || !memory.keywords.is_empty()
+}
+
+fn detect_conflict_marker(
+    store: &crate::store::SqliteStore,
+    memory: &Memory,
+) -> crate::types::ReinResult<Option<ConflictMarker>> {
+    if !has_conflict_signal(memory) {
+        return Ok(None);
+    }
+
+    let query = build_conflict_query(memory);
+    if query.is_empty() {
+        return Ok(None);
+    }
+
+    let candidates = store.search_all_concepts(&query, 5)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let memory_text = format!("{} {} {}", memory.topic, memory.summary, memory.content);
+    let mut best: Option<ConflictMarker> = None;
+
+    for concept in candidates {
+        let sim = crate::extract::similarity(&memory_text, &concept.definition);
+        if sim >= 0.45 {
+            continue;
+        }
+
+        let score = ((0.80 - sim).max(0.0)).min(0.80);
+        let evidence_keyword = format!("conflict-{}", normalize_auto_concept_name(&concept.name));
+        let candidate = ConflictMarker {
+            score,
+            evidence_keyword,
+            matched_concept: concept.name.clone(),
+        };
+
+        if best
+            .as_ref()
+            .map(|existing| candidate.score > existing.score)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best)
+}
+
+fn persist_conflict_marker(
+    store: &crate::store::SqliteStore,
+    memory: &Memory,
+    marker: &ConflictMarker,
+) -> crate::types::ReinResult<()> {
+    let mut keywords = memory.keywords.clone();
+    if !keywords.iter().any(|kw| kw == "conflict") {
+        keywords.push("conflict".to_string());
+    }
+    if !keywords.iter().any(|kw| kw == &marker.evidence_keyword) {
+        keywords.push(marker.evidence_keyword.clone());
+    }
+    if keywords.len() > 16 {
+        keywords.truncate(16);
+    }
+
+    let score = memory.contradiction_score.max(marker.score);
+    let keywords_json = serde_json::to_string(&keywords)?;
+
+    // Wrap both UPDATEs in a SAVEPOINT so a failure between them cannot leave
+    // memory_canonical_state.contradiction_score set while memories.keywords
+    // still reflects the pre-conflict state (partial-write corruption).
+    store
+        .conn()
+        .execute_batch("SAVEPOINT persist_conflict_marker")?;
+    let result: crate::types::ReinResult<()> = (|| {
+        let rows = store.conn().execute(
+            "UPDATE memory_canonical_state SET contradiction_score = ?1 WHERE memory_id = ?2",
+            rusqlite::params![score, memory.id],
+        )?;
+        if rows == 0 {
+            return Err(crate::types::ReinError::NotFound(format!(
+                "memory {} not found (canonical_state)",
+                memory.id
+            )));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = store.conn().execute(
+            "UPDATE memories SET keywords = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![keywords_json, now, memory.id],
+        )?;
+        if rows == 0 {
+            return Err(crate::types::ReinError::NotFound(format!(
+                "memory {} not found (memories)",
+                memory.id
+            )));
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            store
+                .conn()
+                .execute_batch("RELEASE persist_conflict_marker")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = store
+                .conn()
+                .execute_batch("ROLLBACK TO persist_conflict_marker");
+            let _ = store
+                .conn()
+                .execute_batch("RELEASE persist_conflict_marker");
+            Err(e)
+        }
+    }
+}
+
+fn auto_concept_candidates(memory: &Memory) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let topic = normalize_auto_concept_name(&memory.topic);
+    push_auto_concept_candidate(&mut out, &mut seen, topic, "topic");
+
+    for raw in memory.keywords.iter().cloned().chain(
+        crate::extract::extract_keywords_from_text(
+            &format!("{} {}", memory.summary, memory.content),
+            AUTO_CONCEPT_MAX_KEYWORDS,
+        )
+        .into_iter(),
+    ) {
+        if out.len() >= AUTO_CONCEPT_MAX {
+            break;
+        }
+        push_auto_concept_candidate(
+            &mut out,
+            &mut seen,
+            normalize_auto_concept_name(&raw),
+            "keyword",
+        );
+    }
+
+    out
+}
+
+fn push_auto_concept_candidate(
+    out: &mut Vec<(String, &'static str)>,
+    seen: &mut std::collections::HashSet<String>,
+    name: String,
+    source: &'static str,
+) {
+    if !is_useful_auto_concept_name(&name) || !seen.insert(name.clone()) {
+        return;
+    }
+    out.push((name, source));
+}
+
+fn normalize_auto_concept_name(raw: &str) -> String {
+    let sanitized: String = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    crate::store::memoir::normalize_concept_name(&sanitized)
+}
+
+fn is_useful_auto_concept_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    let normalized = name.trim().to_lowercase();
+    if normalized.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+
+    const GENERIC: &[&str] = &[
+        "auto",
+        "content",
+        "general",
+        "idea",
+        "info",
+        "information",
+        "knowledge",
+        "manual",
+        "memory",
+        "note",
+        "notes",
+        "summary",
+        "thing",
+        "things",
+        "stuff",
+        "update",
+        "updated",
+        "change",
+        "changed",
+        "switch",
+        "switched",
+        "move",
+        "moved",
+        "use",
+        "used",
+        "using",
+        "fix",
+        "fixed",
+        "run",
+        "running",
+        "create",
+        "created",
+        "store",
+        "stored",
+        "concept",
+        "concepts",
+        "knowledge-update",
+        "conflict",
+        "conflict-update",
+    ];
+
+    if GENERIC.iter().any(|bad| normalized == *bad) {
+        return false;
+    }
+
+    normalized.chars().count() >= 2
+}
+
+fn concept_evidence(memory: &Memory) -> String {
+    let source = if memory.summary.trim().is_empty() {
+        memory.content.trim()
+    } else {
+        memory.summary.trim()
+    };
+    let evidence: String = source
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(AUTO_CONCEPT_MAX_KWS_IN_DEF)
+        .collect();
+    if evidence.is_empty() {
+        memory
+            .content
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .take(AUTO_CONCEPT_MAX_KWS_IN_DEF)
+            .collect()
+    } else {
+        evidence
+    }
+}
+
+fn infer_auto_concept_type(memory: &Memory) -> &'static str {
+    let text = format!("{} {} {}", memory.topic, memory.summary, memory.content).to_lowercase();
+    let skill_signals = [
+        "how to",
+        "steps",
+        "procedure",
+        "workflow",
+        "run ",
+        "configure",
+        "configuration",
+        "install",
+        "deploy",
+        "debug",
+        "fix ",
+        "migrate",
+        "use ",
+        "guide",
+        "recipe",
+        "操作",
+        "步骤",
+        "配置",
+        "调试",
+    ];
+    if skill_signals.iter().any(|sig| text.contains(sig)) {
+        "skill"
+    } else {
+        "fact"
+    }
+}
+
+fn has_conflict_signal(memory: &Memory) -> bool {
+    let text = format!("{} {} {}", memory.topic, memory.summary, memory.content);
+    if crate::extract::postprocess::is_knowledge_update(&text) {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    [
+        "conflict",
+        "contradict",
+        "contradiction",
+        "inconsistent",
+        "inconsistency",
+        "no longer",
+        "instead of",
+        "replaced",
+        "replacing",
+        "switched to",
+        "moved to",
+        "deprecated",
+        "superseded",
+        "not using",
+        "does not use",
+        "doesn't use",
+        "wrong",
+        "false",
+        "不再",
+        "冲突",
+        "矛盾",
+        "替换",
+        "改为",
+        "不使用",
+        "不一致",
+    ]
+    .iter()
+    .any(|sig| lower.contains(sig))
+}
+
+fn build_conflict_query(memory: &Memory) -> String {
+    let source = format!(
+        "{} {} {}",
+        memory.content.replace('-', " "),
+        memory.summary,
+        memory.topic
+    );
+    let mut parts: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw in source.split_whitespace() {
+        let term = normalize_conflict_query_token(raw);
+        if !is_useful_conflict_query_token(&term) || !seen.insert(term.clone()) {
+            continue;
+        }
+        parts.push(term);
+        if parts.len() >= 2 {
+            break;
+        }
+    }
+
+    if parts.is_empty() {
+        for raw in memory.keywords.iter().cloned().chain(
+            crate::extract::extract_keywords_from_text(
+                &format!("{} {}", memory.summary, memory.content.replace('-', " ")),
+                AUTO_CONCEPT_MAX_KEYWORDS,
+            )
+            .into_iter(),
+        ) {
+            let term = normalize_conflict_query_token(&raw);
+            if !is_useful_conflict_query_token(&term) || !seen.insert(term.clone()) {
+                continue;
+            }
+            parts.push(term);
+            if parts.len() >= 2 {
+                break;
+            }
+        }
+    }
+
+    parts.join(" ")
+}
+
+fn normalize_conflict_query_token(raw: &str) -> String {
+    let mut token = normalize_auto_concept_name(raw);
+    if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
+        token.pop();
+    }
+    if token.ends_with("ies") && token.len() > 4 {
+        token.truncate(token.len() - 3);
+        token.push('y');
+    }
+    token
+}
+
+fn is_useful_conflict_query_token(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if token.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+
+    const STOPWORDS: &[&str] = &[
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "be",
+        "been",
+        "but",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "it",
+        "no",
+        "not",
+        "of",
+        "on",
+        "or",
+        "so",
+        "the",
+        "to",
+        "we",
+        "with",
+        "you",
+        "only",
+        "just",
+        "longer",
+        "model",
+        "use",
+        "used",
+        "using",
+        "switch",
+        "switched",
+        "move",
+        "moved",
+        "replace",
+        "replaced",
+        "update",
+        "updated",
+        "change",
+        "changed",
+        "storage",
+        "model",
+        "models",
+        "system",
+        "systems",
+        "data",
+        "state",
+        "note",
+        "notes",
+        "memory",
+        "memories",
+        "knowledge",
+    ];
+
+    !STOPWORDS.iter().any(|stop| token == *stop)
 }
 
 /// Ingest a full session/transcript through the full extraction path.
@@ -1377,6 +1928,122 @@ mod tests {
         assert_eq!(
             normalize_topic_name("  RMCP 1.3.0 Compatibility "),
             "rmcp-1-3-0-compatibility"
+        );
+    }
+
+    #[test]
+    fn test_derive_auto_concepts_uses_topic_and_keywords() {
+        let memory = test_memory(
+            "Vector Index Rebuild",
+            "Fix vector index rebuild OOM after reindex",
+            "We need to rebuild the vector index after the model change and reindex the cache.",
+        );
+        let concepts = derive_auto_concepts(&memory);
+        assert!(
+            (1..=3).contains(&concepts.len()),
+            "expected 1-3 concepts, got {}",
+            concepts.len()
+        );
+        assert!(
+            concepts.iter().all(|c| c.memoir == AUTO_CONCEPT_MEMOIR),
+            "auto concepts should stay in the auto-discovered memoir"
+        );
+        assert!(
+            concepts.iter().any(|c| c.name == "vector-index-rebuild"),
+            "topic should yield a concept"
+        );
+        assert!(
+            concepts.iter().any(|c| c.name.contains("reindex")),
+            "keywords/content should yield a second concept"
+        );
+    }
+
+    #[test]
+    fn test_detect_conflict_marker_requires_signal_and_low_similarity() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store_knowledge_units_with_sources(
+                &[crate::extract::llm::ExtractedConcept {
+                    name: "append-only-log".to_string(),
+                    definition: "An append-only log stores immutable events for replication."
+                        .to_string(),
+                    labels: vec!["storage".to_string()],
+                    memoir: "architecture".to_string(),
+                    concept_type: "fact".to_string(),
+                    quality_confidence: 0.9,
+                }],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let memory = test_memory(
+            "Storage model",
+            "We no longer use append-only logs and switched to a B-tree index.",
+            "We no longer use append-only logs and switched to a B-tree index.",
+        );
+
+        let marker = detect_conflict_marker(&store, &memory).unwrap();
+        let marker = marker.expect("expected a conflict marker");
+        assert!(marker.score > 0.0);
+        assert!(marker.evidence_keyword.starts_with("conflict-"));
+        assert_eq!(marker.matched_concept, "append-only-log");
+    }
+
+    #[test]
+    fn test_store_memory_adds_auto_concepts_and_conflict_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ReinConfig::default();
+        config.database.path = dir.path().join("rein.sqlite").display().to_string();
+        config.embedding.provider = "none".to_string();
+
+        let store = config.open_store().unwrap();
+        store
+            .store_knowledge_units_with_sources(
+                &[crate::extract::llm::ExtractedConcept {
+                    name: "append-only-log".to_string(),
+                    definition: "An append-only log stores immutable events for replication."
+                        .to_string(),
+                    labels: vec!["storage".to_string()],
+                    memoir: "architecture".to_string(),
+                    concept_type: "fact".to_string(),
+                    quality_confidence: 0.9,
+                }],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let memory = test_memory(
+            "Storage Model",
+            "Storage model update: we no longer use append-only logs and switched to a B-tree index.",
+            "Storage model update: we no longer use append-only logs and switched to a B-tree index.",
+        );
+        let id = store_memory(&store, &config, memory).unwrap();
+        let stored = store.get(&id).unwrap();
+
+        assert!(
+            stored.contradiction_score > 0.0,
+            "conflict marker should bump contradiction_score"
+        );
+        assert!(
+            stored.keywords.iter().any(|kw| kw == "conflict"),
+            "conflict keyword should be added"
+        );
+        assert!(
+            stored.keywords.iter().any(|kw| kw.starts_with("conflict-")),
+            "conflict evidence keyword should be added"
+        );
+        assert!(
+            !stored.concept_ids.is_empty(),
+            "auto-discovered concepts should be linked back to the memory"
+        );
+        assert!(
+            store
+                .get_concept(AUTO_CONCEPT_MEMOIR, "storage-model")
+                .unwrap()
+                .is_some(),
+            "topic should create an auto-discovered concept"
         );
     }
 

@@ -2168,6 +2168,26 @@ fn clean_concept_refs(conn: &Connection, concept_id: &str) -> ReinResult<()> {
 mod tests {
     use super::*;
     use crate::types::{Importance, Source};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn test_memory(topic: &str, summary: &str, importance: Importance) -> Memory {
         Memory {
@@ -2647,6 +2667,84 @@ mod tests {
                 .contains("[merged on"),
             "canonical content should record provenance from gray-zone merge"
         );
+    }
+
+    #[test]
+    fn test_store_with_dedup_intelligent_merge_e2e_records_provenance() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore_config = EnvRestore {
+            key: "REIN_CONFIG",
+            value: std::env::var("REIN_CONFIG").ok(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rein.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[intelligent_merge]
+enabled = true
+"#,
+        )
+        .unwrap();
+        std::env::set_var("REIN_CONFIG", &config_path);
+
+        let _mock = crate::extract::intelligent_merge::test_hook::install(Box::new(
+            |_existing, _incoming| {
+                Some(crate::extract::intelligent_merge::VerdictResult {
+                    verdict: crate::extract::intelligent_merge::InsertionVerdict::Merge,
+                    synthesized: Some(
+                        "docker compose stack uses api database cache queue search metrics with synthesized provenance"
+                            .to_string(),
+                    ),
+                    reasoning: Some("complementary docker stack notes".to_string()),
+                })
+            },
+        ));
+
+        let store = SqliteStore::in_memory().unwrap();
+        let existing = test_memory_with_content(
+            "docker",
+            "docker setup",
+            "docker compose local development stack keeps api database cache queue search metrics logging stable safe deterministic reusable portable observable maintainable candidate old",
+            Importance::High,
+        );
+        let existing_id = store.store_with_dedup(existing, 1.10, 7).unwrap();
+
+        let incoming = test_memory_with_content(
+            "docker",
+            "docker setup extra",
+            "docker compose local development stack keeps api database cache queue search metrics logging stable safe deterministic reusable portable observable maintainable candidate new",
+            Importance::High,
+        );
+        let result_id = store.store_with_dedup(incoming, 1.10, 7).unwrap();
+
+        assert_eq!(result_id, existing_id);
+        let merged = store.get(&existing_id).unwrap();
+        assert!(merged.content.contains("synthesized provenance"));
+        assert!(
+            !merged.content.contains("[merged on"),
+            "intelligent merge should use synthesized content instead of mechanical append"
+        );
+
+        let evidence = store.list_memory_evidence(&existing_id, 10).unwrap();
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.content.contains("candidate old")),
+            "pre-merge existing memory should be preserved as evidence"
+        );
+        let decisions = store.list_dedup_decisions(Some(&existing_id), 10).unwrap();
+        let verdict = decisions
+            .iter()
+            .find(|decision| decision.operator == "llm_verdict")
+            .expect("llm verdict should be recorded");
+        assert_eq!(verdict.relation, DedupRelation::Update);
+        assert!(verdict.reason.contains("complementary docker stack notes"));
+        assert!(verdict
+            .merged_summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("synthesized provenance"));
     }
 
     #[test]
