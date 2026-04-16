@@ -11,6 +11,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 // ---------------------------------------------------------------------------
 // MemoryTier
@@ -87,6 +88,11 @@ impl QuantileEstimator {
     }
 
     /// Insert a single value into the reservoir.
+    ///
+    /// This path is used for numeric values that do not carry an identity;
+    /// it derives its reservoir-sampling decision purely from `total_seen`
+    /// and the value's own bit pattern, so identical input sequences always
+    /// produce identical reservoir state (reproducibility across processes).
     pub fn add(&mut self, value: f64) {
         self.total_seen += 1;
 
@@ -95,22 +101,38 @@ impl QuantileEstimator {
             let pos = self.samples.partition_point(|&v| v < value);
             self.samples.insert(pos, value);
         } else {
-            // Reservoir sampling: accept with probability max_samples / total_seen.
-            // Use a simple deterministic-seed LCG seeded from total_seen so that
-            // the result is reproducible for a given insertion order.
-            // Use nonce from global counter to avoid identical seeds in concurrent instances
-            static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-            let accept = pseudo_random(self.total_seen.wrapping_add(nonce)) % self.total_seen
-                < self.max_samples;
-            if accept {
-                // Replace a random existing entry.
-                let idx = pseudo_random(self.total_seen.wrapping_mul(7).wrapping_add(nonce))
-                    % self.max_samples;
-                self.samples[idx] = value;
-                self.samples
-                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            }
+            // Deterministic reservoir sampling keyed on (total_seen, value bits).
+            // Avoids a global atomic nonce so concurrent insertions no longer
+            // produce non-reproducible tier boundaries.
+            let key = mix_u64(self.total_seen as u64, value.to_bits());
+            self.add_with_key(value, key);
+        }
+    }
+
+    /// Insert a value with an explicit deterministic key (e.g. hash of a memory ID).
+    ///
+    /// Use this when callers have a stable identifier for each value and need
+    /// reproducible reservoir membership across runs / processes.
+    pub fn add_with_id(&mut self, value: f64, id: &str) {
+        self.total_seen += 1;
+
+        if self.samples.len() < self.max_samples {
+            let pos = self.samples.partition_point(|&v| v < value);
+            self.samples.insert(pos, value);
+        } else {
+            let key = hash_id(id);
+            self.add_with_key(value, key);
+        }
+    }
+
+    /// Shared reservoir-replacement logic given a precomputed deterministic key.
+    fn add_with_key(&mut self, value: f64, key: u64) {
+        let accept = (key as usize) % self.total_seen < self.max_samples;
+        if accept {
+            let idx = (key.rotate_left(17) as usize) % self.max_samples;
+            self.samples[idx] = value;
+            self.samples
+                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         }
     }
 
@@ -154,14 +176,27 @@ impl QuantileEstimator {
     }
 }
 
-/// Simple pseudo-random number derived from a seed (deterministic, not crypto).
-/// Used only for reservoir replacement decisions.
-fn pseudo_random(seed: usize) -> usize {
-    // Splitmix-style mixing.
-    let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+/// Splitmix64 mixing of two u64 inputs. Deterministic, not crypto — used only
+/// to derive reservoir-sampling decisions. Results are identical across runs
+/// and processes for the same inputs.
+fn mix_u64(a: u64, b: u64) -> u64 {
+    let mut x = a
+        .wrapping_add(b)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
+}
+
+/// Deterministic 64-bit hash of a string identifier.
+///
+/// Uses `DefaultHasher` which is deterministic within a process for a given
+/// input. For reservoir sampling on memory IDs this is sufficient to keep
+/// tier boundaries reproducible across repeated runs with the same inputs.
+fn hash_id(id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +423,34 @@ mod tests {
         // Should still produce a reasonable estimate.
         let median = est.quantile(0.5).unwrap();
         assert!(median > 50.0 && median < 450.0, "median was {median}");
+    }
+
+    #[test]
+    fn tiering_reservoir_is_deterministic_for_same_inputs() {
+        // Two independent estimators fed the exact same sequence must agree
+        // on the final reservoir state — no global nonce dependence.
+        let mut a = QuantileEstimator::new(50);
+        let mut b = QuantileEstimator::new(50);
+        for i in 0..1000 {
+            let v = (i as f64) * 0.5;
+            a.add(v);
+            b.add(v);
+        }
+        assert_eq!(a.samples, b.samples, "reservoir must be deterministic");
+        assert_eq!(a.total_seen, b.total_seen);
+    }
+
+    #[test]
+    fn tiering_reservoir_add_with_id_is_deterministic() {
+        let mut a = QuantileEstimator::new(50);
+        let mut b = QuantileEstimator::new(50);
+        for i in 0..500 {
+            let v = (i as f64) * 0.25;
+            let id = format!("mem-{i}");
+            a.add_with_id(v, &id);
+            b.add_with_id(v, &id);
+        }
+        assert_eq!(a.samples, b.samples);
     }
 
     #[test]

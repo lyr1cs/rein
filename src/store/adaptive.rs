@@ -451,6 +451,84 @@ impl AdaptiveState {
     }
 }
 
+// ── Cached AdaptiveState with TTL ────────────────────────────────────────────
+
+/// Default TTL for [`CachedAdaptiveState`] when callers don't pass an explicit value.
+///
+/// Matches `config.adaptive.cache_ttl_secs` default and is exposed here so
+/// call sites without config access still get a sane value.
+pub const ADAPTIVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Time-bounded in-memory cache of an `AdaptiveState` snapshot.
+///
+/// Without a TTL the previous code would hold a stale snapshot indefinitely
+/// unless feedback events explicitly rebuilt it — meaning slow-channel
+/// parameter updates applied in another process (GC, alpha optimizer, tier
+/// recomputation) could be invisible to the current one until restart.
+///
+/// This wrapper tracks `last_refreshed_at: Instant`; on `get` it transparently
+/// reloads from the metadata table once the TTL elapses. Callers can also
+/// force a refresh via [`Self::invalidate`].
+pub struct CachedAdaptiveState {
+    state: AdaptiveState,
+    last_refreshed_at: std::time::Instant,
+    ttl: std::time::Duration,
+}
+
+impl CachedAdaptiveState {
+    /// Create a new cache loaded from the DB, with the given TTL.
+    /// Falls back to `AdaptiveState::default()` when no snapshot exists.
+    pub fn load(conn: &Connection, ttl: std::time::Duration) -> Self {
+        let state = AdaptiveState::restore_snapshot(conn).unwrap_or_default();
+        Self {
+            state,
+            last_refreshed_at: std::time::Instant::now(),
+            ttl,
+        }
+    }
+
+    /// Convenience: load with the module-level default TTL.
+    pub fn load_default(conn: &Connection) -> Self {
+        Self::load(conn, ADAPTIVE_CACHE_TTL)
+    }
+
+    /// Return the cached state, transparently refreshing from DB when stale.
+    pub fn get(&mut self, conn: &Connection) -> &AdaptiveState {
+        if self.is_stale() {
+            self.refresh(conn);
+        }
+        &self.state
+    }
+
+    /// Whether the cache has exceeded its TTL.
+    pub fn is_stale(&self) -> bool {
+        self.last_refreshed_at.elapsed() > self.ttl
+    }
+
+    /// Force the next `get` to reload from the DB regardless of age.
+    pub fn invalidate(&mut self) {
+        // Set the refresh timestamp far enough in the past that any non-zero TTL
+        // will classify the cache as stale on the next access.
+        self.last_refreshed_at = std::time::Instant::now()
+            .checked_sub(self.ttl.saturating_add(std::time::Duration::from_secs(1)))
+            .unwrap_or(self.last_refreshed_at);
+    }
+
+    /// Reload from the DB immediately.
+    pub fn refresh(&mut self, conn: &Connection) {
+        if let Some(fresh) = AdaptiveState::restore_snapshot(conn) {
+            self.state = fresh;
+        }
+        self.last_refreshed_at = std::time::Instant::now();
+    }
+
+    /// Direct immutable access without TTL check — for paths that just want
+    /// whatever we have in memory (e.g. when already inside a transaction).
+    pub fn peek(&self) -> &AdaptiveState {
+        &self.state
+    }
+}
+
 // ── Cluster Centroid Persistence ─────────────────────────────────────────────
 
 /// Save cluster centroids to the `cluster_centroids` table (raw f32 LE bytes).
@@ -724,6 +802,54 @@ mod tests {
         );
         let alpha = state.get_alpha("Temporal", None).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn adaptive_cache_refreshes_after_ttl() {
+        let conn = setup_db();
+
+        // Seed DB with version=1
+        let state = AdaptiveState {
+            version: 1,
+            hot_threshold: 0.5,
+            ..Default::default()
+        };
+        state.save_snapshot(&conn).unwrap();
+
+        // Load into cache with a very short TTL
+        let mut cache =
+            CachedAdaptiveState::load(&conn, std::time::Duration::from_millis(20));
+        assert_eq!(cache.get(&conn).version, 1);
+        assert!(!cache.is_stale());
+
+        // Mutate DB directly to simulate another writer bumping version.
+        let mut newer = AdaptiveState {
+            version: 2,
+            hot_threshold: 0.9,
+            ..Default::default()
+        };
+        // Force overwrite (bypass optimistic concurrency for the test)
+        let newer_json = serde_json::to_string(&newer).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![&newer_json],
+        )
+        .unwrap();
+        newer.version = 2; // suppress unused warning
+
+        // Before TTL elapses, cache still serves old version.
+        assert_eq!(cache.peek().version, 1);
+
+        // Wait past TTL, then get() should transparently refresh.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(cache.is_stale());
+        let refreshed = cache.get(&conn);
+        assert_eq!(refreshed.version, 2);
+        assert!((refreshed.hot_threshold - 0.9).abs() < 1e-6);
+
+        // invalidate() forces a reload on the next get().
+        cache.invalidate();
+        assert!(cache.is_stale());
     }
 
     #[test]

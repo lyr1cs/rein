@@ -81,18 +81,31 @@ impl SurvivalCurve {
         };
 
         let dt = t_last - t_prev;
+        // Degenerate curves: no time delta, zero survival, or tied steps (p_prev == p_last)
+        // cannot produce a meaningful hazard. Fall back to the last known probability.
         if dt <= 0.0 || p_prev <= 0.0 || p_last <= 0.0 {
+            return prob;
+        }
+        if (p_prev - p_last).abs() < f64::EPSILON {
+            // Tied steps ⇒ ln(1) = 0 ⇒ hazard = 0 ⇒ no decay beyond the last point.
             return prob;
         }
 
         // Hazard rate: h = -ln(S(t_last)/S(t_prev)) / dt
-        let hazard = -(p_last / p_prev).ln() / dt;
-        if hazard <= 0.0 {
+        let ratio = p_last / p_prev;
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return prob;
+        }
+        let hazard = -ratio.ln() / dt;
+        if !hazard.is_finite() || hazard <= 0.0 {
             return prob;
         }
 
         // S(days) = S(t_last) * exp(-hazard * (days - t_last))
         let extrapolated = p_last * (-hazard * (days - last_time)).exp();
+        if !extrapolated.is_finite() {
+            return prob;
+        }
         extrapolated.clamp(0.0, 1.0)
     }
 }
@@ -623,5 +636,33 @@ mod tests {
             (intervals[0].duration_days - 3.0).abs() < 0.01,
             "Duration should be ~3 days"
         );
+    }
+
+    #[test]
+    fn survival_degenerate_tied_steps_returns_finite_probability() {
+        // Curve with two tied steps (p_prev == p_last) must not produce NaN/Inf
+        // from ln(1) / dt hazard computation.
+        let curve = SurvivalCurve {
+            steps: vec![(1.0, 0.5), (2.0, 0.5)],
+            event_count: 2,
+            total_count: 2,
+            median_survival: None,
+        };
+        let p = curve.probability_at(10.0);
+        assert!(p.is_finite(), "tied-step curve must return finite probability");
+        assert!((0.0..=1.0).contains(&p));
+    }
+
+    #[test]
+    fn survival_degenerate_zero_p_prev_returns_finite() {
+        let curve = SurvivalCurve {
+            steps: vec![(1.0, 0.0), (2.0, 0.0)],
+            event_count: 2,
+            total_count: 2,
+            median_survival: None,
+        };
+        let p = curve.probability_at(10.0);
+        assert!(p.is_finite());
+        assert!((0.0..=1.0).contains(&p));
     }
 }

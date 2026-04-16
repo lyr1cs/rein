@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "0.17.7"
+version = "0.18.0"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
 license = "MIT"
@@ -37,11 +37,13 @@ libc = "0.2"
 futures-util = "0.3"
 tokio-stream = "0.1"
 base64 = "0.22"
+flate2 = "1"
 unicode-normalization = "0.1"
 jieba-rs = "0.7.4"
 ring = "0.17"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 
 [features]

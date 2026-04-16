@@ -101,21 +101,33 @@ pub(crate) fn is_cjk(ch: char) -> bool {
     )
 }
 
-fn jaccard_from_sets(set_a: &HashSet<String>, set_b: &HashSet<String>) -> f32 {
-    let intersection = set_a.intersection(set_b).count();
+/// Jaccard similarity over token sets.
+///
+/// Returns `None` when comparison is undefined — specifically when the union
+/// is empty (both sets empty). Returning `None` distinguishes "no basis for
+/// comparison" from "definite zero overlap", which previously collided at 0.0
+/// and caused empty-text inputs to look maximally dissimilar even though they
+/// were simply un-tokenizable.
+fn jaccard_from_sets(set_a: &HashSet<String>, set_b: &HashSet<String>) -> Option<f32> {
     let union = set_a.union(set_b).count();
     if union == 0 {
-        return 0.0;
+        return None;
     }
-    intersection as f32 / union as f32
+    let intersection = set_a.intersection(set_b).count();
+    Some(intersection as f32 / union as f32)
 }
 
-fn containment_from_sets(set_a: &HashSet<String>, set_b: &HashSet<String>) -> f32 {
+/// Containment similarity: fraction of the smaller set covered by the intersection.
+///
+/// Returns `None` when either set is empty (smaller == 0) — there is no
+/// "smaller side" to ground containment against. Callers must treat `None` as
+/// "skip, do not dedup".
+fn containment_from_sets(set_a: &HashSet<String>, set_b: &HashSet<String>) -> Option<f32> {
     let smaller = set_a.len().min(set_b.len());
     if smaller == 0 {
-        return 0.0;
+        return None;
     }
-    set_a.intersection(set_b).count() as f32 / smaller as f32
+    Some(set_a.intersection(set_b).count() as f32 / smaller as f32)
 }
 
 /// Tokenize text for search/FTS purposes. Returns sorted tokens (deterministic order)
@@ -168,29 +180,57 @@ pub fn extract_keywords_from_text(text: &str, max_keywords: usize) -> Vec<String
 }
 
 /// Jaccard similarity between two texts (token-level, punctuation-stripped).
+///
+/// Preserves historical behavior (returns 0.0) for the public API — the
+/// internal `jaccard_from_sets` now returns `None` when no comparison is
+/// possible, and we collapse that to 0.0 here so scalar callers aren't
+/// forced to change.  New callers should prefer [`jaccard_similarity_opt`].
 pub fn jaccard_similarity(a: &str, b: &str) -> f32 {
+    jaccard_similarity_opt(a, b).unwrap_or(0.0)
+}
+
+/// `Option` variant of [`jaccard_similarity`]: `None` means no tokens to
+/// compare on either side — callers should treat this as "skip, do not dedup".
+pub fn jaccard_similarity_opt(a: &str, b: &str) -> Option<f32> {
     jaccard_from_sets(&normalize_tokens(a), &normalize_tokens(b))
 }
 
 /// Containment similarity: what fraction of the shorter text is covered by the longer.
 /// Better than Jaccard for dedup — a short summary of a longer text scores high.
 pub fn containment_similarity(a: &str, b: &str) -> f32 {
+    containment_similarity_opt(a, b).unwrap_or(0.0)
+}
+
+/// `Option` variant: `None` when either side has no tokens. Treat as "do not merge".
+pub fn containment_similarity_opt(a: &str, b: &str) -> Option<f32> {
     containment_from_sets(&normalize_tokens(a), &normalize_tokens(b))
 }
 
 /// Combined similarity: max of Jaccard and Containment.
 /// Tokenizes each input once (not 4x) — important for CJK where jieba is expensive.
+///
+/// Returns 0.0 when neither jaccard nor containment is defined (both sets empty).
 pub fn similarity(a: &str, b: &str) -> f32 {
     let set_a = normalize_tokens(a);
     let set_b = normalize_tokens(b);
-    jaccard_from_sets(&set_a, &set_b).max(containment_from_sets(&set_a, &set_b))
+    let j = jaccard_from_sets(&set_a, &set_b);
+    let c = containment_from_sets(&set_a, &set_b);
+    match (j, c) {
+        (Some(j), Some(c)) => j.max(c),
+        (Some(v), None) | (None, Some(v)) => v,
+        (None, None) => 0.0,
+    }
 }
 
 pub fn lexical_score(a: &str, b: &str) -> LexicalDedupScore {
     let set_a = normalize_tokens(a);
     let set_b = normalize_tokens(b);
-    let jaccard = jaccard_from_sets(&set_a, &set_b);
-    let containment = containment_from_sets(&set_a, &set_b);
+    // Preserve the legacy public contract (f32 fields) by collapsing None to 0.0
+    // at the struct boundary.  Inside `check_dedup` we never enter the gray-zone
+    // or merge paths when the raw option is None, because the resulting
+    // `score == 0.0` stays below every dedup threshold.
+    let jaccard = jaccard_from_sets(&set_a, &set_b).unwrap_or(0.0);
+    let containment = containment_from_sets(&set_a, &set_b).unwrap_or(0.0);
     LexicalDedupScore {
         jaccard,
         containment,
@@ -717,6 +757,27 @@ mod tests {
         assert!((jaccard_similarity("", "") - 0.0).abs() < f32::EPSILON);
         assert!((jaccard_similarity("hello", "") - 0.0).abs() < f32::EPSILON);
         assert!((jaccard_similarity("", "world") - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dedup_both_empty_returns_no_comparison() {
+        // Both texts yield no tokens — comparison is undefined.
+        assert!(jaccard_similarity_opt("", "").is_none());
+        assert!(containment_similarity_opt("", "").is_none());
+        // Non-alphanumeric whitespace-only texts are likewise undefined.
+        assert!(jaccard_similarity_opt("   ", "\n\t").is_none());
+        assert!(containment_similarity_opt("   ", "\n\t").is_none());
+    }
+
+    #[test]
+    fn dedup_one_empty_returns_no_comparison() {
+        // One side has tokens, the other does not.
+        // Jaccard has a defined union (the non-empty side), so it DOES return Some(0.0).
+        // Containment is still undefined — there's no "smaller side" to ground it.
+        assert_eq!(jaccard_similarity_opt("hello world", ""), Some(0.0));
+        assert_eq!(jaccard_similarity_opt("", "hello world"), Some(0.0));
+        assert!(containment_similarity_opt("hello world", "").is_none());
+        assert!(containment_similarity_opt("", "hello world").is_none());
     }
 
     #[test]

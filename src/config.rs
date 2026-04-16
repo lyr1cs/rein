@@ -181,6 +181,12 @@ pub struct SearchConfig {
     /// MMR lambda: relevance-diversity tradeoff. 1.0 = off (pure relevance), 0.3 = strong diversity.
     #[serde(default = "default_mmr_lambda")]
     pub mmr_lambda: f64,
+    /// Strong-BM25-signal detection: top1 / top2 >= this ratio bypasses LLM rerank + expansion.
+    #[serde(default = "default_strong_signal_ratio")]
+    pub strong_signal_ratio: f32,
+    /// Single-positive-result strong signal: only result with BM25 score >= this value.
+    #[serde(default = "default_strong_signal_single")]
+    pub strong_signal_single: f32,
 }
 
 fn default_fusion_method() -> String {
@@ -200,6 +206,12 @@ fn default_llm_reranker_timeout_ms() -> u64 {
 }
 fn default_mmr_lambda() -> f64 {
     1.0
+}
+fn default_strong_signal_ratio() -> f32 {
+    1.5
+}
+fn default_strong_signal_single() -> f32 {
+    3.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +266,11 @@ pub struct AdaptiveConfig {
     /// Bayesian shrinkage prior strength. Default 5.0.
     #[serde(default = "default_shrinkage_prior")]
     pub shrinkage_prior: f64,
+    /// Time-to-live for in-memory AdaptiveState caches, in seconds. Default 300 (5 min).
+    /// A cached snapshot older than this is considered stale and triggers a refresh
+    /// from the metadata table on the next read.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
 }
 
 fn default_adaptive_enabled() -> bool {
@@ -277,6 +294,9 @@ fn default_alpha_max_step() -> f64 {
 fn default_shrinkage_prior() -> f64 {
     5.0
 }
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
 
 impl Default for AdaptiveConfig {
     fn default() -> Self {
@@ -288,6 +308,7 @@ impl Default for AdaptiveConfig {
             event_retention_days: default_event_retention_days(),
             alpha_max_step: default_alpha_max_step(),
             shrinkage_prior: default_shrinkage_prior(),
+            cache_ttl_secs: default_cache_ttl_secs(),
         }
     }
 }
@@ -604,6 +625,8 @@ impl Default for SearchConfig {
             llm_reranker_top_n: default_llm_reranker_top_n(),
             llm_reranker_timeout_ms: default_llm_reranker_timeout_ms(),
             mmr_lambda: default_mmr_lambda(),
+            strong_signal_ratio: default_strong_signal_ratio(),
+            strong_signal_single: default_strong_signal_single(),
         }
     }
 }
@@ -664,6 +687,8 @@ pub struct ProxyConfig {
     pub bind: String,
     pub anthropic_upstream: String,
     pub openai_upstream: String,
+    pub chatgpt_upstream: String,
+    pub codex_upstream: String,
     pub extract_enabled: bool,
     pub store_min_chars: usize,
     pub store_min_score: u32,
@@ -683,6 +708,8 @@ impl Default for ProxyConfig {
             bind: "127.0.0.1".to_string(),
             anthropic_upstream: "https://api.anthropic.com".to_string(),
             openai_upstream: "https://api.openai.com".to_string(),
+            chatgpt_upstream: "https://chatgpt.com/backend-api".to_string(),
+            codex_upstream: "https://chatgpt.com/backend-api/codex".to_string(),
             extract_enabled: true,
             store_min_chars: 220,
             store_min_score: 3,

@@ -351,7 +351,11 @@ pub fn recall_temporal_with_request_id(
         let (results, ranked) = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
         let scores: std::collections::HashMap<String, f32> = ranked.into_iter().collect();
         let ranked_vec: Vec<(String, f32)> = scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        let ss = crate::search::rerank_llm::detect_strong_signal(&ranked_vec);
+        let ss = crate::search::rerank_llm::detect_strong_signal_with_thresholds(
+            &ranked_vec,
+            config.search.strong_signal_ratio,
+            config.search.strong_signal_single,
+        );
         tracing::debug!(
             elapsed_ms = fts_start.elapsed().as_millis() as u64,
             hits = scores.len(),
@@ -900,18 +904,22 @@ pub fn recall_temporal_with_request_id(
                 config.search.rrf_vec_weight as f32,
             )
         };
+        let fts_empty = fts_for_fusion.is_empty();
+        let vec_empty = vec_for_fusion.is_empty();
+        let kg_empty = kg_ranked.is_empty();
+        let ep_empty = episode_ranked.is_empty();
         let mut lists = Vec::new();
-        if !fts_for_fusion.is_empty() {
+        if !fts_empty {
             lists.push((fts_for_fusion, fts_weight));
         }
-        if !vec_for_fusion.is_empty() {
+        if !vec_empty {
             lists.push((vec_for_fusion, vec_weight));
         }
-        if !kg_ranked.is_empty() {
+        if !kg_empty {
             let kg_weight = 0.3; // KG is supplementary
             lists.push((kg_ranked.clone(), kg_weight));
         }
-        if !episode_ranked.is_empty() {
+        if !ep_empty {
             let episode_weight = match strategy.query_type {
                 crate::search::classify::QueryType::Episodic => 0.45,
                 crate::search::classify::QueryType::Temporal => 0.30,
@@ -919,7 +927,16 @@ pub fn recall_temporal_with_request_id(
             };
             lists.push((episode_ranked.clone(), episode_weight));
         }
-        crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k)
+        let result = crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k);
+        if result.is_empty() && fts_empty && vec_empty && kg_empty && ep_empty {
+            // Diagnostic: every channel returned zero candidates. Emit a single
+            // structured log line so silent empty recalls are observable in ops.
+            tracing::info!(
+                query = %query,
+                "recall: all channels returned zero candidates"
+            );
+        }
+        result
     };
 
     // Build memory lookup from already-fetched results
