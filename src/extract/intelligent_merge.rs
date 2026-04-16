@@ -185,7 +185,7 @@ pub const GRAYZONE_HIGH: f32 = 0.85;
 /// Returns true if a similarity score sits in the gray zone that benefits
 /// from LLM classification.
 pub fn is_gray_zone(similarity: f32) -> bool {
-    similarity >= GRAYZONE_LOW && similarity < GRAYZONE_HIGH
+    (GRAYZONE_LOW..GRAYZONE_HIGH).contains(&similarity)
 }
 
 // ---------------------------------------------------------------------------

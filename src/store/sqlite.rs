@@ -1423,10 +1423,10 @@ impl SqliteStore {
                                             candidate_id,
                                             "intelligent_merge: existing vanished pre-update, falling back"
                                         );
-                                        return Ok(self.store_with_dedup_resolved(
+                                        return self.store_with_dedup_resolved(
                                             memory,
                                             DedupAction::MergeInto(candidate_id.clone()),
-                                        )?);
+                                        );
                                     }
                                     evidence_snapshot = existing;
                                     im_verdict_for_provenance = Some((

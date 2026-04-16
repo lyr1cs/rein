@@ -411,8 +411,7 @@ fn parse_agents_overview_version(text: &str) -> Option<String> {
 }
 
 fn parse_documented_mcp_tool_count(text: &str) -> Option<usize> {
-    text.lines()
-        .find_map(|line| parse_documented_mcp_tool_count_line(line))
+    text.lines().find_map(parse_documented_mcp_tool_count_line)
 }
 
 fn parse_documented_mcp_tool_count_line(line: &str) -> Option<usize> {
@@ -1243,7 +1242,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use std::thread;
 
     use crate::extract::hooks::buffer;
@@ -1392,9 +1391,11 @@ provider = "inherit"
         port
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Async mutex so env-var tests can await safely without tripping
+    /// `clippy::await_holding_lock`. All three doctor tests are `#[tokio::test]`.
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     struct EnvRestore {
@@ -1531,8 +1532,9 @@ provider = "inherit"
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn test_doctor_fix_reports_applied_repairs() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let _restore_http = EnvRestore {
             key: "REIN_HTTP_TOKEN",
             value: std::env::var("REIN_HTTP_TOKEN").ok(),
@@ -1592,8 +1594,9 @@ provider = "inherit"
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn test_doctor_flags_auth_and_queue_warnings() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let _restore_http = EnvRestore {
             key: "REIN_HTTP_TOKEN",
             value: std::env::var("REIN_HTTP_TOKEN").ok(),
@@ -1650,8 +1653,9 @@ provider = "inherit"
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn test_doctor_treats_empty_tokens_as_missing() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let _restore_http = EnvRestore {
             key: "REIN_HTTP_TOKEN",
             value: std::env::var("REIN_HTTP_TOKEN").ok(),
