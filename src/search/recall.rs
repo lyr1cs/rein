@@ -1426,152 +1426,6 @@ pub fn recall_temporal_with_request_id(
     Ok(results)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
-    use chrono::Utc;
-
-    fn test_memory(id: &str, support_count: u32, source_diversity: f32) -> Memory {
-        Memory {
-            id: id.to_string(),
-            layer: MemoryLayer::LTM,
-            topic: "docker".to_string(),
-            summary: format!("summary {id}"),
-            content: format!("content {id}"),
-            keywords: vec![],
-            importance: Importance::High,
-            source: Source::Manual,
-            strength: 0.8,
-            decay_lambda: 0.02,
-            access_count: 0,
-            superseded_by: None,
-            canonical_id: Some(id.to_string()),
-            support_count,
-            merge_count: support_count.saturating_sub(1),
-            dedup_confidence: 0.9,
-            source_diversity,
-            contradiction_score: 0.0,
-            related_ids: vec![],
-            concept_ids: vec![],
-            status: MemoryStatus::Active,
-            embedding: None,
-            tier: MemoryTier::Warm,
-            cluster_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_accessed: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn sort_recall_results_prefers_stronger_canonical_support_on_ties() {
-        let mut results = vec![
-            RecallResult {
-                memory: test_memory("low", 1, 1.0),
-                score: 0.8,
-                confidence: 0.7,
-                sources_hit: 1,
-                evidence_count: 0,
-                evidence_preview: vec![],
-            },
-            RecallResult {
-                memory: test_memory("high", 4, 2.0),
-                score: 0.8,
-                confidence: 0.7,
-                sources_hit: 1,
-                evidence_count: 0,
-                evidence_preview: vec![],
-            },
-        ];
-
-        sort_recall_results(&mut results);
-        assert_eq!(results[0].memory.id, "high");
-    }
-
-    #[test]
-    fn external_filters_require_matching_topic_and_keyword() {
-        let mut memory = test_memory("filtered", 1, 1.0);
-        memory.topic = "rust".to_string();
-        memory.keywords = vec!["borrow".to_string()];
-        memory.content = "borrow checker details".to_string();
-
-        assert!(matches_external_filters(
-            &memory,
-            Some("rust"),
-            Some("borrow"),
-            None,
-            None,
-        ));
-        assert!(!matches_external_filters(
-            &memory,
-            Some("python"),
-            Some("borrow"),
-            None,
-            None,
-        ));
-        assert!(!matches_external_filters(
-            &memory,
-            Some("rust"),
-            Some("decorator"),
-            None,
-            None,
-        ));
-        assert!(!matches_external_filters(
-            &memory,
-            Some("rust"),
-            Some("borrow"),
-            Some(memory.created_at + chrono::Duration::days(1)),
-            None,
-        ));
-    }
-
-    #[test]
-    fn evidence_rerank_boosts_supported_memory() {
-        let store = SqliteStore::in_memory().unwrap();
-        let supported_id = store.store(test_memory("supported", 3, 2.0)).unwrap();
-        let unsupported_id = store.store(test_memory("unsupported", 1, 1.0)).unwrap();
-
-        let supported = store.get(&supported_id).unwrap();
-        store
-            .snapshot_memory_as_evidence(
-                &supported_id,
-                &Memory {
-                    id: "ev1".to_string(),
-                    content: "database connection pool tuning".to_string(),
-                    summary: "connection pool tuning".to_string(),
-                    created_at: supported.created_at,
-                    updated_at: supported.updated_at,
-                    last_accessed: supported.last_accessed,
-                    ..supported.clone()
-                },
-            )
-            .unwrap();
-
-        let mut results = vec![
-            RecallResult {
-                memory: store.get(&supported_id).unwrap(),
-                score: 0.5,
-                confidence: 0.7,
-                sources_hit: 1,
-                evidence_count: 0,
-                evidence_preview: vec![],
-            },
-            RecallResult {
-                memory: store.get(&unsupported_id).unwrap(),
-                score: 0.52,
-                confidence: 0.7,
-                sources_hit: 1,
-                evidence_count: 0,
-                evidence_preview: vec![],
-            },
-        ];
-
-        apply_evidence_rerank(&store, "connection pool", &mut results, 3);
-        sort_recall_results(&mut results);
-        assert_eq!(results[0].memory.id, supported_id);
-    }
-}
 
 /// Try vector search: check cache first, then call API if available.
 /// Returns empty vec on any failure (graceful degradation).
@@ -1958,4 +1812,151 @@ fn collect_episode_memory_scores(
     }
 
     memory_scores
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
+    use chrono::Utc;
+
+    fn test_memory(id: &str, support_count: u32, source_diversity: f32) -> Memory {
+        Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "docker".to_string(),
+            summary: format!("summary {id}"),
+            content: format!("content {id}"),
+            keywords: vec![],
+            importance: Importance::High,
+            source: Source::Manual,
+            strength: 0.8,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: Some(id.to_string()),
+            support_count,
+            merge_count: support_count.saturating_sub(1),
+            dedup_confidence: 0.9,
+            source_diversity,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn sort_recall_results_prefers_stronger_canonical_support_on_ties() {
+        let mut results = vec![
+            RecallResult {
+                memory: test_memory("low", 1, 1.0),
+                score: 0.8,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+            RecallResult {
+                memory: test_memory("high", 4, 2.0),
+                score: 0.8,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+        ];
+
+        sort_recall_results(&mut results);
+        assert_eq!(results[0].memory.id, "high");
+    }
+
+    #[test]
+    fn external_filters_require_matching_topic_and_keyword() {
+        let mut memory = test_memory("filtered", 1, 1.0);
+        memory.topic = "rust".to_string();
+        memory.keywords = vec!["borrow".to_string()];
+        memory.content = "borrow checker details".to_string();
+
+        assert!(matches_external_filters(
+            &memory,
+            Some("rust"),
+            Some("borrow"),
+            None,
+            None,
+        ));
+        assert!(!matches_external_filters(
+            &memory,
+            Some("python"),
+            Some("borrow"),
+            None,
+            None,
+        ));
+        assert!(!matches_external_filters(
+            &memory,
+            Some("rust"),
+            Some("decorator"),
+            None,
+            None,
+        ));
+        assert!(!matches_external_filters(
+            &memory,
+            Some("rust"),
+            Some("borrow"),
+            Some(memory.created_at + chrono::Duration::days(1)),
+            None,
+        ));
+    }
+
+    #[test]
+    fn evidence_rerank_boosts_supported_memory() {
+        let store = SqliteStore::in_memory().unwrap();
+        let supported_id = store.store(test_memory("supported", 3, 2.0)).unwrap();
+        let unsupported_id = store.store(test_memory("unsupported", 1, 1.0)).unwrap();
+
+        let supported = store.get(&supported_id).unwrap();
+        store
+            .snapshot_memory_as_evidence(
+                &supported_id,
+                &Memory {
+                    id: "ev1".to_string(),
+                    content: "database connection pool tuning".to_string(),
+                    summary: "connection pool tuning".to_string(),
+                    created_at: supported.created_at,
+                    updated_at: supported.updated_at,
+                    last_accessed: supported.last_accessed,
+                    ..supported.clone()
+                },
+            )
+            .unwrap();
+
+        let mut results = vec![
+            RecallResult {
+                memory: store.get(&supported_id).unwrap(),
+                score: 0.5,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+            RecallResult {
+                memory: store.get(&unsupported_id).unwrap(),
+                score: 0.52,
+                confidence: 0.7,
+                sources_hit: 1,
+                evidence_count: 0,
+                evidence_preview: vec![],
+            },
+        ];
+
+        apply_evidence_rerank(&store, "connection pool", &mut results, 3);
+        sort_recall_results(&mut results);
+        assert_eq!(results[0].memory.id, supported_id);
+    }
 }
