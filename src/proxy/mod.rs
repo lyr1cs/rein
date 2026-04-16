@@ -598,7 +598,14 @@ impl WebSocketMirrorState {
             let opcode = b0 & 0x0f;
             let masked = (b1 & 0x80) != 0;
             let mut offset = 2usize;
-            let payload_len = match b1 & 0x7f {
+            // Hard cap on a single frame. RFC 6455 allows up to 2^63-1 bytes via
+            // the 64-bit extended length, but in practice no sane client or server
+            // sends multi-GB frames and a malicious upstream could construct huge
+            // values to crash or stall the mirror. We cap at 16 MiB per frame —
+            // 16× the per-message inflate cap — which still comfortably covers
+            // real Codex `/responses` deltas and any reasonable batched update.
+            const MAX_WS_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+            let payload_len: usize = match b1 & 0x7f {
                 len @ 0..=125 => len as usize,
                 126 => {
                     if self.pending.len() < offset + 2 {
@@ -613,7 +620,7 @@ impl WebSocketMirrorState {
                     if self.pending.len() < offset + 8 {
                         return;
                     }
-                    let len = u64::from_be_bytes([
+                    let len64 = u64::from_be_bytes([
                         self.pending[offset],
                         self.pending[offset + 1],
                         self.pending[offset + 2],
@@ -622,9 +629,36 @@ impl WebSocketMirrorState {
                         self.pending[offset + 5],
                         self.pending[offset + 6],
                         self.pending[offset + 7],
-                    ]) as usize;
+                    ]);
                     offset += 8;
-                    len
+                    // Reject obviously-malicious frame lengths: anything above
+                    // MAX_WS_FRAME_BYTES, or anything that can't fit in usize on
+                    // a 32-bit platform. We drain `pending` and treat it as an
+                    // oversize frame; this bounds per-frame work to O(cap).
+                    if len64 > MAX_WS_FRAME_BYTES {
+                        tracing::warn!(
+                            len64,
+                            cap = MAX_WS_FRAME_BYTES,
+                            "websocket mirror: extended frame length exceeds cap; discarding buffer"
+                        );
+                        self.pending.clear();
+                        self.fragmented_payload = None;
+                        self.fragmented_compressed = false;
+                        return;
+                    }
+                    match usize::try_from(len64) {
+                        Ok(len) => len,
+                        Err(_) => {
+                            tracing::warn!(
+                                len64,
+                                "websocket mirror: extended length exceeds usize on this target"
+                            );
+                            self.pending.clear();
+                            self.fragmented_payload = None;
+                            self.fragmented_compressed = false;
+                            return;
+                        }
+                    }
                 }
                 _ => unreachable!(),
             };
@@ -643,11 +677,26 @@ impl WebSocketMirrorState {
             } else {
                 None
             };
-            if self.pending.len() < offset + payload_len {
+            // Guard against offset + payload_len overflow (pathological inputs).
+            let total = match offset.checked_add(payload_len) {
+                Some(total) => total,
+                None => {
+                    tracing::warn!(
+                        offset,
+                        payload_len,
+                        "websocket mirror: offset + payload_len overflowed; discarding buffer"
+                    );
+                    self.pending.clear();
+                    self.fragmented_payload = None;
+                    self.fragmented_compressed = false;
+                    return;
+                }
+            };
+            if self.pending.len() < total {
                 return;
             }
-            let mut payload = self.pending[offset..offset + payload_len].to_vec();
-            self.pending.drain(..offset + payload_len);
+            let mut payload = self.pending[offset..total].to_vec();
+            self.pending.drain(..total);
             if let Some(mask) = mask {
                 for (index, byte) in payload.iter_mut().enumerate() {
                     *byte ^= mask[index % 4];
@@ -2425,15 +2474,46 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
                     recording_mode: RecordingMode::ArtifactMirrorOnly,
                 }),
             },
-            // Negative test: ChatGPT-login JWT without responses scope hits /responses.
-            // Must still route to CodexFirstParty (ambiguous path + chatgpt_account_id).
+            // Negative test: a plain JWT (no chatgpt_account_id, no responses scope)
+            // hitting POST /responses must produce a scope error rather than routing
+            // to the first-party backend. (Earlier this case was mis-named — the
+            // fixture is `JwtWithoutResponsesScope`, NOT a ChatGPT-login token.)
             RouteSupportCase {
-                name: "chatgpt_login_without_scope_still_routes_first_party",
+                name: "jwt_without_responses_scope_on_openai_responses_errs",
                 method: "POST",
                 path: "/responses",
                 token: TokenFixture::JwtWithoutResponsesScope,
                 scope_provider: Some(ProviderKind::OpenAiResponses),
                 expected_scope_error_contains: Some("api.responses.write"),
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::OpenAiResponses,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            // GET /responses with the `api.responses.read` scope passes the
+            // scope gate (v0.18.2 audit: GET + read-scope branch previously
+            // unexercised).
+            RouteSupportCase {
+                name: "responses_api_read_scope_get_passes",
+                method: "GET",
+                path: "/responses",
+                token: TokenFixture::ApiResponses,
+                scope_provider: Some(ProviderKind::OpenAiResponses),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::OpenAiResponses,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            // GET /responses with a bare JWT (no responses scope) must error
+            // mentioning `api.responses.read`, not `.write`.
+            RouteSupportCase {
+                name: "responses_missing_read_scope_on_get_errs",
+                method: "GET",
+                path: "/responses",
+                token: TokenFixture::JwtWithoutResponsesScope,
+                scope_provider: Some(ProviderKind::OpenAiResponses),
+                expected_scope_error_contains: Some("api.responses.read"),
                 expected_route: Some(ResolvedRoute {
                     provider: ProviderKind::OpenAiResponses,
                     recording_mode: RecordingMode::StructuredText,
@@ -3974,11 +4054,48 @@ x-openai-subagent: worker_abc\r\n\
             "access_token": "rot-secret",
         });
         let r = redact_jwt_payload(&payload);
+        // Safe claims retained.
         assert_eq!(r.get("iss").and_then(|v| v.as_str()), Some("issuer.example"));
-        assert_eq!(r.get("sub").and_then(|v| v.as_str()), Some("user_123"));
+        assert_eq!(r.get("aud").and_then(|v| v.as_str()), Some("rein"));
+        assert_eq!(r.get("scp"), payload.get("scp"));
+        // Identifying claims dropped (v0.18.2: tightened allowlist).
+        assert!(r.get("sub").is_none(), "sub must not leak");
+        assert!(
+            r.get("chatgpt_account_id").is_none(),
+            "chatgpt_account_id must not leak"
+        );
+        // Presence-only signal of ChatGPT-login shape.
+        assert_eq!(r.get("has_chatgpt_login").and_then(|v| v.as_bool()), Some(true));
+        // Everything else dropped.
         assert!(r.get("private_note").is_none());
         assert!(r.get("email").is_none());
         assert!(r.get("access_token").is_none());
+    }
+
+    #[test]
+    fn redact_jwt_payload_has_chatgpt_login_false_for_api_key() {
+        let payload = serde_json::json!({
+            "iss": "issuer",
+            "scp": ["api.responses.write"],
+        });
+        let r = redact_jwt_payload(&payload);
+        assert_eq!(r.get("has_chatgpt_login").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn redact_jwt_payload_has_chatgpt_login_true_for_nested_auth() {
+        let payload = serde_json::json!({
+            "iss": "issuer",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct_42"},
+        });
+        let r = redact_jwt_payload(&payload);
+        assert_eq!(r.get("has_chatgpt_login").and_then(|v| v.as_bool()), Some(true));
+        // The raw account id must NOT appear anywhere in the redacted value.
+        let serialized = r.to_string();
+        assert!(
+            !serialized.contains("acct_42"),
+            "account id must not appear in redacted payload, got: {serialized}"
+        );
     }
 
     #[test]
@@ -4125,6 +4242,45 @@ x-openai-subagent: worker_abc\r\n\
     }
 
     // --- v0.18.1 WS boundary-case hardening tests ---
+
+    #[test]
+    fn websocket_mirror_rejects_oversize_len127_frame() {
+        // Craft a frame header with len == 127 (8-byte extended length) whose
+        // declared length exceeds the cap. Must NOT panic / allocate — state
+        // should clear `pending` and reset fragmentation.
+        let mut state = empty_mirror_state();
+        // Pre-seed a fragmentation context to make sure the guard clears it.
+        state.fragmented_payload = Some(b"stale".to_vec());
+        state.fragmented_compressed = true;
+        // Frame: fin=1, opcode=1 (text), masked=0, len byte=127.
+        // Extended length = 1 GiB (exceeds 16 MiB cap).
+        let mut frame = vec![0x81, 127];
+        frame.extend_from_slice(&(1_073_741_824u64).to_be_bytes());
+        state.feed(&frame, true);
+        assert!(
+            state.fragmented_payload.is_none(),
+            "oversize frame must clear fragmentation state"
+        );
+        assert!(
+            state.pending.is_empty(),
+            "oversize frame must drain pending buffer"
+        );
+    }
+
+    #[test]
+    fn websocket_mirror_defers_on_partial_len127_header() {
+        // If only 5 of the 8 extended-length bytes have arrived, the mirror
+        // must NOT consume anything and must wait for more data.
+        let mut state = empty_mirror_state();
+        // 2-byte header + 5 (not 8) bytes of extended length = partial frame.
+        let partial = [0x81u8, 127, 0, 0, 0, 0, 1];
+        state.feed(&partial, true);
+        assert_eq!(
+            state.pending.len(),
+            partial.len(),
+            "partial len==127 header must be held in pending for more data"
+        );
+    }
 
     #[test]
     fn websocket_mirror_decodes_malformed_zlib_gracefully() {

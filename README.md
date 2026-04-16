@@ -12,6 +12,27 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
+### What's new in v0.18.2 (2026-04-17)
+
+Patch release on top of v0.18.1 addressing the final batch of Codex-review findings — 1 HIGH + 2 MEDIUM + 4 LOW — plus 4 new regression tests (472 pass / clippy -D warnings 0 errors).
+
+- **HIGH**: WebSocket extended-frame (`len == 127`) length is now bounded at 16 MiB per frame. Malicious upstream frames declaring multi-GB payloads can no longer stall the mirror or force unbounded allocation. Checked arithmetic on `offset + payload_len` prevents pathological overflow.
+- **MEDIUM**: LIKE-fallback escape order in `fts.rs` now escapes backslash first, then `%` and `_`, so queries containing a literal `\` no longer silently change match semantics.
+- **MEDIUM**: `test_env_override_db` + `sqlite::test_store_with_dedup_intelligent_merge_e2e_records_provenance` are now part of `#[serial_test::serial(global_state)]` and use RAII `EnvGuard` — env state is restored even when assertions panic.
+- **LOW**: `redact_jwt_payload` allowlist tightened — `sub` and `chatgpt_account_id` (including the nested `auth.chatgpt_account_id`) are no longer emitted. A presence-only `has_chatgpt_login: bool` replaces the account id. New `hashed_account_fingerprint()` helper ready if a future diagnostic genuinely needs a tenant identifier.
+- **LOW**: route-matrix case renamed to `jwt_without_responses_scope_on_openai_responses_errs` to match its actual fixture (was mis-named "chatgpt_login_without_scope_…").
+- **LOW**: GET + read-scope matrix coverage added (`responses_api_read_scope_get_passes`, `responses_missing_read_scope_on_get_errs`).
+- **LOW**: content-field LIKE fallback in `fts.rs` now gated: skipped when the store has more than 50 000 memories AND the query has fewer than 4 characters. Keeps latency bounded on large rein installations without giving up the "catch verbatim matches FTS missed" safety net on typical deployments.
+
+### What's new in v0.18.1 (2026-04-17)
+
+- **CI is green again** — all 17 pre-existing clippy warnings addressed (`cargo clippy -D warnings` now passes). 0 errors.
+- **Doctor parallel-test flake reduced** — rate dropped from ~33% to ~20% via `tokio::sync::Mutex` + `serial_test`.
+- **Test depth +13** — 7 new WebSocket boundary cases + 6 new route-matrix cross-product rows.
+- **`jwt.rs` extracted** — first step of the `proxy/mod.rs` split (140 lines out; ws_mirror deferred to a future release).
+- **H1 content-field LIKE fallback** — recall now surfaces verbatim-matched memories the FTS tokenizer missed.
+- **`redact_jwt_payload` integrated** into `responses_scope_error` diagnostic log — ops can see the scope mismatch context without leaking identifying claims.
+
 ### What's new in v0.18.0 (2026-04-17)
 
 - **Codex subscription loopback proxy (Phase C/D)** — first-party WebSocket mirror with `permessage-deflate` decoding, `ArtifactMirrorOnly` recording gate, ChatGPT backend helper routes (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`). `codexsubp` (recommended) and `codexsubpws` (experimental WS-first) entrypoints via `rein init --proxy`. `chatgpt_base_url` now pinned to `.../backend-api/codex` for Codex CLI `PathStyle` compatibility.

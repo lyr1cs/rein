@@ -83,9 +83,16 @@ pub fn search_fts(
         return Ok(results);
     }
 
-    // Fallback to LIKE search on topic and summary
-    // Escape LIKE wildcards in user input to prevent wildcard injection
-    let escaped = query.replace('%', "\\%").replace('_', "\\_");
+    // Fallback to LIKE search on topic and summary.
+    // Escape order matters: we use `ESCAPE '\'` in the SQL, so the escape
+    // character (`\`) itself MUST be escaped first. Otherwise a user query
+    // containing a literal backslash would cause the next character to be
+    // interpreted as escaped, silently changing the match behavior
+    // (e.g. "a\\b" would become "a\\b" with the `\` consuming the `b`).
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
     let like_pattern = format!("%{escaped}%");
     let fallback: Vec<(crate::types::Memory, f32)> = if let Some(topic) = topic {
         let sql = format!(
@@ -140,6 +147,31 @@ pub fn search_fts(
     // Catches cases where the query string appears verbatim in memory body
     // but the FTS tokenizer missed it (e.g. rare technical identifiers that
     // were filtered as stopwords, or CJK edge cases).
+    //
+    // Gating: This is an unindexed O(N) full-table scan over `memories.content`.
+    // We only run it when:
+    //   1. The store is small enough that a full scan is cheap (< 50_000 rows), OR
+    //   2. The query is long enough (>= 4 chars) that index filters are likely
+    //      to return fast even on big stores (BM25 wouldn't have reached this
+    //      branch if either tokenizer had indexed it).
+    // This keeps latency bounded on large rein installations without giving up
+    // the "catch verbatim matches FTS missed" safety net on typical deployments.
+    const CONTENT_FALLBACK_SCAN_THRESHOLD: i64 = 50_000;
+    const CONTENT_FALLBACK_MIN_QUERY_CHARS: usize = 4;
+    let memory_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap_or(CONTENT_FALLBACK_SCAN_THRESHOLD + 1);
+    if memory_count > CONTENT_FALLBACK_SCAN_THRESHOLD
+        && query.chars().count() < CONTENT_FALLBACK_MIN_QUERY_CHARS
+    {
+        tracing::debug!(
+            memory_count,
+            query_chars = query.chars().count(),
+            "fts: skipping content-field LIKE fallback (store too large for short query)"
+        );
+        return Ok(Vec::new());
+    }
+
     let content_fallback = if let Some(topic) = topic {
         let sql = format!(
             "{} WHERE m.content LIKE ?1 ESCAPE '\\' AND m.topic = ?2 \
