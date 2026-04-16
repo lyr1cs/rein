@@ -87,7 +87,7 @@ pub fn search_fts(
     // Escape LIKE wildcards in user input to prevent wildcard injection
     let escaped = query.replace('%', "\\%").replace('_', "\\_");
     let like_pattern = format!("%{escaped}%");
-    let fallback = if let Some(topic) = topic {
+    let fallback: Vec<(crate::types::Memory, f32)> = if let Some(topic) = topic {
         let sql = format!(
             "{} WHERE (m.topic LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\') \
              AND m.topic = ?2 ORDER BY m.strength DESC LIMIT ?3",
@@ -132,5 +132,58 @@ pub fn search_fts(
             .collect()
     };
 
-    Ok(fallback)
+    if !fallback.is_empty() {
+        return Ok(fallback);
+    }
+
+    // Final chance: LIKE search on content field (not just topic/summary).
+    // Catches cases where the query string appears verbatim in memory body
+    // but the FTS tokenizer missed it (e.g. rare technical identifiers that
+    // were filtered as stopwords, or CJK edge cases).
+    let content_fallback = if let Some(topic) = topic {
+        let sql = format!(
+            "{} WHERE m.content LIKE ?1 ESCAPE '\\' AND m.topic = ?2 \
+             ORDER BY m.strength DESC LIMIT ?3",
+            memory_select_base()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![like_pattern, topic, limit as i64],
+            |row| {
+                row_to_memory(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|m| (m, 0.0f32))
+            .collect::<Vec<_>>()
+    } else {
+        let sql = format!(
+            "{} WHERE m.content LIKE ?1 ESCAPE '\\' \
+             ORDER BY m.strength DESC LIMIT ?2",
+            memory_select_base()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![like_pattern, limit as i64], |row| {
+            row_to_memory(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|m| (m, 0.0f32))
+            .collect::<Vec<_>>()
+    };
+
+    Ok(content_fallback)
 }

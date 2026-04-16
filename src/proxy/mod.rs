@@ -8,13 +8,19 @@
 
 mod anthropic;
 mod extract;
+mod jwt;
 mod openai;
 mod policy;
 mod provider;
 mod responses;
 
+use jwt::{bearer_jwt_info, decode_jwt_payload_for_logging, redact_jwt_payload};
+#[cfg(test)]
+use jwt::current_unix_timestamp;
+
 use crate::config::ReinConfig;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -22,7 +28,6 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use provider::{ProviderKind, RecordingMode};
-use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -335,19 +340,14 @@ fn default_codex_user_agent() -> String {
 }
 
 fn websocket_upstream_origin(ws_url: &str) -> Option<String> {
-    if let Some(rest) = ws_url.strip_prefix("wss://") {
-        Some(format!(
-            "https://{}",
-            rest.split('/').next().unwrap_or_default()
-        ))
-    } else if let Some(rest) = ws_url.strip_prefix("ws://") {
-        Some(format!(
-            "http://{}",
-            rest.split('/').next().unwrap_or_default()
-        ))
-    } else {
-        None
-    }
+    ws_url
+        .strip_prefix("wss://")
+        .map(|rest| format!("https://{}", rest.split('/').next().unwrap_or_default()))
+        .or_else(|| {
+            ws_url
+                .strip_prefix("ws://")
+                .map(|rest| format!("http://{}", rest.split('/').next().unwrap_or_default()))
+        })
 }
 
 fn extract_session_id(headers: &hyper::HeaderMap) -> Option<String> {
@@ -1775,113 +1775,26 @@ fn responses_scope_error(
         return None;
     }
 
+    // Emit a redacted diagnostic so ops can debug scope mismatches without
+    // leaking the full JWT payload. `redact_jwt_payload` keeps only iss/aud/
+    // exp/iat/sub/nbf/scp/chatgpt_account_id claims — everything else is
+    // dropped before it reaches tracing.
+    if let Some(decoded) = decode_jwt_payload_for_logging(headers) {
+        tracing::info!(
+            required_scope = %required_scope,
+            redacted_claims = %redact_jwt_payload(&decoded),
+            "responses scope check failed; bearer does not carry the required scope"
+        );
+    }
+
     Some(format!(
         "Codex proxy request blocked locally: bearer token is missing required scope '{required_scope}'. \
 This usually means ChatGPT login tokens are not compatible with OpenAI Responses API proxying."
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BearerJwtInfo {
-    scopes: Vec<String>,
-    has_public_responses_scope: bool,
-    is_chatgpt_login: bool,
-}
-
-/// Keep only the small set of claims needed for routing; drop everything else so
-/// nothing derived from the JWT can leak verbatim into logs or error responses.
-/// The proxy does NOT verify signatures — upstream does. This function is strictly
-/// for extracting routing hints from a transport-layer token.
-///
-/// Currently only used by tests + future log/error paths. Kept as defensive
-/// infrastructure so any future code that needs to emit JWT-derived context has
-/// a ready-to-use redaction primitive.
-#[allow(dead_code)]
-fn redact_jwt_payload(payload: &Value) -> Value {
-    let mut out = serde_json::Map::new();
-    for k in [
-        "iss",
-        "aud",
-        "sub",
-        "exp",
-        "iat",
-        "nbf",
-        "scp",
-        "chatgpt_account_id",
-    ] {
-        if let Some(v) = payload.get(k) {
-            out.insert(k.to_string(), v.clone());
-        }
-    }
-    // Nested OpenAI auth claim, keep only chatgpt_account_id.
-    if let Some(nested) = payload
-        .get("https://api.openai.com/auth")
-        .and_then(|v| v.get("chatgpt_account_id"))
-    {
-        let mut auth_obj = serde_json::Map::new();
-        auth_obj.insert("chatgpt_account_id".to_string(), nested.clone());
-        out.insert(
-            "https://api.openai.com/auth".to_string(),
-            Value::Object(auth_obj),
-        );
-    }
-    Value::Object(out)
-}
-
-fn current_unix_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn bearer_jwt_info(headers: &hyper::HeaderMap) -> Option<BearerJwtInfo> {
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    let token = auth.strip_prefix("Bearer ")?;
-    let payload = token.split('.').nth(1)?;
-    let decoded = BASE64_URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let json: Value = serde_json::from_slice(&decoded).ok()?;
-
-    // Expiry check: if `exp` is present and in the past, treat the bearer as absent
-    // so routing logic does not trust claims from an expired token. Upstream still
-    // validates signatures; this is an additional local sanity check.
-    if let Some(exp) = json.get("exp").and_then(|v| v.as_i64()) {
-        let now = current_unix_timestamp();
-        // 30 s clock skew allowance before rejecting.
-        if exp + 30 < now {
-            tracing::debug!("bearer token is expired, ignoring JWT claims for routing");
-            return None;
-        }
-    }
-
-    let scopes = json
-        .get("scp")
-        .and_then(|value| value.as_array())
-        .map(|scopes| {
-            scopes
-                .iter()
-                .filter_map(|scope| scope.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let has_public_responses_scope = scopes
-        .iter()
-        .any(|scope| scope == "api.responses.read" || scope == "api.responses.write");
-    let is_chatgpt_login = json
-        .get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(|account| account.as_str())
-        .is_some()
-        || json
-            .get("chatgpt_account_id")
-            .and_then(|account| account.as_str())
-            .is_some();
-    Some(BearerJwtInfo {
-        scopes,
-        has_public_responses_scope,
-        is_chatgpt_login,
-    })
-}
+// JWT decode helpers moved to `src/proxy/jwt.rs` in v0.18.1 (audit 'ws_mirror + jwt + routing' split).
+// Re-imported below via the module declaration at the top of this file.
 
 #[cfg(test)]
 mod tests {
@@ -2454,6 +2367,85 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
                 name: "unknown_v1_models_route_rejected",
                 method: "GET",
                 path: "/v1/models",
+                token: TokenFixture::None,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: None,
+            },
+            // --- v0.18.x cross-product expansion (audit gap fill) ---
+            // /api/codex/* family: Codex CLI emits this when chatgpt_base_url
+            // does NOT contain /backend-api. rein v0.18 MUST accept it.
+            RouteSupportCase {
+                name: "api_codex_tasks_list_routes_first_party",
+                method: "GET",
+                path: "/api/codex/tasks/list",
+                token: TokenFixture::None,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "api_codex_responses_routes_first_party_structured",
+                method: "POST",
+                path: "/api/codex/responses",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            // /backend-api/codex/authenticate_app_v2 — Codex agent identity bootstrap.
+            RouteSupportCase {
+                name: "backend_api_authenticate_app_v2_mirror_only",
+                method: "POST",
+                path: "/backend-api/codex/authenticate_app_v2",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            // /backend-api/codex/safety/arc — Codex safety/moderation endpoint.
+            RouteSupportCase {
+                name: "backend_api_safety_arc_mirror_only",
+                method: "POST",
+                path: "/backend-api/codex/safety/arc",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            // Negative test: ChatGPT-login JWT without responses scope hits /responses.
+            // Must still route to CodexFirstParty (ambiguous path + chatgpt_account_id).
+            RouteSupportCase {
+                name: "chatgpt_login_without_scope_still_routes_first_party",
+                method: "POST",
+                path: "/responses",
+                token: TokenFixture::JwtWithoutResponsesScope,
+                scope_provider: Some(ProviderKind::OpenAiResponses),
+                expected_scope_error_contains: Some("api.responses.write"),
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::OpenAiResponses,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            // Negative test: /models with no token → Codex doesn't send this directly,
+            // but rein should still make a routing decision (falls to ChatGptBackend
+            // via ambiguous_chatgpt_backend_path or stays unrouted).
+            RouteSupportCase {
+                name: "models_no_token_unrouted",
+                method: "GET",
+                path: "/models",
                 token: TokenFixture::None,
                 scope_provider: None,
                 expected_scope_error_contains: None,
@@ -4130,5 +4122,119 @@ x-openai-subagent: worker_abc\r\n\
         assert!(should_strip_request_header("host"));
         assert!(should_strip_request_header("x-rein-token"));
         assert!(should_strip_request_header("content-length"));
+    }
+
+    // --- v0.18.1 WS boundary-case hardening tests ---
+
+    #[test]
+    fn websocket_mirror_decodes_malformed_zlib_gracefully() {
+        // A compressed-text frame whose payload is not a valid deflate stream must
+        // return None from decode_text_payload, not panic.
+        let garbage = [0xff, 0xfe, 0xfd, 0xfc, 0xfb];
+        let out = WebSocketMirrorState::decode_text_payload(&garbage, true);
+        assert!(out.is_none(), "malformed deflate must not panic and must return None");
+    }
+
+    #[test]
+    fn websocket_mirror_ping_frame_does_not_corrupt_state() {
+        let mut state = empty_mirror_state();
+        // Inject an active fragmentation context; a ping frame must not disturb it.
+        state.fragmented_payload = Some(b"partial".to_vec());
+        state.fragmented_compressed = false;
+        // Ping frame: fin=1, opcode=9, zero payload → [0x89, 0x00].
+        let ping = [0x89, 0x00];
+        state.feed(&ping, true);
+        // Ping is ignored (opcode not in {0x0, 0x1, 0x8}); fragmentation state preserved.
+        assert_eq!(state.fragmented_payload.as_deref(), Some(b"partial".as_slice()));
+        assert!(!state.close_seen);
+    }
+
+    #[test]
+    fn websocket_mirror_pong_frame_does_not_corrupt_state() {
+        let mut state = empty_mirror_state();
+        state.fragmented_payload = Some(b"partial".to_vec());
+        // Pong frame: fin=1, opcode=10 (0xA), zero payload → [0x8A, 0x00].
+        let pong = [0x8a, 0x00];
+        state.feed(&pong, true);
+        assert_eq!(state.fragmented_payload.as_deref(), Some(b"partial".as_slice()));
+        assert!(!state.close_seen);
+    }
+
+    #[test]
+    fn websocket_mirror_decodes_compressed_fragmented_message() {
+        // Build a compressed message, then split it into start+continuation fragments
+        // at a byte boundary. Both fragments carry rsv1=1 conceptually — but per RFC
+        // 7692, only the first (opcode 0x1) frame carries rsv1; continuation frames
+        // (opcode 0x0) inherit the compressed context from the start frame.
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let raw = b"response.output_text.delta hello world";
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(raw).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mid = compressed.len() / 2;
+        let (a, b) = compressed.split_at(mid);
+
+        let mut state = empty_mirror_state();
+        // Start frame: fin=0, rsv1=1, opcode=1 → 0x41 (first byte), len = a.len().
+        // Byte 0: 0b0_1_00_0001 (fin=0, rsv1=1, rsv2=0, rsv3=0, opcode=1) = 0x41
+        // We assume a.len() < 126 for simplicity in this synthetic test.
+        assert!(a.len() < 126, "test requires small first half");
+        let mut frame1 = vec![0x41, a.len() as u8];
+        frame1.extend_from_slice(a);
+        state.feed(&frame1, true);
+        assert!(
+            state.fragmented_payload.is_some(),
+            "start frame must open fragmentation context"
+        );
+        assert!(state.fragmented_compressed);
+
+        // Continuation + fin=1: fin=1, rsv1=0, opcode=0 → 0x80, len = b.len().
+        assert!(b.len() < 126, "test requires small second half");
+        let mut frame2 = vec![0x80, b.len() as u8];
+        frame2.extend_from_slice(b);
+        state.feed(&frame2, true);
+        // The fragmented payload is consumed after the final frame.
+        assert!(state.fragmented_payload.is_none());
+        // One event got recorded with the decoded text.
+        let combined = state.event_messages.join("\n");
+        assert!(
+            combined.contains("response.output_text.delta"),
+            "decoded output must surface in event log, got: {combined}"
+        );
+    }
+
+    #[test]
+    fn decode_jwt_payload_for_logging_returns_none_for_missing_header() {
+        let headers = hyper::HeaderMap::new();
+        assert!(decode_jwt_payload_for_logging(&headers).is_none());
+    }
+
+    #[test]
+    fn decode_jwt_payload_for_logging_returns_none_for_non_bearer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            hyper::header::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert!(decode_jwt_payload_for_logging(&headers).is_none());
+    }
+
+    #[test]
+    fn decode_jwt_payload_for_logging_extracts_claims_for_redaction() {
+        let token = build_jwt_with_payload(serde_json::json!({
+            "exp": current_unix_timestamp() + 3600,
+            "scp": ["openid"],
+            "private_note": "SHOULD NOT LEAK AFTER REDACT",
+        }));
+        let headers = headers_with_bearer(&token);
+        let decoded = decode_jwt_payload_for_logging(&headers).expect("valid JWT should decode");
+        // The raw decode includes private_note (pre-redaction).
+        assert!(decoded.get("private_note").is_some());
+        // Redaction drops it.
+        let red = redact_jwt_payload(&decoded);
+        assert!(red.get("private_note").is_none());
+        assert!(red.get("exp").is_some());
     }
 }

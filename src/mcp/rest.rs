@@ -161,6 +161,7 @@ pub async fn handle_rest_request<B>(
     }
 }
 
+#[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body; boxing again would force every caller to dereference.
 fn require_mutation_marker<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
     let marker = req
         .headers()
@@ -182,6 +183,7 @@ fn require_mutation_marker<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
 /// Used for endpoints that return raw upstream transcripts (e.g. `/api/artifacts`).
 /// When `REIN_HTTP_TOKEN` is unset, the gate is permissive — this preserves the
 /// localhost-only dev convenience. When it IS set, the token must match exactly.
+#[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body.
 fn require_read_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
     let expected = std::env::var("REIN_HTTP_TOKEN")
         .ok()
@@ -674,6 +676,7 @@ fn api_recall_stream(
     }
 }
 
+#[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body.
 fn run_recall_query(
     config: &ReinConfig,
     query: &std::collections::HashMap<String, String>,
@@ -1538,14 +1541,16 @@ mod tests {
     }
 
     // Serialize env-var tests so parallel cases don't race on REIN_HTTP_TOKEN.
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    // Async mutex so the guard is Send across `.await` (no `await_holding_lock`).
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn api_artifacts_auth_gate_matrix() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
 
         // Case 1: REIN_HTTP_TOKEN unset ⇒ permissive (dev convenience).
         std::env::remove_var("REIN_HTTP_TOKEN");
@@ -1616,8 +1621,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn api_artifact_detail_redacts_raw_bearer_tokens() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         std::env::remove_var("REIN_HTTP_TOKEN");
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("artifacts.db");
@@ -1644,8 +1650,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn api_artifact_detail_omits_transcripts_when_include_false() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         std::env::remove_var("REIN_HTTP_TOKEN");
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("artifacts.db");
@@ -1679,8 +1686,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn api_artifact_detail_truncates_oversize_body() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         std::env::remove_var("REIN_HTTP_TOKEN");
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("artifacts.db");

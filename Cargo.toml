@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
 license = "MIT"
@@ -52,6 +52,7 @@ gui = ["rust-embed"]
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
 
 [profile.release]
 opt-level = 3
