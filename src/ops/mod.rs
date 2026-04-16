@@ -255,7 +255,7 @@ fn detect_conflict_marker(
             continue;
         }
 
-        let score = ((0.80 - sim).max(0.0)).min(0.80);
+        let score = (0.80 - sim).clamp(0.0, 0.80);
         let evidence_keyword = format!("conflict-{}", normalize_auto_concept_name(&concept.name));
         let candidate = ConflictMarker {
             score,
@@ -668,7 +668,7 @@ fn is_useful_conflict_query_token(token: &str) -> bool {
         "knowledge",
     ];
 
-    !STOPWORDS.iter().any(|stop| token == *stop)
+    !STOPWORDS.contains(&token)
 }
 
 /// Ingest a full session/transcript through the full extraction path.
