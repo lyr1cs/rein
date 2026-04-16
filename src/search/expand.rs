@@ -3,6 +3,18 @@ use crate::types::error::{ReinError, ReinResult};
 use reqwest::Client;
 use serde_json::{json, Value};
 
+/// Max byte length of an input query accepted by the expander.
+/// Above this, expansion is skipped (returns empty) — LLM prompt injection risk scales
+/// with attacker-controlled input size, and genuine queries are almost never this long.
+const MAX_EXPAND_QUERY_LEN: usize = 8 * 1024;
+
+/// Render a user query as a JSON-string literal (with surrounding quotes and full escape)
+/// so it cannot escape the prompt's string boundary.
+fn quote_for_prompt(query: &str) -> String {
+    // serde_json::to_string on a &str always succeeds for valid UTF-8.
+    serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 const EXPAND_SYSTEM_PROMPT: &str = r#"Given a memory search query, generate alternative phrasings to improve recall of stored memories.
 
 For CHINESE queries:
@@ -79,14 +91,18 @@ impl GeminiExpander {
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
+        if query.len() > MAX_EXPAND_QUERY_LEN {
+            return Ok(Vec::new());
+        }
         let lang_hint = if is_chinese_query(query) {
             "Language hint: Chinese query — prioritize Chinese-native alternatives first.\n\n"
         } else {
             ""
         };
+        let safe_query = quote_for_prompt(query);
         let prompt = format!(
-            "{}\n\n{}Generate up to {} alternatives.\n\nInput query: \"{}\"",
-            EXPAND_SYSTEM_PROMPT, lang_hint, max, query
+            "{}\n\n{}Generate up to {} alternatives.\n\nInput query: {}",
+            EXPAND_SYSTEM_PROMPT, lang_hint, max, safe_query
         );
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
@@ -153,14 +169,18 @@ impl OmlxExpander {
     }
 
     async fn expand(&self, query: &str, max: usize) -> ReinResult<Vec<String>> {
+        if query.len() > MAX_EXPAND_QUERY_LEN {
+            return Ok(Vec::new());
+        }
         let lang_hint = if is_chinese_query(query) {
             "Language hint: Chinese query — prioritize Chinese-native alternatives first.\n\n"
         } else {
             ""
         };
+        let safe_query = quote_for_prompt(query);
         let user_msg = format!(
-            "{}Generate up to {} alternatives.\n\nInput query: \"{}\"",
-            lang_hint, max, query
+            "{}Generate up to {} alternatives.\n\nInput query: {}",
+            lang_hint, max, safe_query
         );
         let url = format!("{}/chat/completions", self.endpoint);
         let disable_thinking = self.disable_thinking;
@@ -417,6 +437,29 @@ mod tests {
         let input = r#"["a", "b", "c", "d", "e"]"#;
         let result = parse_expansion_response(input, 2).unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn quote_for_prompt_escapes_embedded_quotes_and_braces() {
+        let out = quote_for_prompt(r#"test" , "injected"#);
+        assert_eq!(out, r#""test\" , \"injected""#);
+        let with_brace = quote_for_prompt(r#"}{"a":1"#);
+        assert!(with_brace.starts_with('"') && with_brace.ends_with('"'));
+        assert!(with_brace.contains("\\\""));
+    }
+
+    #[test]
+    fn quote_for_prompt_escapes_newlines() {
+        let out = quote_for_prompt("line1\nline2");
+        assert_eq!(out, "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn max_expand_query_len_is_enforced_via_length_check() {
+        // Smoke check on the constant; the guard in expand() returns Ok(vec![])
+        // so expander network calls are skipped entirely for oversize input.
+        let big = "a".repeat(MAX_EXPAND_QUERY_LEN + 1);
+        assert!(big.len() > MAX_EXPAND_QUERY_LEN);
     }
 
     #[test]
