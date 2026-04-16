@@ -96,9 +96,17 @@ struct MstEdge {
 
 /// Compute core distances: for each point, the distance to its `min_samples`-th
 /// nearest neighbor (1-indexed, so the point itself is excluded).
+///
+/// For degenerate inputs (n <= 1) core distances are vacuous; callers should
+/// short-circuit before reaching this function, but we also return an empty /
+/// zero-filled vector defensively so downstream MR/MST code cannot panic.
 fn compute_core_distances(dist_matrix: &[Vec<f32>], min_samples: usize) -> Vec<f32> {
     let n = dist_matrix.len();
-    let k = min_samples.min(n.saturating_sub(1));
+    if n <= 1 {
+        // Not enough points for a meaningful k-th nearest neighbor.
+        return vec![0.0f32; n];
+    }
+    let k = min_samples.min(n - 1);
     let mut core = vec![0.0f32; n];
     for i in 0..n {
         let mut dists: Vec<f32> = (0..n)
@@ -738,6 +746,20 @@ pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> Hd
         };
     }
 
+    let mcs = min_cluster_size.max(2);
+
+    // Degenerate input: a single point can never form a cluster of size >= 2,
+    // and trying to compute core distances / MR on n=1 produces meaningless
+    // values. Treat it as noise explicitly rather than relying on downstream
+    // guards to handle the edge case.
+    if n == 1 || n < mcs {
+        return HdbscanResult {
+            clusters: Vec::new(),
+            labels: vec![None; n],
+            noise_indices: (0..n).collect(),
+        };
+    }
+
     // For large datasets, sample + cluster + propagate labels to avoid O(n^2) OOM
     if n > HDBSCAN_FULL_MATRIX_LIMIT {
         return hdbscan_sampled(
@@ -748,7 +770,6 @@ pub fn hdbscan(embeddings: &[(String, Vec<f32>)], min_cluster_size: usize) -> Hd
         );
     }
 
-    let mcs = min_cluster_size.max(2);
     let min_samples = mcs;
 
     let vecs: Vec<Vec<f32>> = embeddings.iter().map(|(_, v)| v.clone()).collect();
@@ -788,6 +809,18 @@ pub fn hdbscan_with_params(
         };
     }
 
+    let mcs = min_cluster_size.max(2);
+
+    // Same degenerate-input guard as `hdbscan`: n == 1 or n < min_cluster_size
+    // produces no meaningful cluster, so return all-noise deterministically.
+    if n == 1 || n < mcs {
+        return HdbscanResult {
+            clusters: Vec::new(),
+            labels: vec![None; n],
+            noise_indices: (0..n).collect(),
+        };
+    }
+
     // OOM protection: route to sampled path for large datasets
     if n > HDBSCAN_FULL_MATRIX_LIMIT {
         return hdbscan_sampled(
@@ -798,7 +831,6 @@ pub fn hdbscan_with_params(
         );
     }
 
-    let mcs = min_cluster_size.max(2);
     let ms = min_samples.unwrap_or(mcs);
 
     let vecs: Vec<Vec<f32>> = embeddings.iter().map(|(_, v)| v.clone()).collect();
@@ -1156,6 +1188,35 @@ mod tests {
         let result = hdbscan(&emb, 2);
         assert_eq!(result.labels.len(), 1);
         assert!(result.labels[0].is_none());
+    }
+
+    #[test]
+    fn hdbscan_single_point_returns_noise_or_singleton() {
+        // Single point must be handled deterministically: no panic, no Some(cluster).
+        let emb = vec![("only".to_string(), vec![0.5, 0.5, 0.5])];
+        let r = hdbscan(&emb, 3);
+        assert_eq!(r.labels.len(), 1);
+        assert!(r.labels[0].is_none(), "single point must be noise");
+        assert!(r.clusters.is_empty());
+        assert_eq!(r.noise_indices, vec![0]);
+
+        let r2 = hdbscan_with_params(&emb, 2, Some(3));
+        assert_eq!(r2.labels.len(), 1);
+        assert!(r2.labels[0].is_none());
+    }
+
+    #[test]
+    fn hdbscan_below_min_samples_handled() {
+        // n < min_cluster_size must return all-noise without panicking.
+        let emb = vec![
+            ("a".to_string(), vec![1.0, 0.0]),
+            ("b".to_string(), vec![0.9, 0.1]),
+        ];
+        let r = hdbscan(&emb, 5);
+        assert_eq!(r.labels.len(), 2);
+        assert!(r.labels.iter().all(|l| l.is_none()));
+        assert!(r.clusters.is_empty());
+        assert_eq!(r.noise_indices.len(), 2);
     }
 
     #[test]

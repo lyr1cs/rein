@@ -122,6 +122,38 @@ pub fn extract_assistant_text_sse(chunk_text: &str) -> Option<String> {
     }
 }
 
+/// Extract assistant text fragment from a single Responses websocket JSON event.
+///
+/// Expected event shape:
+/// `{"type":"response.output_text.delta","delta":"Hello"}`
+pub fn extract_assistant_text_ws_message(message_text: &str) -> Option<String> {
+    let json = serde_json::from_str::<Value>(message_text).ok()?;
+    if json.get("type").and_then(|t| t.as_str()) != Some("response.output_text.delta") {
+        return None;
+    }
+    json.get("delta")
+        .and_then(|delta| delta.as_str())
+        .map(str::to_string)
+}
+
+/// Extract the user query from a single Responses websocket request message.
+///
+/// Expected request shape:
+/// `{"type":"response.create","input":[...],"instructions":"..."}`
+pub fn extract_query_ws_message(message_text: &str) -> Option<String> {
+    let json = serde_json::from_str::<Value>(message_text).ok()?;
+    if json.get("type").and_then(|t| t.as_str()) != Some("response.create") {
+        return None;
+    }
+    let query = extract_query(&json);
+    let query = query.trim();
+    if query.is_empty() {
+        None
+    } else {
+        Some(query.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +230,35 @@ mod tests {
     fn test_extract_sse_done() {
         let chunk = "data: [DONE]\n\n";
         assert_eq!(extract_assistant_text_sse(chunk), None);
+    }
+
+    #[test]
+    fn test_extract_ws_delta() {
+        let msg = r#"{"type":"response.output_text.delta","delta":"Hello"}"#;
+        assert_eq!(
+            extract_assistant_text_ws_message(msg),
+            Some("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_ws_non_text_event() {
+        let msg = r#"{"type":"response.created","response":{"id":"resp_123"}}"#;
+        assert_eq!(extract_assistant_text_ws_message(msg), None);
+    }
+
+    #[test]
+    fn test_extract_ws_request_query() {
+        let msg = r#"{"type":"response.create","input":[{"role":"user","content":"Hello from ws"}]}"#;
+        assert_eq!(
+            extract_query_ws_message(msg),
+            Some("Hello from ws".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_ws_request_non_create_event() {
+        let msg = r#"{"type":"response.completed","response":{"id":"resp_123"}}"#;
+        assert_eq!(extract_query_ws_message(msg), None);
     }
 }

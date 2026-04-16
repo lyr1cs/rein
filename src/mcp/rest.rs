@@ -177,6 +177,33 @@ fn require_mutation_marker<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
     }
 }
 
+/// Require an `x-rein-token` header matching `$REIN_HTTP_TOKEN` for sensitive reads.
+///
+/// Used for endpoints that return raw upstream transcripts (e.g. `/api/artifacts`).
+/// When `REIN_HTTP_TOKEN` is unset, the gate is permissive — this preserves the
+/// localhost-only dev convenience. When it IS set, the token must match exactly.
+fn require_read_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
+    let expected = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let presented = req
+        .headers()
+        .get("x-rein-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if presented == expected.trim() {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid x-rein-token for protected read",
+        ))
+    }
+}
+
 async fn handle_api<B>(
     req: &Request<B>,
     method: &Method,
@@ -238,10 +265,18 @@ async fn handle_api<B>(
         }
         (&Method::GET, "/api/timeline") => api_timeline(config, &query),
         (&Method::GET, "/api/episodes") => api_episodes(config, &query),
-        (&Method::GET, "/api/artifacts") => api_artifacts(config, &query),
+        (&Method::GET, "/api/artifacts") => match require_read_token(req) {
+            Ok(()) => api_artifacts(config, &query),
+            Err(response) => response,
+        },
         (&Method::GET, p) if p.starts_with("/api/artifacts/") => {
-            let id = percent_decode(&p["/api/artifacts/".len()..]);
-            api_artifact_detail(config, &id, &query)
+            match require_read_token(req) {
+                Ok(()) => {
+                    let id = percent_decode(&p["/api/artifacts/".len()..]);
+                    api_artifact_detail(config, &id, &query)
+                }
+                Err(response) => response,
+            }
         }
 
         // --- Mutation endpoints (placeholder for Phase 2) ---
@@ -1046,6 +1081,24 @@ fn api_artifacts(
     }
 }
 
+/// Hard cap on the size of each transcript field returned by the detail endpoint.
+/// Prevents unbounded memory allocation during redaction and keeps JSON responses
+/// small enough for GUI consumption. Oversized bodies are truncated at a char
+/// boundary and flagged via `transcript_truncated`.
+const MAX_ARTIFACT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+fn cap_for_redaction(s: &str) -> (String, bool) {
+    if s.len() <= MAX_ARTIFACT_RESPONSE_BYTES {
+        return (s.to_string(), false);
+    }
+    // Truncate at a char boundary to preserve UTF-8 validity.
+    let mut end = MAX_ARTIFACT_RESPONSE_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
 fn api_artifact_detail(
     config: &ReinConfig,
     id: &str,
@@ -1065,6 +1118,33 @@ fn api_artifact_detail(
                FROM session_artifacts WHERE id = ?1";
     let result = store.conn().query_row(sql, rusqlite::params![id], |row| {
         let transcript_text: String = row.get(12)?;
+        let transcript_json_raw: Option<String> = row.get(13)?;
+
+        // Only materialize + redact transcripts when the caller asked for them.
+        // Otherwise omit both fields entirely to avoid leaking raw bodies.
+        let (transcript_text_out, transcript_json_out, transcript_truncated) = if include_transcript
+        {
+            let (capped_text, text_truncated) = cap_for_redaction(&transcript_text);
+            let redacted_text = crate::extract::hooks::parsing::redact_secrets(&capped_text);
+            let (redacted_json, json_truncated) = match transcript_json_raw {
+                Some(raw) => {
+                    let (capped, t) = cap_for_redaction(&raw);
+                    (
+                        Some(crate::extract::hooks::parsing::redact_secrets(&capped)),
+                        t,
+                    )
+                }
+                None => (None, false),
+            };
+            (
+                Some(redacted_text),
+                redacted_json,
+                text_truncated || json_truncated,
+            )
+        } else {
+            (None, None, false)
+        };
+
         Ok(json!({
             "id": row.get::<_, String>(0)?,
             "schema_version": row.get::<_, i32>(1)?,
@@ -1078,14 +1158,10 @@ fn api_artifact_detail(
             "started_at": row.get::<_, Option<String>>(9)?,
             "ended_at": row.get::<_, Option<String>>(10)?,
             "turn_count": row.get::<_, u32>(11)?,
-            "transcript_text": if include_transcript {
-                Some(crate::extract::hooks::parsing::redact_secrets(&transcript_text))
-            } else {
-                None::<String>
-            },
+            "transcript_text": transcript_text_out,
             "transcript_available": !transcript_text.trim().is_empty(),
-            "transcript_json": row.get::<_, Option<String>>(13)?
-                .map(|j| crate::extract::hooks::parsing::redact_secrets(&j)),
+            "transcript_json": transcript_json_out,
+            "transcript_truncated": transcript_truncated,
             "episode_id": row.get::<_, Option<String>>(14)?,
             "created_at": row.get::<_, String>(15)?,
         }))
@@ -1244,7 +1320,9 @@ fn mime_from_path(path: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::store::SqliteStore;
-    use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source};
+    use crate::types::{
+        Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, SessionArtifact, Source,
+    };
     use chrono::Utc;
     use hyper::Request;
     use tempfile::tempdir;
@@ -1350,5 +1428,282 @@ mod tests {
         assert_eq!(json["count"].as_u64(), Some(2));
         assert!(json.get("next_offset").is_none());
         assert_eq!(json["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn artifacts_endpoints_expose_proxy_artifacts_with_transcript() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("artifacts.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        let artifact_id = store
+            .store_session_artifact(SessionArtifact {
+                id: String::new(),
+                schema_version: 1,
+                artifact_kind: "proxy_first_party_ws".to_string(),
+                session_id: Some("thread_123".to_string()),
+                title: Some("WS GET /responses".to_string()),
+                summary: Some("codex-first-party websocket mirror".to_string()),
+                source_agent: Some("proxy".to_string()),
+                source_label: Some("proxy:codex-first-party-ws".to_string()),
+                is_subagent: false,
+                started_at: None,
+                ended_at: None,
+                turn_count: 3,
+                transcript_text: "authorization: <redacted>\nchatgpt-account-id: <redacted>\nresponse.output_text.delta\nhello ws".to_string(),
+                transcript_json: Some(
+                    r#"{"authorization":"<redacted>","chatgpt_account_id":"<redacted>","event":"response.output_text.delta"}"#.to_string(),
+                ),
+                episode_id: None,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        let list = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts?limit=10&offset=0")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&list, &config).await.unwrap();
+        let json = read_json(response).await;
+        let artifacts = json["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0]["id"].as_str(), Some(artifact_id.as_str()));
+        assert_eq!(
+            artifacts[0]["artifact_kind"].as_str(),
+            Some("proxy_first_party_ws")
+        );
+        assert_eq!(
+            artifacts[0]["source_label"].as_str(),
+            Some("proxy:codex-first-party-ws")
+        );
+
+        let detail = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/artifacts/{}?include_transcript=true",
+                artifact_id
+            ))
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&detail, &config).await.unwrap();
+        let json = read_json(response).await;
+        assert_eq!(json["id"].as_str(), Some(artifact_id.as_str()));
+        assert_eq!(json["artifact_kind"].as_str(), Some("proxy_first_party_ws"));
+        assert_eq!(json["session_id"].as_str(), Some("thread_123"));
+        assert!(json["episode_id"].is_null());
+        assert_eq!(json["transcript_available"].as_bool(), Some(true));
+        assert!(json["transcript_text"]
+            .as_str()
+            .unwrap()
+            .contains("response.output_text.delta"));
+        assert!(json["transcript_text"]
+            .as_str()
+            .unwrap()
+            .contains("<redacted>"));
+        assert!(!json["transcript_text"]
+            .as_str()
+            .unwrap()
+            .contains("Bearer "));
+        assert!(json["transcript_json"]
+            .as_str()
+            .unwrap()
+            .contains("<redacted>"));
+    }
+
+    // --- New tests: Stream B fixes (C3 auth, R2 raw-token redaction, H6 size cap, M4 gating) ---
+
+    fn insert_artifact(store: &SqliteStore, text: &str, json_raw: Option<String>) -> String {
+        store
+            .store_session_artifact(SessionArtifact {
+                id: String::new(),
+                schema_version: 1,
+                artifact_kind: "proxy_first_party_ws".to_string(),
+                session_id: Some("thread_test".to_string()),
+                title: None,
+                summary: None,
+                source_agent: Some("proxy".to_string()),
+                source_label: Some("proxy:test".to_string()),
+                is_subagent: false,
+                started_at: None,
+                ended_at: None,
+                turn_count: 0,
+                transcript_text: text.to_string(),
+                transcript_json: json_raw,
+                episode_id: None,
+                created_at: Utc::now(),
+            })
+            .unwrap()
+    }
+
+    // Serialize env-var tests so parallel cases don't race on REIN_HTTP_TOKEN.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn api_artifacts_auth_gate_matrix() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+        // Case 1: REIN_HTTP_TOKEN unset ⇒ permissive (dev convenience).
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let dir1 = tempdir().unwrap();
+        let db_path1 = dir1.path().join("a1.db");
+        let config1 = test_config(&db_path1);
+        let _s1 = SqliteStore::new(&db_path1, &config1.embedding_model(), 3072).unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&req, &config1).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Case 2: token set, request without header → 401.
+        std::env::set_var("REIN_HTTP_TOKEN", "secret-token-xyz");
+        let dir2 = tempdir().unwrap();
+        let db_path2 = dir2.path().join("a2.db");
+        let config2 = test_config(&db_path2);
+        let _s2 = SqliteStore::new(&db_path2, &config2.embedding_model(), 3072).unwrap();
+        let req_no_token = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&req_no_token, &config2)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Case 3: wrong token → 401.
+        let req_wrong = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts")
+            .header("x-rein-token", "wrong")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&req_wrong, &config2)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Case 4: correct token → 200.
+        let req_ok = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts")
+            .header("x-rein-token", "secret-token-xyz")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&req_ok, &config2)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        std::env::remove_var("REIN_HTTP_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn api_artifact_detail_redacts_raw_bearer_tokens() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("artifacts.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        // Raw unredacted Bearer token in transcript — the endpoint MUST redact it.
+        let raw =
+            "POST /responses\nAuthorization: Bearer sk-secret-raw-abc123xyz456\nContent-Type: application/json";
+        let id = insert_artifact(&store, raw, None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/artifacts/{}?include_transcript=true", id))
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&req, &config).await.unwrap();
+        let json = read_json(response).await;
+        let text = json["transcript_text"].as_str().unwrap();
+        assert!(
+            !text.contains("sk-secret-raw-abc123xyz456"),
+            "raw bearer token must be redacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_artifact_detail_omits_transcripts_when_include_false() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("artifacts.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        let id = insert_artifact(
+            &store,
+            "Authorization: Bearer sk-test-token-abcdef123456\nbody",
+            Some(r#"{"secret":"sk-test-token-abcdef123456"}"#.to_string()),
+        );
+
+        // Default (no include_transcript=true) → both transcript fields omitted.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/artifacts/{}", id))
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&req, &config).await.unwrap();
+        let json = read_json(response).await;
+        assert!(
+            json["transcript_text"].is_null(),
+            "transcript_text must be null when include_transcript=false"
+        );
+        assert!(
+            json["transcript_json"].is_null(),
+            "transcript_json must be null when include_transcript=false"
+        );
+        // transcript_available is still reported so the GUI can show a button.
+        assert_eq!(json["transcript_available"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn api_artifact_detail_truncates_oversize_body() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("artifacts.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        // 3 MiB body exceeds the 2 MiB cap.
+        let big = "x".repeat(MAX_ARTIFACT_RESPONSE_BYTES + 1024 * 1024);
+        let id = insert_artifact(&store, &big, None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/artifacts/{}?include_transcript=true", id))
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&req, &config).await.unwrap();
+        let json = read_json(response).await;
+        assert_eq!(json["transcript_truncated"].as_bool(), Some(true));
+        let returned = json["transcript_text"].as_str().unwrap();
+        assert!(
+            returned.len() <= MAX_ARTIFACT_RESPONSE_BYTES,
+            "returned body must be <= cap, got {}",
+            returned.len()
+        );
     }
 }

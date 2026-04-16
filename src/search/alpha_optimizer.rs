@@ -132,6 +132,12 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
         }
     }
 
+    // Invariant: coarse grid pins alpha ∈ [0, 1], fine grid clamps via max(0)/min(1).
+    // best_alpha is never written from any source outside those two grids.
+    debug_assert!(
+        (0.0..=1.0).contains(&best_alpha),
+        "alpha must stay within [0,1]"
+    );
     Some(best_alpha)
 }
 

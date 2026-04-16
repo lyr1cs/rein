@@ -164,8 +164,44 @@ fn proxy_url_host(bind: &str) -> String {
     }
 }
 
+fn codexsub_provider_override(
+    provider_key: &str,
+    provider_name: &str,
+    proxy_url: &str,
+    supports_websockets: bool,
+) -> String {
+    include_str!("../scripts/codexsubp_provider.toml.tmpl")
+        .trim()
+        .replace("__PROVIDER_KEY__", provider_key)
+        .replace("__PROVIDER_NAME__", provider_name)
+        .replace("__PROXY_URL__", proxy_url)
+        .replace(
+            "__SUPPORTS_WEBSOCKETS__",
+            if supports_websockets { "true" } else { "false" },
+        )
+}
+
+fn codexsubp_provider_override(proxy_url: &str) -> String {
+    codexsub_provider_override(
+        "rein_sub_proxy",
+        "Rein Subscription Proxy",
+        proxy_url,
+        false,
+    )
+}
+
+fn codexsubpws_provider_override(proxy_url: &str) -> String {
+    codexsub_provider_override(
+        "rein_sub_proxy_ws",
+        "Rein Subscription Proxy WS",
+        proxy_url,
+        true,
+    )
+}
+
 fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
     let host = proxy_url_host(bind);
+    let proxy_url = format!("http://{host}:{port}");
     vec![
         (
             "rein-proxy".to_string(),
@@ -185,6 +221,22 @@ fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
             "codexp".to_string(),
             format!(
                 r#"codexp() {{ REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={{ name = "Rein Proxy", base_url = "http://{host}:{port}/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = {{ "x-rein-token" = "REIN_PROXY_TOKEN" }} }}' -c 'model_provider="rein_proxy"' "$@"; }}"#
+            ),
+        ),
+        (
+            "codexsubp".to_string(),
+            format!(
+                r#"codexsubp() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="{}/backend-api/codex"' "$@"; }}"#,
+                codexsubp_provider_override(&proxy_url),
+                proxy_url,
+            ),
+        ),
+        (
+            "codexsubpws".to_string(),
+            format!(
+                r#"codexsubpws() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="{}/backend-api/codex"' "$@"; }}"#,
+                codexsubpws_provider_override(&proxy_url),
+                proxy_url,
             ),
         ),
     ]
@@ -226,6 +278,8 @@ pub fn proxy_configure(dry_run: bool) -> anyhow::Result<()> {
     println!("  1. rein-proxy        # start proxy in background");
     println!("  2. claudep           # Claude Code via proxy");
     println!("  3. codexp            # Codex CLI via proxy");
+    println!("  4. codexsubp         # Codex ChatGPT-login via proxy (loopback)");
+    println!("  5. codexsubpws       # Codex ChatGPT-login via proxy (experimental WS-first)");
     println!("  (source your shell rc to apply: source {shell_rc})");
 
     Ok(())
@@ -403,4 +457,91 @@ fn configure_toml_client(path: &Path) -> anyhow::Result<()> {
     let formatted = toml::to_string_pretty(&root)?;
     std::fs::write(path, formatted)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_aliases_include_subscription_login_path() {
+        let aliases = proxy_aliases("127.0.0.1", 8690);
+        let codexsubp = aliases
+            .iter()
+            .find(|(name, _)| name == "codexsubp")
+            .map(|(_, line)| line)
+            .expect("codexsubp alias should exist");
+
+        assert!(codexsubp.contains(r#"model_provider="rein_sub_proxy""#));
+        assert!(codexsubp.contains(r#"requires_openai_auth = true"#));
+        assert!(codexsubp.contains(r#"supports_websockets = false"#));
+        assert!(codexsubp.contains(r#"chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex""#));
+
+        let codexsubpws = aliases
+            .iter()
+            .find(|(name, _)| name == "codexsubpws")
+            .map(|(_, line)| line)
+            .expect("codexsubpws alias should exist");
+        assert!(codexsubpws.contains(r#"model_provider="rein_sub_proxy_ws""#));
+        assert!(codexsubpws.contains(r#"requires_openai_auth = true"#));
+        assert!(codexsubpws.contains(r#"supports_websockets = true"#));
+        assert!(codexsubpws.contains(r#"chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex""#));
+    }
+
+    #[test]
+    fn codexsubp_provider_override_replaces_proxy_url() {
+        let override_str = codexsubp_provider_override("http://127.0.0.1:8788");
+        assert!(override_str.contains(r#"name = "Rein Subscription Proxy""#));
+        assert!(override_str.contains(r#"rein_sub_proxy"#));
+        assert!(override_str.contains(r#"base_url = "http://127.0.0.1:8788""#));
+        assert!(override_str.contains(r#"requires_openai_auth = true"#));
+        assert!(override_str.contains(r#"supports_websockets = false"#));
+    }
+
+    #[test]
+    fn codexsubpws_provider_override_enables_websockets() {
+        let override_str = codexsubpws_provider_override("http://127.0.0.1:8788");
+        assert!(override_str.contains(r#"name = "Rein Subscription Proxy WS""#));
+        assert!(override_str.contains(r#"rein_sub_proxy_ws"#));
+        assert!(override_str.contains(r#"base_url = "http://127.0.0.1:8788""#));
+        assert!(override_str.contains(r#"requires_openai_auth = true"#));
+        assert!(override_str.contains(r#"supports_websockets = true"#));
+    }
+
+    #[test]
+    fn smoke_script_uses_shared_codexsubp_template() {
+        let script = include_str!("../scripts/smoke_codexsubp.sh");
+        assert!(script.contains("codexsubp_provider.toml.tmpl"));
+        assert!(script.contains("PROVIDER_OVERRIDE"));
+    }
+
+    #[test]
+    fn websocket_smoke_script_uses_shared_codexsubp_template() {
+        let script = include_str!("../scripts/smoke_codexsubp_ws.sh");
+        assert!(script.contains("codexsubp_provider.toml.tmpl"));
+        assert!(script.contains("PROVIDER_OVERRIDE"));
+        assert!(script.contains("REIN_SUB_PROXY_WS"));
+    }
+
+    #[test]
+    fn readme_documents_codexsubp_contract() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("scripts/codexsubp_provider.toml.tmpl"));
+        assert!(readme.contains("requires_openai_auth = true"));
+        assert!(readme.contains("supports_websockets = false"));
+        assert!(readme.contains("codexsubpws"));
+        assert!(readme.contains("artifact-mirror-only"));
+    }
+
+    #[test]
+    fn support_matrix_doc_mentions_current_proxy_contract() {
+        let doc =
+            include_str!("../../../docs/reference/codex-subscription-proxy-support-matrix.md");
+        assert!(doc.contains("ArtifactMirrorOnly"));
+        assert!(doc.contains("responses_scope_support_matrix"));
+        assert!(doc.contains("route_resolution_support_matrix"));
+        assert!(doc.contains("proxy_returns_426_when_codex_websocket_upstream_is_unavailable"));
+        assert!(doc.contains("codexsubp"));
+    }
+
 }

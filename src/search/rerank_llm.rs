@@ -324,24 +324,29 @@ fn parse_rerank_response(content: &str, expected_len: usize) -> ReinResult<Vec<f
         ));
     };
 
-    let scores: Vec<f32> = arr
-        .iter()
-        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-        .map(|s| s.clamp(0.0, 1.0))
-        .collect();
-
-    if scores.len() != expected_len {
-        tracing::warn!(
-            expected = expected_len,
-            got = scores.len(),
-            "rerank score count mismatch, padding/truncating"
-        );
-        let mut result = scores;
-        result.resize(expected_len, 0.0);
-        Ok(result)
-    } else {
-        Ok(scores)
+    // Strict validation: length mismatch or non-finite scores → reject (caller falls back
+    // to linear scores). Silent padding obscures LLM misbehavior and corrupts ordering.
+    if arr.len() != expected_len {
+        return Err(ReinError::Extract(format!(
+            "rerank length mismatch: expected {}, got {}",
+            expected_len,
+            arr.len()
+        )));
     }
+
+    let mut scores: Vec<f32> = Vec::with_capacity(expected_len);
+    for (i, v) in arr.iter().enumerate() {
+        let raw = v.as_f64().ok_or_else(|| {
+            ReinError::Extract(format!("rerank score at index {i} is not a number"))
+        })?;
+        if !raw.is_finite() {
+            return Err(ReinError::Extract(format!(
+                "rerank score at index {i} is not finite: {raw}"
+            )));
+        }
+        scores.push((raw as f32).clamp(0.0, 1.0));
+    }
+    Ok(scores)
 }
 
 fn strip_code_fences(s: &str) -> String {
@@ -365,7 +370,20 @@ fn strip_code_fences(s: &str) -> String {
 
 /// Detect if BM25 top result is significantly stronger than runner-up.
 /// Returns true if we should skip LLM reranking (and optionally expansion).
+///
+/// Uses default thresholds (ratio=1.5, single=3.0). Call
+/// [`detect_strong_signal_with_thresholds`] to pass config-driven values.
 pub fn detect_strong_signal(fts_ranked: &[(String, f32)]) -> bool {
+    detect_strong_signal_with_thresholds(fts_ranked, 1.5, 3.0)
+}
+
+/// Config-driven variant: `ratio` is the top1/top2 bypass ratio; `single` is the
+/// min BM25 score for a lone positive result to count as strong.
+pub fn detect_strong_signal_with_thresholds(
+    fts_ranked: &[(String, f32)],
+    ratio: f32,
+    single: f32,
+) -> bool {
     if fts_ranked.len() < 2 {
         return false;
     }
@@ -378,15 +396,13 @@ pub fn detect_strong_signal(fts_ranked: &[(String, f32)]) -> bool {
     scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
     if scores.len() < 2 {
-        // Only one positive result — strong signal if it has a decent BM25 score
-        return scores.len() == 1 && scores[0] >= 3.0;
+        return scores.len() == 1 && scores[0] >= single;
     }
 
     let top1 = scores[0];
     let top2 = scores[1];
 
-    // Strong signal: top1 is at least 1.5x the runner-up
-    if top2.is_finite() && top1.is_finite() && top2 > 0.0 && top1 / top2 >= 1.5 {
+    if top2.is_finite() && top1.is_finite() && top2 > 0.0 && top1 / top2 >= ratio {
         tracing::debug!(
             top1,
             top2,
@@ -438,11 +454,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rerank_length_mismatch() {
+    fn test_parse_rerank_rejects_length_mismatch() {
+        // Short arrays now reject instead of silently padding; caller falls back to linear.
         let input = r#"{"scores": [0.5]}"#;
-        let result = parse_rerank_response(input, 3).unwrap();
-        assert_eq!(result.len(), 3);
-        assert!((result[2] - 0.0).abs() < 0.01); // padded with 0
+        assert!(parse_rerank_response(input, 3).is_err());
+    }
+
+    #[test]
+    fn test_parse_rerank_rejects_too_long() {
+        let input = r#"{"scores": [0.5, 0.4, 0.3, 0.2]}"#;
+        assert!(parse_rerank_response(input, 2).is_err());
+    }
+
+    #[test]
+    fn test_parse_rerank_rejects_nonfinite_scores() {
+        // Non-finite scores cannot be represented as JSON numbers directly, but a
+        // defensive check confirms we never rely on such values passing through.
+        let input = r#"{"scores": [0.5, null, 0.3]}"#;
+        assert!(parse_rerank_response(input, 3).is_err());
     }
 
     #[test]

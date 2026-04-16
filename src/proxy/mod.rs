@@ -1,8 +1,10 @@
 //! Transparent LLM API proxy with conservative recording and extraction.
 //!
-//! Intercepts requests to Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`)
-//! APIs, forwards them to the upstream provider, streams responses back, and
-//! asynchronously records memory candidates from responses.
+//! Intercepts requests to Anthropic (`/v1/messages`), OpenAI
+//! (`/v1/chat/completions` / `/v1/responses`), and Codex first-party backend
+//! routes (`/backend-api/codex/*`), forwards them to the upstream provider,
+//! streams responses back, and asynchronously records memory candidates from
+//! supported response shapes.
 
 mod anthropic;
 mod extract;
@@ -16,17 +18,23 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
-use native_tls::TlsConnector;
-use provider::ProviderKind;
+use provider::{ProviderKind, RecordingMode};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_native_tls::TlsConnector as TokioTlsConnector;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::error::ProtocolError as WsProtocolError;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -64,6 +72,36 @@ impl ProxyMetrics {
 
 struct ProxyState {
     metrics: ProxyMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedRoute {
+    provider: ProviderKind,
+    recording_mode: RecordingMode,
+}
+
+#[derive(Debug, Clone)]
+struct ProxyArtifactInput {
+    route: ResolvedRoute,
+    method: String,
+    path: String,
+    session_id: Option<String>,
+    request_headers: Vec<(String, String)>,
+    request_body: Bytes,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default)]
+struct WebSocketMirrorState {
+    pending: Vec<u8>,
+    fragmented_payload: Option<Vec<u8>>,
+    fragmented_compressed: bool,
+    event_messages: Vec<String>,
+    assistant_text: String,
+    request_query: Option<String>,
+    event_bytes: usize,
+    truncated: bool,
+    close_seen: bool,
 }
 
 /// Start the transparent proxy server.
@@ -160,10 +198,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-type BoxedIo = Box<dyn AsyncIo>;
+type UpstreamWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn box_body<B>(body: B) -> BoxBody
 where
@@ -197,6 +232,43 @@ fn error_response(status: u16, msg: &str) -> hyper::Response<BoxBody> {
         .unwrap_or_else(|_| hyper::Response::new(full_body(Bytes::from("internal error"))))
 }
 
+/// Uniform response for WebSocket upgrade failure: always 426 Upgrade Required.
+///
+/// Previously this returned 426 for `/responses`-family providers and 502 for
+/// everything else. The 502 variant was confusing because WS upgrade is a policy
+/// decision, not an upstream error. 426 is semantically correct for every kind
+/// of "upgrade refused" case; the response body carries the specific reason.
+fn websocket_upstream_failure_response(provider: ProviderKind) -> hyper::Response<BoxBody> {
+    let msg = match provider {
+        ProviderKind::OpenAiResponses | ProviderKind::CodexFirstParty => {
+            "responses websocket unavailable upstream; retry over HTTP"
+        }
+        _ => "upstream does not support websocket upgrade on this route",
+    };
+    error_response(426, msg)
+}
+
+fn recording_mode_label(mode: RecordingMode) -> &'static str {
+    if mode.captures_structured_text() {
+        "structured-text"
+    } else if mode.captures_artifact_mirror_only() {
+        "artifact-mirror-only"
+    } else {
+        unreachable!("unknown recording mode")
+    }
+}
+
+fn is_benign_websocket_read_error(error: &WsError) -> bool {
+    matches!(
+        error,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Protocol(WsProtocolError::ResetWithoutClosingHandshake)
+    ) || error
+        .to_string()
+        .contains("Connection reset without closing handshake")
+}
+
 /// Build a response, falling back to a plain 200 with error text on builder failure.
 fn build_response(
     builder: hyper::http::response::Builder,
@@ -205,6 +277,498 @@ fn build_response(
     builder
         .body(body)
         .unwrap_or_else(|_| hyper::Response::new(full_body(Bytes::from("internal error"))))
+}
+
+fn capture_request_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    redact_header_value(name.as_str(), value),
+                )
+            })
+        })
+        .collect()
+}
+
+fn capture_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    redact_header_value(name.as_str(), value),
+                )
+            })
+        })
+        .collect()
+}
+
+fn redact_header_value(name: &str, value: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "authorization"
+        | "x-rein-token"
+        | "cookie"
+        | "set-cookie"
+        | "proxy-authorization"
+        | "proxy-authenticate"
+        | "chatgpt-account-id" => "<redacted>".to_string(),
+        _ => crate::extract::hooks::parsing::redact_secrets(value),
+    }
+}
+
+fn default_codex_originator() -> &'static str {
+    "codex_cli_rs"
+}
+
+fn default_codex_user_agent() -> String {
+    format!(
+        "{}/{} ({}; {}) rein-proxy",
+        default_codex_originator(),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+fn websocket_upstream_origin(ws_url: &str) -> Option<String> {
+    if let Some(rest) = ws_url.strip_prefix("wss://") {
+        Some(format!(
+            "https://{}",
+            rest.split('/').next().unwrap_or_default()
+        ))
+    } else if let Some(rest) = ws_url.strip_prefix("ws://") {
+        Some(format!(
+            "http://{}",
+            rest.split('/').next().unwrap_or_default()
+        ))
+    } else {
+        None
+    }
+}
+
+fn extract_session_id(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get("x-client-request-id")
+        .or_else(|| headers.get("x-codex-parent-thread-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn format_artifact_body(bytes: &[u8], truncated: bool) -> String {
+    const MAX_BODY_CHARS: usize = 20_000;
+    let preview: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .take(MAX_BODY_CHARS)
+        .collect();
+    let preview = crate::extract::hooks::parsing::redact_secrets(&preview);
+    if truncated {
+        format!("{preview}\n[truncated]")
+    } else {
+        preview
+    }
+}
+
+fn maybe_store_first_party_artifact(
+    config: &ReinConfig,
+    artifact: ProxyArtifactInput,
+    status: u16,
+    response_headers: Vec<(String, String)>,
+    response_body: Vec<u8>,
+    response_truncated: bool,
+    streaming: bool,
+) {
+    if !matches!(
+        artifact.route.provider,
+        ProviderKind::CodexFirstParty | ProviderKind::ChatGptBackend
+    ) {
+        return;
+    }
+
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let request_body = format_artifact_body(&artifact.request_body, false);
+        let response_body = format_artifact_body(&response_body, response_truncated);
+        let provider_label = match artifact.route.provider {
+            ProviderKind::CodexFirstParty => "codex-first-party",
+            ProviderKind::ChatGptBackend => "chatgpt-backend",
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::OpenAi => "openai",
+            ProviderKind::OpenAiResponses => "openai-responses",
+        };
+        let capture_mode = recording_mode_label(artifact.route.recording_mode);
+        let format_headers = |headers: &[(String, String)]| -> String {
+            headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let transcript_text = format!(
+            "provider: {provider_label}\ncapture_mode: {capture_mode}\nmethod: {}\npath: {}\nstatus: {status}\nstreaming: {streaming}\n\nrequest_headers:\n{}\n\nrequest_body:\n{}\n\nresponse_headers:\n{}\n\nresponse_body:\n{}",
+            artifact.method,
+            artifact.path,
+            format_headers(&artifact.request_headers),
+            request_body,
+            format_headers(&response_headers),
+            response_body,
+        );
+        let transcript_json = serde_json::json!({
+            "provider": provider_label,
+            "capture_mode": capture_mode,
+            "method": artifact.method,
+            "path": artifact.path,
+            "status": status,
+            "streaming": streaming,
+            "request_headers": artifact.request_headers,
+            "request_body": request_body,
+            "response_headers": response_headers,
+            "response_body": response_body,
+        });
+        let session_artifact = crate::types::SessionArtifact {
+            id: String::new(),
+            schema_version: 1,
+            artifact_kind: "proxy_first_party".to_string(),
+            session_id: artifact.session_id,
+            title: Some(format!("{} {}", artifact.method, artifact.path)),
+            summary: Some(format!("{provider_label} {} -> {status}", artifact.method)),
+            source_agent: Some("proxy".to_string()),
+            source_label: Some(format!("proxy:{provider_label}")),
+            is_subagent: false,
+            started_at: None,
+            ended_at: None,
+            turn_count: 2,
+            transcript_text,
+            transcript_json: Some(transcript_json.to_string()),
+            episode_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        match config.open_store() {
+            Ok(store) => {
+                if let Err(e) = store.store_session_artifact(session_artifact) {
+                    tracing::warn!("proxy artifact: failed to store session artifact: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("proxy artifact: failed to open store: {e}"),
+        }
+    });
+}
+
+fn maybe_store_first_party_ws_artifact(
+    config: &ReinConfig,
+    artifact: ProxyArtifactInput,
+    response_headers: Vec<(String, String)>,
+    request_event_messages: Vec<String>,
+    response_event_messages: Vec<String>,
+    truncated: bool,
+) {
+    if !matches!(artifact.route.provider, ProviderKind::CodexFirstParty) {
+        return;
+    }
+
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let capture_mode = recording_mode_label(artifact.route.recording_mode);
+        let format_headers = |headers: &[(String, String)]| -> String {
+            headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut request_events = request_event_messages.join("\n");
+        if truncated && !request_events.is_empty() {
+            request_events.push_str("\n[truncated]");
+        } else if truncated && request_events.is_empty() {
+            request_events = "[truncated]".to_string();
+        }
+        let mut response_events = response_event_messages.join("\n");
+        if truncated && !response_events.is_empty() {
+            response_events.push_str("\n[truncated]");
+        } else if truncated && response_events.is_empty() {
+            response_events = "[truncated]".to_string();
+        }
+        let transcript_text = format!(
+            "provider: codex-first-party-ws\ncapture_mode: {capture_mode}\nmethod: {}\npath: {}\n\nrequest_headers:\n{}\n\nhandshake_response_headers:\n{}\n\nclient_ws_events:\n{}\n\nupstream_ws_events:\n{}",
+            artifact.method,
+            artifact.path,
+            format_headers(&artifact.request_headers),
+            format_headers(&response_headers),
+            request_events,
+            response_events,
+        );
+        let transcript_json = serde_json::json!({
+            "provider": "codex-first-party-ws",
+            "capture_mode": capture_mode,
+            "method": artifact.method,
+            "path": artifact.path,
+            "request_headers": artifact.request_headers,
+            "handshake_response_headers": response_headers,
+            "client_ws_events": request_event_messages,
+            "upstream_ws_events": response_event_messages,
+            "truncated": truncated,
+        });
+        let session_artifact = crate::types::SessionArtifact {
+            id: String::new(),
+            schema_version: 1,
+            artifact_kind: "proxy_first_party_ws".to_string(),
+            session_id: artifact.session_id,
+            title: Some(format!("WS {} {}", artifact.method, artifact.path)),
+            summary: Some("codex-first-party websocket mirror".to_string()),
+            source_agent: Some("proxy".to_string()),
+            source_label: Some("proxy:codex-first-party-ws".to_string()),
+            is_subagent: false,
+            started_at: None,
+            ended_at: None,
+            turn_count: (request_event_messages.len() + response_event_messages.len()) as u32,
+            transcript_text,
+            transcript_json: Some(transcript_json.to_string()),
+            episode_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        match config.open_store() {
+            Ok(store) => {
+                if let Err(e) = store.store_session_artifact(session_artifact) {
+                    tracing::warn!("proxy artifact: failed to store websocket artifact: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("proxy artifact: failed to open store: {e}"),
+        }
+    });
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WebSocketMirrorState {
+    fn record_message(&mut self, message: &Message, collect_assistant_text: bool) {
+        match message {
+            Message::Text(text) => {
+                self.record_text_message(text.to_string(), collect_assistant_text, 256_000);
+            }
+            Message::Close(_) => {
+                self.close_seen = true;
+                self.push_event_limited("[close]".to_string(), 256_000);
+            }
+            _ => {}
+        }
+    }
+
+    /// Bound per-message inflate output so an attacker-controlled upstream frame cannot
+    /// expand a tiny compressed payload (deflate bomb) into unbounded memory. 1 MiB is
+    /// generous for legitimate /responses deltas — real messages are typically <50 KB.
+    const MAX_INFLATED_BYTES: u64 = 1024 * 1024;
+
+    fn decode_text_payload(payload: &[u8], compressed: bool) -> Option<String> {
+        if compressed {
+            let mut data = payload.to_vec();
+            data.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+            let decoder = flate2::read::DeflateDecoder::new(&data[..]);
+            let mut limited = std::io::Read::take(decoder, Self::MAX_INFLATED_BYTES + 1);
+            let mut output = Vec::new();
+            use std::io::Read as _;
+            limited.read_to_end(&mut output).ok()?;
+            if output.len() as u64 > Self::MAX_INFLATED_BYTES {
+                tracing::warn!(
+                    limit = Self::MAX_INFLATED_BYTES,
+                    got = output.len(),
+                    "websocket mirror: permessage-deflate payload exceeded inflate cap, dropping"
+                );
+                return None;
+            }
+            String::from_utf8(output).ok()
+        } else {
+            Some(String::from_utf8_lossy(payload).into_owned())
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8], collect_assistant_text: bool) {
+        const MAX_EVENT_BYTES: usize = 256_000;
+        self.pending.extend_from_slice(chunk);
+        loop {
+            if self.pending.len() < 2 {
+                return;
+            }
+            let b0 = self.pending[0];
+            let b1 = self.pending[1];
+            let fin = (b0 & 0x80) != 0;
+            let rsv1 = (b0 & 0x40) != 0;
+            let opcode = b0 & 0x0f;
+            let masked = (b1 & 0x80) != 0;
+            let mut offset = 2usize;
+            let payload_len = match b1 & 0x7f {
+                len @ 0..=125 => len as usize,
+                126 => {
+                    if self.pending.len() < offset + 2 {
+                        return;
+                    }
+                    let len = u16::from_be_bytes([self.pending[offset], self.pending[offset + 1]])
+                        as usize;
+                    offset += 2;
+                    len
+                }
+                127 => {
+                    if self.pending.len() < offset + 8 {
+                        return;
+                    }
+                    let len = u64::from_be_bytes([
+                        self.pending[offset],
+                        self.pending[offset + 1],
+                        self.pending[offset + 2],
+                        self.pending[offset + 3],
+                        self.pending[offset + 4],
+                        self.pending[offset + 5],
+                        self.pending[offset + 6],
+                        self.pending[offset + 7],
+                    ]) as usize;
+                    offset += 8;
+                    len
+                }
+                _ => unreachable!(),
+            };
+            let mask = if masked {
+                if self.pending.len() < offset + 4 {
+                    return;
+                }
+                let mask = [
+                    self.pending[offset],
+                    self.pending[offset + 1],
+                    self.pending[offset + 2],
+                    self.pending[offset + 3],
+                ];
+                offset += 4;
+                Some(mask)
+            } else {
+                None
+            };
+            if self.pending.len() < offset + payload_len {
+                return;
+            }
+            let mut payload = self.pending[offset..offset + payload_len].to_vec();
+            self.pending.drain(..offset + payload_len);
+            if let Some(mask) = mask {
+                for (index, byte) in payload.iter_mut().enumerate() {
+                    *byte ^= mask[index % 4];
+                }
+            }
+
+            match opcode {
+                0x1 => {
+                    // Protocol violation: a new text frame while fragmentation is in progress.
+                    // Clear any partial fragment so the next continuation doesn't see stale bytes.
+                    if self.fragmented_payload.is_some() {
+                        tracing::warn!(
+                            "websocket mirror: new text frame arrived mid-fragmentation; \
+                            discarding partial payload"
+                        );
+                        self.fragmented_payload = None;
+                        self.fragmented_compressed = false;
+                    }
+                    if fin {
+                        if let Some(text) = Self::decode_text_payload(&payload, rsv1) {
+                            self.record_text_message(text, collect_assistant_text, MAX_EVENT_BYTES);
+                        } else {
+                            self.push_event_limited(
+                                "[compressed websocket frame decode failed]".to_string(),
+                                MAX_EVENT_BYTES,
+                            );
+                        }
+                    } else {
+                        self.fragmented_payload = Some(payload);
+                        self.fragmented_compressed = rsv1;
+                    }
+                }
+                0x0 => {
+                    if let Some(existing) = self.fragmented_payload.as_mut() {
+                        existing.extend_from_slice(&payload);
+                        if fin {
+                            let payload = self.fragmented_payload.take().unwrap_or_default();
+                            let compressed = self.fragmented_compressed;
+                            self.fragmented_compressed = false;
+                            if let Some(text) = Self::decode_text_payload(&payload, compressed) {
+                                self.record_text_message(
+                                    text,
+                                    collect_assistant_text,
+                                    MAX_EVENT_BYTES,
+                                );
+                            } else {
+                                self.push_event_limited(
+                                    "[compressed websocket frame decode failed]".to_string(),
+                                    MAX_EVENT_BYTES,
+                                );
+                            }
+                        }
+                    } else {
+                        // Orphan continuation with no prior start frame: discard and log.
+                        tracing::debug!(
+                            "websocket mirror: orphan continuation frame with no active fragment"
+                        );
+                    }
+                }
+                0x8 => {
+                    self.close_seen = true;
+                    // Clear any in-progress fragment on close to avoid leaking state
+                    // across potential reconnects of the same mirror.
+                    self.fragmented_payload = None;
+                    self.fragmented_compressed = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_text_message(
+        &mut self,
+        text: String,
+        collect_assistant_text: bool,
+        max_event_bytes: usize,
+    ) {
+        let text = crate::extract::hooks::parsing::redact_secrets(&text);
+        if !collect_assistant_text && self.request_query.is_none() {
+            self.request_query = responses::extract_query_ws_message(&text)
+                .map(|query| query.trim().to_string())
+                .filter(|query| !query.is_empty());
+        }
+        self.push_event_limited(text.clone(), max_event_bytes);
+        if collect_assistant_text {
+            if let Some(delta) = responses::extract_assistant_text_ws_message(&text) {
+                self.assistant_text.push_str(&delta);
+            }
+        }
+    }
+
+    fn push_event(&mut self, text: String) {
+        self.event_bytes += text.len();
+        self.event_messages.push(text);
+    }
+
+    fn push_event_limited(&mut self, text: String, max_event_bytes: usize) {
+        if self.event_bytes >= max_event_bytes {
+            self.truncated = true;
+            return;
+        }
+        let remaining = max_event_bytes - self.event_bytes;
+        if text.len() > remaining {
+            let preview = truncate_utf8_to_byte_limit(&text, remaining);
+            self.push_event(preview);
+            self.truncated = true;
+            return;
+        }
+        self.push_event(text);
+    }
+}
+
+fn truncate_utf8_to_byte_limit(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -325,29 +889,33 @@ async fn handle_request(
         ));
     }
 
-    // Detect provider from request path. Sampling routes are tracked only to
-    // capture source query metadata for recording; requests are not mutated.
-    let provider = ProviderKind::detect(&path);
+    // Detect provider from request path plus auth semantics. Codex ChatGPT-login
+    // traffic can hit public-looking paths like `/responses` and `/models`, but
+    // still belongs to the first-party backend route family.
+    let route = resolve_route(&path, req.headers());
 
-    if let Some(provider_kind) = provider {
+    if let Some(route) = route {
+        let provider_kind = route.provider;
         if let Some(msg) = responses_scope_error(provider_kind, &method, req.headers()) {
             state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(401, &msg));
         }
     }
 
-    if method == hyper::Method::GET
-        && is_websocket_upgrade(req.headers())
-        && matches!(provider, Some(ProviderKind::OpenAiResponses))
-    {
-        return handle_websocket_proxy(
-            req,
-            &config,
-            &path_and_query,
-            &headers,
-            ProviderKind::OpenAiResponses,
-        )
-        .await;
+    if method == hyper::Method::GET && is_websocket_upgrade(req.headers()) {
+        if let Some(route) = route.filter(|route| {
+            route.recording_mode.captures_structured_text()
+                && route.provider.supports_websocket_passthrough()
+        }) {
+            return handle_websocket_proxy(
+                req,
+                &config,
+                &path_and_query,
+                &headers,
+                route.provider,
+            )
+            .await;
+        }
     }
 
     if let Some(content_length) = headers
@@ -389,8 +957,8 @@ async fn handle_request(
     tracing::debug!(%method, path = %path_and_query, body_size, "proxy request");
 
     // If not a known sampling endpoint, passthrough unmodified.
-    let provider = match provider {
-        Some(p) => p,
+    let route = match route {
+        Some(route) => route,
         None => {
             return forward_raw(
                 &client,
@@ -404,12 +972,25 @@ async fn handle_request(
         }
     };
 
-    let query = extract_query_for_recording(&provider, &body_bytes);
+    let provider = route.provider;
+    let query = if route.recording_mode.captures_structured_text() {
+        extract_query_for_recording(&provider, &body_bytes)
+    } else {
+        None
+    };
     tracing::debug!(
         query_len = query.as_deref().map(str::len).unwrap_or(0),
         orig_bytes = body_size,
         "proxy record-only request"
     );
+    let artifact_input = ProxyArtifactInput {
+        route,
+        method: method.to_string(),
+        path: path_and_query.clone(),
+        session_id: extract_session_id(&headers),
+        request_headers: capture_request_headers(&headers),
+        request_body: body_bytes.clone(),
+    };
 
     // Build upstream URL (rewrite path if needed, e.g. /responses → /v1/responses).
     let upstream_base = provider.upstream_url(&config);
@@ -471,7 +1052,7 @@ async fn handle_request(
             status,
             &resp_headers,
             &config,
-            &provider,
+            artifact_input,
             query,
             &state,
         )
@@ -494,7 +1075,7 @@ async fn handle_request(
                 status,
                 &resp_headers,
                 &config,
-                &provider,
+                artifact_input,
                 query,
                 &state,
             )
@@ -512,13 +1093,23 @@ async fn handle_request(
         };
 
         // Async extract from non-streaming response (with backpressure).
-        if config.proxy.extract_enabled {
+        if config.proxy.extract_enabled && route.recording_mode.captures_structured_text() {
             if let Some(text) = provider.extract_assistant_text_full(&resp_body) {
                 if policy::should_extract_response(&config, query.as_deref(), &text) {
                     maybe_spawn_extraction(&config, &state, query.clone(), text);
                 }
             }
         }
+
+        maybe_store_first_party_artifact(
+            &config,
+            artifact_input,
+            status.as_u16(),
+            capture_response_headers(&resp_headers),
+            resp_body.to_vec(),
+            false,
+            false,
+        );
 
         let mut builder = hyper::Response::builder().status(status.as_u16());
         for (name, value) in resp_headers.iter() {
@@ -555,28 +1146,33 @@ async fn stream_response(
     status: reqwest::StatusCode,
     resp_headers: &reqwest::header::HeaderMap,
     config: &ReinConfig,
-    provider: &ProviderKind,
+    artifact: ProxyArtifactInput,
     query: Option<String>,
     state: &Arc<ProxyState>,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(64);
 
-    let extract_enabled = config.proxy.extract_enabled;
+    let extract_enabled =
+        config.proxy.extract_enabled && artifact.route.recording_mode.captures_structured_text();
     let max_sse_buffer = config.proxy.max_sse_buffer;
-    let provider_clone = *provider;
+    let provider_clone = artifact.route.provider;
     let config_clone = config.clone();
     let query_clone = query.clone();
     let state_clone = Arc::clone(state);
+    let response_headers = capture_response_headers(resp_headers);
 
     // Spawn task to read upstream stream, forward chunks, buffer text.
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
         let mut assistant_buf = String::new();
+        let mut raw_response_buf = Vec::new();
         // SSE line buffer: transport chunks may split across SSE event boundaries.
         let mut sse_line_buf = String::new();
         // Whether SSE parsing has been abandoned due to buffer overflow.
         let mut sse_parsing_active = true;
         const MAX_EXTRACT_BUF: usize = 200_000; // ~50K tokens, prevent OOM
+        const MAX_ARTIFACT_BUF: usize = 256_000;
+        let mut artifact_truncated = false;
 
         use futures_util::StreamExt;
         let mut clean_completion = false;
@@ -590,6 +1186,16 @@ async fn stream_response(
             };
             match chunk_result {
                 Ok(chunk) => {
+                    if raw_response_buf.len() < MAX_ARTIFACT_BUF {
+                        let remaining = MAX_ARTIFACT_BUF.saturating_sub(raw_response_buf.len());
+                        let to_copy = remaining.min(chunk.len());
+                        raw_response_buf.extend_from_slice(&chunk[..to_copy]);
+                        if to_copy < chunk.len() {
+                            artifact_truncated = true;
+                        }
+                    } else {
+                        artifact_truncated = true;
+                    }
                     // Parse SSE chunks for assistant text extraction.
                     // Buffer incomplete lines across chunk boundaries.
                     if extract_enabled
@@ -646,6 +1252,16 @@ async fn stream_response(
         {
             maybe_spawn_extraction(&config_clone, &state_clone, query_clone, assistant_buf);
         }
+
+        maybe_store_first_party_artifact(
+            &config_clone,
+            artifact,
+            status.as_u16(),
+            response_headers,
+            raw_response_buf,
+            artifact_truncated,
+            true,
+        );
     });
 
     // Build response with streaming body.
@@ -752,6 +1368,43 @@ fn extract_query_for_recording(provider: &ProviderKind, body_bytes: &[u8]) -> Op
     }
 }
 
+fn resolve_route(path: &str, headers: &hyper::HeaderMap) -> Option<ResolvedRoute> {
+    let provider = if prefers_codex_first_party(path, headers) {
+        ProviderKind::CodexFirstParty
+    } else if prefers_chatgpt_backend(path, headers) {
+        ProviderKind::ChatGptBackend
+    } else {
+        ProviderKind::detect(path)?
+    };
+    Some(ResolvedRoute {
+        provider,
+        recording_mode: provider.recording_mode_for_path(path),
+    })
+}
+
+fn prefers_codex_first_party(path: &str, headers: &hyper::HeaderMap) -> bool {
+    if ProviderKind::detect(path) == Some(ProviderKind::CodexFirstParty) {
+        return true;
+    }
+    if !ProviderKind::is_ambiguous_codex_first_party_path(path) {
+        return false;
+    }
+    // Ambiguous path resolution: when the client sent a bare/first-party path like
+    // `/responses`, `/models`, or `/authenticate_app_v2`, a ChatGPT-login JWT is
+    // sufficient evidence to route to the Codex first-party upstream.
+    bearer_jwt_info(headers).is_some_and(|info| info.is_chatgpt_login)
+}
+
+fn prefers_chatgpt_backend(path: &str, _headers: &hyper::HeaderMap) -> bool {
+    if ProviderKind::detect(path) == Some(ProviderKind::ChatGptBackend) {
+        return true;
+    }
+    if !ProviderKind::is_ambiguous_chatgpt_backend_path(path) {
+        return false;
+    }
+    true
+}
+
 fn should_strip_request_header(name: &str) -> bool {
     matches!(
         name,
@@ -772,6 +1425,31 @@ async fn handle_websocket_proxy(
     headers: &hyper::HeaderMap,
     provider: ProviderKind,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
+    let recording_mode = provider.recording_mode_for_path(path_and_query);
+    // H5: Only /responses-family routes (StructuredText) are eligible for WS upgrade.
+    // First-party ChatGPT backend helper routes (/wham/*, /connectors/*, /models, etc.)
+    // are recorded as ArtifactMirrorOnly over HTTP and must NEVER upgrade to WS —
+    // Codex does not use WS for those endpoints, so an upgrade request there is
+    // either a protocol confusion or an attacker probing for an attack surface.
+    if !recording_mode.captures_structured_text() {
+        tracing::warn!(
+            path = %path_and_query,
+            "rejecting websocket upgrade on ArtifactMirrorOnly route"
+        );
+        return Ok(websocket_upstream_failure_response(provider));
+    }
+
+    let artifact = ProxyArtifactInput {
+        route: ResolvedRoute {
+            provider,
+            recording_mode,
+        },
+        method: "GET".to_string(),
+        path: path_and_query.to_string(),
+        session_id: extract_session_id(headers),
+        request_headers: capture_request_headers(headers),
+        request_body: Bytes::new(),
+    };
     let client_key = match headers
         .get("sec-websocket-key")
         .and_then(|v| v.to_str().ok())
@@ -783,23 +1461,37 @@ async fn handle_websocket_proxy(
     let upstream = match connect_upstream_websocket(config, provider, path_and_query, headers).await
     {
         Ok(upstream) => upstream,
-        Err(e) => {
+        Err(UpstreamWsError::Unauthorized) => {
+            // H8: upstream 401 is semantically meaningful — Codex clients do a single
+            // refresh-retry on 401. Rewriting to 426/502 breaks their retry loop. Pass
+            // the 401 through unchanged so the client sees exactly what upstream said.
+            tracing::info!(
+                "websocket upstream returned 401; passing through for client refresh"
+            );
+            return Ok(error_response(
+                401,
+                "websocket upstream rejected credentials",
+            ));
+        }
+        Err(UpstreamWsError::Other(e)) => {
             tracing::warn!("websocket upstream connect failed: {e}");
-            return Ok(error_response(502, "upstream websocket handshake failed"));
+            return Ok(websocket_upstream_failure_response(provider));
         }
     };
-
+    let response_protocol = upstream.protocol.clone();
     let accept = websocket_accept(&client_key);
     let on_upgrade = hyper::upgrade::on(req);
+    let config = config.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                let mut upgraded = hyper_util::rt::TokioIo::new(upgraded);
-                let mut upstream_io = upstream.io;
-                if !upstream.buffered.is_empty() {
-                    let _ = upgraded.write_all(&upstream.buffered).await;
-                }
-                let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut *upstream_io).await;
+                relay_websocket_with_mirror(
+                    &config,
+                    artifact,
+                    hyper_util::rt::TokioIo::new(upgraded),
+                    upstream,
+                )
+                .await;
             }
             Err(e) => tracing::warn!("client websocket upgrade failed: {e}"),
         }
@@ -810,20 +1502,30 @@ async fn handle_websocket_proxy(
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-accept", accept);
-    if let Some(protocol) = upstream.protocol {
+    if let Some(protocol) = response_protocol {
         builder = builder.header("sec-websocket-protocol", protocol);
-    }
-    if let Some(extensions) = upstream.extensions {
-        builder = builder.header("sec-websocket-extensions", extensions);
     }
     Ok(build_response(builder, full_body(Bytes::new())))
 }
 
 struct UpstreamWebsocket {
-    io: BoxedIo,
+    stream: UpstreamWsStream,
     protocol: Option<String>,
-    extensions: Option<String>,
-    buffered: Vec<u8>,
+    headers: Vec<(String, String)>,
+}
+
+/// Typed error for upstream WebSocket connection attempts. `Unauthorized` is
+/// distinguished so the proxy can pass 401 through to the client unchanged
+/// (Codex clients do a single refresh-retry on 401; rewriting breaks their retry).
+enum UpstreamWsError {
+    Unauthorized,
+    Other(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for UpstreamWsError {
+    fn from(e: E) -> Self {
+        UpstreamWsError::Other(e.into())
+    }
 }
 
 async fn connect_upstream_websocket(
@@ -831,121 +1533,186 @@ async fn connect_upstream_websocket(
     provider: ProviderKind,
     path_and_query: &str,
     headers: &hyper::HeaderMap,
-) -> anyhow::Result<UpstreamWebsocket> {
+) -> Result<UpstreamWebsocket, UpstreamWsError> {
     let upstream_base = provider.upstream_url(config);
-    let upstream_uri: hyper::Uri = upstream_base.parse()?;
-    let host = upstream_uri
-        .host()
-        .ok_or_else(|| anyhow::anyhow!("upstream host missing"))?
-        .to_string();
-    let secure = matches!(upstream_uri.scheme_str(), Some("https" | "wss"));
-    let port = upstream_uri
-        .port_u16()
-        .unwrap_or(if secure { 443 } else { 80 });
     let rewritten_path = provider.rewrite_path(path_and_query).into_owned();
-
-    let tcp = TcpStream::connect((host.as_str(), port)).await?;
-    let mut io: BoxedIo = if secure {
-        let connector = TokioTlsConnector::from(TlsConnector::new()?);
-        Box::new(connector.connect(&host, tcp).await?)
+    let http_url = format!("{upstream_base}{rewritten_path}");
+    let ws_url = if let Some(rest) = http_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if http_url.starts_with("wss://") || http_url.starts_with("ws://") {
+        http_url.clone()
     } else {
-        Box::new(tcp)
+        return Err(UpstreamWsError::Other(anyhow::anyhow!(
+            "unsupported websocket scheme in upstream url: {http_url}"
+        )));
     };
 
-    let host_header = if (secure && port == 443) || (!secure && port == 80) {
-        host.clone()
-    } else {
-        format!("{host}:{port}")
-    };
-
-    let mut request = format!(
-        "GET {rewritten_path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
-    );
-    /// Strip control characters from header values for defense-in-depth
-    fn sanitize_header_value(s: &str) -> String {
-        s.chars().filter(|c| !c.is_control()).collect()
-    }
-
-    if let Some(key) = headers
-        .get("sec-websocket-key")
-        .and_then(|v| v.to_str().ok())
-    {
-        request.push_str(&format!(
-            "Sec-WebSocket-Key: {}\r\n",
-            sanitize_header_value(key)
-        ));
-    }
+    let mut request = ws_url
+        .clone()
+        .into_client_request()
+        .map_err(|e| UpstreamWsError::Other(anyhow::anyhow!("failed to build websocket request: {e}")))?;
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
         if should_strip_ws_handshake_header(name_str) {
             continue;
         }
-        if let Ok(v) = value.to_str() {
-            request.push_str(&format!("{name_str}: {}\r\n", sanitize_header_value(v)));
+        request.headers_mut().insert(name, value.clone());
+    }
+    if request.headers().contains_key("origin") {
+        if let Some(origin) = websocket_upstream_origin(&ws_url) {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&origin) {
+                request.headers_mut().insert("origin", value);
+            }
         }
     }
-    request.push_str("\r\n");
-    io.write_all(request.as_bytes()).await?;
-    io.flush().await?;
-
-    let (status, resp_headers, buffered) = read_http_response_head(&mut *io).await?;
-    if status != 101 {
-        let preview = String::from_utf8_lossy(&buffered);
-        anyhow::bail!(
-            "upstream websocket handshake returned status {status}; body={}",
-            preview.chars().take(500).collect::<String>()
+    if !request.headers().contains_key("originator") {
+        request.headers_mut().insert(
+            "originator",
+            hyper::header::HeaderValue::from_static(default_codex_originator()),
         );
     }
+    if !request.headers().contains_key("user-agent") {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&default_codex_user_agent()) {
+            request.headers_mut().insert("user-agent", value);
+        }
+    }
+
+    let (stream, response) = match connect_async(request).await {
+        Ok(pair) => pair,
+        Err(WsError::Http(resp)) if resp.status().as_u16() == 401 => {
+            return Err(UpstreamWsError::Unauthorized);
+        }
+        Err(e) => {
+            return Err(UpstreamWsError::Other(anyhow::anyhow!(
+                "upstream websocket handshake failed: {e}"
+            )));
+        }
+    };
+    let response_headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    redact_header_value(name.as_str(), value),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
 
     Ok(UpstreamWebsocket {
-        io,
-        protocol: resp_headers.get("sec-websocket-protocol").cloned(),
-        extensions: resp_headers.get("sec-websocket-extensions").cloned(),
-        buffered,
+        stream,
+        protocol: response
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string),
+        headers: response_headers,
     })
 }
 
-async fn read_http_response_head(
-    io: &mut dyn AsyncIo,
-) -> anyhow::Result<(u16, std::collections::HashMap<String, String>, Vec<u8>)> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    let header_end = loop {
-        let n = io.read(&mut tmp).await?;
-        if n == 0 {
-            anyhow::bail!("upstream closed before websocket handshake completed");
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(idx) = find_header_end(&buf) {
-            break idx;
-        }
-        if buf.len() > 64 * 1024 {
-            anyhow::bail!("upstream websocket handshake headers too large");
-        }
-    };
+async fn relay_websocket_with_mirror(
+    config: &ReinConfig,
+    artifact: ProxyArtifactInput,
+    upgraded: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
+    upstream: UpstreamWebsocket,
+) {
+    let response_headers = upstream.headers.clone();
+    let should_collect = artifact.route.recording_mode.captures_structured_text();
+    let client_ws = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
+    let (mut client_sink, mut client_stream) = client_ws.split();
+    let (mut upstream_sink, mut upstream_stream) = upstream.stream.split();
+    let mut request_mirror = WebSocketMirrorState::default();
+    let mut response_mirror = WebSocketMirrorState::default();
 
-    let head = std::str::from_utf8(&buf[..header_end])?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("invalid upstream websocket status line"))?
-        .parse::<u16>()?;
-    let mut headers = std::collections::HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    loop {
+        tokio::select! {
+            upstream_msg = upstream_stream.next() => {
+                match upstream_msg {
+                    Some(Ok(message)) => {
+                        if should_collect {
+                            response_mirror.record_message(&message, true);
+                        }
+                        let is_close = matches!(message, Message::Close(_));
+                        if client_sink.send(message).await.is_err() {
+                            break;
+                        }
+                        if is_close {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if is_benign_websocket_read_error(&e) {
+                            tracing::debug!("websocket upstream relay ended benignly: {e}");
+                        } else {
+                            tracing::warn!("websocket upstream relay read failed: {e}");
+                        }
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            client_msg = client_stream.next() => {
+                match client_msg {
+                    Some(Ok(message)) => {
+                        if should_collect {
+                            request_mirror.record_message(&message, false);
+                        }
+                        let is_close = matches!(message, Message::Close(_));
+                        if upstream_sink.send(message).await.is_err() {
+                            break;
+                        }
+                        if is_close {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if is_benign_websocket_read_error(&e) {
+                            tracing::debug!("websocket client relay ended benignly: {e}");
+                        } else {
+                            tracing::warn!("websocket client relay read failed: {e}");
+                        }
+                        break;
+                    }
+                    None => break,
+                }
+            }
         }
     }
-    Ok((status, headers, buf[header_end + 4..].to_vec()))
-}
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|window| window == b"\r\n\r\n")
+    let _ = tokio::time::timeout(Duration::from_millis(250), async {
+        let _ = client_sink.close().await;
+        let _ = upstream_sink.close().await;
+    })
+    .await;
+
+    let request_query = request_mirror.request_query.clone();
+    if should_collect
+        && config.proxy.extract_enabled
+        && policy::should_extract_response(config, request_query.as_deref(), &response_mirror.assistant_text)
+    {
+        let state = Arc::new(ProxyState {
+            metrics: ProxyMetrics::new(),
+        });
+        maybe_spawn_extraction(
+            config,
+            &state,
+            request_query,
+            response_mirror.assistant_text.clone(),
+        );
+    }
+
+    maybe_store_first_party_ws_artifact(
+        config,
+        artifact,
+        response_headers,
+        request_mirror.event_messages,
+        response_mirror.event_messages,
+        request_mirror.truncated || response_mirror.truncated,
+    );
 }
 
 fn websocket_accept(key: &str) -> String {
@@ -979,6 +1746,7 @@ fn should_strip_ws_handshake_header(name: &str) -> bool {
             | "upgrade"
             | "sec-websocket-key"
             | "sec-websocket-version"
+            | "sec-websocket-extensions"
             | "proxy-authenticate"
             | "proxy-authorization"
             | "x-rein-token"
@@ -1002,8 +1770,8 @@ fn responses_scope_error(
         return None;
     };
 
-    let scopes = bearer_jwt_scopes(headers)?;
-    if scopes.iter().any(|scope| scope == required_scope) {
+    let info = bearer_jwt_info(headers)?;
+    if info.scopes.iter().any(|scope| scope == required_scope) {
         return None;
     }
 
@@ -1013,62 +1781,2354 @@ This usually means ChatGPT login tokens are not compatible with OpenAI Responses
     ))
 }
 
-fn bearer_jwt_scopes(headers: &hyper::HeaderMap) -> Option<Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BearerJwtInfo {
+    scopes: Vec<String>,
+    has_public_responses_scope: bool,
+    is_chatgpt_login: bool,
+}
+
+/// Keep only the small set of claims needed for routing; drop everything else so
+/// nothing derived from the JWT can leak verbatim into logs or error responses.
+/// The proxy does NOT verify signatures — upstream does. This function is strictly
+/// for extracting routing hints from a transport-layer token.
+///
+/// Currently only used by tests + future log/error paths. Kept as defensive
+/// infrastructure so any future code that needs to emit JWT-derived context has
+/// a ready-to-use redaction primitive.
+#[allow(dead_code)]
+fn redact_jwt_payload(payload: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for k in [
+        "iss",
+        "aud",
+        "sub",
+        "exp",
+        "iat",
+        "nbf",
+        "scp",
+        "chatgpt_account_id",
+    ] {
+        if let Some(v) = payload.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    // Nested OpenAI auth claim, keep only chatgpt_account_id.
+    if let Some(nested) = payload
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.get("chatgpt_account_id"))
+    {
+        let mut auth_obj = serde_json::Map::new();
+        auth_obj.insert("chatgpt_account_id".to_string(), nested.clone());
+        out.insert(
+            "https://api.openai.com/auth".to_string(),
+            Value::Object(auth_obj),
+        );
+    }
+    Value::Object(out)
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn bearer_jwt_info(headers: &hyper::HeaderMap) -> Option<BearerJwtInfo> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     let payload = token.split('.').nth(1)?;
     let decoded = BASE64_URL_SAFE_NO_PAD.decode(payload).ok()?;
     let json: Value = serde_json::from_slice(&decoded).ok()?;
-    let scopes = json.get("scp")?.as_array()?;
-    Some(
-        scopes
-            .iter()
-            .filter_map(|scope| scope.as_str().map(|s| s.to_string()))
-            .collect(),
-    )
+
+    // Expiry check: if `exp` is present and in the past, treat the bearer as absent
+    // so routing logic does not trust claims from an expired token. Upstream still
+    // validates signatures; this is an additional local sanity check.
+    if let Some(exp) = json.get("exp").and_then(|v| v.as_i64()) {
+        let now = current_unix_timestamp();
+        // 30 s clock skew allowance before rejecting.
+        if exp + 30 < now {
+            tracing::debug!("bearer token is expired, ignoring JWT claims for routing");
+            return None;
+        }
+    }
+
+    let scopes = json
+        .get("scp")
+        .and_then(|value| value.as_array())
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|scope| scope.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let has_public_responses_scope = scopes
+        .iter()
+        .any(|scope| scope == "api.responses.read" || scope == "api.responses.write");
+    let is_chatgpt_login = json
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|account| account.as_str())
+        .is_some()
+        || json
+            .get("chatgpt_account_id")
+            .and_then(|account| account.as_str())
+            .is_some();
+    Some(BearerJwtInfo {
+        scopes,
+        has_public_responses_scope,
+        is_chatgpt_login,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn fake_jwt_with_scopes(scopes: &[&str]) -> String {
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    fn find_header_end_for_test(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn spawn_capture_http_server(
+        response_status: &str,
+        response_body: &str,
+    ) -> (String, Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response_status = response_status.to_string();
+        let response_body = response_body.to_string();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(end) = find_header_end_for_test(&buf) {
+                    break end;
+                }
+            };
+
+            let header_text = String::from_utf8_lossy(&buf[..header_end]);
+            let mut lines = header_text.split("\r\n");
+            let request_line = lines.next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let mut headers = HashMap::new();
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = buf[header_end + 4..].to_vec();
+            while body.len() < content_length {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            tx.send(CapturedRequest {
+                method,
+                path,
+                headers,
+                body,
+            })
+            .unwrap();
+
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{}", addr), rx)
+    }
+
+    fn spawn_capture_websocket_server() -> (String, Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(end) = find_header_end_for_test(&buf) {
+                    break end;
+                }
+            };
+
+            let header_text = String::from_utf8_lossy(&buf[..header_end]);
+            let mut lines = header_text.split("\r\n");
+            let request_line = lines.next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let mut headers = HashMap::new();
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let accept = headers
+                .get("sec-websocket-key")
+                .map(|value| websocket_accept(value))
+                .unwrap_or_else(|| "invalid".to_string());
+            tx.send(CapturedRequest {
+                method,
+                path,
+                headers,
+                body: Vec::new(),
+            })
+            .unwrap();
+
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Accept: {accept}\r\n\
+\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{}", addr), rx)
+    }
+
+    fn encode_ws_frame(opcode: u8, payload: &[u8], fin: bool, rsv1: bool) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        let mut first = opcode & 0x0f;
+        if fin {
+            first |= 0x80;
+        }
+        if rsv1 {
+            first |= 0x40;
+        }
+        frame.push(first);
+        match payload.len() {
+            len @ 0..=125 => frame.push(len as u8),
+            len @ 126..=65535 => {
+                frame.push(126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            len => {
+                frame.push(127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn encode_masked_ws_frame(opcode: u8, payload: &[u8], fin: bool) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(payload.len() + 14);
+        let mut first = opcode & 0x0f;
+        if fin {
+            first |= 0x80;
+        }
+        frame.push(first);
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        match payload.len() {
+            len @ 0..=125 => frame.push(0x80 | len as u8),
+            len @ 126..=65535 => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            len => {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[index % 4]);
+        }
+        frame
+    }
+
+    fn encode_ws_text_frame(text: &str) -> Vec<u8> {
+        encode_ws_frame(0x1, text.as_bytes(), true, false)
+    }
+
+    fn encode_ws_text_frame_with_flags(text: &str, fin: bool, rsv1: bool) -> Vec<u8> {
+        encode_ws_frame(0x1, text.as_bytes(), fin, rsv1)
+    }
+
+    fn encode_ws_continuation_frame(text: &str, fin: bool) -> Vec<u8> {
+        encode_ws_frame(0x0, text.as_bytes(), fin, false)
+    }
+
+    fn encode_ws_compressed_text_frame(text: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(text.as_bytes()).unwrap();
+        let mut payload = encoder.finish().unwrap();
+        if payload.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            payload.truncate(payload.len() - 4);
+        }
+        encode_ws_frame(0x1, &payload, true, true)
+    }
+
+    fn encode_ws_close_frame() -> Vec<u8> {
+        vec![0x88, 0x00]
+    }
+
+    fn encode_masked_ws_text_frame(text: &str) -> Vec<u8> {
+        encode_masked_ws_frame(0x1, text.as_bytes(), true)
+    }
+
+    fn spawn_capture_websocket_server_with_frames(
+        frames: Vec<Vec<u8>>,
+    ) -> (String, Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(end) = find_header_end_for_test(&buf) {
+                    break end;
+                }
+            };
+
+            let header_text = String::from_utf8_lossy(&buf[..header_end]);
+            let mut lines = header_text.split("\r\n");
+            let request_line = lines.next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let mut headers = HashMap::new();
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let accept = headers
+                .get("sec-websocket-key")
+                .map(|value| websocket_accept(value))
+                .unwrap_or_else(|| "invalid".to_string());
+            tx.send(CapturedRequest {
+                method,
+                path,
+                headers,
+                body: Vec::new(),
+            })
+            .unwrap();
+
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Accept: {accept}\r\n\
+Sec-WebSocket-Extensions: permessage-deflate\r\n\
+\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            thread::sleep(Duration::from_millis(20));
+            for frame in frames {
+                let _ = stream.write_all(&frame);
+            }
+        });
+        (format!("http://{}", addr), rx)
+    }
+
+    fn unused_local_base_url(scheme: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("{scheme}://{}", addr)
+    }
+
+    fn wait_for_artifact_count(db_path: &std::path::Path, artifact_kind: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(conn) = Connection::open(db_path) {
+                let mut stmt = conn
+                    .prepare("SELECT COUNT(*) FROM session_artifacts WHERE artifact_kind = ?1")
+                    .unwrap();
+                let count: i64 = stmt.query_row([artifact_kind], |row| row.get(0)).unwrap();
+                if count > 0 {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for artifact_kind={artifact_kind}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    async fn spawn_one_shot_proxy(
+        config: ReinConfig,
+        expected_token: Option<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(ProxyState {
+            metrics: ProxyMetrics::new(),
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |req| {
+                let config = config.clone();
+                let client = client.clone();
+                let state = Arc::clone(&state);
+                let expected_token = expected_token.clone();
+                async move {
+                    handle_request(req, config, client, expected_token.as_deref(), state).await
+                }
+            });
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn fake_jwt_payload(payload: serde_json::Value) -> String {
         let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-        let payload = BASE64_URL_SAFE_NO_PAD
-            .encode(serde_json::json!({ "scp": scopes }).to_string().as_bytes());
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         format!("{header}.{payload}.sig")
     }
 
-    #[test]
-    fn chatgpt_login_jwt_without_responses_scope_is_rejected() {
-        let token = fake_jwt_with_scopes(&["openid", "profile", "offline_access"]);
+    fn fake_jwt_with_scopes(scopes: &[&str]) -> String {
+        fake_jwt_payload(serde_json::json!({ "scp": scopes }))
+    }
+
+    fn fake_chatgpt_login_jwt(scopes: &[&str]) -> String {
+        fake_jwt_payload(serde_json::json!({
+            "scp": scopes,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_test"
+            }
+        }))
+    }
+
+    #[derive(Clone, Copy)]
+    enum TokenFixture {
+        None,
+        ApiResponses,
+        JwtWithoutResponsesScope,
+        ChatGptLogin,
+        ChatGptLoginWithResponsesScope,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RouteSupportCase {
+        name: &'static str,
+        method: &'static str,
+        path: &'static str,
+        token: TokenFixture,
+        scope_provider: Option<ProviderKind>,
+        expected_scope_error_contains: Option<&'static str>,
+        expected_route: Option<ResolvedRoute>,
+    }
+
+    #[derive(Clone)]
+    struct SupportMatrixRow {
+        path_family: String,
+        trigger: String,
+        upstream: String,
+        recording_mode: String,
+        coverage: String,
+    }
+
+    fn route_support_cases() -> Vec<RouteSupportCase> {
+        vec![
+            RouteSupportCase {
+                name: "anthropic_messages",
+                method: "POST",
+                path: "/v1/messages",
+                token: TokenFixture::None,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::Anthropic,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            RouteSupportCase {
+                name: "openai_chat_completions",
+                method: "POST",
+                path: "/v1/chat/completions",
+                token: TokenFixture::None,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::OpenAi,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            RouteSupportCase {
+                name: "responses_missing_public_scope",
+                method: "POST",
+                path: "/responses",
+                token: TokenFixture::JwtWithoutResponsesScope,
+                scope_provider: Some(ProviderKind::OpenAiResponses),
+                expected_scope_error_contains: Some("api.responses.write"),
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::OpenAiResponses,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            RouteSupportCase {
+                name: "responses_api_scope_routes_public",
+                method: "POST",
+                path: "/responses",
+                token: TokenFixture::ApiResponses,
+                scope_provider: Some(ProviderKind::OpenAiResponses),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::OpenAiResponses,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            RouteSupportCase {
+                name: "chatgpt_login_responses_routes_first_party",
+                method: "POST",
+                path: "/responses",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            RouteSupportCase {
+                name: "chatgpt_login_models_stays_artifact_mirror_only",
+                method: "GET",
+                path: "/models",
+                token: TokenFixture::ChatGptLoginWithResponsesScope,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "chatgpt_login_compact_stays_artifact_mirror_only",
+                method: "POST",
+                path: "/responses/compact",
+                token: TokenFixture::ChatGptLoginWithResponsesScope,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "chatgpt_login_memories_stays_artifact_mirror_only",
+                method: "POST",
+                path: "/memories/trace_summarize",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "backend_api_responses_structured_text",
+                method: "POST",
+                path: "/backend-api/codex/responses",
+                token: TokenFixture::None,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::StructuredText,
+                }),
+            },
+            RouteSupportCase {
+                name: "backend_api_compact_artifact_mirror_only",
+                method: "POST",
+                path: "/backend-api/codex/responses/compact",
+                token: TokenFixture::None,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "backend_api_memories_artifact_mirror_only",
+                method: "POST",
+                path: "/backend-api/codex/memories/trace_summarize",
+                token: TokenFixture::None,
+                scope_provider: Some(ProviderKind::CodexFirstParty),
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::CodexFirstParty,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "chatgpt_backend_wham_usage",
+                method: "GET",
+                path: "/wham/usage",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::ChatGptBackend,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "chatgpt_backend_connectors_directory",
+                method: "POST",
+                path: "/connectors/directory/list",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::ChatGptBackend,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "backend_api_wham_usage_routes_chatgpt_backend",
+                method: "GET",
+                path: "/backend-api/wham/usage",
+                token: TokenFixture::ChatGptLogin,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: Some(ResolvedRoute {
+                    provider: ProviderKind::ChatGptBackend,
+                    recording_mode: RecordingMode::ArtifactMirrorOnly,
+                }),
+            },
+            RouteSupportCase {
+                name: "unknown_v1_models_route_rejected",
+                method: "GET",
+                path: "/v1/models",
+                token: TokenFixture::None,
+                scope_provider: None,
+                expected_scope_error_contains: None,
+                expected_route: None,
+            },
+        ]
+    }
+
+    fn headers_for_token_fixture(token: TokenFixture) -> hyper::HeaderMap {
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "authorization",
-            hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        let msg = responses_scope_error(
-            ProviderKind::OpenAiResponses,
-            &hyper::Method::POST,
-            &headers,
-        )
-        .unwrap();
-        assert!(msg.contains("api.responses.write"));
+        let token = match token {
+            TokenFixture::None => None,
+            TokenFixture::ApiResponses => {
+                Some(fake_jwt_with_scopes(&["api.responses.read", "api.responses.write"]))
+            }
+            TokenFixture::JwtWithoutResponsesScope => {
+                Some(fake_jwt_with_scopes(&["openid", "profile", "offline_access"]))
+            }
+            TokenFixture::ChatGptLogin => {
+                Some(fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]))
+            }
+            TokenFixture::ChatGptLoginWithResponsesScope => Some(fake_chatgpt_login_jwt(&[
+                "openid",
+                "profile",
+                "offline_access",
+                "api.responses.read",
+                "api.responses.write",
+            ])),
+        };
+        if let Some(token) = token {
+            headers.insert(
+                "authorization",
+                hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn support_matrix_rows() -> Vec<SupportMatrixRow> {
+        let route_rows = route_support_cases()
+            .into_iter()
+            .filter_map(|case| match case.name {
+                "responses_api_scope_routes_public" => Some(SupportMatrixRow {
+                    path_family: "/responses".to_string(),
+                    trigger: "API-key scope: api.responses.read + api.responses.write".to_string(),
+                    upstream: "openai_upstream (/v1/responses)".to_string(),
+                    recording_mode: "StructuredText".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_api_responses_route_to_openai_upstream_with_v1_prefix"
+                            .to_string(),
+                }),
+                "chatgpt_login_responses_routes_first_party" => Some(SupportMatrixRow {
+                    path_family: "/responses".to_string(),
+                    trigger: "ChatGPT login token".to_string(),
+                    upstream: "codex_upstream (/responses)".to_string(),
+                    recording_mode: "StructuredText".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_chatgpt_login_responses_route_to_codex_upstream"
+                            .to_string(),
+                }),
+                "chatgpt_login_models_stays_artifact_mirror_only" => Some(SupportMatrixRow {
+                    path_family: "/models".to_string(),
+                    trigger: "ChatGPT login token".to_string(),
+                    upstream: "codex_upstream (/models)".to_string(),
+                    recording_mode: "ArtifactMirrorOnly".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_chatgpt_login_models_route_to_codex_upstream"
+                            .to_string(),
+                }),
+                "chatgpt_login_compact_stays_artifact_mirror_only" => Some(SupportMatrixRow {
+                    path_family: "/responses/compact".to_string(),
+                    trigger: "ChatGPT login token".to_string(),
+                    upstream: "codex_upstream (/responses/compact)".to_string(),
+                    recording_mode: "ArtifactMirrorOnly".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_chatgpt_login_compact_route_to_codex_upstream"
+                            .to_string(),
+                }),
+                "chatgpt_login_memories_stays_artifact_mirror_only" => Some(SupportMatrixRow {
+                    path_family: "/memories/trace_summarize".to_string(),
+                    trigger: "ChatGPT login token".to_string(),
+                    upstream: "codex_upstream (/memories/trace_summarize)".to_string(),
+                    recording_mode: "ArtifactMirrorOnly".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_chatgpt_login_memories_route_to_codex_upstream"
+                            .to_string(),
+                }),
+                "chatgpt_backend_wham_usage" => Some(SupportMatrixRow {
+                    path_family: "/wham/*".to_string(),
+                    trigger: "ChatGPT login token".to_string(),
+                    upstream: "chatgpt_upstream".to_string(),
+                    recording_mode: "ArtifactMirrorOnly".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_chatgpt_helper_paths_to_chatgpt_upstream, proxy_forwards_chatgpt_tasks_list_route_to_chatgpt_upstream, proxy_forwards_chatgpt_task_details_route_to_chatgpt_upstream, proxy_forwards_chatgpt_sibling_turns_route_to_chatgpt_upstream, proxy_forwards_chatgpt_requirements_route_to_chatgpt_upstream"
+                            .to_string(),
+                }),
+                "chatgpt_backend_connectors_directory" => Some(SupportMatrixRow {
+                    path_family: "/connectors/*".to_string(),
+                    trigger: "ChatGPT login token".to_string(),
+                    upstream: "chatgpt_upstream".to_string(),
+                    recording_mode: "ArtifactMirrorOnly".to_string(),
+                    coverage:
+                        "route_resolution_support_matrix, proxy_forwards_chatgpt_connector_directory_route_to_chatgpt_upstream, proxy_forwards_chatgpt_workspace_connector_route_to_chatgpt_upstream"
+                            .to_string(),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut rows = route_rows;
+        rows.extend([
+            SupportMatrixRow {
+                path_family: "/v1/agent/register".to_string(),
+                trigger: "ChatGPT login token".to_string(),
+                upstream: "chatgpt_upstream".to_string(),
+                recording_mode: "ArtifactMirrorOnly".to_string(),
+                coverage:
+                    "route_resolution_support_matrix, proxy_forwards_chatgpt_agent_register_route_to_chatgpt_upstream"
+                        .to_string(),
+            },
+            SupportMatrixRow {
+                path_family: "/authenticate_app_v2".to_string(),
+                trigger: "ChatGPT login token".to_string(),
+                upstream: "chatgpt_upstream".to_string(),
+                recording_mode: "ArtifactMirrorOnly".to_string(),
+                coverage:
+                    "route_resolution_support_matrix, proxy_forwards_chatgpt_authenticate_app_route_to_chatgpt_upstream"
+                        .to_string(),
+            },
+            SupportMatrixRow {
+                path_family: "/codex/safety/arc".to_string(),
+                trigger: "ChatGPT login token".to_string(),
+                upstream: "chatgpt_upstream".to_string(),
+                recording_mode: "ArtifactMirrorOnly".to_string(),
+                coverage:
+                    "route_resolution_support_matrix, proxy_forwards_chatgpt_arc_monitor_route_to_chatgpt_upstream"
+                        .to_string(),
+            },
+            SupportMatrixRow {
+                path_family: "GET /responses WebSocket upgrade".to_string(),
+                trigger: "ChatGPT login token".to_string(),
+                upstream: "codex_upstream (/responses)".to_string(),
+                recording_mode: "StructuredText + proxy_first_party_ws artifact".to_string(),
+                coverage:
+                    "proxy_forwards_chatgpt_login_websocket_upgrade_to_codex_upstream, proxy_returns_426_when_codex_websocket_upstream_is_unavailable, proxy_stores_redacted_first_party_websocket_artifact_for_chatgpt_login_responses, websocket_request_mirror_extracts_response_create_query, websocket_mirror_reassembles_fragmented_text_frames, websocket_mirror_decodes_compressed_text_frames"
+                        .to_string(),
+            },
+        ]);
+        rows
+    }
+
+    fn normalize_doc_cell(cell: &str) -> String {
+        cell.replace('`', "")
+            .replace("已覆盖：", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn render_support_matrix_rows(rows: &[SupportMatrixRow]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| {
+                vec![
+                    normalize_doc_cell(&row.path_family),
+                    normalize_doc_cell(&row.trigger),
+                    normalize_doc_cell(&row.upstream),
+                    normalize_doc_cell(&row.recording_mode),
+                    normalize_doc_cell(&row.coverage),
+                ]
+            })
+            .collect()
+    }
+
+    fn extract_support_matrix_rows(doc: &str) -> Vec<Vec<String>> {
+        let section = doc
+            .split("## 2. 当前支持矩阵")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("support matrix section should exist");
+        section
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'))
+            .filter(|line| !line.contains("---"))
+            .skip(1)
+            .map(|line| {
+                line.trim()
+                    .trim_matches('|')
+                    .split('|')
+                    .map(normalize_doc_cell)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[test]
-    fn api_jwt_with_responses_scope_is_allowed() {
+    fn responses_scope_support_matrix() {
+        for case in route_support_cases() {
+            let Some(provider) = case.scope_provider else {
+                continue;
+            };
+            let headers = headers_for_token_fixture(case.token);
+            let method = hyper::Method::from_bytes(case.method.as_bytes()).unwrap();
+            let actual = responses_scope_error(provider, &method, &headers);
+            match case.expected_scope_error_contains {
+                Some(fragment) => {
+                    let msg = actual.unwrap_or_else(|| {
+                        panic!("{} should fail responses scope checks", case.name)
+                    });
+                    assert!(
+                        msg.contains(fragment),
+                        "{} returned unexpected scope message: {msg}",
+                        case.name
+                    );
+                }
+                None => assert!(
+                    actual.is_none(),
+                    "{} unexpectedly failed responses scope checks: {:?}",
+                    case.name,
+                    actual
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn route_resolution_support_matrix() {
+        for case in route_support_cases() {
+            let headers = headers_for_token_fixture(case.token);
+            assert_eq!(
+                resolve_route(case.path, &headers),
+                case.expected_route,
+                "{} resolved unexpectedly for path {}",
+                case.name,
+                case.path
+            );
+        }
+    }
+
+    #[test]
+    fn support_matrix_doc_row_parity() {
+        let doc =
+            include_str!("../../../../docs/reference/codex-subscription-proxy-support-matrix.md");
+        assert_eq!(
+            render_support_matrix_rows(&support_matrix_rows()),
+            extract_support_matrix_rows(doc),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_api_responses_route_to_openai_upstream_with_v1_prefix() {
+        let (openai_upstream, openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
         let token = fake_jwt_with_scopes(&["api.responses.read", "api.responses.write"]);
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = openai_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let expected_auth = format!("Bearer {token}");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/v1/responses");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some(expected_auth.as_str())
+        );
+        assert!(!captured.headers.contains_key("x-rein-token"));
+        assert_eq!(captured.body, br#"{"input":"hello"}"#);
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_claude_messages_body_unmodified() {
+        let (anthropic_upstream, anthropic_rx) =
+            spawn_capture_http_server("200 OK", r#"{"content":[{"type":"text","text":"ok"}]}"#);
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.extract_enabled = false;
+        config.proxy.anthropic_upstream = anthropic_upstream;
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let body = r#"{"model":"claude-sonnet","system":"system seed","messages":[{"role":"user","content":"hello"}]}"#;
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/v1/messages"))
+            .header("x-rein-token", "secret")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = anthropic_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/v1/messages");
+        assert_eq!(captured.body, body.as_bytes());
+        assert!(!captured.headers.contains_key("x-rein-token"));
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_login_responses_route_to_codex_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = codex_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let expected_auth = format!("Bearer {token}");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/responses");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_test")
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_helper_paths_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!("{proxy_base}/wham/usage"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/wham/usage");
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_test")
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_login_models_route_to_codex_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!("{proxy_base}/models?client_version=0.120.0"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = codex_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/models?client_version=0.120.0");
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_test")
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_login_compact_route_to_codex_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses/compact"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("content-type", "application/json")
+            .body(r#"{"items":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = codex_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/responses/compact");
+        assert_eq!(captured.body, br#"{"items":[]}"#);
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_login_memories_route_to_codex_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/memories/trace_summarize"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("content-type", "application/json")
+            .body(r#"{"raw_memories":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = codex_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/memories/trace_summarize");
+        assert_eq!(captured.body, br#"{"raw_memories":[]}"#);
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_connector_directory_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{proxy_base}/connectors/directory/list?external_logos=true"
+            ))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(
+            captured.path,
+            "/connectors/directory/list?external_logos=true"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_workspace_connector_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{proxy_base}/connectors/directory/list_workspace?external_logos=true"
+            ))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(
+            captured.path,
+            "/connectors/directory/list_workspace?external_logos=true"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_tasks_list_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!("{proxy_base}/wham/tasks/list?limit=10"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/wham/tasks/list?limit=10");
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_authenticate_app_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/authenticate_app_v2"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("content-type", "application/json")
+            .body(r#"{"challenge":"abc"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/authenticate_app_v2");
+        assert_eq!(captured.body, br#"{"challenge":"abc"}"#);
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_agent_register_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/v1/agent/register"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("content-type", "application/json")
+            .body(r#"{"public_key":"ssh-ed25519 AAA"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/v1/agent/register");
+        assert_eq!(captured.body, br#"{"public_key":"ssh-ed25519 AAA"}"#);
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_arc_monitor_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/codex/safety/arc"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("content-type", "application/json")
+            .body(r#"{"action":"review"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/codex/safety/arc");
+        assert_eq!(captured.body, br#"{"action":"review"}"#);
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_task_details_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!("{proxy_base}/wham/tasks/task_123"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/wham/tasks/task_123");
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_sibling_turns_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{proxy_base}/wham/tasks/task_123/turns/turn_456/sibling_turns"
+            ))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(
+            captured.path,
+            "/wham/tasks/task_123/turns/turn_456/sibling_turns"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_requirements_route_to_chatgpt_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .get(format!("{proxy_base}/wham/config/requirements"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let captured = chatgpt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/wham/config/requirements");
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_forwards_chatgpt_login_websocket_upgrade_to_codex_upstream() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, codex_rx) = spawn_capture_websocket_server();
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let expected_origin = codex_upstream.clone();
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let addr = proxy_base.trim_start_matches("http://");
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /responses HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGVzdC1rZXk=\r\n\
+Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
+x-rein-token: secret\r\n\
+Authorization: Bearer {token}\r\n\
+ChatGPT-Account-ID: acct_test\r\n\
+Origin: http://127.0.0.1:8788\r\n\
+OpenAI-Beta: responses_websockets=2026-02-06\r\n\
+X-Codex-Turn-State: turn_state_123\r\n\
+X-Codex-Turn-Metadata: turn_meta_456\r\n\
+x-client-request-id: ws_upgrade_123\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&tmp[..n]);
+            if find_header_end_for_test(&response).is_some() {
+                break;
+            }
+        }
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 101"));
+        assert!(!response_text.contains("Sec-WebSocket-Extensions"));
+
+        let captured = codex_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let expected_auth = format!("Bearer {token}");
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/responses");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_test")
+        );
+        assert_eq!(
+            captured.headers.get("openai-beta").map(String::as_str),
+            Some("responses_websockets=2026-02-06")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("x-codex-turn-state")
+                .map(String::as_str),
+            Some("turn_state_123")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("x-codex-turn-metadata")
+                .map(String::as_str),
+            Some("turn_meta_456")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("x-client-request-id")
+                .map(String::as_str),
+            Some("ws_upgrade_123")
+        );
+        assert_eq!(
+            captured.headers.get("origin").map(String::as_str),
+            Some(expected_origin.as_str())
+        );
+        assert_eq!(
+            captured.headers.get("originator").map(String::as_str),
+            Some(default_codex_originator())
+        );
+        assert!(
+            captured
+                .headers
+                .get("user-agent")
+                .is_some_and(|value| value.contains("rein-proxy"))
+        );
+        assert!(!captured.headers.contains_key("sec-websocket-extensions"));
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_does_not_upgrade_artifact_only_first_party_paths() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let addr = proxy_base.trim_start_matches("http://");
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /models HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGVzdC1rZXk=\r\n\
+x-rein-token: secret\r\n\
+Authorization: Bearer {token}\r\n\
+ChatGPT-Account-ID: acct_test\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&tmp[..n]);
+            if find_header_end_for_test(&response).is_some() {
+                break;
+            }
+        }
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200"));
+        assert!(!response_text.starts_with("HTTP/1.1 101"));
+
+        let captured = codex_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/models");
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_returns_426_when_codex_websocket_upstream_is_unavailable() {
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = unused_local_base_url("http");
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let addr = proxy_base.trim_start_matches("http://");
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /responses HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGVzdC1rZXk=\r\n\
+x-rein-token: secret\r\n\
+Authorization: Bearer {token}\r\n\
+ChatGPT-Account-ID: acct_test\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&tmp[..n]);
+            if find_header_end_for_test(&response).is_some() {
+                break;
+            }
+        }
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 426"));
+        assert!(response_text.contains("retry over HTTP"));
+
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_stores_redacted_first_party_artifact_for_chatgpt_login_responses() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("proxy.db");
+
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server(
+            "200 OK",
+            "{\"output\":[{\"type\":\"output_text\",\"text\":\"hello back\"}]}",
+        );
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.database.path = db_path.display().to_string();
+        config.proxy.extract_enabled = false;
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+        let _ = config.open_store().unwrap();
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("x-client-request-id", "thread_123")
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_artifact_count(&db_path, "proxy_first_party");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_kind, session_id, source_agent, source_label, transcript_text \
+                 FROM session_artifacts ORDER BY created_at DESC LIMIT 1",
+            )
+            .unwrap();
+        let row = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(row.0, "proxy_first_party");
+        assert_eq!(row.1.as_deref(), Some("thread_123"));
+        assert_eq!(row.2.as_deref(), Some("proxy"));
+        assert_eq!(row.3.as_deref(), Some("proxy:codex-first-party"));
+        assert!(row.4.contains("path: /responses"));
+        assert!(row.4.contains("capture_mode: structured-text"));
+        assert!(row.4.contains("request_body:"));
+        assert!(row.4.contains("response_body:"));
+        assert!(row.4.contains("authorization: <redacted>"));
+        assert!(row.4.contains("chatgpt-account-id: <redacted>"));
+        assert!(!row.4.contains("Bearer ey"));
+        assert!(!row.4.contains("acct_test"));
+
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_http_artifact_is_visible_via_rest_api() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("proxy-rest.db");
+
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server(
+            "200 OK",
+            "{\"output\":[{\"type\":\"output_text\",\"text\":\"hello back\"}]}",
+        );
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.database.path = db_path.display().to_string();
+        config.proxy.extract_enabled = false;
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+        let _ = config.open_store().unwrap();
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config.clone(), Some("secret".to_string())).await;
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", "acct_test")
+            .header("x-client-request-id", "thread_rest_123")
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let list_req = hyper::Request::builder()
+            .method("GET")
+            .uri("/api/artifacts?limit=10&offset=0")
+            .body(())
+            .unwrap();
+        let list_resp = crate::mcp::rest::handle_rest_request(&list_req, &config)
+            .await
+            .unwrap();
+        let list_body = list_resp.into_body().collect().await.unwrap().to_bytes();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        let artifacts = list_json["artifacts"].as_array().unwrap();
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact["artifact_kind"] == "proxy_first_party")
+            .expect("proxy_first_party artifact should be listed");
+        let artifact_id = artifact["id"].as_str().unwrap();
+        assert_eq!(
+            artifact["source_label"].as_str(),
+            Some("proxy:codex-first-party")
+        );
+
+        let detail_req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/artifacts/{}?include_transcript=true",
+                artifact_id
+            ))
+            .body(())
+            .unwrap();
+        let detail_resp = crate::mcp::rest::handle_rest_request(&detail_req, &config)
+            .await
+            .unwrap();
+        let detail_body = detail_resp.into_body().collect().await.unwrap().to_bytes();
+        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(detail_json["id"].as_str(), Some(artifact_id));
+        assert_eq!(detail_json["session_id"].as_str(), Some("thread_rest_123"));
+        assert_eq!(
+            detail_json["artifact_kind"].as_str(),
+            Some("proxy_first_party")
+        );
+        assert_eq!(detail_json["transcript_available"].as_bool(), Some(true));
+        let transcript = detail_json["transcript_text"].as_str().unwrap();
+        assert!(transcript.contains("path: /responses"));
+        assert!(transcript.contains("authorization: <redacted>"));
+        assert!(transcript.contains("chatgpt-account-id: <redacted>"));
+        assert!(!transcript.contains("Bearer ey"));
+        assert!(!transcript.contains("acct_test"));
+
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_stores_redacted_first_party_websocket_artifact_for_chatgpt_login_responses() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("proxy-ws.db");
+
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_websocket_server_with_frames(vec![
+            encode_ws_text_frame(r#"{"type":"response.created","response":{"id":"resp1"}}"#),
+            encode_ws_text_frame(r#"{"type":"response.output_text.delta","delta":"hello ws"}"#),
+            encode_ws_text_frame(r#"{"type":"response.completed","response":{"id":"resp1"}}"#),
+            encode_ws_close_frame(),
+        ]);
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.database.path = db_path.display().to_string();
+        config.proxy.extract_enabled = false;
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+        let _ = config.open_store().unwrap();
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let addr = proxy_base.trim_start_matches("http://");
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /responses HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGVzdC1rZXk=\r\n\
+x-rein-token: secret\r\n\
+Authorization: Bearer {token}\r\n\
+ChatGPT-Account-ID: acct_test\r\n\
+x-client-request-id: ws_thread_123\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&tmp[..n]);
+            if response.windows(2).any(|window| window == b"\x88\x00") {
+                break;
+            }
+        }
+        assert!(!response.is_empty());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_artifact_count(&db_path, "proxy_first_party_ws");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_kind, session_id, source_label, transcript_text \
+                 FROM session_artifacts ORDER BY created_at DESC LIMIT 1",
+            )
+            .unwrap();
+        let row = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(row.0, "proxy_first_party_ws");
+        assert_eq!(row.1.as_deref(), Some("ws_thread_123"));
+        assert_eq!(row.2.as_deref(), Some("proxy:codex-first-party-ws"));
+        assert!(row.3.contains("path: /responses"));
+        assert!(row.3.contains("capture_mode: structured-text"));
+        assert!(row.3.contains("response.output_text.delta"));
+        assert!(row.3.contains("hello ws"));
+        assert!(row.3.contains("authorization: <redacted>"));
+        assert!(row.3.contains("chatgpt-account-id: <redacted>"));
+        assert!(!row.3.contains("Bearer ey"));
+        assert!(!row.3.contains("acct_test"));
+
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_websocket_artifact_uses_parent_thread_id_and_records_client_events() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("proxy-ws-parent.db");
+
+        let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (codex_upstream, _codex_rx) = spawn_capture_websocket_server_with_frames(vec![
+            encode_ws_text_frame(r#"{"type":"response.created","response":{"id":"resp2"}}"#),
+            encode_ws_text_frame(r#"{"type":"response.output_text.delta","delta":"hello parent"}"#),
+            encode_ws_text_frame(r#"{"type":"response.completed","response":{"id":"resp2"}}"#),
+            encode_ws_close_frame(),
+        ]);
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.database.path = db_path.display().to_string();
+        config.proxy.extract_enabled = false;
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+        let _ = config.open_store().unwrap();
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let addr = proxy_base.trim_start_matches("http://");
+        let token = fake_chatgpt_login_jwt(&["openid", "profile", "offline_access"]);
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /responses HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGVzdC1rZXk=\r\n\
+x-rein-token: secret\r\n\
+Authorization: Bearer {token}\r\n\
+ChatGPT-Account-ID: acct_test\r\n\
+x-codex-parent-thread-id: parent_thread_123\r\n\
+x-codex-window-id: win_123\r\n\
+x-openai-subagent: worker_abc\r\n\
+\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&tmp[..n]);
+            if find_header_end_for_test(&response).is_some() {
+                break;
+            }
+        }
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 101"));
+
+        let client_event = r#"{"type":"response.create","input":[{"role":"user","content":"hello from parent"}]}"#;
+        stream
+            .write_all(&encode_masked_ws_text_frame(client_event))
+            .await
+            .unwrap();
+
+        let mut ws_buf = Vec::new();
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            ws_buf.extend_from_slice(&tmp[..n]);
+            if ws_buf.windows(2).any(|window| window == b"\x88\x00") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_artifact_count(&db_path, "proxy_first_party_ws");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_kind, session_id, source_label, transcript_text \
+                 FROM session_artifacts ORDER BY created_at DESC LIMIT 1",
+            )
+            .unwrap();
+        let row = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(row.0, "proxy_first_party_ws");
+        assert_eq!(row.1.as_deref(), Some("parent_thread_123"));
+        assert_eq!(row.2.as_deref(), Some("proxy:codex-first-party-ws"));
+        assert!(row.3.contains("x-codex-parent-thread-id: parent_thread_123"));
+        assert!(row.3.contains("x-codex-window-id: win_123"));
+        assert!(row.3.contains("x-openai-subagent: worker_abc"));
+        assert!(row.3.contains("client_ws_events:"));
+        assert!(row.3.contains("response.create"));
+        assert!(row.3.contains("hello from parent"));
+        assert!(row.3.contains("upstream_ws_events:"));
+        assert!(row.3.contains("response.created"));
+        assert!(!row.3.contains("Bearer ey"));
+        assert!(!row.3.contains("acct_test"));
+
+        proxy_task.abort();
+    }
+
+    #[test]
+    fn websocket_mirror_reassembles_fragmented_text_frames() {
+        let mut mirror = WebSocketMirrorState::default();
+        mirror.feed(
+            &encode_ws_text_frame_with_flags(
+                r#"{"type":"response.output_text.delta","delta":"hello "#,
+                false,
+                false,
+            ),
+            true,
+        );
+        mirror.feed(&encode_ws_continuation_frame(r#"ws"}"#, true), true);
+
+        assert_eq!(mirror.assistant_text, "hello ws");
+        assert_eq!(mirror.event_messages.len(), 1);
+        assert!(mirror.event_messages[0].contains("response.output_text.delta"));
+        assert!(mirror.event_messages[0].contains("hello ws"));
+    }
+
+    #[test]
+    fn websocket_mirror_decodes_compressed_text_frames() {
+        let mut mirror = WebSocketMirrorState::default();
+        mirror.feed(
+            &encode_ws_compressed_text_frame(
+                r#"{"type":"response.output_text.delta","delta":"hello compressed"}"#,
+            ),
+            true,
+        );
+
+        assert_eq!(mirror.assistant_text, "hello compressed");
+        assert_eq!(mirror.event_messages.len(), 1);
+        assert!(mirror.event_messages[0].contains("response.output_text.delta"));
+        assert!(mirror.event_messages[0].contains("hello compressed"));
+    }
+
+    #[test]
+    fn websocket_request_mirror_extracts_response_create_query() {
+        let mut mirror = WebSocketMirrorState::default();
+        mirror.record_message(
+            &Message::Text(
+                r#"{"type":"response.create","input":[{"role":"user","content":"hello ws query"}]}"#
+                    .to_string()
+                    .into(),
+            ),
+            false,
+        );
+
+        assert_eq!(mirror.request_query.as_deref(), Some("hello ws query"));
+    }
+
+    #[test]
+    fn websocket_mirror_truncates_events_by_utf8_bytes() {
+        let mut mirror = WebSocketMirrorState::default();
+        mirror.push_event_limited("你好abc".to_string(), 5);
+
+        assert_eq!(mirror.event_messages, vec!["你".to_string()]);
+        assert!(mirror.truncated);
+        assert_eq!(mirror.event_bytes, "你".len());
+    }
+
+    #[test]
+    fn benign_websocket_read_errors_are_detected() {
+        assert!(is_benign_websocket_read_error(&WsError::ConnectionClosed));
+        assert!(is_benign_websocket_read_error(&WsError::AlreadyClosed));
+        assert!(is_benign_websocket_read_error(&WsError::Protocol(
+            WsProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(!is_benign_websocket_read_error(&WsError::Protocol(
+            WsProtocolError::SendAfterClosing
+        )));
+    }
+
+    // --- Stream A fixes: security + drift regression tests ---
+
+    fn build_jwt_with_payload(payload: serde_json::Value) -> String {
+        fake_jwt_payload(payload)
+    }
+
+    fn headers_with_bearer(token: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
             "authorization",
             hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        assert!(responses_scope_error(
+        h
+    }
+
+    fn empty_mirror_state() -> WebSocketMirrorState {
+        WebSocketMirrorState {
+            pending: Vec::new(),
+            fragmented_payload: None,
+            fragmented_compressed: false,
+            event_messages: Vec::new(),
+            assistant_text: String::new(),
+            request_query: None,
+            event_bytes: 0,
+            truncated: false,
+            close_seen: false,
+        }
+    }
+
+    #[test]
+    fn bearer_jwt_info_ignores_expired_token() {
+        // exp is 1 hour in the past ⇒ function must return None.
+        let exp = current_unix_timestamp() - 3600;
+        let token = build_jwt_with_payload(serde_json::json!({
+            "exp": exp,
+            "scp": ["api.responses.write"],
+        }));
+        let headers = headers_with_bearer(&token);
+        assert!(
+            bearer_jwt_info(&headers).is_none(),
+            "expired JWT must not yield claims"
+        );
+    }
+
+    #[test]
+    fn bearer_jwt_info_accepts_future_exp() {
+        let exp = current_unix_timestamp() + 3600;
+        let token = build_jwt_with_payload(serde_json::json!({
+            "exp": exp,
+            "scp": ["api.responses.write"],
+        }));
+        let headers = headers_with_bearer(&token);
+        let info = bearer_jwt_info(&headers).expect("valid JWT should parse");
+        assert!(info.has_public_responses_scope);
+    }
+
+    #[test]
+    fn redact_jwt_payload_keeps_only_safe_fields() {
+        let payload = serde_json::json!({
+            "iss": "issuer.example",
+            "aud": "rein",
+            "exp": 9999999999i64,
+            "iat": 1_700_000_000i64,
+            "sub": "user_123",
+            "scp": ["api.responses.write"],
+            "chatgpt_account_id": "acct_abc",
+            "private_note": "SHOULD NOT LEAK",
+            "email": "user@example.com",
+            "access_token": "rot-secret",
+        });
+        let r = redact_jwt_payload(&payload);
+        assert_eq!(r.get("iss").and_then(|v| v.as_str()), Some("issuer.example"));
+        assert_eq!(r.get("sub").and_then(|v| v.as_str()), Some("user_123"));
+        assert!(r.get("private_note").is_none());
+        assert!(r.get("email").is_none());
+        assert!(r.get("access_token").is_none());
+    }
+
+    #[test]
+    fn websocket_mirror_rejects_inflate_bomb() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        // Build a compressed payload that decompresses past the 1 MiB cap.
+        let raw = vec![b'a'; (WebSocketMirrorState::MAX_INFLATED_BYTES as usize) + 4096];
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&raw).unwrap();
+        let compressed = enc.finish().unwrap();
+        // The highly compressible 'a' repetition yields a tiny compressed blob that
+        // decompresses past the cap.
+        assert!(compressed.len() < raw.len() / 10);
+        let decoded = WebSocketMirrorState::decode_text_payload(&compressed, true);
+        assert!(
+            decoded.is_none(),
+            "inflate cap must reject oversized decompressed payload"
+        );
+    }
+
+    #[test]
+    fn websocket_mirror_accepts_small_compressed_payload() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let raw = b"response.output_text.delta hello";
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(raw).unwrap();
+        let compressed = enc.finish().unwrap();
+        let decoded = WebSocketMirrorState::decode_text_payload(&compressed, true);
+        assert_eq!(decoded.as_deref(), Some("response.output_text.delta hello"));
+    }
+
+    #[test]
+    fn provider_kind_detects_api_codex_family() {
+        assert_eq!(
+            ProviderKind::detect("/api/codex/tasks/list"),
+            Some(ProviderKind::CodexFirstParty)
+        );
+        assert_eq!(
+            ProviderKind::detect("/api/codex/responses"),
+            Some(ProviderKind::CodexFirstParty)
+        );
+    }
+
+    #[test]
+    fn provider_kind_rewrites_api_codex_prefix() {
+        let pk = ProviderKind::CodexFirstParty;
+        assert_eq!(&*pk.rewrite_path("/api/codex/tasks/list"), "/tasks/list");
+        assert_eq!(&*pk.rewrite_path("/api/codex/responses"), "/responses");
+    }
+
+    #[test]
+    fn prefers_codex_first_party_no_longer_has_dead_branch() {
+        // After M1: any ChatGPT-login JWT on an ambiguous path routes to CodexFirstParty.
+        let token = fake_chatgpt_login_jwt(&["openid", "profile"]);
+        let headers = headers_with_bearer(&token);
+        // Ambiguous /responses → CodexFirstParty when chatgpt_account_id is present.
+        assert!(prefers_codex_first_party("/responses", &headers));
+        // Ambiguous /models → same outcome.
+        assert!(prefers_codex_first_party("/models", &headers));
+        // Without JWT → false.
+        let empty = hyper::HeaderMap::new();
+        assert!(!prefers_codex_first_party("/responses", &empty));
+    }
+
+    #[test]
+    fn websocket_mirror_new_text_frame_clears_fragmentation_state() {
+        let mut state = empty_mirror_state();
+        // Inject a stale fragmented payload to simulate mid-fragmentation.
+        state.fragmented_payload = Some(vec![b'p', b'a', b'r', b't']);
+        state.fragmented_compressed = true;
+        // Build a complete (fin=1) text frame with no mask, short payload "x".
+        // RFC 6455 server→client: fin=1, rsv1=0, opcode=1, masked=0, len=1, payload=x.
+        let frame = [0x81, 0x01, b'x'];
+        state.feed(&frame, true);
+        assert!(
+            state.fragmented_payload.is_none(),
+            "new text frame must clear stale fragmentation state"
+        );
+        assert!(!state.fragmented_compressed);
+    }
+
+    #[test]
+    fn websocket_mirror_close_clears_fragmentation_state() {
+        let mut state = empty_mirror_state();
+        state.fragmented_payload = Some(vec![b'x'; 10]);
+        state.fragmented_compressed = true;
+        // Close frame: fin=1, opcode=8, unmasked, zero payload → [0x88, 0x00].
+        let frame = [0x88, 0x00];
+        state.feed(&frame, true);
+        assert!(state.close_seen);
+        assert!(state.fragmented_payload.is_none());
+        assert!(!state.fragmented_compressed);
+    }
+
+    #[test]
+    fn websocket_upstream_failure_response_is_uniformly_426() {
+        // L1: unify 426 for all provider kinds on WS upgrade refusal.
+        for kind in [
             ProviderKind::OpenAiResponses,
-            &hyper::Method::POST,
-            &headers,
-        )
-        .is_none());
+            ProviderKind::CodexFirstParty,
+            ProviderKind::ChatGptBackend,
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+        ] {
+            let resp = websocket_upstream_failure_response(kind);
+            assert_eq!(
+                resp.status(),
+                hyper::StatusCode::UPGRADE_REQUIRED,
+                "provider {:?} must yield 426",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn should_strip_request_header_preserves_codex_family() {
+        // H7 regression: the header denylist must NOT include Codex-specific
+        // identification headers — they pass through verbatim.
+        for name in [
+            "x-codex-turn-state",
+            "x-codex-installation-id",
+            "x-codex-window-id",
+            "x-codex-parent-thread-id",
+            "openai-beta",
+            "originator",
+            "x-openai-fedramp",
+            "x-request-id",
+            "x-client-request-id",
+            "user-agent",
+        ] {
+            assert!(
+                !should_strip_request_header(name),
+                "Codex-family header {name} must pass through"
+            );
+        }
+        // And the strip list still catches hop-by-hop + rein's own token.
+        assert!(should_strip_request_header("host"));
+        assert!(should_strip_request_header("x-rein-token"));
+        assert!(should_strip_request_header("content-length"));
     }
 }
