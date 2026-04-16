@@ -53,7 +53,13 @@ impl Default for QueryStrategy {
 /// Classify a query and produce a search strategy.
 /// `has_time_from`/`has_time_to` indicate if the caller already supplied temporal bounds.
 pub fn classify(query: &str, has_time_from: bool, has_time_to: bool) -> QueryStrategy {
-    let lower = query.to_lowercase();
+    // NFKC-normalize before matching so that full-width Latin, compatibility forms,
+    // and some confusables canonicalize to the same form as ASCII pattern constants.
+    // Note: this does NOT defend against cross-script confusables (e.g. Cyrillic 'а'
+    // vs Latin 'a') — a determined attacker can still bypass pattern matching.
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = query.nfkc().collect();
+    let lower = normalized.to_lowercase();
     let word_count = query.split_whitespace().count();
 
     // --- Priority 1: Episodic (must check BEFORE Temporal — "what happened" overlaps) ---

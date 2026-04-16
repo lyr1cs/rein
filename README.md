@@ -638,9 +638,12 @@ Add to `~/.zshrc` or `~/.bashrc` for convenience:
 alias rein-proxy="rein serve --proxy &"
 claudep() { REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${REIN_PROXY_TOKEN:-}" claude "$@"; }
 codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"' "$@"; }
+codexsubp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy={ name = "Rein Subscription Proxy", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="http://127.0.0.1:8690"' "$@"; }
+codexsubpws() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy_ws={ name = "Rein Subscription Proxy WS", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = true }' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="http://127.0.0.1:8690"' "$@"; }
 ```
 
-Then: `rein-proxy` to start, `claudep` or `codexp` to use.
+Then: `rein-proxy` to start, `claudep`, `codexp`, `codexsubp`, or `codexsubpws` to use. For ChatGPT-login Codex, `codexsubp` remains the recommended loopback entrypoint; smoke it with `./scripts/smoke_codexsubp.sh`. For the websocket-enabled path, use `codexsubpws` or `./scripts/smoke_codexsubp_ws.sh`.
+The `codexsubp`/`codexsubpws` provider overrides are generated from `scripts/codexsubp_provider.toml.tmpl`, which is the single source of truth for `requires_openai_auth = true`.
 
 #### Codex CLI Config (alternative)
 
@@ -666,17 +669,22 @@ This makes all Codex calls go through the rein proxy by default (requires proxy 
 |-------|--------------|--------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
 | **Codex CLI** | `codexp` shell function or custom `model_provider` in `~/.codex/config.toml` | OpenAI `/responses` |
+| **Codex CLI (ChatGPT login)** | `codexsubp` shell function or `./scripts/smoke_codexsubp.sh` for smoke testing | ChatGPT first-party (`/responses`, `/models`, `/responses/compact`, `/memories/trace_summarize`, `/wham/*`, `/connectors/*`) |
+| **Codex CLI (ChatGPT login, experimental WS-first)** | `codexsubpws` shell function or `./scripts/smoke_codexsubp_ws.sh` | Same first-party routes, but starts with websocket transport and relies on local `426` fallback when needed |
 | **Cursor** | Settings > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | Settings > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **Any OpenAI-compatible** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
 
-> **Note:** Codex subscription/OAuth login proxying is not the same as the API-key Responses API proxy above. The supported Codex path today is `OPENAI_API_KEY` + custom `model_provider` + `wire_api="responses"` + `supports_websockets=false`. Subscription-login proxying requires a separate first-party backend proxy track.
+> **Note:** Codex subscription/OAuth login proxying is not the same as the API-key Responses API proxy above. For API-key Codex, keep using `codexp`. For ChatGPT-login Codex, `codexsubp` is still the recommended loopback entrypoint today: it keeps `requires_openai_auth = true`, points `chatgpt_base_url` at the local rein proxy, and disables websocket transport so the first-party backend stays on the local record-only path. rein now also has an experimental websocket-enabled path (`codexsubpws` / `smoke_codexsubp_ws.sh`) that starts with websocket transport and relies on local `426 Upgrade Required` fallback when upstream websocket is unavailable.
+
+For ChatGPT-login Codex on loopback, `codexsubp` is the practical path today. It uses a custom provider with `requires_openai_auth = true` so Codex still uses ChatGPT login, but the provider itself points to the local rein proxy and disables websocket transport. `chatgpt_base_url` is also pointed at the local proxy so helper/discovery traffic (`/wham/*`, `/connectors/*`, `/v1/agent/register`, etc.) follows the same path. This keeps the subscription-login flow working over HTTP while the broader websocket and matrix automation work is hardened.
+Even when a client attempts websocket upgrade directly, rein only upgrades the structured-text `/responses` path; non-`/responses` first-party routes stay on ordinary HTTP and retain their `artifact-mirror-only` behavior.
 
 #### How it works
 
-- Proxy intercepts `/v1/messages` (Anthropic), `/v1/chat/completions` (OpenAI), and `/responses` / `/v1/responses` (Codex / OpenAI Responses API)
+- Proxy intercepts `/v1/messages` (Anthropic), `/v1/chat/completions` (OpenAI), `/responses` / `/v1/responses` (Codex / OpenAI Responses API), transparently forwards `/backend-api/codex/*` (Codex first-party backend), and routes ChatGPT helper/discovery paths such as `/wham/*`, `/connectors/*`, `/v1/agent/register`, `/authenticate_app_v2`, and `/codex/safety/arc` to the ChatGPT backend root
 - Requests are forwarded **unmodified** (record-only, no injection)
-- Assistant responses are asynchronously extracted and stored as memories
+- Assistant responses are asynchronously extracted and stored as memories on the standard public path and on first-party Codex `/responses`; other first-party routes stay `artifact-mirror-only` and are mirrored as raw artifacts without structured extraction
 - SSE streaming is passed through byte-for-byte with zero latency impact
 - Dedicated blocking thread with resident SqliteStore for extraction
 - Other endpoints (e.g. `/v1/models`) are passed through unmodified
@@ -689,6 +697,8 @@ port = 8690
 bind = "127.0.0.1"
 anthropic_upstream = "https://api.anthropic.com"
 openai_upstream = "https://api.openai.com"
+chatgpt_upstream = "https://chatgpt.com/backend-api"
+codex_upstream = "https://chatgpt.com/backend-api/codex"
 extract_enabled = true    # record memories from responses
 store_min_chars = 220     # skip short responses
 store_min_score = 3       # quality threshold for extraction
@@ -1392,9 +1402,12 @@ codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://1
 alias rein-proxy="rein serve --proxy &"
 claudep() { REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${REIN_PROXY_TOKEN:-}" claude "$@"; }
 codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"' "$@"; }
+codexsubp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy={ name = "Rein Subscription Proxy", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="http://127.0.0.1:8690"' "$@"; }
+codexsubpws() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy_ws={ name = "Rein Subscription Proxy WS", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = true }' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="http://127.0.0.1:8690"' "$@"; }
 ```
 
-然后：`rein-proxy` 启动代理，`claudep` 或 `codexp` 使用。
+然后：`rein-proxy` 启动代理，`claudep`、`codexp`、`codexsubp` 或 `codexsubpws` 使用。对于 ChatGPT 登录的 Codex，`codexsubp` 仍然是推荐的 loopback 入口；回归 smoke 可以直接跑 `./scripts/smoke_codexsubp.sh`。如果要验证 websocket-first 路径，可以跑实验性的 `./scripts/smoke_codexsubp_ws.sh`。
+`codexsubp` / `codexsubpws` 的 provider override 实际都由 `scripts/codexsubp_provider.toml.tmpl` 生成，这个模板是 `requires_openai_auth = true` 的唯一配置源。
 
 #### Codex CLI 配置（替代方案）
 
@@ -1420,15 +1433,20 @@ model_provider = "rein_proxy"
 |-------|---------|----------|
 | **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:8690` | Anthropic `/v1/messages` |
 | **Codex CLI** | `codexp` shell 函数或 `~/.codex/config.toml` 中自定义 `model_provider` | OpenAI `/responses` |
+| **Codex CLI（ChatGPT 登录）** | `codexsubp` shell 函数，或 `./scripts/smoke_codexsubp.sh` 做 smoke | ChatGPT first-party（`/responses`、`/models`、`/responses/compact`、`/memories/trace_summarize`、`/wham/*`、`/connectors/*`） |
+| **Codex CLI（ChatGPT 登录，实验性 WS-first）** | `codexsubpws` shell 函数，或 `./scripts/smoke_codexsubp_ws.sh` | 同一组 first-party 路径，但优先尝试 websocket，必要时依赖本地 `426` 回退 |
 | **Cursor** | 设置 > Override OpenAI Base URL | OpenAI `/v1/chat/completions` |
 | **Windsurf** | 设置 > Custom API Endpoint | OpenAI `/v1/chat/completions` |
 | **任何 OpenAI 兼容工具** | `OPENAI_BASE_URL=http://127.0.0.1:8690` | OpenAI `/v1/chat/completions` |
 
-> **注意：** Codex 订阅/OAuth 登录态 proxy 与上面的 API-key Responses API proxy 不是同一个实现。当前支持的 Codex 路线是 `OPENAI_API_KEY` + 自定义 `model_provider` + `wire_api="responses"` + `supports_websockets=false`。订阅登录态 proxy 需要单独的 first-party backend proxy 开发线。
+> **注意：** Codex 订阅/OAuth 登录态 proxy 与上面的 API-key Responses API proxy 不是同一个实现。API-key Codex 继续走 `codexp`；ChatGPT 登录的 Codex 现在仍推荐走 `codexsubp`。这个入口会保留 `requires_openai_auth = true`，把 `chatgpt_base_url` 指向本地 rein proxy，并显式关闭 websocket 传输，让 first-party backend、helper/discovery 路径和 `/responses` 记录链路保持在 loopback 上。rein 现在也提供实验性的 `codexsubpws` / `smoke_codexsubp_ws.sh`，它保留 websocket 传输，并在上游 websocket 不可用时依赖本地 `426 Upgrade Required` 回退。后续重点是 hardening 与自动化，而不是补齐基础功能。
+
+对于 loopback 场景下的 ChatGPT 登录 Codex，当前最实用的入口是 `codexsubp`。它使用一个 `requires_openai_auth = true` 的自定义 provider，这样仍然走 ChatGPT 登录态，但 provider 本身指向本地 rein proxy，并显式关闭 websocket 传输；同时把 `chatgpt_base_url` 也指向本地 proxy，让模型 API 和 helper/discovery 请求一起走 proxy。这条路径绕开了当前 upstream websocket 403/Cloudflare 问题，同时把订阅登录态固定在本地 record-only 路线上。非 `/responses` 的 first-party 路径保持 `artifact-mirror-only`，只做透明转发和原始 artifact 镜像，不做结构化提取。
+即便客户端主动发起 websocket upgrade，rein 现在也只会对结构化文本的 `/responses` 路径升级；其它 first-party 路径会保持普通 HTTP，并继续沿用 `artifact-mirror-only` 策略。
 
 #### 工作原理
 
-- 代理拦截 `/v1/messages`（Anthropic）和 `/v1/chat/completions`（OpenAI）
+- 代理拦截 `/v1/messages`（Anthropic）、`/v1/chat/completions`（OpenAI）、`/responses` / `/v1/responses`（Codex / OpenAI Responses API），并透明转发 `/backend-api/codex/*`（Codex first-party backend），同时把 `/wham/*`、`/connectors/*`、`/v1/agent/register`、`/authenticate_app_v2`、`/codex/safety/arc` 等 ChatGPT helper/discovery 路径路由到 ChatGPT backend root
 - 请求**原样转发**（仅记录，不注入）
 - 异步从 assistant 响应中提取记忆并存储
 - SSE 流式传输逐字节透传，零延迟影响
