@@ -17,15 +17,18 @@ description: >
   important context.
 ---
 
-# rein Memory System (v0.17.0)
+# rein Memory System (v0.18.2)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (28 tools) or via CLI (20+ commands). Features Neural Wiki GUI (`rein serve --gui`),
 LLM-powered extraction (Gemini 3.1 Flash Lite or local models), temporal knowledge graph,
 autonomous retrieval routing (6 strategies), query expansion (2-3 variants), LLM reranker
 with strong-signal bypass, MMR diversity pass, memory evolution, transparent LLM proxy
-(record-only), concept name normalization and dedup, async memory pipeline with file-based
-queue and background worker, project-scoped working set + always-on index for memory surfaces,
+(record-only) including **Codex subscription loopback** (`codexsubp` / `codexsubpws`
+via `rein init --proxy` — ChatGPT-login WebSocket mirror with permessage-deflate, first-party
+routing, ArtifactMirrorOnly lock for non-`/responses` routes, `/api/artifacts` readback),
+concept name normalization and dedup, async memory pipeline with file-based queue and
+background worker, project-scoped working set + always-on index for memory surfaces,
 canonical-first recall with evidence previews, and adaptive learning loops (M1-M6 + A1).
 
 ## CLI Commands
