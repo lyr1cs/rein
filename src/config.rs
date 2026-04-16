@@ -1340,15 +1340,40 @@ rrf_k = 30.0
         assert_eq!(cfg.database.path, "auto");
     }
 
+    /// RAII guard: remember the current env var value and restore it on drop,
+    /// so a panic inside the test does not leak state to subsequent tests.
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
+    #[serial_test::serial(global_state)]
     fn test_env_override_db() {
-        // Use a unique env var approach to avoid test interference
-        std::env::set_var("REIN_DB", "/tmp/test.db");
-        std::env::set_var("REIN_CONFIG", "/nonexistent/path/config.toml");
+        // `global_state` serializes with every other test in the crate that
+        // mutates process-global env vars (doctor + mcp::rest::tests suites).
+        // RAII guards ensure env is restored even if the assertion panics.
+        let _db = EnvGuard::set("REIN_DB", "/tmp/test.db");
+        let _cfg_path = EnvGuard::set("REIN_CONFIG", "/nonexistent/path/config.toml");
         let cfg = ReinConfig::load().unwrap();
         assert_eq!(cfg.database.path, "/tmp/test.db");
-        std::env::remove_var("REIN_DB");
-        std::env::remove_var("REIN_CONFIG");
     }
 
     #[test]
