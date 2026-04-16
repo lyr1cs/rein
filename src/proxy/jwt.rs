@@ -37,37 +37,48 @@ pub(super) struct BearerJwtInfo {
     pub(super) is_chatgpt_login: bool,
 }
 
-/// Keep only the small set of claims needed for routing / logging; drop
-/// everything else so nothing derived from the JWT can leak verbatim into
-/// logs or error responses.
+/// Keep only non-identifying claims that help debug a scope mismatch. The
+/// allowlist is deliberately tight: anything that stably identifies the user
+/// or tenant (`sub`, `chatgpt_account_id`, nested `auth.chatgpt_account_id`)
+/// is DROPPED here and must not reach tracing output verbatim.
+///
+/// If a future diagnostic genuinely needs a tenant identifier, it should go
+/// through [`hashed_account_fingerprint`] instead, so the log carries a stable
+/// but non-invertible value.
 pub(super) fn redact_jwt_payload(payload: &Value) -> Value {
     let mut out = serde_json::Map::new();
-    for k in [
-        "iss",
-        "aud",
-        "sub",
-        "exp",
-        "iat",
-        "nbf",
-        "scp",
-        "chatgpt_account_id",
-    ] {
+    // Safe claims: issuer, audience, timestamps, scope list. None of these
+    // pin a specific user/tenant on their own.
+    for k in ["iss", "aud", "exp", "iat", "nbf", "scp"] {
         if let Some(v) = payload.get(k) {
             out.insert(k.to_string(), v.clone());
         }
     }
-    if let Some(nested) = payload
+    // Expose the presence of the nested OpenAI auth claim as a boolean —
+    // enough to distinguish "ChatGPT-login JWT" from "API-key JWT" without
+    // leaking the account id.
+    let has_chatgpt_login = payload
         .get("https://api.openai.com/auth")
         .and_then(|v| v.get("chatgpt_account_id"))
-    {
-        let mut auth_obj = serde_json::Map::new();
-        auth_obj.insert("chatgpt_account_id".to_string(), nested.clone());
-        out.insert(
-            "https://api.openai.com/auth".to_string(),
-            Value::Object(auth_obj),
-        );
-    }
+        .is_some()
+        || payload.get("chatgpt_account_id").is_some();
+    out.insert(
+        "has_chatgpt_login".to_string(),
+        Value::Bool(has_chatgpt_login),
+    );
     Value::Object(out)
+}
+
+/// Non-invertible short fingerprint of a stable account/tenant identifier for
+/// correlation in diagnostics, without exposing the raw value. Uses the same
+/// `DefaultHasher` family the rest of the crate uses for reproducibility
+/// (see `store/tiering.rs`), emitted as an 8-hex-char prefix.
+#[allow(dead_code)]
+pub(super) fn hashed_account_fingerprint(raw: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("{:08x}", (h.finish() as u32))
 }
 
 pub(super) fn current_unix_timestamp() -> i64 {

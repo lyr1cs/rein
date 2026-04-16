@@ -2670,6 +2670,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_state)]
     fn test_store_with_dedup_intelligent_merge_e2e_records_provenance() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore_config = EnvRestore {
