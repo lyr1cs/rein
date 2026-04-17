@@ -162,7 +162,7 @@ fn novelty_from_memories(existing: &[Memory], content: &str) -> f64 {
             (i, overlap)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|(_, overlap)| std::cmp::Reverse(*overlap));
 
     // Check if keyword overlap is meaningful (at least one candidate has overlap > 0)
     let has_meaningful_overlap = scored.first().is_some_and(|(_, overlap)| *overlap > 0);
