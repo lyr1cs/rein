@@ -852,7 +852,12 @@ fn resolve_max_input_for_kind(config: &ReinConfig, extractor: &ExtractorKind) ->
             if configured > 0 {
                 configured
             } else if is_large_context_model(&config.extract.google.model) {
-                0
+                // Large-context Gemini models nominally accept 1M+ tokens, but
+                // sending literally unlimited bytes per extraction is wasteful
+                // (bandwidth) and hides runaway inputs. Default to 1M chars
+                // (~250k tokens), which still fits comfortably inside a 1M-token
+                // window; set `max_input_chars` explicitly to override.
+                LARGE_CONTEXT_DEFAULT_CAP
             } else {
                 SAFE_DEFAULT_MAX_CHARS
             }
@@ -875,7 +880,12 @@ fn prepare_input_for_kind(config: &ReinConfig, text: &str, extractor: &Extractor
             if configured > 0 {
                 configured
             } else if is_large_context_model(&config.extract.google.model) {
-                0
+                // Large-context Gemini models nominally accept 1M+ tokens, but
+                // sending literally unlimited bytes per extraction is wasteful
+                // (bandwidth) and hides runaway inputs. Default to 1M chars
+                // (~250k tokens), which still fits comfortably inside a 1M-token
+                // window; set `max_input_chars` explicitly to override.
+                LARGE_CONTEXT_DEFAULT_CAP
             } else {
                 SAFE_DEFAULT_MAX_CHARS
             }
@@ -1103,6 +1113,10 @@ pub async fn extract_full_with_worker_preference(
 
 /// Safe default for models not in the known large-context list.
 const SAFE_DEFAULT_MAX_CHARS: usize = 16000;
+/// Upper bound for "large context" Gemini models when no explicit
+/// `max_input_chars` is set. 1M chars ≈ 250k tokens — fits in a 1M-token
+/// window with headroom, prevents accidental multi-MB POSTs.
+const LARGE_CONTEXT_DEFAULT_CAP: usize = 1_000_000;
 
 /// Check if a Gemini model is known to support 1M+ token input.
 /// All Gemini 2.0+ models (2.0, 2.5, 3.x) support 1,048,576 input tokens.
@@ -1133,10 +1147,13 @@ fn resolve_max_input_chars(config: &ReinConfig) -> usize {
             if configured > 0 {
                 return configured;
             }
-            // 0 means "no truncation" — only safe for known large-context models
+            // 0 means "default" — for large-context models this resolves to a
+            // 1M-char cap (see LARGE_CONTEXT_DEFAULT_CAP); other models get
+            // SAFE_DEFAULT_MAX_CHARS. Previously 0 meant "literally unlimited"
+            // which allowed multi-MB POSTs per extraction with no upper bound.
             let model = &config.extract.google.model;
             if is_large_context_model(model) {
-                0 // truly no truncation
+                LARGE_CONTEXT_DEFAULT_CAP
             } else {
                 tracing::info!(
                     "extract model '{}' not recognized as 1M-token model, applying safe limit of {} chars. \

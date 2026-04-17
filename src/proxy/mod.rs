@@ -146,11 +146,11 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
         metrics: ProxyMetrics::new(),
     });
 
-    // Graceful shutdown: stop accept loop on ctrl-c.
+    // Graceful shutdown: stop accept loop on Ctrl-C OR SIGTERM (Unix).
     loop {
         let accept = tokio::select! {
             res = listener.accept() => res,
-            _ = tokio::signal::ctrl_c() => {
+            _ = crate::service::shutdown_signal() => {
                 tracing::info!("rein proxy: received shutdown signal, stopping accept loop");
                 eprintln!("rein proxy: shutting down gracefully");
                 crate::service::remove_pid("proxy");

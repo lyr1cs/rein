@@ -1796,8 +1796,26 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Graceful shutdown: accept loop stops on Ctrl-C (and SIGTERM on Unix) so
+    // in-flight connections get a chance to finish instead of being torn down.
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let accept = tokio::select! {
+            res = listener.accept() => res,
+            _ = crate::service::shutdown_signal() => {
+                tracing::info!("rein HTTP server: shutdown signal received, stopping accept loop");
+                eprintln!("rein HTTP server: shutting down gracefully");
+                cancel.cancel();
+                crate::service::remove_pid("gui");
+                break;
+            }
+        };
+        let (stream, addr) = match accept {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("http accept error: {e}");
+                continue;
+            }
+        };
         tracing::debug!("connection from {addr}");
         let svc = service.clone();
         tokio::spawn(async move {
@@ -1810,6 +1828,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             }
         });
     }
+    Ok(())
 }
 
 #[cfg(test)]
