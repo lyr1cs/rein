@@ -255,11 +255,19 @@ async fn handle_api<B>(
         (&Method::GET, p)
             if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" =>
         {
-            api_recall(config, &query)
+            match require_read_token(req) {
+                Ok(()) => api_recall(config, &query),
+                Err(response) => response,
+            }
         }
         (&Method::GET, p) if p.starts_with("/api/memories/") => {
-            let id = percent_decode(&p["/api/memories/".len()..]);
-            api_get_memory(config, &id)
+            match require_read_token(req) {
+                Ok(()) => {
+                    let id = percent_decode(&p["/api/memories/".len()..]);
+                    api_get_memory(config, &id)
+                }
+                Err(response) => response,
+            }
         }
         (&Method::GET, "/api/memoirs") => api_memoirs(config),
         (&Method::GET, p) if p.starts_with("/api/memoirs/") => {
@@ -1255,9 +1263,7 @@ fn serve_gui(#[allow(unused)] path: &str) -> BoxedResponse {
         };
         if let Some(content) = GuiAssets::get(file_path) {
             let mime = mime_from_path(file_path);
-            return Response::builder()
-                .status(200)
-                .header("content-type", mime)
+            return gui_response_builder(mime)
                 .body(
                     Full::new(Bytes::from(content.data.to_vec()))
                         .map_err(|never: std::convert::Infallible| match never {})
@@ -1272,9 +1278,7 @@ fn serve_gui(#[allow(unused)] path: &str) -> BoxedResponse {
         }
         // SPA fallback: serve index.html for client-side routing
         if let Some(index) = GuiAssets::get("index.html") {
-            return Response::builder()
-                .status(200)
-                .header("content-type", "text/html")
+            return gui_response_builder("text/html")
                 .body(
                     Full::new(Bytes::from(index.data.to_vec()))
                         .map_err(|never: std::convert::Infallible| match never {})
@@ -1292,6 +1296,25 @@ fn serve_gui(#[allow(unused)] path: &str) -> BoxedResponse {
         StatusCode::NOT_FOUND,
         "GUI not available (build with --features gui)",
     )
+}
+
+/// Builder for SPA responses with hardened security headers. Blocks
+/// clickjacking (X-Frame-Options), MIME sniffing, and third-party script/
+/// resource inclusion via a tight CSP suitable for the embedded SPA.
+#[cfg(feature = "gui")]
+fn gui_response_builder(mime: &'static str) -> hyper::http::response::Builder {
+    Response::builder()
+        .status(200)
+        .header("content-type", mime)
+        .header(
+            "content-security-policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; font-src 'self' data:; connect-src 'self'; \
+             frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        )
+        .header("x-frame-options", "DENY")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
 }
 
 #[cfg(feature = "gui")]
