@@ -69,10 +69,29 @@ pub(super) fn redact_jwt_payload(payload: &Value) -> Value {
     Value::Object(out)
 }
 
-/// Non-invertible short fingerprint of a stable account/tenant identifier for
-/// correlation in diagnostics, without exposing the raw value. Uses the same
-/// `DefaultHasher` family the rest of the crate uses for reproducibility
-/// (see `store/tiering.rs`), emitted as an 8-hex-char prefix.
+/// Short-lived, in-version diagnostic tag for correlating scope-mismatch log
+/// lines from the same caller within a single running process.
+///
+/// **Contract is deliberately narrow** (corrected in v0.19.1 after Codex review):
+///
+/// * **NOT stable across Rust releases.** `std::collections::hash_map::DefaultHasher`
+///   is documented as "the internal algorithm is not specified, and so it and
+///   its hashes should not be relied upon over releases" — so two rein binaries
+///   built with different Rust toolchains may emit different tags for the same
+///   account id. Do not use this as a persistent identifier.
+/// * **NOT cryptographically non-invertible.** Truncating a non-keyed
+///   `DefaultHasher` output to 32 bits is enough to frustrate casual log
+///   readers, but a determined attacker with a dictionary of likely account
+///   ids can trivially recover the original. Treat the tag as an obfuscation
+///   hint, not a privacy primitive.
+/// * **Collision-acceptable for small populations.** 32-bit fingerprint,
+///   birthday bound ≈ 1.16×10⁻⁴ at n=1000 accounts. Good enough for
+///   best-effort log grouping, insufficient for anything that needs to
+///   uniquely identify a tenant.
+///
+/// If any caller starts relying on stability across builds, cryptographic
+/// non-invertibility, or uniqueness for populations >10k, swap this for
+/// a keyed BLAKE3 / SHA-256 truncated to ≥64 bits.
 pub(super) fn hashed_account_fingerprint(raw: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

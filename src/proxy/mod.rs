@@ -3834,19 +3834,22 @@ x-openai-subagent: worker_abc\r\n\
     }
 
     #[test]
-    fn hashed_account_fingerprint_is_stable_and_non_invertible() {
+    fn hashed_account_fingerprint_in_process_properties() {
+        // Narrow contract: stable within a single process, different inputs
+        // get different tags, raw input does not appear in the tag.
+        // Cross-process / cross-build stability is NOT promised — see jwt.rs docs.
         let fp1 = jwt::hashed_account_fingerprint("acct_abc123");
         let fp2 = jwt::hashed_account_fingerprint("acct_abc123");
         let fp3 = jwt::hashed_account_fingerprint("acct_different");
 
-        // Same input → same fingerprint (stable for correlation)
-        assert_eq!(fp1, fp2);
-        // Different input → different fingerprint (collision unlikely for realistic inputs)
-        assert_ne!(fp1, fp3);
-        // 8-hex-char length, not invertible to raw input
-        assert_eq!(fp1.len(), 8);
+        assert_eq!(fp1, fp2, "same input within a process must produce same tag");
+        assert_ne!(fp1, fp3, "different inputs should produce different tags");
+        assert_eq!(fp1.len(), 8, "8 hex chars");
         assert!(fp1.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(!fp1.contains("acct"));
+        assert!(
+            !fp1.contains("acct"),
+            "raw input substring must not appear in the tag"
+        );
     }
 
     #[test]
@@ -4280,10 +4283,20 @@ Connection: close\r\n\r\n\
             .send()
             .await
             .unwrap();
-        let code = response.status().as_u16();
+        // Tightened in v0.19.1 (Codex review LOW): the current implementation
+        // in `handle_request` maps upstream-connection errors deterministically
+        // to `error_response(502, "upstream request failed")`. Assert the
+        // exact code + body so a future accidental regression to 503/504 or
+        // a different body message is caught immediately.
+        assert_eq!(
+            response.status().as_u16(),
+            502,
+            "upstream drop must surface as exactly 502"
+        );
+        let body = response.text().await.unwrap_or_default();
         assert!(
-            (500..600).contains(&code),
-            "upstream drop must surface as 5xx, got {code}"
+            body.contains("upstream request failed"),
+            "502 body must carry the stable 'upstream request failed' marker, got: {body}"
         );
         proxy_task.abort();
     }

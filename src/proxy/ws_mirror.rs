@@ -64,13 +64,21 @@ impl WebSocketMirrorState {
     /// unbounded memory. 1 MiB is generous for legitimate `/responses` deltas
     /// — real messages are typically <50 KB.
     ///
-    /// NOTE (v0.19.0 finding): this cap is only reached through the raw-frame
-    /// entry point [`Self::feed`], which is currently used only by unit tests.
-    /// Production WS relay ([`relay_websocket_with_mirror`] in `mod.rs`) calls
-    /// [`Self::record_message`] with a pre-decoded `tungstenite::Message`, so
-    /// the inflate bomb is guarded one layer up by tungstenite's own deflate
-    /// handling. The cap here remains as defensive scaffolding in case the
-    /// raw-frame path is ever used from production code.
+    /// NOTE (v0.19.0 finding, corrected by v0.19.1 Codex review):
+    /// this cap is only reached through the raw-frame entry point
+    /// [`Self::feed`], which is currently used only by unit tests. Production
+    /// WS relay ([`relay_websocket_with_mirror`] in `mod.rs`) calls
+    /// [`Self::record_message`] with a pre-decoded `tungstenite::Message`.
+    ///
+    /// The actual production defence against permessage-deflate bombs is
+    /// NOT done by tungstenite (tokio-tungstenite 0.28 does not support
+    /// permessage-deflate and rejects RSV1 frames as `NonZeroReservedBits`).
+    /// It comes from rein's handshake rewrite — we strip the
+    /// `sec-websocket-extensions` header in [`should_strip_ws_handshake_header`]
+    /// so compression is never negotiated end-to-end. If a future change
+    /// restores extension passthrough (or wires up a compressed transport),
+    /// the bomb cap MUST be reconnected into the production path and a
+    /// real compressed-frame E2E test added.
     #[cfg(test)]
     pub(super) const MAX_INFLATED_BYTES: u64 = 1024 * 1024;
 
