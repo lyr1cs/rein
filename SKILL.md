@@ -17,7 +17,7 @@ description: >
   important context.
 ---
 
-# rein Memory System (v0.19.0)
+# rein Memory System (v0.19.1)
 
 Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
 (28 tools) or via CLI (20+ commands). Features Neural Wiki GUI (`rein serve --gui`),
