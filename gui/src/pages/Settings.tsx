@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { apiPost } from '../api/client';
-import { useDoctor } from '../hooks/useApi';
+import { useDoctor, useServerVersion } from '../hooks/useApi';
 import type { DoctorCheck, DoctorReport } from '../api/types';
 
 const CATEGORY_LABELS: Record<DoctorCheck['category'], string> = {
@@ -41,6 +41,7 @@ export default function Settings() {
   const [fixRunning, setFixRunning] = useState(false);
   const [fixError, setFixError] = useState<string | null>(null);
   const { data: doctor, isLoading: doctorLoading, error: doctorError, refetch } = useDoctor();
+  const { data: serverVersion } = useServerVersion();
 
   // Persist polling interval on change
   useEffect(() => {
@@ -115,6 +116,18 @@ export default function Settings() {
   }
 
   async function runFix() {
+    // B6 #30 — runFix can trigger index rebuilds (Tantivy + HNSW) and other
+    // write-path repairs. Requiring a confirmation mirrors the Delete button
+    // pattern elsewhere in the page so a misclick doesn't silently kick off
+    // several seconds of disk churn.
+    const confirmed = window.confirm(
+      'Run rein doctor --fix?\n\n' +
+        'This may rebuild Tantivy / HNSW indexes and apply other repairs on disk. ' +
+        'Safe to run, but it is not instant — expect a brief pause while work completes.',
+    );
+    if (!confirmed) {
+      return;
+    }
     setFixRunning(true);
     setFixError(null);
     try {
@@ -228,7 +241,7 @@ export default function Settings() {
           <div className="text-sm font-medium text-[var(--text-primary)]">About</div>
           <div className="space-y-2">
             <div className="text-sm text-[var(--text-secondary)]">
-              rein Neural Wiki v0.17.0
+              rein Neural Wiki v{serverVersion?.version ?? '…'}
             </div>
             <div className="text-xs text-[var(--text-muted)]">
               Multi-source cross-validated memory MCP server with adaptive engine,

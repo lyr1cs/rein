@@ -224,6 +224,10 @@ async fn handle_api<B>(
         (&Method::GET, "/api/adaptive") => api_adaptive(config),
         (&Method::GET, "/api/dedup_decisions") => api_dedup_decisions(config, &query),
         (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
+        (&Method::GET, "/api/version") => json_response(
+            StatusCode::OK,
+            json!({ "version": env!("CARGO_PKG_VERSION") }),
+        ),
         (&Method::GET, "/api/health") => api_health(config, &query),
         (&Method::GET, "/api/doctor") => {
             if query

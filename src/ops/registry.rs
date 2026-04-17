@@ -118,6 +118,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "artifacts", "GET /api/artifacts"),
     op!(Rest, "artifacts", "GET /api/artifacts/{id}"),
     op!(Rest, "memory", "DELETE /api/memories/{id}"),
+    op!(Rest, "metrics", "GET /api/version"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -204,6 +205,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[19],
     REST_OPERATIONS[20],
     REST_OPERATIONS[21],
+    REST_OPERATIONS[22],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -260,13 +262,13 @@ mod tests {
     fn registry_counts_match_expected_values() {
         assert_eq!(cli_operations().len(), 33);
         assert_eq!(mcp_operations().len(), 28);
-        assert_eq!(rest_operations().len(), 22);
+        assert_eq!(rest_operations().len(), 23);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 28,
-                rest: 22
+                rest: 23
             }
         );
     }
