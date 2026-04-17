@@ -237,6 +237,17 @@ pub fn adaptive_strength(
         None => return ebbinghaus_strength,
     };
 
+    // A Kaplan-Meier curve needs at least one *uncensored* observation (an
+    // actual access event) to be meaningful. With all-censored cohorts the
+    // curve reduces to a constant 1.0 at every t>0, which would silently
+    // disable M3 decay once total_count passes cold_start_max. Falling back
+    // to Ebbinghaus when there's no event evidence (B5 #23) is a principled
+    // binary rule — either we have an uncensored event or we don't — not a
+    // tunable threshold.
+    if curve.event_count == 0 {
+        return ebbinghaus_strength;
+    }
+
     let n = curve.total_count;
 
     if n < cold_start_min {

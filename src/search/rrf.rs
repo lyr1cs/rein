@@ -43,8 +43,17 @@ pub fn convex_combination(
             .fold(f32::INFINITY, f32::min);
         let range = max - min;
         if range < 1e-6 {
-            // All scores equal (including singleton) → assign 1.0 to all
-            return results.iter().map(|(id, _)| (id.clone(), 1.0)).collect();
+            // A singleton carries a real positive signal — keep it at 1.0 so
+            // the remaining fusion weight still reaches it. But when ≥2 items
+            // tie, the channel has no ranking signal of its own: blanketing
+            // every tied item at 1.0 silently promotes the channel to "every
+            // candidate is perfect", which biases fusion. Drop the tied block
+            // from the channel instead (B5 #25) — lets the other channel rank
+            // on its own evidence rather than being overruled by a flat tie.
+            if results.len() == 1 {
+                return results.iter().map(|(id, _)| (id.clone(), 1.0)).collect();
+            }
+            return vec![];
         }
         results
             .iter()

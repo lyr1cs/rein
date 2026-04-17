@@ -284,6 +284,31 @@ fn create_expander(config: &ReinConfig) -> Option<ExpanderKind> {
 /// Returns expanded queries (NOT including original). Falls back to empty vec on failure.
 /// `max_override` allows callers to request fewer expansions than config default.
 pub fn expand_query(config: &ReinConfig, query: &str, max_override: Option<usize>) -> Vec<String> {
+    expand_query_cancellable(config, query, max_override, None)
+}
+
+/// Cancellable variant of [`expand_query`]. The caller passes an `AtomicBool`
+/// flag; when the flag flips to `true`, the function short-circuits at the
+/// next checkpoint (before the LLM call, and before the cache write) and
+/// returns an empty vec. Cannot abort an already in-flight HTTP request —
+/// that would require switching the underlying async expander to use a
+/// `tokio::CancellationToken` (B5 #24 follow-up).
+pub fn expand_query_cancellable(
+    config: &ReinConfig,
+    query: &str,
+    max_override: Option<usize>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<String> {
+    let check_cancel = |label: &str| -> bool {
+        match cancel {
+            Some(c) if c.load(std::sync::atomic::Ordering::Relaxed) => {
+                tracing::debug!(stage = label, "query expansion cancelled");
+                true
+            }
+            _ => false,
+        }
+    };
+
     let expander = match create_expander(config) {
         Some(e) => e,
         None => return vec![],
@@ -299,6 +324,10 @@ pub fn expand_query(config: &ReinConfig, query: &str, max_override: Option<usize
             tracing::debug!(query_len = query.len(), "expansion cache hit");
             return cached;
         }
+    }
+
+    if check_cancel("pre-llm") {
+        return vec![];
     }
 
     let expand_start = std::time::Instant::now();
@@ -317,6 +346,10 @@ pub fn expand_query(config: &ReinConfig, query: &str, max_override: Option<usize
             Err(e) => Err(e),
         }
     };
+
+    if check_cancel("post-llm") {
+        return vec![];
+    }
 
     match result {
         Ok(expansions) => {

@@ -165,21 +165,28 @@ pub fn consume_events(
     Ok(events)
 }
 
-/// Clean up old events that all consumers have processed and are beyond retention.
+/// Clean up old events that all *live* consumers have processed and are
+/// beyond retention.
+///
+/// A stale consumer row with `last_event_id = 0` whose `updated_at` is older
+/// than the retention window floors the cutoff at 0 and prevents any
+/// pruning — `feedback_events` then grows without bound even when the rest
+/// of the adaptive pipeline has moved past those events (B5 #26). Filtering
+/// out consumers that haven't advanced within retention lets cleanup
+/// proceed; the stale consumer will simply resume from whatever events
+/// still exist when it next runs.
 pub fn cleanup_expired_events(conn: &Connection, retention_days: u64) -> ReinResult<u64> {
-    // Find the minimum offset across all consumers (oldest unprocessed event)
+    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
     let min_offset: i64 = conn
         .query_row(
-            "SELECT COALESCE(MIN(last_event_id), 0) FROM consumer_offsets",
-            [],
+            "SELECT COALESCE(MIN(last_event_id), 0)
+               FROM consumer_offsets
+              WHERE updated_at >= ?1",
+            rusqlite::params![cutoff.to_rfc3339()],
             |row| row.get(0),
         )
         .unwrap_or(0);
 
-    // Delete events that are:
-    // 1. Below all consumer offsets (fully consumed)
-    // 2. Older than retention period
-    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
     let deleted = conn.execute(
         "DELETE FROM feedback_events WHERE id <= ?1 AND ts < ?2",
         rusqlite::params![min_offset, cutoff.to_rfc3339()],
