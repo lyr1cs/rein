@@ -921,6 +921,12 @@ impl MemoryStore for SqliteStore {
         struct DecayRow {
             id: String,
             new_strength: f64,
+            // Snapshot of last_accessed so the UPDATE is a conditional CAS: if another
+            // writer (e.g. intelligent_merge, record_access) bumps this row's
+            // last_accessed between the SELECT above and the UPDATE below, the WHERE
+            // clause misses and the stale decay value is discarded rather than
+            // clobbering the fresher strength.
+            last_accessed_snapshot: String,
         }
 
         let updates: Vec<DecayRow> = stmt
@@ -955,7 +961,11 @@ impl MemoryStore for SqliteStore {
                     let beta = layer.beta();
                     let new_strength = (-lambda_eff * days.powf(beta)).exp();
 
-                    Some(DecayRow { id, new_strength })
+                    Some(DecayRow {
+                        id,
+                        new_strength,
+                        last_accessed_snapshot: last_accessed_str,
+                    })
                 },
             )
             .collect();
@@ -966,8 +976,8 @@ impl MemoryStore for SqliteStore {
         self.conn.execute_batch("SAVEPOINT decay_batch")?;
         for u in &updates {
             self.conn.execute(
-                "UPDATE memories SET strength = ?1 WHERE id = ?2",
-                rusqlite::params![u.new_strength, u.id],
+                "UPDATE memories SET strength = ?1 WHERE id = ?2 AND last_accessed = ?3",
+                rusqlite::params![u.new_strength, u.id, u.last_accessed_snapshot],
             )?;
         }
         // Record last decay time inside the savepoint (not after)
@@ -1275,7 +1285,10 @@ impl SqliteStore {
             self.preflight_intelligent_classify(&memory, similarity_threshold, time_window_days);
 
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let mut pending_grayzone: Option<(String, f32)> = None;
+        // Third tuple element is the `pending_grayzone_jobs` row id written inside
+        // the transaction; the post-COMMIT enqueue deletes this row on success.
+        // On crash, startup drains surviving rows back into the file queue.
+        let mut pending_grayzone: Option<(String, String, f32)> = None;
 
         let decision = (|| -> ReinResult<String> {
             let memory = memory;
@@ -1467,7 +1480,24 @@ impl SqliteStore {
                         DedupAction::MergeInto(canonical_id)
                     } else {
                         if self.get(&candidate_id).is_ok() {
-                            pending_grayzone = Some((candidate_id, sim));
+                            // Persist inside the transaction so a crash between
+                            // COMMIT and the file-queue enqueue cannot lose this
+                            // pair silently. The post-COMMIT path deletes the row
+                            // on successful enqueue; startup drains any survivors.
+                            let job_id = ulid::Ulid::new().to_string();
+                            self.conn.execute(
+                                "INSERT INTO pending_grayzone_jobs
+                                 (id, candidate_id, result_id, sim, created_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                rusqlite::params![
+                                    &job_id,
+                                    &candidate_id,
+                                    &memory.id,
+                                    sim as f64,
+                                    chrono::Utc::now().to_rfc3339(),
+                                ],
+                            )?;
+                            pending_grayzone = Some((job_id, candidate_id, sim));
                         }
                         DedupAction::CreateNew
                     }
@@ -1559,7 +1589,7 @@ impl SqliteStore {
         match decision {
             Ok(result) => {
                 self.conn.execute_batch("COMMIT")?;
-                if let Some((candidate_id, sim)) = pending_grayzone {
+                if let Some((pending_row_id, candidate_id, sim)) = pending_grayzone {
                     let config = crate::config::ReinConfig::load().unwrap_or_default();
                     match crate::extract::hooks::queue::queue_dedup_job(
                         &config,
@@ -1570,6 +1600,11 @@ impl SqliteStore {
                     ) {
                         Ok(job_id) => {
                             crate::extract::hooks::queue::spawn_dedup_worker(&config);
+                            // File queue took ownership — drop the durable row.
+                            let _ = self.conn.execute(
+                                "DELETE FROM pending_grayzone_jobs WHERE id = ?1",
+                                rusqlite::params![&pending_row_id],
+                            );
                             tracing::debug!(
                                 "queued dedup job {job_id} for gray-zone pair {} <-> {} (sim={sim:.2})",
                                 candidate_id,
@@ -1577,8 +1612,10 @@ impl SqliteStore {
                             );
                         }
                         Err(error) => {
+                            // Leave the durable row in place; startup drain will
+                            // retry. This is the whole point of the SQLite backing.
                             tracing::warn!(
-                                "failed to queue gray-zone dedup job for {} <-> {}: {}",
+                                "failed to queue gray-zone dedup job for {} <-> {}: {} (will retry on next drain)",
                                 candidate_id,
                                 result,
                                 error
@@ -1858,6 +1895,64 @@ impl SqliteStore {
         if let Some(ref tantivy) = *cache {
             f(tantivy);
         }
+    }
+
+    /// Drain the durable `pending_grayzone_jobs` table back into the file queue.
+    ///
+    /// Covers the crash-after-COMMIT / enqueue-failure window in
+    /// `store_with_dedup_resolved`. Safe to call on every startup; if nothing
+    /// is pending, it's an O(1) query. On successful enqueue each row is
+    /// deleted; on persistent queue failure the row is left for the next call.
+    pub fn drain_pending_grayzone_jobs(
+        &self,
+        config: &crate::config::ReinConfig,
+    ) -> ReinResult<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, candidate_id, result_id, sim FROM pending_grayzone_jobs
+             ORDER BY created_at",
+        )?;
+        let rows: Vec<(String, String, String, Option<f64>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut drained = 0usize;
+        for (row_id, candidate_id, result_id, sim) in rows {
+            match crate::extract::hooks::queue::queue_dedup_job(
+                config,
+                candidate_id.clone(),
+                result_id.clone(),
+                sim.map(|v| v as f32),
+                "startup_drain",
+            ) {
+                Ok(_) => {
+                    let _ = self.conn.execute(
+                        "DELETE FROM pending_grayzone_jobs WHERE id = ?1",
+                        rusqlite::params![&row_id],
+                    );
+                    drained += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to drain pending grayzone job {row_id} for {} <-> {}: {error}",
+                        candidate_id,
+                        result_id
+                    );
+                }
+            }
+        }
+        if drained > 0 {
+            crate::extract::hooks::queue::spawn_dedup_worker(config);
+        }
+        Ok(drained)
     }
 
     /// Fire-and-forget: update Tantivy index after a write.

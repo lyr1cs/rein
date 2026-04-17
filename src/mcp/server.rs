@@ -1634,6 +1634,16 @@ fn spawn_background_warmup(config: &ReinConfig) {
     // inside spawn_blocking. Use a dedicated current-thread runtime for the async parts.
     tokio::task::spawn_blocking(move || {
         if let Ok(store) = warmup_config.open_store() {
+            // Drain any `pending_grayzone_jobs` rows left over from a crash
+            // between the store COMMIT and the file-queue enqueue in the
+            // previous session — before doing index warmup.
+            match store.drain_pending_grayzone_jobs(&warmup_config) {
+                Ok(count) if count > 0 => tracing::info!(
+                    "drained {count} pending grayzone jobs recovered from prior session"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("pending grayzone drain failed: {e}"),
+            }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
