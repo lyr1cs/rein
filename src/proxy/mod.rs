@@ -13,10 +13,12 @@ mod openai;
 mod policy;
 mod provider;
 mod responses;
+mod ws_mirror;
 
 use jwt::{bearer_jwt_info, decode_jwt_payload_for_logging, redact_jwt_payload};
 #[cfg(test)]
 use jwt::current_unix_timestamp;
+use ws_mirror::WebSocketMirrorState;
 
 use crate::config::ReinConfig;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -95,19 +97,8 @@ struct ProxyArtifactInput {
     request_body: Bytes,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Default)]
-struct WebSocketMirrorState {
-    pending: Vec<u8>,
-    fragmented_payload: Option<Vec<u8>>,
-    fragmented_compressed: bool,
-    event_messages: Vec<String>,
-    assistant_text: String,
-    request_query: Option<String>,
-    event_bytes: usize,
-    truncated: bool,
-    close_seen: bool,
-}
+// WebSocketMirrorState (struct + ~270-line impl) moved to
+// `src/proxy/ws_mirror.rs` in v0.19.0. Re-imported at the top of this file.
 
 /// Start the transparent proxy server.
 pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
@@ -541,275 +532,10 @@ fn maybe_store_first_party_ws_artifact(
     });
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-impl WebSocketMirrorState {
-    fn record_message(&mut self, message: &Message, collect_assistant_text: bool) {
-        match message {
-            Message::Text(text) => {
-                self.record_text_message(text.to_string(), collect_assistant_text, 256_000);
-            }
-            Message::Close(_) => {
-                self.close_seen = true;
-                self.push_event_limited("[close]".to_string(), 256_000);
-            }
-            _ => {}
-        }
-    }
+// `impl WebSocketMirrorState { ... }` moved to `src/proxy/ws_mirror.rs`
+// in v0.19.0 (audit `proxy/mod.rs` split). ~270 lines extracted.
 
-    /// Bound per-message inflate output so an attacker-controlled upstream frame cannot
-    /// expand a tiny compressed payload (deflate bomb) into unbounded memory. 1 MiB is
-    /// generous for legitimate /responses deltas — real messages are typically <50 KB.
-    const MAX_INFLATED_BYTES: u64 = 1024 * 1024;
-
-    fn decode_text_payload(payload: &[u8], compressed: bool) -> Option<String> {
-        if compressed {
-            let mut data = payload.to_vec();
-            data.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
-            let decoder = flate2::read::DeflateDecoder::new(&data[..]);
-            let mut limited = std::io::Read::take(decoder, Self::MAX_INFLATED_BYTES + 1);
-            let mut output = Vec::new();
-            use std::io::Read as _;
-            limited.read_to_end(&mut output).ok()?;
-            if output.len() as u64 > Self::MAX_INFLATED_BYTES {
-                tracing::warn!(
-                    limit = Self::MAX_INFLATED_BYTES,
-                    got = output.len(),
-                    "websocket mirror: permessage-deflate payload exceeded inflate cap, dropping"
-                );
-                return None;
-            }
-            String::from_utf8(output).ok()
-        } else {
-            Some(String::from_utf8_lossy(payload).into_owned())
-        }
-    }
-
-    fn feed(&mut self, chunk: &[u8], collect_assistant_text: bool) {
-        const MAX_EVENT_BYTES: usize = 256_000;
-        self.pending.extend_from_slice(chunk);
-        loop {
-            if self.pending.len() < 2 {
-                return;
-            }
-            let b0 = self.pending[0];
-            let b1 = self.pending[1];
-            let fin = (b0 & 0x80) != 0;
-            let rsv1 = (b0 & 0x40) != 0;
-            let opcode = b0 & 0x0f;
-            let masked = (b1 & 0x80) != 0;
-            let mut offset = 2usize;
-            // Hard cap on a single frame. RFC 6455 allows up to 2^63-1 bytes via
-            // the 64-bit extended length, but in practice no sane client or server
-            // sends multi-GB frames and a malicious upstream could construct huge
-            // values to crash or stall the mirror. We cap at 16 MiB per frame —
-            // 16× the per-message inflate cap — which still comfortably covers
-            // real Codex `/responses` deltas and any reasonable batched update.
-            const MAX_WS_FRAME_BYTES: u64 = 16 * 1024 * 1024;
-            let payload_len: usize = match b1 & 0x7f {
-                len @ 0..=125 => len as usize,
-                126 => {
-                    if self.pending.len() < offset + 2 {
-                        return;
-                    }
-                    let len = u16::from_be_bytes([self.pending[offset], self.pending[offset + 1]])
-                        as usize;
-                    offset += 2;
-                    len
-                }
-                127 => {
-                    if self.pending.len() < offset + 8 {
-                        return;
-                    }
-                    let len64 = u64::from_be_bytes([
-                        self.pending[offset],
-                        self.pending[offset + 1],
-                        self.pending[offset + 2],
-                        self.pending[offset + 3],
-                        self.pending[offset + 4],
-                        self.pending[offset + 5],
-                        self.pending[offset + 6],
-                        self.pending[offset + 7],
-                    ]);
-                    offset += 8;
-                    // Reject obviously-malicious frame lengths: anything above
-                    // MAX_WS_FRAME_BYTES, or anything that can't fit in usize on
-                    // a 32-bit platform. We drain `pending` and treat it as an
-                    // oversize frame; this bounds per-frame work to O(cap).
-                    if len64 > MAX_WS_FRAME_BYTES {
-                        tracing::warn!(
-                            len64,
-                            cap = MAX_WS_FRAME_BYTES,
-                            "websocket mirror: extended frame length exceeds cap; discarding buffer"
-                        );
-                        self.pending.clear();
-                        self.fragmented_payload = None;
-                        self.fragmented_compressed = false;
-                        return;
-                    }
-                    match usize::try_from(len64) {
-                        Ok(len) => len,
-                        Err(_) => {
-                            tracing::warn!(
-                                len64,
-                                "websocket mirror: extended length exceeds usize on this target"
-                            );
-                            self.pending.clear();
-                            self.fragmented_payload = None;
-                            self.fragmented_compressed = false;
-                            return;
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            };
-            let mask = if masked {
-                if self.pending.len() < offset + 4 {
-                    return;
-                }
-                let mask = [
-                    self.pending[offset],
-                    self.pending[offset + 1],
-                    self.pending[offset + 2],
-                    self.pending[offset + 3],
-                ];
-                offset += 4;
-                Some(mask)
-            } else {
-                None
-            };
-            // Guard against offset + payload_len overflow (pathological inputs).
-            let total = match offset.checked_add(payload_len) {
-                Some(total) => total,
-                None => {
-                    tracing::warn!(
-                        offset,
-                        payload_len,
-                        "websocket mirror: offset + payload_len overflowed; discarding buffer"
-                    );
-                    self.pending.clear();
-                    self.fragmented_payload = None;
-                    self.fragmented_compressed = false;
-                    return;
-                }
-            };
-            if self.pending.len() < total {
-                return;
-            }
-            let mut payload = self.pending[offset..total].to_vec();
-            self.pending.drain(..total);
-            if let Some(mask) = mask {
-                for (index, byte) in payload.iter_mut().enumerate() {
-                    *byte ^= mask[index % 4];
-                }
-            }
-
-            match opcode {
-                0x1 => {
-                    // Protocol violation: a new text frame while fragmentation is in progress.
-                    // Clear any partial fragment so the next continuation doesn't see stale bytes.
-                    if self.fragmented_payload.is_some() {
-                        tracing::warn!(
-                            "websocket mirror: new text frame arrived mid-fragmentation; \
-                            discarding partial payload"
-                        );
-                        self.fragmented_payload = None;
-                        self.fragmented_compressed = false;
-                    }
-                    if fin {
-                        if let Some(text) = Self::decode_text_payload(&payload, rsv1) {
-                            self.record_text_message(text, collect_assistant_text, MAX_EVENT_BYTES);
-                        } else {
-                            self.push_event_limited(
-                                "[compressed websocket frame decode failed]".to_string(),
-                                MAX_EVENT_BYTES,
-                            );
-                        }
-                    } else {
-                        self.fragmented_payload = Some(payload);
-                        self.fragmented_compressed = rsv1;
-                    }
-                }
-                0x0 => {
-                    if let Some(existing) = self.fragmented_payload.as_mut() {
-                        existing.extend_from_slice(&payload);
-                        if fin {
-                            let payload = self.fragmented_payload.take().unwrap_or_default();
-                            let compressed = self.fragmented_compressed;
-                            self.fragmented_compressed = false;
-                            if let Some(text) = Self::decode_text_payload(&payload, compressed) {
-                                self.record_text_message(
-                                    text,
-                                    collect_assistant_text,
-                                    MAX_EVENT_BYTES,
-                                );
-                            } else {
-                                self.push_event_limited(
-                                    "[compressed websocket frame decode failed]".to_string(),
-                                    MAX_EVENT_BYTES,
-                                );
-                            }
-                        }
-                    } else {
-                        // Orphan continuation with no prior start frame: discard and log.
-                        tracing::debug!(
-                            "websocket mirror: orphan continuation frame with no active fragment"
-                        );
-                    }
-                }
-                0x8 => {
-                    self.close_seen = true;
-                    // Clear any in-progress fragment on close to avoid leaking state
-                    // across potential reconnects of the same mirror.
-                    self.fragmented_payload = None;
-                    self.fragmented_compressed = false;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn record_text_message(
-        &mut self,
-        text: String,
-        collect_assistant_text: bool,
-        max_event_bytes: usize,
-    ) {
-        let text = crate::extract::hooks::parsing::redact_secrets(&text);
-        if !collect_assistant_text && self.request_query.is_none() {
-            self.request_query = responses::extract_query_ws_message(&text)
-                .map(|query| query.trim().to_string())
-                .filter(|query| !query.is_empty());
-        }
-        self.push_event_limited(text.clone(), max_event_bytes);
-        if collect_assistant_text {
-            if let Some(delta) = responses::extract_assistant_text_ws_message(&text) {
-                self.assistant_text.push_str(&delta);
-            }
-        }
-    }
-
-    fn push_event(&mut self, text: String) {
-        self.event_bytes += text.len();
-        self.event_messages.push(text);
-    }
-
-    fn push_event_limited(&mut self, text: String, max_event_bytes: usize) {
-        if self.event_bytes >= max_event_bytes {
-            self.truncated = true;
-            return;
-        }
-        let remaining = max_event_bytes - self.event_bytes;
-        if text.len() > remaining {
-            let preview = truncate_utf8_to_byte_limit(&text, remaining);
-            self.push_event(preview);
-            self.truncated = true;
-            return;
-        }
-        self.push_event(text);
-    }
-}
-
-fn truncate_utf8_to_byte_limit(text: &str, max_bytes: usize) -> String {
+pub(super) fn truncate_utf8_to_byte_limit(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
@@ -1826,12 +1552,21 @@ fn responses_scope_error(
 
     // Emit a redacted diagnostic so ops can debug scope mismatches without
     // leaking the full JWT payload. `redact_jwt_payload` keeps only iss/aud/
-    // exp/iat/sub/nbf/scp/chatgpt_account_id claims — everything else is
-    // dropped before it reaches tracing.
+    // exp/iat/nbf/scp + has_chatgpt_login. The `account_fingerprint` field
+    // is a non-invertible short hash of chatgpt_account_id (when present),
+    // so two calls from the same subscription group together in the log
+    // without exposing the raw account id.
     if let Some(decoded) = decode_jwt_payload_for_logging(headers) {
+        let account_fp = decoded
+            .get("https://api.openai.com/auth")
+            .and_then(|v| v.get("chatgpt_account_id"))
+            .or_else(|| decoded.get("chatgpt_account_id"))
+            .and_then(|v| v.as_str())
+            .map(jwt::hashed_account_fingerprint);
         tracing::info!(
             required_scope = %required_scope,
             redacted_claims = %redact_jwt_payload(&decoded),
+            account_fingerprint = account_fp.as_deref().unwrap_or("<none>"),
             "responses scope check failed; bearer does not carry the required scope"
         );
     }
@@ -4099,6 +3834,22 @@ x-openai-subagent: worker_abc\r\n\
     }
 
     #[test]
+    fn hashed_account_fingerprint_is_stable_and_non_invertible() {
+        let fp1 = jwt::hashed_account_fingerprint("acct_abc123");
+        let fp2 = jwt::hashed_account_fingerprint("acct_abc123");
+        let fp3 = jwt::hashed_account_fingerprint("acct_different");
+
+        // Same input → same fingerprint (stable for correlation)
+        assert_eq!(fp1, fp2);
+        // Different input → different fingerprint (collision unlikely for realistic inputs)
+        assert_ne!(fp1, fp3);
+        // 8-hex-char length, not invertible to raw input
+        assert_eq!(fp1.len(), 8);
+        assert!(fp1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!fp1.contains("acct"));
+    }
+
+    #[test]
     fn websocket_mirror_rejects_inflate_bomb() {
         use flate2::write::DeflateEncoder;
         use flate2::Compression;
@@ -4392,5 +4143,148 @@ x-openai-subagent: worker_abc\r\n\
         let red = redact_jwt_payload(&decoded);
         assert!(red.get("private_note").is_none());
         assert!(red.get("exp").is_some());
+    }
+
+    // --- v0.19.0 upstream-error passthrough tests (audit LOW) ---
+    //
+    // These verify that status codes meaningful to clients — 5xx server errors,
+    // 429 rate-limit, and mid-stream connection drops — are passed through
+    // unchanged so clients can implement their own retry/backoff. rein does NOT
+    // rewrite them to 4xx or internal status codes.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_passes_through_upstream_500_status_unchanged() {
+        let (openai_upstream, _openai_rx) =
+            spawn_capture_http_server("500 Internal Server Error", r#"{"error":"boom"}"#);
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_jwt_with_scopes(&["api.responses.read", "api.responses.write"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            500,
+            "upstream 500 must pass through to client unchanged"
+        );
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            body.contains("boom"),
+            "upstream body must pass through unchanged, got: {body}"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_passes_through_upstream_429_with_retry_after_header() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hand-crafted server so we can add a Retry-After header.
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\n\
+Retry-After: 42\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 18\r\n\
+Connection: close\r\n\r\n\
+{\"error\":\"slow\"}\r\n",
+            );
+        });
+
+        let openai_upstream = format!("http://{}", addr);
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_jwt_with_scopes(&["api.responses.read", "api.responses.write"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            429,
+            "upstream 429 must pass through"
+        );
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        assert_eq!(
+            retry_after.as_deref(),
+            Some("42"),
+            "Retry-After header must pass through"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_surfaces_upstream_connection_drop_as_5xx() {
+        // Bind a listener that accepts then immediately drops the connection
+        // before writing any response bytes.  reqwest/hyper should return an
+        // error; the proxy should map this to a 5xx status.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+
+        let openai_upstream = format!("http://{}", addr);
+        let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+        let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
+
+        let mut config = ReinConfig::default();
+        config.proxy.openai_upstream = openai_upstream;
+        config.proxy.codex_upstream = codex_upstream;
+        config.proxy.chatgpt_upstream = chatgpt_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let token = fake_jwt_with_scopes(&["api.responses.read", "api.responses.write"]);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/responses"))
+            .header("x-rein-token", "secret")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hello"}"#)
+            .send()
+            .await
+            .unwrap();
+        let code = response.status().as_u16();
+        assert!(
+            (500..600).contains(&code),
+            "upstream drop must surface as 5xx, got {code}"
+        );
+        proxy_task.abort();
     }
 }
