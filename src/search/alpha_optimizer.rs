@@ -111,6 +111,7 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
     // Phase 1: Coarse grid (0.00, 0.05, ..., 1.00)
     let mut best_alpha = 0.0_f64;
     let mut best_mrr = f64::NEG_INFINITY;
+    let mut worst_mrr = f64::INFINITY;
     for step in 0..COARSE_STEPS {
         let alpha = step as f64 / (COARSE_STEPS - 1) as f64;
         let mrr = eval_alpha(alpha, &mut scored);
@@ -118,6 +119,20 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
             best_mrr = mrr;
             best_alpha = alpha;
         }
+        if mrr < worst_mrr {
+            worst_mrr = mrr;
+        }
+    }
+
+    // If every alpha in the coarse grid produced an identical MRR the event
+    // carries no preference for any alpha (zero-variance candidate set).
+    // Previously the strict `>` comparison picked whichever alpha was tried
+    // first — always 0.0, biasing the learned mean toward pure-vector.
+    // Returning None here makes the event invisible to `optimize_alpha`'s
+    // weighted mean, so the existing prior in the cluster/global hierarchy
+    // is preserved instead of being dragged by a signal-free event.
+    if (best_mrr - worst_mrr).abs() < 1e-12 {
+        return None;
     }
 
     // Phase 2: Fine grid around coarse best (±0.05 at 0.01 resolution)
@@ -457,13 +472,17 @@ mod tests {
 
     #[test]
     fn test_episode_and_kg_signals_affect_alpha_scoring() {
+        // Event where BM25 and vector differ (so alpha is *meaningful*), and
+        // the accessed candidate additionally carries KG + episode signals.
+        // The learned alpha must still fall inside [0, 1] — the accessory
+        // signals shift the ranking but do not push alpha out of bounds.
         let event = RecallEvent {
             request_id: "test".to_string(),
             candidates: vec![
                 CandidateLog {
                     memory_id: "episodic".to_string(),
-                    bm25_norm: 0.3,
-                    vec_norm: 0.3,
+                    bm25_norm: 0.8,
+                    vec_norm: 0.2,
                     kg_norm: 0.2,
                     episode_norm: 0.9,
                     support_count: 1,
@@ -471,8 +490,8 @@ mod tests {
                 },
                 CandidateLog {
                     memory_id: "plain".to_string(),
-                    bm25_norm: 0.3,
-                    vec_norm: 0.3,
+                    bm25_norm: 0.2,
+                    vec_norm: 0.8,
                     kg_norm: 0.0,
                     episode_norm: 0.0,
                     support_count: 1,
@@ -485,5 +504,40 @@ mod tests {
 
         let alpha = optimal_alpha_for_event(&event).unwrap();
         assert!((0.0..=1.0).contains(&alpha));
+    }
+
+    #[test]
+    fn test_zero_variance_event_returns_none() {
+        // All candidates identical on alpha-sensitive signals → the learned
+        // alpha would be meaningless noise. optimal_alpha_for_event must
+        // return None so the weighted mean in optimize_alpha skips the event
+        // instead of biasing toward the first grid point evaluated.
+        let event = RecallEvent {
+            request_id: "tied".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "a".to_string(),
+                    bm25_norm: 0.5,
+                    vec_norm: 0.5,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "b".to_string(),
+                    bm25_norm: 0.5,
+                    vec_norm: 0.5,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["a".to_string()],
+            timestamp: Utc::now(),
+        };
+
+        assert_eq!(optimal_alpha_for_event(&event), None);
     }
 }

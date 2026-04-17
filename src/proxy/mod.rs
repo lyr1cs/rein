@@ -3423,6 +3423,7 @@ ChatGPT-Account-ID: acct_test\r\n\
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(global_state)]
     async fn proxy_http_artifact_is_visible_via_rest_api() {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("proxy-rest.db");
