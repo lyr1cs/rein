@@ -2064,7 +2064,7 @@ fn memory_content_snapshot(store: &SqliteStore, id: &str) -> Option<String> {
 /// `memory_canonical_state` is handled via ON DELETE CASCADE on the schema FK.
 /// This matches the cleanup already performed by batch prune paths so single-memory
 /// deletion (rein_forget / CLI / REST) no longer orphans JSON refs.
-fn clean_memory_refs(conn: &Connection, memory_id: &str) -> ReinResult<()> {
+pub(super) fn clean_memory_refs(conn: &Connection, memory_id: &str) -> ReinResult<()> {
     // Quoted JSON string literal form, e.g. "01KP..."
     let quoted = format!("\"{memory_id}\"");
     let like = format!("%{quoted}%");
@@ -2890,6 +2890,44 @@ enabled = true
         // Replacement topic "Docker Deployment" is normalized to "docker-deployment" at store time
         let consolidated = store.get_by_topic("docker-deployment").unwrap();
         assert_eq!(consolidated.len(), 1);
+    }
+
+    #[test]
+    fn consolidate_by_ids_atomic_strips_related_ids_from_survivors() {
+        // Verifies that when consolidate_by_ids_atomic deletes M1 + M2, any OTHER
+        // memory with those IDs in its related_ids gets cleanly scrubbed — preventing
+        // the dangling-ref corruption that was the top CRITICAL in the v0.20 audit.
+        let store = SqliteStore::in_memory().unwrap();
+        let m1_id = store
+            .store(test_memory("topic-a", "first", Importance::Medium))
+            .unwrap();
+        let m2_id = store
+            .store(test_memory("topic-a", "second", Importance::Medium))
+            .unwrap();
+
+        let mut survivor = test_memory("topic-b", "survivor", Importance::Medium);
+        survivor.related_ids = vec![m1_id.clone(), m2_id.clone(), "untouched".to_string()];
+        let survivor_id = store.store(survivor).unwrap();
+
+        let replacement = test_memory("topic-a", "merged", Importance::High);
+
+        store
+            .consolidate_by_ids_atomic(&[m1_id.clone(), m2_id.clone()], replacement)
+            .unwrap();
+
+        let after = store.get(&survivor_id).unwrap();
+        assert!(
+            !after.related_ids.contains(&m1_id),
+            "survivor.related_ids must not retain deleted {m1_id}"
+        );
+        assert!(
+            !after.related_ids.contains(&m2_id),
+            "survivor.related_ids must not retain deleted {m2_id}"
+        );
+        assert!(
+            after.related_ids.iter().any(|id| id == "untouched"),
+            "unrelated related_ids entries must be preserved"
+        );
     }
 
     #[test]
