@@ -1171,8 +1171,17 @@ pub fn run_dedup(
 
 /// Extract lines from `source` that are not present in `target`.
 /// Used for provenance-preserving merge: keeps unique temporal anchors and details.
+///
+/// Comparison is done at the LINE level (not via substring containment) so a
+/// line like "Stop" or "a" doesn't get dropped just because its lowercased
+/// form appears inside some unrelated word in target — previously the
+/// substring-based `target_lower.contains(...)` form could silently discard
+/// short but genuinely-unique source lines during merge (B6 #31).
 pub fn extract_unique_lines(source: &str, target: &str) -> String {
-    let target_lower = target.to_lowercase();
+    let target_lines: std::collections::HashSet<String> = target
+        .lines()
+        .map(|line| line.trim().to_lowercase())
+        .collect();
     let unique: Vec<&str> = source
         .lines()
         .filter(|line| {
@@ -1184,11 +1193,7 @@ pub fn extract_unique_lines(source: &str, target: &str) -> String {
             if trimmed.starts_with("[merged from ") || trimmed.starts_with("[merged on ") {
                 return false;
             }
-            // Keep lines that aren't found in target.
-            // For lines with temporal anchors (dates), also keep if they differ
-            // even slightly from target (prevents date-bearing lines from
-            // accumulating via repeated merges when they are exact duplicates).
-            !target_lower.contains(&trimmed.to_lowercase())
+            !target_lines.contains(&trimmed.to_lowercase())
         })
         .collect();
     unique.join("\n")
@@ -1605,5 +1610,31 @@ mod tests {
         assert!(unique.contains("line D"), "should keep unique line D");
         assert!(!unique.contains("line A"), "should exclude shared line A");
         assert!(!unique.contains("line C"), "should exclude shared line C");
+    }
+
+    #[test]
+    fn extract_unique_lines_does_not_drop_substring_matches() {
+        // Before B6 #31, source lines that were substrings of target text were
+        // silently discarded — "Stop" would disappear if target happened to
+        // contain "Stopwatch" somewhere. The line-level match now preserves
+        // these genuinely unique lines.
+        let source = "Stop\nA short note\nDistinct fact";
+        let target = "Stopwatch measurements were logged.\nUnrelated text that mentions a short-note in prose.\n";
+        let unique = extract_unique_lines(source, target);
+        assert!(unique.contains("Stop"), "short line 'Stop' must be preserved");
+        assert!(
+            unique.contains("A short note"),
+            "distinct multi-word line must be preserved even if its hyphenated form appears inside another word"
+        );
+        assert!(unique.contains("Distinct fact"));
+    }
+
+    #[test]
+    fn extract_unique_lines_drops_exact_duplicate_lines() {
+        let source = "line A\nline B\n";
+        let target = "line A\nother\n";
+        let unique = extract_unique_lines(source, target);
+        assert!(!unique.contains("line A"));
+        assert!(unique.contains("line B"));
     }
 }

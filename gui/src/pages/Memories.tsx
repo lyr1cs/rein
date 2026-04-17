@@ -364,6 +364,7 @@ export default function Memories() {
   const [tierFilter, setTierFilter] = useState<TierFilter>('all');
   const [sortMode, setSortMode] = useState<SortMode>('recent');
   const [selected, setSelected] = useState<(Memory | RecallResult) | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const { data: selectedDetail, isLoading: selectedLoading } = useMemoryDetail(selected?.id ?? null);
 
   // Debounce search query (300ms)
@@ -421,6 +422,7 @@ export default function Memories() {
       try {
         await apiDelete(`/api/memories/${id}`);
         setSelected(null);
+        setDeleteError(null);
         await Promise.all([
           refetchRecent(),
           queryClient.invalidateQueries({ queryKey: ['recent'] }),
@@ -428,7 +430,16 @@ export default function Memories() {
           queryClient.invalidateQueries({ queryKey: ['memory-detail'] }),
         ]);
       } catch (err) {
+        // B6 — surface the failure instead of only logging to console so the
+        // user sees why the item stayed visible after clicking Delete.
+        const message =
+          err instanceof Error
+            ? err.message
+            : typeof err === 'string'
+              ? err
+              : 'Delete failed';
         console.error('Delete failed:', err);
+        setDeleteError(message);
       }
     },
     [queryClient, refetchRecent],
@@ -531,6 +542,24 @@ export default function Memories() {
           )}
         </div>
       </div>
+
+      {/* Delete error banner — B6 #30 follow-up */}
+      {deleteError && (
+        <div className="fixed top-4 right-4 z-50 max-w-md rounded-lg border border-[var(--hot)]/30 bg-[var(--hot)]/10 px-4 py-3 text-sm text-[var(--hot)] shadow-lg">
+          <div className="flex items-start gap-2">
+            <span className="font-medium">Delete failed:</span>
+            <span className="flex-1 break-words">{deleteError}</span>
+            <button
+              type="button"
+              onClick={() => setDeleteError(null)}
+              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] -mt-0.5"
+              aria-label="Dismiss error"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Detail slide-over panel */}
       {selected && (

@@ -14,6 +14,14 @@ import type {
 
 const DEFAULT_INTERVAL = 5000;
 
+/**
+ * Read the user's polling cadence from localStorage.
+ *
+ * Passed as a function to React Query's `refetchInterval` so it is evaluated
+ * after each fetch — letting a Settings-page change take effect on the next
+ * poll without a full page reload. Before B6 #29 this was called once at
+ * module init and the interval stayed frozen until reload.
+ */
 function getPollingInterval(): number {
   const saved = localStorage.getItem('rein_polling_interval');
   return saved ? parseInt(saved, 10) * 1000 : DEFAULT_INTERVAL;
@@ -23,7 +31,7 @@ export function useStats() {
   return useQuery({
     queryKey: ['stats'],
     queryFn: () => apiGet<StoreStats>('/api/stats'),
-    refetchInterval: getPollingInterval(),
+    refetchInterval: () => getPollingInterval(),
   });
 }
 
@@ -38,7 +46,7 @@ export function useRecent(limit = 20) {
   return useQuery({
     queryKey: ['recent', limit],
     queryFn: () => apiGet<{ memories: Memory[] }>(`/api/recent?limit=${limit}`),
-    refetchInterval: getPollingInterval(),
+    refetchInterval: () => getPollingInterval(),
   });
 }
 
@@ -85,7 +93,7 @@ export function useAdaptive() {
   return useQuery({
     queryKey: ['adaptive'],
     queryFn: () => apiGet<AdaptiveStatus>('/api/adaptive'),
-    refetchInterval: getPollingInterval(),
+    refetchInterval: () => getPollingInterval(),
   });
 }
 
@@ -108,7 +116,7 @@ export function useActivity(days = 14) {
   return useQuery({
     queryKey: ['activity', days],
     queryFn: () => apiGet<{ activity: Array<{ date: string; recalls: number; stores: number }> }>(`/api/activity?days=${days}`),
-    refetchInterval: getPollingInterval(),
+    refetchInterval: () => getPollingInterval(),
   });
 }
 
@@ -123,5 +131,14 @@ export function useArtifacts(limit = 20) {
   return useQuery({
     queryKey: ['artifacts', limit],
     queryFn: () => apiGet<{ artifacts: Artifact[] }>(`/api/artifacts?limit=${limit}`),
+  });
+}
+
+export function useServerVersion() {
+  return useQuery({
+    queryKey: ['server-version'],
+    queryFn: () => apiGet<{ version: string }>(`/api/version`),
+    staleTime: 60 * 60 * 1000, // 1 hour — version is pinned per build
+    refetchInterval: false,
   });
 }

@@ -140,18 +140,20 @@ export default function Brain() {
           apiGet<{ memoirs: Memoir[] }>('/api/memoirs').catch(() => ({ memoirs: [] as Memoir[] })),
         ]);
 
-        /* Fetch all memoir exports */
-        const exports: MemoirExport[] = [];
-        for (const m of memoirsRes.memoirs) {
-          try {
-            const exp = await apiGet<MemoirExport>(
-              `/api/memoirs/${encodeURIComponent(m.name)}/export?format=json`,
-            );
-            exports.push(exp);
-          } catch {
-            /* skip failed memoir */
-          }
-        }
+        /* Fetch all memoir exports IN PARALLEL. The previous sequential
+         * `await` loop turned every poll into an N+1 trip on large vaults;
+         * Promise.all lets the browser fire every request together and still
+         * collect the successes. Failed memoirs still degrade gracefully via
+         * the per-request `.catch`. */
+        const exports: MemoirExport[] = (
+          await Promise.all(
+            memoirsRes.memoirs.map((m) =>
+              apiGet<MemoirExport>(
+                `/api/memoirs/${encodeURIComponent(m.name)}/export?format=json`,
+              ).catch(() => null),
+            ),
+          )
+        ).filter((exp): exp is MemoirExport => exp !== null);
 
         if (cancelled) return;
 
