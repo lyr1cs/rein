@@ -536,7 +536,7 @@ fn bucket_embeddings(
         if batch.len() != chunk.len() {
             continue;
         }
-        for ((idx, enriched), emb) in chunk.iter().zip(batch.into_iter()) {
+        for ((idx, enriched), emb) in chunk.iter().zip(batch) {
             let _ = crate::embed::EmbedCache::put(conn, enriched, &model, &emb);
             let _ = crate::store::vec::insert_embedding(conn, &mems[*idx].id, &emb);
             embeddings.insert(*idx, emb);
@@ -675,7 +675,7 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             continue;
         }
 
-        for ((id, enriched), emb) in chunk.iter().zip(batch_embeddings.into_iter()) {
+        for ((id, enriched), emb) in chunk.iter().zip(batch_embeddings) {
             let _ = crate::embed::EmbedCache::put(conn, enriched, &model_name, &emb);
             let _ = crate::store::vec::insert_embedding(conn, id, &emb);
             embeddings_by_id.insert(id.clone(), emb);
