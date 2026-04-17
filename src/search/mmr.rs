@@ -35,17 +35,29 @@ pub fn apply_mmr(candidates: Vec<(Memory, f32)>, limit: usize, lambda: f32) -> V
 
     // Normalise scores once against the full candidate list so `lambda` is a
     // stable relevance-diversity knob throughout the greedy loop.
-    let max_score = candidates
+    //
+    // Fold against NEG_INFINITY so all-negative score sets (RRF rank
+    // sentinels `-0, -1, -2, ...`) produce the real max, not 0.0. Previously
+    // starting from 0.0 could snap max_score to 0 → divide-by-near-zero →
+    // normalised relevance collapsed to 0 → MMR degenerated to pure
+    // diversity regardless of lambda. When every score is non-positive, we
+    // shift to a >=0 range so the normalisation is well-defined.
+    let raw_max = candidates
         .iter()
         .map(|(_, s)| *s)
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
+        .fold(f32::NEG_INFINITY, f32::max);
+    let raw_min = candidates
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::INFINITY, f32::min);
+    let shift = if raw_max <= 0.0 { -raw_min } else { 0.0 };
+    let max_score = (raw_max + shift).max(1e-6);
 
     let mut selected: Vec<(Memory, f32)> = Vec::with_capacity(limit);
     // (memory, raw_score, fixed_normalised_relevance)
     let mut remaining: Vec<(Memory, f32, f32)> = candidates
         .into_iter()
-        .map(|(m, s)| (m, s, s / max_score))
+        .map(|(m, s)| (m, s, (s + shift) / max_score))
         .collect();
 
     while selected.len() < limit && !remaining.is_empty() {

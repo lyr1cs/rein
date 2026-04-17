@@ -207,15 +207,21 @@ fn full_body(data: Bytes) -> BoxBody {
     box_body(Full::new(data).map_err(|never| match never {}))
 }
 
-/// Constant-time byte equality for proxy token comparison.
-/// Prevents timing side channels that would otherwise leak the expected token
-/// one byte at a time based on how quickly the comparison short-circuits.
+/// Constant-time equality for proxy token comparison.
+///
+/// Hashes BOTH sides to a fixed-size digest before the XOR-accumulate
+/// compare. The earlier form short-circuited on length mismatch, which
+/// leaked the expected token's length to a wall-clock-attacker — for
+/// short-by-design tokens that narrows brute-force search meaningfully
+/// (B7 LOW). With SHA-256 both sides always end up at 32 bytes, so
+/// mismatches are indistinguishable whether they differ in length or
+/// content.
 fn proxy_token_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.bytes()
-        .zip(right.bytes())
+    use sha2::{Digest, Sha256};
+    let lh = Sha256::digest(left.as_bytes());
+    let rh = Sha256::digest(right.as_bytes());
+    lh.iter()
+        .zip(rh.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
