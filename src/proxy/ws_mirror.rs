@@ -314,7 +314,24 @@ impl WebSocketMirrorState {
         self.push_event_limited(text.clone(), max_event_bytes);
         if collect_assistant_text {
             if let Some(delta) = responses::extract_assistant_text_ws_message(&text) {
-                self.assistant_text.push_str(&delta);
+                // Cap assistant_text the same way stream_response caps MAX_EXTRACT_BUF
+                // in mod.rs — without this, a long-lived /responses WS session with a
+                // misbehaving upstream can grow the buffer without bound and OOM the
+                // proxy. 200 KB comfortably covers a single assistant turn and mirrors
+                // the SSE path's policy.
+                const MAX_ASSISTANT_TEXT_BYTES: usize = 200_000;
+                if self.assistant_text.len() >= MAX_ASSISTANT_TEXT_BYTES {
+                    self.truncated = true;
+                } else {
+                    let remaining = MAX_ASSISTANT_TEXT_BYTES - self.assistant_text.len();
+                    if delta.len() > remaining {
+                        let preview = truncate_utf8_to_byte_limit(&delta, remaining);
+                        self.assistant_text.push_str(&preview);
+                        self.truncated = true;
+                    } else {
+                        self.assistant_text.push_str(&delta);
+                    }
+                }
             }
         }
     }
