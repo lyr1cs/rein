@@ -228,6 +228,67 @@ fn error_response(status: u16, msg: &str) -> hyper::Response<BoxBody> {
         .unwrap_or_else(|_| hyper::Response::new(full_body(Bytes::from("internal error"))))
 }
 
+/// True when the request path contains RFC 3986 dot-segment wildcards
+/// (`/../`, `/./`, or trailing `/..`). `reqwest`/`url` normalize these on
+/// the wire, which decouples the path used for local policy decisions from
+/// the path the upstream actually sees. Reject such requests at the edge
+/// so the two views are always identical.
+fn has_traversal_segments(path: &str) -> bool {
+    // Strip query string — path traversal only matters for the path portion.
+    let path_only = path.split('?').next().unwrap_or(path);
+    for segment in path_only.split('/') {
+        if segment == ".." || segment == "." {
+            return true;
+        }
+    }
+    // Also catch `//` (empty segment) which some servers collapse asymmetrically.
+    // We allow exactly one leading `/` but reject any `//` inside.
+    if let Some(rest) = path_only.strip_prefix('/') {
+        if rest.contains("//") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod traversal_guard_tests {
+    use super::has_traversal_segments;
+
+    #[test]
+    fn rejects_parent_dot_dot() {
+        assert!(has_traversal_segments("/backend-api/codex/../v1/chat/completions"));
+        assert!(has_traversal_segments("/foo/.."));
+        assert!(has_traversal_segments("/../etc/passwd"));
+    }
+
+    #[test]
+    fn rejects_single_dot_segments() {
+        assert!(has_traversal_segments("/foo/./bar"));
+        assert!(has_traversal_segments("/./"));
+    }
+
+    #[test]
+    fn rejects_double_slash() {
+        assert!(has_traversal_segments("/foo//bar"));
+    }
+
+    #[test]
+    fn accepts_clean_paths() {
+        assert!(!has_traversal_segments("/v1/messages"));
+        assert!(!has_traversal_segments("/backend-api/codex/responses"));
+        assert!(!has_traversal_segments("/responses?stream=true"));
+        assert!(!has_traversal_segments("/"));
+    }
+
+    #[test]
+    fn ignores_dots_inside_segments() {
+        // "..foo" is not the ".." segment — must not trip.
+        assert!(!has_traversal_segments("/a.b/c..d/e"));
+        assert!(!has_traversal_segments("/config.yml"));
+    }
+}
+
 /// Uniform response for WebSocket upgrade failure: always 426 Upgrade Required.
 ///
 /// Previously this returned 426 for `/responses`-family providers and 502 for
@@ -652,6 +713,17 @@ async fn handle_request(
         .unwrap_or_else(|| uri.path().to_string());
     let path = uri.path().to_string();
     let headers = req.headers().clone();
+
+    // Reject path-traversal segments before ANY routing decision.
+    // `reqwest`/`url` normalize `/foo/../bar` → `/bar` on the wire, which means
+    // the path we use for provider detection, recording-mode selection, and
+    // ArtifactMirrorOnly gating can disagree with what upstream actually sees.
+    // That divergence breaks the "the policy decision matches the wire path"
+    // invariant; the safest behavior is to refuse such paths at the edge.
+    if has_traversal_segments(&path_and_query) {
+        state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+        return Ok(error_response(400, "path contains traversal segments"));
+    }
 
     // Metrics endpoint.
     if method == hyper::Method::GET && path == "/rein/metrics" {
