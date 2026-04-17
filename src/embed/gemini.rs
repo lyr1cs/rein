@@ -53,10 +53,7 @@ impl GeminiEmbedder {
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to build reqwest client with timeout: {e}, using default");
-                Client::default()
-            });
+            .expect("reqwest client build failed for gemini (likely TLS backend)");
         Self {
             client,
             api_key,

@@ -350,7 +350,10 @@ fn parse_rerank_response(content: &str, expected_len: usize) -> ReinResult<Vec<f
 }
 
 fn strip_code_fences(s: &str) -> String {
-    let s = if let Some(idx) = s.find("</think>") {
+    // `rfind` matches search/expand.rs so nested or repeated <think> blocks
+    // don't leave the opening tag in the parse buffer — the last
+    // </think> is always the closure of the outermost block.
+    let s = if let Some(idx) = s.rfind("</think>") {
         s[idx + 8..].trim()
     } else {
         s.trim()
