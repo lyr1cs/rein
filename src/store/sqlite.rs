@@ -827,10 +827,11 @@ impl MemoryStore for SqliteStore {
             if rows == 0 {
                 return Err(ReinError::NotFound(format!("memory {id} not found")));
             }
-            // FTS cleanup handled by trigger; vec and memory_canonical_state CASCADE.
-            if let Err(e) = vec::delete_embedding(&self.conn, id) {
-                tracing::warn!("failed to delete embedding for {id}: {e}");
-            }
+            // FTS cleanup handled by trigger; memory_canonical_state CASCADE.
+            // vec_memories is a vec0 virtual table with NO FK cascade — the comment
+            // that claimed otherwise was wrong. Failure here must abort the tx or
+            // we leave a ghost embedding that the vector channel will keep returning.
+            vec::delete_embedding(&self.conn, id)?;
             Ok(())
         })();
 
@@ -1951,10 +1952,27 @@ impl SqliteStore {
     }
 
     /// Fire-and-forget: remove from HNSW index after a delete.
+    ///
+    /// Mirrors [`Self::update_hnsw`]: on lock-unavailable or open/save failure
+    /// we mark the index dirty so the next warmup rebuild picks up the missed
+    /// removal. Without this, a failed delete leaves a stale embedding that the
+    /// vector channel keeps returning for the lifetime of the index file.
     pub(crate) fn remove_from_hnsw(&self, id: &str) {
-        self.with_hnsw_lock(self.dims, |index| {
-            let _ = index.delete(id);
-        });
+        match self.with_hnsw_lock(self.dims, |index| index.delete(id)) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                tracing::warn!("HNSW delete failed for {id}: {error}");
+                crate::store::hnsw::HnswIndex::mark_dirty(&self.hnsw_path());
+            }
+            None => {
+                if self.db_path.to_str() != Some(":memory:") {
+                    tracing::warn!(
+                        "HNSW delete skipped for {id} (lock unavailable); marking dirty"
+                    );
+                    crate::store::hnsw::HnswIndex::mark_dirty(&self.hnsw_path());
+                }
+            }
+        }
     }
 
     pub fn canonical_id_for(&self, memory_id: &str) -> ReinResult<String> {

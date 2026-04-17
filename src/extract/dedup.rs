@@ -238,6 +238,33 @@ pub fn lexical_score(a: &str, b: &str) -> LexicalDedupScore {
     }
 }
 
+/// Directional check: does `new` strongly contain `old`?
+///
+/// Containment alone (max of the two directions) collapses asymmetry, so
+/// `check_dedup` ends up treating "new is longer and subsumes old" the same as
+/// "old is longer and subsumes new" — always returning `MergeInto(existing)`
+/// even though the former case should `Supersede(existing)` (the longer new
+/// record has strictly more information than the old one).
+///
+/// Returns `true` iff both (a) `old` is nearly fully covered by `new` and
+/// (b) `new` is NOT fully covered by `old`. The asymmetry is what distinguishes
+/// "new contains old with extras" from "both sides are near-duplicates".
+pub(crate) fn new_strongly_contains_old(new_content: &str, old_content: &str) -> bool {
+    let set_new = normalize_tokens(new_content);
+    let set_old = normalize_tokens(old_content);
+    if set_new.is_empty() || set_old.is_empty() {
+        return false;
+    }
+    if set_new.len() <= set_old.len() {
+        return false;
+    }
+    let intersection = set_new.intersection(&set_old).count() as f32;
+    let old_covered = intersection / set_old.len() as f32;
+    let new_covered = intersection / set_new.len() as f32;
+    // "old is ~fully inside new" AND "new still has meaningful extra tokens"
+    old_covered >= 0.85 && new_covered <= 0.7
+}
+
 pub fn normalize_topic_key(topic: &str) -> String {
     // Apply NFC normalization before lowercasing to handle composed vs decomposed
     // Unicode forms (e.g., "café" NFC vs "cafe\u{0301}" NFD produce the same key).
@@ -438,7 +465,9 @@ pub fn check_dedup(
     if best_vec_sim > 0.85 {
         if let Some(memory) = best_vec_memory {
             let age_days = (chrono::Utc::now() - memory.created_at).num_days();
-            if age_days < time_window_days {
+            if age_days < time_window_days
+                && !new_strongly_contains_old(content, &memory.content)
+            {
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
@@ -464,7 +493,9 @@ pub fn check_dedup(
                     true,
                 );
             }
-            if age_days < time_window_days {
+            if age_days < time_window_days
+                && !new_strongly_contains_old(content, &memory.content)
+            {
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
@@ -484,7 +515,9 @@ pub fn check_dedup(
                 if embed_sim > 0.85 {
                     // Embedding confirms strong match — treat as dedup
                     let age_days = (chrono::Utc::now() - memory.created_at).num_days();
-                    if age_days < time_window_days {
+                    if age_days < time_window_days
+                        && !new_strongly_contains_old(content, &memory.content)
+                    {
                         return Ok(DedupAction::MergeInto(memory.id.clone()));
                     } else {
                         return Ok(DedupAction::Supersede(memory.id.clone()));
@@ -972,5 +1005,30 @@ mod tests {
             !tokens.is_empty(),
             "single CJK character should produce at least one token"
         );
+    }
+
+    #[test]
+    fn new_strongly_contains_old_detects_richer_replacement() {
+        // Old summary is fully inside the new, which also carries new information.
+        let old = "docker compose yaml for deployment";
+        let new = "docker compose yaml for deployment with healthchecks restart policies and secret mounts";
+        assert!(new_strongly_contains_old(new, old));
+        // Reverse direction must NOT trip the check.
+        assert!(!new_strongly_contains_old(old, new));
+    }
+
+    #[test]
+    fn new_strongly_contains_old_ignores_near_duplicates() {
+        let a = "alpha beta gamma delta";
+        let b = "alpha beta gamma epsilon";
+        assert!(!new_strongly_contains_old(a, b));
+        assert!(!new_strongly_contains_old(b, a));
+    }
+
+    #[test]
+    fn new_strongly_contains_old_handles_empty_inputs() {
+        assert!(!new_strongly_contains_old("", "anything"));
+        assert!(!new_strongly_contains_old("anything", ""));
+        assert!(!new_strongly_contains_old("", ""));
     }
 }
