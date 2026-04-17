@@ -494,6 +494,24 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     ",
     )?;
 
+    // Gray-zone dedup pairs that still need a follow-up LLM verdict. Inserted
+    // INSIDE the store transaction so a crash between COMMIT and the file-queue
+    // enqueue can't lose the pair silently. Drained on startup and whenever the
+    // live enqueue succeeds post-COMMIT.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pending_grayzone_jobs (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            sim REAL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_grayzone_created
+            ON pending_grayzone_jobs(created_at);
+    ",
+    )?;
+
     Ok(())
 }
 
