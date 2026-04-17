@@ -1897,6 +1897,31 @@ impl SqliteStore {
         }
     }
 
+    /// Backfill `session_artifacts.episode_id` for rows orphaned by a crash
+    /// between `create_episode` and `link_session_artifact_episode` in the
+    /// stop-hook pipeline. Matches on `session_id == episode.source_session_id`
+    /// so the relationship can be reconstructed idempotently — safe to call on
+    /// every startup even when there are no orphans.
+    pub fn repair_orphan_artifact_episode_links(&self) -> ReinResult<usize> {
+        let affected = self.conn.execute(
+            "UPDATE session_artifacts
+                SET episode_id = (
+                    SELECT e.id FROM episodes AS e
+                     WHERE e.source_session_id = session_artifacts.session_id
+                     ORDER BY e.created_at DESC
+                     LIMIT 1
+                )
+              WHERE session_artifacts.episode_id IS NULL
+                AND session_artifacts.session_id IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM episodes AS e
+                     WHERE e.source_session_id = session_artifacts.session_id
+                )",
+            [],
+        )?;
+        Ok(affected)
+    }
+
     /// Drain the durable `pending_grayzone_jobs` table back into the file queue.
     ///
     /// Covers the crash-after-COMMIT / enqueue-failure window in
