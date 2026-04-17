@@ -1644,6 +1644,16 @@ fn spawn_background_warmup(config: &ReinConfig) {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("pending grayzone drain failed: {e}"),
             }
+            // Repair any session_artifacts orphaned by a crash between
+            // create_episode and link_session_artifact_episode in the
+            // previous session (B3 #18).
+            match store.repair_orphan_artifact_episode_links() {
+                Ok(count) if count > 0 => tracing::info!(
+                    "repaired {count} orphan session_artifact → episode links"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("artifact-episode repair failed: {e}"),
+            }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();

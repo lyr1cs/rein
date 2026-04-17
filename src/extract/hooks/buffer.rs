@@ -3,6 +3,16 @@
 use crate::config::ReinConfig;
 use crate::extract::hooks::parsing::redact_secrets;
 
+/// Hard cap on per-session buffer file size. Above this, appends drop (and
+/// the event is marked in tracing) instead of growing without bound. A
+/// misbehaving client tool can easily dump hundreds of MB of output per
+/// PostToolUse; without the cap, a single long session could OOM the hook
+/// process when `read_and_clear_buffer` pulls the whole file into memory.
+///
+/// 16 MiB is ~20× the largest realistic session buffer we've seen, so
+/// legitimate use never trips the cap.
+const MAX_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Resolve the buffer directory (auto = ~/.rein/).
 pub fn resolve_buffer_dir(config: &ReinConfig) -> std::path::PathBuf {
     if config.hooks.buffer_dir == "auto" {
@@ -36,6 +46,17 @@ pub fn session_buffer_path(config: &ReinConfig, input: &str) -> std::path::PathB
 pub fn append_to_buffer(path: &std::path::Path, text: &str, source: &str) -> anyhow::Result<()> {
     with_buffer_lock(path, || {
         use std::io::Write;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() >= MAX_BUFFER_BYTES {
+                tracing::warn!(
+                    path = ?path,
+                    size = meta.len(),
+                    cap = MAX_BUFFER_BYTES,
+                    "session buffer hit size cap; dropping append"
+                );
+                return Ok(());
+            }
+        }
         let entry = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "text": redact_secrets(text),
@@ -50,12 +71,30 @@ pub fn append_to_buffer(path: &std::path::Path, text: &str, source: &str) -> any
     })
 }
 
+/// Safely read a buffer file, bounded by `MAX_BUFFER_BYTES`. Returns `None`
+/// when the file is absent or unreadable; oversize files are dropped and
+/// cleared on disk to guarantee progress.
+fn read_buffer_bounded(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_BUFFER_BYTES {
+        tracing::warn!(
+            path = ?path,
+            size = meta.len(),
+            cap = MAX_BUFFER_BYTES,
+            "session buffer exceeded size cap; discarding"
+        );
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Read all text entries from a buffer file and delete it.
 pub fn read_and_clear_buffer(path: &std::path::Path) -> Vec<String> {
     with_buffer_lock(path, || {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return Ok(vec![]),
+        let content = match read_buffer_bounded(path) {
+            Some(c) => c,
+            None => return Ok(vec![]),
         };
         let _ = std::fs::remove_file(path);
         Ok(content
@@ -76,9 +115,9 @@ pub fn read_and_clear_buffer(path: &std::path::Path) -> Vec<String> {
 
 /// Adaptive flush threshold: adjusts based on signal density in the buffer.
 pub fn adaptive_flush_threshold(base: usize, buf_path: &std::path::Path) -> usize {
-    let content = match std::fs::read_to_string(buf_path) {
-        Ok(c) => c,
-        Err(_) => return base,
+    let content = match read_buffer_bounded(buf_path) {
+        Some(c) => c,
+        None => return base,
     };
     let total_lines = content.lines().count();
     if total_lines < 5 {
