@@ -354,8 +354,7 @@ fn auto_concept_candidates(memory: &Memory) -> Vec<(String, &'static str)> {
         crate::extract::extract_keywords_from_text(
             &format!("{} {}", memory.summary, memory.content),
             AUTO_CONCEPT_MAX_KEYWORDS,
-        )
-        .into_iter(),
+        ),
     ) {
         if out.len() >= AUTO_CONCEPT_MAX {
             break;
@@ -573,8 +572,7 @@ fn build_conflict_query(memory: &Memory) -> String {
             crate::extract::extract_keywords_from_text(
                 &format!("{} {}", memory.summary, memory.content.replace('-', " ")),
                 AUTO_CONCEPT_MAX_KEYWORDS,
-            )
-            .into_iter(),
+            ),
         ) {
             let term = normalize_conflict_query_token(&raw);
             if !is_useful_conflict_query_token(&term) || !seen.insert(term.clone()) {

@@ -506,7 +506,7 @@ pub fn recall_temporal_with_request_id(
         } else {
             vec![]
         };
-        for (id, score) in concept_results.into_iter().chain(bfs_expanded.into_iter()) {
+        for (id, score) in concept_results.into_iter().chain(bfs_expanded) {
             let entry = kg_scores.entry(id).or_default();
             *entry = entry.max(score);
         }

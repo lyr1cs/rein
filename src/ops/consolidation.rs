@@ -226,7 +226,7 @@ pub fn build_consolidated_from_memories(
     summary_template: Option<&str>,
 ) -> Memory {
     let mut ordered: Vec<&Memory> = memories.iter().collect();
-    ordered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    ordered.sort_by_key(|m| std::cmp::Reverse(m.created_at));
 
     let memory_count = ordered.len();
     let rendered = summary_template.map(|template| {
