@@ -81,16 +81,21 @@ function getPollingIntervalMs(): number {
 /*  Relation-type colors                                              */
 /* ------------------------------------------------------------------ */
 
+// Keys must match the snake_case serde names of the server `Relation` enum in
+// src/types/memory.rs (Relation::PartOf -> "part_of", etc). Before B6, most
+// of these keys were aspirational ("is_a", "has_a", "causes", "uses",
+// "extends", "implements") and never matched server output, so 6 of the 9
+// real relations always rendered in the fallback grey.
 const RELATION_COLORS: Record<string, string> = {
-  is_a:       '#7c3aed',
-  has_a:      '#3b82f6',
-  part_of:    '#22d3ee',
-  depends_on: '#f97316',
-  related_to: '#94a3b8',
-  causes:     '#ef4444',
-  uses:       '#4ade80',
-  extends:    '#fbbf24',
-  implements: '#a78bfa',
+  part_of:         '#22d3ee',
+  depends_on:      '#f97316',
+  related_to:      '#94a3b8',
+  contradicts:     '#ef4444',
+  refines:         '#4ade80',
+  alternative_to:  '#a78bfa',
+  caused_by:       '#fbbf24',
+  instance_of:     '#7c3aed',
+  superseded_by:   '#3b82f6',
 };
 
 function relationColor(rel: string): string {
