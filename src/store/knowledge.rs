@@ -514,6 +514,11 @@ impl SqliteStore {
 
     /// Atomically consolidate a topic: delete all old memories and insert replacement in one transaction.
     /// Returns the old memories for reference. If insertion fails, everything rolls back.
+    ///
+    /// Test-only — bypasses `clean_memory_refs`, so it would leak dangling `related_ids` /
+    /// `episodes.memory_ids` if used on a live DB. Prefer `consolidate_by_ids_atomic`
+    /// (which does the cleanup) for production paths.
+    #[cfg(test)]
     pub fn consolidate_atomic(&self, topic: &str, replacement: Memory) -> ReinResult<Vec<Memory>> {
         self.conn.execute_batch("SAVEPOINT consolidate_atomic")?;
 
@@ -552,6 +557,9 @@ impl SqliteStore {
 
     /// Atomically consolidate multiple topics into a single replacement memory.
     /// Used for normalized topic-variant cleanup (case/space/hyphen variants).
+    ///
+    /// Test-only — same `clean_memory_refs` caveat as `consolidate_atomic`.
+    #[cfg(test)]
     pub fn consolidate_topics_atomic(
         &self,
         topics: &[String],
