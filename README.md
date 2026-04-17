@@ -12,34 +12,6 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-### What's new in v0.18.2 (2026-04-17)
-
-Patch release on top of v0.18.1 addressing the final batch of Codex-review findings — 1 HIGH + 2 MEDIUM + 4 LOW — plus 4 new regression tests (472 pass / clippy -D warnings 0 errors).
-
-- **HIGH**: WebSocket extended-frame (`len == 127`) length is now bounded at 16 MiB per frame. Malicious upstream frames declaring multi-GB payloads can no longer stall the mirror or force unbounded allocation. Checked arithmetic on `offset + payload_len` prevents pathological overflow.
-- **MEDIUM**: LIKE-fallback escape order in `fts.rs` now escapes backslash first, then `%` and `_`, so queries containing a literal `\` no longer silently change match semantics.
-- **MEDIUM**: `test_env_override_db` + `sqlite::test_store_with_dedup_intelligent_merge_e2e_records_provenance` are now part of `#[serial_test::serial(global_state)]` and use RAII `EnvGuard` — env state is restored even when assertions panic.
-- **LOW**: `redact_jwt_payload` allowlist tightened — `sub` and `chatgpt_account_id` (including the nested `auth.chatgpt_account_id`) are no longer emitted. A presence-only `has_chatgpt_login: bool` replaces the account id. New `hashed_account_fingerprint()` helper ready if a future diagnostic genuinely needs a tenant identifier.
-- **LOW**: route-matrix case renamed to `jwt_without_responses_scope_on_openai_responses_errs` to match its actual fixture (was mis-named "chatgpt_login_without_scope_…").
-- **LOW**: GET + read-scope matrix coverage added (`responses_api_read_scope_get_passes`, `responses_missing_read_scope_on_get_errs`).
-- **LOW**: content-field LIKE fallback in `fts.rs` now gated: skipped when the store has more than 50 000 memories AND the query has fewer than 4 characters. Keeps latency bounded on large rein installations without giving up the "catch verbatim matches FTS missed" safety net on typical deployments.
-
-### What's new in v0.18.1 (2026-04-17)
-
-- **CI is green again** — all 17 pre-existing clippy warnings addressed (`cargo clippy -D warnings` now passes). 0 errors.
-- **Doctor parallel-test flake reduced** — rate dropped from ~33% to ~20% via `tokio::sync::Mutex` + `serial_test`.
-- **Test depth +13** — 7 new WebSocket boundary cases + 6 new route-matrix cross-product rows.
-- **`jwt.rs` extracted** — first step of the `proxy/mod.rs` split (140 lines out; ws_mirror deferred to a future release).
-- **H1 content-field LIKE fallback** — recall now surfaces verbatim-matched memories the FTS tokenizer missed.
-- **`redact_jwt_payload` integrated** into `responses_scope_error` diagnostic log — ops can see the scope mismatch context without leaking identifying claims.
-
-### What's new in v0.18.0 (2026-04-17)
-
-- **Codex subscription loopback proxy (Phase C/D)** — first-party WebSocket mirror with `permessage-deflate` decoding, `ArtifactMirrorOnly` recording gate, ChatGPT backend helper routes (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`). `codexsubp` (recommended) and `codexsubpws` (experimental WS-first) entrypoints via `rein init --proxy`. `chatgpt_base_url` set to `http://127.0.0.1:PORT/backend-api` (v0.20.1 fix: `/codex` suffix removed — Codex hard-codes `/codex/` in analytics and uses string-contains for `wham/apps`, so a trailing `/codex` caused double-prefix 404s and `codex_apps` MCP initialize failure).
-- **Security hardening** — 28 audit fixes, 29 regression tests: WS deflate-bomb cap, JWT `exp` validation, `/api/artifacts` `require_read_token` auth, prompt-injection defense in query expansion, strict rerank validation, KM degenerate-curve early-return, HDBSCAN single-point guard, deterministic tiering, adaptive cache TTL.
-- **New config**: `config.search.strong_signal_{ratio,single}`, `config.adaptive.cache_ttl_secs` — all with defaults, no action required on upgrade.
-- See [release notes](https://github.com/lyr1cs/rein/releases/tag/v0.18.0) for the full changelog.
-
 ### Features
 
 | Feature | Description |
@@ -820,51 +792,57 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 
 ### Architecture
 
-```
-                      User / AI Agent
-                            |
-                   +--------+--------+
-                   |                 |
-               CLI (20 cmds)  MCP Server (28 tools)
-                   |                 |
-                   +--------+--------+
-                            |
-                     +------+------+
-                     |             |
-                  Recall        Hooks
-                  Pipeline    (extract + stop)
-                     |
-              +------+------+
-              |             |
-          FTS Search    Vec Search
-              |             |
-              |        +----+----+
-              |        |         |
-           Tantivy  Cache hit  Embed API
-           (BM25)   (HNSW)    (Google/OMLX)
-          fallback:  fallback:     |
-            FTS5    sqlite-vec    HNSW
-              |        |          |
-              +---+----+----+-----+
-                  |
-             RRF/CC Fusion (weighted)
-                  |
-           Ebbinghaus Scoring
-                  |
-           Cross-Validation
-        (local + supermemory + auto-memory)
-                  |
-              Results
+```mermaid
+flowchart TD
+    U[User / AI Agent]
+    CLI[CLI\n20+ commands]
+    MCP[MCP Server\n28 tools · stdio / HTTP / SSE]
+    GUI[Neural Wiki GUI\nReact + Tailwind]
+    PXY[Proxy\nClaude · Codex subscription · record-only]
 
-Storage (source of truth):
-  SQLite memories.db
-    ├── memories table (CRUD)
-    ├── FTS5 (built-in text index)
-    └── sqlite-vec (vector fallback)
-Side Indexes (derived, auto-rebuilt):
-    ├── memories.tantivy/ (BM25 FTS)
-    └── memories.usearch (HNSW ANN)
+    U --> CLI
+    U --> MCP
+    U --> GUI
+    U --> PXY
+
+    CORE[rein core]
+    CLI --> CORE
+    MCP --> CORE
+    GUI -->|REST 21 endpoints| CORE
+    PXY -.->|async queue| CORE
+
+    REC[Recall Pipeline\n3-channel + RRF/CC + rerank + canonical-first]
+    ST[Store · Dedup · Evolve\nauto-link · provenance-preserving merge]
+    HK[Hooks\npost · compact · stop]
+    ADP[Adaptive Engine\nM1-M6 + A1]
+    KG[Knowledge Graph\nmemoir · concept · episode · temporal links]
+
+    CORE --> REC
+    CORE --> ST
+    CORE --> HK
+    CORE --> ADP
+    CORE --> KG
+
+    DB[(SQLite memories.db\nmemories · FTS5 · sqlite-vec)]
+    TN[[Tantivy BM25 side index]]
+    US[[usearch HNSW side index]]
+
+    REC --> DB
+    ST --> DB
+    HK --> ST
+    ADP --> DB
+    KG --> DB
+
+    ST -.fire-and-forget.-> TN
+    ST -.fire-and-forget.-> US
+    REC -.reads.-> TN
+    REC -.reads.-> US
+
+    style DB fill:#6af,color:#000
+    style CORE fill:#f96,color:#000
 ```
+
+**Storage is the single source of truth** (`memories.db`): SQLite with FTS5 + sqlite-vec. Tantivy and usearch side indexes are derived, auto-rebuilt, and queried by the recall pipeline — storage writes update them fire-and-forget so hot-path latency stays unaffected.
 
 #### Search Pipeline
 
@@ -1618,51 +1596,57 @@ flowchart TD
 
 ### 架构
 
-```
-                      用户 / AI 智能体
-                            |
-                   +--------+--------+
-                   |                 |
-              CLI (20 命令)   MCP 服务 (28 工具)
-                   |                 |
-                   +--------+--------+
-                            |
-                     +------+------+
-                     |             |
-                   召回          Hooks
-                   管线      (提取 + 会话保存)
-                     |
-              +------+------+
-              |             |
-           全文搜索      向量搜索
-              |             |
-              |        +----+----+
-              |        |         |
-           Tantivy   缓存命中  Embed API
-           (BM25)    (HNSW)   (Google/OMLX)
-          回退:      回退:        |
-            FTS5   sqlite-vec   HNSW
-              |        |         |
-              +---+----+----+----+
-                  |
-             RRF 融合（加权）
-                  |
-             艾宾浩斯评分
-                  |
-             交叉验证
-        (本地 + Supermemory + auto-memory)
-                  |
-               结果
+```mermaid
+flowchart TD
+    U[用户 / AI 智能体]
+    CLI[CLI\n20+ 命令]
+    MCP[MCP 服务\n28 工具 · stdio / HTTP / SSE]
+    GUI[Neural Wiki GUI\nReact + Tailwind]
+    PXY[代理\nClaude · Codex 订阅 · record-only]
 
-存储（唯一真实来源）:
-  SQLite memories.db
-    ├── memories 表（CRUD）
-    ├── FTS5（内置全文索引）
-    └── sqlite-vec（向量回退）
-旁路索引（派生，可自动重建）:
-    ├── memories.tantivy/（BM25 全文搜索）
-    └── memories.usearch（HNSW 近似最近邻）
+    U --> CLI
+    U --> MCP
+    U --> GUI
+    U --> PXY
+
+    CORE[rein core]
+    CLI --> CORE
+    MCP --> CORE
+    GUI -->|REST 21 端点| CORE
+    PXY -.->|异步队列| CORE
+
+    REC[召回管线\n三通道 + RRF/CC + 重排 + canonical 优先]
+    ST[存储 · 去重 · 演进\n自动关联 · 保留溯源合并]
+    HK[Hooks\npost · compact · stop]
+    ADP[自适应引擎\nM1-M6 + A1]
+    KG[知识图谱\nmemoir · concept · episode · 时序链接]
+
+    CORE --> REC
+    CORE --> ST
+    CORE --> HK
+    CORE --> ADP
+    CORE --> KG
+
+    DB[(SQLite memories.db\nmemories · FTS5 · sqlite-vec)]
+    TN[[Tantivy BM25 旁路索引]]
+    US[[usearch HNSW 旁路索引]]
+
+    REC --> DB
+    ST --> DB
+    HK --> ST
+    ADP --> DB
+    KG --> DB
+
+    ST -.fire-and-forget.-> TN
+    ST -.fire-and-forget.-> US
+    REC -.reads.-> TN
+    REC -.reads.-> US
+
+    style DB fill:#6af,color:#000
+    style CORE fill:#f96,color:#000
 ```
+
+**存储是唯一真实来源**（`memories.db`）：SQLite + FTS5 + sqlite-vec。Tantivy 和 usearch 是派生的旁路索引，由召回管线查询，存储写入 fire-and-forget 更新它们，不阻塞热路径。
 
 #### 搜索管线
 
