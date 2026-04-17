@@ -14,10 +14,14 @@ pub struct OmlxEmbedder {
 
 impl OmlxEmbedder {
     pub fn new(endpoint: String, model: String, dimensions: usize) -> Self {
+        // Builder failure returning `Client::default()` silently drops the
+        // 10-second timeout — a hung OMLX endpoint would then stall recall.
+        // `.expect` is correct: builder() only fails on a broken TLS backend
+        // and that's a boot-time problem we want surfaced, not swallowed.
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap_or_default();
+            .expect("reqwest client build failed for omlx (likely TLS backend)");
         Self {
             client,
             endpoint,
