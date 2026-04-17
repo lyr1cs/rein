@@ -4,14 +4,31 @@ use rusqlite::Connection;
 use super::sqlite::{memory_select_base, row_to_memory, MEMORY_SELECT_COLUMNS};
 
 /// Sanitize user input for FTS5 queries by quoting each token.
+///
 /// NOTE: FTS5 uses the unicode61 tokenizer which does NOT segment CJK text.
 /// CJK content is stored as-is, so we pass raw whitespace-split tokens here.
 /// Jieba-based tokenization is only used in the Tantivy search path.
+///
+/// Also strips fullwidth / Unicode smart-quote variants — a straight `"` is
+/// already filtered, but `"`, `"`, `'`, `'`, `」`, `「` etc. would otherwise
+/// slip into the phrase literal and produce malformed FTS5 MATCH syntax.
 pub fn sanitize_fts_query(query: &str) -> String {
+    const FTS_RESERVED: &str = "-*:()\"^";
+    const UNICODE_QUOTES: &[char] = &[
+        '\u{201C}', '\u{201D}', // “ ”
+        '\u{2018}', '\u{2019}', // ‘ ’
+        '\u{FF02}', '\u{FF07}', // ＂ ＇
+        '\u{300C}', '\u{300D}', // 「 」
+        '\u{300E}', '\u{300F}', // 『 』
+        '\u{FF08}', '\u{FF09}', // （ ）
+    ];
     query
         .split_whitespace()
         .map(|t| {
-            let clean: String = t.chars().filter(|c| !"-*:()\"^".contains(*c)).collect();
+            let clean: String = t
+                .chars()
+                .filter(|c| !FTS_RESERVED.contains(*c) && !UNICODE_QUOTES.contains(c))
+                .collect();
             format!("\"{}\"", clean)
         })
         .filter(|t| t != "\"\"")

@@ -8,11 +8,16 @@ pub struct SupermemoryClient {
 
 impl SupermemoryClient {
     pub fn new(api_key: String, endpoint: String) -> Self {
+        // Builder failure returning `Client::default()` silently drops the
+        // 5-second timeout — a hung Supermemory endpoint would then stall
+        // recall indefinitely. `.expect` is the right shape: builder() only
+        // fails on a broken TLS backend, which is a boot-time problem.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client build failed for supermemory (likely TLS backend)");
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
+            client,
             api_key,
             endpoint,
         }
