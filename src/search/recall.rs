@@ -394,7 +394,15 @@ pub fn recall_temporal_with_request_id(
             if cancel_expand_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 return vec![];
             }
-            crate::search::expand::expand_query(&expand_config, &expand_query_str, adaptive_max)
+            // Checks the cancel flag at pre-LLM and post-LLM boundaries so the
+            // strong-signal bypass can short-circuit the expansion thread even
+            // if it started between `spawn` and that bypass decision.
+            crate::search::expand::expand_query_cancellable(
+                &expand_config,
+                &expand_query_str,
+                adaptive_max,
+                Some(&cancel_expand_clone),
+            )
         }))
     } else {
         None
@@ -628,11 +636,24 @@ pub fn recall_temporal_with_request_id(
             .and_then(|h| h.join().ok())
             .unwrap_or_default()
     };
-    // Filter out expanded queries too similar to original (Jaccard word overlap > 0.8)
-    let deduped_queries: Vec<&String> = expanded_queries
-        .iter()
-        .filter(|eq| word_jaccard(query, eq) <= 0.8)
-        .collect();
+    // Filter out expanded queries too similar to original OR to each other
+    // (Jaccard word overlap > 0.8). Previously the filter was only vs. the
+    // original, so two identical LLM variants would both survive and each
+    // trigger a fresh embedding batch — B5 #21.
+    let deduped_queries: Vec<&String> = {
+        let mut kept: Vec<&String> = Vec::new();
+        for eq in &expanded_queries {
+            if word_jaccard(query, eq) > 0.8 {
+                continue;
+            }
+            let too_similar_to_sibling =
+                kept.iter().any(|prev| word_jaccard(prev, eq) > 0.8);
+            if !too_similar_to_sibling {
+                kept.push(eq);
+            }
+        }
+        kept
+    };
     if deduped_queries.len() < expanded_queries.len() {
         tracing::debug!(
             before = expanded_queries.len(),
