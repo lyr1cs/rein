@@ -35,7 +35,7 @@ Patch release on top of v0.18.1 addressing the final batch of Codex-review findi
 
 ### What's new in v0.18.0 (2026-04-17)
 
-- **Codex subscription loopback proxy (Phase C/D)** — first-party WebSocket mirror with `permessage-deflate` decoding, `ArtifactMirrorOnly` recording gate, ChatGPT backend helper routes (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`). `codexsubp` (recommended) and `codexsubpws` (experimental WS-first) entrypoints via `rein init --proxy`. `chatgpt_base_url` now pinned to `.../backend-api/codex` for Codex CLI `PathStyle` compatibility.
+- **Codex subscription loopback proxy (Phase C/D)** — first-party WebSocket mirror with `permessage-deflate` decoding, `ArtifactMirrorOnly` recording gate, ChatGPT backend helper routes (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`). `codexsubp` (recommended) and `codexsubpws` (experimental WS-first) entrypoints via `rein init --proxy`. `chatgpt_base_url` set to `http://127.0.0.1:PORT/backend-api` (v0.20.1 fix: `/codex` suffix removed — Codex hard-codes `/codex/` in analytics and uses string-contains for `wham/apps`, so a trailing `/codex` caused double-prefix 404s and `codex_apps` MCP initialize failure).
 - **Security hardening** — 28 audit fixes, 29 regression tests: WS deflate-bomb cap, JWT `exp` validation, `/api/artifacts` `require_read_token` auth, prompt-injection defense in query expansion, strict rerank validation, KM degenerate-curve early-return, HDBSCAN single-point guard, deterministic tiering, adaptive cache TTL.
 - **New config**: `config.search.strong_signal_{ratio,single}`, `config.adaptive.cache_ttl_secs` — all with defaults, no action required on upgrade.
 - See [release notes](https://github.com/lyr1cs/rein/releases/tag/v0.18.0) for the full changelog.
@@ -666,8 +666,8 @@ Add to `~/.zshrc` or `~/.bashrc` for convenience:
 alias rein-proxy="rein serve --proxy &"
 claudep() { REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${REIN_PROXY_TOKEN:-}" claude "$@"; }
 codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"' "$@"; }
-codexsubp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy={ name = "Rein Subscription Proxy", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex"' "$@"; }
-codexsubpws() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy_ws={ name = "Rein Subscription Proxy WS", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = true }' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex"' "$@"; }
+codexsubp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy={ name = "Rein Subscription Proxy", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api"' "$@"; }
+codexsubpws() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy_ws={ name = "Rein Subscription Proxy WS", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = true }' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api"' "$@"; }
 ```
 
 Then: `rein-proxy` to start, `claudep`, `codexp`, `codexsubp`, or `codexsubpws` to use. For ChatGPT-login Codex, `codexsubp` remains the recommended loopback entrypoint; smoke it with `./scripts/smoke_codexsubp.sh`. For the websocket-enabled path, use `codexsubpws` or `./scripts/smoke_codexsubp_ws.sh`.
@@ -726,7 +726,7 @@ bind = "127.0.0.1"
 anthropic_upstream = "https://api.anthropic.com"
 openai_upstream = "https://api.openai.com"
 chatgpt_upstream = "https://chatgpt.com/backend-api"
-codex_upstream = "https://chatgpt.com/backend-api/codex"
+codex_upstream = "https://chatgpt.com/backend-api"
 extract_enabled = true    # record memories from responses
 store_min_chars = 220     # skip short responses
 store_min_score = 3       # quality threshold for extraction
@@ -1430,8 +1430,8 @@ codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://1
 alias rein-proxy="rein serve --proxy &"
 claudep() { REIN_PROXY_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8690 ANTHROPIC_CUSTOM_HEADERS="x-rein-token: ${REIN_PROXY_TOKEN:-}" claude "$@"; }
 codexp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={ name = "Rein Proxy", base_url = "http://127.0.0.1:8690/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }' -c 'model_provider="rein_proxy"' "$@"; }
-codexsubp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy={ name = "Rein Subscription Proxy", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex"' "$@"; }
-codexsubpws() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy_ws={ name = "Rein Subscription Proxy WS", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = true }' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex"' "$@"; }
+codexsubp() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy={ name = "Rein Subscription Proxy", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = false }' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api"' "$@"; }
+codexsubpws() { REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_sub_proxy_ws={ name = "Rein Subscription Proxy WS", base_url = "http://127.0.0.1:8690", requires_openai_auth = true, wire_api = "responses", supports_websockets = true }' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="http://127.0.0.1:8690/backend-api"' "$@"; }
 ```
 
 然后：`rein-proxy` 启动代理，`claudep`、`codexp`、`codexsubp` 或 `codexsubpws` 使用。对于 ChatGPT 登录的 Codex，`codexsubp` 仍然是推荐的 loopback 入口；回归 smoke 可以直接跑 `./scripts/smoke_codexsubp.sh`。如果要验证 websocket-first 路径，可以跑实验性的 `./scripts/smoke_codexsubp_ws.sh`。
