@@ -428,7 +428,7 @@ pub fn handle_export(
         all_memories.extend(store.get_by_topic(t)?);
     }
     all_memories = store.collapse_to_canonicals(all_memories, usize::MAX)?;
-    all_memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    all_memories.sort_by_key(|m| std::cmp::Reverse(m.created_at));
 
     let content = match format.as_str() {
         "json" => serde_json::to_string_pretty(&all_memories)?,

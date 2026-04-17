@@ -421,7 +421,7 @@ pub fn queue_cleanup_job(
     with_advisory_lock(&cleanup_lock_path(config), true, || {
         for queued in read_cleanup_jobs(&path)
             .into_iter()
-            .chain(read_cleanup_jobs(&inflight).into_iter())
+            .chain(read_cleanup_jobs(&inflight))
         {
             if cleanup_job_fingerprint(&queued) == fingerprint {
                 return Ok(queued.id);
@@ -481,7 +481,7 @@ pub fn queue_dedup_job(
     with_advisory_lock(&dedup_lock_path(config), true, || {
         for queued in read_dedup_jobs(&path)
             .into_iter()
-            .chain(read_dedup_jobs(&inflight).into_iter())
+            .chain(read_dedup_jobs(&inflight))
         {
             if dedup_job_fingerprint(&queued) == fingerprint {
                 return Ok(queued.id);
@@ -539,7 +539,7 @@ pub fn queue_merge_refinement_job(config: &ReinConfig, winner_id: String) {
         // Deduplicate: skip if a job for this winner_id is already pending or in-flight.
         for queued in read_merge_refinement_jobs(&path)
             .into_iter()
-            .chain(read_merge_refinement_jobs(&inflight).into_iter())
+            .chain(read_merge_refinement_jobs(&inflight))
         {
             if queued.winner_id == fingerprint {
                 return Ok(queued.id);
