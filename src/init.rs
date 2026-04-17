@@ -223,10 +223,24 @@ fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
                 r#"codexp() {{ REIN_PROXY_ACTIVE=1 codex -c 'model_providers.rein_proxy={{ name = "Rein Proxy", base_url = "http://{host}:{port}/v1", env_key = "OPENAI_API_KEY", wire_api = "responses", supports_websockets = false, env_http_headers = {{ "x-rein-token" = "REIN_PROXY_TOKEN" }} }}' -c 'model_provider="rein_proxy"' "$@"; }}"#
             ),
         ),
+        // v0.20.1 fix: chatgpt_base_url must be `/backend-api` (NOT
+        // `/backend-api/codex`). Codex hard-codes a `/codex/` prefix in front
+        // of analytics-events (codex-rs/analytics/src/client.rs) and uses a
+        // string-contains switch for `wham/apps` vs `api/codex/apps` in the
+        // `codex_apps` MCP endpoint (codex-rs/codex-mcp/src/mcp/mod.rs). With
+        // `/backend-api/codex` set as base we would double-prefix to
+        // `/backend-api/codex/codex/analytics-events/events` → upstream 404,
+        // and `/backend-api/codex/wham/apps` → `codex_apps` MCP initialize
+        // failure (HTML error body breaks rmcp streamable-http decode).
+        //
+        // `PathStyle::from_base_url` detects `/backend-api` via a
+        // `contains("/backend-api")` check, so dropping the `/codex` suffix
+        // still keeps PathStyle::ChatGptApi, which is what cloud-tasks
+        // expects. See investigation in docs/backlog/architecture.md #C3.
         (
             "codexsubp".to_string(),
             format!(
-                r#"codexsubp() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="{}/backend-api/codex"' "$@"; }}"#,
+                r#"codexsubp() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="{}/backend-api"' "$@"; }}"#,
                 codexsubp_provider_override(&proxy_url),
                 proxy_url,
             ),
@@ -234,7 +248,7 @@ fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
         (
             "codexsubpws".to_string(),
             format!(
-                r#"codexsubpws() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="{}/backend-api/codex"' "$@"; }}"#,
+                r#"codexsubpws() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="{}/backend-api"' "$@"; }}"#,
                 codexsubpws_provider_override(&proxy_url),
                 proxy_url,
             ),
@@ -475,7 +489,16 @@ mod tests {
         assert!(codexsubp.contains(r#"model_provider="rein_sub_proxy""#));
         assert!(codexsubp.contains(r#"requires_openai_auth = true"#));
         assert!(codexsubp.contains(r#"supports_websockets = false"#));
-        assert!(codexsubp.contains(r#"chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex""#));
+        // v0.20.1: MUST be /backend-api (not /backend-api/codex) — see
+        // template comment in proxy_aliases for the Codex source-level
+        // analysis. Asserting the absence of `/backend-api/codex` here so
+        // any regression (re-introducing the suffix) fails loudly.
+        assert!(codexsubp.contains(r#"chatgpt_base_url="http://127.0.0.1:8690/backend-api""#));
+        assert!(
+            !codexsubp.contains("/backend-api/codex"),
+            "chatgpt_base_url must NOT include /codex suffix (causes double-prefix 404 on \
+             analytics and codex_apps MCP init failure)"
+        );
 
         let codexsubpws = aliases
             .iter()
@@ -485,7 +508,12 @@ mod tests {
         assert!(codexsubpws.contains(r#"model_provider="rein_sub_proxy_ws""#));
         assert!(codexsubpws.contains(r#"requires_openai_auth = true"#));
         assert!(codexsubpws.contains(r#"supports_websockets = true"#));
-        assert!(codexsubpws.contains(r#"chatgpt_base_url="http://127.0.0.1:8690/backend-api/codex""#));
+        assert!(codexsubpws.contains(r#"chatgpt_base_url="http://127.0.0.1:8690/backend-api""#));
+        assert!(
+            !codexsubpws.contains("/backend-api/codex"),
+            "chatgpt_base_url must NOT include /codex suffix (causes double-prefix 404 on \
+             analytics and codex_apps MCP init failure)"
+        );
     }
 
     #[test]
