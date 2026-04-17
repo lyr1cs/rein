@@ -1589,7 +1589,22 @@ provider = "inherit"
             .fixes_applied
             .iter()
             .any(|item| item.contains("memory inflight")));
-        assert!(!report.has_failures());
+        if report.has_failures() {
+            // v0.19 root-fix: dump the actual failing check instead of a bare
+            // `!has_failures()` assertion. This turned an opaque ~20% parallel
+            // flake into an actionable diagnostic.
+            let failures: Vec<String> = report
+                .checks
+                .iter()
+                .filter(|c| matches!(c.status, CheckStatus::Fail))
+                .map(|c| format!("{}: {}", c.name, c.message))
+                .collect();
+            panic!(
+                "doctor test unexpectedly reported {} failures under parallel load: {:#?}",
+                failures.len(),
+                failures
+            );
+        }
         assert_eq!(report.status, ReportStatus::Degraded);
     }
 

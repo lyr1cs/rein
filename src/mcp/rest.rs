@@ -1434,7 +1434,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn artifacts_endpoints_expose_proxy_artifacts_with_transcript() {
+        // Joins the global_state serial group so it can't race tests that mutate
+        // REIN_HTTP_TOKEN (api_artifacts_auth_gate_matrix and friends).  When
+        // REIN_HTTP_TOKEN was set by a racing test, require_read_token would
+        // reject this GET with 401 and the `artifacts` field would be missing,
+        // producing a bare `Option::unwrap()` panic at line 1473.
+        let _guard = env_lock().lock().await;
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("artifacts.db");
         let config = test_config(&db_path);

@@ -73,7 +73,6 @@ pub(super) fn redact_jwt_payload(payload: &Value) -> Value {
 /// correlation in diagnostics, without exposing the raw value. Uses the same
 /// `DefaultHasher` family the rest of the crate uses for reproducibility
 /// (see `store/tiering.rs`), emitted as an 8-hex-char prefix.
-#[allow(dead_code)]
 pub(super) fn hashed_account_fingerprint(raw: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
