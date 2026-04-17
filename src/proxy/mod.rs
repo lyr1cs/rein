@@ -417,12 +417,40 @@ fn extract_session_id(headers: &hyper::HeaderMap) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn format_artifact_body(bytes: &[u8], truncated: bool) -> String {
-    const MAX_BODY_CHARS: usize = 20_000;
-    let preview: String = String::from_utf8_lossy(bytes)
-        .chars()
-        .take(MAX_BODY_CHARS)
-        .collect();
+fn format_artifact_body(bytes: &[u8], truncated: bool, mode: RecordingMode) -> String {
+    // Cap size depends on capture_mode:
+    // - ArtifactMirrorOnly (analytics / telemetry / helper routes): 20K head is plenty
+    //   — these bodies are usually <5KB anyway.
+    // - StructuredText (`/responses` conversations): 200K, and for oversized bodies
+    //   keep head + tail so the user's last `input` message (at the END of the
+    //   request JSON) and the assistant's response text (at the END of the SSE
+    //   stream) both survive the truncation. v0.20.1 shipped with a flat 20K
+    //   head-only cap, which for Codex `/responses` ate the entire system
+    //   prompt + tool-definitions block and never reached the actual
+    //   conversation content.
+    let cap = match mode {
+        RecordingMode::StructuredText => 200_000,
+        _ => 20_000,
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let char_count = text.chars().count();
+
+    let preview = if char_count <= cap {
+        text.into_owned()
+    } else if matches!(mode, RecordingMode::StructuredText) && char_count > cap {
+        // Oversized structured body → head + tail so both metadata (start)
+        // and user/assistant content (end) are preserved.
+        let head_n = cap / 4;
+        let tail_n = cap - head_n - 40;
+        let chars: Vec<char> = text.chars().collect();
+        let head: String = chars[..head_n].iter().collect();
+        let tail: String = chars[chars.len() - tail_n..].iter().collect();
+        let omitted = char_count - head_n - tail_n;
+        format!("{head}\n\n…[middle {omitted} chars omitted]…\n\n{tail}")
+    } else {
+        text.chars().take(cap).collect()
+    };
+
     let preview = crate::extract::hooks::parsing::redact_secrets(&preview);
     if truncated {
         format!("{preview}\n[truncated]")
@@ -448,9 +476,11 @@ fn maybe_store_first_party_artifact(
     }
 
     let config = config.clone();
+    let recording_mode = artifact.route.recording_mode;
     tokio::task::spawn_blocking(move || {
-        let request_body = format_artifact_body(&artifact.request_body, false);
-        let response_body = format_artifact_body(&response_body, response_truncated);
+        let request_body = format_artifact_body(&artifact.request_body, false, recording_mode);
+        let response_body =
+            format_artifact_body(&response_body, response_truncated, recording_mode);
         let provider_label = match artifact.route.provider {
             ProviderKind::CodexFirstParty => "codex-first-party",
             ProviderKind::ChatGptBackend => "chatgpt-backend",
@@ -3783,6 +3813,45 @@ x-openai-subagent: worker_abc\r\n\
         assert_eq!(mirror.event_messages, vec!["你".to_string()]);
         assert!(mirror.truncated);
         assert_eq!(mirror.event_bytes, "你".len());
+    }
+
+    #[test]
+    fn format_artifact_body_mirror_mode_caps_at_20k_head() {
+        // ArtifactMirrorOnly: keeps flat 20K head cap (analytics bodies fit well under)
+        let big = "a".repeat(50_000);
+        let out =
+            format_artifact_body(big.as_bytes(), false, RecordingMode::ArtifactMirrorOnly);
+        assert_eq!(out.chars().count(), 20_000);
+        assert!(!out.contains("…[middle"));
+    }
+
+    #[test]
+    fn format_artifact_body_structured_mode_keeps_head_and_tail() {
+        // StructuredText with body > 200K: head + tail so user message (end of
+        // request JSON) and assistant response (end of SSE stream) survive
+        // truncation.
+        let big = format!(
+            "{head}{body}TAILMARK_USER_QUERY",
+            head = "H".repeat(50_000),
+            body = "x".repeat(200_000),
+        );
+        let out = format_artifact_body(big.as_bytes(), false, RecordingMode::StructuredText);
+        assert!(out.starts_with('H'), "head preserved");
+        assert!(
+            out.contains("TAILMARK_USER_QUERY"),
+            "tail (where user message lives) preserved"
+        );
+        assert!(out.contains("…[middle"), "omitted middle section marker present");
+    }
+
+    #[test]
+    fn format_artifact_body_structured_mode_fits_small_bodies_verbatim() {
+        // Small /responses bodies (< 200K) go through untouched — no truncation
+        // markers introduced.
+        let small = "小对话内容".to_string();
+        let out = format_artifact_body(small.as_bytes(), false, RecordingMode::StructuredText);
+        assert_eq!(out, "小对话内容");
+        assert!(!out.contains("…[middle"));
     }
 
     #[test]
