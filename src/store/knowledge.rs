@@ -614,8 +614,56 @@ impl SqliteStore {
             }
         }
 
-        // Delete only the specified IDs
+        // Delete only the specified IDs. For each id, scrub it out of related_ids
+        // and episodes.memory_ids BEFORE the DELETE so we don't leave dangling refs.
+        // Concepts.source_memory_ids are handled by the migration pass below (old_id
+        // → replacement_id), so we don't call the full `clean_memory_refs` here.
         for id in memory_ids {
+            let quoted = format!("\"{id}\"");
+            let like = format!("%{quoted}%");
+
+            if let Err(e) = self.conn.execute(
+                "UPDATE memories
+                 SET related_ids = COALESCE(
+                    (SELECT json_group_array(value)
+                     FROM json_each(related_ids)
+                     WHERE value != ?1),
+                    '[]')
+                 WHERE related_ids LIKE ?2 AND id != ?1",
+                rusqlite::params![id, like],
+            ) {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
+                return Err(e.into());
+            }
+
+            let has_episodes: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='episodes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_episodes {
+                if let Err(e) = self.conn.execute(
+                    "UPDATE episodes
+                     SET memory_ids = COALESCE(
+                        (SELECT json_group_array(value)
+                         FROM json_each(memory_ids)
+                         WHERE value != ?1),
+                        '[]')
+                     WHERE memory_ids LIKE ?2",
+                    rusqlite::params![id, like],
+                ) {
+                    let _ = self.conn.execute_batch(
+                        "ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids",
+                    );
+                    return Err(e.into());
+                }
+            }
+
             if let Err(e) = self
                 .conn
                 .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
