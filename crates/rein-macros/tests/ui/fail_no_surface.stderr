@@ -1,0 +1,11 @@
+error: #[op] must declare at least one surface (cli, mcp, or rest)
+  --> tests/ui/fail_no_surface.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "metrics",
+ 9 | |         description = "no surface declared",
+10 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
