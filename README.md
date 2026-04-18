@@ -62,10 +62,10 @@ git clone https://github.com/lyr1cs/rein.git
 cd rein
 
 # Standard build (CLI + MCP server only)
-cargo install --path .
+cargo install --path crates/rein
 
 # Full build with Neural Wiki GUI (recommended)
-cargo install --path . --features gui
+cargo install --path crates/rein --features gui
 ```
 
 Or use the install script:
@@ -742,7 +742,7 @@ rein includes a built-in web GUI for visual exploration of your memory system. T
 
 ```bash
 # Build with GUI support
-cargo install --path . --features gui
+cargo install --path crates/rein --features gui
 
 # Start the server with GUI enabled (implies --sse)
 rein serve --gui
@@ -1001,10 +1001,10 @@ git clone https://github.com/lyr1cs/rein.git
 cd rein
 
 # 标准构建（CLI + MCP 服务）
-cargo install --path .
+cargo install --path crates/rein
 
 # 完整构建（包含 Neural Wiki GUI，推荐）
-cargo install --path . --features gui
+cargo install --path crates/rein --features gui
 ```
 
 或使用安装脚本：
@@ -1482,7 +1482,7 @@ rein 内置 Web 图形界面，用于可视化探索记忆系统。GUI 通过 `r
 
 ```bash
 # 带 GUI 构建
-cargo install --path . --features gui
+cargo install --path crates/rein --features gui
 
 # 启动 GUI 服务（自动启用 SSE）
 rein serve --gui

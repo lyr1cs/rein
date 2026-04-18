@@ -4,11 +4,10 @@ FROM rust:1.94.1-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY AGENTS.md README.md ./
-COPY src/ src/
-COPY config/ config/
-COPY tests/ tests/
+COPY scripts/ scripts/
+COPY crates/ crates/
 
-RUN cargo build --release --locked
+RUN cargo build -p rein --release --locked
 
 # === Runtime stage (must match builder's glibc) ===
 FROM debian:bookworm-slim

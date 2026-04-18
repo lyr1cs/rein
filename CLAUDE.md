@@ -4,10 +4,16 @@
 
 ## Build & Test
 
+This is a 2-crate Cargo workspace (since v0.21 A1):
+- `crates/rein/` — main crate (binary + lib)
+- `crates/rein-macros/` — proc-macro crate (`#[op]`, `#[derive(OpsRender)]`)
+
 ```bash
-cargo build
-cargo test            # 666+ tests, all must pass
-cargo install --path . # Install to ~/.cargo/bin/rein
+cargo build -p rein                  # main crate
+cargo build -p rein --features gui   # with embedded Neural Wiki GUI
+cargo test --workspace               # all crates
+cargo clippy --workspace --all-targets -- -D warnings
+cargo install --path crates/rein     # install to ~/.cargo/bin/rein
 ```
 
 ## Architecture
