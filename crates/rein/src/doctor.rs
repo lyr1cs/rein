@@ -310,7 +310,7 @@ fn fail_with_hint(
 
 fn check_overview_version() -> DoctorCheck {
     let cargo_version = env!("CARGO_PKG_VERSION");
-    match parse_agents_overview_version(include_str!("../AGENTS.md")) {
+    match parse_agents_overview_version(include_str!("../../../AGENTS.md")) {
         Some(version) if version == cargo_version => ok_in(
             DoctorCategory::Architecture,
             "overview_version",
@@ -431,8 +431,8 @@ fn parse_documented_mcp_tool_count_line(line: &str) -> Option<usize> {
 fn documented_mcp_tool_counts() -> Vec<(&'static str, usize)> {
     let mut counts = Vec::new();
     for (name, text) in [
-        ("AGENTS.md", include_str!("../AGENTS.md")),
-        ("README.md", include_str!("../README.md")),
+        ("AGENTS.md", include_str!("../../../AGENTS.md")),
+        ("README.md", include_str!("../../../README.md")),
     ] {
         if let Some(count) = parse_documented_mcp_tool_count(text) {
             counts.push((name, count));
