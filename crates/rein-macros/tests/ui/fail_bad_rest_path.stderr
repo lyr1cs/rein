@@ -1,0 +1,12 @@
+error: rest.path must start with '/api/', got '/wrong/x'
+  --> tests/ui/fail_bad_rest_path.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "memory",
+ 9 | |         description = "rest.path must start with /api/",
+10 | |         rest(method = "GET", path = "/wrong/x"),
+11 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
