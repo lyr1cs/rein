@@ -1,0 +1,13 @@
+error: #[op] kind 'stream' not supported in v0.21 — only 'unary' implemented; see backlog #C2/#C4 for streaming op design
+  --> tests/ui/fail_streaming_kind.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "memory",
+ 9 | |         description = "kind=stream reserved but not implemented in v0.21",
+10 | |         kind = "stream",
+11 | |         rest(method = "GET", path = "/api/x"),
+12 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
