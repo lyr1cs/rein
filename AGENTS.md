@@ -23,12 +23,14 @@ rein v0.20.2 — Multi-source cross-validated memory MCP server for AI agents. R
 
 ## Build & Test
 
+This is a 2-crate Cargo workspace since v0.21 A1: `crates/rein` (main) + `crates/rein-macros` (proc-macro for `#[op]`).
+
 ```bash
-cargo build           # Debug build
-cargo test            # All tests must pass (666+)
-cargo build --release # Optimized binary (~7MB)
-cargo install --path . # Install to ~/.cargo/bin/rein
-docker build -t rein . # Docker image (~165MB)
+cargo build -p rein               # Debug build of main crate
+cargo test --workspace            # All tests across both crates must pass
+cargo build -p rein --release     # Optimized binary (~7MB)
+cargo install --path crates/rein  # Install to ~/.cargo/bin/rein
+docker build -t rein .            # Docker image (~165MB), build context = workspace root
 ```
 
 ## Directory Structure

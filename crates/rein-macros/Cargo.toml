@@ -1,0 +1,16 @@
+[package]
+name = "rein-macros"
+version = "0.21.0-dev"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+
+[dev-dependencies]
+trybuild = "1"
