@@ -47,6 +47,7 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 inventory = { workspace = true }
 rein-macros = { path = "../rein-macros" }
+schemars = "1"
 
 [features]
 default = []
