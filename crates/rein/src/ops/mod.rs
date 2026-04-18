@@ -13,10 +13,21 @@ pub mod dedup;
 pub mod registry;
 pub mod system_health;
 
+// v0.21 A1 unified-ops infrastructure. Handlers populated incrementally.
+pub mod error;
+pub mod handlers;
+pub mod inventory;
+pub mod render;
+pub mod runtime;
+
 pub use adaptive::*;
 pub use consolidation::*;
 pub use dedup::*;
+pub use error::OpsErrorKind;
+pub use inventory::{OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry};
 pub use registry::*;
+pub use render::{IntoCliText, IntoJson, IntoMarkdown};
+pub use runtime::{OpsRuntime, SurfaceKind};
 
 /// Build a Memory struct from user-provided fields.
 /// Used by both `rein store` CLI and `rein_store` MCP tool.
