@@ -11,6 +11,7 @@ pub mod adaptive;
 pub mod consolidation;
 pub mod dedup;
 pub mod registry;
+pub mod system_health;
 
 pub use adaptive::*;
 pub use consolidation::*;
