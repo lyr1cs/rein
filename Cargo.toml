@@ -1,58 +1,20 @@
-[package]
-name = "rein"
-version = "0.20.2"
+[workspace]
+resolver = "2"
+members = [
+    "crates/rein",
+    "crates/rein-macros",
+]
+
+[workspace.package]
 edition = "2021"
-description = "Multi-source cross-validated memory for AI agents"
 license = "MIT"
+authors = ["liyuchen"]
 
-[dependencies]
-rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }
-sqlite-vec = "0.1"
-zerocopy = { version = "0.8", features = ["derive"] }
-rmcp = { version = "1.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "tower"] }
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "stream"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-chrono = { version = "0.4", features = ["serde"] }
-ulid = "1"
-sha2 = "0.10"
-clap = { version = "4", features = ["derive"] }
-directories = "6"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2"
-anyhow = "1"
-regex = "1"
-glob = "0.3"
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
-http-body-util = "0.1"
-bytes = "1"
-tokio-util = { version = "0.7", features = ["full"] }
-usearch = "2.24.0"
-tantivy = "0.22"
-libc = "0.2"
-futures-util = "0.3"
-tokio-stream = "0.1"
-base64 = "0.22"
-flate2 = "1"
-unicode-normalization = "0.1"
-jieba-rs = "0.7.4"
-ring = "0.17"
-native-tls = "0.2"
-tokio-native-tls = "0.3"
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
-rust-embed = { version = "8", features = ["compression"], optional = true }
-
-[features]
-default = []
-gui = ["rust-embed"]
-
-[dev-dependencies]
-tempfile = "3"
-serial_test = "3"
+[workspace.dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+inventory = "0.3"
 
 [profile.release]
 opt-level = 3

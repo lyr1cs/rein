@@ -170,7 +170,7 @@ fn codexsub_provider_override(
     proxy_url: &str,
     supports_websockets: bool,
 ) -> String {
-    include_str!("../scripts/codexsubp_provider.toml.tmpl")
+    include_str!("../../../scripts/codexsubp_provider.toml.tmpl")
         .trim()
         .replace("__PROVIDER_KEY__", provider_key)
         .replace("__PROVIDER_NAME__", provider_name)
@@ -538,14 +538,14 @@ mod tests {
 
     #[test]
     fn smoke_script_uses_shared_codexsubp_template() {
-        let script = include_str!("../scripts/smoke_codexsubp.sh");
+        let script = include_str!("../../../scripts/smoke_codexsubp.sh");
         assert!(script.contains("codexsubp_provider.toml.tmpl"));
         assert!(script.contains("PROVIDER_OVERRIDE"));
     }
 
     #[test]
     fn websocket_smoke_script_uses_shared_codexsubp_template() {
-        let script = include_str!("../scripts/smoke_codexsubp_ws.sh");
+        let script = include_str!("../../../scripts/smoke_codexsubp_ws.sh");
         assert!(script.contains("codexsubp_provider.toml.tmpl"));
         assert!(script.contains("PROVIDER_OVERRIDE"));
         assert!(script.contains("REIN_SUB_PROXY_WS"));
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn readme_documents_codexsubp_contract() {
-        let readme = include_str!("../README.md");
+        let readme = include_str!("../../../README.md");
         assert!(readme.contains("scripts/codexsubp_provider.toml.tmpl"));
         assert!(readme.contains("requires_openai_auth = true"));
         assert!(readme.contains("supports_websockets = false"));
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn support_matrix_doc_mentions_current_proxy_contract() {
         let doc =
-            include_str!("../../../docs/reference/codex-subscription-proxy-support-matrix.md");
+            include_str!("../../../../../docs/reference/codex-subscription-proxy-support-matrix.md");
         assert!(doc.contains("ArtifactMirrorOnly"));
         assert!(doc.contains("responses_scope_support_matrix"));
         assert!(doc.contains("route_resolution_support_matrix"));
