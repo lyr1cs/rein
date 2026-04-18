@@ -587,7 +587,18 @@ fn api_health(
                     })
                 })
                 .collect();
-            json_response(StatusCode::OK, json!({ "health": items }))
+            let system = crate::ops::system_health::collect(&store, config);
+            let mut body = json!({ "health": items });
+            if let Some(map) = body.as_object_mut() {
+                if let Ok(sys) = serde_json::to_value(&system) {
+                    if let Some(sys_map) = sys.as_object() {
+                        for (k, v) in sys_map {
+                            map.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            json_response(StatusCode::OK, body)
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
