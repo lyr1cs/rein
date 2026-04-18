@@ -1,0 +1,12 @@
+error: #[op] category 'frobnicate' not in allowlist; allowed: ["server", "memory", "ingest", "diagnostics", "knowledge", "maintenance", "integration", "index", "adaptive", "worker", "hooks", "service", "session", "metrics", "health", "artifacts", "timeline"]
+  --> tests/ui/fail_unknown_category.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "frobnicate",
+ 9 | |         description = "category must be in allowlist",
+10 | |         rest(method = "GET", path = "/api/x"),
+11 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
