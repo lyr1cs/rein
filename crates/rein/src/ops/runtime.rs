@@ -5,7 +5,7 @@
 //! store handles via `with_store`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
@@ -29,6 +29,7 @@ pub struct OpsRuntime {
     // and calls `std::process::exit` so CI shell scripts still see 1 on failure.
     // MCP/REST surfaces ignore the field.
     pub(crate) exit_code: AtomicI32,
+    pub(crate) dry_run: AtomicBool,
 }
 
 impl OpsRuntime {
@@ -38,6 +39,7 @@ impl OpsRuntime {
             non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Cli,
             exit_code: AtomicI32::new(0),
+            dry_run: AtomicBool::new(false),
         }
     }
 
@@ -47,6 +49,7 @@ impl OpsRuntime {
             non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Mcp,
             exit_code: AtomicI32::new(0),
+            dry_run: AtomicBool::new(false),
         }
     }
 
@@ -56,6 +59,7 @@ impl OpsRuntime {
             non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Rest,
             exit_code: AtomicI32::new(0),
+            dry_run: AtomicBool::new(false),
         }
     }
 
@@ -87,8 +91,11 @@ impl OpsRuntime {
     }
 
     pub fn dry_run(&self) -> bool {
-        // v0.21: dry_run is handled per-op for now; runtime-level plumbing deferred.
-        false
+        self.dry_run.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dry_run(&self, value: bool) {
+        self.dry_run.store(value, Ordering::Relaxed);
     }
 
     pub fn with_store<F, R>(&self, f: F) -> ReinResult<R>
