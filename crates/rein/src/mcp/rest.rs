@@ -1408,17 +1408,29 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(rein_http_token_env)]
     fn enforce_auth_read_token_is_permissive_when_env_unset() {
         // Dev-mode behavior: unset REIN_HTTP_TOKEN → read_token is effectively
-        // public. Guard the env manipulation so parallel tests don't trample.
-        let _guard = std::env::var("REIN_HTTP_TOKEN");
-        // SAFETY: test-only temporary manipulation; other tests that care
-        // about this env are gated via `serial_test` upstream.
+        // public. The #[serial] attribute serializes against other tests that
+        // touch the same env var (Codex 2026-04-19 audit flagged this as a
+        // flake risk without explicit serialization).
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        // SAFETY: test-only temporary manipulation, serialized via
+        // #[serial(rein_http_token_env)] — no parallel test can observe.
         unsafe {
             std::env::remove_var("REIN_HTTP_TOKEN");
         }
+
         let req: Request<String> = req_with(None);
         let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::ReadToken);
+
+        // Restore before asserting so a failing assert still leaves env clean.
+        if let Some(v) = original {
+            unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            }
+        }
+
         assert!(
             result.is_ok(),
             "read_token must be permissive when REIN_HTTP_TOKEN is unset"
