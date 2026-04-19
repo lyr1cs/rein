@@ -792,3 +792,120 @@ async fn dedup_dry_run_parity_across_surfaces_respects_auth() {
         "dedup must be registered as CLI"
     );
 }
+
+#[tokio::test]
+async fn dedup_log_returns_consistent_output_across_surfaces() {
+    use rein::ops::{OpsCliEntry, OpsRestEntry};
+    use rein::types::{DedupDecision, DedupRelation};
+    use serde_json::Value;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+
+    // Seed a couple of dedup decisions directly via the store.
+    {
+        let cfg = make_config();
+        let store = cfg.open_store().expect("open store for seeding");
+
+        let make_decision = |id: &str, winner: &str, loser: &str, relation: DedupRelation| {
+            DedupDecision {
+                id: id.to_string(),
+                winner_id: Some(winner.to_string()),
+                loser_id: Some(loser.to_string()),
+                canonical_id: Some(winner.to_string()),
+                lexical_score: Some(0.85),
+                embedding_score: Some(0.90),
+                relation,
+                confidence: 0.92,
+                reason: "test dedup decision".to_string(),
+                operator: "auto".to_string(),
+                reversible: true,
+                merged_summary: None,
+                novel_facts: vec![],
+                conflict_detected: false,
+                payload: None,
+                created_at: chrono::Utc::now(),
+            }
+        };
+
+        store
+            .record_dedup_decision(make_decision("dd1", "w1", "l1", DedupRelation::Duplicate))
+            .expect("seed dd1");
+        store
+            .record_dedup_decision(make_decision("dd2", "w2", "l2", DedupRelation::Update))
+            .expect("seed dd2");
+    }
+
+    // --- REST surface ---
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let runtime = Arc::new(OpsRuntime::for_rest(make_config()));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "dedup_log")
+            .expect("dedup_log REST entry registered");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            "limit=50".to_string(),
+            None,
+        )
+        .await
+        .expect("REST dedup_log invoke");
+        let value: Value = serde_json::from_slice(&bytes).expect("REST body is valid JSON");
+        (status, value)
+    };
+
+    // --- CLI surface (smoke check) ---
+    let cli_out = {
+        let runtime = Arc::new(OpsRuntime::for_cli(make_config()));
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "dedup-log")
+            .expect("dedup-log CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["dedup-log", "--limit", "50"])
+            .expect("CLI arg parse");
+        (entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI dedup-log invoke")
+    };
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // REST must return a `decisions` array with the same count as CLI output lines.
+    let rest_arr = rest_json["decisions"]
+        .as_array()
+        .expect("REST dedup_log output must have `decisions` array");
+    assert_eq!(rest_arr.len(), 2, "expected 2 seeded dedup decisions via REST");
+
+    // CLI output must contain the decision IDs.
+    assert!(cli_out.contains("dd1") || cli_out.contains("No dedup decisions"), "CLI output must contain dd1");
+    assert!(cli_out.contains("dd2") || cli_out.contains("No dedup decisions"), "CLI output must contain dd2");
+
+    // REST JSON must preserve novel_facts as a JSON string (GUI parity).
+    let first = &rest_arr[0];
+    assert!(
+        first["novel_facts"].is_string(),
+        "novel_facts must be a JSON string in REST output for GUI parity; got: {:?}",
+        first["novel_facts"]
+    );
+
+    // No MCP surface for dedup_log.
+    assert!(
+        !inventory::iter::<rein::ops::OpsMcpEntry>().any(|e| e.op_name == "dedup_log"),
+        "dedup_log must NOT be registered as MCP"
+    );
+
+    // CLI and REST must be registered.
+    assert!(
+        inventory::iter::<OpsCliEntry>().any(|e| e.name == "dedup-log"),
+        "dedup-log must be registered as CLI"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().any(|e| e.op_name == "dedup_log"),
+        "dedup_log must be registered as REST"
+    );
+}

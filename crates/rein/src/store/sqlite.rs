@@ -385,34 +385,69 @@ impl SqliteStore {
         canonical_id: Option<&str>,
         limit: usize,
     ) -> ReinResult<Vec<DedupDecision>> {
-        let decisions = if let Some(canonical_id) = canonical_id {
-            let mut stmt = self.conn.prepare(
-                "SELECT * FROM dedup_decisions WHERE canonical_id = ?1 ORDER BY created_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![canonical_id, limit as i64], |row| {
-                row_to_dedup_decision(row).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        } else {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT * FROM dedup_decisions ORDER BY created_at DESC LIMIT ?1")?;
-            let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
-                row_to_dedup_decision(row).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
+        self.list_dedup_decisions_filtered(canonical_id, None, limit)
+    }
+
+    /// Like [`list_dedup_decisions`] but supports an additional optional
+    /// `operator` filter (e.g. `"llm_verdict"` or `"auto"`).
+    pub fn list_dedup_decisions_filtered(
+        &self,
+        canonical_id: Option<&str>,
+        operator: Option<&str>,
+        limit: usize,
+    ) -> ReinResult<Vec<DedupDecision>> {
+        let map_err = |e: ReinError| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        };
+        let decisions = match (canonical_id, operator) {
+            (Some(cid), Some(op)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM dedup_decisions \
+                     WHERE canonical_id = ?1 AND operator = ?2 \
+                     ORDER BY created_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![cid, op, limit as i64],
+                    |row| row_to_dedup_decision(row).map_err(map_err),
+                )?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+            (Some(cid), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM dedup_decisions WHERE canonical_id = ?1 \
+                     ORDER BY created_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![cid, limit as i64],
+                    |row| row_to_dedup_decision(row).map_err(map_err),
+                )?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+            (None, Some(op)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM dedup_decisions WHERE operator = ?1 \
+                     ORDER BY created_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![op, limit as i64],
+                    |row| row_to_dedup_decision(row).map_err(map_err),
+                )?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM dedup_decisions ORDER BY created_at DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![limit as i64],
+                    |row| row_to_dedup_decision(row).map_err(map_err),
+                )?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
         };
         Ok(decisions)
     }
