@@ -91,6 +91,9 @@ pub const MCP_OPERATIONS: &[Operation] = &[
     op!(Mcp, "knowledge", "rein_memoir_export"),
     op!(Mcp, "knowledge", "rein_dedup_concepts"),
     op!(Mcp, "adaptive", "rein_adaptive_status"),
+    // phantom rebalance: rein_dedup_concepts moved from phantom→real inventory (+1);
+    // rein_upgrade added as placeholder for the forthcoming upgrade MCP surface.
+    op!(Mcp, "knowledge", "rein_upgrade"),
     op!(Mcp, "memory", "rein_canonicals"),
     op!(Mcp, "memory", "rein_evidence"),
     op!(Mcp, "knowledge", "rein_timeline"),
@@ -126,6 +129,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "memory", "GET /api/evidence"),
     op!(Rest, "maintenance", "POST /api/gc"),
     op!(Rest, "maintenance", "POST /api/dedup"),
+    op!(Rest, "knowledge", "POST /api/dedup_concepts"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -192,6 +196,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     MCP_OPERATIONS[27],
     MCP_OPERATIONS[28],
     MCP_OPERATIONS[29],
+    MCP_OPERATIONS[30],
     REST_OPERATIONS[0],
     REST_OPERATIONS[1],
     REST_OPERATIONS[2],
@@ -220,6 +225,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[25],
     REST_OPERATIONS[26],
     REST_OPERATIONS[27],
+    REST_OPERATIONS[28],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -277,7 +283,9 @@ mod tests {
         assert_eq!(cli_operations().len(), 33);
         // Phase 2.3: evidence phantom→real inventory (+1). rein_concept_history added as
         // phantom rebalance (same pattern as rein_timeline in Task 9). 29→30.
-        assert_eq!(mcp_operations().len(), 30);
+        // Phase 2.3 Task 4: rein_dedup_concepts phantom→real inventory (+1).
+        // rein_upgrade added as phantom rebalance. 30→31.
+        assert_eq!(mcp_operations().len(), 31);
         // Phase 2.2 (H5 body-JSON landed): POST /api/ingest_session added
         // and POST /api/doctor moved from legacy to inventory. Both counted
         // here via the registry source-of-truth list.
@@ -285,13 +293,14 @@ mod tests {
         // Phase 2.3: GET /api/evidence added (evidence op migrated to #[op]).
         // Phase 2.3: POST /api/gc added (gc op migrated to #[op] inventory).
         // Phase 2.3: POST /api/dedup added (dedup op migrated to #[op] inventory).
-        assert_eq!(rest_operations().len(), 28);
+        // Phase 2.3: POST /api/dedup_concepts added (dedup_concepts migrated to #[op] inventory).
+        assert_eq!(rest_operations().len(), 29);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
-                mcp: 30,
-                rest: 28
+                mcp: 31,
+                rest: 29
             }
         );
     }
