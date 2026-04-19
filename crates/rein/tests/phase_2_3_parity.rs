@@ -1764,3 +1764,345 @@ async fn migrated_mcp_op_returns_markdown_in_compact_mode() {
         "compact MCP response must not be empty"
     );
 }
+
+// ── N2 regression tests ──────────────────────────────────────────────────────
+
+/// N2 (MEDIUM): `consolidate` with a scope that matches zero topics must set
+/// `matched: false` in the JSON output and emit the legacy no-match string in
+/// compact-mode MCP (IntoMarkdown).
+///
+/// Before Phase 2.3 migration, `rein_consolidate` returned `Ok(None)` when
+/// `resolve_topic_groups` returned an empty vec — i.e. when a glob pattern
+/// matched no stored topics, or `--all` was used on an empty DB. That mapped
+/// to the no-match sentinel strings. The A1 migration replaced those with a
+/// zero-count structured object which is ambiguous — clients cannot distinguish
+/// "nothing to do" from "nothing matched".
+///
+/// Note: explicit `topic="nonexistent"` does NOT trigger `groups.is_empty()`
+/// because `resolve_topic_groups` always adds an explicitly-named topic to
+/// the group list. The no-match path fires specifically for glob patterns and
+/// all-scope on an empty DB.
+///
+/// Fix (Option A): `matched: bool` field + conditional no-match text in
+/// IntoMarkdown / IntoCliText renderers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consolidate_empty_scope_signals_no_match() {
+    use rein::ops::OpsMcpEntry;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let cfg = std::sync::Arc::new(config);
+
+    // Seed one memory under a topic that does NOT match the test pattern.
+    {
+        use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
+        let store = cfg.open_store().expect("open store for seeding");
+        store
+            .store(Memory {
+                id: "n2_exists_a".to_string(),
+                layer: MemoryLayer::LTM,
+                topic: "exists-n2-consolidate".to_string(),
+                summary: "A real memory that exists for n2 consolidate test".to_string(),
+                content: "A real memory that exists for n2 consolidate test".to_string(),
+                keywords: vec![],
+                importance: Importance::Medium,
+                source: Source::Manual,
+                strength: 1.0,
+                decay_lambda: 0.0,
+                access_count: 0,
+                superseded_by: None,
+                canonical_id: None,
+                support_count: 1,
+                merge_count: 0,
+                dedup_confidence: 1.0,
+                source_diversity: 0.5,
+                contradiction_score: 0.0,
+                related_ids: vec![],
+                concept_ids: vec![],
+                status: MemoryStatus::Active,
+                embedding: None,
+                tier: Default::default(),
+                cluster_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_accessed: chrono::Utc::now(),
+            })
+            .expect("seed n2_exists_a");
+    }
+
+    let entry = inventory::iter::<OpsMcpEntry>()
+        .find(|e| e.op_name == "consolidate")
+        .expect("consolidate must be registered as MCP");
+
+    // --- pattern no-match: non-compact JSON must have matched=false ---
+    // Use a glob pattern that matches no stored topic (DB has "exists-n2-consolidate",
+    // no topic starts with "zzz-no-such-").
+    let runtime_plain = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    let plain_body = (entry.invoke)(
+        runtime_plain,
+        serde_json::json!({ "dry_run": true, "pattern": "zzz-no-such-*" }),
+    )
+    .await
+    .expect("consolidate pattern invoke must not error");
+    let plain_json: serde_json::Value =
+        serde_json::from_str(&plain_body).expect("non-compact output must be valid JSON");
+    assert_eq!(
+        plain_json["matched"].as_bool(),
+        Some(false),
+        "N2: consolidate pattern with zero matches must have matched=false; got: {plain_json}"
+    );
+    assert_eq!(
+        plain_json["consolidated_count"].as_u64(),
+        Some(0),
+        "N2: consolidated_count must be 0 on no-match; got: {plain_json}"
+    );
+
+    // --- compact + pattern no-match: IntoMarkdown must emit legacy string byte-exact ---
+    let runtime_compact = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    runtime_compact.set_compact(true);
+    let compact_body = (entry.invoke)(
+        runtime_compact,
+        serde_json::json!({ "dry_run": true, "pattern": "zzz-no-such-*" }),
+    )
+    .await
+    .expect("consolidate compact invoke must not error");
+    assert_eq!(
+        compact_body,
+        "No topics matched pattern: zzz-no-such-*",
+        "N2: compact consolidate pattern no-match must reproduce legacy byte-exact string"
+    );
+
+    // --- all + empty DB: no-match (use a fresh DB with no memories) ---
+    let tmp2 = tempfile::TempDir::new().expect("tempdir2");
+    let mut config2 = ReinConfig::default();
+    config2.database.path = tmp2.path().join("memories.db").to_string_lossy().into_owned();
+    let cfg2 = std::sync::Arc::new(config2);
+
+    let runtime_all = std::sync::Arc::new(OpsRuntime::for_mcp(cfg2.clone()));
+    let all_body = (entry.invoke)(
+        runtime_all,
+        serde_json::json!({ "dry_run": true, "all": true }),
+    )
+    .await
+    .expect("consolidate all on empty DB must not error");
+    let all_json: serde_json::Value =
+        serde_json::from_str(&all_body).expect("all-on-empty output must be valid JSON");
+    assert_eq!(
+        all_json["matched"].as_bool(),
+        Some(false),
+        "N2: consolidate --all on empty DB must have matched=false; got: {all_json}"
+    );
+
+    // --- compact + all + empty DB ---
+    let runtime_all_compact = std::sync::Arc::new(OpsRuntime::for_mcp(cfg2.clone()));
+    runtime_all_compact.set_compact(true);
+    let all_compact_body = (entry.invoke)(
+        runtime_all_compact,
+        serde_json::json!({ "dry_run": true, "all": true }),
+    )
+    .await
+    .expect("consolidate compact all-on-empty must not error");
+    assert_eq!(
+        all_compact_body,
+        "No topics matched the selected scope.",
+        "N2: compact consolidate all-no-match must reproduce legacy byte-exact string"
+    );
+
+    // --- positive control: existing topic (matched=true) ---
+    // Explicit topic always produces matched=true because resolve_topic_groups
+    // always includes named topics in the group list (even if they have 0 memories).
+    let runtime_match = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    let match_body = (entry.invoke)(
+        runtime_match,
+        serde_json::json!({ "dry_run": true, "topic": "exists-n2-consolidate" }),
+    )
+    .await
+    .expect("consolidate invoke on existing topic must not error");
+    let match_json: serde_json::Value =
+        serde_json::from_str(&match_body).expect("output for existing topic must be valid JSON");
+    assert_eq!(
+        match_json["matched"].as_bool(),
+        Some(true),
+        "N2: consolidate on existing topic must have matched=true; got: {match_json}"
+    );
+
+    // --- positive control: pattern that matches a topic (matched=true) ---
+    let runtime_pattern_match = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    let pattern_match_body = (entry.invoke)(
+        runtime_pattern_match,
+        serde_json::json!({ "dry_run": true, "pattern": "exists-n2-*" }),
+    )
+    .await
+    .expect("consolidate pattern-match invoke must not error");
+    let pattern_match_json: serde_json::Value = serde_json::from_str(&pattern_match_body)
+        .expect("pattern-match output must be valid JSON");
+    assert_eq!(
+        pattern_match_json["matched"].as_bool(),
+        Some(true),
+        "N2: consolidate with matching pattern must have matched=true; got: {pattern_match_json}"
+    );
+}
+
+/// N2 (MEDIUM): `cleanup` with a scope that matches zero topics must set
+/// `matched: false` in the JSON output and emit the legacy no-match string
+/// in compact-mode MCP (IntoMarkdown).
+///
+/// Pre-A1 `rein_cleanup` on a pattern that matched no stored topics returned
+/// the same no-match signals as consolidate. Post-migration the zero-count
+/// structured object was ambiguous. Note: explicit `topic=<name>` never
+/// triggers groups.is_empty() — only pattern and all-on-empty-DB do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_empty_scope_signals_no_match() {
+    use rein::ops::OpsMcpEntry;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let cfg = std::sync::Arc::new(config);
+
+    // Seed one memory under a topic that does NOT match the test pattern.
+    {
+        use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
+        let store = cfg.open_store().expect("open store for seeding");
+        store
+            .store(Memory {
+                id: "n2_cu_exists_a".to_string(),
+                layer: MemoryLayer::LTM,
+                topic: "exists-n2-cleanup".to_string(),
+                summary: "A real memory for cleanup scope test".to_string(),
+                content: "A real memory for cleanup scope test".to_string(),
+                keywords: vec![],
+                importance: Importance::Medium,
+                source: Source::Manual,
+                strength: 1.0,
+                decay_lambda: 0.0,
+                access_count: 0,
+                superseded_by: None,
+                canonical_id: None,
+                support_count: 1,
+                merge_count: 0,
+                dedup_confidence: 1.0,
+                source_diversity: 0.5,
+                contradiction_score: 0.0,
+                related_ids: vec![],
+                concept_ids: vec![],
+                status: MemoryStatus::Active,
+                embedding: None,
+                tier: Default::default(),
+                cluster_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_accessed: chrono::Utc::now(),
+            })
+            .expect("seed n2_cu_exists_a");
+    }
+
+    let entry = inventory::iter::<OpsMcpEntry>()
+        .find(|e| e.op_name == "cleanup")
+        .expect("cleanup must be registered as MCP");
+
+    // --- pattern no-match: non-compact JSON must have matched=false ---
+    let runtime_plain = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    let plain_body = (entry.invoke)(
+        runtime_plain,
+        serde_json::json!({ "dry_run": true, "pattern": "zzz-no-such-cleanup-*" }),
+    )
+    .await
+    .expect("cleanup pattern invoke must not error");
+    let plain_json: serde_json::Value =
+        serde_json::from_str(&plain_body).expect("non-compact output must be valid JSON");
+    assert_eq!(
+        plain_json["matched"].as_bool(),
+        Some(false),
+        "N2: cleanup pattern with zero matches must have matched=false; got: {plain_json}"
+    );
+    assert_eq!(
+        plain_json["groups_consolidated"].as_u64(),
+        Some(0),
+        "N2: groups_consolidated must be 0 on no-match; got: {plain_json}"
+    );
+
+    // --- compact + pattern no-match: IntoMarkdown must emit legacy string byte-exact ---
+    let runtime_compact = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    runtime_compact.set_compact(true);
+    let compact_body = (entry.invoke)(
+        runtime_compact,
+        serde_json::json!({ "dry_run": true, "pattern": "zzz-no-such-cleanup-*" }),
+    )
+    .await
+    .expect("cleanup compact invoke must not error");
+    assert_eq!(
+        compact_body,
+        "No topics matched pattern: zzz-no-such-cleanup-*",
+        "N2: compact cleanup pattern no-match must reproduce legacy byte-exact string"
+    );
+
+    // --- all + empty DB: no-match ---
+    let tmp2 = tempfile::TempDir::new().expect("tempdir2");
+    let mut config2 = ReinConfig::default();
+    config2.database.path = tmp2.path().join("memories.db").to_string_lossy().into_owned();
+    let cfg2 = std::sync::Arc::new(config2);
+
+    let runtime_all = std::sync::Arc::new(OpsRuntime::for_mcp(cfg2.clone()));
+    let all_body = (entry.invoke)(
+        runtime_all,
+        serde_json::json!({ "dry_run": true, "all": true }),
+    )
+    .await
+    .expect("cleanup all on empty DB must not error");
+    let all_json: serde_json::Value =
+        serde_json::from_str(&all_body).expect("all-on-empty output must be valid JSON");
+    assert_eq!(
+        all_json["matched"].as_bool(),
+        Some(false),
+        "N2: cleanup --all on empty DB must have matched=false; got: {all_json}"
+    );
+
+    // --- compact + all + empty DB ---
+    let runtime_all_compact = std::sync::Arc::new(OpsRuntime::for_mcp(cfg2.clone()));
+    runtime_all_compact.set_compact(true);
+    let all_compact_body = (entry.invoke)(
+        runtime_all_compact,
+        serde_json::json!({ "dry_run": true, "all": true }),
+    )
+    .await
+    .expect("cleanup compact all-on-empty must not error");
+    assert_eq!(
+        all_compact_body,
+        "No topics matched the selected scope.",
+        "N2: compact cleanup all-no-match must reproduce legacy byte-exact string"
+    );
+
+    // --- positive control: existing topic (matched=true) ---
+    let runtime_match = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    let match_body = (entry.invoke)(
+        runtime_match,
+        serde_json::json!({ "dry_run": true, "topic": "exists-n2-cleanup" }),
+    )
+    .await
+    .expect("cleanup invoke on existing topic must not error");
+    let match_json: serde_json::Value =
+        serde_json::from_str(&match_body).expect("output for existing topic must be valid JSON");
+    assert_eq!(
+        match_json["matched"].as_bool(),
+        Some(true),
+        "N2: cleanup on existing topic must have matched=true; got: {match_json}"
+    );
+
+    // --- positive control: pattern that matches a topic (matched=true) ---
+    let runtime_pattern_match = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    let pattern_match_body = (entry.invoke)(
+        runtime_pattern_match,
+        serde_json::json!({ "dry_run": true, "pattern": "exists-n2-*" }),
+    )
+    .await
+    .expect("cleanup pattern-match invoke must not error");
+    let pattern_match_json: serde_json::Value = serde_json::from_str(&pattern_match_body)
+        .expect("pattern-match output must be valid JSON");
+    assert_eq!(
+        pattern_match_json["matched"].as_bool(),
+        Some(true),
+        "N2: cleanup with matching pattern must have matched=true; got: {pattern_match_json}"
+    );
+}
