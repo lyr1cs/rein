@@ -20,8 +20,11 @@ const HTTP_SESSION_COOKIE: &str = "rein_http_token";
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Read the full body into a `Bytes` buffer, rejecting anything beyond the
-/// configured cap. The cap is enforced progressively so a malicious client
-/// declaring Content-Length: 100GB doesn't let us allocate before we notice.
+/// configured cap. Cap is enforced **progressively** — chunks are checked
+/// as they arrive so a chunked body that reports `upper = None` (no
+/// advertised upper bound) cannot buffer gigabytes before the cap fires.
+/// The `size_hint().upper()` pre-check still runs for well-behaved bodies
+/// so we short-circuit before reading anything when possible.
 ///
 /// Returns `Err(413-response)` when the cap is exceeded and
 /// `Err(400-response)` on transport errors reading the body.
@@ -37,6 +40,8 @@ where
 
     // Size-hint pre-check: if the body advertises an upper bound above the
     // cap, reject immediately instead of streaming until we blow the limit.
+    // Not authoritative (size_hint is advisory) — the progressive check
+    // below is the real guard.
     let hint = body.size_hint();
     if let Some(upper) = hint.upper() {
         if upper as usize > max {
@@ -47,22 +52,33 @@ where
         }
     }
 
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("body read error: {e}"),
-            ));
+    let mut body = body;
+    let mut buf = bytes::BytesMut::with_capacity(hint.lower().min(max as u64) as usize);
+    loop {
+        let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        let frame = match next {
+            Some(Ok(frame)) => frame,
+            Some(Err(e)) => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("body read error: {e}"),
+                ));
+            }
+            None => break,
+        };
+        // Only data frames contribute to the body size cap. Trailer frames
+        // (if any) are ignored for cap accounting but still consumed.
+        if let Ok(data) = frame.into_data() {
+            if buf.len().saturating_add(data.len()) > max {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!("request body exceeds {max} byte cap"),
+                ));
+            }
+            buf.extend_from_slice(&data);
         }
-    };
-    if collected.len() > max {
-        return Err(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &format!("request body exceeds {max} byte cap"),
-        ));
     }
-    Ok(collected)
+    Ok(buf.freeze())
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> BoxedResponse {
@@ -216,11 +232,34 @@ pub async fn handle_rest_request<B>(
 /// Always returns a response — `/api/*` paths either match a route or
 /// receive a 404. Callers do not need to handle fall-through for this
 /// entry point.
+///
+/// **Auth ordering invariant**: for inventory routes, the declared
+/// `AuthPolicy` is enforced *before* body collection. An unauthenticated
+/// POST must hit 403 without paying the 1 MiB body read — otherwise an
+/// anonymous client can force the server to drain a large body and use
+/// the 403/413 status difference to probe the body cap. The inventory
+/// lookup is header-only and cheap enough that doing it twice (once here
+/// for pre-auth, once inside `try_dispatch_inventory_rest`) is negligible.
 pub async fn handle_api_request<B>(req: Request<B>, config: &ReinConfig) -> BoxedResponse
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
+    // Pre-body auth gate: if this path is served by an inventory op and
+    // declares a non-Public AuthPolicy, enforce the gate now so a rejected
+    // request never triggers body collection. Routes not in inventory
+    // (legacy match arms in handle_api) do their own auth checks inline
+    // after body-less dispatch, so no ordering inversion there.
+    if let Some(entry) = inventory::iter::<crate::ops::OpsRestEntry>()
+        .find(|e| e.method == *req.method() && e.path_template == req.uri().path())
+    {
+        if !matches!(entry.auth_policy, crate::ops::AuthPolicy::Public) {
+            if let Err(resp) = enforce_auth_policy(&req, entry.auth_policy) {
+                return resp;
+            }
+        }
+    }
+
     let is_body_method = matches!(
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE,
@@ -2090,6 +2129,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_api_request_auth_rejects_before_body_cap() {
+        use http_body_util::Full;
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = test_config(&db_path);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/doctor")
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(vec![b'a'; 2 * 1024 * 1024])))
+            .unwrap();
+        let resp = handle_api_request(req, &config).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "auth rejection should happen before the body-size gate on protected POST routes",
+        );
+    }
+
+    #[tokio::test]
     async fn handle_api_request_returns_404_for_unknown_route() {
         use http_body_util::Full;
         let dir = tempdir().unwrap();
@@ -2114,5 +2173,87 @@ mod tests {
         let result = collect_body_capped(big).await;
         let resp = result.expect_err("2 MiB body must exceed 1 MiB cap");
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Streaming body with no advertised upper bound — simulates a chunked
+    /// transfer where the client lies about (or doesn't declare) size.
+    /// `poll_frame` yields one 200 KiB chunk at a time until aborted.
+    struct StreamingBody {
+        remaining_chunks: usize,
+    }
+
+    impl hyper::body::Body for StreamingBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>>
+        {
+            if self.remaining_chunks == 0 {
+                std::task::Poll::Ready(None)
+            } else {
+                self.remaining_chunks -= 1;
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(
+                    vec![b'x'; 200 * 1024],
+                )))))
+            }
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            // Deliberately claim no upper bound — this is the pre-fix
+            // pathological case where collect_body_capped's old
+            // `.collect().await + post-len-check` would buffer everything
+            // before tripping the cap.
+            hyper::body::SizeHint::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_body_capped_progressive_on_streaming_body() {
+        // 6 chunks of 200 KiB = 1200 KiB, above the 1 MiB default cap.
+        // With the progressive frame-loop, cap fires mid-stream; with the
+        // old implementation this test was the missing regression signal.
+        let body = StreamingBody { remaining_chunks: 6 };
+        let result = collect_body_capped(body).await;
+        let resp = result.expect_err("streaming body past cap must 413");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn collect_body_capped_streaming_under_cap() {
+        // 4 chunks of 200 KiB = 800 KiB, well under the 1 MiB cap.
+        // Confirms the progressive loop drains the full stream and returns
+        // the assembled buffer — not just the cap-rejection path.
+        let body = StreamingBody { remaining_chunks: 4 };
+        let result = collect_body_capped(body).await;
+        let bytes = result.expect("streaming body under cap must succeed");
+        assert_eq!(bytes.len(), 4 * 200 * 1024);
+    }
+
+    #[tokio::test]
+    async fn doctor_fix_honors_explicit_fix_false() {
+        // Pre-migration `POST /api/doctor?fix=false&network=1` ran the
+        // diagnostic without applying repairs. Post-migration this lives
+        // in the DoctorFixParams JSON body. Without the Option<bool>-ish
+        // default, every POST would force fix=true and silently repair.
+        // We can't easily assert "didn't repair" at this layer (the
+        // doctor report doesn't tag fixes-applied), but we can confirm
+        // the request goes through (200) with fix explicitly false.
+        use http_body_util::Full;
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = test_config(&db_path);
+        let body = Bytes::from(r#"{"fix":false,"network":false}"#);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/doctor")
+            .header("content-type", "application/json")
+            .header("x-rein-action", "1")
+            .body(Full::new(body))
+            .unwrap();
+        let resp = handle_api_request(req, &config).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
