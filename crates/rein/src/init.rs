@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn support_matrix_doc_mentions_current_proxy_contract() {
         let doc =
-            include_str!("../../../../../docs/reference/codex-subscription-proxy-support-matrix.md");
+            include_str!("../../../docs/reference/codex-subscription-proxy-support-matrix.md");
         assert!(doc.contains("ArtifactMirrorOnly"));
         assert!(doc.contains("responses_scope_support_matrix"));
         assert!(doc.contains("route_resolution_support_matrix"));
