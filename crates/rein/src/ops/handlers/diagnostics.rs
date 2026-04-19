@@ -293,3 +293,109 @@ impl OpsRuntime {
         })
     }
 }
+
+/// Summary of non-secret configuration values surfaced via `rein config`.
+///
+/// Scope is deliberately narrow: paths + provider/model names + numeric
+/// knobs that shape behavior. API keys, tokens, and anything else loaded
+/// from environment variables stay out. The CLI-only surface reinforces
+/// that — if `rein config` is later promoted to REST/MCP, this struct is
+/// already safe to serialize.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConfigSnapshot {
+    pub database_path: String,
+    pub embedding_provider: String,
+    pub embedding_dimensions: usize,
+    pub extract_provider: String,
+    pub extract_model: String,
+    pub compact_mode: bool,
+    pub sse_enabled: bool,
+    pub decay_base_lambda: f64,
+    pub dedup_similarity: f64,
+}
+
+impl IntoJson for ConfigSnapshot {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ConfigSnapshot {
+    fn to_markdown(&self) -> String {
+        format!(
+            "**Configuration**\n\
+             - Database path: {}\n\
+             - Embedding provider: {}\n\
+             - Embedding dimensions: {}\n\
+             - Extract provider: {}\n\
+             - Extract model: {}\n\
+             - Compact mode: {}\n\
+             - SSE enabled: {}\n\
+             - Decay base_lambda: {}\n\
+             - Dedup similarity: {}",
+            self.database_path,
+            self.embedding_provider,
+            self.embedding_dimensions,
+            self.extract_provider,
+            self.extract_model,
+            self.compact_mode,
+            self.sse_enabled,
+            self.decay_base_lambda,
+            self.dedup_similarity,
+        )
+    }
+}
+
+impl IntoCliText for ConfigSnapshot {
+    fn to_cli_text(&self) -> String {
+        // Mirror the pre-A1 `rein config` line-by-line output for terminal
+        // users that may grep it in scripts.
+        format!(
+            "Database path: {}\n\
+             Embedding provider: {}\n\
+             Embedding dimensions: {}\n\
+             Extract provider: {}\n\
+             Extract model: {}\n\
+             Compact mode: {}\n\
+             SSE enabled: {}\n\
+             Decay base_lambda: {}\n\
+             Dedup similarity: {}",
+            self.database_path,
+            self.embedding_provider,
+            self.embedding_dimensions,
+            self.extract_provider,
+            self.extract_model,
+            self.compact_mode,
+            self.sse_enabled,
+            self.decay_base_lambda,
+            self.dedup_similarity,
+        )
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "config",
+        category = "diagnostics",
+        description = "Show non-secret configuration: database path, providers, models, and tunable knobs. CLI-only to avoid accidental exposure over the network.",
+        cli(name = "config"),
+    )]
+    pub fn config_snapshot(&self) -> ReinResult<ConfigSnapshot> {
+        let cfg = self.config.as_ref();
+        let extract_model = match cfg.extract_provider() {
+            crate::config::Provider::Omlx => cfg.extract.omlx.model.clone(),
+            _ => cfg.extract.google.model.clone(),
+        };
+        Ok(ConfigSnapshot {
+            database_path: cfg.resolve_db_path().display().to_string(),
+            embedding_provider: cfg.embedding.provider.clone(),
+            embedding_dimensions: cfg.embedding.dimensions,
+            extract_provider: cfg.extract.provider.clone(),
+            extract_model,
+            compact_mode: cfg.server.compact,
+            sse_enabled: cfg.server.sse_enabled,
+            decay_base_lambda: cfg.decay.base_lambda,
+            dedup_similarity: cfg.search.dedup_similarity,
+        })
+    }
+}

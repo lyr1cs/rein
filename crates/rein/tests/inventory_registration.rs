@@ -153,6 +153,35 @@ async fn stats_rest_invoke_fn_pointer_returns_json() {
 }
 
 #[test]
+fn config_registers_as_cli_only() {
+    let cli: Vec<&OpsCliEntry> = inventory::iter::<OpsCliEntry>()
+        .filter(|e| e.op_name == "config")
+        .collect();
+    assert_eq!(cli.len(), 1);
+    assert_eq!(cli[0].name, "config");
+
+    // Explicit: no MCP / no REST. Non-secret snapshot today, but restricting
+    // to CLI avoids depending on that invariant holding in the future.
+    assert!(
+        inventory::iter::<OpsMcpEntry>().all(|e| e.op_name != "config"),
+        "config should not expose MCP"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().all(|e| e.op_name != "config"),
+        "config should not expose REST"
+    );
+
+    let meta: Vec<&OpsMetadata> = inventory::iter::<OpsMetadata>()
+        .filter(|e| e.name == "config")
+        .collect();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].category, "diagnostics");
+    assert!(meta[0].cli_visible);
+    assert!(!meta[0].mcp_visible);
+    assert!(!meta[0].rest_visible);
+}
+
+#[test]
 fn doctor_registers_on_cli_and_rest_but_not_mcp() {
     let cli: Vec<&OpsCliEntry> = inventory::iter::<OpsCliEntry>()
         .filter(|e| e.op_name == "doctor")
