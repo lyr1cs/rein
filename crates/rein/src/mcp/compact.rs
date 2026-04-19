@@ -1,5 +1,4 @@
 use crate::search::recall::RecallResult;
-use crate::types::{HealthReport, StoreStats};
 
 const MAX_MCP_RECALL_OUTPUT_CHARS: usize = 12_000;
 const MAX_RECALL_SUMMARY_CHARS: usize = 120;
@@ -166,57 +165,11 @@ pub fn format_topics(topics: &[String], compact: bool) -> String {
     }
 }
 
-pub fn format_stats(stats: &StoreStats, compact: bool) -> String {
-    if compact {
-        format!(
-            "total:{} ltm:{} stm:{} topics:{} str:{:.3} memoirs:{} concepts:{} links:{}",
-            stats.total_memories,
-            stats.ltm_count,
-            stats.stm_count,
-            stats.topic_count,
-            stats.avg_strength,
-            stats.memoir_count,
-            stats.concept_count,
-            stats.link_count
-        )
-    } else {
-        format!(
-            "Memory Store Statistics:\n  Total memories: {}\n  LTM: {}\n  STM: {}\n  Topics: {}\n  Avg strength: {:.3}\n  Memoirs: {}\n  Concepts: {}\n  Links: {}",
-            stats.total_memories, stats.ltm_count, stats.stm_count, stats.topic_count,
-            stats.avg_strength, stats.memoir_count, stats.concept_count, stats.link_count
-        )
-    }
-}
-
-pub fn format_health(reports: &[HealthReport], compact: bool) -> String {
-    if compact {
-        reports
-            .iter()
-            .map(|r| {
-                format!(
-                    "{}:cnt={},avg={:.2},stale={},consolidate={}",
-                    r.topic, r.count, r.avg_strength, r.stale_count, r.needs_consolidation
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        if reports.is_empty() {
-            return "No topics to report on.".to_string();
-        }
-        reports
-            .iter()
-            .map(|r| {
-                format!(
-                    "Topic: {}\n  Memories: {}\n  Avg strength: {:.3}\n  Stale: {}\n  Needs consolidation: {}",
-                    r.topic, r.count, r.avg_strength, r.stale_count,
-                    if r.needs_consolidation { "yes" } else { "no" }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-}
+// format_stats + format_health removed in A1 Phase 1.7 cleanup — the only
+// callers (commands::handle_stats, commands::handle_health, rein_stats /
+// rein_health rmcp tool methods) were deleted when stats + health migrated
+// to the #[op] inventory in diagnostics.rs. Output formatting now flows
+// through IntoCliText / IntoMarkdown / IntoJson on StatsOutput / HealthOutput.
 
 #[cfg(test)]
 mod tests {

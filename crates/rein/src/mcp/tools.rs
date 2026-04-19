@@ -168,12 +168,8 @@ pub struct ForgetParams {
     pub id: String,
 }
 
-/// Parameters for rein_health tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct HealthParams {
-    /// Optional topic to check health for.
-    pub topic: Option<String>,
-}
+// HealthParams removed in A1 Phase 1.7 — rein_health migrated to #[op] and
+// now uses ops::handlers::diagnostics::HealthParams (derives clap::Args too).
 
 /// Parameters for rein_consolidate tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
