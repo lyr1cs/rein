@@ -78,5 +78,18 @@ pub fn validate(attr: &OpAttr) -> syn::Result<()> {
         ));
     }
 
+    if !matches!(
+        attr.auth.as_str(),
+        "public" | "mutation_marker" | "read_token"
+    ) {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            format!(
+                "#[op] auth '{}' not supported — must be one of: public, mutation_marker, read_token",
+                attr.auth
+            ),
+        ));
+    }
+
     Ok(())
 }

@@ -161,6 +161,21 @@ pub async fn handle_rest_request<B>(
     }
 }
 
+/// Dispatch the declared `AuthPolicy` to the existing per-kind gate helpers.
+/// Returns `Err(response)` when the request fails the gate; the caller
+/// (inventory REST dispatcher) short-circuits with that response.
+#[allow(clippy::result_large_err)]
+fn enforce_auth_policy<B>(
+    req: &Request<B>,
+    policy: crate::ops::AuthPolicy,
+) -> Result<(), BoxedResponse> {
+    match policy {
+        crate::ops::AuthPolicy::Public => Ok(()),
+        crate::ops::AuthPolicy::MutationMarker => require_mutation_marker(req),
+        crate::ops::AuthPolicy::ReadToken => require_read_token(req),
+    }
+}
+
 #[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body; boxing again would force every caller to dereference.
 fn require_mutation_marker<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
     let marker = req
@@ -232,8 +247,9 @@ async fn handle_api<B>(
     }
 
     // A1: migrated ops get first crack via OpsRestEntry inventory. Falls through
-    // to the legacy match for routes that aren't yet migrated.
-    if let Some(resp) = try_dispatch_inventory_rest(method, path, uri, config).await {
+    // to the legacy match for routes that aren't yet migrated. The `req` ref is
+    // threaded in so the H3 auth gate can inspect headers before dispatch.
+    if let Some(resp) = try_dispatch_inventory_rest(req, method, path, uri, config).await {
         return resp;
     }
 
@@ -543,7 +559,8 @@ fn api_intelligent_merge_metrics() -> BoxedResponse {
     )
 }
 
-async fn try_dispatch_inventory_rest(
+async fn try_dispatch_inventory_rest<B>(
+    req: &Request<B>,
     method: &Method,
     path: &str,
     uri: &hyper::Uri,
@@ -551,6 +568,16 @@ async fn try_dispatch_inventory_rest(
 ) -> Option<BoxedResponse> {
     let entry = inventory::iter::<crate::ops::OpsRestEntry>()
         .find(|e| e.method == *method && e.path_template == path)?;
+
+    // H3 (audit 2026-04-19): enforce the entry's declared AuthPolicy before
+    // invoking the op. Pre-H3 inventory dispatch ran *before* route-local
+    // `require_mutation_marker` / `require_read_token` gates, so migrating a
+    // protected route would silently bypass auth. Declaring the policy as
+    // metadata pushes enforcement here so Phase 2.2 POST/DELETE migrations
+    // are safe.
+    if let Err(resp) = enforce_auth_policy(req, entry.auth_policy) {
+        return Some(resp);
+    }
 
     let query = uri.query().unwrap_or("").to_string();
     let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_rest(std::sync::Arc::new(
@@ -1346,6 +1373,57 @@ mod tests {
     use chrono::Utc;
     use hyper::Request;
     use tempfile::tempdir;
+
+    // ---- H3 auth policy dispatch tests ----
+
+    fn req_with<B: Default>(header: Option<(&str, &str)>) -> Request<B> {
+        let mut builder = Request::builder().uri("/api/x");
+        if let Some((k, v)) = header {
+            builder = builder.header(k, v);
+        }
+        builder.body(B::default()).unwrap()
+    }
+
+    #[test]
+    fn enforce_auth_public_always_passes() {
+        let req: Request<String> = req_with(None);
+        assert!(enforce_auth_policy(&req, crate::ops::AuthPolicy::Public).is_ok());
+    }
+
+    #[test]
+    fn enforce_auth_mutation_marker_rejects_missing_header() {
+        let req: Request<String> = req_with(None);
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::MutationMarker);
+        assert!(
+            result.is_err(),
+            "missing x-rein-action: 1 header must be rejected"
+        );
+    }
+
+    #[test]
+    fn enforce_auth_mutation_marker_accepts_correct_header() {
+        let req: Request<String> = req_with(Some(("x-rein-action", "1")));
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::MutationMarker);
+        assert!(result.is_ok(), "x-rein-action: 1 must pass the gate");
+    }
+
+    #[test]
+    fn enforce_auth_read_token_is_permissive_when_env_unset() {
+        // Dev-mode behavior: unset REIN_HTTP_TOKEN → read_token is effectively
+        // public. Guard the env manipulation so parallel tests don't trample.
+        let _guard = std::env::var("REIN_HTTP_TOKEN");
+        // SAFETY: test-only temporary manipulation; other tests that care
+        // about this env are gated via `serial_test` upstream.
+        unsafe {
+            std::env::remove_var("REIN_HTTP_TOKEN");
+        }
+        let req: Request<String> = req_with(None);
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::ReadToken);
+        assert!(
+            result.is_ok(),
+            "read_token must be permissive when REIN_HTTP_TOKEN is unset"
+        );
+    }
 
     fn test_memory(id: &str, summary: &str, content: &str) -> Memory {
         Memory {
