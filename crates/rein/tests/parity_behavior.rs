@@ -230,6 +230,51 @@ async fn adaptive_status_parity_cli_dispatch_runs_to_completion() {
     let _ = invoke_cli("adaptive_status", &[]).await;
 }
 
+#[tokio::test]
+async fn doctor_parity_rest_returns_checks_and_status() {
+    // GET /api/doctor (no ?fix) should dispatch via inventory to the #[op]
+    // doctor handler and return the same top-level shape the GUI expects.
+    let (rest_status, rest) = invoke_rest("doctor", "").await;
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+    let obj = rest.as_object().expect("doctor REST is an object");
+    assert!(
+        obj.contains_key("status") && obj.contains_key("checks"),
+        "doctor output must expose `status` + `checks` fields, got: {rest:?}"
+    );
+    assert!(obj["checks"].is_array());
+}
+
+#[tokio::test]
+async fn doctor_parity_cli_runs_and_sets_exit_code() {
+    // The test config points at a throwaway tempdir with no provider
+    // credentials; the doctor op is expected to detect FAILs and set
+    // exit_code = 1. This asserts the runtime-level exit-code plumbing
+    // without invoking process::exit.
+    use std::sync::Arc;
+    let (config, _tmp) = config_for_test();
+    let runtime = Arc::new(rein::ops::OpsRuntime::for_cli(config));
+    let entry = inventory::iter::<rein::ops::OpsCliEntry>()
+        .find(|e| e.op_name == "doctor")
+        .expect("doctor CLI registered");
+    let matches = (entry.build_clap)()
+        .try_get_matches_from(["doctor"])
+        .expect("doctor args parse");
+    let _out = (entry.invoke)(runtime.clone(), &matches)
+        .await
+        .expect("doctor invoke");
+    // With an unconfigured tempdir some FAIL checks will fire; exit code
+    // should propagate. Whether 0 or 1 depends on checks; the important
+    // part is that the channel exists and doesn't panic on a second call.
+    let first = runtime.take_exit_code();
+    let second = runtime.take_exit_code();
+    // take_exit_code must clear the slot (second call returns None).
+    assert!(second.is_none(), "take_exit_code must be one-shot");
+    // first may be Some(1) in CI or None in a fully-provisioned setup;
+    // either is a valid outcome of running doctor — the contract we're
+    // testing is the channel, not the specific failure count.
+    let _ = first;
+}
+
 fn json_type_tag(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",

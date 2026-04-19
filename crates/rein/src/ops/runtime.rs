@@ -5,7 +5,7 @@
 //! store handles via `with_store`.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
@@ -24,6 +24,11 @@ pub struct OpsRuntime {
     #[allow(dead_code)]
     pub(crate) non_store_count: AtomicUsize,
     pub(crate) surface: SurfaceKind,
+    // Ops like `doctor` signal a non-zero exit code by calling `set_exit_code`.
+    // The CLI inventory dispatcher reads it via `take_exit_code` after invoke
+    // and calls `std::process::exit` so CI shell scripts still see 1 on failure.
+    // MCP/REST surfaces ignore the field.
+    pub(crate) exit_code: AtomicI32,
 }
 
 impl OpsRuntime {
@@ -32,6 +37,7 @@ impl OpsRuntime {
             config,
             non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Cli,
+            exit_code: AtomicI32::new(0),
         }
     }
 
@@ -40,6 +46,7 @@ impl OpsRuntime {
             config,
             non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Mcp,
+            exit_code: AtomicI32::new(0),
         }
     }
 
@@ -48,7 +55,23 @@ impl OpsRuntime {
             config,
             non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Rest,
+            exit_code: AtomicI32::new(0),
         }
+    }
+
+    /// CLI-only: ops that want the process to exit with a specific code call
+    /// this before returning. `doctor` uses it to preserve the historical
+    /// `rein doctor` exit-1-on-failure contract that CI scripts depend on.
+    /// MCP/REST surfaces also store the value but the adapters ignore it.
+    pub fn set_exit_code(&self, code: i32) {
+        self.exit_code.store(code, Ordering::Relaxed);
+    }
+
+    /// Read and clear the pending exit code. Returns `None` when no op
+    /// requested an exit (the common case).
+    pub fn take_exit_code(&self) -> Option<i32> {
+        let code = self.exit_code.swap(0, Ordering::Relaxed);
+        (code != 0).then_some(code)
     }
 
     pub fn config(&self) -> &ReinConfig {
