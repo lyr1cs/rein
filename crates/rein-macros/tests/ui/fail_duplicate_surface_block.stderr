@@ -1,0 +1,5 @@
+error: duplicate #[op] key/block: 'rest'
+  --> tests/ui/fail_duplicate_surface_block.rs:11:9
+   |
+11 |         rest(method = "POST", path = "/api/x"),
+   |         ^^^^
