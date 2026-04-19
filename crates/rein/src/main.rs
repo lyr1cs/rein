@@ -145,14 +145,6 @@ enum Commands {
         #[arg(long)]
         asynchronous: bool,
     },
-    /// Migrate from QMD
-    Migrate {
-        #[arg(long)]
-        from_qmd: Option<String>,
-        /// Re-embed all memories with the current embedding model
-        #[arg(long)]
-        reindex: bool,
-    },
     /// Auto-configure MCP clients
     Init {
         #[arg(long)]
@@ -411,9 +403,6 @@ async fn main() -> anyhow::Result<()> {
                 HookAction::Stop => "stop",
             };
             commands::handle_hook(&config, action_str).await?
-        }
-        Some(Commands::Migrate { from_qmd, reindex }) => {
-            commands::handle_migrate(&config, from_qmd, reindex).await?
         }
         Some(Commands::Init { dry_run, proxy }) => commands::handle_init(dry_run, proxy)?,
         Some(Commands::Consolidate {

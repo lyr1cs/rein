@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use rein_macros::op;
 
 use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsRuntime};
-use crate::types::{Memory, MemoryEvidence, MemoryStore, ReinResult};
+use crate::types::{Memory, MemoryEvidence, MemoryStore, ReinError, ReinResult};
 
 fn default_canonicals_limit() -> usize {
     20
@@ -438,5 +438,131 @@ impl OpsRuntime {
                 synthesis: result.as_ref().and_then(|v| v.synthesized.clone()),
             })
         })
+    }
+}
+
+// ── migrate ──────────────────────────────────────────────────────────────────
+
+/// Params for the migrate command.
+///
+/// Without `--reindex`, imports data from a QMD SQLite database. With
+/// `--reindex`, re-embeds all existing memories with the current embedding
+/// model (rebuilds the vector index).
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct MigrateParams {
+    /// Path to the QMD SQLite database. Defaults to `~/.cache/qmd/index.sqlite`.
+    /// Ignored when `--reindex` is set.
+    #[serde(default)]
+    #[arg(long)]
+    pub from_qmd: Option<String>,
+    /// Re-embed all memories with the current embedding model and rebuild the
+    /// vector index. Mutually exclusive with `--from-qmd` (reindex takes
+    /// priority when both are set).
+    #[serde(default)]
+    #[arg(long)]
+    pub reindex: bool,
+}
+
+/// Summary of a migrate run.
+#[derive(Serialize, Clone, Debug)]
+pub struct MigrateOutput {
+    /// Human-readable summary line (mirrors the pre-A1 println output).
+    pub summary: String,
+    /// True when `--reindex` mode was used.
+    pub reindex: bool,
+    /// Number of QMD documents read (only populated in from-qmd mode).
+    pub documents_read: Option<usize>,
+    /// Number of chunks / memories created (from-qmd) or re-embedded (reindex).
+    pub items_processed: usize,
+    /// Number of errors encountered.
+    pub errors: usize,
+}
+
+impl IntoJson for MigrateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for MigrateOutput {
+    fn to_markdown(&self) -> String {
+        self.summary.clone()
+    }
+}
+
+impl IntoCliText for MigrateOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirror the pre-A1 `handle_migrate` output format verbatim.
+        self.summary.clone()
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "migrate",
+        category = "maintenance",
+        description = "Import data from a QMD SQLite database into rein memories, or reindex all memories with the current embedding model. Admin-only: CLI surface, no MCP/REST exposure.",
+        mutating = true,
+        cli(name = "migrate"),
+    )]
+    pub fn migrate(&self, params: MigrateParams) -> ReinResult<MigrateOutput> {
+        let config = self.config.clone();
+        if params.reindex {
+            let store = config.open_store()?;
+            let run = async move {
+                crate::store::migrate::reindex(&store, &config)
+                    .await
+                    .map_err(|e| ReinError::Config(e.to_string()))
+                    .map(|report| MigrateOutput {
+                        summary: report.to_string(),
+                        reindex: true,
+                        documents_read: None,
+                        items_processed: report.embedded,
+                        errors: report.errors,
+                    })
+            };
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                tokio::task::block_in_place(|| handle.block_on(run))
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
+                rt.block_on(run)
+            }
+        } else {
+            let qmd_path = params.from_qmd.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
+            });
+            let store = config.open_store()?;
+            let embedder = crate::embed::create_embedder(&config);
+            let run = async move {
+                crate::store::migrate::migrate_from_qmd(
+                    &qmd_path,
+                    &store,
+                    &config,
+                    embedder.as_ref(),
+                )
+                .await
+                .map_err(|e| ReinError::Config(e.to_string()))
+                .map(|report| MigrateOutput {
+                    summary: report.to_string(),
+                    reindex: false,
+                    documents_read: Some(report.documents_read),
+                    items_processed: report.chunks_created,
+                    errors: report.errors,
+                })
+            };
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                tokio::task::block_in_place(|| handle.block_on(run))
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
+                rt.block_on(run)
+            }
+        }
     }
 }

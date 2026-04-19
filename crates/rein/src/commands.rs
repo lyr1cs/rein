@@ -5,7 +5,6 @@
 //! bodies live here.
 
 use rein::config::ReinConfig;
-use rein::embed;
 use rein::extract;
 use rein::mcp;
 use rein::ops;
@@ -578,29 +577,6 @@ pub fn handle_dedup_log(
                 decision.reason
             );
         }
-    }
-    Ok(())
-}
-
-pub async fn handle_migrate(
-    config: &ReinConfig,
-    from_qmd: Option<String>,
-    reindex: bool,
-) -> anyhow::Result<()> {
-    if reindex {
-        let store = config.open_store()?;
-        let report = store::migrate::reindex(&store, config).await?;
-        println!("{report}");
-    } else {
-        let qmd_path = from_qmd.map(std::path::PathBuf::from).unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
-        });
-        let store = config.open_store()?;
-        let embedder = embed::create_embedder(config);
-        let report =
-            store::migrate::migrate_from_qmd(&qmd_path, &store, config, embedder.as_ref()).await?;
-        println!("{report}");
     }
     Ok(())
 }
