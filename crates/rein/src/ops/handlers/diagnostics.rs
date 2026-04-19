@@ -1,4 +1,4 @@
-//! Diagnostics-category op handlers (Phase 1 PoC: stats, health).
+//! Diagnostics-category op handlers (Phase 1: stats, health; Phase 2.1: doctor).
 
 use clap::Args;
 use schemars::JsonSchema;
@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use rein_macros::op;
 
+use crate::doctor::{self, DoctorOptions, DoctorReport};
+use crate::ops::SurfaceKind;
 use crate::ops::system_health::{
     self, GrayzoneSnapshot, IndexesSnapshot, QueuesSnapshot, SystemStatus,
 };
@@ -208,6 +210,86 @@ impl OpsRuntime {
             queues: system.queues,
             grayzone: system.grayzone,
             status: system.status,
+        })
+    }
+}
+
+#[derive(Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct DoctorParams {
+    /// Emit machine-readable JSON on CLI (REST always returns JSON).
+    #[serde(default)]
+    #[arg(long)]
+    pub json: bool,
+    /// Probe the embedding backend with a real network request.
+    #[serde(default)]
+    #[arg(long)]
+    pub network: bool,
+    /// Apply safe local fixes (side-index rebuilds, queue repair).
+    #[serde(default)]
+    #[arg(long)]
+    pub fix: bool,
+}
+
+/// CLI and REST wrapper around `DoctorReport`. `json_cli` is a render hint set
+/// from the `--json` flag; it's skipped from JSON output so the REST body stays
+/// a plain `DoctorReport` (identical to the pre-A1 `/api/doctor` shape).
+#[derive(Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct DoctorOutput {
+    pub report: DoctorReport,
+    #[serde(skip)]
+    pub json_cli: bool,
+}
+
+impl IntoJson for DoctorOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.report).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for DoctorOutput {
+    fn to_markdown(&self) -> String {
+        doctor::format_human(&self.report)
+    }
+}
+
+impl IntoCliText for DoctorOutput {
+    fn to_cli_text(&self) -> String {
+        if self.json_cli {
+            serde_json::to_string_pretty(&self.report)
+                .unwrap_or_else(|e| format!("Error serializing report: {e}"))
+        } else {
+            doctor::format_human(&self.report)
+        }
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "doctor",
+        category = "diagnostics",
+        description = "Run system diagnostics: database, indexes, queues, provider readiness. CLI supports --json/--network/--fix; REST GET ignores fix (POST /api/doctor handles fix with mutation marker).",
+        cli(name = "doctor"),
+        rest(method = "GET", path = "/api/doctor"),
+    )]
+    pub async fn doctor(&self, params: DoctorParams) -> ReinResult<DoctorOutput> {
+        let report = doctor::run(
+            self.config.as_ref(),
+            DoctorOptions {
+                network: params.network,
+                fix: params.fix,
+            },
+        )
+        .await;
+        // Preserve the pre-A1 CLI contract: exit 1 on any FAIL check so CI
+        // scripts that grep the exit status keep working. MCP/REST surfaces
+        // don't surface exit codes; the adapter ignores non-CLI exits.
+        if matches!(self.surface(), SurfaceKind::Cli) {
+            self.set_exit_code(report.exit_code());
+        }
+        Ok(DoctorOutput {
+            report,
+            json_cli: params.json,
         })
     }
 }

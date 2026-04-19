@@ -258,21 +258,6 @@ pub fn handle_topics(config: &ReinConfig) -> anyhow::Result<()> {
 // main.rs intercepts those subcommands before Cli::parse() and dispatches through
 // OpsCliEntry inventory.
 
-pub async fn handle_doctor(
-    config: &ReinConfig,
-    json: bool,
-    network: bool,
-    fix: bool,
-) -> anyhow::Result<()> {
-    let report = rein::doctor::run(config, rein::doctor::DoctorOptions { network, fix }).await;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("{}", rein::doctor::format_human(&report));
-    }
-    std::process::exit(report.exit_code());
-}
-
 pub fn handle_forget(config: &ReinConfig, id: String) -> anyhow::Result<()> {
     let store = config.open_store()?;
     store.delete(&id)?;
