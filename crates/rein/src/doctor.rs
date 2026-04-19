@@ -391,20 +391,26 @@ fn check_mcp_registry() -> DoctorCheck {
 
 fn check_rest_registry() -> DoctorCheck {
     let registry_count = registry::rest_operations().len();
-    let source_count = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
+    // A1: migrated ops appear via OpsRestEntry inventory; remaining legacy
+    // routes still live in src/mcp/rest.rs as `(&Method::*, "/api/...")` arms.
+    let inventory_count = inventory::iter::<crate::ops::OpsRestEntry>().count();
+    let derived_count = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
+    let source_count = derived_count + inventory_count;
     if registry_count != source_count {
         return fail_in(
             DoctorCategory::Architecture,
             "rest_registry",
             format!(
-                "registry has {registry_count} REST operations but src/mcp/rest.rs exposes {source_count}"
+                "registry has {registry_count} REST operations but src/mcp/rest.rs exposes {derived_count} derived + {inventory_count} inventory = {source_count}"
             ),
         );
     }
     ok_in(
         DoctorCategory::Architecture,
         "rest_registry",
-        format!("{registry_count} REST operations match src/mcp/rest.rs"),
+        format!(
+            "{registry_count} REST operations match source ({derived_count} derived + {inventory_count} inventory)"
+        ),
     )
 }
 
@@ -1716,10 +1722,9 @@ provider = "inherit"
             count_mcp_tools_in_source(include_str!("mcp/server.rs")),
             registry::mcp_operations().len()
         );
-        assert_eq!(
-            count_rest_operations_in_source(include_str!("mcp/rest.rs")),
-            registry::rest_operations().len()
-        );
+        let derived_rest = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
+        let inventory_rest = inventory::iter::<crate::ops::OpsRestEntry>().count();
+        assert_eq!(derived_rest + inventory_rest, registry::rest_operations().len());
         assert_eq!(
             parse_agents_overview_version("rein v1.2.3 — demo release"),
             Some("1.2.3".to_string())
