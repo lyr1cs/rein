@@ -12,6 +12,11 @@
 #![allow(clippy::redundant_slicing)]
 #![allow(clippy::collapsible_match)]
 #![allow(clippy::cloned_ref_to_slice_refs)]
+
+// Allow `#[op]`-generated code to use `::rein::ops::*` paths uniformly —
+// both inside this crate and in external trybuild tests that path-dep on rein.
+extern crate self as rein;
+
 pub mod config;
 pub mod doctor;
 pub mod embed;

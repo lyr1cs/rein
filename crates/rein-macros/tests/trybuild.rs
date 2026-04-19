@@ -9,6 +9,8 @@
 #[test]
 fn ui() {
     let t = trybuild::TestCases::new();
-    t.pass("tests/ui/pass_*.rs");
+    // Pass tests live in the rein crate's integration tests (see
+    // `crates/rein/tests/inventory_registration.rs`) since the macro emits
+    // `::rein::ops::*` paths that can't resolve in trybuild scratch crates.
     t.compile_fail("tests/ui/fail_*.rs");
 }
