@@ -623,27 +623,6 @@ pub async fn handle_cleanup(
     Ok(())
 }
 
-pub fn handle_canonicals(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let canonicals = store.list_canonical_memories(limit)?;
-    if canonicals.is_empty() {
-        println!("No canonical memories found");
-    } else {
-        for memory in canonicals {
-            println!(
-                "- {} [{}] support={} merges={} diversity={:.2} dedup_conf={:.2}",
-                memory.id,
-                memory.summary,
-                memory.support_count,
-                memory.merge_count,
-                memory.source_diversity,
-                memory.dedup_confidence,
-            );
-        }
-    }
-    Ok(())
-}
-
 pub fn handle_evidence(
     config: &ReinConfig,
     canonical_id: String,

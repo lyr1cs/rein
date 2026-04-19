@@ -171,11 +171,8 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
-    /// Show canonical memories (one row per canonical)
-    Canonicals {
-        #[arg(short, long, default_value = "20")]
-        limit: usize,
-    },
+    // Canonicals migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "canonicals" via OpsCliEntry before the derived-enum path.
     /// Show evidence snapshots for a canonical memory
     Evidence {
         canonical_id: String,
@@ -480,7 +477,6 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Some(Commands::Canonicals { limit }) => commands::handle_canonicals(&config, limit)?,
         Some(Commands::Evidence {
             canonical_id,
             limit,
