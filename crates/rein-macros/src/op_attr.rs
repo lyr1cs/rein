@@ -40,6 +40,12 @@ pub struct OpAttr {
 #[derive(Debug, Default)]
 pub struct CliBlock {
     pub name: Option<String>,
+    /// Parsed from `cli(positional = [...])` but NOT emitted into clap yet —
+    /// Phase 3 cleanup will either wire it into `build_clap` or drop the key.
+    /// Codex 2026-04-19 audit L2 flagged this as misleading surface area;
+    /// keep the field so the parser doesn't reject `positional` in existing
+    /// call sites.
+    #[allow(dead_code)]
     pub positional: Vec<String>,
     pub aliases: Vec<String>,
     pub hidden: bool,
@@ -516,6 +522,15 @@ fn method_ident(method: &str) -> syn::Result<syn::Ident> {
 
 // ===== Parser (unchanged from Phase 0b) =====
 
+/// Report "duplicate key/block 'X'" pointing at the offending span. Shared
+/// between the top-level attribute parser and the nested cli/mcp/rest block
+/// parsers so every duplicate declaration fails at compile time instead of
+/// silently overwriting an earlier entry. Codex audit 2026-04-19 (H1) flagged
+/// the silent last-wins behavior.
+fn dup_err<S: quote::ToTokens>(span_src: S, key: &str) -> syn::Error {
+    syn::Error::new_spanned(span_src, format!("duplicate #[op] key/block: '{key}'"))
+}
+
 fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
     let input: AttrInput = parse2(attr)?;
 
@@ -528,14 +543,6 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
     let mut cli: Option<CliBlock> = None;
     let mut mcp: Option<McpBlock> = None;
     let mut rest: Option<RestBlock> = None;
-
-    // Helper: report "duplicate key 'X'" at the offending span so copy-paste
-    // mistakes fail loudly at compile time instead of last-wins overwriting
-    // a prior declaration. Codex audit 2026-04-19 (H1) flagged the silent
-    // last-wins behavior as a footgun for handlers authored later.
-    fn dup_err<S: quote::ToTokens>(span_src: S, key: &str) -> syn::Error {
-        syn::Error::new_spanned(span_src, format!("duplicate #[op] key/block: '{key}'"))
-    }
 
     for meta in input.metas {
         match meta {
@@ -651,20 +658,45 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
 
 fn parse_cli_block(tokens: TokenStream) -> syn::Result<CliBlock> {
     let input: AttrInput = parse2(tokens)?;
-    let mut block = CliBlock::default();
+    let mut name: Option<String> = None;
+    let mut hidden: Option<bool> = None;
+    let mut parent: Option<String> = None;
+    let mut positional: Option<Vec<String>> = None;
+    let mut aliases: Option<Vec<String>> = None;
     for meta in input.metas {
         match meta {
             Meta::NameValue(nv) => {
                 let key = ident_string(&nv.path)?;
                 match key.as_str() {
-                    "name" => block.name = Some(extract_string_lit(&nv.value, "cli.name")?),
-                    "hidden" => block.hidden = extract_bool_lit(&nv.value, "cli.hidden")?,
-                    "parent" => block.parent = Some(extract_string_lit(&nv.value, "cli.parent")?),
+                    "name" => {
+                        if name.is_some() {
+                            return Err(dup_err(&nv.path, "cli.name"));
+                        }
+                        name = Some(extract_string_lit(&nv.value, "cli.name")?);
+                    }
+                    "hidden" => {
+                        if hidden.is_some() {
+                            return Err(dup_err(&nv.path, "cli.hidden"));
+                        }
+                        hidden = Some(extract_bool_lit(&nv.value, "cli.hidden")?);
+                    }
+                    "parent" => {
+                        if parent.is_some() {
+                            return Err(dup_err(&nv.path, "cli.parent"));
+                        }
+                        parent = Some(extract_string_lit(&nv.value, "cli.parent")?);
+                    }
                     "positional" => {
-                        block.positional = extract_string_array(&nv.value, "cli.positional")?
+                        if positional.is_some() {
+                            return Err(dup_err(&nv.path, "cli.positional"));
+                        }
+                        positional = Some(extract_string_array(&nv.value, "cli.positional")?);
                     }
                     "aliases" => {
-                        block.aliases = extract_string_array(&nv.value, "cli.aliases")?
+                        if aliases.is_some() {
+                            return Err(dup_err(&nv.path, "cli.aliases"));
+                        }
+                        aliases = Some(extract_string_array(&nv.value, "cli.aliases")?);
                     }
                     other => {
                         return Err(syn::Error::new(
@@ -682,7 +714,13 @@ fn parse_cli_block(tokens: TokenStream) -> syn::Result<CliBlock> {
             }
         }
     }
-    Ok(block)
+    Ok(CliBlock {
+        name,
+        hidden: hidden.unwrap_or(false),
+        parent,
+        positional: positional.unwrap_or_default(),
+        aliases: aliases.unwrap_or_default(),
+    })
 }
 
 fn parse_mcp_block(tokens: TokenStream) -> syn::Result<McpBlock> {
@@ -693,7 +731,12 @@ fn parse_mcp_block(tokens: TokenStream) -> syn::Result<McpBlock> {
             Meta::NameValue(nv) => {
                 let key = ident_string(&nv.path)?;
                 match key.as_str() {
-                    "name" => name = Some(extract_string_lit(&nv.value, "mcp.name")?),
+                    "name" => {
+                        if name.is_some() {
+                            return Err(dup_err(&nv.path, "mcp.name"));
+                        }
+                        name = Some(extract_string_lit(&nv.value, "mcp.name")?);
+                    }
                     other => {
                         return Err(syn::Error::new(
                             nv.path.span(),
@@ -721,16 +764,29 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
     let input: AttrInput = parse2(tokens)?;
     let mut method: Option<String> = None;
     let mut path: Option<String> = None;
-    let mut path_params: Vec<String> = Vec::new();
+    let mut path_params: Option<Vec<String>> = None;
     for meta in input.metas {
         match meta {
             Meta::NameValue(nv) => {
                 let key = ident_string(&nv.path)?;
                 match key.as_str() {
-                    "method" => method = Some(extract_string_lit(&nv.value, "rest.method")?),
-                    "path" => path = Some(extract_string_lit(&nv.value, "rest.path")?),
+                    "method" => {
+                        if method.is_some() {
+                            return Err(dup_err(&nv.path, "rest.method"));
+                        }
+                        method = Some(extract_string_lit(&nv.value, "rest.method")?);
+                    }
+                    "path" => {
+                        if path.is_some() {
+                            return Err(dup_err(&nv.path, "rest.path"));
+                        }
+                        path = Some(extract_string_lit(&nv.value, "rest.path")?);
+                    }
                     "path_params" => {
-                        path_params = extract_string_array(&nv.value, "rest.path_params")?
+                        if path_params.is_some() {
+                            return Err(dup_err(&nv.path, "rest.path_params"));
+                        }
+                        path_params = Some(extract_string_array(&nv.value, "rest.path_params")?);
                     }
                     other => {
                         return Err(syn::Error::new(
@@ -755,7 +811,7 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
         path: path.ok_or_else(|| {
             syn::Error::new(Span::call_site(), "rest block missing required key 'path'")
         })?,
-        path_params,
+        path_params: path_params.unwrap_or_default(),
     })
 }
 
