@@ -153,6 +153,38 @@ async fn stats_rest_invoke_fn_pointer_returns_json() {
 }
 
 #[test]
+fn migrated_ops_default_to_public_auth_policy() {
+    // None of the Phase 1 / 2.1 ops declared an auth policy, so the macro
+    // must emit AuthPolicy::Public by default. This guards against a future
+    // macro change silently flipping the default to e.g. MutationMarker,
+    // which would require x-rein-action: 1 on every GET. Catches the class
+    // of bug Codex H3 audit (2026-04-19) was specifically worried about —
+    // wrong default on migrated routes.
+    for op_name in ["stats", "health", "adaptive_status", "doctor", "config"] {
+        let meta = inventory::iter::<OpsMetadata>()
+            .find(|e| e.name == op_name)
+            .unwrap_or_else(|| panic!("metadata for '{op_name}' not registered"));
+        assert_eq!(
+            meta.auth_policy,
+            rein::ops::AuthPolicy::Public,
+            "op '{op_name}' expected AuthPolicy::Public (default)"
+        );
+    }
+
+    // REST entries must carry the same policy (duplicated for O(1) dispatch).
+    for op_name in ["stats", "health", "adaptive_status", "doctor"] {
+        let rest = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == op_name)
+            .unwrap_or_else(|| panic!("REST entry for '{op_name}' not registered"));
+        assert_eq!(
+            rest.auth_policy,
+            rein::ops::AuthPolicy::Public,
+            "REST entry for '{op_name}' must mirror metadata auth_policy"
+        );
+    }
+}
+
+#[test]
 fn ops_runtime_exit_code_channel_round_trips() {
     // Framework-level contract for the exit-code side channel that doctor
     // (and future ops needing CLI-specific exit codes) relies on. Proving

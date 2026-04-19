@@ -1,0 +1,13 @@
+error: #[op] auth 'admin_only' not supported — must be one of: public, mutation_marker, read_token
+  --> tests/ui/fail_bad_auth.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "bad auth value",
+10 | |         auth = "admin_only",
+11 | |         cli(name = "x"),
+12 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)

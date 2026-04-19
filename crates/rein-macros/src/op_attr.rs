@@ -28,6 +28,10 @@ pub struct OpAttr {
     pub description: String,
     pub kind: String,
     pub mutating: bool,
+    /// Declared auth policy. Parsed from `auth = "..."`. Stored as string
+    /// so validation.rs can emit a precise error for unknown values; the
+    /// emit_* functions lower this to `::rein::ops::AuthPolicy::Variant`.
+    pub auth: String,
     pub cli: Option<CliBlock>,
     pub mcp: Option<McpBlock>,
     pub rest: Option<RestBlock>,
@@ -128,6 +132,20 @@ fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> 
     let category = &attr.category;
     let description = &attr.description;
     let mutating = attr.mutating;
+    let auth_variant = match attr.auth.as_str() {
+        "public" => quote! { ::rein::ops::AuthPolicy::Public },
+        "mutation_marker" => quote! { ::rein::ops::AuthPolicy::MutationMarker },
+        "read_token" => quote! { ::rein::ops::AuthPolicy::ReadToken },
+        // validation.rs rejects unknown values before we reach this path,
+        // but keep a fallback that errors loudly rather than silently
+        // defaulting — belt-and-braces for future additions.
+        other => {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                format!("BUG: validation let through unknown auth '{other}'"),
+            ))
+        }
+    };
 
     let params_schema_fn = emit_params_schema_fn(fi.params_ty.as_ref());
 
@@ -142,7 +160,7 @@ fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> 
     let rest_block = attr
         .rest
         .as_ref()
-        .map(|rest| emit_rest_block(rest, op_name, fn_name, fi));
+        .map(|rest| emit_rest_block(rest, op_name, fn_name, fi, &auth_variant));
 
     let cli_visible = attr.cli.is_some();
     let mcp_visible = attr.mcp.is_some();
@@ -192,6 +210,7 @@ fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> 
                     mcp_name: #mcp_name_tokens,
                     rest_method: #rest_method_tokens,
                     rest_path: #rest_path_tokens,
+                    auth_policy: #auth_variant,
                     params_schema: __op_params_schema,
                 }
             }
@@ -417,6 +436,7 @@ fn emit_rest_block(
     op_name: &str,
     fn_name: &syn::Ident,
     fi: &FnInfo,
+    auth_variant: &TokenStream,
 ) -> TokenStream {
     let method_ident = match method_ident(&rest.method) {
         Ok(id) => id,
@@ -473,6 +493,7 @@ fn emit_rest_block(
                 path_template: #path,
                 path_params: &[ #( #path_params ),* ],
                 op_name: #op_name,
+                auth_policy: #auth_variant,
                 invoke: __op_rest_invoke,
             }
         }
@@ -503,6 +524,7 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
     let mut description: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut mutating: Option<bool> = None;
+    let mut auth: Option<String> = None;
     let mut cli: Option<CliBlock> = None;
     let mut mcp: Option<McpBlock> = None;
     let mut rest: Option<RestBlock> = None;
@@ -549,6 +571,12 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
                             return Err(dup_err(&nv.path, "mutating"));
                         }
                         mutating = Some(extract_bool_lit(&nv.value, "mutating")?);
+                    }
+                    "auth" => {
+                        if auth.is_some() {
+                            return Err(dup_err(&nv.path, "auth"));
+                        }
+                        auth = Some(extract_string_lit(&nv.value, "auth")?);
                     }
                     other => {
                         return Err(syn::Error::new(
@@ -599,6 +627,9 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
 
     let kind = kind.unwrap_or_else(|| "unary".to_string());
     let mutating = mutating.unwrap_or(false);
+    // Default to "public" — read-only endpoints dominate the migration and
+    // explicit opt-in on mutations keeps the surface area small.
+    let auth = auth.unwrap_or_else(|| "public".to_string());
 
     Ok(OpAttr {
         name: name
@@ -611,6 +642,7 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
         })?,
         kind,
         mutating,
+        auth,
         cli,
         mcp,
         rest,
