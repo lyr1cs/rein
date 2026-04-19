@@ -614,3 +614,181 @@ fn migrate_cli_only_surface_applies_schema() {
         );
     });
 }
+
+#[tokio::test]
+async fn dedup_dry_run_parity_across_surfaces_respects_auth() {
+    use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use serde_json::Value;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        // Use a similarity threshold low enough that nearly-identical memories are detected.
+        c.search.dedup_similarity = 0.70;
+        Arc::new(c)
+    };
+
+    // Seed two near-duplicate memories with very similar content so they are
+    // detected as duplicates even by the lexical/jaccard dedup pass.
+    {
+        let cfg = make_config();
+        let store = cfg.open_store().expect("open store for seeding");
+
+        let make_mem = |id: &str, content: &str| Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "dedup-test".to_string(),
+            summary: content.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.0,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 0.5,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: Default::default(),
+            cluster_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        };
+
+        store
+            .store(make_mem(
+                "dedup_a",
+                "rein stores memories for AI agents across sessions",
+            ))
+            .expect("seed dedup_a");
+        store
+            .store(make_mem(
+                "dedup_b",
+                "rein stores memories for AI agents across sessions and conversations",
+            ))
+            .expect("seed dedup_b");
+    }
+
+    // --- MCP surface (dry_run = true) ---
+    let mcp_json: Value = {
+        let runtime = Arc::new(OpsRuntime::for_mcp(make_config()));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "dedup")
+            .expect("dedup MCP entry registered");
+        let out = (entry.invoke)(
+            runtime,
+            serde_json::json!({ "dry_run": true, "merge_variants": false }),
+        )
+        .await
+        .expect("MCP dedup invoke");
+        serde_json::from_str(&out).expect("MCP dedup output is valid JSON")
+    };
+
+    // --- REST surface (dry_run = true, POST body) ---
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let runtime = Arc::new(OpsRuntime::for_rest(make_config()));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "dedup")
+            .expect("dedup REST entry registered");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "dry_run": true, "merge_variants": false }))
+                .expect("serialize body");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(body.into()),
+        )
+        .await
+        .expect("REST dedup invoke");
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("REST dedup body is valid JSON");
+        (status, value)
+    };
+
+    // --- CLI surface (smoke check) ---
+    {
+        let runtime = Arc::new(OpsRuntime::for_cli(make_config()));
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "dedup")
+            .expect("dedup CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["dedup", "--dry-run"])
+            .expect("CLI dedup arg parse");
+        let _out = (entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI dedup invoke");
+    }
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // Both surfaces must return `dry_run: true`.
+    assert_eq!(
+        mcp_json["dry_run"].as_bool(),
+        Some(true),
+        "MCP dedup must echo dry_run flag"
+    );
+    assert_eq!(
+        rest_json["dry_run"].as_bool(),
+        Some(true),
+        "REST dedup must echo dry_run flag"
+    );
+
+    // Both surfaces must agree on the found count (dry_run, DB unchanged).
+    let mcp_found = mcp_json["found"]
+        .as_u64()
+        .expect("MCP dedup output must have `found` count");
+    let rest_found = rest_json["found"]
+        .as_u64()
+        .expect("REST dedup output must have `found` count");
+    assert_eq!(
+        mcp_found, rest_found,
+        "MCP and REST dry-run dedup must agree on found count"
+    );
+
+    // In dry-run mode nothing is removed.
+    let mcp_removed = mcp_json["removed"]
+        .as_u64()
+        .expect("MCP dedup output must have `removed` count");
+    let rest_removed = rest_json["removed"]
+        .as_u64()
+        .expect("REST dedup output must have `removed` count");
+    assert_eq!(
+        mcp_removed, 0,
+        "MCP dry-run dedup must not remove anything"
+    );
+    assert_eq!(
+        rest_removed, 0,
+        "REST dry-run dedup must not remove anything"
+    );
+    assert_eq!(
+        mcp_removed, rest_removed,
+        "MCP and REST dry-run dedup must agree on removed count"
+    );
+
+    // Verify the dedup op is NOT registered with the wrong surface names.
+    assert!(
+        inventory::iter::<OpsMcpEntry>().any(|e| e.op_name == "dedup"),
+        "dedup must be registered as MCP"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().any(|e| e.op_name == "dedup"),
+        "dedup must be registered as REST"
+    );
+    assert!(
+        inventory::iter::<OpsCliEntry>().any(|e| e.name == "dedup"),
+        "dedup must be registered as CLI"
+    );
+}

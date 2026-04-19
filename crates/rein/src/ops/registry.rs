@@ -125,6 +125,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "memory", "GET /api/canonicals"),
     op!(Rest, "memory", "GET /api/evidence"),
     op!(Rest, "maintenance", "POST /api/gc"),
+    op!(Rest, "maintenance", "POST /api/dedup"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -218,6 +219,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[24],
     REST_OPERATIONS[25],
     REST_OPERATIONS[26],
+    REST_OPERATIONS[27],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -282,13 +284,14 @@ mod tests {
         // Phase 2.3: GET /api/canonicals added (canonicals op migrated to #[op]).
         // Phase 2.3: GET /api/evidence added (evidence op migrated to #[op]).
         // Phase 2.3: POST /api/gc added (gc op migrated to #[op] inventory).
-        assert_eq!(rest_operations().len(), 27);
+        // Phase 2.3: POST /api/dedup added (dedup op migrated to #[op] inventory).
+        assert_eq!(rest_operations().len(), 28);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 30,
-                rest: 27
+                rest: 28
             }
         );
     }

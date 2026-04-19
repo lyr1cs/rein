@@ -484,24 +484,8 @@ pub async fn handle_consolidate(
     Ok(())
 }
 
-pub fn handle_dedup(
-    config: &ReinConfig,
-    dry_run: bool,
-    merge_variants: bool,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    // A1: adaptive threshold drives the dedup run; config remains last-resort fallback.
-    let threshold = ops::effective_dedup_threshold(&store, config);
-    let (dups_found, dups_removed) =
-        ops::run_dedup(&store, config, threshold, dry_run, merge_variants)?;
-    if dry_run {
-        println!("Found {dups_found} duplicates (dry-run, nothing removed)");
-    } else {
-        println!("Removed {dups_removed} of {dups_found} duplicates");
-    }
-    Ok(())
-}
-
+// handle_dedup removed — rein dedup migrated to #[op] inventory.
+// See ops/handlers/maintenance.rs for the new implementation.
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_cleanup(

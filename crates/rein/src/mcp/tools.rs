@@ -191,14 +191,8 @@ pub struct ConsolidateParams {
     pub dry_run: Option<bool>,
 }
 
-/// Parameters for rein_dedup tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DedupParams {
-    /// If true, only report duplicates without removing them.
-    pub dry_run: Option<bool>,
-    /// If true, deduplicate across normalized topic variants instead of exact-topic only.
-    pub merge_variants: Option<bool>,
-}
+// DedupParams removed — rein_dedup migrated to #[op] inventory.
+// See ops/handlers/maintenance.rs for the new DedupParams + DedupOutput structs.
 
 /// Parameters for rein_cleanup tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
