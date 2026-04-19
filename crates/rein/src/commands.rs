@@ -254,25 +254,9 @@ pub fn handle_topics(config: &ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn handle_stats(config: &ReinConfig) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let stats = store.stats()?;
-    println!(
-        "{}",
-        mcp::compact::format_stats(&stats, config.server.compact)
-    );
-    Ok(())
-}
-
-pub fn handle_health(config: &ReinConfig, topic: Option<String>) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let reports = store.health(topic.as_deref())?;
-    println!(
-        "{}",
-        mcp::compact::format_health(&reports, config.server.compact)
-    );
-    Ok(())
-}
+// handle_stats / handle_health migrated to #[op] (see ops/handlers/diagnostics.rs).
+// main.rs intercepts those subcommands before Cli::parse() and dispatches through
+// OpsCliEntry inventory.
 
 pub async fn handle_doctor(
     config: &ReinConfig,

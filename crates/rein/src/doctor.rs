@@ -331,20 +331,27 @@ fn check_overview_version() -> DoctorCheck {
 
 fn check_cli_registry() -> DoctorCheck {
     let registry_count = registry::cli_operations().len();
-    let source_count = count_cli_operations_in_source(include_str!("main.rs"));
+    // A1: migrated ops no longer appear as `Some(Commands::*)` arms in main.rs —
+    // they register through `OpsCliEntry` inventory. Sum both sources so the
+    // drift check stays honest during the incremental migration.
+    let inventory_count = inventory::iter::<crate::ops::OpsCliEntry>().count();
+    let derived_count = count_cli_operations_in_source(include_str!("main.rs"));
+    let source_count = derived_count + inventory_count;
     if registry_count != source_count {
         return fail_in(
             DoctorCategory::Architecture,
             "cli_registry",
             format!(
-                "registry has {registry_count} CLI operations but main.rs exposes {source_count}"
+                "registry has {registry_count} CLI operations but main.rs exposes {derived_count} derived + {inventory_count} inventory = {source_count}"
             ),
         );
     }
     ok_in(
         DoctorCategory::Architecture,
         "cli_registry",
-        format!("{registry_count} CLI operations match main.rs"),
+        format!(
+            "{registry_count} CLI operations match source ({derived_count} derived + {inventory_count} inventory)"
+        ),
     )
 }
 
@@ -1702,10 +1709,9 @@ provider = "inherit"
 
     #[test]
     fn test_architecture_drift_helpers_match_source_counts() {
-        assert_eq!(
-            count_cli_operations_in_source(include_str!("main.rs")),
-            registry::cli_operations().len()
-        );
+        let derived = count_cli_operations_in_source(include_str!("main.rs"));
+        let inventory_count = inventory::iter::<crate::ops::OpsCliEntry>().count();
+        assert_eq!(derived + inventory_count, registry::cli_operations().len());
         assert_eq!(
             count_mcp_tools_in_source(include_str!("mcp/server.rs")),
             registry::mcp_operations().len()
