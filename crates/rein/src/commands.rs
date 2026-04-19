@@ -503,48 +503,6 @@ pub fn handle_dedup(
     Ok(())
 }
 
-/// POC: run the intelligent-merge classifier on two memory IDs and print the verdict.
-/// Read-only — does not modify any data.
-pub fn handle_intelligent_merge_try(
-    config: &ReinConfig,
-    existing_id: &str,
-    incoming_id: &str,
-) -> anyhow::Result<()> {
-    use rein::extract::intelligent_merge::{classify_insertion, MemorySnippet};
-
-    let store = config.open_store()?;
-    let existing = store
-        .get(existing_id)
-        .map_err(|e| anyhow::anyhow!("existing memory {existing_id} not found: {e}"))?;
-    let incoming = store
-        .get(incoming_id)
-        .map_err(|e| anyhow::anyhow!("incoming memory {incoming_id} not found: {e}"))?;
-
-    let a = MemorySnippet::from(&existing);
-    let b = MemorySnippet::from(&incoming);
-
-    println!("→ existing: {}", existing.summary);
-    println!("→ incoming: {}", incoming.summary);
-    println!();
-
-    match classify_insertion(config, &a, &b) {
-        Some(v) => {
-            println!("verdict  : {:?}", v.verdict);
-            if let Some(r) = &v.reasoning {
-                println!("reason   : {r}");
-            }
-            if let Some(s) = &v.synthesized {
-                println!("synthesis: {s}");
-            }
-        }
-        None => {
-            println!(
-                "classifier returned None (no LLM configured, or API error — check logs with REIN_LOG=debug)"
-            );
-        }
-    }
-    Ok(())
-}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_cleanup(
