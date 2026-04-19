@@ -313,15 +313,7 @@ pub fn handle_recent(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn handle_organize(config: &ReinConfig) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    // A1: prefer adaptive global threshold over static config default.
-    let threshold = ops::effective_dedup_threshold(&store, config);
-    let links = store.organize(threshold, 5)?;
-    println!("Organized: created {links} new links between related memories");
-    Ok(())
-}
-
+// handle_organize removed — rein organize migrated to #[op] inventory.
 // handle_dedup_concepts removed — rein dedup-concepts migrated to #[op] inventory.
 
 pub fn handle_export(
