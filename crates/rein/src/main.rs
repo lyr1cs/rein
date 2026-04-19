@@ -175,17 +175,14 @@ enum Commands {
     // main() intercepts "canonicals" via OpsCliEntry before the derived-enum path.
     // Evidence migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "evidence" via OpsCliEntry before the derived-enum path.
+    // Gc migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "gc" via OpsCliEntry before the derived-enum path.
     /// Show recent dedup decisions
     DedupLog {
         #[arg(long)]
         canonical: Option<String>,
         #[arg(short, long, default_value = "20")]
         limit: usize,
-    },
-    /// Garbage collect weak/stale STM memories below strength threshold
-    Gc {
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Auto-link related memories based on content similarity
     Organize,
@@ -368,7 +365,6 @@ async fn main() -> anyhow::Result<()> {
             importance,
         }) => commands::handle_update(&config, id, content, importance)?,
         Some(Commands::Recent { limit }) => commands::handle_recent(&config, limit)?,
-        Some(Commands::Gc { dry_run }) => commands::handle_gc(&config, dry_run)?,
         Some(Commands::Organize) => commands::handle_organize(&config)?,
         Some(Commands::DedupConcepts) => commands::handle_dedup_concepts(&config)?,
         Some(Commands::Export {

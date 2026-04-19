@@ -195,3 +195,119 @@ impl OpsRuntime {
         })
     }
 }
+
+// ── gc ──────────────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct GcParams {
+    /// Preview without applying changes: report how many memories/concepts
+    /// would be decayed or pruned without modifying the database.
+    #[serde(default)]
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Strength threshold below which weak STM memories are pruned. Defaults
+    /// to the configured `decay.prune_threshold`.
+    #[serde(default)]
+    #[arg(long)]
+    pub threshold: Option<f64>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct GcOutput {
+    pub decayed: u64,
+    pub pruned: u64,
+    pub concepts: u64,
+    pub dry_run: bool,
+    pub threshold: f64,
+}
+
+impl IntoJson for GcOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for GcOutput {
+    fn to_markdown(&self) -> String {
+        // Mirrors the pre-A1 `rein_gc` MCP non-compact output so MCP callers
+        // that parse the string keep working.
+        if self.dry_run {
+            let mut s = format!(
+                "GC dry run: {} weak STM memories would be pruned (threshold: {})",
+                self.pruned, self.threshold
+            );
+            if self.concepts > 0 {
+                s.push_str(&format!(", {} low-quality concepts", self.concepts));
+            }
+            s
+        } else {
+            let mut s = format!(
+                "GC complete: decayed {} memories, pruned {} weak STM memories (threshold: {})",
+                self.decayed, self.pruned, self.threshold
+            );
+            if self.concepts > 0 {
+                s.push_str(&format!(", {} low-quality concepts", self.concepts));
+            }
+            s
+        }
+    }
+}
+
+impl IntoCliText for GcOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirrors the pre-A1 `handle_gc` CLI output verbatim so shell scripts
+        // that grep or parse this text continue to work.
+        if self.dry_run {
+            let mut s = format!(
+                "Would decay {} and prune {} weak STM memories (threshold: {})",
+                self.decayed, self.pruned, self.threshold
+            );
+            if self.concepts > 0 {
+                s.push_str(&format!(", {} low-quality concepts", self.concepts));
+            }
+            s
+        } else {
+            let mut s = format!(
+                "Decayed {} memories, pruned {} weak STM memories (threshold: {})",
+                self.decayed, self.pruned, self.threshold
+            );
+            if self.concepts > 0 {
+                s.push_str(&format!(", {} low-quality concepts", self.concepts));
+            }
+            s
+        }
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "gc",
+        category = "maintenance",
+        description = "Run garbage collection: apply decay to all memories, then prune weak STM memories below the configured strength threshold. Use dry_run=true to preview.",
+        mutating = true,
+        cli(name = "gc"),
+        mcp(name = "rein_gc"),
+        rest(method = "POST", path = "/api/gc"),
+        auth = "mutation_marker",
+    )]
+    pub fn gc(&self, params: GcParams) -> ReinResult<GcOutput> {
+        self.set_dry_run(params.dry_run);
+        let dry_run = self.dry_run();
+        let threshold = params
+            .threshold
+            .unwrap_or(self.config.decay.prune_threshold);
+        let config = self.config.clone();
+
+        self.with_store(|store| {
+            let (decayed, pruned, concepts) =
+                crate::ops::run_gc_adaptive(store, &config, threshold, dry_run)?;
+            Ok(GcOutput {
+                decayed,
+                pruned,
+                concepts,
+                dry_run,
+                threshold,
+            })
+        })
+    }
+}
