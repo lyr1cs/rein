@@ -401,8 +401,9 @@ async fn handle_api<B>(
         (&Method::GET, "/api/activity") => api_activity(config, &query),
         (&Method::GET, "/api/topics") => api_topics(config),
         (&Method::GET, "/api/recent") => api_recent(config, &query),
-        (&Method::GET, "/api/dedup_decisions") => api_dedup_decisions(config, &query),
-        (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
+        // GET /api/dedup_decisions migrated to #[op] inventory (dedup_log op in
+        // ops/handlers/maintenance.rs); served via try_dispatch_inventory_rest above.
+(&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
         (&Method::GET, "/api/version") => json_response(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
@@ -627,61 +628,6 @@ fn api_recent(
     }
 }
 
-/// Return recent dedup_decisions rows so the GUI / MCP clients can explain
-/// why a canonical exists in its current shape. Supports `?limit=N` and
-/// `?operator=llm_verdict` to filter intelligent_merge decisions.
-fn api_dedup_decisions(
-    config: &ReinConfig,
-    query: &std::collections::HashMap<String, String>,
-) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let limit: i64 = query
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50)
-        .clamp(1, 500);
-    let operator_filter = query.get("operator").cloned();
-
-    let rows_result: rusqlite::Result<Vec<serde_json::Value>> = (|| {
-        let mut stmt = store.conn().prepare(
-            "SELECT id, winner_id, loser_id, canonical_id, lexical_score, embedding_score,
-                    relation, confidence, reason, operator, reversible, merged_summary,
-                    novel_facts, conflict_detected, created_at
-             FROM dedup_decisions
-             WHERE (?1 IS NULL OR operator = ?1)
-             ORDER BY created_at DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![operator_filter, limit], |r| {
-            Ok(json!({
-                "id": r.get::<_, String>(0)?,
-                "winner_id": r.get::<_, Option<String>>(1)?,
-                "loser_id": r.get::<_, Option<String>>(2)?,
-                "canonical_id": r.get::<_, Option<String>>(3)?,
-                "lexical_score": r.get::<_, Option<f64>>(4)?,
-                "embedding_score": r.get::<_, Option<f64>>(5)?,
-                "relation": r.get::<_, String>(6)?,
-                "confidence": r.get::<_, f64>(7)?,
-                "reason": r.get::<_, String>(8)?,
-                "operator": r.get::<_, String>(9)?,
-                "reversible": r.get::<_, i64>(10)? != 0,
-                "merged_summary": r.get::<_, Option<String>>(11)?,
-                "novel_facts": r.get::<_, String>(12)?,
-                "conflict_detected": r.get::<_, i64>(13)? != 0,
-                "created_at": r.get::<_, String>(14)?,
-            }))
-        })?;
-        rows.collect()
-    })();
-
-    match rows_result {
-        Ok(items) => json_response(StatusCode::OK, json!({ "decisions": items })),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
 
 /// Return process-wide intelligent_merge classifier counters for monitoring.
 fn api_intelligent_merge_metrics() -> BoxedResponse {

@@ -160,13 +160,8 @@ enum Commands {
     // main() intercepts "evidence" via OpsCliEntry before the derived-enum path.
     // Gc migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "gc" via OpsCliEntry before the derived-enum path.
-    /// Show recent dedup decisions
-    DedupLog {
-        #[arg(long)]
-        canonical: Option<String>,
-        #[arg(short, long, default_value = "20")]
-        limit: usize,
-    },
+    // DedupLog migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "dedup-log" via OpsCliEntry before the derived-enum path.
     /// Auto-link related memories based on content similarity
     Organize,
     /// Deduplicate concepts with same normalized name (case/separator variants)
@@ -442,10 +437,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Some(Commands::DedupLog { canonical, limit }) => {
-            commands::handle_dedup_log(&config, canonical, limit)?
-        }
-        Some(Commands::Dashboard) => commands::handle_dashboard(&config),
+        // DedupLog migrated to #[op] inventory (dedup_log op); intercepted above via OpsCliEntry.
+Some(Commands::Dashboard) => commands::handle_dashboard(&config),
         Some(Commands::Gui { action }) => match action {
             ServiceAction::On => commands::handle_gui_on()?,
             ServiceAction::Off => commands::handle_gui_off()?,

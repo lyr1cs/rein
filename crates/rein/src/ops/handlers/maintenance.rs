@@ -533,6 +533,160 @@ impl OpsRuntime {
     }
 }
 
+// ── dedup_log ────────────────────────────────────────────────────────────────
+
+fn default_dedup_log_limit() -> usize {
+    50
+}
+
+/// Query parameters for the dedup-log op.
+///
+/// `canonical` and `operator` are optional filters.  `limit` is clamped to
+/// `[1, 500]` so the REST surface cannot request arbitrarily large payloads.
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone)]
+pub struct DedupLogParams {
+    /// Return only decisions whose `canonical_id` matches this value.
+    #[serde(default)]
+    #[arg(long)]
+    pub canonical: Option<String>,
+    /// Return only decisions whose `operator` matches this value (e.g. `llm_verdict`, `auto`).
+    #[serde(default)]
+    #[arg(long)]
+    pub operator: Option<String>,
+    /// Maximum number of decisions to return.
+    #[serde(default = "default_dedup_log_limit")]
+    #[arg(short, long, default_value = "50")]
+    pub limit: usize,
+}
+
+impl Default for DedupLogParams {
+    fn default() -> Self {
+        Self {
+            canonical: None,
+            operator: None,
+            limit: default_dedup_log_limit(),
+        }
+    }
+}
+
+/// A single dedup decision row — all 15 fields stored in the DB.
+///
+/// `novel_facts` is kept as a raw JSON string (e.g. `"[]"` or `"[\"fact\"]"`)
+/// to preserve exact wire-format parity with the legacy derived REST handler
+/// consumed by the Neural Wiki GUI (Provenance page).
+#[derive(Serialize, Clone, Debug)]
+pub struct DedupDecisionRow {
+    pub id: String,
+    pub winner_id: Option<String>,
+    pub loser_id: Option<String>,
+    pub canonical_id: Option<String>,
+    pub lexical_score: Option<f32>,
+    pub embedding_score: Option<f32>,
+    pub relation: String,
+    pub confidence: f32,
+    pub reason: String,
+    pub operator: String,
+    pub reversible: bool,
+    pub merged_summary: Option<String>,
+    /// Raw JSON string — kept as-is from the DB column to match existing GUI contract.
+    pub novel_facts: String,
+    pub conflict_detected: bool,
+    pub created_at: String,
+}
+
+impl DedupDecisionRow {
+    fn from_decision(d: crate::types::DedupDecision) -> Self {
+        let novel_facts = serde_json::to_string(&d.novel_facts).unwrap_or_else(|_| "[]".to_string());
+        let created_at = d.created_at.to_rfc3339();
+        Self {
+            id: d.id,
+            winner_id: d.winner_id,
+            loser_id: d.loser_id,
+            canonical_id: d.canonical_id,
+            lexical_score: d.lexical_score,
+            embedding_score: d.embedding_score,
+            relation: d.relation.to_string(),
+            confidence: d.confidence,
+            reason: d.reason,
+            operator: d.operator,
+            reversible: d.reversible,
+            merged_summary: d.merged_summary,
+            novel_facts,
+            conflict_detected: d.conflict_detected,
+            created_at,
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DedupLogOutput {
+    pub decisions: Vec<DedupDecisionRow>,
+}
+
+impl IntoJson for DedupLogOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for DedupLogOutput {
+    fn to_markdown(&self) -> String {
+        if self.decisions.is_empty() {
+            return "No dedup decisions found".to_string();
+        }
+        let mut out = String::new();
+        for d in &self.decisions {
+            out.push_str(&format!(
+                "- {} relation={} confidence={:.2} winner={:?} loser={:?} reason={}\n",
+                d.id, d.relation, d.confidence, d.winner_id, d.loser_id, d.reason
+            ));
+        }
+        out
+    }
+}
+
+impl IntoCliText for DedupLogOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirror the pre-A1 `handle_dedup_log` output format verbatim.
+        if self.decisions.is_empty() {
+            return "No dedup decisions found".to_string();
+        }
+        let mut out = String::new();
+        for d in &self.decisions {
+            out.push_str(&format!(
+                "- {} relation={} confidence={:.2} winner={:?} loser={:?} reason={}\n",
+                d.id, d.relation, d.confidence, d.winner_id, d.loser_id, d.reason
+            ));
+        }
+        out
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "dedup_log",
+        category = "maintenance",
+        description = "Show recent deduplication decisions (kept/merged/skipped with reasons). Read-only trace for debugging dedup behavior.",
+        cli(name = "dedup-log"),
+        rest(method = "GET", path = "/api/dedup_decisions"),
+    )]
+    pub fn dedup_log(&self, params: DedupLogParams) -> ReinResult<DedupLogOutput> {
+        let canonical = params.canonical.clone();
+        let operator = params.operator.clone();
+        let limit = params.limit.clamp(1, 500);
+        self.with_store(|store| {
+            let decisions = store.list_dedup_decisions_filtered(
+                canonical.as_deref(),
+                operator.as_deref(),
+                limit,
+            )?;
+            Ok(DedupLogOutput {
+                decisions: decisions.into_iter().map(DedupDecisionRow::from_decision).collect(),
+            })
+        })
+    }
+}
+
 // ── migrate ──────────────────────────────────────────────────────────────────
 
 /// Params for the migrate command.
