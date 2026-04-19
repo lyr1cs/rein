@@ -106,6 +106,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "health", "GET /api/health"),
     op!(Rest, "diagnostics", "GET /api/doctor"),
     op!(Rest, "diagnostics", "POST /api/doctor"),
+    op!(Rest, "session", "POST /api/ingest_session"),
     op!(Rest, "session", "POST /api/session"),
     op!(Rest, "session", "DELETE /api/session"),
     op!(Rest, "memory", "GET /api/recall_stream"),
@@ -206,6 +207,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[20],
     REST_OPERATIONS[21],
     REST_OPERATIONS[22],
+    REST_OPERATIONS[23],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -262,13 +264,16 @@ mod tests {
     fn registry_counts_match_expected_values() {
         assert_eq!(cli_operations().len(), 33);
         assert_eq!(mcp_operations().len(), 28);
-        assert_eq!(rest_operations().len(), 23);
+        // Phase 2.2 (H5 body-JSON landed): POST /api/ingest_session added
+        // and POST /api/doctor moved from legacy to inventory. Both counted
+        // here via the registry source-of-truth list.
+        assert_eq!(rest_operations().len(), 24);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 28,
-                rest: 23
+                rest: 24
             }
         );
     }
