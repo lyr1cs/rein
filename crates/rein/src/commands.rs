@@ -540,30 +540,6 @@ pub async fn handle_cleanup(
     Ok(())
 }
 
-pub fn handle_dedup_log(
-    config: &ReinConfig,
-    canonical: Option<String>,
-    limit: usize,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let decisions = store.list_dedup_decisions(canonical.as_deref(), limit)?;
-    if decisions.is_empty() {
-        println!("No dedup decisions found");
-    } else {
-        for decision in decisions {
-            println!(
-                "- {} relation={} confidence={:.2} winner={:?} loser={:?} reason={}",
-                decision.id,
-                decision.relation,
-                decision.confidence,
-                decision.winner_id,
-                decision.loser_id,
-                decision.reason
-            );
-        }
-    }
-    Ok(())
-}
 
 pub fn handle_init(dry_run: bool, proxy: bool) -> anyhow::Result<()> {
     rein::init::auto_configure(dry_run)?;
