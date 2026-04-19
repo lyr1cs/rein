@@ -252,23 +252,28 @@ fn emit_cli_block(
         None => quote! { ::std::option::Option::None },
     };
 
-    let (build_body, invoke_prep) = match &fi.params_ty {
+    let (build_body, pre_extract) = match &fi.params_ty {
         Some(ty) => (
             quote! {
                 let cmd = ::clap::Command::new(#cli_name);
                 <#ty as ::clap::Args>::augment_args(cmd)
             },
+            // Extract params synchronously (before async block) so `_matches`
+            // borrow doesn't leak into the returned `'static` future.
             quote! {
-                let params = <#ty as ::clap::FromArgMatches>::from_arg_matches(_matches)
-                    .map_err(|e| ::rein::types::ReinError::Config(
-                        format!("cli arg parse error: {e}")
-                    ))?;
+                let params_result = <#ty as ::clap::FromArgMatches>::from_arg_matches(_matches);
             },
         ),
-        None => (
-            quote! { ::clap::Command::new(#cli_name) },
-            quote! {},
-        ),
+        None => (quote! { ::clap::Command::new(#cli_name) }, quote! {}),
+    };
+
+    let async_prep = match &fi.params_ty {
+        Some(_) => quote! {
+            let params = params_result.map_err(|e| {
+                ::rein::types::ReinError::Config(format!("cli arg parse error: {e}"))
+            })?;
+        },
+        None => quote! {},
     };
 
     let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
@@ -288,8 +293,9 @@ fn emit_cli_block(
                 > + ::std::marker::Send,
             >,
         > {
+            #pre_extract
             ::std::boxed::Box::pin(async move {
-                #invoke_prep
+                #async_prep
                 let out = #call_expr?;
                 ::std::result::Result::Ok(
                     <_ as ::rein::ops::IntoCliText>::to_cli_text(&out),
