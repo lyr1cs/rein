@@ -511,9 +511,18 @@ async fn main() -> anyhow::Result<()> {
 
 /// Inject each `#[op]`-registered CLI subcommand into the top-level clap
 /// Command so `--help` and argument parsing work uniformly for migrated and
-/// legacy ops alike.
+/// legacy ops alike. Aborts with a clear message if two entries share a name —
+/// the same check exists at test time via `inventory_registration.rs` but
+/// catching it at startup prevents link-order-dependent silent shadowing.
 fn augment_with_inventory(mut cmd: clap::Command) -> clap::Command {
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     for entry in inventory::iter::<OpsCliEntry>() {
+        if !seen.insert(entry.name) {
+            panic!(
+                "duplicate OpsCliEntry name '{}': two #[op]s registered the same CLI subcommand",
+                entry.name
+            );
+        }
         cmd = cmd.subcommand((entry.build_clap)());
     }
     cmd

@@ -99,8 +99,7 @@ impl OpsRuntime {
 
 #[derive(Args, Deserialize, JsonSchema, Debug, Clone, Default)]
 pub struct HealthParams {
-    /// Filter reports to a single topic.
-    #[arg(long)]
+    /// Filter reports to a single topic (positional; pre-A1 CLI compat).
     #[serde(default)]
     pub topic: Option<String>,
 }
