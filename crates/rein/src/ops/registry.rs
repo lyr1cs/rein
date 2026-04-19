@@ -93,6 +93,7 @@ pub const MCP_OPERATIONS: &[Operation] = &[
     op!(Mcp, "adaptive", "rein_adaptive_status"),
     op!(Mcp, "memory", "rein_canonicals"),
     op!(Mcp, "memory", "rein_evidence"),
+    op!(Mcp, "knowledge", "rein_timeline"),
 ];
 
 pub const REST_OPERATIONS: &[Operation] = &[
@@ -120,6 +121,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "artifacts", "GET /api/artifacts/{id}"),
     op!(Rest, "memory", "DELETE /api/memories/{id}"),
     op!(Rest, "metrics", "GET /api/version"),
+    op!(Rest, "memory", "GET /api/canonicals"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -184,6 +186,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     MCP_OPERATIONS[25],
     MCP_OPERATIONS[26],
     MCP_OPERATIONS[27],
+    MCP_OPERATIONS[28],
     REST_OPERATIONS[0],
     REST_OPERATIONS[1],
     REST_OPERATIONS[2],
@@ -208,6 +211,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[21],
     REST_OPERATIONS[22],
     REST_OPERATIONS[23],
+    REST_OPERATIONS[24],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -263,17 +267,18 @@ mod tests {
     #[test]
     fn registry_counts_match_expected_values() {
         assert_eq!(cli_operations().len(), 33);
-        assert_eq!(mcp_operations().len(), 28);
+        assert_eq!(mcp_operations().len(), 29);
         // Phase 2.2 (H5 body-JSON landed): POST /api/ingest_session added
         // and POST /api/doctor moved from legacy to inventory. Both counted
         // here via the registry source-of-truth list.
-        assert_eq!(rest_operations().len(), 24);
+        // Phase 2.3: GET /api/canonicals added (canonicals op migrated to #[op]).
+        assert_eq!(rest_operations().len(), 25);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
-                mcp: 28,
-                rest: 24
+                mcp: 29,
+                rest: 25
             }
         );
     }
