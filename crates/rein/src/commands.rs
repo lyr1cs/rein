@@ -623,26 +623,6 @@ pub async fn handle_cleanup(
     Ok(())
 }
 
-pub fn handle_evidence(
-    config: &ReinConfig,
-    canonical_id: String,
-    limit: usize,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let evidence = store.list_memory_evidence(&canonical_id, limit)?;
-    if evidence.is_empty() {
-        println!("No evidence found for canonical '{canonical_id}'");
-    } else {
-        for item in evidence {
-            println!(
-                "- {} [{}] {}\n{}",
-                item.id, item.source_topic, item.summary, item.content
-            );
-        }
-    }
-    Ok(())
-}
-
 pub fn handle_dedup_log(
     config: &ReinConfig,
     canonical: Option<String>,
