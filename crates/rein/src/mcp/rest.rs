@@ -215,6 +215,22 @@ async fn handle_api<B>(
 ) -> BoxedResponse {
     let query = parse_query(uri);
 
+    // Pre-inventory guard: GET /api/doctor with fix=true is disallowed — fixes
+    // require POST with the mutation marker. Without this check the inventory
+    // doctor op would happily run with fix=true on a read-method request.
+    if method == Method::GET
+        && path == "/api/doctor"
+        && query
+            .get("fix")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    {
+        return error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "doctor fixes require POST /api/doctor?fix=true",
+        );
+    }
+
     // A1: migrated ops get first crack via OpsRestEntry inventory. Falls through
     // to the legacy match for routes that aren't yet migrated.
     if let Some(resp) = try_dispatch_inventory_rest(method, path, uri, config).await {
@@ -232,20 +248,10 @@ async fn handle_api<B>(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
         ),
-        (&Method::GET, "/api/doctor") => {
-            if query
-                .get("fix")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false)
-            {
-                error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "doctor fixes require POST /api/doctor?fix=true",
-                )
-            } else {
-                api_doctor(config, &query)
-            }
-        }
+        // GET /api/doctor is served via OpsRestEntry inventory
+        // (see ops/handlers/diagnostics.rs). POST /api/doctor stays legacy
+        // because the mutation-marker auth is a REST-specific concern that
+        // hasn't been modeled in the op framework yet.
         (&Method::POST, "/api/doctor") => match require_mutation_marker(req) {
             Ok(()) => api_doctor(config, &query),
             Err(response) => response,
