@@ -1708,3 +1708,59 @@ fn mutating_mcp_op_resets_non_store_count() {
         );
     }
 }
+
+// ── M1 regression test ─────────────────────────────────────────────────────────
+
+/// M1 (MEDIUM): Migrated MCP ops must return `IntoMarkdown` output when the
+/// runtime compact flag is set, and valid JSON when it is not.
+///
+/// Before this fix the macro always called `serde_json::to_string(&out)`,
+/// ignoring `runtime.compact()`. Compact-mode MCP clients (including Claude
+/// Code's compact integration) received serialized JSON instead of the
+/// human-readable short-form text they expected.
+///
+/// Fix: the macro now branches on `runtime.compact()` — markdown when true,
+/// JSON otherwise. This test exercises both branches for the `stats` op (a
+/// read-only, always-present migrated op with a known output shape).
+#[tokio::test]
+async fn migrated_mcp_op_returns_markdown_in_compact_mode() {
+    use rein::ops::OpsMcpEntry;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let cfg = std::sync::Arc::new(config);
+
+    let entry = inventory::iter::<OpsMcpEntry>()
+        .find(|e| e.op_name == "stats")
+        .expect("stats (rein_stats) must be registered as MCP");
+
+    // --- non-compact branch: output must be valid JSON ---
+    let runtime_plain = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    assert!(!runtime_plain.compact(), "compact defaults to false");
+    let plain_body = (entry.invoke)(runtime_plain, serde_json::json!({}))
+        .await
+        .expect("stats invoke (non-compact) must not error");
+    serde_json::from_str::<serde_json::Value>(&plain_body).unwrap_or_else(|e| {
+        panic!(
+            "non-compact MCP response must be valid JSON; parse error: {e}\nbody: {plain_body:?}"
+        )
+    });
+
+    // --- compact branch: output must NOT be valid JSON (it's markdown) ---
+    let runtime_compact = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
+    runtime_compact.set_compact(true);
+    assert!(runtime_compact.compact(), "compact must be true after set_compact(true)");
+    let compact_body = (entry.invoke)(runtime_compact, serde_json::json!({}))
+        .await
+        .expect("stats invoke (compact) must not error");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&compact_body).is_err(),
+        "compact MCP response must NOT be valid JSON (expected markdown); body: {compact_body:?}"
+    );
+    // The compact body must be non-empty (IntoMarkdown must produce something).
+    assert!(
+        !compact_body.is_empty(),
+        "compact MCP response must not be empty"
+    );
+}

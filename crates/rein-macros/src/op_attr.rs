@@ -421,8 +421,15 @@ fn emit_mcp_block(
             ::std::boxed::Box::pin(async move {
                 #prep
                 let out = #call_expr?;
-                let json = ::serde_json::to_string(&out)?;
-                ::std::result::Result::Ok(json)
+                // M1: when compact mode is active, return human-readable markdown
+                // (honouring the pre-A1 compact rendering contract). Non-compact
+                // callers still receive serialized JSON.
+                let body = if runtime.compact() {
+                    <_ as ::rein::ops::IntoMarkdown>::to_markdown(&out)
+                } else {
+                    ::serde_json::to_string(&out)?
+                };
+                ::std::result::Result::Ok(body)
             })
         }
 
