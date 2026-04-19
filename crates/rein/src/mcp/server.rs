@@ -92,6 +92,8 @@ impl ReinServer {
         let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
             std::sync::Arc::new(self.config.clone()),
         ));
+        // M1: mirror compact flag so test-path dispatch honours compact rendering.
+        runtime.set_compact(self.compact());
         Some((entry.invoke)(runtime, args).await.map_err(|e| e.to_string()))
     }
 
@@ -1177,6 +1179,9 @@ impl ServerHandler for ReinServer {
             let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
                 std::sync::Arc::new(self.config.clone()),
             ));
+            // M1: propagate the server-level compact flag so the macro-emitted
+            // MCP output branch renders IntoMarkdown when compact is set.
+            runtime.set_compact(self.compact());
             return match (entry.invoke)(runtime, args_value).await {
                 Ok(body) => Ok(rmcp::model::CallToolResult::success(vec![
                     rmcp::model::Content::text(body),
