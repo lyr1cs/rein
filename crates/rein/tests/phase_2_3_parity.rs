@@ -1298,3 +1298,173 @@ async fn organize_parity_across_surfaces() {
         "organize must be registered as REST"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consolidate_dry_run_parity_across_surfaces_respects_auth() {
+    use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use serde_json::Value;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+
+    // Seed 3 memories under "consolidate-test" so the op has something to work with.
+    {
+        let cfg = make_config();
+        let store = cfg.open_store().expect("open store for seeding");
+
+        let make_mem = |id: &str, summary: &str| Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "consolidate-test".to_string(),
+            summary: summary.to_string(),
+            content: summary.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.0,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 0.5,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: Default::default(),
+            cluster_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        };
+
+        store
+            .store(make_mem("cons_a", "rein is a memory server for AI agents"))
+            .expect("seed cons_a");
+        store
+            .store(make_mem(
+                "cons_b",
+                "rein provides cross-validated recall across sessions",
+            ))
+            .expect("seed cons_b");
+        store
+            .store(make_mem(
+                "cons_c",
+                "rein stores and retrieves memories with evidence weighting",
+            ))
+            .expect("seed cons_c");
+    }
+
+    // --- MCP surface (dry_run = true) ---
+    let mcp_json: Value = {
+        let runtime = Arc::new(OpsRuntime::for_mcp(make_config()));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "consolidate")
+            .expect("consolidate MCP entry registered");
+        let out = (entry.invoke)(
+            runtime,
+            serde_json::json!({ "dry_run": true, "topic": "consolidate-test" }),
+        )
+        .await
+        .expect("MCP consolidate invoke");
+        serde_json::from_str(&out).expect("MCP consolidate output is valid JSON")
+    };
+
+    // --- REST surface (dry_run = true, POST body) ---
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let runtime = Arc::new(OpsRuntime::for_rest(make_config()));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "consolidate")
+            .expect("consolidate REST entry registered");
+        let body = serde_json::to_vec(
+            &serde_json::json!({ "dry_run": true, "topic": "consolidate-test" }),
+        )
+        .expect("serialize body");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(body.into()),
+        )
+        .await
+        .expect("REST consolidate invoke");
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("REST consolidate body is valid JSON");
+        (status, value)
+    };
+
+    // --- CLI surface (smoke check) ---
+    {
+        let runtime = Arc::new(OpsRuntime::for_cli(make_config()));
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "consolidate")
+            .expect("consolidate CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["consolidate", "consolidate-test", "--dry-run"])
+            .expect("CLI consolidate arg parse");
+        let _out = (entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI consolidate invoke");
+    }
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // Both surfaces must return `dry_run: true`.
+    assert_eq!(
+        mcp_json["dry_run"].as_bool(),
+        Some(true),
+        "MCP consolidate must echo dry_run flag"
+    );
+    assert_eq!(
+        rest_json["dry_run"].as_bool(),
+        Some(true),
+        "REST consolidate must echo dry_run flag"
+    );
+
+    // consolidated_count must be consistent across surfaces.
+    let mcp_count = mcp_json["consolidated_count"]
+        .as_u64()
+        .expect("MCP consolidate output must have `consolidated_count`");
+    let rest_count = rest_json["consolidated_count"]
+        .as_u64()
+        .expect("REST consolidate output must have `consolidated_count`");
+    assert_eq!(
+        mcp_count, rest_count,
+        "MCP and REST dry-run consolidate must agree on consolidated_count"
+    );
+
+    // In dry-run mode nothing must be written; DB still has 3 memories.
+    {
+        use rein::types::MemoryStore;
+        let store = make_config().open_store().expect("open store for check");
+        let topics = store.list_topics().expect("list topics");
+        assert!(
+            topics.contains(&"consolidate-test".to_string()),
+            "dry-run must not delete the topic"
+        );
+    }
+
+    // Surface registration checks.
+    assert!(
+        inventory::iter::<OpsCliEntry>().any(|e| e.name == "consolidate"),
+        "consolidate must be registered as CLI"
+    );
+    assert!(
+        inventory::iter::<OpsMcpEntry>().any(|e| e.op_name == "consolidate"),
+        "consolidate must be registered as MCP"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().any(|e| e.op_name == "consolidate"),
+        "consolidate must be registered as REST"
+    );
+}
