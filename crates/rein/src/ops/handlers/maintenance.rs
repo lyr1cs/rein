@@ -1026,12 +1026,25 @@ pub struct ConsolidateGroupDetail {
 /// Output of the consolidate op.
 #[derive(Serialize, Clone, Debug)]
 pub struct ConsolidateOutput {
+    /// `false` when the requested scope (topic/pattern/all) resolved to zero
+    /// topics — i.e. nothing matched. Clients that relied on the pre-A1
+    /// "No memories found for topic: X" / "No topics matched pattern: X"
+    /// no-match signal can check this field instead of inspecting counts.
+    /// `true` whenever at least one topic was in scope (counts may still be
+    /// zero when all resolved topics had no memories to consolidate).
+    pub matched: bool,
     /// Number of consolidation groups that contained memories.
     pub consolidated_count: usize,
     /// Total number of topics (groups) considered.
     pub topic_count: usize,
     /// Echoes the dry_run flag.
     pub dry_run: bool,
+    /// The single topic selector, if provided, carried through for rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// The glob pattern selector, if provided, carried through for rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     /// Per-group detail, mirroring the pre-A1 MCP response structure.
     pub details: Vec<ConsolidateGroupDetail>,
 }
@@ -1046,8 +1059,16 @@ impl IntoMarkdown for ConsolidateOutput {
     fn to_markdown(&self) -> String {
         // Mirrors the pre-A1 `rein_consolidate` MCP non-compact output so
         // MCP callers that parse the string continue to work.
-        if self.topic_count == 0 {
-            return "No topics matched the selected scope.".to_string();
+        // N2: when the requested scope resolved to zero topics (matched=false),
+        // emit the same no-match signal the pre-A1 handler returned.
+        if !self.matched {
+            return if let Some(topic) = &self.topic {
+                format!("No memories found for topic: {topic}")
+            } else if let Some(pattern) = &self.pattern {
+                format!("No topics matched pattern: {pattern}")
+            } else {
+                "No topics matched the selected scope.".to_string()
+            };
         }
         let mut text = if self.dry_run {
             format!(
@@ -1095,8 +1116,16 @@ impl IntoCliText for ConsolidateOutput {
     fn to_cli_text(&self) -> String {
         // Mirrors the pre-A1 `handle_consolidate` / `print_consolidation_report`
         // output verbatim so shell scripts that parse it continue to work.
-        if self.topic_count == 0 {
-            return "No topics matched the selected scope.".to_string();
+        // N2: when the requested scope resolved to zero topics (matched=false),
+        // emit the same no-match signal the pre-A1 handler returned.
+        if !self.matched {
+            return if let Some(topic) = &self.topic {
+                format!("No memories found for topic: {topic}")
+            } else if let Some(pattern) = &self.pattern {
+                format!("No topics matched pattern: {pattern}")
+            } else {
+                "No topics matched the selected scope.".to_string()
+            };
         }
         let mut text = if self.dry_run {
             format!(
@@ -1150,6 +1179,9 @@ impl OpsRuntime {
         let merge_variants = params.merge_variants;
         let all = params.all;
         let config = self.config.clone();
+        // Carry topic/pattern into the output for byte-accurate no-match rendering.
+        let topic = params.topic.clone();
+        let pattern = params.pattern.clone();
 
         self.with_store(|store| {
             let selected_topics = params.topics.clone().unwrap_or_default();
@@ -1161,11 +1193,17 @@ impl OpsRuntime {
                 all,
                 merge_variants,
             )?;
+            // N2: when the scope resolved to zero topics, set matched=false so
+            // renderers can emit the pre-A1 no-match signal instead of a
+            // zero-count structured object.
             if groups.is_empty() {
                 return Ok(ConsolidateOutput {
+                    matched: false,
                     consolidated_count: 0,
                     topic_count: 0,
                     dry_run,
+                    topic: topic.clone(),
+                    pattern: pattern.clone(),
                     details: vec![],
                 });
             }
@@ -1188,9 +1226,12 @@ impl OpsRuntime {
                 })
                 .collect();
             Ok(ConsolidateOutput {
+                matched: true,
                 consolidated_count: report.groups_processed,
                 topic_count,
                 dry_run,
+                topic: topic.clone(),
+                pattern: pattern.clone(),
                 details,
             })
         })
@@ -1252,6 +1293,13 @@ pub struct CleanupGroupDetail {
 /// Output of the cleanup op.
 #[derive(Serialize, Clone, Debug)]
 pub struct CleanupOutput {
+    /// `false` when the requested scope (topic/pattern/all) resolved to zero
+    /// topics — i.e. nothing matched. Clients that relied on the pre-A1
+    /// "No memories found for topic: X" / "No topics matched pattern: X"
+    /// no-match signal can check this field instead of inspecting counts.
+    /// `true` whenever at least one topic was in scope (counts may still be
+    /// zero when all resolved topics had no memories to consolidate).
+    pub matched: bool,
     /// Number of consolidation groups that contained memories.
     pub groups_consolidated: usize,
     /// Total memories replaced during consolidation.
@@ -1262,6 +1310,12 @@ pub struct CleanupOutput {
     pub duplicates_merged: u32,
     /// Echoes the dry_run flag.
     pub dry_run: bool,
+    /// The single topic selector, if provided, carried through for rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// The glob pattern selector, if provided, carried through for rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     /// Per-group detail (up to all groups; output formatting truncates at 8).
     pub groups: Vec<CleanupGroupDetail>,
 }
@@ -1276,6 +1330,17 @@ impl IntoMarkdown for CleanupOutput {
     fn to_markdown(&self) -> String {
         // Mirrors the pre-A1 `rein_cleanup` MCP non-compact output so MCP
         // callers that parse the string continue to work.
+        // N2: when the requested scope resolved to zero topics (matched=false),
+        // emit the same no-match signal the pre-A1 handler returned.
+        if !self.matched {
+            return if let Some(topic) = &self.topic {
+                format!("No memories found for topic: {topic}")
+            } else if let Some(pattern) = &self.pattern {
+                format!("No topics matched pattern: {pattern}")
+            } else {
+                "No topics matched the selected scope.".to_string()
+            };
+        }
         if self.dry_run {
             format!(
                 "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
@@ -1323,6 +1388,17 @@ impl IntoCliText for CleanupOutput {
     fn to_cli_text(&self) -> String {
         // Mirrors the pre-A1 `print_cleanup_report` CLI output verbatim so
         // shell scripts that parse it continue to work.
+        // N2: when the requested scope resolved to zero topics (matched=false),
+        // emit the same no-match signal the pre-A1 handler returned.
+        if !self.matched {
+            return if let Some(topic) = &self.topic {
+                format!("No memories found for topic: {topic}")
+            } else if let Some(pattern) = &self.pattern {
+                format!("No topics matched pattern: {pattern}")
+            } else {
+                "No topics matched the selected scope.".to_string()
+            };
+        }
         if self.dry_run {
             format!(
                 "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
@@ -1360,6 +1436,9 @@ impl OpsRuntime {
                 && params.topics.as_ref().is_none_or(|t| t.is_empty())
                 && params.pattern.is_none());
         let config = self.config.clone();
+        // Carry topic/pattern into the output for byte-accurate no-match rendering.
+        let topic = params.topic.clone();
+        let pattern = params.pattern.clone();
 
         self.with_store(|store| {
             let selected_topics = params.topics.clone().unwrap_or_default();
@@ -1371,13 +1450,19 @@ impl OpsRuntime {
                 all,
                 merge_variants,
             )?;
+            // N2: when the scope resolved to zero topics, set matched=false so
+            // renderers can emit the pre-A1 no-match signal instead of a
+            // zero-count structured object.
             if groups.is_empty() {
                 return Ok(CleanupOutput {
+                    matched: false,
                     groups_consolidated: 0,
                     memories_consolidated: 0,
                     duplicates_found: 0,
                     duplicates_merged: 0,
                     dry_run,
+                    topic: topic.clone(),
+                    pattern: pattern.clone(),
                     groups: vec![],
                 });
             }
@@ -1398,11 +1483,14 @@ impl OpsRuntime {
                 })
                 .collect();
             Ok(CleanupOutput {
+                matched: true,
                 groups_consolidated: report.consolidation.groups_processed,
                 memories_consolidated: report.consolidation.memories_replaced,
                 duplicates_found: report.duplicates_found,
                 duplicates_merged: report.duplicates_merged,
                 dry_run,
+                topic: topic.clone(),
+                pattern: pattern.clone(),
                 groups: details,
             })
         })
