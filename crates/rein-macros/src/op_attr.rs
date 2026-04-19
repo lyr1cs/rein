@@ -253,10 +253,24 @@ fn emit_cli_block(
         None => quote! { ::std::option::Option::None },
     };
 
+    let apply_aliases = if aliases.is_empty() {
+        quote! {}
+    } else {
+        quote! { .visible_aliases([ #( #aliases ),* ]) }
+    };
+    let apply_hidden = if hidden {
+        quote! { .hide(true) }
+    } else {
+        quote! {}
+    };
+
     let (build_body, pre_extract) = match &fi.params_ty {
         Some(ty) => (
             quote! {
-                let cmd = ::clap::Command::new(#cli_name).about(#description);
+                let cmd = ::clap::Command::new(#cli_name)
+                    .about(#description)
+                    #apply_aliases
+                    #apply_hidden;
                 <#ty as ::clap::Args>::augment_args(cmd)
             },
             // Extract params synchronously (before async block) so `_matches`
@@ -266,7 +280,12 @@ fn emit_cli_block(
             },
         ),
         None => (
-            quote! { ::clap::Command::new(#cli_name).about(#description) },
+            quote! {
+                ::clap::Command::new(#cli_name)
+                    .about(#description)
+                    #apply_aliases
+                    #apply_hidden
+            },
             quote! {},
         ),
     };
