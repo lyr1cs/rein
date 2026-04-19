@@ -19,6 +19,41 @@ pub enum OpKind {
     Unary,
 }
 
+/// Per-op authorization requirement honored by the REST adapter. Pre-H3
+/// audit (2026-04-19) the inventory dispatch ran **before** route-local
+/// `require_mutation_marker` / `require_read_token` gates, so any migrated
+/// protected route would silently bypass auth. Declaring the policy as
+/// metadata pushes enforcement into the dispatcher so Phase 2.2 onwards
+/// can migrate POST/DELETE ops safely.
+///
+/// MCP surface ignores the policy today (stdio channel is all-or-nothing
+/// at the transport layer). Metadata is still recorded so the future B1
+/// MCP proxy aggregator can filter tools by auth policy when federating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPolicy {
+    /// No gate. Default for read-only endpoints that expose non-sensitive
+    /// data (e.g. `/api/stats`, `/api/health`, `/api/adaptive`).
+    Public,
+    /// Requires `x-rein-action: 1` header. Used for POST/DELETE routes
+    /// that mutate server state. Mirrors `require_mutation_marker`.
+    MutationMarker,
+    /// Requires `x-rein-token` matching `$REIN_HTTP_TOKEN`. Used for GET
+    /// routes that expose raw upstream transcripts or similar sensitive
+    /// reads. Permissive when `$REIN_HTTP_TOKEN` is unset (dev mode).
+    /// Mirrors `require_read_token`.
+    ReadToken,
+}
+
+impl AuthPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthPolicy::Public => "public",
+            AuthPolicy::MutationMarker => "mutation_marker",
+            AuthPolicy::ReadToken => "read_token",
+        }
+    }
+}
+
 pub struct OpsCliEntry {
     pub name: &'static str,
     pub op_name: &'static str,
@@ -48,6 +83,9 @@ pub struct OpsRestEntry {
     pub path_template: &'static str,
     pub path_params: &'static [&'static str],
     pub op_name: &'static str,
+    /// Duplicated from `OpsMetadata::auth_policy` so the REST dispatcher can
+    /// pick the gate in O(1) without a metadata scan per request.
+    pub auth_policy: AuthPolicy,
     pub invoke: fn(
         runtime: Arc<OpsRuntime>,
         path_values: HashMap<&'static str, String>,
@@ -68,6 +106,7 @@ pub struct OpsMetadata {
     pub mcp_name: Option<&'static str>,
     pub rest_method: Option<hyper::Method>,
     pub rest_path: Option<&'static str>,
+    pub auth_policy: AuthPolicy,
     pub params_schema: fn() -> schemars::Schema,
 }
 
