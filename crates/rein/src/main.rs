@@ -1,6 +1,9 @@
-use clap::{Parser, Subcommand};
+use std::sync::Arc;
+
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use rein::config;
+use rein::ops::{OpsCliEntry, OpsRuntime};
 
 mod commands;
 
@@ -80,10 +83,8 @@ enum Commands {
     },
     /// List all topics
     Topics,
-    /// Show statistics
-    Stats,
-    /// Health check
-    Health { topic: Option<String> },
+    // Stats + Health migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
+    // main() intercepts them before clap::Parser so they're invoked via OpsCliEntry.
     /// System diagnostics for database, indexes, queues, and provider readiness
     Doctor {
         /// Emit machine-readable JSON
@@ -310,7 +311,25 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    // A1: build the clap command and augment it with inventory-registered
+    // subcommands so `--help` lists them and clap can parse their args. Then
+    // dispatch: if an inventory subcommand matched, invoke its fn pointer;
+    // otherwise fall through to the derived-enum path.
+    let augmented = augment_with_inventory(Cli::command());
+    let matches = augmented.get_matches();
+
+    if let Some((sub_name, sub_matches)) = matches.subcommand() {
+        if let Some(entry) = inventory::iter::<OpsCliEntry>().find(|e| e.name == sub_name) {
+            let config = config::ReinConfig::load()?;
+            let runtime = Arc::new(OpsRuntime::for_cli(Arc::new(config)));
+            let out = (entry.invoke)(runtime, sub_matches).await?;
+            println!("{out}");
+            return Ok(());
+        }
+    }
+
+    let cli = Cli::from_arg_matches(&matches)
+        .map_err(|e| anyhow::anyhow!("cli arg matches → struct: {e}"))?;
     let config = config::ReinConfig::load()?;
 
     match cli.command {
@@ -352,8 +371,6 @@ async fn main() -> anyhow::Result<()> {
             limit,
         }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
         Some(Commands::Topics) => commands::handle_topics(&config)?,
-        Some(Commands::Stats) => commands::handle_stats(&config)?,
-        Some(Commands::Health { topic }) => commands::handle_health(&config, topic)?,
         Some(Commands::Doctor { json, network, fix }) => {
             commands::handle_doctor(&config, json, network, fix).await?
         }
@@ -490,6 +507,16 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+/// Inject each `#[op]`-registered CLI subcommand into the top-level clap
+/// Command so `--help` and argument parsing work uniformly for migrated and
+/// legacy ops alike.
+fn augment_with_inventory(mut cmd: clap::Command) -> clap::Command {
+    for entry in inventory::iter::<OpsCliEntry>() {
+        cmd = cmd.subcommand((entry.build_clap)());
+    }
+    cmd
 }
 
 #[cfg(test)]
