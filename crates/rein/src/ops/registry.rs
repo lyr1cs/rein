@@ -94,6 +94,7 @@ pub const MCP_OPERATIONS: &[Operation] = &[
     op!(Mcp, "memory", "rein_canonicals"),
     op!(Mcp, "memory", "rein_evidence"),
     op!(Mcp, "knowledge", "rein_timeline"),
+    op!(Mcp, "knowledge", "rein_concept_history"),
 ];
 
 pub const REST_OPERATIONS: &[Operation] = &[
@@ -122,6 +123,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "memory", "DELETE /api/memories/{id}"),
     op!(Rest, "metrics", "GET /api/version"),
     op!(Rest, "memory", "GET /api/canonicals"),
+    op!(Rest, "memory", "GET /api/evidence"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -187,6 +189,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     MCP_OPERATIONS[26],
     MCP_OPERATIONS[27],
     MCP_OPERATIONS[28],
+    MCP_OPERATIONS[29],
     REST_OPERATIONS[0],
     REST_OPERATIONS[1],
     REST_OPERATIONS[2],
@@ -212,6 +215,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[22],
     REST_OPERATIONS[23],
     REST_OPERATIONS[24],
+    REST_OPERATIONS[25],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -267,18 +271,21 @@ mod tests {
     #[test]
     fn registry_counts_match_expected_values() {
         assert_eq!(cli_operations().len(), 33);
-        assert_eq!(mcp_operations().len(), 29);
+        // Phase 2.3: evidence phantom→real inventory (+1). rein_concept_history added as
+        // phantom rebalance (same pattern as rein_timeline in Task 9). 29→30.
+        assert_eq!(mcp_operations().len(), 30);
         // Phase 2.2 (H5 body-JSON landed): POST /api/ingest_session added
         // and POST /api/doctor moved from legacy to inventory. Both counted
         // here via the registry source-of-truth list.
         // Phase 2.3: GET /api/canonicals added (canonicals op migrated to #[op]).
-        assert_eq!(rest_operations().len(), 25);
+        // Phase 2.3: GET /api/evidence added (evidence op migrated to #[op]).
+        assert_eq!(rest_operations().len(), 26);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
-                mcp: 29,
-                rest: 25
+                mcp: 30,
+                rest: 26
             }
         );
     }
