@@ -2610,7 +2610,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
     #[test]
     fn support_matrix_doc_row_parity() {
         let doc =
-            include_str!("../../../../../../docs/reference/codex-subscription-proxy-support-matrix.md");
+            include_str!("../../../../docs/reference/codex-subscription-proxy-support-matrix.md");
         assert_eq!(
             render_support_matrix_rows(&support_matrix_rows()),
             extract_support_matrix_rows(doc),
