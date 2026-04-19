@@ -2202,4 +2202,76 @@ mod tests {
         let resp = handle_api_request(req, &config).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    // ---- Phase 2.3 M3: auth/body-cap regression matrix for new POST routes ----
+    //
+    // Phase 2.3 added six new POST REST routes to the inventory dispatcher.
+    // All declare `auth = "mutation_marker"` and are gated by the shared
+    // body-cap middleware. The two tests below form a table-driven matrix that
+    // asserts both invariants hold for every route, so a future refactor that
+    // accidentally bypasses H3 auth or the body-cap for a specific inventory
+    // route is caught immediately.
+
+    /// The six POST routes added in Phase 2.3, each migrated to the #[op]
+    /// inventory and declared with `auth = "mutation_marker"`.
+    const NEW_POST_ROUTES: &[&str] = &[
+        "/api/gc",
+        "/api/dedup",
+        "/api/dedup_concepts",
+        "/api/organize",
+        "/api/consolidate",
+        "/api/cleanup",
+    ];
+
+    #[tokio::test]
+    async fn new_post_routes_reject_missing_mutation_marker() {
+        // Mirrors `ingest_session_rejects_missing_mutation_marker`: build_post
+        // with `with_action = false`, call handle_rest_request_with_body, expect 403.
+        // Auth runs before body collection so body content is irrelevant here.
+        for route in NEW_POST_ROUTES {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("memories.db");
+            let config = test_config(&db_path);
+            let body = Bytes::from(r#"{}"#);
+            let req = build_post(route, false, &body);
+            let resp = handle_rest_request_with_body(&req, Some(body), &config)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{route} should 403 without x-rein-action: 1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_post_routes_reject_oversized_body() {
+        // Mirror image of `handle_api_request_auth_rejects_before_body_cap`
+        // (which proves missing marker → 403 even with a 2 MiB body). Here
+        // the marker IS present so auth passes; the body-cap gate fires next
+        // and must return 413. Uses handle_api_request (Full<Bytes>) so that
+        // collect_body_capped is exercised — handle_rest_request_with_body
+        // takes pre-collected bytes and would bypass the cap entirely.
+        use http_body_util::Full;
+        let oversized = vec![b'a'; 2 * 1024 * 1024];
+        for route in NEW_POST_ROUTES {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("memories.db");
+            let config = test_config(&db_path);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(*route)
+                .header("content-type", "application/json")
+                .header("x-rein-action", "1")
+                .body(Full::new(Bytes::from(oversized.clone())))
+                .unwrap();
+            let resp = handle_api_request(req, &config).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{route} should 413 for oversized body"
+            );
+        }
+    }
 }
