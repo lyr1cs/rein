@@ -1196,3 +1196,215 @@ impl OpsRuntime {
         })
     }
 }
+
+// ── cleanup ───────────────────────────────────────────────────────────────────
+
+/// Parameters for the cleanup op.
+///
+/// Mirrors the six fields of the legacy `CleanupParams` in `mcp/tools.rs`
+/// exactly (and the six flags on `Commands::Cleanup` in `main.rs`) so that
+/// existing MCP callers and CLI scripts see no regression.
+///
+/// `dry_run`, `all`, `exact_topics` use plain `bool` so clap treats them as
+/// flags without values, matching the old `Commands::Cleanup` arm.
+/// `#[serde(default)]` ensures JSON/MCP callers that omit them get `false`.
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct CleanupParams {
+    /// Optional single topic to clean.
+    #[serde(default)]
+    #[arg()]
+    pub topic: Option<String>,
+
+    /// Optional comma-separated topic list to clean.
+    #[serde(default, deserialize_with = "crate::mcp::tools::deserialize_option_string_list")]
+    #[arg(long, value_delimiter = ',')]
+    pub topics: Option<Vec<String>>,
+
+    /// Optional glob pattern for matching topics.
+    #[serde(default)]
+    #[arg(long)]
+    pub pattern: Option<String>,
+
+    /// Force processing all topics (default when no selector is provided).
+    #[serde(default)]
+    #[arg(long)]
+    pub all: bool,
+
+    /// Disable topic-variant grouping; use exact topic boundaries only.
+    #[serde(default)]
+    #[arg(long)]
+    pub exact_topics: bool,
+
+    /// Preview matched groups without writing changes.
+    #[serde(default)]
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Per-group detail line in the cleanup consolidation output.
+#[derive(Serialize, Clone, Debug)]
+pub struct CleanupGroupDetail {
+    pub canonical_topic: String,
+    pub source_topics: Vec<String>,
+    pub memory_count: usize,
+}
+
+/// Output of the cleanup op.
+#[derive(Serialize, Clone, Debug)]
+pub struct CleanupOutput {
+    /// Number of consolidation groups that contained memories.
+    pub groups_consolidated: usize,
+    /// Total memories replaced during consolidation.
+    pub memories_consolidated: usize,
+    /// Number of duplicate memories found during dedup scan.
+    pub duplicates_found: u32,
+    /// Number of duplicate memories removed (0 in dry_run mode).
+    pub duplicates_merged: u32,
+    /// Echoes the dry_run flag.
+    pub dry_run: bool,
+    /// Per-group detail (up to all groups; output formatting truncates at 8).
+    pub groups: Vec<CleanupGroupDetail>,
+}
+
+impl IntoJson for CleanupOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for CleanupOutput {
+    fn to_markdown(&self) -> String {
+        // Mirrors the pre-A1 `rein_cleanup` MCP non-compact output so MCP
+        // callers that parse the string continue to work.
+        if self.dry_run {
+            format!(
+                "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
+                self.groups_consolidated, self.memories_consolidated, self.duplicates_found
+            )
+        } else {
+            let mut text = format!(
+                "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
+                self.groups_consolidated,
+                self.memories_consolidated,
+                self.duplicates_merged,
+                self.duplicates_found
+            );
+            let visible: Vec<_> = self
+                .groups
+                .iter()
+                .filter(|g| g.memory_count > 0)
+                .take(8)
+                .collect();
+            for group in &visible {
+                if group.source_topics.len() > 1 {
+                    text.push_str(&format!(
+                        "\n- {} <= {} [{} memories]",
+                        group.canonical_topic,
+                        group.source_topics.join(", "),
+                        group.memory_count
+                    ));
+                } else {
+                    text.push_str(&format!(
+                        "\n- {} [{} memories]",
+                        group.canonical_topic, group.memory_count
+                    ));
+                }
+            }
+            let total_non_empty = self.groups.iter().filter(|g| g.memory_count > 0).count();
+            if total_non_empty > visible.len() {
+                text.push_str(&format!("\n... {} more groups", total_non_empty - visible.len()));
+            }
+            text
+        }
+    }
+}
+
+impl IntoCliText for CleanupOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirrors the pre-A1 `print_cleanup_report` CLI output verbatim so
+        // shell scripts that parse it continue to work.
+        if self.dry_run {
+            format!(
+                "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
+                self.groups_consolidated, self.memories_consolidated, self.duplicates_found
+            )
+        } else {
+            format!(
+                "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
+                self.groups_consolidated,
+                self.memories_consolidated,
+                self.duplicates_merged,
+                self.duplicates_found
+            )
+        }
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "cleanup",
+        category = "maintenance",
+        description = "One-click cleanup for memories: consolidate fragmented topics, deduplicate, and refresh adaptive state. Supports dry_run preview.",
+        mutating = true,
+        cli(name = "cleanup"),
+        mcp(name = "rein_cleanup"),
+        rest(method = "POST", path = "/api/cleanup"),
+        auth = "mutation_marker",
+    )]
+    pub fn cleanup(&self, params: CleanupParams) -> ReinResult<CleanupOutput> {
+        self.set_dry_run(params.dry_run);
+        let dry_run = self.dry_run();
+        let merge_variants = !params.exact_topics;
+        let all = params.all
+            || (params.topic.is_none()
+                && params.topics.as_ref().is_none_or(|t| t.is_empty())
+                && params.pattern.is_none());
+        let config = self.config.clone();
+
+        self.with_store(|store| {
+            let selected_topics = params.topics.clone().unwrap_or_default();
+            let groups = crate::ops::resolve_topic_groups(
+                store,
+                params.topic.as_deref(),
+                &selected_topics,
+                params.pattern.as_deref(),
+                all,
+                merge_variants,
+            )?;
+            if groups.is_empty() {
+                return Ok(CleanupOutput {
+                    groups_consolidated: 0,
+                    memories_consolidated: 0,
+                    duplicates_found: 0,
+                    duplicates_merged: 0,
+                    dry_run,
+                    groups: vec![],
+                });
+            }
+            // Compose at the business-function layer: call run_cleanup_sync
+            // directly (which internally does consolidation + dedup).
+            // Do NOT call self.consolidate() or self.dedup() — those would
+            // re-invoke set_dry_run and could override state.
+            let report =
+                crate::ops::run_cleanup_sync(store, &config, &groups, merge_variants, dry_run)?;
+            let details = report
+                .consolidation
+                .groups
+                .into_iter()
+                .map(|g| CleanupGroupDetail {
+                    canonical_topic: g.canonical_topic,
+                    source_topics: g.source_topics,
+                    memory_count: g.memory_count,
+                })
+                .collect();
+            Ok(CleanupOutput {
+                groups_consolidated: report.consolidation.groups_processed,
+                memories_consolidated: report.consolidation.memories_replaced,
+                duplicates_found: report.duplicates_found,
+                duplicates_merged: report.duplicates_merged,
+                dry_run,
+                groups: details,
+            })
+        })
+    }
+}
