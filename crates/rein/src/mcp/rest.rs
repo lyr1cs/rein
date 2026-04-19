@@ -572,10 +572,14 @@ async fn try_dispatch_inventory_rest(
                 )
                 .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response")),
         ),
-        Err(e) => Some(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Err(e) => {
+            // A1 H4 (audit 2026-04-19): honor ReinError::kind() so handlers
+            // that tag BadRequest / NotFound / Forbidden / Conflict surface
+            // the right HTTP status to REST clients. Pre-H4 this was a
+            // hardcoded 500 regardless of error kind.
+            let status = e.kind().status_code();
+            Some(error_response(status, &e.to_string()))
+        }
     }
 }
 
