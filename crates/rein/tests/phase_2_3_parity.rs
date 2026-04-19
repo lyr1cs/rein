@@ -530,3 +530,87 @@ fn intelligent_merge_try_cli_only_surface() {
         assert!(out.contains("incoming merge candidate"), "incoming summary missing from output");
     });
 }
+
+#[test]
+fn migrate_cli_only_surface_applies_schema() {
+    use rein::ops::OpsCliEntry;
+    use rusqlite::Connection;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+
+    // Build a minimal QMD SQLite database in the tempdir.
+    let qmd_path = tmp.path().join("qmd.sqlite");
+    {
+        let conn = Connection::open(&qmd_path).expect("open qmd db");
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                id INTEGER PRIMARY KEY,
+                collection TEXT NOT NULL,
+                path TEXT NOT NULL,
+                title TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE content (
+                hash TEXT PRIMARY KEY,
+                doc TEXT NOT NULL
+            );",
+        )
+        .expect("create qmd schema");
+
+        conn.execute(
+            "INSERT INTO content (hash, doc) VALUES (?1, ?2)",
+            rusqlite::params!["h1", "This is a test document imported via rein migrate."],
+        )
+        .expect("insert content");
+        conn.execute(
+            "INSERT INTO documents (id, collection, path, title, hash, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![1, "test-collection", "/test/doc.md", "Test Doc", "h1", 1],
+        )
+        .expect("insert document");
+    }
+
+    // The migrate op must be registered as CLI-only (no MCP, no REST entry).
+    let cli_entry = inventory::iter::<OpsCliEntry>()
+        .find(|e| e.name == "migrate")
+        .expect("migrate CLI entry registered");
+
+    assert!(
+        !inventory::iter::<rein::ops::OpsMcpEntry>().any(|e| e.op_name == "migrate"),
+        "migrate must NOT be registered as MCP"
+    );
+    assert!(
+        !inventory::iter::<rein::ops::OpsRestEntry>().any(|e| e.op_name == "migrate"),
+        "migrate must NOT be registered as REST"
+    );
+
+    // CLI invocation via the from-qmd path using the temp QMD database.
+    // Use multi-thread runtime because the migrate handler uses block_in_place
+    // (matching the production CLI runtime flavor).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio rt");
+    rt.block_on(async {
+        let runtime = Arc::new(rein::ops::OpsRuntime::for_cli(make_config()));
+        let qmd_path_str = qmd_path.to_string_lossy().to_string();
+        let matches = (cli_entry.build_clap)()
+            .try_get_matches_from(["migrate", "--from-qmd", &qmd_path_str])
+            .expect("CLI arg parse");
+        let out = (cli_entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI migrate invoke");
+        // Output should mention the migration completion.
+        assert!(
+            out.contains("Migration complete") || out.contains("migrated") || out.contains("chunks") || out.contains("documents"),
+            "migrate output must describe result; got: {out}"
+        );
+    });
+}
