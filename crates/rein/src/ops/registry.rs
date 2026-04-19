@@ -73,7 +73,7 @@ pub const MCP_OPERATIONS: &[Operation] = &[
     op!(Mcp, "memory", "rein_list_topics"),
     op!(Mcp, "memory", "rein_stats"),
     op!(Mcp, "memory", "rein_health"),
-    op!(Mcp, "maintenance", "rein_consolidate"),
+    op!(Mcp, "knowledge", "rein_consolidate"),
     op!(Mcp, "maintenance", "rein_dedup"),
     op!(Mcp, "maintenance", "rein_cleanup"),
     op!(Mcp, "memory", "rein_recent"),
@@ -131,6 +131,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "maintenance", "POST /api/dedup"),
     op!(Rest, "knowledge", "POST /api/dedup_concepts"),
     op!(Rest, "knowledge", "POST /api/organize"),
+    op!(Rest, "knowledge", "POST /api/consolidate"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -228,6 +229,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[27],
     REST_OPERATIONS[28],
     REST_OPERATIONS[29],
+    REST_OPERATIONS[30],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -297,13 +299,14 @@ mod tests {
         // Phase 2.3: POST /api/dedup added (dedup op migrated to #[op] inventory).
         // Phase 2.3: POST /api/dedup_concepts added (dedup_concepts migrated to #[op] inventory).
         // Phase 2.3: POST /api/organize added (organize op migrated to #[op] inventory).
-        assert_eq!(rest_operations().len(), 30);
+        // Phase 2.3: POST /api/consolidate added (consolidate op migrated to #[op] inventory).
+        assert_eq!(rest_operations().len(), 31);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 31,
-                rest: 30
+                rest: 31
             }
         );
     }

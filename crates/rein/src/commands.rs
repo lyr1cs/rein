@@ -42,39 +42,8 @@ pub fn resolve_cleanup_scope(
     Ok(groups)
 }
 
-/// Print a human-readable message after a consolidation run.
-pub fn print_consolidation_report(report: &ops::ConsolidateReport, dry_run: bool) {
-    if dry_run {
-        println!(
-            "Dry run: {} groups, {} memories would be consolidated",
-            report.groups_processed, report.memories_replaced
-        );
-    } else {
-        println!(
-            "Consolidated {} groups ({} memories)",
-            report.groups_processed, report.memories_replaced
-        );
-    }
-
-    for group in report.groups.iter().filter(|g| g.memory_count > 0) {
-        let sources = if group.source_topics.len() > 1 {
-            format!(" <= {}", group.source_topics.join(", "))
-        } else {
-            String::new()
-        };
-        if dry_run {
-            println!(
-                "- {}{} [{} memories]",
-                group.canonical_topic, sources, group.memory_count
-            );
-        } else if let Some(created_id) = &group.created_id {
-            println!(
-                "- {}{} [{} memories] -> {}",
-                group.canonical_topic, sources, group.memory_count, created_id
-            );
-        }
-    }
-}
+// print_consolidation_report removed — rein consolidate migrated to #[op] inventory.
+// The formatting logic now lives in ConsolidateOutput::to_cli_text() (ops/handlers/maintenance.rs).
 
 /// Print a human-readable message after a cleanup run.
 pub fn print_cleanup_report(report: &ops::CleanupReport, dry_run: bool) {
@@ -432,44 +401,8 @@ pub async fn handle_warmup(config: &ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_consolidate(
-    config: &ReinConfig,
-    topic: Option<String>,
-    summary: Option<String>,
-    topics: Option<Vec<String>>,
-    pattern: Option<String>,
-    all: bool,
-    merge_variants: bool,
-    dry_run: bool,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let selected_topics = topics.unwrap_or_default();
-    let groups = ops::resolve_topic_groups(
-        &store,
-        topic.as_deref(),
-        &selected_topics,
-        pattern.as_deref(),
-        all,
-        merge_variants,
-    )?;
-
-    if groups.is_empty() {
-        if let Some(topic) = topic {
-            println!("No memories found in topic '{topic}'");
-        } else if let Some(pattern) = pattern {
-            println!("No topics matched pattern '{pattern}'");
-        } else {
-            println!("No topics matched the selected scope");
-        }
-    } else {
-        let report =
-            ops::run_consolidation_async(&store, config, &groups, summary.as_deref(), dry_run)
-                .await?;
-        print_consolidation_report(&report, dry_run);
-    }
-    Ok(())
-}
+// handle_consolidate removed — rein consolidate migrated to #[op] inventory.
+// See ops/handlers/maintenance.rs for the new implementation.
 
 // handle_dedup removed — rein dedup migrated to #[op] inventory.
 // See ops/handlers/maintenance.rs for the new implementation.

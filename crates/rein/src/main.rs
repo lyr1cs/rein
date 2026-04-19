@@ -89,28 +89,9 @@ enum Commands {
     // main() intercepts it via OpsCliEntry before the derived Parser path, and
     // the inventory CLI dispatcher honors the op's `set_exit_code(1)` call so
     // `rein doctor` still exits 1 on any FAIL check for CI scripts.
-    /// Consolidate a topic into a single memory
-    Consolidate {
-        /// Single topic to consolidate (legacy mode)
-        topic: Option<String>,
-        #[arg(short, long)]
-        summary: Option<String>,
-        /// Comma-separated topic list
-        #[arg(long, value_delimiter = ',')]
-        topics: Option<Vec<String>>,
-        /// Glob pattern for topics, e.g. "rmcp*"
-        #[arg(long)]
-        pattern: Option<String>,
-        /// Consolidate all topics
-        #[arg(long)]
-        all: bool,
-        /// Group case/space/hyphen variants before consolidating
-        #[arg(long)]
-        merge_variants: bool,
-        /// Preview matched groups without writing changes
-        #[arg(long)]
-        dry_run: bool,
-    },
+    // Consolidate migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "consolidate" via OpsCliEntry before the derived-enum path.
+    // MCP: rein_consolidate. REST: POST /api/consolidate. auth = "mutation_marker".
     // Dedup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "dedup" via OpsCliEntry before the derived-enum path.
     // MCP: rein_dedup. REST: POST /api/dedup. auth = "mutation_marker".
@@ -394,27 +375,7 @@ async fn main() -> anyhow::Result<()> {
             commands::handle_hook(&config, action_str).await?
         }
         Some(Commands::Init { dry_run, proxy }) => commands::handle_init(dry_run, proxy)?,
-        Some(Commands::Consolidate {
-            topic,
-            summary,
-            topics,
-            pattern,
-            all,
-            merge_variants,
-            dry_run,
-        }) => {
-            commands::handle_consolidate(
-                &config,
-                topic,
-                summary,
-                topics,
-                pattern,
-                all,
-                merge_variants,
-                dry_run,
-            )
-            .await?
-        }
+        // Commands::Consolidate removed — intercepted above via OpsCliEntry.
         Some(Commands::Cleanup {
             topic,
             topics,
