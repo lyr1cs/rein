@@ -173,12 +173,8 @@ enum Commands {
     },
     // Canonicals migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "canonicals" via OpsCliEntry before the derived-enum path.
-    /// Show evidence snapshots for a canonical memory
-    Evidence {
-        canonical_id: String,
-        #[arg(short, long, default_value = "20")]
-        limit: usize,
-    },
+    // Evidence migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "evidence" via OpsCliEntry before the derived-enum path.
     /// Show recent dedup decisions
     DedupLog {
         #[arg(long)]
@@ -477,10 +473,6 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Some(Commands::Evidence {
-            canonical_id,
-            limit,
-        }) => commands::handle_evidence(&config, canonical_id, limit)?,
         Some(Commands::DedupLog { canonical, limit }) => {
             commands::handle_dedup_log(&config, canonical, limit)?
         }
