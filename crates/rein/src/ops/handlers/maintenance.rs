@@ -757,6 +757,86 @@ impl OpsRuntime {
     }
 }
 
+// ── organize ─────────────────────────────────────────────────────────────────
+
+fn default_max_links() -> usize {
+    5
+}
+
+/// Params for the organize op.
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone)]
+pub struct OrganizeParams {
+    /// Maximum number of related-memory links to create per memory (default 5).
+    #[serde(default = "default_max_links")]
+    #[arg(long, default_value = "5")]
+    pub max_links: usize,
+}
+
+impl Default for OrganizeParams {
+    fn default() -> Self {
+        Self {
+            max_links: default_max_links(),
+        }
+    }
+}
+
+/// Output of the organize op.
+#[derive(Serialize, Clone, Debug)]
+pub struct OrganizeOutput {
+    /// Number of new bidirectional links created between related memories.
+    pub links_created: usize,
+}
+
+impl IntoJson for OrganizeOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for OrganizeOutput {
+    fn to_markdown(&self) -> String {
+        // Mirrors the pre-A1 `rein_organize` MCP non-compact output so MCP callers
+        // that parse the string continue to work.
+        format!(
+            "Organized: created {} new links between related memories",
+            self.links_created
+        )
+    }
+}
+
+impl IntoCliText for OrganizeOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirror the pre-A1 `handle_organize` CLI output verbatim so shell scripts
+        // that parse this text continue to work.
+        format!(
+            "Organized: created {} new links between related memories",
+            self.links_created
+        )
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "organize",
+        category = "knowledge",
+        description = "Scan all memories and create bidirectional links between related ones based on content similarity. Returns the number of new links created.",
+        mutating = true,
+        cli(name = "organize"),
+        mcp(name = "rein_organize"),
+        rest(method = "POST", path = "/api/organize"),
+        auth = "mutation_marker",
+    )]
+    pub fn organize(&self, params: OrganizeParams) -> ReinResult<OrganizeOutput> {
+        let max_links = params.max_links;
+        let config = self.config.clone();
+        self.with_store(|store| {
+            let threshold = crate::ops::effective_dedup_threshold(store, &config);
+            let links_created = store.organize(threshold, max_links)?;
+            Ok(OrganizeOutput { links_created })
+        })
+    }
+}
+
 // ── migrate ──────────────────────────────────────────────────────────────────
 
 /// Params for the migrate command.

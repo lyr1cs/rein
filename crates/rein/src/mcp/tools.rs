@@ -220,13 +220,7 @@ pub struct RecentParams {
     pub limit: Option<usize>,
 }
 
-/// Parameters for rein_organize tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct OrganizeParams {
-    /// Maximum links per memory (default 5).
-    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
-    pub max_links: Option<usize>,
-}
+// OrganizeParams removed — rein_organize migrated to #[op] inventory (see ops/handlers/maintenance.rs).
 
 /// Parameters for rein_memoir_create tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -1103,35 +1103,7 @@ impl ReinServer {
         }
     }
 
-    /// Auto-link all memories based on content similarity. Creates bidirectional related_ids links.
-    #[tool(
-        name = "rein_organize",
-        description = "Scan all memories and create bidirectional links between related ones based on content similarity. Returns the number of new links created."
-    )]
-    fn rein_organize(&self, Parameters(params): Parameters<OrganizeParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let max_links = params.max_links.unwrap_or(5);
-        let compact = self.compact();
-
-        let result = self.with_store(|store| {
-            // A1: prefer adaptive threshold over static config.
-            let threshold = crate::ops::effective_dedup_threshold(store, &self.config);
-            store.organize(threshold, max_links)
-        });
-
-        match result {
-            Ok(links) => {
-                let mut text = if compact {
-                    format!("links:{links}")
-                } else {
-                    format!("Organized: created {links} new links between related memories")
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    // rein_organize migrated to #[op] inventory (see ops/handlers/maintenance.rs).
 
     /// View a timeline of events (episodes, concept changes, memory creation) in a date range.
     #[tool(
