@@ -357,13 +357,17 @@ fn check_cli_registry() -> DoctorCheck {
 
 fn check_mcp_registry() -> DoctorCheck {
     let registry_count = registry::mcp_operations().len();
-    let source_count = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
+    // A1: migrated tools register via OpsMcpEntry inventory and are served by
+    // the custom ServerHandler impl, not via `#[tool(...)]` on ReinServer.
+    let inventory_count = inventory::iter::<crate::ops::OpsMcpEntry>().count();
+    let derived_count = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
+    let source_count = derived_count + inventory_count;
     if registry_count != source_count {
         return fail_in(
             DoctorCategory::Architecture,
             "mcp_registry",
             format!(
-                "registry has {registry_count} MCP tools but src/mcp/server.rs exposes {source_count}"
+                "registry has {registry_count} MCP tools but src/mcp/server.rs exposes {derived_count} derived + {inventory_count} inventory = {source_count}"
             ),
         );
     }
@@ -1718,10 +1722,9 @@ provider = "inherit"
         let derived = count_cli_operations_in_source(include_str!("main.rs"));
         let inventory_count = inventory::iter::<crate::ops::OpsCliEntry>().count();
         assert_eq!(derived + inventory_count, registry::cli_operations().len());
-        assert_eq!(
-            count_mcp_tools_in_source(include_str!("mcp/server.rs")),
-            registry::mcp_operations().len()
-        );
+        let derived_mcp = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
+        let inventory_mcp = inventory::iter::<crate::ops::OpsMcpEntry>().count();
+        assert_eq!(derived_mcp + inventory_mcp, registry::mcp_operations().len());
         let derived_rest = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
         let inventory_rest = inventory::iter::<crate::ops::OpsRestEntry>().count();
         assert_eq!(derived_rest + inventory_rest, registry::rest_operations().len());
