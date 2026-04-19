@@ -71,6 +71,10 @@ pub struct OpsMcpEntry {
     pub op_name: &'static str,
     pub mcp_name: &'static str,
     pub description: &'static str,
+    /// True when the op writes/mutates state (e.g. gc, dedup, consolidate,
+    /// cleanup). Used by the MCP adapter to reset the non-store counter instead
+    /// of incrementing it, preserving pre-A1 nudge semantics.
+    pub mutating: bool,
     pub input_schema: fn() -> schemars::Schema,
     pub invoke: fn(
         runtime: Arc<OpsRuntime>,
