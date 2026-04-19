@@ -152,6 +152,37 @@ async fn stats_rest_invoke_fn_pointer_returns_json() {
     assert!(v["ltm_count"].is_number());
 }
 
+#[test]
+fn adaptive_status_registers_on_all_three_surfaces() {
+    let cli: Vec<&OpsCliEntry> = inventory::iter::<OpsCliEntry>()
+        .filter(|e| e.op_name == "adaptive_status")
+        .collect();
+    assert_eq!(cli.len(), 1);
+    assert_eq!(cli[0].name, "adaptive-status");
+
+    let mcp: Vec<&OpsMcpEntry> = inventory::iter::<OpsMcpEntry>()
+        .filter(|e| e.op_name == "adaptive_status")
+        .collect();
+    assert_eq!(mcp.len(), 1);
+    assert_eq!(mcp[0].mcp_name, "rein_adaptive_status");
+
+    let rest: Vec<&OpsRestEntry> = inventory::iter::<OpsRestEntry>()
+        .filter(|e| e.op_name == "adaptive_status")
+        .collect();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].path_template, "/api/adaptive");
+    assert_eq!(rest[0].method, hyper::Method::GET);
+
+    let meta: Vec<&OpsMetadata> = inventory::iter::<OpsMetadata>()
+        .filter(|e| e.name == "adaptive_status")
+        .collect();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].category, "adaptive");
+    assert!(meta[0].cli_visible);
+    assert!(meta[0].mcp_visible);
+    assert!(meta[0].rest_visible);
+}
+
 #[tokio::test]
 async fn health_rest_preserves_legacy_top_level_health_key() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

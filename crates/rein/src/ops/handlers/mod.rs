@@ -4,4 +4,5 @@
 //! in that category. Phase 1 adds `diagnostics` (stats + health). Phase 2
 //! migrates the remaining categories one file at a time.
 
+pub mod adaptive;
 pub mod diagnostics;

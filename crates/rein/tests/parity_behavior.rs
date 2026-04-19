@@ -185,6 +185,51 @@ async fn health_parity_rest_query_filter_matches_mcp_args() {
     );
 }
 
+#[tokio::test]
+async fn adaptive_status_parity_mcp_and_rest_share_shape() {
+    let mcp = invoke_mcp("adaptive_status", Value::Object(Default::default())).await;
+    let (rest_status, rest) = invoke_rest("adaptive_status", "").await;
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    let mcp_obj = mcp.as_object().expect("adaptive_status MCP is an object");
+    let rest_obj = rest.as_object().expect("adaptive_status REST is an object");
+
+    let mcp_keys: std::collections::BTreeSet<_> = mcp_obj.keys().collect();
+    let rest_keys: std::collections::BTreeSet<_> = rest_obj.keys().collect();
+    assert_eq!(
+        mcp_keys, rest_keys,
+        "MCP and REST adaptive_status payloads must expose the same top-level keys"
+    );
+
+    // Contract fields the Adaptive GUI page reads. If any of these disappear,
+    // the Neural Wiki dashboard panels go blank.
+    for required in [
+        "learned_alphas",
+        "reranker_weights",
+        "cluster_info",
+        "tier_boundaries",
+        "event_counts",
+        "survival_curves",
+        "dedup_thresholds",
+        "cluster_profiles",
+    ] {
+        assert!(
+            mcp_obj.contains_key(required),
+            "MCP adaptive_status missing `{required}`"
+        );
+        assert!(
+            rest_obj.contains_key(required),
+            "REST adaptive_status missing `{required}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn adaptive_status_parity_cli_dispatch_runs_to_completion() {
+    let _ = invoke_cli("adaptive_status", &[]).await;
+}
+
 fn json_type_tag(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
