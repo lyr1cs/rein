@@ -177,23 +177,8 @@ pub struct ForgetParams {
 // DedupParams removed — rein_dedup migrated to #[op] inventory.
 // See ops/handlers/maintenance.rs for the new DedupParams + DedupOutput structs.
 
-/// Parameters for rein_cleanup tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CleanupParams {
-    /// Optional single topic to clean.
-    pub topic: Option<String>,
-    /// Optional topic list to clean.
-    #[serde(default, deserialize_with = "deserialize_option_string_list")]
-    pub topics: Option<Vec<String>>,
-    /// Optional glob pattern for matching topics.
-    pub pattern: Option<String>,
-    /// If true, process all topics.
-    pub all: Option<bool>,
-    /// If true, keep exact topic boundaries instead of grouping variants.
-    pub exact_topics: Option<bool>,
-    /// If true, only preview matched groups without writing.
-    pub dry_run: Option<bool>,
-}
+// CleanupParams removed — rein_cleanup migrated to #[op] inventory.
+// See ops/handlers/maintenance.rs for the new CleanupParams + CleanupOutput structs.
 
 /// Parameters for rein_recent tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -361,10 +346,12 @@ mod tests {
 
     #[test]
     fn cleanup_params_accept_topic_array_with_commas() {
-        let params: CleanupParams = serde_json::from_value(json!({
-            "topics": ["alpha, beta", "gamma", " "]
-        }))
-        .unwrap();
+        // CleanupParams migrated to ops/handlers/maintenance.rs — test re-targeted.
+        let params: rein::ops::handlers::maintenance::CleanupParams =
+            serde_json::from_value(json!({
+                "topics": ["alpha, beta", "gamma", " "]
+            }))
+            .unwrap();
 
         assert_eq!(
             params.topics,
