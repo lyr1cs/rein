@@ -427,11 +427,18 @@ fn emit_rest_block(
     let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
 
     let prep = match &fi.params_ty {
+        // A1 H2 (audit 2026-04-19): tag query-string parse failures as
+        // BadRequest so REST clients see 400 instead of 500. The H4 plumbing
+        // carries the kind through ReinError::with_kind; the REST dispatcher
+        // in mcp/rest.rs consults `.kind()` to pick the status code.
         Some(ty) => quote! {
             let params: #ty = ::serde_urlencoded::from_str(&_query)
-                .map_err(|e| ::rein::types::ReinError::Config(
-                    format!("query parse error: {e}")
-                ))?;
+                .map_err(|e| {
+                    ::rein::types::ReinError::Config(
+                        format!("query parse error: {e}")
+                    )
+                    .with_kind(::rein::types::OpsErrorKind::BadRequest)
+                })?;
         },
         None => quote! {},
     };
