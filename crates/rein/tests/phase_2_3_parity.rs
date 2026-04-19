@@ -437,3 +437,96 @@ async fn gc_dry_run_parity_across_surfaces_respects_auth() {
     let rest_decayed = rest_json["decayed"].as_u64().expect("REST gc must have `decayed`");
     assert_eq!(mcp_decayed, rest_decayed, "MCP and REST must agree on decayed count");
 }
+
+#[test]
+fn intelligent_merge_try_cli_only_surface() {
+    use rein::ops::{OpsCliEntry, OpsRuntime};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+
+    // Seed two memories directly.
+    {
+        let cfg = make_config();
+        let store = cfg.open_store().expect("open store for seeding");
+
+        let make_mem = |id: &str, summary: &str| Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "merge-test".to_string(),
+            summary: summary.to_string(),
+            content: summary.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.0,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 0.5,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: Default::default(),
+            cluster_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        };
+
+        store.store(make_mem("imt_a", "existing merge candidate")).expect("seed imt_a");
+        store.store(make_mem("imt_b", "incoming merge candidate")).expect("seed imt_b");
+    }
+
+    // The op must be registered as CLI-only (no MCP, no REST entry).
+    let cli_entry = inventory::iter::<OpsCliEntry>()
+        .find(|e| e.name == "intelligent-merge-try")
+        .expect("intelligent-merge-try CLI entry registered");
+
+    // No MCP entry for this op.
+    assert!(
+        !inventory::iter::<rein::ops::OpsMcpEntry>().any(|e| e.op_name == "intelligent_merge_try"),
+        "intelligent_merge_try must NOT be registered as MCP"
+    );
+
+    // No REST entry for this op.
+    assert!(
+        !inventory::iter::<rein::ops::OpsRestEntry>().any(|e| e.op_name == "intelligent_merge_try"),
+        "intelligent_merge_try must NOT be registered as REST"
+    );
+
+    // CLI surface invocation (no LLM configured → None path, but output shape must be correct).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio rt");
+    rt.block_on(async {
+        let runtime = Arc::new(OpsRuntime::for_cli(make_config()));
+        let matches = (cli_entry.build_clap)()
+            .try_get_matches_from(["intelligent-merge-try", "imt_a", "imt_b"])
+            .expect("CLI arg parse");
+        let out = (cli_entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI intelligent-merge-try invoke");
+        // Without an LLM key, verdict is None — the output must contain the "no LLM" message.
+        assert!(
+            out.contains("classifier returned None") || out.contains("verdict"),
+            "output must contain either verdict or no-LLM message; got: {out}"
+        );
+        // Summaries must be in output.
+        assert!(out.contains("existing merge candidate"), "existing summary missing from output");
+        assert!(out.contains("incoming merge candidate"), "incoming summary missing from output");
+    });
+}
