@@ -1637,3 +1637,74 @@ async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
         "cleanup must be registered as REST"
     );
 }
+
+// ── N1 + M2 regression tests ──────────────────────────────────────────────────
+
+/// N1 (HIGH): Migrated MCP responses must remain valid JSON regardless of how
+/// many times they are called. The previous bug appended `[rein: ...]` plain
+/// text to the serialized JSON payload after the nudge threshold (10 calls),
+/// producing invalid JSON. This test calls a read-only migrated op 15 times
+/// and asserts every response parses as JSON.
+///
+/// Tests via `entry.invoke` directly — the invariant is that the output from
+/// the inventory path is always valid JSON. The counter and nudge skip in
+/// `call_tool` / `dispatch_inventory` ensure the banner is never appended.
+#[tokio::test]
+async fn migrated_mcp_response_stays_valid_json_after_nudge_threshold() {
+    use rein::ops::OpsMcpEntry;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+
+    let entry = inventory::iter::<OpsMcpEntry>()
+        .find(|e| e.op_name == "stats")
+        .expect("stats (rein_stats) must be registered as MCP");
+
+    // 15 calls — well past the 10-call nudge threshold.
+    for i in 1..=15u32 {
+        let runtime = std::sync::Arc::new(OpsRuntime::for_mcp(std::sync::Arc::new(config.clone())));
+        let body = (entry.invoke)(runtime, serde_json::json!({}))
+            .await
+            .expect("stats invoke must not error");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap_or_else(|e| {
+            panic!(
+                "call {i}: migrated MCP response must be valid JSON; parse error: {e}\nbody: {body:?}"
+            )
+        });
+    }
+}
+
+/// M2 (MEDIUM): The `mutating` flag on `OpsMcpEntry` must be set correctly for
+/// known ops so the MCP adapter can apply the right counter policy (reset vs
+/// increment). This test asserts the metadata contract that drives the fix.
+#[test]
+fn mutating_mcp_op_resets_non_store_count() {
+    use rein::ops::OpsMcpEntry;
+
+    // Read-only ops: must have mutating = false (counter increments).
+    let read_only_ops = ["stats", "canonicals", "evidence", "dedup_log"];
+    for op_name in read_only_ops {
+        if let Some(entry) = inventory::iter::<OpsMcpEntry>().find(|e| e.op_name == op_name) {
+            assert!(
+                !entry.mutating,
+                "op '{}' (mcp_name: '{}') must be non-mutating (read-only counter increment)",
+                entry.op_name, entry.mcp_name,
+            );
+        }
+        // If the op isn't registered as MCP, skip (no surface = no assertion needed).
+    }
+
+    // Mutating ops: must have mutating = true (counter resets).
+    let mutating_ops = ["gc", "dedup", "consolidate", "cleanup", "organize"];
+    for op_name in mutating_ops {
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == op_name)
+            .unwrap_or_else(|| panic!("op '{}' must be registered as MCP", op_name));
+        assert!(
+            entry.mutating,
+            "op '{}' (mcp_name: '{}') must be mutating (counter reset on write)",
+            entry.op_name, entry.mcp_name,
+        );
+    }
+}

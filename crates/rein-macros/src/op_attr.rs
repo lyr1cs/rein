@@ -162,7 +162,7 @@ fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> 
     let mcp_block = attr
         .mcp
         .as_ref()
-        .map(|mcp| emit_mcp_block(mcp, op_name, description, fn_name, fi));
+        .map(|mcp| emit_mcp_block(mcp, op_name, description, fn_name, fi, mutating));
     let rest_block = attr
         .rest
         .as_ref()
@@ -371,6 +371,7 @@ fn emit_mcp_block(
     description: &str,
     fn_name: &syn::Ident,
     fi: &FnInfo,
+    mutating: bool,
 ) -> TokenStream {
     let mcp_name = &mcp.name;
     let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
@@ -430,6 +431,7 @@ fn emit_mcp_block(
                 op_name: #op_name,
                 mcp_name: #mcp_name,
                 description: #description,
+                mutating: #mutating,
                 input_schema: __op_mcp_schema,
                 invoke: __op_mcp_invoke,
             }
