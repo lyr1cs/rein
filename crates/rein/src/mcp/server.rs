@@ -69,6 +69,37 @@ impl ReinServer {
         let store = self.config.open_store().map_err(|e| format!("{e}"))?;
         f(&store).map_err(|e| format!("{e}"))
     }
+
+    /// Dispatch an inventory-registered op by MCP tool name without requiring
+    /// a `RequestContext`. Applies the same counter policy and nudge-skip logic
+    /// as `call_tool`. Used by regression tests that cannot construct a full
+    /// rmcp `RequestContext`.
+    #[cfg(test)]
+    pub async fn dispatch_inventory(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> Option<Result<String, String>> {
+        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .find(|e| e.mcp_name == tool_name)?;
+
+        if entry.mutating {
+            self.non_store_count.store(0, Ordering::Relaxed);
+        } else {
+            self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
+            std::sync::Arc::new(self.config.clone()),
+        ));
+        Some((entry.invoke)(runtime, args).await.map_err(|e| e.to_string()))
+    }
+
+    /// Read the current non-store counter value. Used by regression tests.
+    #[cfg(test)]
+    pub fn non_store_count(&self) -> u32 {
+        self.non_store_count.load(Ordering::Relaxed)
+    }
 }
 
 const HTTP_SESSION_COOKIE: &str = "rein_http_token";
@@ -1120,12 +1151,24 @@ impl ServerHandler for ReinServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
         let tool_name = request.name.as_ref();
 
+        // Inventory-dispatched (migrated #[op]) tools: apply mutating-aware
+        // counter policy and return structured JSON without the nudge banner.
+        // Legacy #[tool] handlers manage non_store_count themselves; they also
+        // append the nudge via maybe_nudge at the end of their own return string.
+        // Concatenating the banner to a serialized JSON payload (inventory path)
+        // would produce invalid JSON — so the nudge is intentionally skipped here.
         if let Some(entry) = inventory::iter::<crate::ops::OpsMcpEntry>()
             .find(|e| e.mcp_name == tool_name)
         {
+            // Mutating ops reset the counter (write); read-ish ops increment it.
+            if entry.mutating {
+                self.non_store_count.store(0, Ordering::Relaxed);
+            } else {
+                self.non_store_count.fetch_add(1, Ordering::Relaxed);
+            }
+
             let args_value = request
                 .arguments
                 .clone()
@@ -1135,13 +1178,9 @@ impl ServerHandler for ReinServer {
                 std::sync::Arc::new(self.config.clone()),
             ));
             return match (entry.invoke)(runtime, args_value).await {
-                Ok(body) => {
-                    let mut text = body;
-                    self.maybe_nudge(&mut text);
-                    Ok(rmcp::model::CallToolResult::success(vec![
-                        rmcp::model::Content::text(text),
-                    ]))
-                }
+                Ok(body) => Ok(rmcp::model::CallToolResult::success(vec![
+                    rmcp::model::Content::text(body),
+                ])),
                 Err(e) => Ok(rmcp::model::CallToolResult::error(vec![
                     rmcp::model::Content::text(e.to_string()),
                 ])),
