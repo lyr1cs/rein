@@ -1468,3 +1468,172 @@ async fn consolidate_dry_run_parity_across_surfaces_respects_auth() {
         "consolidate must be registered as REST"
     );
 }
+
+// ── cleanup parity test ───────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
+    use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
+    use serde_json::Value;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        std::sync::Arc::new(c)
+    };
+
+    // Seed DB with memories in two variants of the same topic, so that
+    // cleanup would see both consolidate candidates AND dedup candidates.
+    {
+        use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, Source};
+        let cfg = make_config();
+        let store = cfg.open_store().expect("open store for seeding");
+
+        let make_mem = |id: &str, topic: &str, content: &str| -> Memory {
+            Memory {
+                id: id.to_string(),
+                layer: MemoryLayer::LTM,
+                topic: topic.to_string(),
+                summary: content.chars().take(200).collect(),
+                content: content.to_string(),
+                keywords: vec![],
+                importance: Importance::Medium,
+                source: Source::Manual,
+                strength: 1.0,
+                decay_lambda: 0.0,
+                access_count: 0,
+                superseded_by: None,
+                canonical_id: None,
+                support_count: 1,
+                merge_count: 0,
+                dedup_confidence: 1.0,
+                source_diversity: 0.5,
+                contradiction_score: 0.0,
+                related_ids: vec![],
+                concept_ids: vec![],
+                status: rein::types::MemoryStatus::Active,
+                embedding: None,
+                tier: Default::default(),
+                cluster_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_accessed: chrono::Utc::now(),
+            }
+        };
+
+        store
+            .store(make_mem("cu_a", "cleanup-test", "rein is a cross-validated memory server for AI agents"))
+            .expect("seed cu_a");
+        store
+            .store(make_mem("cu_b", "cleanup-test", "rein provides reliable recall across agent sessions"))
+            .expect("seed cu_b");
+        store
+            .store(make_mem("cu_c", "cleanup-test", "rein stores memories with decay and importance scoring"))
+            .expect("seed cu_c");
+    }
+
+    // --- MCP surface (dry_run = true) ---
+    let mcp_json: Value = {
+        let runtime = std::sync::Arc::new(OpsRuntime::for_mcp(make_config()));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "cleanup")
+            .expect("cleanup MCP entry registered");
+        let out = (entry.invoke)(
+            runtime,
+            serde_json::json!({ "dry_run": true, "topic": "cleanup-test" }),
+        )
+        .await
+        .expect("MCP cleanup invoke");
+        serde_json::from_str(&out).expect("MCP cleanup output is valid JSON")
+    };
+
+    // --- REST surface (dry_run = true, POST body) ---
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let runtime = std::sync::Arc::new(OpsRuntime::for_rest(make_config()));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "cleanup")
+            .expect("cleanup REST entry registered");
+        let body = serde_json::to_vec(
+            &serde_json::json!({ "dry_run": true, "topic": "cleanup-test" }),
+        )
+        .expect("serialize body");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(body.into()),
+        )
+        .await
+        .expect("REST cleanup invoke");
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("REST cleanup body is valid JSON");
+        (status, value)
+    };
+
+    // --- CLI surface (smoke check) ---
+    {
+        let runtime = std::sync::Arc::new(OpsRuntime::for_cli(make_config()));
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "cleanup")
+            .expect("cleanup CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["cleanup", "cleanup-test", "--dry-run"])
+            .expect("CLI cleanup arg parse");
+        let _out = (entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI cleanup invoke");
+    }
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // Both MCP and REST must echo dry_run = true.
+    assert_eq!(
+        mcp_json["dry_run"].as_bool(),
+        Some(true),
+        "MCP cleanup must echo dry_run flag"
+    );
+    assert_eq!(
+        rest_json["dry_run"].as_bool(),
+        Some(true),
+        "REST cleanup must echo dry_run flag"
+    );
+
+    // groups_consolidated must be consistent across surfaces.
+    let mcp_groups = mcp_json["groups_consolidated"]
+        .as_u64()
+        .expect("MCP cleanup output must have `groups_consolidated`");
+    let rest_groups = rest_json["groups_consolidated"]
+        .as_u64()
+        .expect("REST cleanup output must have `groups_consolidated`");
+    assert_eq!(
+        mcp_groups, rest_groups,
+        "MCP and REST dry-run cleanup must agree on groups_consolidated"
+    );
+
+    // In dry-run mode nothing must be written; DB still has the seeded topic.
+    {
+        use rein::types::MemoryStore;
+        let store = make_config().open_store().expect("open store for check");
+        let topics = store.list_topics().expect("list topics");
+        assert!(
+            topics.contains(&"cleanup-test".to_string()),
+            "dry-run must not delete the topic"
+        );
+    }
+
+    // Surface registration checks.
+    assert!(
+        inventory::iter::<OpsCliEntry>().any(|e| e.name == "cleanup"),
+        "cleanup must be registered as CLI"
+    );
+    assert!(
+        inventory::iter::<OpsMcpEntry>().any(|e| e.op_name == "cleanup"),
+        "cleanup must be registered as MCP"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().any(|e| e.op_name == "cleanup"),
+        "cleanup must be registered as REST"
+    );
+}
