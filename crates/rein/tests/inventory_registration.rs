@@ -51,3 +51,28 @@ fn stats_schema_is_empty_object() {
         "no-params op should have empty properties object"
     );
 }
+
+#[test]
+fn health_registers_with_params_schema() {
+    let cli = inventory::iter::<OpsCliEntry>()
+        .find(|e| e.op_name == "health")
+        .expect("health CLI registered");
+    let cmd = (cli.build_clap)();
+    assert!(
+        cmd.get_arguments().any(|a| a.get_id() == "topic"),
+        "health CLI should expose --topic arg"
+    );
+
+    let mcp = inventory::iter::<OpsMcpEntry>()
+        .find(|e| e.op_name == "health")
+        .expect("health MCP registered");
+    let schema = (mcp.input_schema)();
+    let value: serde_json::Value = serde_json::to_value(schema).expect("schema to json");
+    // schemars generates an object schema whose `properties` contains `topic`.
+    assert!(
+        value["properties"]["topic"].is_object()
+            || value["$defs"].is_object()
+            || value["definitions"].is_object(),
+        "health MCP schema should describe the topic property (got {value})"
+    );
+}
