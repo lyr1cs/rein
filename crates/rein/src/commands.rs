@@ -314,30 +314,6 @@ pub fn handle_recent(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn handle_gc(config: &ReinConfig, dry_run: bool) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let threshold = config.decay.prune_threshold;
-    let (decayed, pruned, concepts) = ops::run_gc_adaptive(&store, config, threshold, dry_run)?;
-    if dry_run {
-        let mut msg = format!(
-            "Would decay {decayed} and prune {pruned} weak STM memories (threshold: {threshold})"
-        );
-        if concepts > 0 {
-            msg.push_str(&format!(", {concepts} low-quality concepts"));
-        }
-        println!("{msg}");
-    } else {
-        let mut msg = format!(
-            "Decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})"
-        );
-        if concepts > 0 {
-            msg.push_str(&format!(", {concepts} low-quality concepts"));
-        }
-        println!("{msg}");
-    }
-    Ok(())
-}
-
 pub fn handle_organize(config: &ReinConfig) -> anyhow::Result<()> {
     let store = config.open_store()?;
     // A1: prefer adaptive global threshold over static config default.

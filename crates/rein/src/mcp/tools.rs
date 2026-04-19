@@ -226,13 +226,6 @@ pub struct RecentParams {
     pub limit: Option<usize>,
 }
 
-/// Parameters for rein_gc tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GcParams {
-    /// If true, only report how many would be pruned without removing them.
-    pub dry_run: Option<bool>,
-}
-
 /// Parameters for rein_organize tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OrganizeParams {
