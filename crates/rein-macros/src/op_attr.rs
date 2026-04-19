@@ -494,24 +494,55 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
     let mut name: Option<String> = None;
     let mut category: Option<String> = None;
     let mut description: Option<String> = None;
-    let mut kind = "unary".to_string();
-    let mut mutating = false;
+    let mut kind: Option<String> = None;
+    let mut mutating: Option<bool> = None;
     let mut cli: Option<CliBlock> = None;
     let mut mcp: Option<McpBlock> = None;
     let mut rest: Option<RestBlock> = None;
+
+    // Helper: report "duplicate key 'X'" at the offending span so copy-paste
+    // mistakes fail loudly at compile time instead of last-wins overwriting
+    // a prior declaration. Codex audit 2026-04-19 (H1) flagged the silent
+    // last-wins behavior as a footgun for handlers authored later.
+    fn dup_err<S: quote::ToTokens>(span_src: S, key: &str) -> syn::Error {
+        syn::Error::new_spanned(span_src, format!("duplicate #[op] key/block: '{key}'"))
+    }
 
     for meta in input.metas {
         match meta {
             Meta::NameValue(nv) => {
                 let key = ident_string(&nv.path)?;
                 match key.as_str() {
-                    "name" => name = Some(extract_string_lit(&nv.value, "name")?),
-                    "category" => category = Some(extract_string_lit(&nv.value, "category")?),
-                    "description" => {
-                        description = Some(extract_string_lit(&nv.value, "description")?)
+                    "name" => {
+                        if name.is_some() {
+                            return Err(dup_err(&nv.path, "name"));
+                        }
+                        name = Some(extract_string_lit(&nv.value, "name")?);
                     }
-                    "kind" => kind = extract_string_lit(&nv.value, "kind")?,
-                    "mutating" => mutating = extract_bool_lit(&nv.value, "mutating")?,
+                    "category" => {
+                        if category.is_some() {
+                            return Err(dup_err(&nv.path, "category"));
+                        }
+                        category = Some(extract_string_lit(&nv.value, "category")?);
+                    }
+                    "description" => {
+                        if description.is_some() {
+                            return Err(dup_err(&nv.path, "description"));
+                        }
+                        description = Some(extract_string_lit(&nv.value, "description")?);
+                    }
+                    "kind" => {
+                        if kind.is_some() {
+                            return Err(dup_err(&nv.path, "kind"));
+                        }
+                        kind = Some(extract_string_lit(&nv.value, "kind")?);
+                    }
+                    "mutating" => {
+                        if mutating.is_some() {
+                            return Err(dup_err(&nv.path, "mutating"));
+                        }
+                        mutating = Some(extract_bool_lit(&nv.value, "mutating")?);
+                    }
                     other => {
                         return Err(syn::Error::new(
                             nv.path.span(),
@@ -524,9 +555,24 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
                 let key = ident_string(&list.path)?;
                 let inner = list.tokens.clone();
                 match key.as_str() {
-                    "cli" => cli = Some(parse_cli_block(inner)?),
-                    "mcp" => mcp = Some(parse_mcp_block(inner)?),
-                    "rest" => rest = Some(parse_rest_block(inner)?),
+                    "cli" => {
+                        if cli.is_some() {
+                            return Err(dup_err(&list.path, "cli"));
+                        }
+                        cli = Some(parse_cli_block(inner)?);
+                    }
+                    "mcp" => {
+                        if mcp.is_some() {
+                            return Err(dup_err(&list.path, "mcp"));
+                        }
+                        mcp = Some(parse_mcp_block(inner)?);
+                    }
+                    "rest" => {
+                        if rest.is_some() {
+                            return Err(dup_err(&list.path, "rest"));
+                        }
+                        rest = Some(parse_rest_block(inner)?);
+                    }
                     other => {
                         return Err(syn::Error::new(
                             list.path.span(),
@@ -543,6 +589,9 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
             }
         }
     }
+
+    let kind = kind.unwrap_or_else(|| "unary".to_string());
+    let mutating = mutating.unwrap_or(false);
 
     Ok(OpAttr {
         name: name
