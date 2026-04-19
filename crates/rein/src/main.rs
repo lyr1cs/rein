@@ -85,18 +85,10 @@ enum Commands {
     Topics,
     // Stats + Health migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
     // main() intercepts them before clap::Parser so they're invoked via OpsCliEntry.
-    /// System diagnostics for database, indexes, queues, and provider readiness
-    Doctor {
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-        /// Probe the embedding backend with a real network request
-        #[arg(long)]
-        network: bool,
-        /// Apply safe local fixes such as side-index rebuilds
-        #[arg(long)]
-        fix: bool,
-    },
+    // Doctor migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
+    // main() intercepts it via OpsCliEntry before the derived Parser path, and
+    // the inventory CLI dispatcher honors the op's `set_exit_code(1)` call so
+    // `rein doctor` still exits 1 on any FAIL check for CI scripts.
     /// Consolidate a topic into a single memory
     Consolidate {
         /// Single topic to consolidate (legacy mode)
@@ -322,8 +314,11 @@ async fn main() -> anyhow::Result<()> {
         if let Some(entry) = inventory::iter::<OpsCliEntry>().find(|e| e.name == sub_name) {
             let config = config::ReinConfig::load()?;
             let runtime = Arc::new(OpsRuntime::for_cli(Arc::new(config)));
-            let out = (entry.invoke)(runtime, sub_matches).await?;
+            let out = (entry.invoke)(runtime.clone(), sub_matches).await?;
             println!("{out}");
+            if let Some(code) = runtime.take_exit_code() {
+                std::process::exit(code);
+            }
             return Ok(());
         }
     }
@@ -371,9 +366,6 @@ async fn main() -> anyhow::Result<()> {
             limit,
         }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
         Some(Commands::Topics) => commands::handle_topics(&config)?,
-        Some(Commands::Doctor { json, network, fix }) => {
-            commands::handle_doctor(&config, json, network, fix).await?
-        }
         Some(Commands::Forget { id }) => commands::handle_forget(&config, id)?,
         Some(Commands::Update {
             id,
@@ -533,14 +525,16 @@ mod tests {
 
     #[test]
     fn test_cli_parses_doctor_flags() {
-        let cli = Cli::try_parse_from(["rein", "doctor", "--json", "--network", "--fix"]).unwrap();
-        match cli.command {
-            Some(Commands::Doctor { json, network, fix }) => {
-                assert!(json);
-                assert!(network);
-                assert!(fix);
-            }
-            _ => panic!("expected doctor command"),
-        }
+        // doctor migrated to #[op]; parse via the inventory-built clap command
+        // so regressions in the macro's CLI arg emission surface here.
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "doctor")
+            .expect("doctor CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["doctor", "--json", "--network", "--fix"])
+            .expect("doctor flags parse");
+        assert!(matches.get_flag("json"));
+        assert!(matches.get_flag("network"));
+        assert!(matches.get_flag("fix"));
     }
 }

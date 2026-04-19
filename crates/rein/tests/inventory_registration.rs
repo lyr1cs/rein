@@ -153,6 +153,39 @@ async fn stats_rest_invoke_fn_pointer_returns_json() {
 }
 
 #[test]
+fn doctor_registers_on_cli_and_rest_but_not_mcp() {
+    let cli: Vec<&OpsCliEntry> = inventory::iter::<OpsCliEntry>()
+        .filter(|e| e.op_name == "doctor")
+        .collect();
+    assert_eq!(cli.len(), 1);
+    assert_eq!(cli[0].name, "doctor");
+
+    // doctor intentionally has no MCP surface — agents don't need to trigger
+    // --fix mutations remotely, and the read-only diagnostics overlap with
+    // `rein health` for agent-side monitoring.
+    let mcp: Vec<&OpsMcpEntry> = inventory::iter::<OpsMcpEntry>()
+        .filter(|e| e.op_name == "doctor")
+        .collect();
+    assert!(mcp.is_empty(), "doctor should not expose MCP surface");
+
+    let rest: Vec<&OpsRestEntry> = inventory::iter::<OpsRestEntry>()
+        .filter(|e| e.op_name == "doctor")
+        .collect();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].path_template, "/api/doctor");
+    assert_eq!(rest[0].method, hyper::Method::GET);
+
+    let meta: Vec<&OpsMetadata> = inventory::iter::<OpsMetadata>()
+        .filter(|e| e.name == "doctor")
+        .collect();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].category, "diagnostics");
+    assert!(meta[0].cli_visible);
+    assert!(!meta[0].mcp_visible);
+    assert!(meta[0].rest_visible);
+}
+
+#[test]
 fn adaptive_status_registers_on_all_three_surfaces() {
     let cli: Vec<&OpsCliEntry> = inventory::iter::<OpsCliEntry>()
         .filter(|e| e.op_name == "adaptive_status")
