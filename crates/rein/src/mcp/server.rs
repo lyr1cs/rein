@@ -914,48 +914,8 @@ impl ReinServer {
         }
     }
 
-    /// Scan for and optionally remove duplicate memories.
-    #[tool(
-        name = "rein_dedup",
-        description = "Scan for duplicate memories using content similarity. Use dry_run=true to preview without deleting."
-    )]
-    fn rein_dedup(&self, Parameters(params): Parameters<DedupParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let dry_run = params.dry_run.unwrap_or(false);
-        let merge_variants = params.merge_variants.unwrap_or(false);
-        let compact = self.compact();
-
-        let result = self.with_store(|store| {
-            // A1: adaptive threshold with config fallback.
-            let threshold = crate::ops::effective_dedup_threshold(store, &self.config);
-            crate::ops::run_dedup(store, &self.config, threshold, dry_run, merge_variants)
-        });
-
-        match result {
-            Ok((dups_found, dups_removed)) => {
-                let mut text = if compact {
-                    format!("found:{dups_found} removed:{dups_removed}")
-                } else if dry_run {
-                    format!(
-                        "Dedup scan: found {} potential duplicates (dry run, none removed)",
-                        dups_found
-                    )
-                } else {
-                    format!(
-                        "Dedup scan: found {} duplicates, removed {}",
-                        dups_found, dups_removed
-                    )
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
+    // rein_dedup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // POST /api/dedup REST surface added. auth = "mutation_marker".
 
     /// One-click cleanup: consolidate fragmented topics, then deduplicate and refresh adaptive state.
     #[tool(
