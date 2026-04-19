@@ -322,12 +322,7 @@ pub fn handle_organize(config: &ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn handle_dedup_concepts(config: &ReinConfig) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let (groups, removed) = store.dedup_concepts()?;
-    println!("Concept dedup: merged {groups} groups, removed {removed} duplicate concepts");
-    Ok(())
-}
+// handle_dedup_concepts removed — rein dedup-concepts migrated to #[op] inventory.
 
 pub fn handle_export(
     config: &ReinConfig,
