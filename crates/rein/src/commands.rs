@@ -45,25 +45,8 @@ pub fn resolve_cleanup_scope(
 // print_consolidation_report removed — rein consolidate migrated to #[op] inventory.
 // The formatting logic now lives in ConsolidateOutput::to_cli_text() (ops/handlers/maintenance.rs).
 
-/// Print a human-readable message after a cleanup run.
-pub fn print_cleanup_report(report: &ops::CleanupReport, dry_run: bool) {
-    if dry_run {
-        println!(
-            "Dry run: {} groups ({} memories) would be consolidated; found {} duplicates",
-            report.consolidation.groups_processed,
-            report.consolidation.memories_replaced,
-            report.duplicates_found
-        );
-    } else {
-        println!(
-            "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
-            report.consolidation.groups_processed,
-            report.consolidation.memories_replaced,
-            report.duplicates_merged,
-            report.duplicates_found
-        );
-    }
-}
+// print_cleanup_report removed — rein cleanup migrated to #[op] inventory.
+// The formatting logic now lives in CleanupOutput::to_cli_text() (ops/handlers/maintenance.rs).
 
 // ---------------------------------------------------------------------------
 // Command handlers
@@ -407,59 +390,8 @@ pub async fn handle_warmup(config: &ReinConfig) -> anyhow::Result<()> {
 // handle_dedup removed — rein dedup migrated to #[op] inventory.
 // See ops/handlers/maintenance.rs for the new implementation.
 
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_cleanup(
-    config: &ReinConfig,
-    topic: Option<String>,
-    topics: Option<Vec<String>>,
-    pattern: Option<String>,
-    all: bool,
-    exact_topics: bool,
-    dry_run: bool,
-    asynchronous: bool,
-) -> anyhow::Result<()> {
-    let selected_topics = topics.unwrap_or_default();
-    let scope_all = all || (topic.is_none() && selected_topics.is_empty() && pattern.is_none());
-    if asynchronous {
-        let job_id = extract::hooks::queue::queue_cleanup_job(
-            config,
-            topic.clone(),
-            selected_topics,
-            pattern.clone(),
-            scope_all,
-            exact_topics,
-            dry_run,
-        )?;
-        extract::hooks::queue::spawn_cleanup_worker(config);
-        println!("Queued cleanup job {job_id}");
-    } else {
-        let store = config.open_store()?;
-        let merge_variants = !exact_topics;
-        let groups = ops::resolve_topic_groups(
-            &store,
-            topic.as_deref(),
-            &selected_topics,
-            pattern.as_deref(),
-            scope_all,
-            merge_variants,
-        )?;
-        if groups.is_empty() {
-            if let Some(topic) = topic {
-                println!("No memories found in topic '{topic}'");
-            } else if let Some(pattern) = pattern {
-                println!("No topics matched pattern '{pattern}'");
-            } else {
-                println!("No topics matched the selected scope");
-            }
-        } else {
-            let report =
-                ops::run_cleanup_async(&store, config, &groups, merge_variants, dry_run).await?;
-            print_cleanup_report(&report, dry_run);
-        }
-    }
-    Ok(())
-}
-
+// handle_cleanup removed — rein cleanup migrated to #[op] inventory.
+// The handler now lives in OpsRuntime::cleanup() (ops/handlers/maintenance.rs).
 
 pub fn handle_init(dry_run: bool, proxy: bool) -> anyhow::Result<()> {
     rein::init::auto_configure(dry_run)?;

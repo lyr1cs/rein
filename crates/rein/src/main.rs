@@ -98,29 +98,11 @@ enum Commands {
     // IntelligentMergeTry migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "intelligent-merge-try" via OpsCliEntry before the derived-enum path.
     // CLI-only surface — no MCP, no REST, no auth attribute.
-    /// One-click cleanup: consolidate fragmented topics, deduplicate, refresh adaptive state
-    Cleanup {
-        /// Optional single topic to clean
-        topic: Option<String>,
-        /// Optional comma-separated topic list to clean
-        #[arg(long, value_delimiter = ',')]
-        topics: Option<Vec<String>>,
-        /// Optional glob pattern for matching topics
-        #[arg(long)]
-        pattern: Option<String>,
-        /// Force processing all topics (default when no selector is provided)
-        #[arg(long)]
-        all: bool,
-        /// Disable topic-variant grouping; use exact topic boundaries only
-        #[arg(long)]
-        exact_topics: bool,
-        /// Preview matched groups without writing changes
-        #[arg(long)]
-        dry_run: bool,
-        /// Spawn cleanup in a detached background worker process
-        #[arg(long)]
-        asynchronous: bool,
-    },
+    // Cleanup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "cleanup" via OpsCliEntry before the derived-enum path.
+    // MCP: rein_cleanup (derived→inventory, net zero). REST: POST /api/cleanup. auth = "mutation_marker".
+    // NOTE: the legacy --asynchronous flag (queue_cleanup_job) is not carried forward;
+    // use `rein worker cleanup <args>` for background worker invocation.
     /// Auto-configure MCP clients
     Init {
         #[arg(long)]
@@ -376,27 +358,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Init { dry_run, proxy }) => commands::handle_init(dry_run, proxy)?,
         // Commands::Consolidate removed — intercepted above via OpsCliEntry.
-        Some(Commands::Cleanup {
-            topic,
-            topics,
-            pattern,
-            all,
-            exact_topics,
-            dry_run,
-            asynchronous,
-        }) => {
-            commands::handle_cleanup(
-                &config,
-                topic,
-                topics,
-                pattern,
-                all,
-                exact_topics,
-                dry_run,
-                asynchronous,
-            )
-            .await?
-        }
+        // Commands::Cleanup removed — intercepted above via OpsCliEntry.
         // DedupLog migrated to #[op] inventory (dedup_log op); intercepted above via OpsCliEntry.
 Some(Commands::Dashboard) => commands::handle_dashboard(&config),
         Some(Commands::Gui { action }) => match action {
