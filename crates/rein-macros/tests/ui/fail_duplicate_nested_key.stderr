@@ -1,0 +1,5 @@
+error: duplicate #[op] key/block: 'rest.path'
+  --> tests/ui/fail_duplicate_nested_key.rs:10:47
+   |
+10 |         rest(method = "GET", path = "/api/x", path = "/api/y"),
+   |                                               ^^^^
