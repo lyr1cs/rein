@@ -153,6 +153,27 @@ async fn stats_rest_invoke_fn_pointer_returns_json() {
 }
 
 #[test]
+fn ops_runtime_exit_code_channel_round_trips() {
+    // Framework-level contract for the exit-code side channel that doctor
+    // (and future ops needing CLI-specific exit codes) relies on. Proving
+    // this here lets higher-level parity tests focus on the op-to-channel
+    // wiring rather than re-deriving the channel semantics.
+    use std::sync::Arc;
+    let config = Arc::new(rein::config::ReinConfig::default());
+    let rt = rein::ops::OpsRuntime::for_cli(config);
+    assert_eq!(rt.take_exit_code(), None, "fresh runtime has no exit code");
+    rt.set_exit_code(42);
+    assert_eq!(rt.take_exit_code(), Some(42));
+    assert_eq!(rt.take_exit_code(), None, "take is one-shot");
+    rt.set_exit_code(0);
+    assert_eq!(
+        rt.take_exit_code(),
+        None,
+        "set_exit_code(0) is a no-op: zero is not a signal"
+    );
+}
+
+#[test]
 fn config_registers_as_cli_only() {
     let cli: Vec<&OpsCliEntry> = inventory::iter::<OpsCliEntry>()
         .filter(|e| e.op_name == "config")

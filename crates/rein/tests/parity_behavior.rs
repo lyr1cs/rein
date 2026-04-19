@@ -245,11 +245,45 @@ async fn doctor_parity_rest_returns_checks_and_status() {
 }
 
 #[tokio::test]
-async fn doctor_parity_cli_runs_and_sets_exit_code() {
-    // The test config points at a throwaway tempdir with no provider
-    // credentials; the doctor op is expected to detect FAILs and set
-    // exit_code = 1. This asserts the runtime-level exit-code plumbing
-    // without invoking process::exit.
+async fn doctor_parity_cli_forces_fail_and_propagates_exit_code_1() {
+    // Force a FAIL by pointing `database.path` at an un-creatable path.
+    // `rein::doctor::run` pushes a Storage-category FAIL when `open_store`
+    // errors, which bumps `DoctorReport::exit_code()` to 1. This proves the
+    // end-to-end chain: op -> self.set_exit_code -> runtime channel -> CLI
+    // dispatcher's std::process::exit call. The framework-level one-shot
+    // contract is covered by `ops_runtime_exit_code_channel_round_trips`
+    // in inventory_registration.rs.
+    use std::sync::Arc;
+    let mut config = rein::config::ReinConfig::default();
+    config.database.path = "/nonexistent-parent-xxx-phase21/memories.db".to_string();
+    let runtime = Arc::new(rein::ops::OpsRuntime::for_cli(Arc::new(config)));
+
+    let entry = inventory::iter::<rein::ops::OpsCliEntry>()
+        .find(|e| e.op_name == "doctor")
+        .expect("doctor CLI registered");
+    let matches = (entry.build_clap)()
+        .try_get_matches_from(["doctor"])
+        .expect("doctor args parse");
+    let _out = (entry.invoke)(runtime.clone(), &matches)
+        .await
+        .expect("doctor invoke");
+
+    assert_eq!(
+        runtime.take_exit_code(),
+        Some(1),
+        "unreachable database path must produce FAIL -> exit_code 1"
+    );
+    assert!(
+        runtime.take_exit_code().is_none(),
+        "take_exit_code is one-shot"
+    );
+}
+
+#[tokio::test]
+async fn doctor_parity_cli_clean_run_leaves_exit_code_unset() {
+    // Mirror case: a provisioned tempdir with no FAIL checks should not
+    // touch the exit_code slot, so take_exit_code returns None and the
+    // CLI dispatcher falls through to a normal exit 0.
     use std::sync::Arc;
     let (config, _tmp) = config_for_test();
     let runtime = Arc::new(rein::ops::OpsRuntime::for_cli(config));
@@ -262,17 +296,11 @@ async fn doctor_parity_cli_runs_and_sets_exit_code() {
     let _out = (entry.invoke)(runtime.clone(), &matches)
         .await
         .expect("doctor invoke");
-    // With an unconfigured tempdir some FAIL checks will fire; exit code
-    // should propagate. Whether 0 or 1 depends on checks; the important
-    // part is that the channel exists and doesn't panic on a second call.
-    let first = runtime.take_exit_code();
-    let second = runtime.take_exit_code();
-    // take_exit_code must clear the slot (second call returns None).
-    assert!(second.is_none(), "take_exit_code must be one-shot");
-    // first may be Some(1) in CI or None in a fully-provisioned setup;
-    // either is a valid outcome of running doctor — the contract we're
-    // testing is the channel, not the specific failure count.
-    let _ = first;
+    assert_eq!(
+        runtime.take_exit_code(),
+        None,
+        "healthy doctor run must leave the exit_code channel untouched"
+    );
 }
 
 fn json_type_tag(v: &Value) -> &'static str {
