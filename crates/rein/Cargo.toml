@@ -48,6 +48,7 @@ rust-embed = { version = "8", features = ["compression"], optional = true }
 inventory = { workspace = true }
 rein-macros = { path = "../rein-macros" }
 schemars = "1"
+serde_urlencoded = "0.7"
 
 [features]
 default = []

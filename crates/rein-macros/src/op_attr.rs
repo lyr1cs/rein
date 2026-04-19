@@ -1,24 +1,26 @@
-//! `#[op(...)]` attribute parsing.
+//! `#[op(...)]` attribute: parse + emit surface-aware inventory registrations.
 //!
-//! Spec §4.1, §4.3, §4.4 define the attribute syntax. This module parses the
-//! attribute into an `OpAttr` struct, runs `validation::validate`, then (in
-//! Phase 0b) emits the original method unchanged.
+//! Phase 0b parsed the attribute; Phase 1.2 adds full emission. For each `#[op]`
+//! we emit the original method unchanged, plus a hidden associated const
+//! `__OP_INV_<name>: () = { ... }` whose block body declares per-surface invoke
+//! helpers and `inventory::submit!` entries for CLI/MCP/REST + metadata.
+//!
+//! Emitted paths all go through `::rein::ops::*`. `crates/rein/src/lib.rs`
+//! declares `extern crate self as rein;` so the paths resolve both inside the
+//! rein crate and in external test crates that path-dep on rein.
 
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
     parse::{Parse, ParseStream},
     parse2,
     punctuated::Punctuated,
     spanned::Spanned,
-    Expr, ExprLit, ImplItemFn, Lit, Meta, Token,
+    Expr, ExprLit, FnArg, ImplItemFn, Lit, Meta, Token, Type,
 };
 
 use crate::validation;
 
-/// Parsed `#[op(...)]` attribute. Fields populated in Phase 0b but consumed
-/// only when Phase 1 fills in the codegen — silenced until then.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct OpAttr {
     pub name: String,
@@ -31,7 +33,6 @@ pub struct OpAttr {
     pub rest: Option<RestBlock>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct CliBlock {
     pub name: Option<String>,
@@ -41,13 +42,11 @@ pub struct CliBlock {
     pub parent: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct McpBlock {
     pub name: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct RestBlock {
     pub method: String,
@@ -55,7 +54,6 @@ pub struct RestBlock {
     pub path_params: Vec<String>,
 }
 
-/// Wrapper struct so we can use `Punctuated::parse_terminated` via `parse2`.
 struct AttrInput {
     metas: Punctuated<Meta, Token![,]>,
 }
@@ -68,16 +66,398 @@ impl Parse for AttrInput {
     }
 }
 
-/// Top-level expansion entry point — called from `#[op]` proc macro.
+/// Analyzed method signature: what the macro needs for emission.
+struct FnInfo {
+    name: syn::Ident,
+    is_async: bool,
+    params_ty: Option<Type>,
+}
+
 pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let parsed_attr = parse_op_attr(attr)?;
     let parsed_fn: ImplItemFn = parse2(item)?;
-
     validation::validate(&parsed_attr)?;
 
-    // Phase 0b: emit the original method unchanged. Full expansion in Phase 1.
-    Ok(quote! { #parsed_fn })
+    let fn_info = analyze_fn(&parsed_fn.sig)?;
+    let emission = emit_inventory_block(&parsed_attr, &fn_info)?;
+
+    Ok(quote! {
+        #parsed_fn
+        #emission
+    })
 }
+
+fn analyze_fn(sig: &syn::Signature) -> syn::Result<FnInfo> {
+    let name = sig.ident.clone();
+    let is_async = sig.asyncness.is_some();
+
+    let user_args: Vec<&FnArg> = sig
+        .inputs
+        .iter()
+        .filter(|arg| matches!(arg, FnArg::Typed(_)))
+        .collect();
+
+    let params_ty = match user_args.len() {
+        0 => None,
+        1 => {
+            if let FnArg::Typed(pt) = user_args[0] {
+                Some((*pt.ty).clone())
+            } else {
+                None
+            }
+        }
+        _ => {
+            return Err(syn::Error::new(
+                sig.span(),
+                "#[op] methods must take 0 or 1 user argument (receiver + optional params struct)",
+            ));
+        }
+    };
+
+    Ok(FnInfo {
+        name,
+        is_async,
+        params_ty,
+    })
+}
+
+fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> {
+    let fn_name = &fi.name;
+    let const_name = format_ident!("__OP_INV_{}", fn_name);
+    let op_name = &attr.name;
+    let category = &attr.category;
+    let description = &attr.description;
+    let mutating = attr.mutating;
+
+    let params_schema_fn = emit_params_schema_fn(fi.params_ty.as_ref());
+
+    let cli_block = attr
+        .cli
+        .as_ref()
+        .map(|cli| emit_cli_block(cli, op_name, fn_name, fi));
+    let mcp_block = attr
+        .mcp
+        .as_ref()
+        .map(|mcp| emit_mcp_block(mcp, op_name, description, fn_name, fi));
+    let rest_block = attr
+        .rest
+        .as_ref()
+        .map(|rest| emit_rest_block(rest, op_name, fn_name, fi));
+
+    let cli_visible = attr.cli.is_some();
+    let mcp_visible = attr.mcp.is_some();
+    let rest_visible = attr.rest.is_some();
+
+    let mcp_name_tokens = match &attr.mcp {
+        Some(m) => {
+            let n = &m.name;
+            quote! { ::std::option::Option::Some(#n) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
+    let rest_method_tokens = match &attr.rest {
+        Some(r) => {
+            let method_ident = method_ident(&r.method)?;
+            quote! { ::std::option::Option::Some(::hyper::Method::#method_ident) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
+    let rest_path_tokens = match &attr.rest {
+        Some(r) => {
+            let p = &r.path;
+            quote! { ::std::option::Option::Some(#p) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
+
+    Ok(quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        const #const_name: () = {
+            #params_schema_fn
+            #cli_block
+            #mcp_block
+            #rest_block
+
+            ::inventory::submit! {
+                ::rein::ops::OpsMetadata {
+                    name: #op_name,
+                    category: #category,
+                    description: #description,
+                    kind: ::rein::ops::OpKind::Unary,
+                    mutating: #mutating,
+                    cli_visible: #cli_visible,
+                    mcp_visible: #mcp_visible,
+                    rest_visible: #rest_visible,
+                    mcp_name: #mcp_name_tokens,
+                    rest_method: #rest_method_tokens,
+                    rest_path: #rest_path_tokens,
+                    params_schema: __op_params_schema,
+                }
+            }
+        };
+    })
+}
+
+fn emit_params_schema_fn(params_ty: Option<&Type>) -> TokenStream {
+    match params_ty {
+        Some(ty) => quote! {
+            fn __op_params_schema() -> ::schemars::Schema {
+                ::schemars::schema_for!(#ty)
+            }
+        },
+        None => quote! {
+            fn __op_params_schema() -> ::schemars::Schema {
+                let mut __map = ::serde_json::Map::new();
+                __map.insert(
+                    ::std::string::String::from("type"),
+                    ::serde_json::Value::String(::std::string::String::from("object")),
+                );
+                __map.insert(
+                    ::std::string::String::from("properties"),
+                    ::serde_json::Value::Object(::serde_json::Map::new()),
+                );
+                ::schemars::Schema::from(__map)
+            }
+        },
+    }
+}
+
+/// `OpsRuntime::foo(&runtime)` or `OpsRuntime::foo(&runtime, params)` plus `.await` if async.
+fn emit_call(fn_name: &syn::Ident, has_params: bool, is_async: bool) -> TokenStream {
+    let args = if has_params {
+        quote! { &runtime, params }
+    } else {
+        quote! { &runtime }
+    };
+    let call = quote! { ::rein::ops::OpsRuntime::#fn_name(#args) };
+    if is_async {
+        quote! { #call.await }
+    } else {
+        quote! { #call }
+    }
+}
+
+fn emit_cli_block(
+    cli: &CliBlock,
+    op_name: &str,
+    fn_name: &syn::Ident,
+    fi: &FnInfo,
+) -> TokenStream {
+    let cli_name = cli.name.clone().unwrap_or_else(|| op_name.to_string());
+    let aliases = &cli.aliases;
+    let hidden = cli.hidden;
+    let parent_tokens = match &cli.parent {
+        Some(p) => quote! { ::std::option::Option::Some(#p) },
+        None => quote! { ::std::option::Option::None },
+    };
+
+    let (build_body, invoke_prep) = match &fi.params_ty {
+        Some(ty) => (
+            quote! {
+                let cmd = ::clap::Command::new(#cli_name);
+                <#ty as ::clap::Args>::augment_args(cmd)
+            },
+            quote! {
+                let params = <#ty as ::clap::FromArgMatches>::from_arg_matches(_matches)
+                    .map_err(|e| ::rein::types::ReinError::Config(
+                        format!("cli arg parse error: {e}")
+                    ))?;
+            },
+        ),
+        None => (
+            quote! { ::clap::Command::new(#cli_name) },
+            quote! {},
+        ),
+    };
+
+    let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
+
+    quote! {
+        fn __op_cli_build() -> ::clap::Command {
+            #build_body
+        }
+
+        fn __op_cli_invoke(
+            runtime: ::std::sync::Arc<::rein::ops::OpsRuntime>,
+            _matches: &::clap::ArgMatches,
+        ) -> ::std::pin::Pin<
+            ::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::rein::types::ReinResult<::std::string::String>,
+                > + ::std::marker::Send,
+            >,
+        > {
+            ::std::boxed::Box::pin(async move {
+                #invoke_prep
+                let out = #call_expr?;
+                ::std::result::Result::Ok(
+                    <_ as ::rein::ops::IntoCliText>::to_cli_text(&out),
+                )
+            })
+        }
+
+        ::inventory::submit! {
+            ::rein::ops::OpsCliEntry {
+                name: #cli_name,
+                op_name: #op_name,
+                parent: #parent_tokens,
+                aliases: &[ #( #aliases ),* ],
+                hidden: #hidden,
+                build_clap: __op_cli_build,
+                invoke: __op_cli_invoke,
+            }
+        }
+    }
+}
+
+fn emit_mcp_block(
+    mcp: &McpBlock,
+    op_name: &str,
+    description: &str,
+    fn_name: &syn::Ident,
+    fi: &FnInfo,
+) -> TokenStream {
+    let mcp_name = &mcp.name;
+    let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
+
+    let prep = match &fi.params_ty {
+        Some(ty) => quote! {
+            let params: #ty = ::serde_json::from_value(_params_json)?;
+        },
+        None => quote! {},
+    };
+
+    let schema_fn = match &fi.params_ty {
+        Some(ty) => quote! {
+            fn __op_mcp_schema() -> ::schemars::Schema {
+                ::schemars::schema_for!(#ty)
+            }
+        },
+        None => quote! {
+            fn __op_mcp_schema() -> ::schemars::Schema {
+                let mut __map = ::serde_json::Map::new();
+                __map.insert(
+                    ::std::string::String::from("type"),
+                    ::serde_json::Value::String(::std::string::String::from("object")),
+                );
+                __map.insert(
+                    ::std::string::String::from("properties"),
+                    ::serde_json::Value::Object(::serde_json::Map::new()),
+                );
+                ::schemars::Schema::from(__map)
+            }
+        },
+    };
+
+    quote! {
+        #schema_fn
+
+        fn __op_mcp_invoke(
+            runtime: ::std::sync::Arc<::rein::ops::OpsRuntime>,
+            _params_json: ::serde_json::Value,
+        ) -> ::std::pin::Pin<
+            ::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::rein::types::ReinResult<::std::string::String>,
+                > + ::std::marker::Send,
+            >,
+        > {
+            ::std::boxed::Box::pin(async move {
+                #prep
+                let out = #call_expr?;
+                let json = ::serde_json::to_string(&out)?;
+                ::std::result::Result::Ok(json)
+            })
+        }
+
+        ::inventory::submit! {
+            ::rein::ops::OpsMcpEntry {
+                op_name: #op_name,
+                mcp_name: #mcp_name,
+                description: #description,
+                input_schema: __op_mcp_schema,
+                invoke: __op_mcp_invoke,
+            }
+        }
+    }
+}
+
+fn emit_rest_block(
+    rest: &RestBlock,
+    op_name: &str,
+    fn_name: &syn::Ident,
+    fi: &FnInfo,
+) -> TokenStream {
+    let method_ident = match method_ident(&rest.method) {
+        Ok(id) => id,
+        Err(e) => return e.to_compile_error(),
+    };
+    let path = &rest.path;
+    let path_params = &rest.path_params;
+    let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
+
+    let prep = match &fi.params_ty {
+        Some(ty) => quote! {
+            let params: #ty = ::serde_urlencoded::from_str(&_query)
+                .map_err(|e| ::rein::types::ReinError::Config(
+                    format!("query parse error: {e}")
+                ))?;
+        },
+        None => quote! {},
+    };
+
+    quote! {
+        fn __op_rest_invoke(
+            runtime: ::std::sync::Arc<::rein::ops::OpsRuntime>,
+            _path_values: ::std::collections::HashMap<&'static str, ::std::string::String>,
+            _query: ::std::string::String,
+            _body: ::std::option::Option<::bytes::Bytes>,
+        ) -> ::std::pin::Pin<
+            ::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::rein::types::ReinResult<(::hyper::StatusCode, ::bytes::Bytes)>,
+                > + ::std::marker::Send,
+            >,
+        > {
+            ::std::boxed::Box::pin(async move {
+                #prep
+                let out = #call_expr?;
+                let bytes = ::serde_json::to_vec(&out)?;
+                ::std::result::Result::Ok((
+                    ::hyper::StatusCode::OK,
+                    ::bytes::Bytes::from(bytes),
+                ))
+            })
+        }
+
+        ::inventory::submit! {
+            ::rein::ops::OpsRestEntry {
+                method: ::hyper::Method::#method_ident,
+                path_template: #path,
+                path_params: &[ #( #path_params ),* ],
+                op_name: #op_name,
+                invoke: __op_rest_invoke,
+            }
+        }
+    }
+}
+
+fn method_ident(method: &str) -> syn::Result<syn::Ident> {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" => Ok(syn::Ident::new("GET", Span::call_site())),
+        "POST" => Ok(syn::Ident::new("POST", Span::call_site())),
+        "PUT" => Ok(syn::Ident::new("PUT", Span::call_site())),
+        "DELETE" => Ok(syn::Ident::new("DELETE", Span::call_site())),
+        "PATCH" => Ok(syn::Ident::new("PATCH", Span::call_site())),
+        other => Err(syn::Error::new(
+            Span::call_site(),
+            format!("unsupported REST method '{other}' (use GET/POST/PUT/DELETE/PATCH)"),
+        )),
+    }
+}
+
+// ===== Parser (unchanged from Phase 0b) =====
 
 fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
     let input: AttrInput = parse2(attr)?;
@@ -261,8 +641,6 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
         path_params,
     })
 }
-
-// --- helpers ---
 
 fn ident_string(path: &syn::Path) -> syn::Result<String> {
     path.get_ident()
