@@ -441,6 +441,98 @@ impl OpsRuntime {
     }
 }
 
+// ── dedup ────────────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct DedupParams {
+    /// Preview without applying changes: report how many duplicates would be
+    /// removed without modifying the database.
+    #[serde(default)]
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Deduplicate across normalized topic variants instead of exact-topic only.
+    #[serde(default)]
+    #[arg(long)]
+    pub merge_variants: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DedupOutput {
+    pub found: u32,
+    pub removed: u32,
+    pub dry_run: bool,
+    pub merge_variants: bool,
+    pub threshold: f32,
+}
+
+impl IntoJson for DedupOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for DedupOutput {
+    fn to_markdown(&self) -> String {
+        // Mirrors the pre-A1 `rein_dedup` MCP non-compact output so MCP callers
+        // that parse the string continue to work.
+        if self.dry_run {
+            format!(
+                "Dedup scan: found {} potential duplicates (dry run, none removed)",
+                self.found
+            )
+        } else {
+            format!(
+                "Dedup scan: found {} duplicates, removed {}",
+                self.found, self.removed
+            )
+        }
+    }
+}
+
+impl IntoCliText for DedupOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirrors the pre-A1 `handle_dedup` CLI output verbatim so shell scripts
+        // that parse this text continue to work.
+        if self.dry_run {
+            format!("Found {} duplicates (dry-run, nothing removed)", self.found)
+        } else {
+            format!("Removed {} of {} duplicates", self.removed, self.found)
+        }
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "dedup",
+        category = "maintenance",
+        description = "Scan for duplicate memories using content similarity. Use dry_run=true to preview without deleting. Optional merge_variants collapses semantic variants.",
+        mutating = true,
+        cli(name = "dedup"),
+        mcp(name = "rein_dedup"),
+        rest(method = "POST", path = "/api/dedup"),
+        auth = "mutation_marker",
+    )]
+    pub fn dedup(&self, params: DedupParams) -> ReinResult<DedupOutput> {
+        self.set_dry_run(params.dry_run);
+        let dry_run = self.dry_run();
+        let merge_variants = params.merge_variants;
+        let config = self.config.clone();
+
+        self.with_store(|store| {
+            let threshold = crate::ops::effective_dedup_threshold(store, &config);
+            let (found, removed) =
+                crate::ops::run_dedup(store, &config, threshold, dry_run, merge_variants)?;
+            Ok(DedupOutput {
+                found,
+                removed,
+                dry_run,
+                merge_variants,
+                threshold,
+            })
+        })
+    }
+}
+
 // ── migrate ──────────────────────────────────────────────────────────────────
 
 /// Params for the migrate command.

@@ -111,14 +111,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Scan for duplicates
-    Dedup {
-        #[arg(long)]
-        dry_run: bool,
-        /// Deduplicate across normalized topic variants instead of only exact topics
-        #[arg(long)]
-        merge_variants: bool,
-    },
+    // Dedup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "dedup" via OpsCliEntry before the derived-enum path.
+    // MCP: rein_dedup. REST: POST /api/dedup. auth = "mutation_marker".
     // IntelligentMergeTry migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "intelligent-merge-try" via OpsCliEntry before the derived-enum path.
     // CLI-only surface — no MCP, no REST, no auth attribute.
@@ -426,10 +421,6 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Some(Commands::Dedup {
-            dry_run,
-            merge_variants,
-        }) => commands::handle_dedup(&config, dry_run, merge_variants)?,
         Some(Commands::Cleanup {
             topic,
             topics,
