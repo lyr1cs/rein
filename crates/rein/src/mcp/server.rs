@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{tool, tool_router, ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
 use crate::mcp::compact;
@@ -491,53 +491,9 @@ impl ReinServer {
         }
     }
 
-    /// Show memory store statistics.
-    #[tool(
-        name = "rein_stats",
-        description = "Show memory store statistics (total, LTM/STM counts, avg strength)."
-    )]
-    fn rein_stats(&self) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-
-        let result = self.with_store(|store| store.stats());
-
-        match result {
-            Ok(stats) => {
-                let mut text = compact::format_stats(&stats, self.compact());
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
-
-    /// Check health of memory topics.
-    #[tool(
-        name = "rein_health",
-        description = "Check health of memory topics. Shows stale count, avg strength, consolidation needs."
-    )]
-    fn rein_health(&self, Parameters(params): Parameters<HealthParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-
-        let result = self.with_store(|store| store.health(params.topic.as_deref()));
-
-        match result {
-            Ok(reports) => {
-                let mut text = compact::format_health(&reports, self.compact());
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
+    // rein_stats + rein_health migrated to #[op] (see ops/handlers/diagnostics.rs).
+    // Dispatch is handled by the custom impl ServerHandler below, which checks
+    // the OpsMcpEntry inventory before delegating to tool_router for legacy tools.
 
     /// Consolidate all memories in a topic into a single summary.
     #[tool(
@@ -1619,12 +1575,101 @@ fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
-#[tool_handler]
 impl ServerHandler for ReinServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("rein: Multi-source cross-validated memory for AI agents. Use rein_store to save important context and rein_recall to search memories.")
     }
+
+    // A1 Phase 1.7 — approach (B): single source of truth flows through our
+    // OpsMcpEntry inventory. list_tools merges the legacy rmcp tool_router
+    // output with inventory-derived tools; call_tool checks inventory first
+    // and only falls through to tool_router for tools that haven't been
+    // migrated yet. Mirrors what `#[tool_handler]` would emit but interleaves
+    // the inventory path.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        for entry in inventory::iter::<crate::ops::OpsMcpEntry>() {
+            tools.push(inventory_entry_to_tool(entry));
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.non_store_count.fetch_add(1, Ordering::Relaxed);
+        let tool_name = request.name.as_ref();
+
+        if let Some(entry) = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .find(|e| e.mcp_name == tool_name)
+        {
+            let args_value = request
+                .arguments
+                .clone()
+                .map(serde_json::Value::Object)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
+                std::sync::Arc::new(self.config.clone()),
+            ));
+            return match (entry.invoke)(runtime, args_value).await {
+                Ok(body) => {
+                    let mut text = body;
+                    self.maybe_nudge(&mut text);
+                    Ok(rmcp::model::CallToolResult::success(vec![
+                        rmcp::model::Content::text(text),
+                    ]))
+                }
+                Err(e) => Ok(rmcp::model::CallToolResult::error(vec![
+                    rmcp::model::Content::text(e.to_string()),
+                ])),
+            };
+        }
+
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if let Some(entry) = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .find(|e| e.mcp_name == name)
+        {
+            return Some(inventory_entry_to_tool(entry));
+        }
+        self.tool_router.get(name).cloned()
+    }
+}
+
+/// Convert an `OpsMcpEntry` into the `rmcp::model::Tool` that `list_tools`
+/// returns. Schemars emits a JSON Value; rmcp's Tool wants a JsonObject
+/// (map). Fallback to an empty object schema if the emitted schema isn't
+/// a JSON object (shouldn't happen given our macro emission, but guard).
+fn inventory_entry_to_tool(entry: &crate::ops::OpsMcpEntry) -> rmcp::model::Tool {
+    let schema = (entry.input_schema)();
+    let value: serde_json::Value = schema.into();
+    let obj = match value {
+        serde_json::Value::Object(m) => m,
+        _ => {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+            m
+        }
+    };
+    rmcp::model::Tool::new(entry.mcp_name, entry.description, obj)
 }
 
 /// Spawn background warmup task for embedding cache pre-computation.
