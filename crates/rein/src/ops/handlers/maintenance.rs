@@ -962,3 +962,237 @@ impl OpsRuntime {
         }
     }
 }
+
+// ── consolidate ──────────────────────────────────────────────────────────────
+
+/// Parameters for the consolidate op.
+///
+/// Mirrors the pre-A1 `ConsolidateParams` in `mcp/tools.rs` and the
+/// `Commands::Consolidate` variant in `main.rs` — all seven fields are
+/// preserved so existing CLI scripts and MCP callers see no regression.
+///
+/// Boolean fields (`dry_run`, `all`, `merge_variants`) are plain `bool`
+/// (not `Option<bool>`) so clap treats them as flags without values,
+/// matching the old `Commands::Consolidate` arm. `#[serde(default)]`
+/// ensures JSON/MCP callers that omit them get `false`.
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct ConsolidateParams {
+    /// Single topic to consolidate (positional, optional).
+    #[serde(default)]
+    #[arg()]
+    pub topic: Option<String>,
+
+    /// Optional comma-separated topic list to consolidate.
+    #[serde(default, deserialize_with = "crate::mcp::tools::deserialize_option_string_list")]
+    #[arg(long, value_delimiter = ',')]
+    pub topics: Option<Vec<String>>,
+
+    /// Optional glob pattern for matching topics (e.g. "rmcp*").
+    #[serde(default)]
+    #[arg(long)]
+    pub pattern: Option<String>,
+
+    /// Process all topics.
+    #[serde(default)]
+    #[arg(long)]
+    pub all: bool,
+
+    /// Group case/space/hyphen topic variants before consolidating.
+    #[serde(default)]
+    #[arg(long)]
+    pub merge_variants: bool,
+
+    /// Summary text or template. Supports {topic}, {count}, {topics}.
+    /// If omitted, rein auto-generates one.
+    #[serde(default)]
+    #[arg(short, long)]
+    pub summary: Option<String>,
+
+    /// Preview matched groups without writing changes.
+    #[serde(default)]
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Per-group detail line in the consolidate output.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConsolidateGroupDetail {
+    pub canonical_topic: String,
+    pub source_topics: Vec<String>,
+    pub memory_count: usize,
+    pub created_id: Option<String>,
+}
+
+/// Output of the consolidate op.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConsolidateOutput {
+    /// Number of consolidation groups that contained memories.
+    pub consolidated_count: usize,
+    /// Total number of topics (groups) considered.
+    pub topic_count: usize,
+    /// Echoes the dry_run flag.
+    pub dry_run: bool,
+    /// Per-group detail, mirroring the pre-A1 MCP response structure.
+    pub details: Vec<ConsolidateGroupDetail>,
+}
+
+impl IntoJson for ConsolidateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ConsolidateOutput {
+    fn to_markdown(&self) -> String {
+        // Mirrors the pre-A1 `rein_consolidate` MCP non-compact output so
+        // MCP callers that parse the string continue to work.
+        if self.topic_count == 0 {
+            return "No topics matched the selected scope.".to_string();
+        }
+        let mut text = if self.dry_run {
+            format!(
+                "Dry run: {} groups ({} memories) would be consolidated",
+                self.consolidated_count,
+                self.details.iter().map(|g| g.memory_count).sum::<usize>()
+            )
+        } else {
+            format!(
+                "Consolidated {} groups ({} memories)",
+                self.consolidated_count,
+                self.details.iter().map(|g| g.memory_count).sum::<usize>()
+            )
+        };
+        let visible: Vec<_> = self
+            .details
+            .iter()
+            .filter(|g| g.memory_count > 0)
+            .take(8)
+            .collect();
+        for group in &visible {
+            if group.source_topics.len() > 1 {
+                text.push_str(&format!(
+                    "\n- {} <= {} [{} memories]",
+                    group.canonical_topic,
+                    group.source_topics.join(", "),
+                    group.memory_count
+                ));
+            } else {
+                text.push_str(&format!(
+                    "\n- {} [{} memories]",
+                    group.canonical_topic, group.memory_count
+                ));
+            }
+        }
+        let total_non_empty = self.details.iter().filter(|g| g.memory_count > 0).count();
+        if total_non_empty > visible.len() {
+            text.push_str(&format!("\n... {} more groups", total_non_empty - visible.len()));
+        }
+        text
+    }
+}
+
+impl IntoCliText for ConsolidateOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirrors the pre-A1 `handle_consolidate` / `print_consolidation_report`
+        // output verbatim so shell scripts that parse it continue to work.
+        if self.topic_count == 0 {
+            return "No topics matched the selected scope.".to_string();
+        }
+        let mut text = if self.dry_run {
+            format!(
+                "Dry run: {} groups, {} memories would be consolidated",
+                self.consolidated_count,
+                self.details.iter().map(|g| g.memory_count).sum::<usize>()
+            )
+        } else {
+            format!(
+                "Consolidated {} groups ({} memories)",
+                self.consolidated_count,
+                self.details.iter().map(|g| g.memory_count).sum::<usize>()
+            )
+        };
+        for group in self.details.iter().filter(|g| g.memory_count > 0) {
+            let sources = if group.source_topics.len() > 1 {
+                format!(" <= {}", group.source_topics.join(", "))
+            } else {
+                String::new()
+            };
+            if self.dry_run {
+                text.push_str(&format!(
+                    "\n- {}{} [{} memories]",
+                    group.canonical_topic, sources, group.memory_count
+                ));
+            } else if let Some(created_id) = &group.created_id {
+                text.push_str(&format!(
+                    "\n- {}{} [{} memories] -> {}",
+                    group.canonical_topic, sources, group.memory_count, created_id
+                ));
+            }
+        }
+        text
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "consolidate",
+        category = "knowledge",
+        description = "Consolidate all memories in a topic into a single summary memory, removing the originals. Use dry_run=true to preview.",
+        mutating = true,
+        cli(name = "consolidate"),
+        mcp(name = "rein_consolidate"),
+        rest(method = "POST", path = "/api/consolidate"),
+        auth = "mutation_marker",
+    )]
+    pub fn consolidate(&self, params: ConsolidateParams) -> ReinResult<ConsolidateOutput> {
+        self.set_dry_run(params.dry_run);
+        let dry_run = self.dry_run();
+        let merge_variants = params.merge_variants;
+        let all = params.all;
+        let config = self.config.clone();
+
+        self.with_store(|store| {
+            let selected_topics = params.topics.clone().unwrap_or_default();
+            let groups = crate::ops::resolve_topic_groups(
+                store,
+                params.topic.as_deref(),
+                &selected_topics,
+                params.pattern.as_deref(),
+                all,
+                merge_variants,
+            )?;
+            if groups.is_empty() {
+                return Ok(ConsolidateOutput {
+                    consolidated_count: 0,
+                    topic_count: 0,
+                    dry_run,
+                    details: vec![],
+                });
+            }
+            let topic_count = groups.len();
+            let report = crate::ops::run_consolidation_sync(
+                store,
+                &config,
+                &groups,
+                params.summary.as_deref(),
+                dry_run,
+            )?;
+            let details = report
+                .groups
+                .into_iter()
+                .map(|g| ConsolidateGroupDetail {
+                    canonical_topic: g.canonical_topic,
+                    source_topics: g.source_topics,
+                    memory_count: g.memory_count,
+                    created_id: g.created_id,
+                })
+                .collect();
+            Ok(ConsolidateOutput {
+                consolidated_count: report.groups_processed,
+                topic_count,
+                dry_run,
+                details,
+            })
+        })
+    }
+}
