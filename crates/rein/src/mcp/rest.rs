@@ -226,7 +226,6 @@ async fn handle_api<B>(
         (&Method::GET, "/api/activity") => api_activity(config, &query),
         (&Method::GET, "/api/topics") => api_topics(config),
         (&Method::GET, "/api/recent") => api_recent(config, &query),
-        (&Method::GET, "/api/adaptive") => api_adaptive(config),
         (&Method::GET, "/api/dedup_decisions") => api_dedup_decisions(config, &query),
         (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
         (&Method::GET, "/api/version") => json_response(
@@ -464,14 +463,6 @@ fn api_recent(
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
-}
-
-fn api_adaptive(config: &ReinConfig) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    json_response(StatusCode::OK, crate::ops::adaptive_status(&store))
 }
 
 /// Return recent dedup_decisions rows so the GUI / MCP clients can explain

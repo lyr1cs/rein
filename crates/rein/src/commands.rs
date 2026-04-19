@@ -323,13 +323,6 @@ pub fn handle_config(config: &ReinConfig) {
     println!("Dedup similarity: {}", config.search.dedup_similarity);
 }
 
-pub fn handle_adaptive_status(config: &ReinConfig) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let status = ops::adaptive_status(&store);
-    println!("{}", serde_json::to_string_pretty(&status)?);
-    Ok(())
-}
-
 pub fn handle_recent(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
     let store = config.open_store()?;
     let memories = store.recent(limit)?;

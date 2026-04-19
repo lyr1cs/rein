@@ -1527,21 +1527,6 @@ impl ReinServer {
         }
     }
 
-    /// Show adaptive engine status: learned parameters, weights, cluster info.
-    #[tool(
-        name = "rein_adaptive_status",
-        description = "Show adaptive engine status: learned alphas, reranker weights, cluster info, tier boundaries, event counts, survival curve summaries."
-    )]
-    fn rein_adaptive_status(&self) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let result = self.with_store(|store| Ok(crate::ops::adaptive_status(store)));
-        match result {
-            Ok(status) => {
-                serde_json::to_string_pretty(&status).unwrap_or_else(|e| format!("Error: {e}"))
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
 }
 
 /// Parse a date string as start-of-day (for `from` bounds).

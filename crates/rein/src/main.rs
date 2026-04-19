@@ -231,8 +231,8 @@ enum Commands {
     Warmup,
     /// Show configuration
     Config,
-    /// Show adaptive engine status (learned parameters, convergence info)
-    AdaptiveStatus,
+    // AdaptiveStatus migrated to #[op] inventory (see ops/handlers/adaptive.rs).
+    // main() intercepts it via OpsCliEntry before the derived Parser path.
     /// Background worker commands
     Worker {
         #[command(subcommand)]
@@ -381,7 +381,6 @@ async fn main() -> anyhow::Result<()> {
             importance,
         }) => commands::handle_update(&config, id, content, importance)?,
         Some(Commands::Config) => commands::handle_config(&config),
-        Some(Commands::AdaptiveStatus) => commands::handle_adaptive_status(&config)?,
         Some(Commands::Recent { limit }) => commands::handle_recent(&config, limit)?,
         Some(Commands::Gc { dry_run }) => commands::handle_gc(&config, dry_run)?,
         Some(Commands::Organize) => commands::handle_organize(&config)?,
