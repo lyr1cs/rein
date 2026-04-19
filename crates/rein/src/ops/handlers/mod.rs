@@ -6,4 +6,5 @@
 
 pub mod adaptive;
 pub mod diagnostics;
+pub mod maintenance;
 pub mod session;
