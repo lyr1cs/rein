@@ -27,6 +27,10 @@ pub struct OpsRuntime {
     // MCP/REST surfaces ignore the field.
     pub(crate) exit_code: AtomicI32,
     pub(crate) dry_run: AtomicBool,
+    /// When true the MCP surface renders op output via `IntoMarkdown` instead of
+    /// serialized JSON. Mirrors `ReinServer::compact()` (driven by
+    /// `config.server.compact`). CLI and REST surfaces always ignore this flag.
+    pub(crate) compact: AtomicBool,
 }
 
 impl OpsRuntime {
@@ -36,6 +40,7 @@ impl OpsRuntime {
             surface: SurfaceKind::Cli,
             exit_code: AtomicI32::new(0),
             dry_run: AtomicBool::new(false),
+            compact: AtomicBool::new(false),
         }
     }
 
@@ -45,6 +50,7 @@ impl OpsRuntime {
             surface: SurfaceKind::Mcp,
             exit_code: AtomicI32::new(0),
             dry_run: AtomicBool::new(false),
+            compact: AtomicBool::new(false),
         }
     }
 
@@ -54,6 +60,7 @@ impl OpsRuntime {
             surface: SurfaceKind::Rest,
             exit_code: AtomicI32::new(0),
             dry_run: AtomicBool::new(false),
+            compact: AtomicBool::new(false),
         }
     }
 
@@ -90,6 +97,17 @@ impl OpsRuntime {
 
     pub fn set_dry_run(&self, value: bool) {
         self.dry_run.store(value, Ordering::Relaxed);
+    }
+
+    /// Returns `true` when the MCP caller expects compact (human-readable
+    /// markdown) output rather than serialized JSON. Set by `ReinServer::call_tool`
+    /// from `self.compact()` before dispatching. CLI/REST surfaces never set this.
+    pub fn compact(&self) -> bool {
+        self.compact.load(Ordering::Relaxed)
+    }
+
+    pub fn set_compact(&self, value: bool) {
+        self.compact.store(value, Ordering::Relaxed);
     }
 
     pub fn with_store<F, R>(&self, f: F) -> ReinResult<R>
