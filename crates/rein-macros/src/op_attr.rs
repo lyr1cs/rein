@@ -134,7 +134,7 @@ fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> 
     let cli_block = attr
         .cli
         .as_ref()
-        .map(|cli| emit_cli_block(cli, op_name, fn_name, fi));
+        .map(|cli| emit_cli_block(cli, op_name, description, fn_name, fi));
     let mcp_block = attr
         .mcp
         .as_ref()
@@ -241,6 +241,7 @@ fn emit_call(fn_name: &syn::Ident, has_params: bool, is_async: bool) -> TokenStr
 fn emit_cli_block(
     cli: &CliBlock,
     op_name: &str,
+    description: &str,
     fn_name: &syn::Ident,
     fi: &FnInfo,
 ) -> TokenStream {
@@ -255,7 +256,7 @@ fn emit_cli_block(
     let (build_body, pre_extract) = match &fi.params_ty {
         Some(ty) => (
             quote! {
-                let cmd = ::clap::Command::new(#cli_name);
+                let cmd = ::clap::Command::new(#cli_name).about(#description);
                 <#ty as ::clap::Args>::augment_args(cmd)
             },
             // Extract params synchronously (before async block) so `_matches`
@@ -264,7 +265,10 @@ fn emit_cli_block(
                 let params_result = <#ty as ::clap::FromArgMatches>::from_arg_matches(_matches);
             },
         ),
-        None => (quote! { ::clap::Command::new(#cli_name) }, quote! {}),
+        None => (
+            quote! { ::clap::Command::new(#cli_name).about(#description) },
+            quote! {},
+        ),
     };
 
     let async_prep = match &fi.params_ty {
