@@ -294,35 +294,56 @@ impl OpsRuntime {
     }
 }
 
-/// Body params accepted by `POST /api/doctor`. Kept intentionally minimal —
-/// `fix` is implied (the whole reason to POST is to apply fixes) and `json`
-/// is a CLI-only render knob. Extra fields in the JSON body are ignored so
-/// client evolution doesn't wedge the server.
-#[derive(Deserialize, JsonSchema, Debug, Clone, Default)]
+/// Body params accepted by `POST /api/doctor`. `fix` defaults to `true`
+/// because the whole reason to POST (vs GET) is to apply fixes, but
+/// callers can explicitly set `fix: false` to run a mutation-authorized
+/// read-only probe — that preserves the pre-migration query-string
+/// behavior of `?fix=false` (the GUI does not use this knob today, but
+/// external admin scripts might rely on it to assert-without-repair).
+/// Extra fields in the JSON body are ignored so client evolution doesn't
+/// wedge the server.
+#[derive(Deserialize, JsonSchema, Debug, Clone)]
 pub struct DoctorFixParams {
-    /// Probe the embedding backend during the pre-fix diagnostic.
+    /// Probe the embedding backend during the diagnostic.
     #[serde(default)]
     pub network: bool,
+    /// Apply repairs (default true for POST). Set false for a dry-run
+    /// diagnostic that still requires the mutation marker.
+    #[serde(default = "default_doctor_fix_flag")]
+    pub fix: bool,
+}
+
+fn default_doctor_fix_flag() -> bool {
+    true
+}
+
+impl Default for DoctorFixParams {
+    fn default() -> Self {
+        Self {
+            network: false,
+            fix: true,
+        }
+    }
 }
 
 impl OpsRuntime {
     #[op(
         name = "doctor_fix",
         category = "diagnostics",
-        description = "Apply safe local fixes (side-index rebuilds, queue repair) and return the post-fix diagnostic report. REST-only POST counterpart to the read-only GET /api/doctor.",
+        description = "Run the doctor diagnostic with mutation authorization; defaults to applying fixes. Pass `fix: false` for an authed dry run. REST-only POST counterpart to the read-only GET /api/doctor.",
         mutating = true,
         rest(method = "POST", path = "/api/doctor"),
         auth = "mutation_marker",
     )]
     pub async fn doctor_fix(&self, params: DoctorFixParams) -> ReinResult<DoctorOutput> {
-        // POST /api/doctor always runs with fix=true. The H3 auth framework
-        // enforces `x-rein-action: 1` on this route; see mcp/rest.rs
-        // enforce_auth_policy and the AuthPolicy::MutationMarker branch.
+        // The H3 auth framework enforces `x-rein-action: 1` on this route
+        // (see mcp/rest.rs enforce_auth_policy + AuthPolicy::MutationMarker);
+        // the op body runs only after that gate passes.
         let report = doctor::run(
             self.config.as_ref(),
             DoctorOptions {
                 network: params.network,
-                fix: true,
+                fix: params.fix,
             },
         )
         .await;
