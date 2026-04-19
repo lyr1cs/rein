@@ -1143,53 +1143,6 @@ impl ReinServer {
         }
     }
 
-    /// Garbage collect weak STM memories below the configured strength threshold.
-    #[tool(
-        name = "rein_gc",
-        description = "Run garbage collection: apply decay to all memories, then prune weak STM memories below the configured strength threshold. Use dry_run=true to preview."
-    )]
-    fn rein_gc(&self, Parameters(params): Parameters<GcParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let dry_run = params.dry_run.unwrap_or(false);
-        let threshold = self.config.decay.prune_threshold;
-        let compact = self.compact();
-
-        let config = self.config.clone();
-        let result = self
-            .with_store(|store| crate::ops::run_gc_adaptive(store, &config, threshold, dry_run));
-
-        match result {
-            Ok((decayed, pruned, concepts)) => {
-                let mut text = if compact {
-                    if dry_run {
-                        let mut s = format!("would_prune:{pruned}");
-                        if concepts > 0 {
-                            s.push_str(&format!(" concepts:{concepts}"));
-                        }
-                        s
-                    } else {
-                        format!("decayed:{decayed} pruned:{pruned}")
-                    }
-                } else if dry_run {
-                    let mut s = format!("GC dry run: {pruned} weak STM memories would be pruned (threshold: {threshold})");
-                    if concepts > 0 {
-                        s.push_str(&format!(", {concepts} low-quality concepts"));
-                    }
-                    s
-                } else {
-                    let mut s = format!("GC complete: decayed {decayed} memories, pruned {pruned} weak STM memories (threshold: {threshold})");
-                    if concepts > 0 {
-                        s.push_str(&format!(", {concepts} low-quality concepts"));
-                    }
-                    s
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-
     /// Auto-link all memories based on content similarity. Creates bidirectional related_ids links.
     #[tool(
         name = "rein_organize",
