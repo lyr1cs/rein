@@ -127,6 +127,9 @@ impl From<HealthReport> for HealthReportItem {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct HealthOutput {
+    // Serde-named "health" to preserve the pre-A1 `/api/health` response shape
+    // that the Neural Wiki GUI reads from.
+    #[serde(rename = "health")]
     pub reports: Vec<HealthReportItem>,
     pub indexes: IndexesSnapshot,
     pub queues: QueuesSnapshot,
