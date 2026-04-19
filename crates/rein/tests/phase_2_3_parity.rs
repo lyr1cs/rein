@@ -909,3 +909,231 @@ async fn dedup_log_returns_consistent_output_across_surfaces() {
         "dedup_log must be registered as REST"
     );
 }
+
+#[tokio::test]
+async fn dedup_concepts_dry_run_parity_across_surfaces() {
+    use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
+    use rein::types::{Concept, Memoir};
+    use serde_json::Value;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let make_config = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+
+    // Seed one memoir with two concepts sharing the same normalized name
+    // ("adaptive engine" vs "Adaptive Engine" → same after normalize_concept_name).
+    {
+        let cfg = make_config();
+        let store = cfg.open_store().expect("open store for seeding");
+
+        let memoir = Memoir {
+            id: "m_dc_test".to_string(),
+            name: "dedup-concepts-test".to_string(),
+            description: "test memoir".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.create_memoir(memoir).expect("create memoir");
+
+        let make_concept = |id: &str, name: &str| Concept {
+            id: id.to_string(),
+            memoir_id: "m_dc_test".to_string(),
+            name: name.to_string(),
+            definition: format!("definition of {}", name),
+            labels: vec![],
+            source_memory_ids: vec![],
+            confidence: 1.0,
+            revision: 0,
+            last_episode_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        store
+            .add_concept(make_concept("dc_c1", "adaptive engine"))
+            .expect("seed concept 1");
+        store
+            .add_concept(make_concept("dc_c2", "Adaptive Engine"))
+            .expect("seed concept 2 (duplicate via normalization)");
+    }
+
+    // --- CLI surface ---
+    let cli_out = {
+        let runtime = Arc::new(OpsRuntime::for_cli(make_config()));
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "dedup-concepts")
+            .expect("dedup-concepts CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["dedup-concepts"])
+            .expect("CLI arg parse");
+        (entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI dedup-concepts invoke")
+    };
+
+    // --- MCP surface (on a fresh DB copy seeded again) ---
+    // We need a second fresh DB because CLI already ran the dedup.
+    let tmp2 = tempfile::TempDir::new().expect("tempdir2");
+    let make_config2 = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp2.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+    {
+        let cfg = make_config2();
+        let store = cfg.open_store().expect("open store for seeding (mcp)");
+        let memoir = Memoir {
+            id: "m_dc_test".to_string(),
+            name: "dedup-concepts-test".to_string(),
+            description: "test memoir".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.create_memoir(memoir).expect("create memoir (mcp)");
+        let make_concept = |id: &str, name: &str| Concept {
+            id: id.to_string(),
+            memoir_id: "m_dc_test".to_string(),
+            name: name.to_string(),
+            definition: format!("definition of {}", name),
+            labels: vec![],
+            source_memory_ids: vec![],
+            confidence: 1.0,
+            revision: 0,
+            last_episode_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store
+            .add_concept(make_concept("dc_c1", "adaptive engine"))
+            .expect("seed concept 1 (mcp)");
+        store
+            .add_concept(make_concept("dc_c2", "Adaptive Engine"))
+            .expect("seed concept 2 (mcp)");
+    }
+
+    let mcp_json: Value = {
+        let runtime = Arc::new(OpsRuntime::for_mcp(make_config2()));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "dedup_concepts")
+            .expect("dedup_concepts MCP entry registered");
+        let out = (entry.invoke)(runtime, serde_json::json!({}))
+            .await
+            .expect("MCP dedup_concepts invoke");
+        serde_json::from_str(&out).expect("MCP output is valid JSON")
+    };
+
+    // --- REST surface ---
+    let tmp3 = tempfile::TempDir::new().expect("tempdir3");
+    let make_config3 = || {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp3.path().join("memories.db").to_string_lossy().into_owned();
+        Arc::new(c)
+    };
+    {
+        let cfg = make_config3();
+        let store = cfg.open_store().expect("open store for seeding (rest)");
+        let memoir = Memoir {
+            id: "m_dc_test".to_string(),
+            name: "dedup-concepts-test".to_string(),
+            description: "test memoir".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.create_memoir(memoir).expect("create memoir (rest)");
+        let make_concept = |id: &str, name: &str| Concept {
+            id: id.to_string(),
+            memoir_id: "m_dc_test".to_string(),
+            name: name.to_string(),
+            definition: format!("definition of {}", name),
+            labels: vec![],
+            source_memory_ids: vec![],
+            confidence: 1.0,
+            revision: 0,
+            last_episode_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store
+            .add_concept(make_concept("dc_c1", "adaptive engine"))
+            .expect("seed concept 1 (rest)");
+        store
+            .add_concept(make_concept("dc_c2", "Adaptive Engine"))
+            .expect("seed concept 2 (rest)");
+    }
+
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let runtime = Arc::new(OpsRuntime::for_rest(make_config3()));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "dedup_concepts")
+            .expect("dedup_concepts REST entry registered");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(serde_json::json!({}).to_string().into_bytes().into()),
+        )
+        .await
+        .expect("REST dedup_concepts invoke");
+        let value: Value = serde_json::from_slice(&bytes).expect("REST body is valid JSON");
+        (status, value)
+    };
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // All three surfaces must report groups_merged == 1 and concepts_removed == 1.
+    // CLI: parse from text output (mirrors handle_dedup_concepts verbatim).
+    assert!(
+        cli_out.contains("merged 1 groups") || cli_out.contains("merged"),
+        "CLI output must mention merged groups; got: {cli_out}"
+    );
+    assert!(
+        cli_out.contains("removed 1 duplicate") || cli_out.contains("removed"),
+        "CLI output must mention removed concepts; got: {cli_out}"
+    );
+
+    // MCP: JSON fields.
+    assert_eq!(
+        mcp_json["groups_merged"].as_u64(),
+        Some(1),
+        "MCP groups_merged must be 1; got: {:?}",
+        mcp_json
+    );
+    assert_eq!(
+        mcp_json["concepts_removed"].as_u64(),
+        Some(1),
+        "MCP concepts_removed must be 1; got: {:?}",
+        mcp_json
+    );
+
+    // REST: JSON fields must match MCP.
+    assert_eq!(
+        rest_json["groups_merged"].as_u64(),
+        Some(1),
+        "REST groups_merged must be 1; got: {:?}",
+        rest_json
+    );
+    assert_eq!(
+        rest_json["concepts_removed"].as_u64(),
+        Some(1),
+        "REST concepts_removed must be 1; got: {:?}",
+        rest_json
+    );
+
+    // Surface registration checks.
+    assert!(
+        inventory::iter::<OpsCliEntry>().any(|e| e.name == "dedup-concepts"),
+        "dedup-concepts must be registered as CLI"
+    );
+    assert!(
+        inventory::iter::<OpsMcpEntry>().any(|e| e.op_name == "dedup_concepts"),
+        "dedup_concepts must be registered as MCP"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().any(|e| e.op_name == "dedup_concepts"),
+        "dedup_concepts must be registered as REST"
+    );
+}

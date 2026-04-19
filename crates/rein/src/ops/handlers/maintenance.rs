@@ -533,6 +533,76 @@ impl OpsRuntime {
     }
 }
 
+// ── dedup_concepts ───────────────────────────────────────────────────────────
+
+/// Params for the dedup-concepts op.
+///
+/// No fields — the underlying `SqliteStore::dedup_concepts` performs the full
+/// scan and merge atomically. A `dry_run` mode is intentionally omitted: the
+/// underlying function does not support preview and changing it would be a
+/// logic change outside the scope of this migration.
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct DedupConceptsParams {}
+
+/// Output of the dedup-concepts op.
+#[derive(Serialize, Clone, Debug)]
+pub struct DedupConceptsOutput {
+    /// Number of duplicate groups merged (each group = 2+ concepts with same
+    /// normalized name within a memoir).
+    pub groups_merged: usize,
+    /// Total number of duplicate concept records removed.
+    pub concepts_removed: usize,
+}
+
+impl IntoJson for DedupConceptsOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for DedupConceptsOutput {
+    fn to_markdown(&self) -> String {
+        // Mirrors the MCP-visible summary format.
+        format!(
+            "Concept dedup: merged {} groups, removed {} duplicate concepts",
+            self.groups_merged, self.concepts_removed
+        )
+    }
+}
+
+impl IntoCliText for DedupConceptsOutput {
+    fn to_cli_text(&self) -> String {
+        // Mirror the pre-A1 `handle_dedup_concepts` CLI output verbatim so
+        // shell scripts that parse it continue to work.
+        format!(
+            "Concept dedup: merged {} groups, removed {} duplicate concepts",
+            self.groups_merged, self.concepts_removed
+        )
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "dedup_concepts",
+        category = "knowledge",
+        description = "Deduplicate concepts in the knowledge graph. Merges concepts with the same normalized name within each memoir, keeping the oldest as canonical.",
+        mutating = true,
+        cli(name = "dedup-concepts"),
+        mcp(name = "rein_dedup_concepts"),
+        rest(method = "POST", path = "/api/dedup_concepts"),
+        auth = "mutation_marker",
+    )]
+    pub fn dedup_concepts(&self, _params: DedupConceptsParams) -> ReinResult<DedupConceptsOutput> {
+        self.with_store(|store| {
+            let (groups_merged, concepts_removed) = store.dedup_concepts()?;
+            Ok(DedupConceptsOutput {
+                groups_merged,
+                concepts_removed,
+            })
+        })
+    }
+}
+
 // ── dedup_log ────────────────────────────────────────────────────────────────
 
 fn default_dedup_log_limit() -> usize {
