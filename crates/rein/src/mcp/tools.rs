@@ -51,7 +51,7 @@ fn normalize_string_list(mut values: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-fn deserialize_option_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+pub(crate) fn deserialize_option_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -171,25 +171,8 @@ pub struct ForgetParams {
 // HealthParams removed in A1 Phase 1.7 — rein_health migrated to #[op] and
 // now uses ops::handlers::diagnostics::HealthParams (derives clap::Args too).
 
-/// Parameters for rein_consolidate tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ConsolidateParams {
-    /// Single topic to consolidate.
-    pub topic: Option<String>,
-    /// Optional comma-separated topic list to consolidate.
-    #[serde(default, deserialize_with = "deserialize_option_string_list")]
-    pub topics: Option<Vec<String>>,
-    /// Optional glob pattern for matching topics.
-    pub pattern: Option<String>,
-    /// If true, process all topics.
-    pub all: Option<bool>,
-    /// Group case/space/hyphen topic variants before consolidating.
-    pub merge_variants: Option<bool>,
-    /// Summary text or template. Supports {topic}, {count}, {topics}. If omitted, rein auto-generates one.
-    pub summary: Option<String>,
-    /// If true, only preview matched groups without writing.
-    pub dry_run: Option<bool>,
-}
+// ConsolidateParams removed — rein_consolidate migrated to #[op] inventory.
+// See ops/handlers/maintenance.rs for the new ConsolidateParams + ConsolidateOutput structs.
 
 // DedupParams removed — rein_dedup migrated to #[op] inventory.
 // See ops/handlers/maintenance.rs for the new DedupParams + DedupOutput structs.
@@ -360,6 +343,7 @@ mod tests {
 
     #[test]
     fn consolidate_params_accept_comma_separated_topics() {
+        use crate::ops::handlers::maintenance::ConsolidateParams;
         let params: ConsolidateParams = serde_json::from_value(json!({
             "topics": "rein-release, rein-architecture , rein-devlog"
         }))
