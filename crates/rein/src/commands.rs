@@ -290,24 +290,6 @@ pub fn handle_update(
     Ok(())
 }
 
-pub fn handle_config(config: &ReinConfig) {
-    println!("Database path: {}", config.resolve_db_path().display());
-    println!("Embedding provider: {}", config.embedding.provider);
-    println!("Embedding dimensions: {}", config.embedding.dimensions);
-    println!("Extract provider: {}", config.extract.provider);
-    println!(
-        "Extract model: {}",
-        match config.extract_provider() {
-            rein::config::Provider::Omlx => &config.extract.omlx.model,
-            _ => &config.extract.google.model,
-        }
-    );
-    println!("Compact mode: {}", config.server.compact);
-    println!("SSE enabled: {}", config.server.sse_enabled);
-    println!("Decay base_lambda: {}", config.decay.base_lambda);
-    println!("Dedup similarity: {}", config.search.dedup_similarity);
-}
-
 pub fn handle_recent(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
     let store = config.open_store()?;
     let memories = store.recent(limit)?;
