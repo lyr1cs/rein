@@ -5,7 +5,7 @@
 //! store handles via `with_store`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
@@ -20,9 +20,6 @@ pub enum SurfaceKind {
 
 pub struct OpsRuntime {
     pub config: Arc<ReinConfig>,
-    // Reserved for Phase 1.5+ observability (count ops that bypass the store).
-    #[allow(dead_code)]
-    pub(crate) non_store_count: AtomicUsize,
     pub(crate) surface: SurfaceKind,
     // Ops like `doctor` signal a non-zero exit code by calling `set_exit_code`.
     // The CLI inventory dispatcher reads it via `take_exit_code` after invoke
@@ -36,7 +33,6 @@ impl OpsRuntime {
     pub fn for_cli(config: Arc<ReinConfig>) -> Self {
         Self {
             config,
-            non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Cli,
             exit_code: AtomicI32::new(0),
             dry_run: AtomicBool::new(false),
@@ -46,7 +42,6 @@ impl OpsRuntime {
     pub fn for_mcp(config: Arc<ReinConfig>) -> Self {
         Self {
             config,
-            non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Mcp,
             exit_code: AtomicI32::new(0),
             dry_run: AtomicBool::new(false),
@@ -56,7 +51,6 @@ impl OpsRuntime {
     pub fn for_rest(config: Arc<ReinConfig>) -> Self {
         Self {
             config,
-            non_store_count: AtomicUsize::new(0),
             surface: SurfaceKind::Rest,
             exit_code: AtomicI32::new(0),
             dry_run: AtomicBool::new(false),
