@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use rein_macros::op;
 
 use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsRuntime};
-use crate::types::{Memory, MemoryEvidence, ReinResult};
+use crate::types::{Memory, MemoryEvidence, MemoryStore, ReinResult};
 
 fn default_canonicals_limit() -> usize {
     20
@@ -307,6 +307,135 @@ impl OpsRuntime {
                 concepts,
                 dry_run,
                 threshold,
+            })
+        })
+    }
+}
+
+// ── intelligent_merge_try ────────────────────────────────────────────────────
+
+/// Params for the intelligent-merge dry-run classifier.
+///
+/// Both IDs must exist in the store. The classifier asks an LLM to label the
+/// relationship (Ignore / Update / Merge / CreateNew) and returns reasoning and
+/// optional synthesized content. No data is written.
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct IntelligentMergeTryParams {
+    /// Existing memory ID (the "baseline" in the merge comparison).
+    #[serde(default)]
+    pub existing: String,
+    /// Incoming memory ID (the candidate being evaluated against `existing`).
+    #[serde(default)]
+    pub incoming: String,
+}
+
+/// Output of the intelligent-merge dry-run classifier.
+#[derive(Serialize, Clone, Debug)]
+pub struct IntelligentMergeTryOutput {
+    pub existing_summary: String,
+    pub incoming_summary: String,
+    /// `None` when no LLM is configured or on API error (check logs with REIN_LOG=debug).
+    pub verdict: Option<String>,
+    pub reasoning: Option<String>,
+    pub synthesis: Option<String>,
+}
+
+impl IntoJson for IntelligentMergeTryOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for IntelligentMergeTryOutput {
+    fn to_markdown(&self) -> String {
+        let mut out = format!(
+            "**existing**: {}\n**incoming**: {}\n",
+            self.existing_summary, self.incoming_summary
+        );
+        match &self.verdict {
+            Some(v) => {
+                out.push_str(&format!("\n**verdict**: {v}\n"));
+                if let Some(r) = &self.reasoning {
+                    out.push_str(&format!("**reason**: {r}\n"));
+                }
+                if let Some(s) = &self.synthesis {
+                    out.push_str(&format!("**synthesis**: {s}\n"));
+                }
+            }
+            None => {
+                out.push_str(
+                    "\nclassifier returned None (no LLM configured, or API error — check logs with REIN_LOG=debug)\n",
+                );
+            }
+        }
+        out
+    }
+}
+
+impl IntoCliText for IntelligentMergeTryOutput {
+    fn to_cli_text(&self) -> String {
+        // Preserves the pre-A1 `handle_intelligent_merge_try` output verbatim,
+        // including the blank line separator and conditional fields.
+        let mut out = format!(
+            "→ existing: {}\n→ incoming: {}\n\n",
+            self.existing_summary, self.incoming_summary
+        );
+        match &self.verdict {
+            Some(v) => {
+                out.push_str(&format!("verdict  : {v}\n"));
+                if let Some(r) = &self.reasoning {
+                    out.push_str(&format!("reason   : {r}\n"));
+                }
+                if let Some(s) = &self.synthesis {
+                    out.push_str(&format!("synthesis: {s}\n"));
+                }
+            }
+            None => {
+                out.push_str(
+                    "classifier returned None (no LLM configured, or API error — check logs with REIN_LOG=debug)\n",
+                );
+            }
+        }
+        out
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "intelligent_merge_try",
+        category = "maintenance",
+        description = "Dry-run intelligent merge: classify the relationship between two candidate memories (Ignore / Update / Merge / CreateNew), report the decision path, without committing changes.",
+        mutating = false,
+        cli(name = "intelligent-merge-try"),
+    )]
+    pub fn intelligent_merge_try(
+        &self,
+        params: IntelligentMergeTryParams,
+    ) -> ReinResult<IntelligentMergeTryOutput> {
+        use crate::extract::intelligent_merge::{classify_insertion, MemorySnippet};
+
+        let existing_id = params.existing.clone();
+        let incoming_id = params.incoming.clone();
+        let config = self.config.clone();
+
+        self.with_store(|store| {
+            let existing = store.get(&existing_id)?;
+            let incoming = store.get(&incoming_id)?;
+
+            let a = MemorySnippet::from(&existing);
+            let b = MemorySnippet::from(&incoming);
+
+            let existing_summary = existing.summary.clone();
+            let incoming_summary = incoming.summary.clone();
+
+            let result = classify_insertion(&config, &a, &b);
+
+            Ok(IntelligentMergeTryOutput {
+                existing_summary,
+                incoming_summary,
+                verdict: result.as_ref().map(|v| format!("{:?}", v.verdict)),
+                reasoning: result.as_ref().and_then(|v| v.reasoning.clone()),
+                synthesis: result.as_ref().and_then(|v| v.synthesized.clone()),
             })
         })
     }
