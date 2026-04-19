@@ -1137,3 +1137,164 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
         "dedup_concepts must be registered as REST"
     );
 }
+
+#[tokio::test]
+async fn organize_parity_across_surfaces() {
+    use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
+    use serde_json::Value;
+
+    // Helper: seed memories that share overlapping keywords so that organize
+    // actually creates links. We need separate tempdirs per surface because
+    // organize is mutating and each surface modifies the DB.
+
+    let make_config = |tmp: &tempfile::TempDir| {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        // Use a low similarity threshold so nearby memories are linked.
+        c.search.dedup_similarity = 0.1;
+        std::sync::Arc::new(c)
+    };
+
+    let seed_memories = |store: &rein::store::SqliteStore| {
+        let make_mem = |id: &str, content: &str| Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "organize-test".to_string(),
+            summary: content.to_string(),
+            content: content.to_string(),
+            keywords: vec!["rust".to_string(), "memory".to_string()],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.0,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 0.5,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: Default::default(),
+            cluster_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        };
+        store
+            .store(make_mem("org_a", "rein stores memories for AI agents in Rust"))
+            .expect("seed org_a");
+        store
+            .store(make_mem("org_b", "rein recalls memories for AI agents in Rust"))
+            .expect("seed org_b");
+        store
+            .store(make_mem("org_c", "rein manages long-term AI memory in Rust"))
+            .expect("seed org_c");
+    };
+
+    // --- CLI surface ---
+    let tmp_cli = tempfile::TempDir::new().expect("tempdir cli");
+    {
+        let cfg = make_config(&tmp_cli);
+        let store = cfg.open_store().expect("open store for seeding (cli)");
+        seed_memories(&store);
+    }
+    let cli_out = {
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_cli(make_config(&tmp_cli)));
+        let entry = inventory::iter::<OpsCliEntry>()
+            .find(|e| e.name == "organize")
+            .expect("organize CLI entry registered");
+        let matches = (entry.build_clap)()
+            .try_get_matches_from(["organize", "--max-links", "5"])
+            .expect("CLI arg parse");
+        (entry.invoke)(runtime, &matches)
+            .await
+            .expect("CLI organize invoke")
+    };
+
+    // --- MCP surface ---
+    let tmp_mcp = tempfile::TempDir::new().expect("tempdir mcp");
+    {
+        let cfg = make_config(&tmp_mcp);
+        let store = cfg.open_store().expect("open store for seeding (mcp)");
+        seed_memories(&store);
+    }
+    let mcp_json: Value = {
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_mcp(make_config(&tmp_mcp)));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "organize")
+            .expect("organize MCP entry registered");
+        let out = (entry.invoke)(runtime, serde_json::json!({ "max_links": 5 }))
+            .await
+            .expect("MCP organize invoke");
+        serde_json::from_str(&out).expect("MCP output is valid JSON")
+    };
+
+    // --- REST surface ---
+    let tmp_rest = tempfile::TempDir::new().expect("tempdir rest");
+    {
+        let cfg = make_config(&tmp_rest);
+        let store = cfg.open_store().expect("open store for seeding (rest)");
+        seed_memories(&store);
+    }
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_rest(make_config(&tmp_rest)));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "organize")
+            .expect("organize REST entry registered");
+        let body = serde_json::to_vec(&serde_json::json!({ "max_links": 5 }))
+            .expect("serialize body");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(body.into()),
+        )
+        .await
+        .expect("REST organize invoke");
+        let value: Value = serde_json::from_slice(&bytes).expect("REST body is valid JSON");
+        (status, value)
+    };
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // All three surfaces must report links_created as a non-negative integer.
+    // CLI: output must contain the "Organized" message.
+    assert!(
+        cli_out.contains("Organized") || cli_out.contains("links"),
+        "CLI organize output must mention links; got: {cli_out}"
+    );
+
+    // MCP and REST must return a `links_created` field.
+    let mcp_links = mcp_json["links_created"]
+        .as_u64()
+        .expect("MCP organize output must have `links_created`");
+    let rest_links = rest_json["links_created"]
+        .as_u64()
+        .expect("REST organize output must have `links_created`");
+
+    // Both surfaces operate on identical seeds so counts must agree.
+    assert_eq!(
+        mcp_links, rest_links,
+        "MCP and REST organize must return the same links_created count"
+    );
+
+    // Surface registration checks.
+    assert!(
+        inventory::iter::<OpsCliEntry>().any(|e| e.name == "organize"),
+        "organize must be registered as CLI"
+    );
+    assert!(
+        inventory::iter::<OpsMcpEntry>().any(|e| e.op_name == "organize"),
+        "organize must be registered as MCP"
+    );
+    assert!(
+        inventory::iter::<OpsRestEntry>().any(|e| e.op_name == "organize"),
+        "organize must be registered as REST"
+    );
+}

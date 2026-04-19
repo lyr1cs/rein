@@ -164,8 +164,8 @@ enum Commands {
     // main() intercepts "dedup-log" via OpsCliEntry before the derived-enum path.
     // DedupConcepts migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "dedup-concepts" via OpsCliEntry before the derived-enum path.
-    /// Auto-link related memories based on content similarity
-    Organize,
+    // Organize migrated to #[op] inventory (see ops/handlers/maintenance.rs).
+    // main() intercepts "organize" via OpsCliEntry before the derived-enum path.
     /// Export memories to file
     Export {
         /// Output format: md, json, or csv (default json)
@@ -343,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
             importance,
         }) => commands::handle_update(&config, id, content, importance)?,
         Some(Commands::Recent { limit }) => commands::handle_recent(&config, limit)?,
-        Some(Commands::Organize) => commands::handle_organize(&config)?,
+        // Commands::Organize migrated to #[op] inventory — intercepted via OpsCliEntry above.
         Some(Commands::Export {
             format,
             topic,
