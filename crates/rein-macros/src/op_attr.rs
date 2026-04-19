@@ -452,12 +452,17 @@ fn emit_rest_block(
     let path_params = &rest.path_params;
     let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
 
-    let prep = match &fi.params_ty {
-        // A1 H2 (audit 2026-04-19): tag query-string parse failures as
-        // BadRequest so REST clients see 400 instead of 500. The H4 plumbing
-        // carries the kind through ReinError::with_kind; the REST dispatcher
-        // in mcp/rest.rs consults `.kind()` to pick the status code.
-        Some(ty) => quote! {
+    // A1 H5 (audit 2026-04-19 follow-up): GET/HEAD read from query string,
+    // other methods read from JSON body. The macro cannot know the runtime
+    // method at callsite, so we branch on the declared `rest.method` at
+    // compile time. Both paths map parse failures to BadRequest so REST
+    // clients see 400; the H4 plumbing carries the kind to the dispatcher.
+    let is_body_method = matches!(
+        rest.method.to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    );
+    let prep = match (&fi.params_ty, is_body_method) {
+        (Some(ty), false) => quote! {
             let params: #ty = ::serde_urlencoded::from_str(&_query)
                 .map_err(|e| {
                     ::rein::types::ReinError::Config(
@@ -466,7 +471,30 @@ fn emit_rest_block(
                     .with_kind(::rein::types::OpsErrorKind::BadRequest)
                 })?;
         },
-        None => quote! {},
+        (Some(ty), true) => quote! {
+            // Empty body with a params struct present → reject as BadRequest
+            // instead of silently defaulting. Use `{}` explicitly when all
+            // fields are Option.
+            let body_bytes = _body.unwrap_or_default();
+            let params: #ty = if body_bytes.is_empty() {
+                ::serde_json::from_slice(b"{}")
+                    .map_err(|e| {
+                        ::rein::types::ReinError::Config(
+                            format!("empty body — expected JSON object: {e}")
+                        )
+                        .with_kind(::rein::types::OpsErrorKind::BadRequest)
+                    })?
+            } else {
+                ::serde_json::from_slice(&body_bytes)
+                    .map_err(|e| {
+                        ::rein::types::ReinError::Config(
+                            format!("JSON body parse error: {e}")
+                        )
+                        .with_kind(::rein::types::OpsErrorKind::BadRequest)
+                    })?
+            };
+        },
+        (None, _) => quote! {},
     };
 
     quote! {

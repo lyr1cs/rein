@@ -268,7 +268,7 @@ impl OpsRuntime {
     #[op(
         name = "doctor",
         category = "diagnostics",
-        description = "Run system diagnostics: database, indexes, queues, provider readiness. CLI supports --json/--network/--fix; REST GET ignores fix (POST /api/doctor handles fix with mutation marker).",
+        description = "Run system diagnostics: database, indexes, queues, provider readiness. CLI supports --json/--network/--fix; REST GET is read-only (ignores fix); POST /api/doctor applies fixes — see `doctor_fix` op.",
         cli(name = "doctor"),
         rest(method = "GET", path = "/api/doctor"),
     )]
@@ -290,6 +290,45 @@ impl OpsRuntime {
         Ok(DoctorOutput {
             report,
             json_cli: params.json,
+        })
+    }
+}
+
+/// Body params accepted by `POST /api/doctor`. Kept intentionally minimal —
+/// `fix` is implied (the whole reason to POST is to apply fixes) and `json`
+/// is a CLI-only render knob. Extra fields in the JSON body are ignored so
+/// client evolution doesn't wedge the server.
+#[derive(Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct DoctorFixParams {
+    /// Probe the embedding backend during the pre-fix diagnostic.
+    #[serde(default)]
+    pub network: bool,
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "doctor_fix",
+        category = "diagnostics",
+        description = "Apply safe local fixes (side-index rebuilds, queue repair) and return the post-fix diagnostic report. REST-only POST counterpart to the read-only GET /api/doctor.",
+        mutating = true,
+        rest(method = "POST", path = "/api/doctor"),
+        auth = "mutation_marker",
+    )]
+    pub async fn doctor_fix(&self, params: DoctorFixParams) -> ReinResult<DoctorOutput> {
+        // POST /api/doctor always runs with fix=true. The H3 auth framework
+        // enforces `x-rein-action: 1` on this route; see mcp/rest.rs
+        // enforce_auth_policy and the AuthPolicy::MutationMarker branch.
+        let report = doctor::run(
+            self.config.as_ref(),
+            DoctorOptions {
+                network: params.network,
+                fix: true,
+            },
+        )
+        .await;
+        Ok(DoctorOutput {
+            report,
+            json_cli: false,
         })
     }
 }
