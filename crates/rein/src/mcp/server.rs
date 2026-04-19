@@ -224,116 +224,9 @@ impl ReinServer {
         }
     }
 
-    /// Ingest a full session/transcript through the full extraction pipeline.
-    #[tool(
-        name = "rein_ingest_session",
-        description = "Ingest a full session transcript into memories, concepts, links, and an episode using the full extraction pipeline."
-    )]
-    fn rein_ingest_session(&self, Parameters(params): Parameters<IngestSessionParams>) -> String {
-        self.non_store_count.store(0, Ordering::Relaxed);
-
-        let config = self.config.clone();
-        let result = if let Some(turns) = params.turns {
-            // Enforce size cap on turns path (same 500KB limit as content path)
-            let total_chars: usize = turns.iter().map(|t| t.role.len() + t.content.len()).sum();
-            if total_chars > 500_000 {
-                return "Error: turns too large (max 500KB aggregate)".to_string();
-            }
-            if turns.len() > 1000 {
-                return "Error: too many turns (max 1000)".to_string();
-            }
-            let started_at = params
-                .started_at
-                .as_deref()
-                .and_then(parse_datetime)
-                .or_else(|| params.started_at.as_deref().and_then(parse_datetime_end));
-            let session = crate::types::SessionIngest {
-                schema_version: 1,
-                artifact_kind: "session".to_string(),
-                session_id: params.session_id,
-                title: params.title,
-                started_at,
-                ended_at: None,
-                summary: params.summary,
-                source_agent: params.agent_label.clone(),
-                source_label: Some("mcp".to_string()),
-                compact_summary: params.compact_summary,
-                tool_outputs: params.tool_outputs.unwrap_or_default(),
-                turns: turns
-                    .into_iter()
-                    .map(|turn| crate::types::SessionTurn {
-                        role: turn.role,
-                        content: turn.content,
-                    })
-                    .collect(),
-            };
-            if params.async_mode.unwrap_or(false) {
-                crate::ops::queue_ingest_session(
-                    &config,
-                    &session,
-                    params.agent_label.as_deref(),
-                    params.is_subagent.unwrap_or(false),
-                )
-            } else {
-                crate::ops::ingest_session_sync_report(
-                    &config,
-                    &session,
-                    params.agent_label.as_deref(),
-                    params.is_subagent.unwrap_or(false),
-                )
-            }
-        } else if let Some(content) = params.content {
-            if content.len() > 500_000 {
-                return "Error: content too large (max 500KB)".to_string();
-            }
-            if params.async_mode.unwrap_or(false) {
-                crate::ops::queue_ingest_session_text(
-                    &config,
-                    &content,
-                    params.agent_label.as_deref(),
-                    params.is_subagent.unwrap_or(false),
-                )
-            } else {
-                crate::ops::ingest_session_text_sync_report(
-                    &config,
-                    &content,
-                    params.agent_label.as_deref(),
-                    params.is_subagent.unwrap_or(false),
-                )
-            }
-        } else {
-            Err(crate::types::ReinError::Config(
-                "ingest_session requires either content or turns".to_string(),
-            ))
-        };
-
-        match result {
-            Ok(report) => {
-                if self.compact() {
-                    format!(
-                        "ok queued:{} memories:{} concepts:{} links:{} artifact:{} episode:{}",
-                        report.queued,
-                        report.memory_count,
-                        report.concept_count,
-                        report.link_count,
-                        report.artifact_id.as_deref().unwrap_or("-"),
-                        report.episode_id.as_deref().unwrap_or("-"),
-                    )
-                } else {
-                    format!(
-                        "Ingested session: queued={} artifact={} episode={} memories={} concepts={} links={}",
-                        report.queued,
-                        report.artifact_id.as_deref().unwrap_or("-"),
-                        report.episode_id.as_deref().unwrap_or("-"),
-                        report.memory_count,
-                        report.concept_count,
-                        report.link_count
-                    )
-                }
-            }
-            Err(e) => format!("Error ingesting session: {e}"),
-        }
-    }
+    // rein_ingest_session migrated to #[op] (see ops/handlers/session.rs).
+    // Dispatch flows through the OpsMcpEntry inventory; legacy tool_router
+    // delegation below is still used for tools that haven't migrated yet.
 
     /// Update an existing memory by ID.
     #[tool(
@@ -1817,11 +1710,27 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                     }
                 }
             } // needs_auth
-              // Try REST API / GUI routes before MCP dispatch
-            if let Some(response) = crate::mcp::rest::handle_rest_request(&req, &cfg).await {
+
+            // H5 (Phase 2.2): /api/* always handled by REST; body bytes are
+            // collected for POST/PUT/PATCH/DELETE before dispatch. GUI asset
+            // paths (non-/api/, non-/mcp when gui_enabled) reuse the body-less
+            // entry point since they never consult the body. /mcp and unknown
+            // paths fall through to MCP dispatch with the original body.
+            if path.starts_with("/api/") {
+                let response =
+                    crate::mcp::rest::handle_api_request(req, &cfg).await;
                 return Ok::<_, std::convert::Infallible>(response);
             }
 
+            if config.server.gui_enabled && !path.starts_with("/mcp") {
+                if let Some(response) =
+                    crate::mcp::rest::handle_rest_request(&req, &cfg).await
+                {
+                    return Ok::<_, std::convert::Infallible>(response);
+                }
+            }
+
+            // /mcp or unmatched path: pass through with original body.
             Ok::<_, std::convert::Infallible>(svc.handle(req).await)
         }
     });
