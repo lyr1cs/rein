@@ -1,10 +1,14 @@
-//! Verifies that #[op]-registered ops actually appear in the inventory.
+//! Verifies that #[op]-registered ops actually appear in the inventory AND
+//! that the fn pointers the macro emits actually execute without panicking.
 //!
-//! This is Phase 1.2 acceptance: the macro emission produces entries that the
-//! `inventory` crate collects at startup. Without this test passing, the CLI /
-//! MCP / REST adapters would iterate an empty registry.
+//! Phase 1.2 acceptance: `inventory::submit!` wiring.
+//! Phase 1.6 addition: fn-pointer exercise (prevents "tests pass but the macro
+//! emits a broken __op_*_invoke that panics on first real call" hazard).
 
-use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry};
+use std::sync::Arc;
+
+use rein::config::ReinConfig;
+use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry, OpsRuntime};
 
 #[test]
 fn stats_registers_on_all_three_surfaces() {
@@ -60,7 +64,7 @@ fn health_registers_with_params_schema() {
     let cmd = (cli.build_clap)();
     assert!(
         cmd.get_arguments().any(|a| a.get_id() == "topic"),
-        "health CLI should expose --topic arg"
+        "health CLI should expose positional `topic` arg"
     );
 
     let mcp = inventory::iter::<OpsMcpEntry>()
@@ -75,4 +79,104 @@ fn health_registers_with_params_schema() {
             || value["definitions"].is_object(),
         "health MCP schema should describe the topic property (got {value})"
     );
+}
+
+fn runtime_for_test() -> (Arc<OpsRuntime>, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let runtime = Arc::new(OpsRuntime::for_cli(Arc::new(config)));
+    (runtime, tmp)
+}
+
+/// Exercise each migrated op's CLI fn pointer. Without this, a broken
+/// `__op_cli_invoke` emission would silently pass the "does the entry exist?"
+/// tests above — Codex flagged this gap during the 1.5 audit.
+#[tokio::test]
+async fn stats_cli_invoke_fn_pointer_returns_rendered_output() {
+    let (runtime, _tmp) = runtime_for_test();
+    let entry = inventory::iter::<OpsCliEntry>()
+        .find(|e| e.op_name == "stats")
+        .expect("stats CLI registered");
+    let matches = (entry.build_clap)()
+        .try_get_matches_from(["stats"])
+        .expect("empty stats args parse");
+    let out = (entry.invoke)(runtime, &matches)
+        .await
+        .expect("stats invoke");
+    assert!(
+        out.contains("Memory stats") && out.contains("total:"),
+        "CLI output should match IntoCliText rendering, got: {out}"
+    );
+}
+
+#[tokio::test]
+async fn health_cli_invoke_fn_pointer_handles_no_topic() {
+    let (runtime, _tmp) = runtime_for_test();
+    let entry = inventory::iter::<OpsCliEntry>()
+        .find(|e| e.op_name == "health")
+        .expect("health CLI registered");
+    let matches = (entry.build_clap)()
+        .try_get_matches_from(["health"])
+        .expect("health with no topic parses");
+    let out = (entry.invoke)(runtime, &matches)
+        .await
+        .expect("health invoke");
+    assert!(
+        out.contains("System"),
+        "health output should include system status, got: {out}"
+    );
+}
+
+#[tokio::test]
+async fn stats_rest_invoke_fn_pointer_returns_json() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let runtime = Arc::new(OpsRuntime::for_rest(Arc::new(config)));
+
+    let entry = inventory::iter::<OpsRestEntry>()
+        .find(|e| e.op_name == "stats")
+        .expect("stats REST registered");
+    let (status, body) = (entry.invoke)(
+        runtime,
+        std::collections::HashMap::new(),
+        String::new(),
+        None,
+    )
+    .await
+    .expect("stats REST invoke");
+    assert_eq!(status, hyper::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+    assert!(v["total_memories"].is_number(), "got: {v}");
+    assert!(v["ltm_count"].is_number());
+}
+
+#[tokio::test]
+async fn health_rest_preserves_legacy_top_level_health_key() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let runtime = Arc::new(OpsRuntime::for_rest(Arc::new(config)));
+
+    let entry = inventory::iter::<OpsRestEntry>()
+        .find(|e| e.op_name == "health")
+        .expect("health REST registered");
+    let (status, body) = (entry.invoke)(
+        runtime,
+        std::collections::HashMap::new(),
+        String::new(),
+        None,
+    )
+    .await
+    .expect("health REST invoke");
+    assert_eq!(status, hyper::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+    // GUI reads response.health — preserving the pre-A1 key name matters.
+    assert!(
+        v["health"].is_array(),
+        "response must keep the top-level `health` array (GUI contract), got: {v}"
+    );
+    assert!(v["indexes"]["hnsw"].is_object());
+    assert!(v["status"].is_object());
 }

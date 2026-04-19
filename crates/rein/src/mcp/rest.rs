@@ -215,9 +215,14 @@ async fn handle_api<B>(
 ) -> BoxedResponse {
     let query = parse_query(uri);
 
+    // A1: migrated ops get first crack via OpsRestEntry inventory. Falls through
+    // to the legacy match for routes that aren't yet migrated.
+    if let Some(resp) = try_dispatch_inventory_rest(method, path, uri, config).await {
+        return resp;
+    }
+
     match (method, path) {
         // --- Read endpoints ---
-        (&Method::GET, "/api/stats") => api_stats(config),
         (&Method::GET, "/api/activity") => api_activity(config, &query),
         (&Method::GET, "/api/topics") => api_topics(config),
         (&Method::GET, "/api/recent") => api_recent(config, &query),
@@ -228,7 +233,6 @@ async fn handle_api<B>(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
         ),
-        (&Method::GET, "/api/health") => api_health(config, &query),
         (&Method::GET, "/api/doctor") => {
             if query
                 .get("fix")
@@ -340,31 +344,9 @@ fn handle_memoir_path(
 // API handlers
 // ===========================================================================
 
-fn api_stats(config: &ReinConfig) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.stats() {
-        Ok(stats) => json_response(
-            StatusCode::OK,
-            json!({
-                "total_memories": stats.total_memories,
-                "ltm_count": stats.ltm_count,
-                "stm_count": stats.stm_count,
-                "topic_count": stats.topic_count,
-                "avg_strength": stats.avg_strength,
-                "memoir_count": stats.memoir_count,
-                "concept_count": stats.concept_count,
-                "link_count": stats.link_count,
-                "hot_count": stats.hot_count,
-                "warm_count": stats.warm_count,
-                "cold_count": stats.cold_count,
-            }),
-        ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
+// api_stats / api_health migrated to #[op] (see ops/handlers/diagnostics.rs).
+// `try_dispatch_inventory_rest` intercepts /api/stats + /api/health before the
+// legacy match in `handle_api`.
 
 fn api_activity(
     config: &ReinConfig,
@@ -564,43 +546,39 @@ fn api_intelligent_merge_metrics() -> BoxedResponse {
     )
 }
 
-fn api_health(
+async fn try_dispatch_inventory_rest(
+    method: &Method,
+    path: &str,
+    uri: &hyper::Uri,
     config: &ReinConfig,
-    query: &std::collections::HashMap<String, String>,
-) -> BoxedResponse {
-    let topic = query.get("topic").map(|s| s.as_str());
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.health(topic) {
-        Ok(reports) => {
-            let items: Vec<serde_json::Value> = reports
-                .iter()
-                .map(|r| {
-                    json!({
-                        "topic": r.topic,
-                        "count": r.count,
-                        "avg_strength": r.avg_strength,
-                        "stale_count": r.stale_count,
-                        "needs_consolidation": r.needs_consolidation,
-                    })
-                })
-                .collect();
-            let system = crate::ops::system_health::collect(&store, config);
-            let mut body = json!({ "health": items });
-            if let Some(map) = body.as_object_mut() {
-                if let Ok(sys) = serde_json::to_value(&system) {
-                    if let Some(sys_map) = sys.as_object() {
-                        for (k, v) in sys_map {
-                            map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-            json_response(StatusCode::OK, body)
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+) -> Option<BoxedResponse> {
+    let entry = inventory::iter::<crate::ops::OpsRestEntry>()
+        .find(|e| e.method == *method && e.path_template == path)?;
+
+    let query = uri.query().unwrap_or("").to_string();
+    let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_rest(std::sync::Arc::new(
+        config.clone(),
+    )));
+    // Phase 1: no path params yet. When path templates like /api/memory/:id
+    // appear, extract path_values here via the template parser.
+    let path_values = std::collections::HashMap::new();
+
+    match (entry.invoke)(runtime, path_values, query, None).await {
+        Ok((status, body)) => Some(
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(
+                    Full::new(body)
+                        .map_err(|never: std::convert::Infallible| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response")),
+        ),
+        Err(e) => Some(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
