@@ -151,13 +151,6 @@ pub struct UpdateParams {
 // FeedbackParams removed — rein_feedback migrated to #[op] inventory (Phase 2.4).
 // See ops/handlers/adaptive.rs for the new FeedbackParams + FeedbackOutput structs.
 
-/// Parameters for rein_forget tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ForgetParams {
-    /// The memory ID to delete.
-    pub id: String,
-}
-
 // HealthParams removed in A1 Phase 1.7 — rein_health migrated to #[op] and
 // now uses ops::handlers::diagnostics::HealthParams (derives clap::Args too).
 
