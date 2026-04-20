@@ -72,8 +72,11 @@ pub struct OpsMcpEntry {
     pub mcp_name: &'static str,
     pub description: &'static str,
     /// True when the op writes/mutates state (e.g. gc, dedup, consolidate,
-    /// cleanup). Used by the MCP adapter to reset the non-store counter instead
-    /// of incrementing it, preserving pre-A1 nudge semantics.
+    /// cleanup). Phase 3 removed the MCP nudge counter so this flag has no
+    /// runtime reader today — it is retained as metadata for future adapters:
+    /// B1 MCP proxy aggregator will filter by mutating policy when
+    /// federating multiple rein instances, and external MCP clients may
+    /// inspect it through `list_tools` extensions.
     pub mutating: bool,
     pub input_schema: fn() -> schemars::Schema,
     pub invoke: fn(

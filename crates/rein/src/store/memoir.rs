@@ -478,10 +478,18 @@ impl SqliteStore {
         })();
 
         match result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
+            Ok(()) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(commit_err) => {
+                    // If COMMIT itself fails (SQLITE_BUSY, I/O error, disk
+                    // full), the transaction is still open on this
+                    // connection. Best-effort ROLLBACK closes it so the
+                    // per-request SqliteStore does not poison the next call
+                    // on the same connection before the request ends.
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(commit_err.into())
+                }
+            },
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 Err(e)
