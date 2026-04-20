@@ -61,7 +61,6 @@ pub struct McpBlock {
 pub struct RestBlock {
     pub method: String,
     pub path: String,
-    pub path_params: Vec<String>,
 }
 
 struct AttrInput {
@@ -458,7 +457,6 @@ fn emit_rest_block(
         Err(e) => return e.to_compile_error(),
     };
     let path = &rest.path;
-    let path_params = &rest.path_params;
     let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
 
     // A1 H5 (audit 2026-04-19 follow-up): GET/HEAD read from query string,
@@ -534,7 +532,9 @@ fn emit_rest_block(
             ::rein::ops::OpsRestEntry {
                 method: ::hyper::Method::#method_ident,
                 path_template: #path,
-                path_params: &[ #( #path_params ),* ],
+                // T1: segment list is always empty; T2 will parse `{seg}`
+                // placeholders from `path_template` at macro expansion time.
+                path_segments: &[],
                 op_name: #op_name,
                 auth_policy: #auth_variant,
                 invoke: __op_rest_invoke,
@@ -801,7 +801,6 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
     let input: AttrInput = parse2(tokens)?;
     let mut method: Option<String> = None;
     let mut path: Option<String> = None;
-    let mut path_params: Option<Vec<String>> = None;
     for meta in input.metas {
         match meta {
             Meta::NameValue(nv) => {
@@ -818,12 +817,6 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
                             return Err(dup_err(&nv.path, "rest.path"));
                         }
                         path = Some(extract_string_lit(&nv.value, "rest.path")?);
-                    }
-                    "path_params" => {
-                        if path_params.is_some() {
-                            return Err(dup_err(&nv.path, "rest.path_params"));
-                        }
-                        path_params = Some(extract_string_array(&nv.value, "rest.path_params")?);
                     }
                     other => {
                         return Err(syn::Error::new(
@@ -848,7 +841,6 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
         path: path.ok_or_else(|| {
             syn::Error::new(Span::call_site(), "rest block missing required key 'path'")
         })?,
-        path_params: path_params.unwrap_or_default(),
     })
 }
 
