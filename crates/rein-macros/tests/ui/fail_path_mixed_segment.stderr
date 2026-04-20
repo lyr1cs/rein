@@ -1,0 +1,68 @@
+error: path placeholders must occupy an entire segment: 'prefix{id}' — use '{name}' alone, not 'prefix{name}' or '{name}suffix'
+  --> tests/ui/fail_path_mixed_segment.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "placeholder must occupy entire segment — prefix{id} not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/prefix{id}"),
+11 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `inventory` in the list of imported crates
+  --> tests/ui/fail_path_mixed_segment.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "placeholder must occupy entire segment — prefix{id} not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/prefix{id}"),
+11 | |     )]
+   | |______^ could not find `inventory` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `schemars` in the list of imported crates
+  --> tests/ui/fail_path_mixed_segment.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "placeholder must occupy entire segment — prefix{id} not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/prefix{id}"),
+11 | |     )]
+   | |______^ could not find `schemars` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `serde_json` in the list of imported crates
+  --> tests/ui/fail_path_mixed_segment.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "placeholder must occupy entire segment — prefix{id} not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/prefix{id}"),
+11 | |     )]
+   | |______^ could not find `serde_json` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `serde_json` in the list of imported crates
+  --> tests/ui/fail_path_mixed_segment.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "placeholder must occupy entire segment — prefix{id} not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/prefix{id}"),
+11 | |     )]
+   | |______^ could not find `serde_json` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider importing this struct
+   |
+ 1 + use std::iter::Map;
+   |
