@@ -2185,3 +2185,187 @@ fn cleanup_asynchronous_alias_queues_via_worker() {
         "L1: CLI text must contain 'Queued cleanup job'; got: {cli_text}"
     );
 }
+
+// ── Phase 2.4: feedback ───────────────────────────────────────────────────────
+
+/// Phase 2.4: `rein_feedback` / `POST /api/feedback` must write events to
+/// `feedback_events` on both MCP and REST surfaces and report correct counts.
+///
+/// We use separate tempdirs per surface so each surface's write count can be
+/// asserted independently without interference from the other surface's calls.
+#[tokio::test]
+async fn feedback_records_consistent_across_surfaces() {
+    use rein::ops::{OpsMcpEntry, OpsRestEntry};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use serde_json::Value;
+
+    // Helper: build a fresh memory for seeding.
+    fn make_memory(id: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "feedback-test".to_string(),
+            summary: "feedback test memory".to_string(),
+            content: "feedback test memory".to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.0,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 0.5,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: Default::default(),
+            cluster_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        }
+    }
+
+    let make_config = |tmp: &tempfile::TempDir| {
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        std::sync::Arc::new(c)
+    };
+
+    // ── MCP surface ──────────────────────────────────────────────────────────
+    let mcp_json: Value = {
+        let tmp_mcp = tempfile::TempDir::new().expect("tempdir mcp");
+        let cfg = make_config(&tmp_mcp);
+
+        // Seed a memory so the access_count UPDATE has a row to touch.
+        cfg.open_store()
+            .expect("open store for MCP seed")
+            .store(make_memory("fb_mcp_1"))
+            .expect("seed fb_mcp_1");
+
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_mcp(cfg));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "feedback")
+            .expect("feedback MCP entry registered");
+        let out = (entry.invoke)(
+            runtime,
+            serde_json::json!({
+                "memory_ids": ["fb_mcp_1"],
+                "request_id": "test-req-1",
+                "query": "test query",
+                "helpful": true
+            }),
+        )
+        .await
+        .expect("MCP feedback invoke");
+        serde_json::from_str(&out).expect("MCP feedback output is valid JSON")
+    };
+
+    // ── REST surface (POST body) ──────────────────────────────────────────────
+    let (rest_status, rest_json): (hyper::StatusCode, Value) = {
+        let tmp_rest = tempfile::TempDir::new().expect("tempdir rest");
+        let cfg = make_config(&tmp_rest);
+
+        // Seed a memory so the access_count UPDATE has a row to touch.
+        cfg.open_store()
+            .expect("open store for REST seed")
+            .store(make_memory("fb_rest_1"))
+            .expect("seed fb_rest_1");
+
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_rest(cfg));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "feedback")
+            .expect("feedback REST entry registered");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "memory_ids": ["fb_rest_1"],
+            "request_id": "test-req-2",
+            "query": "test query",
+            "helpful": true
+        }))
+        .expect("serialize body");
+        let (status, bytes) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(body.into()),
+        )
+        .await
+        .expect("REST feedback invoke");
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("REST feedback body is valid JSON");
+        (status, value)
+    };
+
+    assert_eq!(rest_status, hyper::StatusCode::OK);
+
+    // Both surfaces must report emitted == 1 (one memory_id each).
+    assert_eq!(
+        mcp_json["emitted"].as_u64(),
+        Some(1),
+        "MCP feedback must report emitted = 1"
+    );
+    assert_eq!(
+        rest_json["emitted"].as_u64(),
+        Some(1),
+        "REST feedback must report emitted = 1"
+    );
+}
+
+/// Phase 2.4: Empty `memory_ids` must be rejected as an error on both
+/// MCP and REST surfaces (BadRequest kind propagates as Err from invoke).
+#[tokio::test]
+async fn feedback_empty_memory_ids_is_rejected() {
+    use rein::ops::{OpsMcpEntry, OpsRestEntry};
+
+    let make_config = || {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut c = rein::config::ReinConfig::default();
+        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        std::sync::Arc::new(c)
+    };
+
+    // REST: empty memory_ids → Err (BadRequest kind; the HTTP dispatcher maps
+    // this to 400 when running the real server, but invoke() propagates as Err).
+    {
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_rest(make_config()));
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.op_name == "feedback")
+            .expect("feedback REST entry registered");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "memory_ids": [] })).expect("serialize body");
+        let result = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::new(),
+            String::new(),
+            Some(body.into()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "REST feedback with empty memory_ids must return an error"
+        );
+    }
+
+    // MCP: empty memory_ids → error result.
+    {
+        let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_mcp(make_config()));
+        let entry = inventory::iter::<OpsMcpEntry>()
+            .find(|e| e.op_name == "feedback")
+            .expect("feedback MCP entry registered");
+        let result = (entry.invoke)(
+            runtime,
+            serde_json::json!({ "memory_ids": [] }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "MCP feedback with empty memory_ids must return an error"
+        );
+    }
+}

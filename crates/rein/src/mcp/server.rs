@@ -311,63 +311,6 @@ impl ReinServer {
         }
     }
 
-    /// Report which recalled memories were actually used by the agent.
-    /// This feedback improves future recall quality through adaptive weight learning.
-    #[tool(
-        name = "rein_feedback",
-        description = "Report which recalled memories were actually used. Improves future recall quality. Call after using rein_recall results."
-    )]
-    fn rein_feedback(&self, Parameters(params): Parameters<FeedbackParams>) -> String {
-        if params.memory_ids.is_empty() {
-            return "No memory IDs provided.".to_string();
-        }
-
-        let result = self.with_store(|store| {
-            let conn = store.conn();
-            let mut emitted = 0;
-
-            // Emit RecallAccess for each confirmed-used memory
-            for mem_id in &params.memory_ids {
-                let _ = crate::store::adaptive::emit_event(conn, crate::store::adaptive::FeedbackEvent {
-                    event_type: crate::store::adaptive::EventType::RecallAccess,
-                    request_id: params.request_id.clone(),
-                    memory_id: Some(mem_id.clone()),
-                    concept_id: None,
-                    query: params.query.clone(),
-                    query_type: None,
-                    topic: None,
-                    payload: Some(serde_json::json!({
-                        "source": "agent_feedback",
-                        "helpful": params.helpful,
-                    })),
-                });
-                // Increment access_count on the memory
-                let _ = conn.execute(
-                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-                    rusqlite::params![chrono::Utc::now().to_rfc3339(), mem_id],
-                );
-                emitted += 1;
-            }
-            Ok(emitted)
-        });
-
-        match result {
-            Ok(count) => {
-                let mut text = if self.compact() {
-                    format!("ok:{count}")
-                } else {
-                    format!(
-                        "Feedback recorded for {} memories. This improves future recall quality.",
-                        count
-                    )
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-
     /// Delete a memory by ID.
     #[tool(name = "rein_forget", description = "Delete a memory by its ID.")]
     fn rein_forget(&self, Parameters(params): Parameters<ForgetParams>) -> String {
