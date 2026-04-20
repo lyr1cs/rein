@@ -1,16 +1,13 @@
-//! Test-only op for Phase 2.5 path-template framework validation.
+//! Test-only op handlers for path-template framework validation.
 //!
-//! Provides a minimal `#[op]` that uses `rest(path = "/api/test_path_template/{id}")`
-//! so integration tests in `tests/phase_2_5_path_template.rs` can exercise
-//! T2 (segment emission), T3 (dispatcher template match), and T4 (param merge)
-//! without requiring a real migrated op.
+//! Compiled only when the `test-support` feature is active. Integration tests
+//! in `tests/phase_2_5_path_template.rs` declare `rein` with `features =
+//! ["test-support"]` (via `dev-dependencies`) so inventory entries are visible.
 //!
-//! Registered unconditionally (not gated on `#[cfg(test)]`) because integration
-//! tests link to the library crate and cannot see `#[cfg(test)]` modules from it.
-//! The op name is prefixed `__test_` to signal test-only status to reviewers.
-//!
-//! Phase 3 cleanup: delete this file once real path-template ops are migrated and
-//! the framework is validated by production ops themselves.
+//! Two ops are provided:
+//!   - `__test_path_template`  — GET, Public auth, echoes the {id} param.
+//!   - `__test_path_template_mut` — POST, MutationMarker auth, echoes {id}.
+//!     Used by the H3 regression test (templated route auth checked pre-body).
 
 use rein_macros::op;
 use schemars::JsonSchema;
@@ -45,10 +42,26 @@ impl OpsRuntime {
     #[op(
         name = "__test_path_template",
         category = "diagnostics",
-        description = "Test-only op for path-template framework (T5). Echoes the {id} path param.",
+        description = "Test-only op: echoes the {id} path param.",
         rest(method = "GET", path = "/api/test_path_template/{id}"),
     )]
     pub fn __test_path_template(
+        &self,
+        params: TestPathTemplateParams,
+    ) -> ReinResult<TestPathTemplateOutput> {
+        Ok(TestPathTemplateOutput {
+            echoed_id: params.id,
+        })
+    }
+
+    #[op(
+        name = "__test_path_template_mut",
+        category = "diagnostics",
+        description = "Test-only op: mutation-auth templated route for H3 regression tests.",
+        rest(method = "POST", path = "/api/test_path_template_mut/{id}"),
+        auth = "mutation_marker",
+    )]
+    pub fn __test_path_template_mut(
         &self,
         params: TestPathTemplateParams,
     ) -> ReinResult<TestPathTemplateOutput> {
