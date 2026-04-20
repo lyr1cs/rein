@@ -9,7 +9,6 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde_json::json;
 
 use crate::config::ReinConfig;
-use crate::types::MemoryStore; // for store.delete()
 
 type BoxedResponse = Response<BoxBody<Bytes, std::convert::Infallible>>;
 const HTTP_SESSION_COOKIE: &str = "rein_http_token";
@@ -431,8 +430,6 @@ async fn handle_api<B>(
     match (method, path) {
         // --- Read endpoints ---
         (&Method::GET, "/api/activity") => api_activity(config, &query),
-        (&Method::GET, "/api/topics") => api_topics(config),
-        (&Method::GET, "/api/recent") => api_recent(config, &query),
         // GET /api/dedup_decisions migrated to #[op] inventory (dedup_log op in
         // ops/handlers/maintenance.rs); served via try_dispatch_inventory_rest above.
 (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
@@ -607,39 +604,6 @@ fn api_activity(
         json!({ "activity": activity, "granularity": granularity }),
     )
 }
-
-fn api_topics(config: &ReinConfig) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.list_topics() {
-        Ok(topics) => json_response(StatusCode::OK, json!({ "topics": topics })),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
-
-fn api_recent(
-    config: &ReinConfig,
-    query: &std::collections::HashMap<String, String>,
-) -> BoxedResponse {
-    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
-        Ok(limit) => limit,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
-    };
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.recent(limit) {
-        Ok(memories) => {
-            let items: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
-            json_response(StatusCode::OK, json!({ "memories": items }))
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
-
 
 /// Return process-wide intelligent_merge classifier counters for monitoring.
 fn api_intelligent_merge_metrics() -> BoxedResponse {
@@ -1440,6 +1404,7 @@ fn mime_from_path(path: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::store::SqliteStore;
+    use crate::types::MemoryStore;
     use crate::types::{
         Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, SessionArtifact, Source,
     };

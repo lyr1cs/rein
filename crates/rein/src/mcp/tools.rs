@@ -163,14 +163,6 @@ pub struct UpdateParams {
 // CleanupParams removed — rein_cleanup migrated to #[op] inventory.
 // See ops/handlers/maintenance.rs for the new CleanupParams + CleanupOutput structs.
 
-/// Parameters for rein_recent tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RecentParams {
-    /// Maximum number of recent memories to return (default 10).
-    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
-    pub limit: Option<usize>,
-}
-
 // OrganizeParams removed — rein_organize migrated to #[op] inventory (see ops/handlers/maintenance.rs).
 
 /// Parameters for rein_memoir_create tool.
