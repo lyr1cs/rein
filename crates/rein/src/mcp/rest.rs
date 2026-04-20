@@ -181,15 +181,19 @@ fn parse_query(uri: &hyper::Uri) -> std::collections::HashMap<String, String> {
                     let mut parts = pair.splitn(2, '=');
                     let key = parts.next()?;
                     let value = parts.next().unwrap_or("");
-                    Some((percent_decode(key), percent_decode(value)))
+                    // Skip pairs with invalid UTF-8 in key or value.
+                    Some((percent_decode(key)?, percent_decode(value)?))
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Simple percent-decoding: handles %XX and + (space).
-fn percent_decode(s: &str) -> String {
+/// Percent-decode a URI segment or query component. Returns `None` on
+/// invalid UTF-8 after decoding — callers that match path templates use this
+/// to reject the route (producing 404) rather than silently matching with
+/// a corrupted string.
+fn percent_decode(s: &str) -> Option<String> {
     let s = s.replace('+', " ");
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -207,7 +211,15 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    String::from_utf8(out).ok()
+}
+
+/// Percent-decode with lossy fallback for legacy route handlers that extract
+/// IDs from path strings directly. Returns the raw string on UTF-8 failure so
+/// downstream handlers can handle the invalid ID (typically a 404 from the DB
+/// query). Use `percent_decode` (returns `Option`) for template matching.
+fn percent_decode_lossy(s: &str) -> String {
+    percent_decode(s).unwrap_or_else(|| s.to_string())
 }
 
 /// Try to handle an API or GUI request. Returns `Some(response)` if matched, `None` to fall through to MCP.
@@ -224,6 +236,29 @@ pub async fn handle_rest_request<B>(
     handle_rest_request_with_body(req, None, config).await
 }
 
+/// Resolve the inventory `OpsRestEntry` for a given method + path without
+/// building path values. Tries exact match first, then template match.
+///
+/// Used in two phases: (1) pre-body auth gate in `handle_api_request`, and
+/// (2) inside `try_dispatch_inventory_rest` where path values are extracted.
+/// Doing both with the same resolver guarantees they agree on which entry wins.
+pub(crate) fn resolve_route(
+    method: &Method,
+    path: &str,
+) -> Option<&'static crate::ops::OpsRestEntry> {
+    // First: O(n) exact match on path_template string — cheapest case.
+    if let Some(entry) = inventory::iter::<crate::ops::OpsRestEntry>()
+        .find(|e| e.method == *method && e.path_template == path)
+    {
+        return Some(entry);
+    }
+    // Second: template match — only entries with non-empty path_segments.
+    let req_segs = split_path_segments(path);
+    inventory::iter::<crate::ops::OpsRestEntry>()
+        .filter(|e| e.method == *method && !e.path_segments.is_empty())
+        .find(|e| match_path_template(e.path_segments, &req_segs).is_some())
+}
+
 /// Production entry point for `/api/*` requests. Consumes the `Request<B>`
 /// by value so body bytes can be collected for POST/PUT/PATCH/DELETE ops,
 /// then rebuilds a body-less probe (`Request<()>`) that downstream REST
@@ -237,22 +272,19 @@ pub async fn handle_rest_request<B>(
 /// `AuthPolicy` is enforced *before* body collection. An unauthenticated
 /// POST must hit 403 without paying the 1 MiB body read — otherwise an
 /// anonymous client can force the server to drain a large body and use
-/// the 403/413 status difference to probe the body cap. The inventory
-/// lookup is header-only and cheap enough that doing it twice (once here
-/// for pre-auth, once inside `try_dispatch_inventory_rest`) is negligible.
+/// the 403/413 status difference to probe the body cap. The resolve_route
+/// helper runs both exact and template match so templated routes are
+/// protected at the same point as literal routes.
 pub async fn handle_api_request<B>(req: Request<B>, config: &ReinConfig) -> BoxedResponse
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    // Pre-body auth gate: if this path is served by an inventory op and
-    // declares a non-Public AuthPolicy, enforce the gate now so a rejected
-    // request never triggers body collection. Routes not in inventory
-    // (legacy match arms in handle_api) do their own auth checks inline
-    // after body-less dispatch, so no ordering inversion there.
-    if let Some(entry) = inventory::iter::<crate::ops::OpsRestEntry>()
-        .find(|e| e.method == *req.method() && e.path_template == req.uri().path())
-    {
+    // Pre-body auth gate: resolve the inventory entry (exact or template) and
+    // enforce its declared AuthPolicy before any body bytes are consumed.
+    // Routes not in inventory (legacy match arms in handle_api) do their own
+    // auth checks inline, so no ordering inversion there.
+    if let Some(entry) = resolve_route(req.method(), req.uri().path()) {
         if !matches!(entry.auth_policy, crate::ops::AuthPolicy::Public) {
             if let Err(resp) = enforce_auth_policy(&req, entry.auth_policy) {
                 return resp;
@@ -433,7 +465,7 @@ async fn handle_api<B>(
         (&Method::GET, p) if p.starts_with("/api/memories/") => {
             match require_read_token(req) {
                 Ok(()) => {
-                    let id = percent_decode(&p["/api/memories/".len()..]);
+                    let id = percent_decode_lossy(&p["/api/memories/".len()..]);
                     api_get_memory(config, &id)
                 }
                 Err(response) => response,
@@ -452,7 +484,7 @@ async fn handle_api<B>(
         (&Method::GET, p) if p.starts_with("/api/artifacts/") => {
             match require_read_token(req) {
                 Ok(()) => {
-                    let id = percent_decode(&p["/api/artifacts/".len()..]);
+                    let id = percent_decode_lossy(&p["/api/artifacts/".len()..]);
                     api_artifact_detail(config, &id, &query)
                 }
                 Err(response) => response,
@@ -463,7 +495,7 @@ async fn handle_api<B>(
         (&Method::DELETE, p) if p.starts_with("/api/memories/") => {
             match require_mutation_marker(req) {
                 Ok(()) => {
-                    let id = percent_decode(&p["/api/memories/".len()..]);
+                    let id = percent_decode_lossy(&p["/api/memories/".len()..]);
                     api_forget(config, &id)
                 }
                 Err(response) => response,
@@ -481,14 +513,14 @@ fn handle_memoir_path(
 ) -> BoxedResponse {
     let rest = &path["/api/memoirs/".len()..];
     if let Some(slash) = rest.find('/') {
-        let name = &percent_decode(&rest[..slash]);
+        let name = &percent_decode_lossy(&rest[..slash]);
         let sub = &rest[slash + 1..];
         if sub == "export" {
             let format = query.get("format").map(|s| s.as_str()).unwrap_or("json");
             return api_memoir_export(config, name, format);
         }
         if sub.starts_with("inspect/") {
-            let concept = percent_decode(&sub["inspect/".len()..]);
+            let concept = percent_decode_lossy(&sub["inspect/".len()..]);
             let depth = match parse_bounded_usize(query, "depth", 1, 1, 8) {
                 Ok(depth) => depth,
                 Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
@@ -497,7 +529,7 @@ fn handle_memoir_path(
         }
         error_response(StatusCode::NOT_FOUND, "unknown memoir API endpoint")
     } else {
-        let decoded = percent_decode(rest);
+        let decoded = percent_decode_lossy(rest);
         api_memoir_show(config, &decoded)
     }
 }
@@ -679,12 +711,14 @@ fn match_path_template(
                 }
             }
             crate::ops::PathSegment::Param(name) => {
-                // Percent-decode after split — spec §5.
-                let decoded = percent_decode(actual);
-                // Non-UTF-8 bytes in percent_decode fall back to the raw
-                // string (percent_decode's existing behavior). Spec §7 wants
-                // 400 for non-UTF-8, but the helper already handles it
-                // gracefully; pure-ASCII IDs are the dominant case.
+                // Reject empty segments — an empty path segment cannot bind a
+                // meaningful param value (spec: trailing slash or double slash).
+                if actual.is_empty() {
+                    return None;
+                }
+                // Percent-decode after split — spec §5 (decode before split
+                // would let %2F corrupt segment boundaries).
+                let decoded = percent_decode(actual)?;
                 values.insert(*name, decoded);
             }
         }
@@ -700,8 +734,7 @@ async fn try_dispatch_inventory_rest<B>(
     body: Option<Bytes>,
     config: &ReinConfig,
 ) -> Option<BoxedResponse> {
-    // T3: two-pass dispatch. First pass: exact-match (zero additional cost vs
-    // pre-T3). Second pass: template match (only on exact miss).
+    // Two-pass dispatch: exact match first, then template match on miss.
 
     // First pass: exact match — unchanged hot path.
     let exact_entry = inventory::iter::<crate::ops::OpsRestEntry>()
@@ -720,17 +753,10 @@ async fn try_dispatch_inventory_rest<B>(
         template_hit?
     };
 
-    // H3 (audit 2026-04-19): enforce the entry's declared AuthPolicy before
-    // invoking the op. Pre-H3 inventory dispatch ran *before* route-local
-    // `require_mutation_marker` / `require_read_token` gates, so migrating a
-    // protected route would silently bypass auth. Declaring the policy as
-    // metadata pushes enforcement here so Phase 2.2 POST/DELETE migrations
-    // are safe.
-    //
-    // Note: the pre-body auth gate at handle_api_request:253 only does exact-match
-    // lookup today. Templated ops with non-Public auth (e.g. DELETE /api/memories/{id})
-    // will have their body collected before auth fires here. This is acceptable for
-    // Phase 2.5 — a future pass can extend the pre-body gate to template-match too.
+    // Enforce the entry's declared AuthPolicy. For requests arriving through
+    // handle_api_request, auth was already enforced pre-body via resolve_route.
+    // This secondary check covers requests that arrive through the body-less
+    // handle_rest_request_with_body path (e.g. tests, legacy callers).
     if let Err(resp) = enforce_auth_policy(req, entry.auth_policy) {
         return Some(resp);
     }

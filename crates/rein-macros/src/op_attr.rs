@@ -467,6 +467,16 @@ fn parse_path_segments(path: &str, path_span: proc_macro2::Span) -> syn::Result<
     let mut result = Vec::with_capacity(segments.len());
 
     for seg in &segments {
+        // Reject empty literal segments: these arise from consecutive slashes
+        // (/api//foo) or a trailing slash (/api/foo/). Both indicate a
+        // malformed path template in the source code.
+        if seg.is_empty() {
+            return Err(syn::Error::new(
+                path_span,
+                "path template must not contain empty segments (no consecutive // or trailing /)",
+            ));
+        }
+
         // Count braces to detect unbalanced / mixed cases.
         let open = seg.chars().filter(|&c| c == '{').count();
         let close = seg.chars().filter(|&c| c == '}').count();
@@ -586,31 +596,30 @@ fn emit_rest_block(
     // object before deserialization — path fields go in as JSON strings.
     let prep = match (&fi.params_ty, is_body_method) {
         (Some(ty), false) => quote! {
-            // T4 GET merge: strip any existing occurrence of path param keys from
+            // GET merge: strip any existing occurrence of path param keys from
             // the query string, then append path values so they win on conflict.
+            // Path values are inserted structurally (as map entries) and the
+            // whole set is re-serialized with serde_urlencoded::to_string, which
+            // percent-encodes all values. This prevents a decoded path value that
+            // contains '&' or '=' from forging extra query parameters.
             let _effective_query = if _path_values.is_empty() {
                 _query.clone()
             } else {
-                // Rebuild query, excluding keys that appear in _path_values, then
-                // append path values as query-string pairs at the end.
+                // Decode the existing query into (k, v) pairs, dropping any key
+                // that would be overridden by a path value.
                 let mut _q_pairs: Vec<(::std::string::String, ::std::string::String)> =
-                    _query.split('&')
-                        .filter(|p| !p.is_empty())
-                        .filter_map(|pair| {
-                            let mut parts = pair.splitn(2, '=');
-                            let k = parts.next()?.to_string();
-                            let v = parts.next().unwrap_or("").to_string();
-                            Some((k, v))
-                        })
+                    ::serde_urlencoded::from_str::<Vec<(::std::string::String, ::std::string::String)>>(&_query)
+                        .unwrap_or_default()
+                        .into_iter()
                         .filter(|(k, _)| !_path_values.contains_key(k.as_str()))
                         .collect();
+                // Append path values — they always win over query-string values.
                 for (pk, pv) in &_path_values {
                     _q_pairs.push((pk.to_string(), pv.clone()));
                 }
-                _q_pairs.iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("&")
+                // Serialize back with proper percent-encoding.
+                ::serde_urlencoded::to_string(&_q_pairs)
+                    .unwrap_or_default()
             };
             let params: #ty = ::serde_urlencoded::from_str(&_effective_query)
                 .map_err(|e| {
@@ -621,26 +630,33 @@ fn emit_rest_block(
                 })?;
         },
         (Some(ty), true) => quote! {
-            // T4 POST/PUT/PATCH/DELETE merge: decode body to JSON Value first,
-            // then overlay path_values (path always wins). Treat non-object or
-            // empty body as {} before merge.
+            // POST/PUT/PATCH/DELETE merge: decode body to JSON Value first,
+            // then overlay path_values (path always wins).
+            // Empty body is treated as {} (omitting all optional fields).
+            // Non-empty, non-object body (null, array, scalar, bool) is rejected
+            // with 400 BadRequest — required-field validation must not be bypassed
+            // by having path values silently satisfy fields the client omitted.
             let body_bytes = _body.unwrap_or_default();
             let mut _params_json: ::serde_json::Value = if body_bytes.is_empty() {
                 ::serde_json::Value::Object(::serde_json::Map::new())
             } else {
-                ::serde_json::from_slice(&body_bytes)
+                let _parsed: ::serde_json::Value = ::serde_json::from_slice(&body_bytes)
                     .map_err(|e| {
                         ::rein::types::ReinError::Config(
                             format!("JSON body parse error: {e}")
                         )
                         .with_kind(::rein::types::OpsErrorKind::BadRequest)
-                    })?
+                    })?;
+                if !_parsed.is_object() {
+                    return ::std::result::Result::Err(
+                        ::rein::types::ReinError::Config(
+                            "request body must be a JSON object".into()
+                        )
+                        .with_kind(::rein::types::OpsErrorKind::BadRequest)
+                    );
+                }
+                _parsed
             };
-            // Ensure we have an object to merge into; if body was e.g. `null`
-            // or a bare array, replace with empty object before path-value merge.
-            if !_params_json.is_object() {
-                _params_json = ::serde_json::Value::Object(::serde_json::Map::new());
-            }
             // Merge path values — path wins over body.
             if let ::serde_json::Value::Object(ref mut obj) = _params_json {
                 for (pk, pv) in &_path_values {

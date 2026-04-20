@@ -1,15 +1,20 @@
-//! Phase 2.5 path-template framework integration tests (T5).
+//! Phase 2.5 path-template framework integration tests.
 //!
 //! Covers T2 (PathSegment emission), T3 (dispatcher template match), T4
-//! (path-value merge with path winning over query), and edge cases from spec §Q3/§5/§7.
+//! (path-value merge with path winning over query), and audit hardening:
+//! H1 (GET param injection prevention), H2 (non-object body rejection),
+//! H3 (templated route auth checked pre-body), M1 (empty segment 404),
+//! M2 (invalid UTF-8 in segment → 404).
 //!
-//! All tests rely on `__test_path_template` — a test-only `#[op]` compiled
-//! under `#[cfg(test)]` in `ops/handlers/test_path_template.rs`. That op
-//! registers `GET /api/test_path_template/{id}` in inventory and echoes `id`.
+//! Tests rely on `__test_path_template` (GET, Public) and
+//! `__test_path_template_mut` (POST, MutationMarker) — test-only ops
+//! compiled when the `test-support` feature is active (activated via
+//! dev-dependencies in Cargo.toml).
 
+use bytes::Bytes;
 use hyper::{Method, Request, StatusCode};
 use rein::config::ReinConfig;
-use rein::mcp::rest::handle_rest_request_with_body;
+use rein::mcp::rest::{handle_api_request, handle_rest_request_with_body};
 use rein::ops::{OpsRestEntry, PathSegment};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -26,6 +31,25 @@ fn get_req(path_and_query: &str) -> Request<()> {
         .method(Method::GET)
         .uri(format!("http://localhost{path_and_query}"))
         .body(())
+        .unwrap()
+}
+
+fn post_req_with_body(path: &str, body: Bytes) -> Request<http_body_util::Full<Bytes>> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://localhost{path}"))
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(body))
+        .unwrap()
+}
+
+fn post_req_mutation(path: &str, body: Bytes) -> Request<http_body_util::Full<Bytes>> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://localhost{path}"))
+        .header("content-type", "application/json")
+        .header("x-rein-action", "1")
+        .body(http_body_util::Full::new(body))
         .unwrap()
 }
 
@@ -189,22 +213,196 @@ async fn trailing_slash_returns_404() {
 #[tokio::test]
 async fn empty_id_segment_returns_404() {
     let cfg = test_config();
-    // /api/test_path_template/ — the last segment is empty string, which is
-    // a valid non-Param segment but won't match the template because split
-    // gives ["api", "test_path_template", ""] vs template ["api",
-    // "test_path_template", Param("id")] — the Param match would give empty
-    // id. Actually the Param matcher accepts any value including "".
-    // The spec says this should be 404. Since our Param matcher does accept "",
-    // we verify the downstream handles it — the test verifies either 200 with
-    // empty id (acceptable per current design) or 404.
+    // /api/test_path_template/ splits into ["api", "test_path_template", ""].
+    // The empty trailing segment must not bind to Param("id") — match_path_template
+    // rejects empty strings for Param variants, so this returns 404.
     let req = get_req("/api/test_path_template/");
     let result = dispatch(&req, &cfg).await;
-    // Either 404 (no match) or 200 with empty id. Both are acceptable; the
-    // important thing is we don't panic or 500.
-    if let Some((status, _body)) = result {
-        assert!(
-            status == StatusCode::OK || status == StatusCode::NOT_FOUND,
-            "empty segment should give 200 (empty id) or 404, got {status}"
-        );
+    match result {
+        Some((status, _)) => assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "empty id segment must not match Param variant — expected 404"
+        ),
+        None => {
+            // handle_rest_request_with_body returned None (shouldn't happen
+            // for /api/ paths), caller would 404. Acceptable.
+        }
     }
+}
+
+// ─── M2: invalid UTF-8 in segment → 404 ────────────────────────────────────
+
+#[tokio::test]
+async fn invalid_utf8_in_segment_returns_404() {
+    let cfg = test_config();
+    // %FF is not valid UTF-8; percent_decode returns None, match_path_template
+    // returns None, the route is not matched → 404.
+    let req = get_req("/api/test_path_template/%FF");
+    let result = dispatch(&req, &cfg).await;
+    if let Some((status, _)) = result {
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "%FF (invalid UTF-8) should not match the template — expected 404"
+        );
+    } // None: caller would 404 anyway
+}
+
+// ─── H1: GET path-param injection prevention ────────────────────────────────
+
+#[tokio::test]
+async fn get_path_param_with_encoded_ampersand_does_not_inject() {
+    let cfg = test_config();
+    // %26 decodes to '&'. If the GET param merge did naive string concatenation,
+    // id=a%26admin%3D1 would decode to "a&admin=1" and be re-interpreted as two
+    // query params (id=a, admin=1), binding id="a" instead of id="a&admin=1".
+    // The fix (serde_urlencoded::to_string re-encodes values) ensures the full
+    // decoded value is bound as `id`.
+    let req = get_req("/api/test_path_template/a%26admin%3D1");
+    let (status, body) = dispatch(&req, &cfg)
+        .await
+        .expect("route should respond");
+    assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
+    assert_eq!(
+        body["echoed_id"].as_str(),
+        Some("a&admin=1"),
+        "decoded id should be 'a&admin=1', not split by '&'"
+    );
+}
+
+#[tokio::test]
+async fn get_path_param_with_encoded_equals_does_not_forge_key() {
+    let cfg = test_config();
+    // %3D decodes to '='. Naive concat would produce id=foo%3Dbar which
+    // serde_urlencoded would parse as id="foo=bar" — but only because the '='
+    // is already encoded. The re-encoding path must still produce the right id.
+    let req = get_req("/api/test_path_template/foo%3Dbar");
+    let (status, body) = dispatch(&req, &cfg)
+        .await
+        .expect("route should respond");
+    assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
+    assert_eq!(
+        body["echoed_id"].as_str(),
+        Some("foo=bar"),
+        "decoded id should contain '='"
+    );
+}
+
+#[tokio::test]
+async fn get_path_param_with_percent_literal_survives_roundtrip() {
+    let cfg = test_config();
+    // %25 decodes to '%'. Re-encoding must produce %25 again.
+    let req = get_req("/api/test_path_template/100%25pure");
+    let (status, body) = dispatch(&req, &cfg)
+        .await
+        .expect("route should respond");
+    assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
+    assert_eq!(
+        body["echoed_id"].as_str(),
+        Some("100%pure"),
+        "decoded id should contain literal '%'"
+    );
+}
+
+#[tokio::test]
+async fn get_path_param_with_encoded_hash_does_not_split_fragment() {
+    let cfg = test_config();
+    // %23 decodes to '#' (URL fragment delimiter). Naive string concat could
+    // confuse URL parsers; structured re-encoding preserves the literal '#'.
+    let req = get_req("/api/test_path_template/tag%23123");
+    let (status, body) = dispatch(&req, &cfg)
+        .await
+        .expect("route should respond");
+    assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
+    assert_eq!(
+        body["echoed_id"].as_str(),
+        Some("tag#123"),
+        "decoded id should contain literal '#'"
+    );
+}
+
+// ─── H2: non-object body rejection ──────────────────────────────────────────
+
+#[tokio::test]
+async fn post_with_null_body_returns_400() {
+    let cfg = test_config();
+    let req = post_req_mutation("/api/test_path_template_mut/abc", Bytes::from("null"));
+    let resp = handle_api_request(req, &cfg).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "null body must be rejected with 400"
+    );
+}
+
+#[tokio::test]
+async fn post_with_array_body_returns_400() {
+    let cfg = test_config();
+    let req = post_req_mutation("/api/test_path_template_mut/abc", Bytes::from(r#"[1,2,3]"#));
+    let resp = handle_api_request(req, &cfg).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "array body must be rejected with 400"
+    );
+}
+
+#[tokio::test]
+async fn post_with_bool_body_returns_400() {
+    let cfg = test_config();
+    let req = post_req_mutation("/api/test_path_template_mut/abc", Bytes::from("true"));
+    let resp = handle_api_request(req, &cfg).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "bool body must be rejected with 400"
+    );
+}
+
+#[tokio::test]
+async fn post_with_string_body_returns_400() {
+    let cfg = test_config();
+    let req = post_req_mutation("/api/test_path_template_mut/abc", Bytes::from(r#""hello""#));
+    let resp = handle_api_request(req, &cfg).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "string body must be rejected with 400"
+    );
+}
+
+#[tokio::test]
+async fn post_with_empty_body_succeeds() {
+    // Empty body treated as {} — path value provides the id param.
+    let cfg = test_config();
+    let req = post_req_mutation("/api/test_path_template_mut/abc", Bytes::new());
+    let resp = handle_api_request(req, &cfg).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "empty body should be accepted (treated as {{}})"
+    );
+}
+
+// ─── H3: templated route auth checked pre-body ──────────────────────────────
+
+#[tokio::test]
+async fn templated_mutation_route_auth_rejects_before_body_cap() {
+    // Mirror of handle_api_request_auth_rejects_before_body_cap (rest.rs) for
+    // a *templated* route. The pre-body auth gate must match templates, not
+    // only exact paths, so a 2 MiB body without the action marker → 403, NOT 413.
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let mut cfg = ReinConfig::default();
+    cfg.database.path = dir.path().join("memories.db").to_string_lossy().into_owned();
+
+    let big_body = Bytes::from(vec![b'x'; 2 * 1024 * 1024]);
+    let req = post_req_with_body("/api/test_path_template_mut/abc", big_body);
+    let resp = handle_api_request(req, &cfg).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "templated mutation route: auth rejection must happen before body-size gate (2 MiB body, no marker)"
+    );
 }

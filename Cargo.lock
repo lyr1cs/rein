@@ -2112,6 +2112,7 @@ dependencies = [
  "libc",
  "native-tls",
  "regex",
+ "rein",
  "rein-macros",
  "reqwest",
  "ring",
