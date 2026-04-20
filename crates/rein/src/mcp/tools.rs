@@ -1,10 +1,44 @@
 use rmcp::schemars;
-use serde::de::Deserializer;
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
 
-// deserialize_option_usize_from_string removed with the last legacy memoir
-// Params struct in Phase 2.6. Op-side Params types use standard serde via
-// `#[serde(default)] Option<usize>` on clap-derived fields.
+/// Accept either a JSON number or a JSON string containing digits for an
+/// `Option<usize>` field. Pre-A1 MCP handlers for memoir search / inspect
+/// accepted `{"limit": "10"}` alongside `{"limit": 10}`; Phase 2.6 F2
+/// hardening restores that contract after the dead-code sweep dropped the
+/// helper. Shared as `pub(crate)` so new MCP-only Params structs that want
+/// the same tolerance can re-apply it via `#[serde(default,
+/// deserialize_with = "...")]`.
+pub(crate) fn deserialize_option_usize_from_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UsizeValue {
+        Number(u64),
+        String(String),
+    }
+
+    match Option::<UsizeValue>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(UsizeValue::Number(value)) => usize::try_from(value)
+            .map(Some)
+            .map_err(|_| de::Error::custom(format!("value {value} exceeds usize range"))),
+        Some(UsizeValue::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed
+                .parse::<usize>()
+                .map(Some)
+                .map_err(de::Error::custom)
+        }
+    }
+}
 
 fn normalize_string_list(mut values: Vec<String>) -> Option<Vec<String>> {
     values = values

@@ -490,20 +490,29 @@ fn handle_memoir_path(
     path: &str,
     query: &std::collections::HashMap<String, String>,
 ) -> BoxedResponse {
-    // After Phase 2.6 T0-T2 migrations, the inventory dispatcher serves:
+    // After Phase 2.6, the inventory dispatcher serves:
     //   GET /api/memoirs               → memoir_list
     //   GET /api/memoirs/{name}        → memoir_show
-    //   GET /api/memoirs/{name}/export → memoir_export
+    //   GET /api/memoirs/{name}/export → memoir_export  (format=json only)
     //
-    // Only /api/memoirs/{name}/inspect/{concept} remains here because the
-    // path-template framework enforces a single-seg contract (spec §Q2)
-    // and inspect needs two path parameters.
+    // Remaining legacy branches here:
+    //   - /api/memoirs/{name}/export?format=ascii|dot → text/plain response
+    //     (F1 hardening: inventory path would emit JSON envelope, which breaks
+    //     external clients that expect raw bytes). The dispatcher skips the
+    //     inventory path for these formats via an op_name guard, letting them
+    //     fall through here.
+    //   - /api/memoirs/{name}/inspect/{concept} → two path params, beyond
+    //     the single-seg path-template framework (spec §Q2).
     let rest = &path["/api/memoirs/".len()..];
     let Some(slash) = rest.find('/') else {
         return error_response(StatusCode::NOT_FOUND, "unknown memoir API endpoint");
     };
     let name = &percent_decode_lossy(&rest[..slash]);
     let sub = &rest[slash + 1..];
+    if sub == "export" {
+        let format = query.get("format").map(|s| s.as_str()).unwrap_or("json");
+        return api_memoir_export_text(config, name, format);
+    }
     if let Some(concept_rest) = sub.strip_prefix("inspect/") {
         let concept = percent_decode_lossy(concept_rest);
         let depth = match parse_bounded_usize(query, "depth", 1, 1, 8) {
@@ -700,6 +709,20 @@ async fn try_dispatch_inventory_rest<B>(
             });
         template_hit?
     };
+
+    // Phase 2.6 F1: memoir_export returns text/plain (not JSON) for
+    // format=ascii|dot in the legacy contract. The inventory dispatcher
+    // always emits application/json, so for these formats we fall through
+    // to the derived handler in handle_memoir_path which preserves the
+    // historical content-type. format=json (and the default when no
+    // format is supplied) stays on the inventory path.
+    if entry.op_name == "memoir_export" {
+        let query_params = parse_query(uri);
+        match query_params.get("format").map(|s| s.as_str()) {
+            Some("ascii") | Some("dot") => return None,
+            _ => {}
+        }
+    }
 
     // Enforce the entry's declared AuthPolicy. For requests arriving through
     // handle_api_request, auth was already enforced pre-body via resolve_route.
@@ -901,12 +924,58 @@ fn recall_results_response(
 
 // api_memoir_show migrated to #[op] (see ops/handlers/knowledge.rs::memoir_show).
 
-// api_memoir_export migrated to #[op] (see ops/handlers/knowledge.rs::memoir_export).
-// Note: the inventory response always returns JSON (via IntoJson). Clients that
-// relied on text/plain bodies for ascii/dot formats now receive a
-// `{"format": "...", "output": "..."}` JSON envelope. The GUI only uses
-// format=json, so this change is transparent there; external clients using
-// format=ascii or format=dot must extract `.output` from the JSON body.
+// api_memoir_export migrated to #[op] (see ops/handlers/knowledge.rs::memoir_export)
+// for format=json. The ascii|dot branches intentionally stay here because the
+// inventory REST dispatcher hardcodes content-type: application/json, and
+// wrapping the raw graph bytes in a JSON envelope would break external clients
+// that rely on text/plain responses. The dispatcher's op_name guard for
+// memoir_export forwards ascii|dot requests back to this helper via
+// handle_memoir_path (see Phase 2.6 audit F1).
+fn api_memoir_export_text(config: &ReinConfig, name: &str, format: &str) -> BoxedResponse {
+    if !matches!(format, "json" | "ascii" | "dot") {
+        return error_response(StatusCode::BAD_REQUEST, "invalid export format");
+    }
+    // json should never reach this helper — the inventory dispatcher claims
+    // it. Defend against misrouting by returning an internal error rather
+    // than silently regressing the content-type contract.
+    if format == "json" {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memoir export json routing error (should have dispatched to inventory)",
+        );
+    }
+    let store = match config.open_store() {
+        Ok(s) => s,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    match store.export_memoir(name, format) {
+        Ok(output) => {
+            let body = Full::new(Bytes::from(output))
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed();
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/plain")
+                .body(body)
+                .unwrap_or_else(|_| {
+                    Response::new(
+                        Full::new(Bytes::new())
+                            .map_err(|never: std::convert::Infallible| match never {})
+                            .boxed(),
+                    )
+                })
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            error_response(status, &msg)
+        }
+    }
+}
 
 fn api_memoir_inspect(
     config: &ReinConfig,
