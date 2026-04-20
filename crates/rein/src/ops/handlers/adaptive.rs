@@ -63,17 +63,20 @@ impl IntoJson for FeedbackOutput {
 
 impl IntoMarkdown for FeedbackOutput {
     fn to_markdown(&self) -> String {
-        format!(
-            "Feedback recorded for {} {}. This improves future recall quality.",
-            self.emitted,
-            if self.emitted == 1 { "memory" } else { "memories" }
-        )
+        // M1 compact contract: matches the pre-A1 legacy MCP compact branch
+        // verbatim (`format!("ok:{count}")`) so MCP callers that parse this
+        // string continue to work.
+        format!("ok:{}", self.emitted)
     }
 }
 
 impl IntoCliText for FeedbackOutput {
     fn to_cli_text(&self) -> String {
-        self.to_markdown()
+        format!(
+            "Feedback recorded for {} {}. This improves future recall quality.",
+            self.emitted,
+            if self.emitted == 1 { "memory" } else { "memories" }
+        )
     }
 }
 
@@ -99,31 +102,46 @@ impl OpsRuntime {
             let conn = store.conn();
             let mut emitted: u32 = 0;
 
-            for mem_id in &params.memory_ids {
-                let _ = crate::store::adaptive::emit_event(
-                    conn,
-                    crate::store::adaptive::FeedbackEvent {
-                        event_type: crate::store::adaptive::EventType::RecallAccess,
-                        request_id: params.request_id.clone(),
-                        memory_id: Some(mem_id.clone()),
-                        concept_id: None,
-                        query: params.query.clone(),
-                        query_type: None,
-                        topic: None,
-                        payload: Some(serde_json::json!({
-                            "source": "agent_feedback",
-                            "helpful": params.helpful,
-                        })),
-                    },
-                );
-                let _ = conn.execute(
-                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-                    rusqlite::params![chrono::Utc::now().to_rfc3339(), mem_id],
-                );
-                emitted += 1;
+            // F2: wrap the entire per-id batch in BEGIN IMMEDIATE so
+            // concurrent consumers never see partial state. Errors propagate
+            // via `?` and the ROLLBACK branch prevents a leaked open tx.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> crate::types::ReinResult<u32> {
+                for mem_id in &params.memory_ids {
+                    crate::store::adaptive::emit_event(
+                        conn,
+                        crate::store::adaptive::FeedbackEvent {
+                            event_type: crate::store::adaptive::EventType::RecallAccess,
+                            request_id: params.request_id.clone(),
+                            memory_id: Some(mem_id.clone()),
+                            concept_id: None,
+                            query: params.query.clone(),
+                            query_type: None,
+                            topic: None,
+                            payload: Some(serde_json::json!({
+                                "source": "agent_feedback",
+                                "helpful": params.helpful,
+                            })),
+                        },
+                    )?;
+                    conn.execute(
+                        "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
+                        rusqlite::params![chrono::Utc::now().to_rfc3339(), mem_id],
+                    )?;
+                    emitted += 1;
+                }
+                Ok(emitted)
+            })();
+            match result {
+                Ok(n) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(FeedbackOutput { emitted: n })
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
             }
-
-            Ok(FeedbackOutput { emitted })
         })
     }
 }
