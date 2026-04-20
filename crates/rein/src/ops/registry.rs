@@ -132,6 +132,8 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "knowledge", "POST /api/consolidate"),
     op!(Rest, "maintenance", "POST /api/cleanup"),
     op!(Rest, "adaptive", "POST /api/feedback"),
+    // Test-only op for Phase 2.5 path-template framework (T5). Delete in Phase 3.
+    op!(Rest, "diagnostics", "GET /api/test_path_template/{id}"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -232,6 +234,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[30],
     REST_OPERATIONS[31],
     REST_OPERATIONS[32],
+    REST_OPERATIONS[33],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -306,13 +309,14 @@ mod tests {
         // Phase 2.3: POST /api/consolidate added (consolidate op migrated to #[op] inventory).
         // Phase 2.3: POST /api/cleanup added (cleanup op migrated to #[op] inventory).
         // Phase 2.4: POST /api/feedback added (feedback op migrated to #[op] inventory).
-        assert_eq!(rest_operations().len(), 33);
+        // Phase 2.5 T5: GET /api/test_path_template/{id} test-only op added (delete in Phase 3).
+        assert_eq!(rest_operations().len(), 34);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 31,
-                rest: 33
+                rest: 34
             }
         );
     }

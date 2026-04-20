@@ -445,6 +445,95 @@ fn emit_mcp_block(
     }
 }
 
+/// Parse a `rest(path = "...")` literal at macro expansion time.
+/// Returns `Ok(Vec<TokenStream>)` where each element is one `PathSegment` expr.
+/// Validates the single-seg MVP constraint and malformed-brace rules.
+///
+/// Segments are split on `/`; the leading empty segment from a leading `/` is
+/// filtered. Trailing empties are kept so `/api/foo/` becomes 4 tokens and
+/// cannot match a 3-token template.
+fn parse_path_segments(path: &str, path_span: proc_macro2::Span) -> syn::Result<Vec<TokenStream>> {
+    // Strip the leading `/` to avoid a spurious empty first segment, but do NOT
+    // strip trailing empties — this lets `/api/foo/` (4 segments) differ from
+    // `/api/foo` (3 segments) in the template-match pass, giving trailing-slash 404.
+    let stripped = path.trim_start_matches('/');
+    let segments: Vec<&str> = if stripped.is_empty() {
+        vec![]
+    } else {
+        stripped.split('/').collect()
+    };
+
+    let mut param_count = 0usize;
+    let mut result = Vec::with_capacity(segments.len());
+
+    for seg in &segments {
+        // Count braces to detect unbalanced / mixed cases.
+        let open = seg.chars().filter(|&c| c == '{').count();
+        let close = seg.chars().filter(|&c| c == '}').count();
+
+        if open == 0 && close == 0 {
+            // Pure literal segment.
+            let lit = proc_macro2::Literal::string(seg);
+            result.push(quote! { ::rein::ops::PathSegment::Literal(#lit) });
+            continue;
+        }
+
+        // Any brace mismatch → unbalanced.
+        if open != close {
+            return Err(syn::Error::new(
+                path_span,
+                format!("unbalanced brace in path template: segment '{seg}'"),
+            ));
+        }
+
+        // Exactly one pair of braces: must span the entire segment, i.e. starts
+        // with `{` and ends with `}` with no surrounding literal text.
+        if !(seg.starts_with('{') && seg.ends_with('}')) {
+            return Err(syn::Error::new(
+                path_span,
+                format!(
+                    "path placeholders must occupy an entire segment: '{seg}' \
+                     — use '{{name}}' alone, not 'prefix{{name}}' or '{{name}}suffix'"
+                ),
+            ));
+        }
+
+        // Multiple pairs in one segment — reject.
+        if open > 1 {
+            return Err(syn::Error::new(
+                path_span,
+                "path templates support at most one {param} placeholder per segment in Phase 2.5",
+            ));
+        }
+
+        // Extract param name — strip `{` and `}`.
+        let name = &seg[1..seg.len() - 1];
+
+        // Empty placeholder `{}`.
+        if name.is_empty() {
+            return Err(syn::Error::new(
+                path_span,
+                "empty path placeholder {} is not allowed",
+            ));
+        }
+
+        // Single-seg MVP: at most one Param across the whole path.
+        param_count += 1;
+        if param_count > 1 {
+            return Err(syn::Error::new(
+                path_span,
+                "path templates support at most one {param} placeholder in Phase 2.5 \
+                 (multiple placeholders like {a}/{b} are not yet supported)",
+            ));
+        }
+
+        let name_lit = proc_macro2::Literal::string(name);
+        result.push(quote! { ::rein::ops::PathSegment::Param(#name_lit) });
+    }
+
+    Ok(result)
+}
+
 fn emit_rest_block(
     rest: &RestBlock,
     op_name: &str,
@@ -456,7 +545,27 @@ fn emit_rest_block(
         Ok(id) => id,
         Err(e) => return e.to_compile_error(),
     };
+
+    // T2: parse path segments at macro expansion time, emitting PathSegment literals.
+    // Static paths with no placeholders keep path_segments: &[] (leading-only split,
+    // never populate segments list unless a {seg} is present).
     let path = &rest.path;
+    let path_span = Span::call_site();
+
+    // Check whether the path contains any placeholders at all before parsing.
+    let has_placeholder = path.contains('{');
+    let path_segments_tokens = if has_placeholder {
+        match parse_path_segments(path, path_span) {
+            Ok(segs) => {
+                quote! { &[ #( #segs ),* ] }
+            }
+            Err(e) => return e.to_compile_error(),
+        }
+    } else {
+        // Literal-only path — no segments needed; exact-match pass handles it.
+        quote! { &[] }
+    };
+
     let call_expr = emit_call(fn_name, fi.params_ty.is_some(), fi.is_async);
 
     // A1 H5 (audit 2026-04-19 follow-up): GET/HEAD read from query string,
@@ -468,9 +577,42 @@ fn emit_rest_block(
         rest.method.to_ascii_uppercase().as_str(),
         "POST" | "PUT" | "PATCH" | "DELETE"
     );
+
+    // T4: path_values merge strategy.
+    // GET/HEAD: we use query-string append so serde_urlencoded coercion still
+    // works for bool/u64 query fields. Path values (always String per spec) are
+    // appended after stripping any conflicting query key, so path wins.
+    // POST/PUT/PATCH/DELETE: body is a JSON Value; we merge path_values into the
+    // object before deserialization — path fields go in as JSON strings.
     let prep = match (&fi.params_ty, is_body_method) {
         (Some(ty), false) => quote! {
-            let params: #ty = ::serde_urlencoded::from_str(&_query)
+            // T4 GET merge: strip any existing occurrence of path param keys from
+            // the query string, then append path values so they win on conflict.
+            let _effective_query = if _path_values.is_empty() {
+                _query.clone()
+            } else {
+                // Rebuild query, excluding keys that appear in _path_values, then
+                // append path values as query-string pairs at the end.
+                let mut _q_pairs: Vec<(::std::string::String, ::std::string::String)> =
+                    _query.split('&')
+                        .filter(|p| !p.is_empty())
+                        .filter_map(|pair| {
+                            let mut parts = pair.splitn(2, '=');
+                            let k = parts.next()?.to_string();
+                            let v = parts.next().unwrap_or("").to_string();
+                            Some((k, v))
+                        })
+                        .filter(|(k, _)| !_path_values.contains_key(k.as_str()))
+                        .collect();
+                for (pk, pv) in &_path_values {
+                    _q_pairs.push((pk.to_string(), pv.clone()));
+                }
+                _q_pairs.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            };
+            let params: #ty = ::serde_urlencoded::from_str(&_effective_query)
                 .map_err(|e| {
                     ::rein::types::ReinError::Config(
                         format!("query parse error: {e}")
@@ -479,18 +621,12 @@ fn emit_rest_block(
                 })?;
         },
         (Some(ty), true) => quote! {
-            // Empty body with a params struct present → reject as BadRequest
-            // instead of silently defaulting. Use `{}` explicitly when all
-            // fields are Option.
+            // T4 POST/PUT/PATCH/DELETE merge: decode body to JSON Value first,
+            // then overlay path_values (path always wins). Treat non-object or
+            // empty body as {} before merge.
             let body_bytes = _body.unwrap_or_default();
-            let params: #ty = if body_bytes.is_empty() {
-                ::serde_json::from_slice(b"{}")
-                    .map_err(|e| {
-                        ::rein::types::ReinError::Config(
-                            format!("empty body — expected JSON object: {e}")
-                        )
-                        .with_kind(::rein::types::OpsErrorKind::BadRequest)
-                    })?
+            let mut _params_json: ::serde_json::Value = if body_bytes.is_empty() {
+                ::serde_json::Value::Object(::serde_json::Map::new())
             } else {
                 ::serde_json::from_slice(&body_bytes)
                     .map_err(|e| {
@@ -500,6 +636,24 @@ fn emit_rest_block(
                         .with_kind(::rein::types::OpsErrorKind::BadRequest)
                     })?
             };
+            // Ensure we have an object to merge into; if body was e.g. `null`
+            // or a bare array, replace with empty object before path-value merge.
+            if !_params_json.is_object() {
+                _params_json = ::serde_json::Value::Object(::serde_json::Map::new());
+            }
+            // Merge path values — path wins over body.
+            if let ::serde_json::Value::Object(ref mut obj) = _params_json {
+                for (pk, pv) in &_path_values {
+                    obj.insert(pk.to_string(), ::serde_json::Value::String(pv.clone()));
+                }
+            }
+            let params: #ty = ::serde_json::from_value(_params_json)
+                .map_err(|e| {
+                    ::rein::types::ReinError::Config(
+                        format!("params deserialize error: {e}")
+                    )
+                    .with_kind(::rein::types::OpsErrorKind::BadRequest)
+                })?;
         },
         (None, _) => quote! {},
     };
@@ -532,9 +686,9 @@ fn emit_rest_block(
             ::rein::ops::OpsRestEntry {
                 method: ::hyper::Method::#method_ident,
                 path_template: #path,
-                // T1: segment list is always empty; T2 will parse `{seg}`
-                // placeholders from `path_template` at macro expansion time.
-                path_segments: &[],
+                // T2: segments populated for paths with {seg} placeholders;
+                // literal-only paths keep &[] for exact-match pass efficiency.
+                path_segments: #path_segments_tokens,
                 op_name: #op_name,
                 auth_policy: #auth_variant,
                 invoke: __op_rest_invoke,
