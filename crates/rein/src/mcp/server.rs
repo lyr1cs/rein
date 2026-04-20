@@ -311,34 +311,6 @@ impl ReinServer {
         }
     }
 
-    /// Delete a memory by ID.
-    #[tool(name = "rein_forget", description = "Delete a memory by its ID.")]
-    fn rein_forget(&self, Parameters(params): Parameters<ForgetParams>) -> String {
-        // Don't count forget as non-store (it's a mutation, not a read)
-        self.non_store_count.store(0, Ordering::Relaxed);
-        let compact = self.compact();
-        let id = params.id.clone();
-
-        let result = self.with_store(|store| store.delete(&params.id));
-
-        match result {
-            Ok(()) => {
-                let mut text = if compact {
-                    format!("ok:{id}")
-                } else {
-                    format!("Deleted memory: {id}")
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
-
     /// List all topics in the memory store.
     #[tool(name = "rein_list_topics", description = "List all memory topics.")]
     fn rein_list_topics(&self) -> String {
