@@ -62,6 +62,8 @@ pub const CLI_OPERATIONS: &[Operation] = &[
     op!(Cli, "service", "rein dashboard"),
     op!(Cli, "service", "rein gui"),
     op!(Cli, "service", "rein proxy"),
+    op!(Cli, "knowledge", "rein timeline"),
+    op!(Cli, "knowledge", "rein concept-history"),
 ];
 
 pub const MCP_OPERATIONS: &[Operation] = &[
@@ -168,6 +170,8 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     CLI_OPERATIONS[30],
     CLI_OPERATIONS[31],
     CLI_OPERATIONS[32],
+    CLI_OPERATIONS[33],
+    CLI_OPERATIONS[34],
     MCP_OPERATIONS[0],
     MCP_OPERATIONS[1],
     MCP_OPERATIONS[2],
@@ -286,13 +290,13 @@ mod tests {
 
     #[test]
     fn registry_counts_match_expected_values() {
-        assert_eq!(cli_operations().len(), 33);
+        assert_eq!(cli_operations().len(), 35);
         assert_eq!(mcp_operations().len(), 31);
         assert_eq!(rest_operations().len(), 33);
         assert_eq!(
             counts(),
             OperationCounts {
-                cli: 33,
+                cli: 35,
                 mcp: 31,
                 rest: 33
             }
