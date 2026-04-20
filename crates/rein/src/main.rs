@@ -301,7 +301,7 @@ async fn main() -> anyhow::Result<()> {
         // Commands::Consolidate removed — intercepted above via OpsCliEntry.
         // Commands::Cleanup removed — intercepted above via OpsCliEntry.
         // DedupLog migrated to #[op] inventory (dedup_log op); intercepted above via OpsCliEntry.
-Some(Commands::Dashboard) => commands::handle_dashboard(&config),
+        Some(Commands::Dashboard) => commands::handle_dashboard(&config),
         Some(Commands::Gui { action }) => match action {
             ServiceAction::On => commands::handle_gui_on()?,
             ServiceAction::Off => commands::handle_gui_off()?,
@@ -320,6 +320,7 @@ Some(Commands::Dashboard) => commands::handle_dashboard(&config),
 /// the same check exists at test time via `inventory_registration.rs` but
 /// catching it at startup prevents link-order-dependent silent shadowing.
 fn augment_with_inventory(mut cmd: clap::Command) -> clap::Command {
+    rein::ops::inventory::ensure_unique_registrations();
     let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     for entry in inventory::iter::<OpsCliEntry>() {
         if !seen.insert(entry.name) {

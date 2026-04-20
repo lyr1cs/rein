@@ -75,7 +75,11 @@ impl IntoCliText for FeedbackOutput {
         format!(
             "Feedback recorded for {} {}. This improves future recall quality.",
             self.emitted,
-            if self.emitted == 1 { "memory" } else { "memories" }
+            if self.emitted == 1 {
+                "memory"
+            } else {
+                "memories"
+            }
         )
     }
 }
@@ -88,14 +92,12 @@ impl OpsRuntime {
         mutating = true,
         mcp(name = "rein_feedback"),
         rest(method = "POST", path = "/api/feedback"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn feedback(&self, params: FeedbackParams) -> ReinResult<FeedbackOutput> {
         if params.memory_ids.is_empty() {
-            return Err(
-                ReinError::Config("memory_ids cannot be empty".into())
-                    .with_kind(OpsErrorKind::BadRequest),
-            );
+            return Err(ReinError::Config("memory_ids cannot be empty".into())
+                .with_kind(OpsErrorKind::BadRequest));
         }
 
         self.with_store(|store| {
@@ -108,6 +110,7 @@ impl OpsRuntime {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> crate::types::ReinResult<u32> {
                 for mem_id in &params.memory_ids {
+                    store.record_access(mem_id)?;
                     crate::store::adaptive::emit_event(
                         conn,
                         crate::store::adaptive::FeedbackEvent {
@@ -123,10 +126,6 @@ impl OpsRuntime {
                                 "helpful": params.helpful,
                             })),
                         },
-                    )?;
-                    conn.execute(
-                        "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-                        rusqlite::params![chrono::Utc::now().to_rfc3339(), mem_id],
                     )?;
                     emitted += 1;
                 }
@@ -153,7 +152,7 @@ impl OpsRuntime {
         description = "Show adaptive engine status: learned alphas, reranker weights, cluster info, tier boundaries, event counts, survival curve summaries.",
         cli(name = "adaptive-status"),
         mcp(name = "rein_adaptive_status"),
-        rest(method = "GET", path = "/api/adaptive"),
+        rest(method = "GET", path = "/api/adaptive")
     )]
     pub fn adaptive_status(&self) -> ReinResult<AdaptiveStatusOutput> {
         let value = self.with_store(|s| Ok(crate::ops::adaptive_status(s)))?;

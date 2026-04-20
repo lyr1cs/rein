@@ -91,5 +91,26 @@ pub fn validate(attr: &OpAttr) -> syn::Result<()> {
         ));
     }
 
+    // Fail-open guard: a write op on a REST surface must declare non-public auth.
+    // Without this, forgetting `auth = "mutation_marker"` on a new
+    // `#[op(mutating = true, rest(method = "POST", ...))]` silently registers
+    // an unauthenticated mutating endpoint that REST enforcement short-circuits.
+    if attr.mutating && attr.auth == "public" {
+        if let Some(rest) = &attr.rest {
+            let method = rest.method.to_ascii_uppercase();
+            if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+                return Err(syn::Error::new(
+                    Span::call_site(),
+                    format!(
+                        "#[op] mutating = true with REST {method} on '{}' must set \
+                         auth = \"mutation_marker\" (or a stricter policy); \
+                         public writes bypass REST auth enforcement",
+                        rest.path
+                    ),
+                ));
+            }
+        }
+    }
+
     Ok(())
 }

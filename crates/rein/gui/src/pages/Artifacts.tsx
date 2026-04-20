@@ -64,6 +64,7 @@ export default function Artifacts() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ArtifactDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const detailAbortRef = useRef<AbortController | null>(null);
   const detailRequestRef = useRef(0);
 
@@ -79,6 +80,7 @@ export default function Artifacts() {
         detailRequestRef.current += 1;
         setExpandedId(null);
         setDetail(null);
+        setDetailError(null);
         setDetailLoading(false);
         return;
       }
@@ -89,6 +91,7 @@ export default function Artifacts() {
       const requestId = detailRequestRef.current;
       setExpandedId(artifact.id);
       setDetail(null);
+      setDetailError(null);
       setDetailLoading(true);
       try {
         const d = await apiGet<ArtifactDetail>(
@@ -101,6 +104,9 @@ export default function Artifacts() {
       } catch (err) {
         if (!(err instanceof DOMException && err.name === 'AbortError')) {
           console.error('Failed to fetch artifact detail:', err);
+          if (detailRequestRef.current === requestId) {
+            setDetailError(err instanceof Error ? err.message : 'Failed to load transcript');
+          }
         }
       } finally {
         if (detailRequestRef.current === requestId) {
@@ -179,6 +185,10 @@ export default function Artifacts() {
                     {detailLoading ? (
                       <div className="text-xs text-[var(--text-muted)] py-4">
                         Loading transcript...
+                      </div>
+                    ) : detailError ? (
+                      <div className="text-xs text-[var(--hot)] py-2 break-words">
+                        Failed to load transcript: {detailError}
                       </div>
                     ) : detail?.transcript_text ? (
                       <div className="space-y-3 max-h-96 overflow-y-auto">

@@ -7,7 +7,11 @@ use rein::ops::OpsRuntime;
 fn runtime_dry_run_defaults_to_false_and_is_settable() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg = Arc::new(config);
     let rt = OpsRuntime::for_cli(cfg);
     assert!(!rt.dry_run(), "default should be false");
@@ -28,7 +32,11 @@ async fn canonicals_returns_consistent_output_across_surfaces() {
 
     let make_config = || {
         let mut c = ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -70,8 +78,12 @@ async fn canonicals_returns_consistent_output_across_surfaces() {
             }
         };
 
-        store.store(seed("c1", "test", "canonical one")).expect("seed c1");
-        store.store(seed("c2", "test", "canonical two")).expect("seed c2");
+        store
+            .store(seed("c1", "test", "canonical one"))
+            .expect("seed c1");
+        store
+            .store(seed("c2", "test", "canonical two"))
+            .expect("seed c2");
     }
 
     // --- MCP surface ---
@@ -137,17 +149,14 @@ async fn canonicals_returns_consistent_output_across_surfaces() {
     assert_eq!(mcp_arr.len(), 2, "expected 2 seeded canonical memories");
 
     // IDs present in both surfaces must match (order may differ; sort for comparison).
-    let mut mcp_ids: Vec<&str> = mcp_arr
-        .iter()
-        .filter_map(|v| v["id"].as_str())
-        .collect();
-    let mut rest_ids: Vec<&str> = rest_arr
-        .iter()
-        .filter_map(|v| v["id"].as_str())
-        .collect();
+    let mut mcp_ids: Vec<&str> = mcp_arr.iter().filter_map(|v| v["id"].as_str()).collect();
+    let mut rest_ids: Vec<&str> = rest_arr.iter().filter_map(|v| v["id"].as_str()).collect();
     mcp_ids.sort_unstable();
     rest_ids.sort_unstable();
-    assert_eq!(mcp_ids, rest_ids, "MCP and REST must return the same memory IDs");
+    assert_eq!(
+        mcp_ids, rest_ids,
+        "MCP and REST must return the same memory IDs"
+    );
 }
 
 #[tokio::test]
@@ -160,7 +169,11 @@ async fn evidence_returns_consistent_output_across_surfaces() {
 
     let make_config = || {
         let mut c = ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -215,8 +228,12 @@ async fn evidence_returns_consistent_output_across_surfaces() {
             imported_at: now,
         };
 
-        store.add_memory_evidence(make_ev("e1", "evidence one")).expect("seed e1");
-        store.add_memory_evidence(make_ev("e2", "evidence two")).expect("seed e2");
+        store
+            .add_memory_evidence(make_ev("e1", "evidence one"))
+            .expect("seed e1");
+        store
+            .add_memory_evidence(make_ev("e2", "evidence two"))
+            .expect("seed e2");
     }
 
     // --- MCP surface ---
@@ -283,20 +300,21 @@ async fn evidence_returns_consistent_output_across_surfaces() {
         "MCP and REST evidence must return the same count"
     );
     // 1 auto-snapshot (store() snapshots the memory itself as evidence) + 2 manually seeded.
-    assert_eq!(mcp_arr.len(), 3, "expected 3 evidence rows (1 auto-snapshot + 2 manual)");
+    assert_eq!(
+        mcp_arr.len(),
+        3,
+        "expected 3 evidence rows (1 auto-snapshot + 2 manual)"
+    );
 
     // IDs present in both surfaces must match.
-    let mut mcp_ids: Vec<&str> = mcp_arr
-        .iter()
-        .filter_map(|v| v["id"].as_str())
-        .collect();
-    let mut rest_ids: Vec<&str> = rest_arr
-        .iter()
-        .filter_map(|v| v["id"].as_str())
-        .collect();
+    let mut mcp_ids: Vec<&str> = mcp_arr.iter().filter_map(|v| v["id"].as_str()).collect();
+    let mut rest_ids: Vec<&str> = rest_arr.iter().filter_map(|v| v["id"].as_str()).collect();
     mcp_ids.sort_unstable();
     rest_ids.sort_unstable();
-    assert_eq!(mcp_ids, rest_ids, "MCP and REST must return the same evidence IDs");
+    assert_eq!(
+        mcp_ids, rest_ids,
+        "MCP and REST must return the same evidence IDs"
+    );
 }
 
 #[tokio::test]
@@ -309,7 +327,11 @@ async fn gc_dry_run_parity_across_surfaces_respects_auth() {
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         // Low prune threshold so the test memory is eligible for pruning.
         c.decay.prune_threshold = 0.99;
         Arc::new(c)
@@ -433,21 +455,32 @@ async fn gc_dry_run_parity_across_surfaces_respects_auth() {
         "MCP and REST dry-run gc must agree on pruned count"
     );
     // Both surfaces must see the same decayed count.
-    let mcp_decayed = mcp_json["decayed"].as_u64().expect("MCP gc must have `decayed`");
-    let rest_decayed = rest_json["decayed"].as_u64().expect("REST gc must have `decayed`");
-    assert_eq!(mcp_decayed, rest_decayed, "MCP and REST must agree on decayed count");
+    let mcp_decayed = mcp_json["decayed"]
+        .as_u64()
+        .expect("MCP gc must have `decayed`");
+    let rest_decayed = rest_json["decayed"]
+        .as_u64()
+        .expect("REST gc must have `decayed`");
+    assert_eq!(
+        mcp_decayed, rest_decayed,
+        "MCP and REST must agree on decayed count"
+    );
 }
 
 #[test]
 fn intelligent_merge_try_cli_only_surface() {
     use rein::ops::{OpsCliEntry, OpsRuntime};
-    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -486,8 +519,12 @@ fn intelligent_merge_try_cli_only_surface() {
             last_accessed: chrono::Utc::now(),
         };
 
-        store.store(make_mem("imt_a", "existing merge candidate")).expect("seed imt_a");
-        store.store(make_mem("imt_b", "incoming merge candidate")).expect("seed imt_b");
+        store
+            .store(make_mem("imt_a", "existing merge candidate"))
+            .expect("seed imt_a");
+        store
+            .store(make_mem("imt_b", "incoming merge candidate"))
+            .expect("seed imt_b");
     }
 
     // The op must be registered as CLI-only (no MCP, no REST entry).
@@ -526,8 +563,14 @@ fn intelligent_merge_try_cli_only_surface() {
             "output must contain either verdict or no-LLM message; got: {out}"
         );
         // Summaries must be in output.
-        assert!(out.contains("existing merge candidate"), "existing summary missing from output");
-        assert!(out.contains("incoming merge candidate"), "incoming summary missing from output");
+        assert!(
+            out.contains("existing merge candidate"),
+            "existing summary missing from output"
+        );
+        assert!(
+            out.contains("incoming merge candidate"),
+            "incoming summary missing from output"
+        );
     });
 }
 
@@ -540,7 +583,11 @@ fn migrate_cli_only_surface_applies_schema() {
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -609,7 +656,10 @@ fn migrate_cli_only_surface_applies_schema() {
             .expect("CLI migrate invoke");
         // Output should mention the migration completion.
         assert!(
-            out.contains("Migration complete") || out.contains("migrated") || out.contains("chunks") || out.contains("documents"),
+            out.contains("Migration complete")
+                || out.contains("migrated")
+                || out.contains("chunks")
+                || out.contains("documents"),
             "migrate output must describe result; got: {out}"
         );
     });
@@ -618,14 +668,18 @@ fn migrate_cli_only_surface_applies_schema() {
 #[tokio::test]
 async fn dedup_dry_run_parity_across_surfaces_respects_auth() {
     use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
-    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
     use serde_json::Value;
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         // Use a similarity threshold low enough that nearly-identical memories are detected.
         c.search.dedup_similarity = 0.70;
         Arc::new(c)
@@ -713,8 +767,7 @@ async fn dedup_dry_run_parity_across_surfaces_respects_auth() {
         )
         .await
         .expect("REST dedup invoke");
-        let value: Value =
-            serde_json::from_slice(&bytes).expect("REST dedup body is valid JSON");
+        let value: Value = serde_json::from_slice(&bytes).expect("REST dedup body is valid JSON");
         (status, value)
     };
 
@@ -765,10 +818,7 @@ async fn dedup_dry_run_parity_across_surfaces_respects_auth() {
     let rest_removed = rest_json["removed"]
         .as_u64()
         .expect("REST dedup output must have `removed` count");
-    assert_eq!(
-        mcp_removed, 0,
-        "MCP dry-run dedup must not remove anything"
-    );
+    assert_eq!(mcp_removed, 0, "MCP dry-run dedup must not remove anything");
     assert_eq!(
         rest_removed, 0,
         "REST dry-run dedup must not remove anything"
@@ -803,7 +853,11 @@ async fn dedup_log_returns_consistent_output_across_surfaces() {
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -812,8 +866,8 @@ async fn dedup_log_returns_consistent_output_across_surfaces() {
         let cfg = make_config();
         let store = cfg.open_store().expect("open store for seeding");
 
-        let make_decision = |id: &str, winner: &str, loser: &str, relation: DedupRelation| {
-            DedupDecision {
+        let make_decision =
+            |id: &str, winner: &str, loser: &str, relation: DedupRelation| DedupDecision {
                 id: id.to_string(),
                 winner_id: Some(winner.to_string()),
                 loser_id: Some(loser.to_string()),
@@ -830,8 +884,7 @@ async fn dedup_log_returns_consistent_output_across_surfaces() {
                 conflict_detected: false,
                 payload: None,
                 created_at: chrono::Utc::now(),
-            }
-        };
+            };
 
         store
             .record_dedup_decision(make_decision("dd1", "w1", "l1", DedupRelation::Duplicate))
@@ -879,11 +932,21 @@ async fn dedup_log_returns_consistent_output_across_surfaces() {
     let rest_arr = rest_json["decisions"]
         .as_array()
         .expect("REST dedup_log output must have `decisions` array");
-    assert_eq!(rest_arr.len(), 2, "expected 2 seeded dedup decisions via REST");
+    assert_eq!(
+        rest_arr.len(),
+        2,
+        "expected 2 seeded dedup decisions via REST"
+    );
 
     // CLI output must contain the decision IDs.
-    assert!(cli_out.contains("dd1") || cli_out.contains("No dedup decisions"), "CLI output must contain dd1");
-    assert!(cli_out.contains("dd2") || cli_out.contains("No dedup decisions"), "CLI output must contain dd2");
+    assert!(
+        cli_out.contains("dd1") || cli_out.contains("No dedup decisions"),
+        "CLI output must contain dd1"
+    );
+    assert!(
+        cli_out.contains("dd2") || cli_out.contains("No dedup decisions"),
+        "CLI output must contain dd2"
+    );
 
     // REST JSON must preserve novel_facts as a JSON string (GUI parity).
     let first = &rest_arr[0];
@@ -920,7 +983,11 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -980,7 +1047,11 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
     let tmp2 = tempfile::TempDir::new().expect("tempdir2");
     let make_config2 = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp2.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp2
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
     {
@@ -1030,7 +1101,11 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
     let tmp3 = tempfile::TempDir::new().expect("tempdir3");
     let make_config3 = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp3.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp3
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
     {
@@ -1150,7 +1225,11 @@ async fn organize_parity_across_surfaces() {
 
     let make_config = |tmp: &tempfile::TempDir| {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         // Use a low similarity threshold so nearby memories are linked.
         c.search.dedup_similarity = 0.1;
         std::sync::Arc::new(c)
@@ -1187,13 +1266,22 @@ async fn organize_parity_across_surfaces() {
             last_accessed: chrono::Utc::now(),
         };
         store
-            .store(make_mem("org_a", "rein stores memories for AI agents in Rust"))
+            .store(make_mem(
+                "org_a",
+                "rein stores memories for AI agents in Rust",
+            ))
             .expect("seed org_a");
         store
-            .store(make_mem("org_b", "rein recalls memories for AI agents in Rust"))
+            .store(make_mem(
+                "org_b",
+                "rein recalls memories for AI agents in Rust",
+            ))
             .expect("seed org_b");
         store
-            .store(make_mem("org_c", "rein manages long-term AI memory in Rust"))
+            .store(make_mem(
+                "org_c",
+                "rein manages long-term AI memory in Rust",
+            ))
             .expect("seed org_c");
     };
 
@@ -1247,8 +1335,8 @@ async fn organize_parity_across_surfaces() {
         let entry = inventory::iter::<OpsRestEntry>()
             .find(|e| e.op_name == "organize")
             .expect("organize REST entry registered");
-        let body = serde_json::to_vec(&serde_json::json!({ "max_links": 5 }))
-            .expect("serialize body");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "max_links": 5 })).expect("serialize body");
         let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
@@ -1302,14 +1390,18 @@ async fn organize_parity_across_surfaces() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consolidate_dry_run_parity_across_surfaces_respects_auth() {
     use rein::ops::{OpsCliEntry, OpsMcpEntry, OpsRestEntry};
-    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
     use serde_json::Value;
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         Arc::new(c)
     };
 
@@ -1480,7 +1572,11 @@ async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
 
     let make_config = || {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         std::sync::Arc::new(c)
     };
 
@@ -1524,13 +1620,25 @@ async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
         };
 
         store
-            .store(make_mem("cu_a", "cleanup-test", "rein is a cross-validated memory server for AI agents"))
+            .store(make_mem(
+                "cu_a",
+                "cleanup-test",
+                "rein is a cross-validated memory server for AI agents",
+            ))
             .expect("seed cu_a");
         store
-            .store(make_mem("cu_b", "cleanup-test", "rein provides reliable recall across agent sessions"))
+            .store(make_mem(
+                "cu_b",
+                "cleanup-test",
+                "rein provides reliable recall across agent sessions",
+            ))
             .expect("seed cu_b");
         store
-            .store(make_mem("cu_c", "cleanup-test", "rein stores memories with decay and importance scoring"))
+            .store(make_mem(
+                "cu_c",
+                "cleanup-test",
+                "rein stores memories with decay and importance scoring",
+            ))
             .expect("seed cu_c");
     }
 
@@ -1555,10 +1663,9 @@ async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
         let entry = inventory::iter::<OpsRestEntry>()
             .find(|e| e.op_name == "cleanup")
             .expect("cleanup REST entry registered");
-        let body = serde_json::to_vec(
-            &serde_json::json!({ "dry_run": true, "topic": "cleanup-test" }),
-        )
-        .expect("serialize body");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "dry_run": true, "topic": "cleanup-test" }))
+                .expect("serialize body");
         let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
@@ -1567,8 +1674,7 @@ async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
         )
         .await
         .expect("REST cleanup invoke");
-        let value: Value =
-            serde_json::from_slice(&bytes).expect("REST cleanup body is valid JSON");
+        let value: Value = serde_json::from_slice(&bytes).expect("REST cleanup body is valid JSON");
         (status, value)
     };
 
@@ -1655,7 +1761,11 @@ async fn migrated_mcp_response_stays_valid_json_after_nudge_threshold() {
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
 
     let entry = inventory::iter::<OpsMcpEntry>()
         .find(|e| e.op_name == "stats")
@@ -1728,7 +1838,11 @@ async fn migrated_mcp_op_returns_markdown_in_compact_mode() {
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg = std::sync::Arc::new(config);
 
     let entry = inventory::iter::<OpsMcpEntry>()
@@ -1750,7 +1864,10 @@ async fn migrated_mcp_op_returns_markdown_in_compact_mode() {
     // --- compact branch: output must NOT be valid JSON (it's markdown) ---
     let runtime_compact = std::sync::Arc::new(OpsRuntime::for_mcp(cfg.clone()));
     runtime_compact.set_compact(true);
-    assert!(runtime_compact.compact(), "compact must be true after set_compact(true)");
+    assert!(
+        runtime_compact.compact(),
+        "compact must be true after set_compact(true)"
+    );
     let compact_body = (entry.invoke)(runtime_compact, serde_json::json!({}))
         .await
         .expect("stats invoke (compact) must not error");
@@ -1791,7 +1908,11 @@ async fn consolidate_empty_scope_signals_no_match() {
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg = std::sync::Arc::new(config);
 
     // Seed one memory under a topic that does NOT match the test pattern.
@@ -1868,15 +1989,18 @@ async fn consolidate_empty_scope_signals_no_match() {
     .await
     .expect("consolidate compact invoke must not error");
     assert_eq!(
-        compact_body,
-        "No topics matched pattern: zzz-no-such-*",
+        compact_body, "No topics matched pattern: zzz-no-such-*",
         "N2: compact consolidate pattern no-match must reproduce legacy byte-exact string"
     );
 
     // --- all + empty DB: no-match (use a fresh DB with no memories) ---
     let tmp2 = tempfile::TempDir::new().expect("tempdir2");
     let mut config2 = ReinConfig::default();
-    config2.database.path = tmp2.path().join("memories.db").to_string_lossy().into_owned();
+    config2.database.path = tmp2
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg2 = std::sync::Arc::new(config2);
 
     let runtime_all = std::sync::Arc::new(OpsRuntime::for_mcp(cfg2.clone()));
@@ -1904,8 +2028,7 @@ async fn consolidate_empty_scope_signals_no_match() {
     .await
     .expect("consolidate compact all-on-empty must not error");
     assert_eq!(
-        all_compact_body,
-        "No topics matched the selected scope.",
+        all_compact_body, "No topics matched the selected scope.",
         "N2: compact consolidate all-no-match must reproduce legacy byte-exact string"
     );
 
@@ -1935,8 +2058,8 @@ async fn consolidate_empty_scope_signals_no_match() {
     )
     .await
     .expect("consolidate pattern-match invoke must not error");
-    let pattern_match_json: serde_json::Value = serde_json::from_str(&pattern_match_body)
-        .expect("pattern-match output must be valid JSON");
+    let pattern_match_json: serde_json::Value =
+        serde_json::from_str(&pattern_match_body).expect("pattern-match output must be valid JSON");
     assert_eq!(
         pattern_match_json["matched"].as_bool(),
         Some(true),
@@ -1958,7 +2081,11 @@ async fn cleanup_empty_scope_signals_no_match() {
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg = std::sync::Arc::new(config);
 
     // Seed one memory under a topic that does NOT match the test pattern.
@@ -2033,15 +2160,18 @@ async fn cleanup_empty_scope_signals_no_match() {
     .await
     .expect("cleanup compact invoke must not error");
     assert_eq!(
-        compact_body,
-        "No topics matched pattern: zzz-no-such-cleanup-*",
+        compact_body, "No topics matched pattern: zzz-no-such-cleanup-*",
         "N2: compact cleanup pattern no-match must reproduce legacy byte-exact string"
     );
 
     // --- all + empty DB: no-match ---
     let tmp2 = tempfile::TempDir::new().expect("tempdir2");
     let mut config2 = ReinConfig::default();
-    config2.database.path = tmp2.path().join("memories.db").to_string_lossy().into_owned();
+    config2.database.path = tmp2
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg2 = std::sync::Arc::new(config2);
 
     let runtime_all = std::sync::Arc::new(OpsRuntime::for_mcp(cfg2.clone()));
@@ -2069,8 +2199,7 @@ async fn cleanup_empty_scope_signals_no_match() {
     .await
     .expect("cleanup compact all-on-empty must not error");
     assert_eq!(
-        all_compact_body,
-        "No topics matched the selected scope.",
+        all_compact_body, "No topics matched the selected scope.",
         "N2: compact cleanup all-no-match must reproduce legacy byte-exact string"
     );
 
@@ -2098,8 +2227,8 @@ async fn cleanup_empty_scope_signals_no_match() {
     )
     .await
     .expect("cleanup pattern-match invoke must not error");
-    let pattern_match_json: serde_json::Value = serde_json::from_str(&pattern_match_body)
-        .expect("pattern-match output must be valid JSON");
+    let pattern_match_json: serde_json::Value =
+        serde_json::from_str(&pattern_match_body).expect("pattern-match output must be valid JSON");
     assert_eq!(
         pattern_match_json["matched"].as_bool(),
         Some(true),
@@ -2147,10 +2276,10 @@ fn cleanup_asynchronous_flag_parses_from_clap() {
 /// in the environment so it does not attempt to spawn any child processes.
 #[test]
 fn cleanup_asynchronous_alias_queues_via_worker() {
-    use std::sync::Arc;
     use rein::config::ReinConfig;
-    use rein::ops::OpsRuntime;
     use rein::ops::handlers::maintenance::CleanupParams;
+    use rein::ops::OpsRuntime;
+    use std::sync::Arc;
 
     // Prevent spawn_cleanup_worker from actually forking a process.
     std::env::set_var("REIN_CLEANUP_WORKER", "1");
@@ -2159,7 +2288,11 @@ fn cleanup_asynchronous_alias_queues_via_worker() {
     let mut config = ReinConfig::default();
     // database.path inside the tempdir → resolve_buffer_dir returns tmp.path()
     // so queue_cleanup_job writes its JSONL file there rather than ~/.rein.
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let cfg = Arc::new(config);
     let rt = OpsRuntime::for_cli(cfg);
 
@@ -2169,12 +2302,26 @@ fn cleanup_asynchronous_alias_queues_via_worker() {
         ..Default::default()
     };
 
-    let output = rt.cleanup(params).expect("cleanup with asynchronous=true must not error");
+    let output = rt
+        .cleanup(params)
+        .expect("cleanup with asynchronous=true must not error");
 
-    assert!(output.queued, "L1: queued must be true when --asynchronous is set");
-    assert_eq!(output.groups_consolidated, 0, "L1: groups_consolidated must be 0 (async path)");
-    assert_eq!(output.memories_consolidated, 0, "L1: memories_consolidated must be 0 (async path)");
-    assert_eq!(output.duplicates_found, 0, "L1: duplicates_found must be 0 (async path)");
+    assert!(
+        output.queued,
+        "L1: queued must be true when --asynchronous is set"
+    );
+    assert_eq!(
+        output.groups_consolidated, 0,
+        "L1: groups_consolidated must be 0 (async path)"
+    );
+    assert_eq!(
+        output.memories_consolidated, 0,
+        "L1: memories_consolidated must be 0 (async path)"
+    );
+    assert_eq!(
+        output.duplicates_found, 0,
+        "L1: duplicates_found must be 0 (async path)"
+    );
 
     // CLI render must short-circuit with the queued message, not a consolidation
     // report or no-match signal.
@@ -2196,7 +2343,7 @@ fn cleanup_asynchronous_alias_queues_via_worker() {
 #[tokio::test]
 async fn feedback_records_consistent_across_surfaces() {
     use rein::ops::{OpsMcpEntry, OpsRestEntry};
-    use rein::types::{Importance, Memory, MemoryLayer, MemoryStore, MemoryStatus, Source};
+    use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
     use serde_json::Value;
 
     // Helper: build a fresh memory for seeding.
@@ -2234,7 +2381,11 @@ async fn feedback_records_consistent_across_surfaces() {
 
     let make_config = |tmp: &tempfile::TempDir| {
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         std::sync::Arc::new(c)
     };
 
@@ -2326,7 +2477,11 @@ async fn feedback_empty_memory_ids_is_rejected() {
     let make_config = || {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut c = rein::config::ReinConfig::default();
-        c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+        c.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
         std::sync::Arc::new(c)
     };
 
@@ -2358,14 +2513,54 @@ async fn feedback_empty_memory_ids_is_rejected() {
         let entry = inventory::iter::<OpsMcpEntry>()
             .find(|e| e.op_name == "feedback")
             .expect("feedback MCP entry registered");
-        let result = (entry.invoke)(
-            runtime,
-            serde_json::json!({ "memory_ids": [] }),
-        )
-        .await;
+        let result = (entry.invoke)(runtime, serde_json::json!({ "memory_ids": [] })).await;
         assert!(
             result.is_err(),
             "MCP feedback with empty memory_ids must return an error"
         );
     }
+}
+
+#[tokio::test]
+async fn feedback_missing_memory_is_rejected_without_emitting_event() {
+    use rein::ops::OpsRestEntry;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut c = rein::config::ReinConfig::default();
+    c.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
+    let cfg = std::sync::Arc::new(c);
+    let runtime = std::sync::Arc::new(rein::ops::OpsRuntime::for_rest(cfg.clone()));
+
+    let entry = inventory::iter::<OpsRestEntry>()
+        .find(|e| e.op_name == "feedback")
+        .expect("feedback REST entry registered");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "memory_ids": ["missing-id"],
+        "request_id": "missing-req"
+    }))
+    .expect("serialize body");
+
+    let result = (entry.invoke)(
+        runtime,
+        std::collections::HashMap::new(),
+        String::new(),
+        Some(body.into()),
+    )
+    .await;
+    assert!(result.is_err(), "missing memory must fail feedback");
+
+    let store = cfg.open_store().expect("open store after failed feedback");
+    let count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM feedback_events WHERE request_id = 'missing-req'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count feedback events");
+    assert_eq!(count, 0, "failed feedback must not emit stray events");
 }

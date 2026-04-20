@@ -900,7 +900,19 @@ fn compute_counterfactual_alphas(
 }
 
 /// Main orchestrator for M2 alpha learning.
-/// Peeks at recall events, parses candidates, computes optimal alphas.
+///
+/// Peeks at recall events, parses candidates, advances both consumer offsets
+/// (`alpha_optimizer` over recall_complete, `alpha_optimizer_access` over
+/// recall_access) atomically, then computes optimal alphas.
+///
+/// **Atomicity invariant:** both offsets are advanced inside one
+/// `BEGIN IMMEDIATE` / `COMMIT` block. The previous implementation advanced
+/// `alpha_optimizer_access` mid-function via `consume_events` and
+/// `alpha_optimizer` later via a separate `INSERT`, with no enclosing
+/// transaction. A crash between those writes marked access events consumed
+/// while the matching recall_complete events were re-peeked — producing
+/// ghost events (no access signal), silently dropped by
+/// `events_with_access`, and the alpha for that window went unlearned.
 fn run_alpha_learning(
     store: &SqliteStore,
     state: &mut crate::store::adaptive::AdaptiveState,
@@ -913,14 +925,11 @@ fn run_alpha_learning(
         return;
     }
 
-    // Consume recall_access events (these are fire-and-forget, safe to advance)
-    let access_events = crate::store::adaptive::consume_events(
-        conn,
-        "alpha_optimizer_access",
-        &["recall_access"],
-        500,
-    )
-    .unwrap_or_default();
+    // Peek recall_access events WITHOUT advancing their offset. Advancement
+    // happens below, inside the same transaction that moves the
+    // alpha_optimizer cursor, so the two offsets cannot disagree across a
+    // process crash.
+    let access_events = peek_access_events(conn, 500);
 
     // Build RecallEvent structs from stored events
     let recall_events: Vec<crate::search::alpha_optimizer::RecallEvent> = events
@@ -946,6 +955,8 @@ fn run_alpha_learning(
         .collect();
 
     let mut advance_to: Option<i64> = None;
+    let mut rids_we_advanced_through: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for event in &events {
         let rid = event.request_id.as_deref().unwrap_or("");
         let is_matched = matched_request_ids.contains(rid);
@@ -955,18 +966,75 @@ fn run_alpha_learning(
 
         if is_matched || is_expired {
             advance_to = Some(event.id);
+            rids_we_advanced_through.insert(rid.to_string());
         } else {
             break;
         }
     }
 
-    if let Some(new_offset) = advance_to {
-        let _ = conn.execute(
-            "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
-             VALUES ('alpha_optimizer', ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-             ON CONFLICT(consumer) DO UPDATE SET last_event_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            rusqlite::params![new_offset],
-        );
+    // Advance the access cursor only through the contiguous id-order prefix
+    // of access events whose `request_id` correlates to a recall_complete we
+    // also advanced past in this pass. Two constraints force the
+    // prefix-safe walk:
+    //
+    // 1. `peek_access_events` loads up to 500 rows while `peek_recall_events`
+    //    caps at 100. If we naively advanced to the MAX correlated id, an
+    //    interleaved access event for a not-yet-peeked recall sitting
+    //    between two "advanced-through" access events would get silently
+    //    consumed — on a later pass when that recall is peeked, its access
+    //    signal is already past the cursor and it ages out unlearned.
+    //
+    // 2. The consumer_offsets row for `alpha_optimizer_access` is a single
+    //    monotonic id. We cannot mark id=100 and id=102 consumed while
+    //    leaving id=101 unconsumed. The only safe advance is the highest X
+    //    such that *every* access event in (prev_offset, X] is in
+    //    `rids_we_advanced_through`.
+    //
+    // Worst case: an orphan access event forever gates the prefix until its
+    // recall arrives (or `cleanup_expired_events` prunes it). That is the
+    // intended trade-off — correctness over liveness.
+    let mut access_advance_to: Option<i64> = None;
+    for ae in &access_events {
+        let rid = ae.request_id.as_deref().unwrap_or("");
+        if rids_we_advanced_through.contains(rid) {
+            access_advance_to = Some(ae.id);
+        } else {
+            break;
+        }
+    }
+
+    if advance_to.is_some() || access_advance_to.is_some() {
+        if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
+            let tx_result = (|| -> rusqlite::Result<()> {
+                if let Some(new_offset) = advance_to {
+                    conn.execute(
+                        "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
+                         VALUES ('alpha_optimizer', ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                         ON CONFLICT(consumer) DO UPDATE SET last_event_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                        rusqlite::params![new_offset],
+                    )?;
+                }
+                if let Some(access_offset) = access_advance_to {
+                    conn.execute(
+                        "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
+                         VALUES ('alpha_optimizer_access', ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                         ON CONFLICT(consumer) DO UPDATE SET last_event_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                        rusqlite::params![access_offset],
+                    )?;
+                }
+                Ok(())
+            })();
+            match tx_result {
+                Ok(()) => {
+                    let _ = conn.execute_batch("COMMIT");
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    tracing::warn!(error = %err, "M2: offset advance failed, rolling back");
+                    return;
+                }
+            }
+        }
     }
 
     if events_with_access.is_empty() {
@@ -978,6 +1046,50 @@ fn run_alpha_learning(
     }
 
     compute_counterfactual_alphas(&events_with_access, &events, state, config);
+}
+
+/// Non-advancing peek for `recall_access` events. Mirrors `peek_recall_events`
+/// but reads against the `alpha_optimizer_access` offset. Separated from
+/// `consume_events` so the caller can defer offset advancement until after
+/// all side-effects have been committed atomically alongside the
+/// `alpha_optimizer` offset (B5 M2 atomicity fix).
+fn peek_access_events(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> Vec<crate::store::adaptive::StoredEvent> {
+    let last_offset: i64 = conn
+        .query_row(
+            "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'alpha_optimizer_access'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    match conn.prepare(
+        "SELECT id, ts, event_type, request_id, memory_id, concept_id, query, query_type, topic, payload
+         FROM feedback_events WHERE id > ?1 AND event_type = 'recall_access'
+         ORDER BY id ASC LIMIT ?2",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map(rusqlite::params![last_offset, limit as i64], |row| {
+                Ok(crate::store::adaptive::StoredEvent {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    event_type: row.get(2)?,
+                    request_id: row.get(3)?,
+                    memory_id: row.get(4)?,
+                    concept_id: row.get(5)?,
+                    query: row.get(6)?,
+                    query_type: row.get(7)?,
+                    topic: row.get(8)?,
+                    payload: row.get(9)?,
+                })
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ===========================================================================
@@ -2061,6 +2173,169 @@ mod tests {
             (0.40..=0.90).contains(&state.global_dedup_threshold),
             "global_dedup_threshold should be in [0.40, 0.90], got {}",
             state.global_dedup_threshold
+        );
+    }
+
+    /// Regression: M2 alpha learning must (a) advance both offsets in one
+    /// transaction AND (b) advance the access cursor only through the
+    /// contiguous id-order prefix of access events whose recall_complete is
+    /// also in this pass's advance prefix — NOT just `max(correlated_id)`.
+    ///
+    /// Fixture (exercises both the trailing-orphan and interleaved-orphan
+    /// hazards Codex flagged):
+    /// - rid-A: RecallComplete at id=1, RecallAccess at id=2. Learned.
+    /// - rid-B: RecallAccess at id=3 with NO matching RecallComplete yet.
+    /// - rid-C: RecallComplete at id=4, RecallAccess at id=5. Learned.
+    ///
+    /// A naive `max()` over correlated rids would advance access cursor to
+    /// id=5, silently consuming rid-B's access event at id=3. The
+    /// prefix-safe walk must stop at id=2 (A's access), because id=3 (B's)
+    /// is the first non-advanced rid in the sequence.
+    #[test]
+    fn run_alpha_learning_advances_cursors_correlated_not_past_unseen_recalls() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+
+        // --- rid-A: full pair (will be matched + learned) ---
+        let rid_a = "req-atomic-A".to_string();
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some(rid_a.clone()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("q".into()),
+                query_type: Some("Semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [{
+                        "id": "mem-1",
+                        "bm25_norm": 0.8,
+                        "vec_norm": 0.6,
+                        "kg_norm": 0.0,
+                        "episode_norm": 0.0,
+                        "support_count": 1,
+                        "source_diversity": 1.0,
+                    }],
+                    "cc_alpha": 0.5,
+                })),
+            },
+        );
+        let access_a_id = emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some(rid_a.clone()),
+                memory_id: Some("mem-1".into()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+
+        // --- rid-B: orphan access event BETWEEN A's and C's events ---
+        // This is the exact case a `max(correlated_id)` strategy would miss:
+        // B's rid is not in advance_through, but a naive max would skip B
+        // entirely and land on C's access event id, silently consuming B's
+        // access signal before B's recall_complete ever arrives.
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some("req-atomic-B".into()),
+                memory_id: Some("mem-2".into()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+
+        // --- rid-C: full pair arriving AFTER B's orphan access ---
+        let rid_c = "req-atomic-C".to_string();
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some(rid_c.clone()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("q2".into()),
+                query_type: Some("Semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [{
+                        "id": "mem-3",
+                        "bm25_norm": 0.7,
+                        "vec_norm": 0.5,
+                        "kg_norm": 0.0,
+                        "episode_norm": 0.0,
+                        "support_count": 1,
+                        "source_diversity": 1.0,
+                    }],
+                    "cc_alpha": 0.5,
+                })),
+            },
+        );
+        let _access_c_id = emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some(rid_c.clone()),
+                memory_id: Some("mem-3".into()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+
+        let mut state = AdaptiveState::default();
+        run_alpha_learning(&store, &mut state, &config);
+
+        let alpha_off: i64 = store
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'alpha_optimizer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let access_off: i64 = store
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets \
+                  WHERE consumer = 'alpha_optimizer_access'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        assert!(alpha_off > 0, "alpha_optimizer offset must advance");
+        // Access cursor must stop at rid-A's access event.
+        //
+        // The prefix-safe contract: walk access events in id-order,
+        // advance through the contiguous prefix where every rid is in
+        // `rids_we_advanced_through`. In this fixture the sequence is
+        // [A@access_a_id, B@..., C@...]. A is advanced through, B is not
+        // (no recall_complete yet), so the walk stops at A.
+        //
+        // A buggy `max(correlated_id)` advance would land on C's access
+        // event id, silently swallowing B's access event at position 2.
+        // On a later pass when B's recall_complete finally arrives, B's
+        // access signal would already be past the cursor and B would age
+        // out as "no access data", never contributing to alpha learning.
+        assert_eq!(
+            access_off, access_a_id,
+            "alpha_optimizer_access must stop at rid-A's access (prefix-safe), \
+             not advance to rid-C's access past rid-B's orphan. \
+             A `max(correlated_id)` strategy would fail this assertion."
         );
     }
 }

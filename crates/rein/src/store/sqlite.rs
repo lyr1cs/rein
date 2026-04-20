@@ -1809,13 +1809,40 @@ impl SqliteStore {
                         ));
                     }
                     // Cap content length to prevent unbounded growth from repeated merges.
-                    // Trim from the end (newest additions) to preserve original core content.
-                    if existing.content.len() > 10_000 {
-                        let mut trim_at = 10_000;
-                        while trim_at > 0 && !existing.content.is_char_boundary(trim_at) {
-                            trim_at -= 1;
+                    //
+                    // Keep the **tail** (newest additions + most recent
+                    // `[merged on ...]` marker). Before v0.21.0 this kept the
+                    // head, which meant once a canonical reached the cap every
+                    // subsequent merge bumped `merge_count` without the new
+                    // facts actually landing in `content` — the exact "silent
+                    // data loss" Codex 2026-04-12 flagged. Keep-tail reverses
+                    // that: the summary (re-derived from `content` below) now
+                    // reflects the most recent evidence, and older material
+                    // remains available via the `memory_evidence` archive.
+                    //
+                    // v0.22 will replace this with an LLM-driven resummarize
+                    // pass that avoids dropping either end; see project
+                    // backlog. Emit a warn so operators can correlate the
+                    // event with merge-count drift during the interim.
+                    const MERGE_CONTENT_CAP: usize = 10_000;
+                    if existing.content.len() > MERGE_CONTENT_CAP {
+                        let original_len = existing.content.len();
+                        let skip = original_len - MERGE_CONTENT_CAP;
+                        // Walk to the next char boundary at or after `skip`
+                        // so we always drop *more* rather than bisecting a
+                        // codepoint.
+                        let mut split_at = skip;
+                        while split_at < original_len
+                            && !existing.content.is_char_boundary(split_at)
+                        {
+                            split_at += 1;
                         }
-                        existing.content.truncate(trim_at);
+                        existing.content = existing.content.split_off(split_at);
+                        tracing::warn!(
+                            canonical_id = %canonical_id,
+                            dropped_bytes = split_at,
+                            "merge content exceeded cap; oldest bytes dropped (v0.22 TODO: resummarize)"
+                        );
                     }
                     existing.summary = existing
                         .content
@@ -3245,5 +3272,52 @@ enabled = true
         let fetched = store.get(&id).unwrap();
         assert_eq!(fetched.layer, MemoryLayer::LTM);
         assert_eq!(fetched.access_count, 4);
+    }
+
+    /// Regression: once a merged canonical passes the 10KB cap, every
+    /// subsequent merge must still surface its new facts in `content`.
+    /// Before v0.21.0 the cap truncated from the end, so new merges bumped
+    /// `merge_count` but lost the actual evidence — long-lived canonicals
+    /// silently stopped growing. Keep-tail makes the most recent merge
+    /// observable; the `[merged on ...]` timestamp and the newest unique
+    /// lines are preserved.
+    #[test]
+    fn merge_content_cap_keeps_tail_not_head() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Seed with near-cap content so the first merge pushes us over.
+        let base_line = "background context line ";
+        let mut bulky = String::new();
+        while bulky.len() < 10_200 {
+            bulky.push_str(base_line);
+            bulky.push('\n');
+        }
+
+        let first = test_memory_with_content("rust", "ownership", &bulky, Importance::High);
+        let id1 = store.store_with_dedup(first, 0.85, 7).unwrap();
+
+        // A near-duplicate merge that carries a *distinct* new fact. The
+        // fact must survive the cap — that's the whole point of merging.
+        let second_content = format!("{bulky}\nunique-fact-needle-abc");
+        let second = test_memory_with_content(
+            "rust",
+            "ownership update",
+            &second_content,
+            Importance::High,
+        );
+        let id2 = store.store_with_dedup(second, 0.85, 7).unwrap();
+        assert_eq!(id1, id2, "expected merge, not a new row");
+
+        let merged = store.get(&id1).unwrap();
+        assert!(
+            merged.content.len() <= 10_000,
+            "content must respect 10KB cap, got {}",
+            merged.content.len()
+        );
+        assert!(
+            merged.content.contains("unique-fact-needle-abc"),
+            "newest merged fact must survive the cap (keep-tail); \
+             if this asserts, the truncation reverted to keep-head"
+        );
     }
 }

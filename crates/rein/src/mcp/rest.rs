@@ -181,19 +181,24 @@ fn parse_query(uri: &hyper::Uri) -> std::collections::HashMap<String, String> {
                     let key = parts.next()?;
                     let value = parts.next().unwrap_or("");
                     // Skip pairs with invalid UTF-8 in key or value.
-                    Some((percent_decode(key)?, percent_decode(value)?))
+                    Some((
+                        percent_decode_component(key, true)?,
+                        percent_decode_component(value, true)?,
+                    ))
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Percent-decode a URI segment or query component. Returns `None` on
-/// invalid UTF-8 after decoding — callers that match path templates use this
-/// to reject the route (producing 404) rather than silently matching with
-/// a corrupted string.
-fn percent_decode(s: &str) -> Option<String> {
-    let s = s.replace('+', " ");
+/// Percent-decode a URI component. Query-string components treat `+` as a
+/// space; path segments must preserve literal `+`.
+fn percent_decode_component(s: &str, plus_as_space: bool) -> Option<String> {
+    let s = if plus_as_space {
+        s.replace('+', " ")
+    } else {
+        s.to_string()
+    };
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -218,7 +223,7 @@ fn percent_decode(s: &str) -> Option<String> {
 /// downstream handlers can handle the invalid ID (typically a 404 from the DB
 /// query). Use `percent_decode` (returns `Option`) for template matching.
 fn percent_decode_lossy(s: &str) -> String {
-    percent_decode(s).unwrap_or_else(|| s.to_string())
+    percent_decode_component(s, false).unwrap_or_else(|| s.to_string())
 }
 
 /// Try to handle an API or GUI request. Returns `Some(response)` if matched, `None` to fall through to MCP.
@@ -319,6 +324,7 @@ pub async fn handle_rest_request_with_body<B>(
     body: Option<Bytes>,
     config: &ReinConfig,
 ) -> Option<BoxedResponse> {
+    crate::ops::inventory::ensure_unique_registrations();
     let path = req.uri().path();
     let method = req.method();
 
@@ -345,6 +351,28 @@ fn enforce_auth_policy<B>(
         crate::ops::AuthPolicy::MutationMarker => require_mutation_marker(req),
         crate::ops::AuthPolicy::ReadToken => require_read_token(req),
     }
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+fn cookie_value(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get("cookie")?.to_str().ok()?;
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        if key.trim() == name {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
 }
 
 #[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body; boxing again would force every caller to dereference.
@@ -382,12 +410,22 @@ fn require_read_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
         .get("x-rein-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if presented == expected.trim() {
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let expected_bearer = format!("Bearer {}", expected.trim());
+    let session_cookie = cookie_value(req.headers(), HTTP_SESSION_COOKIE).unwrap_or_default();
+    if constant_time_eq(presented, expected.trim())
+        || constant_time_eq(auth_header, &expected_bearer)
+        || constant_time_eq(&session_cookie, expected.trim())
+    {
         Ok(())
     } else {
         Err(error_response(
             StatusCode::UNAUTHORIZED,
-            "missing or invalid x-rein-token for protected read",
+            "missing or invalid protected-read credential",
         ))
     }
 }
@@ -432,7 +470,7 @@ async fn handle_api<B>(
         (&Method::GET, "/api/activity") => api_activity(config, &query),
         // GET /api/dedup_decisions migrated to #[op] inventory (dedup_log op in
         // ops/handlers/maintenance.rs); served via try_dispatch_inventory_rest above.
-(&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
+        (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
         (&Method::GET, "/api/version") => json_response(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
@@ -471,15 +509,13 @@ async fn handle_api<B>(
             Ok(()) => api_artifacts(config, &query),
             Err(response) => response,
         },
-        (&Method::GET, p) if p.starts_with("/api/artifacts/") => {
-            match require_read_token(req) {
-                Ok(()) => {
-                    let id = percent_decode_lossy(&p["/api/artifacts/".len()..]);
-                    api_artifact_detail(config, &id, &query)
-                }
-                Err(response) => response,
+        (&Method::GET, p) if p.starts_with("/api/artifacts/") => match require_read_token(req) {
+            Ok(()) => {
+                let id = percent_decode_lossy(&p["/api/artifacts/".len()..]);
+                api_artifact_detail(config, &id, &query)
             }
-        }
+            Err(response) => response,
+        },
 
         _ => error_response(StatusCode::NOT_FOUND, "unknown API endpoint"),
     }
@@ -669,7 +705,7 @@ fn match_path_template(
                 }
                 // Percent-decode after split — spec §5 (decode before split
                 // would let %2F corrupt segment boundaries).
-                let decoded = percent_decode(actual)?;
+                let decoded = percent_decode_component(actual, false)?;
                 values.insert(*name, decoded);
             }
         }
@@ -698,9 +734,7 @@ async fn try_dispatch_inventory_rest<B>(
         let req_segs = split_path_segments(path);
         let template_hit = inventory::iter::<crate::ops::OpsRestEntry>()
             .filter(|e| e.method == *method && !e.path_segments.is_empty())
-            .find_map(|e| {
-                match_path_template(e.path_segments, &req_segs).map(|vals| (e, vals))
-            });
+            .find_map(|e| match_path_template(e.path_segments, &req_segs).map(|vals| (e, vals)));
         template_hit?
     };
 
@@ -731,7 +765,9 @@ async fn try_dispatch_inventory_rest<B>(
                         .map_err(|never: std::convert::Infallible| match never {})
                         .boxed(),
                 )
-                .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response")),
+                .unwrap_or_else(|_| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response")
+                }),
         ),
         Err(e) => {
             // A1 H4 (audit 2026-04-19): honor ReinError::kind() so handlers
@@ -778,7 +814,7 @@ fn api_recall(
     query: &std::collections::HashMap<String, String>,
 ) -> BoxedResponse {
     match run_recall_query(config, query, None) {
-        Ok(results) => recall_results_response(results, 0, None),
+        Ok((results, request_id)) => recall_results_response(results, 0, None, &request_id),
         Err(response) => response,
     }
 }
@@ -798,7 +834,9 @@ fn api_recall_stream(
 
     let fetch_limit = offset.saturating_add(page_limit).saturating_add(1);
     match run_recall_query(config, query, Some(fetch_limit)) {
-        Ok(results) => recall_results_response(results, offset, Some(page_limit)),
+        Ok((results, request_id)) => {
+            recall_results_response(results, offset, Some(page_limit), &request_id)
+        }
         Err(response) => response,
     }
 }
@@ -808,7 +846,7 @@ fn run_recall_query(
     config: &ReinConfig,
     query: &std::collections::HashMap<String, String>,
     limit_override: Option<usize>,
-) -> Result<Vec<crate::search::recall::RecallResult>, BoxedResponse> {
+) -> Result<(Vec<crate::search::recall::RecallResult>, String), BoxedResponse> {
     let q = match query.get("q") {
         Some(q) if !q.is_empty() => q.clone(),
         _ => {
@@ -840,10 +878,25 @@ fn run_recall_query(
         }
     };
 
-    crate::search::recall::recall_temporal(
-        &store, config, &q, topic, keyword, limit, from, to, None, false,
+    // Generate a request_id here so feedback submitted against this recall
+    // (via `POST /api/feedback` with request_id=...) can be correlated by M1.
+    // Clients observe it in the `request_id` field of the recall response.
+    let request_id = ulid::Ulid::new().to_string();
+    let results = crate::search::recall::recall_temporal_with_request_id(
+        &store,
+        config,
+        &q,
+        topic,
+        keyword,
+        limit,
+        from,
+        to,
+        None,
+        false,
+        Some(request_id.clone()),
     )
-    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok((results, request_id))
 }
 
 fn recall_result_to_json(r: &crate::search::recall::RecallResult) -> serde_json::Value {
@@ -862,6 +915,7 @@ fn recall_results_response(
     results: Vec<crate::search::recall::RecallResult>,
     offset: usize,
     page_limit: Option<usize>,
+    request_id: &str,
 ) -> BoxedResponse {
     let page = match page_limit {
         Some(limit) => {
@@ -894,12 +948,17 @@ fn recall_results_response(
                 "limit": page_limit,
                 "next_offset": next_offset,
                 "has_more": has_more,
+                "request_id": request_id,
             }),
         )
     } else {
         json_response(
             StatusCode::OK,
-            json!({ "results": page, "count": page.len() }),
+            json!({
+                "results": page,
+                "count": page.len(),
+                "request_id": request_id,
+            }),
         )
     }
 }
@@ -931,7 +990,7 @@ fn api_memoir_inspect(
                 "links": links,
             }),
         ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error_response(e.kind().status_code(), &e.to_string()),
     }
 }
 
@@ -1424,6 +1483,40 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial(rein_http_token_env)]
+    fn enforce_auth_read_token_accepts_bearer_and_cookie_auth() {
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::set_var("REIN_HTTP_TOKEN", "secret-token");
+        }
+
+        let bearer_req: Request<String> = req_with(Some(("authorization", "Bearer secret-token")));
+        assert!(
+            enforce_auth_policy(&bearer_req, crate::ops::AuthPolicy::ReadToken).is_ok(),
+            "Bearer auth should satisfy read_token policy"
+        );
+
+        let cookie_req = Request::builder()
+            .uri("/api/x")
+            .header("cookie", "rein_http_token=secret-token")
+            .body(String::new())
+            .unwrap();
+        assert!(
+            enforce_auth_policy(&cookie_req, crate::ops::AuthPolicy::ReadToken).is_ok(),
+            "session cookie should satisfy read_token policy"
+        );
+
+        match original {
+            Some(v) => unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            },
+            None => unsafe {
+                std::env::remove_var("REIN_HTTP_TOKEN");
+            },
+        }
+    }
+
     fn test_memory(id: &str, summary: &str, content: &str) -> Memory {
         Memory {
             id: id.to_string(),
@@ -1472,7 +1565,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(global_state)]
     async fn recall_stream_pages_results_without_changing_legacy_endpoint() {
+        // Joins `global_state` so REIN_HTTP_TOKEN mutations from racing
+        // auth tests can't make `require_read_token` reject these GETs
+        // (which produces a 401 with no `count` field and panics the
+        // assertion at "count == Some(2)").
+        let _guard = env_lock().lock().await;
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("memories.db");
         let config = test_config(&db_path);
@@ -1718,7 +1817,51 @@ mod tests {
             StatusCode::OK
         );
 
+        let req_bearer = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts")
+            .header("authorization", "Bearer secret-token-xyz")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&req_bearer, &config2)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let req_cookie = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts")
+            .header("cookie", "rein_http_token=secret-token-xyz")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&req_cookie, &config2)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
         std::env::remove_var("REIN_HTTP_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn memoir_inspect_missing_concept_returns_404() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memoir-inspect.db");
+        let config = test_config(&db_path);
+        let _store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/memoirs/missing/inspect/concept")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&req, &config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1884,10 +2027,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = read_json(resp).await;
         assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("content"),
+            json["error"].as_str().unwrap_or("").contains("content"),
             "error should mention missing content/turns: {}",
             json,
         );
@@ -2071,8 +2211,7 @@ mod tests {
         fn poll_frame(
             mut self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>>
-        {
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
             if self.remaining_chunks == 0 {
                 std::task::Poll::Ready(None)
             } else {
@@ -2097,7 +2236,9 @@ mod tests {
         // 6 chunks of 200 KiB = 1200 KiB, above the 1 MiB default cap.
         // With the progressive frame-loop, cap fires mid-stream; with the
         // old implementation this test was the missing regression signal.
-        let body = StreamingBody { remaining_chunks: 6 };
+        let body = StreamingBody {
+            remaining_chunks: 6,
+        };
         let result = collect_body_capped(body).await;
         let resp = result.expect_err("streaming body past cap must 413");
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -2108,7 +2249,9 @@ mod tests {
         // 4 chunks of 200 KiB = 800 KiB, well under the 1 MiB cap.
         // Confirms the progressive loop drains the full stream and returns
         // the assembled buffer — not just the cap-rejection path.
-        let body = StreamingBody { remaining_chunks: 4 };
+        let body = StreamingBody {
+            remaining_chunks: 4,
+        };
         let result = collect_body_capped(body).await;
         let bytes = result.expect("streaming body under cap must succeed");
         assert_eq!(bytes.len(), 4 * 200 * 1024);
@@ -2235,6 +2378,65 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "/api/feedback with empty memory_ids should 400"
+        );
+    }
+
+    /// Regression: `/api/memories` and `/api/recall_stream` must expose the
+    /// server-generated `request_id` so clients can correlate later
+    /// `POST /api/feedback` calls back to the originating recall. Previously
+    /// the REST endpoint called `recall_temporal` (no request_id) which
+    /// broke the M1 feedback→replay chain for every non-MCP caller.
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn recall_response_includes_request_id_and_matches_feedback_event() {
+        let _guard = env_lock().lock().await;
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+        store
+            .store(test_memory("debug", "pool fix", "connection pool saturation"))
+            .unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/memories?q=connection+pool&limit=5")
+            .body(())
+            .unwrap();
+        let resp = handle_rest_request(&req, &config).await.unwrap();
+        let json = read_json(resp).await;
+        let request_id = json["request_id"]
+            .as_str()
+            .expect("recall response must include request_id")
+            .to_string();
+        assert!(!request_id.is_empty());
+
+        // Feedback event must have been written with the same request_id.
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+        let logged: String = store
+            .conn()
+            .query_row(
+                "SELECT request_id FROM feedback_events \
+                  WHERE event_type = 'recall_complete' \
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("recall_complete event");
+        assert_eq!(logged, request_id, "REST must propagate its request_id");
+
+        // Streaming endpoint has the same contract.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/recall_stream?q=connection+pool&limit=5&offset=0")
+            .body(())
+            .unwrap();
+        let resp = handle_rest_request(&req, &config).await.unwrap();
+        let json = read_json(resp).await;
+        assert!(
+            json["request_id"].as_str().is_some(),
+            "stream response must include request_id: {}",
+            json
         );
     }
 }

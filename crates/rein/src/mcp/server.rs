@@ -31,6 +31,7 @@ impl ReinServer {
     /// Stores the config so each request can open its own connection via
     /// `config.open_store()`, eliminating the Mutex bottleneck.
     pub fn new(config: ReinConfig) -> Self {
+        crate::ops::inventory::ensure_unique_registrations();
         Self { config }
     }
 
@@ -47,13 +48,17 @@ impl ReinServer {
         tool_name: &str,
         args: serde_json::Value,
     ) -> Option<Result<String, String>> {
-        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
-            .find(|e| e.mcp_name == tool_name)?;
-        let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
-            std::sync::Arc::new(self.config.clone()),
-        ));
+        let entry =
+            inventory::iter::<crate::ops::OpsMcpEntry>().find(|e| e.mcp_name == tool_name)?;
+        let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
+            self.config.clone(),
+        )));
         runtime.set_compact(self.compact());
-        Some((entry.invoke)(runtime, args).await.map_err(|e| e.to_string()))
+        Some(
+            (entry.invoke)(runtime, args)
+                .await
+                .map_err(|e| e.to_string()),
+        )
     }
 }
 
@@ -86,8 +91,12 @@ fn request_has_valid_http_auth(headers: &hyper::HeaderMap, expected: &str) -> bo
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let token_header = headers
+        .get("x-rein-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let expected_str = format!("Bearer {expected}");
-    if constant_time_eq(auth_header, &expected_str) {
+    if constant_time_eq(auth_header, &expected_str) || constant_time_eq(token_header, expected) {
         return true;
     }
     cookie_value(headers, HTTP_SESSION_COOKIE)
@@ -123,8 +132,7 @@ impl ServerHandler for ReinServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let tool_name = request.name.as_ref();
-        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
-            .find(|e| e.mcp_name == tool_name);
+        let entry = inventory::iter::<crate::ops::OpsMcpEntry>().find(|e| e.mcp_name == tool_name);
         let Some(entry) = entry else {
             return Ok(rmcp::model::CallToolResult::error(vec![
                 rmcp::model::Content::text(format!("unknown tool: {tool_name}")),
@@ -135,9 +143,9 @@ impl ServerHandler for ReinServer {
             .clone()
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
-            std::sync::Arc::new(self.config.clone()),
-        ));
+        let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
+            self.config.clone(),
+        )));
         // Propagate the server-level compact flag so the macro-emitted MCP
         // output branch renders IntoMarkdown when compact is set.
         runtime.set_compact(self.compact());
@@ -200,9 +208,9 @@ fn spawn_background_warmup(config: &ReinConfig) {
             // create_episode and link_session_artifact_episode in the
             // previous session (B3 #18).
             match store.repair_orphan_artifact_episode_links() {
-                Ok(count) if count > 0 => tracing::info!(
-                    "repaired {count} orphan session_artifact → episode links"
-                ),
+                Ok(count) if count > 0 => {
+                    tracing::info!("repaired {count} orphan session_artifact → episode links")
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("artifact-episode repair failed: {e}"),
             }
@@ -346,15 +354,12 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             // entry point since they never consult the body. /mcp and unknown
             // paths fall through to MCP dispatch with the original body.
             if path.starts_with("/api/") {
-                let response =
-                    crate::mcp::rest::handle_api_request(req, &cfg).await;
+                let response = crate::mcp::rest::handle_api_request(req, &cfg).await;
                 return Ok::<_, std::convert::Infallible>(response);
             }
 
             if config.server.gui_enabled && !path.starts_with("/mcp") {
-                if let Some(response) =
-                    crate::mcp::rest::handle_rest_request(&req, &cfg).await
-                {
+                if let Some(response) = crate::mcp::rest::handle_rest_request(&req, &cfg).await {
                     return Ok::<_, std::convert::Infallible>(response);
                 }
             }
@@ -409,6 +414,16 @@ mod tests {
         headers.insert(
             "cookie",
             hyper::header::HeaderValue::from_static("rein_http_token=secret-token"),
+        );
+        assert!(request_has_valid_http_auth(&headers, "secret-token"));
+    }
+
+    #[test]
+    fn request_auth_accepts_matching_x_rein_token() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-rein-token",
+            hyper::header::HeaderValue::from_static("secret-token"),
         );
         assert!(request_has_valid_http_auth(&headers, "secret-token"));
     }

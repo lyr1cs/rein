@@ -75,7 +75,8 @@ export default function Adaptive() {
   /* Panel 1: Alpha values */
   const alphaOrder = ['Global', 'Semantic', 'Temporal', 'ExactKeyword', 'Exploratory'];
   const alphaData = alphaOrder.map((key) => {
-    const entry = adaptive.learned_alphas[key] ?? adaptive.learned_alphas[key.toLowerCase()];
+    const normalizedKey = key === 'ExactKeyword' ? 'exact' : key.toLowerCase();
+    const entry = adaptive.learned_alphas[key] ?? adaptive.learned_alphas[normalizedKey];
     return { name: key.replace('ExactKeyword', 'ExactKW'), value: entry?.value ?? 0, samples: entry?.sample_count ?? 0 };
   });
 

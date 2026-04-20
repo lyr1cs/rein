@@ -127,12 +127,14 @@ function MemoryCard({ memory, onClick }: { memory: Memory | RecallResult; onClic
 function DetailPanel({
   memory,
   detail,
+  error,
   loading,
   onClose,
   onDelete,
 }: {
   memory: Memory | RecallResult;
   detail: MemoryDetailResponse | null | undefined;
+  error: string | null;
   loading: boolean;
   onClose: () => void;
   onDelete: (id: string) => void;
@@ -258,6 +260,8 @@ function DetailPanel({
           <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-1.5">Evidence</div>
           {loading ? (
             <div className="text-xs text-[var(--text-muted)]">Loading detail...</div>
+          ) : error ? (
+            <div className="text-xs text-[var(--hot)] break-words">Failed to load detail: {error}</div>
           ) : evidence.length > 0 ? (
             <div className="space-y-2">
               <div className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/5 p-2">
@@ -365,7 +369,11 @@ export default function Memories() {
   const [sortMode, setSortMode] = useState<SortMode>('recent');
   const [selected, setSelected] = useState<(Memory | RecallResult) | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const { data: selectedDetail, isLoading: selectedLoading } = useMemoryDetail(selected?.id ?? null);
+  const {
+    data: selectedDetail,
+    isLoading: selectedLoading,
+    error: selectedDetailError,
+  } = useMemoryDetail(selected?.id ?? null);
 
   // Debounce search query (300ms)
   useEffect(() => {
@@ -572,6 +580,7 @@ export default function Memories() {
           <DetailPanel
             memory={selected}
             detail={selectedDetail}
+            error={selectedDetailError instanceof Error ? selectedDetailError.message : null}
             loading={selectedLoading}
             onClose={() => setSelected(null)}
             onDelete={handleDelete}

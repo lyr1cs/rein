@@ -1,4 +1,4 @@
-error[E0433]: failed to resolve: could not find `inventory` in the list of imported crates
+error[E0433]: cannot find `inventory` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -11,7 +11,7 @@ error[E0433]: failed to resolve: could not find `inventory` in the list of impor
    |
    = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0433]: failed to resolve: could not find `schemars` in the list of imported crates
+error[E0433]: cannot find `schemars` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -24,7 +24,7 @@ error[E0433]: failed to resolve: could not find `schemars` in the list of import
    |
    = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0433]: failed to resolve: could not find `serde_json` in the list of imported crates
+error[E0433]: cannot find `serde_json` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -37,7 +37,7 @@ error[E0433]: failed to resolve: could not find `serde_json` in the list of impo
    |
    = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0433]: failed to resolve: could not find `rein` in the list of imported crates
+error[E0433]: cannot find `rein` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -50,7 +50,7 @@ error[E0433]: failed to resolve: could not find `rein` in the list of imported c
    |
    = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0433]: failed to resolve: could not find `bytes` in the list of imported crates
+error[E0433]: cannot find `bytes` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -63,7 +63,7 @@ error[E0433]: failed to resolve: could not find `bytes` in the list of imported 
    |
    = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0433]: failed to resolve: could not find `hyper` in the list of imported crates
+error[E0433]: cannot find `hyper` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -76,7 +76,7 @@ error[E0433]: failed to resolve: could not find `hyper` in the list of imported 
    |
    = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0433]: failed to resolve: could not find `serde_json` in the list of imported crates
+error[E0433]: cannot find `serde_json` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -93,7 +93,7 @@ help: consider importing this struct
  1 + use std::iter::Map;
    |
 
-error[E0433]: failed to resolve: could not find `rein` in the list of imported crates
+error[E0433]: cannot find `rein` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -110,7 +110,7 @@ help: consider importing this struct
  1 + use crate::OpsRuntime;
    |
 
-error[E0433]: failed to resolve: could not find `bytes` in the list of imported crates
+error[E0433]: cannot find `bytes` in the crate root
   --> tests/ui/fail_path_consecutive_slashes.rs:6:5
    |
  6 | /     #[op(
@@ -127,4 +127,6 @@ help: consider importing one of these structs
  1 + use std::io::Bytes;
    |
  1 + use std::str::Bytes;
+   |
+ 1 + use core::str::Bytes;
    |
