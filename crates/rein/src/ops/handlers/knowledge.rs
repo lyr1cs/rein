@@ -339,6 +339,190 @@ impl IntoCliText for ConceptSearchOutput {
     }
 }
 
+// ── memoir_create ────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct MemoirCreateParams {
+    /// Name for the memoir (must be unique).
+    pub name: String,
+    /// Optional description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct MemoirCreateOutput {
+    pub id: String,
+    pub name: String,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for MemoirCreateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "id": self.id, "name": self.name })
+    }
+}
+
+impl IntoMarkdown for MemoirCreateOutput {
+    fn to_markdown(&self) -> String {
+        if self.compact {
+            format!("ok:{}", self.id)
+        } else {
+            format!("Created memoir '{}': {}", self.name, self.id)
+        }
+    }
+}
+
+impl IntoCliText for MemoirCreateOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
+// ── memoir_add_concept ───────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct ConceptAddParams {
+    /// Name of the memoir to add the concept to.
+    pub memoir: String,
+    /// Name of the concept.
+    pub name: String,
+    /// Definition of the concept.
+    pub definition: String,
+    /// Optional comma-separated labels.
+    #[serde(default)]
+    pub labels: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ConceptAddOutput {
+    pub id: String,
+    pub name: String,
+    pub memoir: String,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for ConceptAddOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "id": self.id, "name": self.name, "memoir": self.memoir })
+    }
+}
+
+impl IntoMarkdown for ConceptAddOutput {
+    fn to_markdown(&self) -> String {
+        if self.compact {
+            format!("ok:{}", self.id)
+        } else {
+            format!("Added concept '{}' to memoir '{}': {}", self.name, self.memoir, self.id)
+        }
+    }
+}
+
+impl IntoCliText for ConceptAddOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
+// ── memoir_refine ────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct ConceptRefineParams {
+    /// Name of the memoir containing the concept.
+    pub memoir: String,
+    /// Name of the concept to refine.
+    pub name: String,
+    /// New definition.
+    pub definition: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ConceptRefineOutput {
+    pub name: String,
+    pub memoir: String,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for ConceptRefineOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "name": self.name, "memoir": self.memoir, "refined": true })
+    }
+}
+
+impl IntoMarkdown for ConceptRefineOutput {
+    fn to_markdown(&self) -> String {
+        if self.compact {
+            format!("ok:{}", self.name)
+        } else {
+            format!("Refined concept '{}' in memoir '{}'", self.name, self.memoir)
+        }
+    }
+}
+
+impl IntoCliText for ConceptRefineOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
+// ── memoir_link ──────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct LinkParams {
+    /// Name of the memoir containing both concepts.
+    pub memoir: String,
+    /// Name of the source concept.
+    pub from: String,
+    /// Name of the target concept.
+    pub to: String,
+    /// Relation type: part_of, depends_on, related_to, contradicts, refines,
+    /// alternative_to, caused_by, instance_of, superseded_by.
+    pub relation: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LinkOutput {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for LinkOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "id": self.id,
+            "from": self.from,
+            "to": self.to,
+            "relation": self.relation,
+        })
+    }
+}
+
+impl IntoMarkdown for LinkOutput {
+    fn to_markdown(&self) -> String {
+        if self.compact {
+            format!("ok:{}", self.id)
+        } else {
+            format!(
+                "Linked '{}' --{}-> '{}': {}",
+                self.from, self.relation, self.to, self.id
+            )
+        }
+    }
+}
+
+impl IntoCliText for LinkOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
 impl OpsRuntime {
     #[op(
         name = "memoir_list",
@@ -381,6 +565,167 @@ impl OpsRuntime {
                 json_value,
                 compact,
             })
+        })
+    }
+
+    #[op(
+        name = "memoir_create",
+        category = "knowledge",
+        description = "Create a new memoir (named knowledge graph container).",
+        mutating = true,
+        mcp(name = "rein_memoir_create"),
+    )]
+    pub fn memoir_create(
+        &self,
+        params: MemoirCreateParams,
+    ) -> ReinResult<MemoirCreateOutput> {
+        let compact = self.compact();
+        let name = params.name.clone();
+        self.with_store(|store| {
+            let memoir = crate::types::Memoir {
+                id: String::new(),
+                name: name.clone(),
+                description: params.description.unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let id = store.create_memoir(memoir)?;
+            Ok(MemoirCreateOutput { id, name, compact })
+        })
+    }
+
+    #[op(
+        name = "memoir_add_concept",
+        category = "knowledge",
+        description = "Add a concept (knowledge node) to a memoir with name, definition, and optional comma-separated labels.",
+        mutating = true,
+        mcp(name = "rein_memoir_add_concept"),
+    )]
+    pub fn memoir_add_concept(
+        &self,
+        params: ConceptAddParams,
+    ) -> ReinResult<ConceptAddOutput> {
+        let compact = self.compact();
+        let name = params.name.clone();
+        let memoir = params.memoir.clone();
+        let labels: Vec<String> = params
+            .labels
+            .as_deref()
+            .map(|l| {
+                l.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.with_store(|store| {
+            let concept = crate::types::Concept {
+                id: String::new(),
+                memoir_id: memoir.clone(),
+                name: name.clone(),
+                definition: params.definition.clone(),
+                labels,
+                source_memory_ids: vec![],
+                confidence: 0.5,
+                revision: 1,
+                last_episode_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let id = store.add_concept(concept)?;
+            Ok(ConceptAddOutput { id, name, memoir, compact })
+        })
+    }
+
+    #[op(
+        name = "memoir_refine",
+        category = "knowledge",
+        description = "Refine a concept: update definition, increment revision, snapshot prior revision, boost confidence.",
+        mutating = true,
+        mcp(name = "rein_memoir_refine"),
+    )]
+    pub fn memoir_refine(
+        &self,
+        params: ConceptRefineParams,
+    ) -> ReinResult<ConceptRefineOutput> {
+        let compact = self.compact();
+        let name = params.name.clone();
+        let memoir = params.memoir.clone();
+        self.with_store(|store| {
+            store.refine_concept(&memoir, &name, &params.definition)?;
+            Ok(ConceptRefineOutput { name, memoir, compact })
+        })
+    }
+
+    #[op(
+        name = "memoir_link",
+        category = "knowledge",
+        description = "Create a typed relation (edge) between two concepts in the same memoir. Cross-memoir links are forbidden. Relations: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by.",
+        mutating = true,
+        mcp(name = "rein_memoir_link"),
+    )]
+    pub fn memoir_link(&self, params: LinkParams) -> ReinResult<LinkOutput> {
+        let compact = self.compact();
+        let memoir = params.memoir.clone();
+        let from_name = params.from.clone();
+        let to_name = params.to.clone();
+        let relation_str = params.relation.clone();
+        let relation = relation_str
+            .parse::<crate::types::Relation>()
+            .map_err(|e| {
+                ReinError::Config(e.to_string()).with_kind(OpsErrorKind::BadRequest)
+            })?;
+        self.with_store(|store| {
+            // Wrap the name→id lookups + add_link in BEGIN IMMEDIATE so a
+            // concurrent delete cannot make the link reference a stale ID
+            // (Phase 2.4 F2 / Phase 2.5 H2 nomenclature). add_link itself
+            // re-validates the memoir invariant inside the transaction.
+            let conn = store.conn();
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> ReinResult<LinkOutput> {
+                let from = store
+                    .get_concept(&memoir, &from_name)?
+                    .ok_or_else(|| {
+                        ReinError::NotFound(format!(
+                            "concept '{from_name}' not found in memoir '{memoir}'"
+                        ))
+                    })?;
+                let to = store
+                    .get_concept(&memoir, &to_name)?
+                    .ok_or_else(|| {
+                        ReinError::NotFound(format!(
+                            "concept '{to_name}' not found in memoir '{memoir}'"
+                        ))
+                    })?;
+                let link = crate::types::ConceptLink {
+                    id: String::new(),
+                    source_id: from.id,
+                    target_id: to.id,
+                    relation,
+                    weight: 1.0,
+                    created_at: chrono::Utc::now(),
+                    valid_from: None,
+                    valid_until: None,
+                };
+                let id = store.add_link(link)?;
+                Ok(LinkOutput {
+                    id,
+                    from: from_name.clone(),
+                    to: to_name.clone(),
+                    relation: relation_str.clone(),
+                    compact,
+                })
+            })();
+            match result {
+                Ok(out) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(out)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
     }
 
