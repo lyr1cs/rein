@@ -35,17 +35,6 @@ enum Commands {
         #[arg(long)]
         gui: bool,
     },
-    /// Store a memory
-    Store {
-        #[arg(short, long)]
-        topic: String,
-        #[arg(short, long)]
-        content: String,
-        #[arg(short = 'I', long, default_value = "medium")]
-        importance: String,
-        #[arg(short, long, value_delimiter = ',')]
-        keywords: Option<Vec<String>>,
-    },
     /// Ingest a full session/transcript through the extraction pipeline
     Ingest {
         #[arg(short, long, conflicts_with = "file")]
@@ -249,12 +238,6 @@ async fn main() -> anyhow::Result<()> {
             proxy,
             gui,
         }) => commands::handle_serve(config, compact, sse, proxy, gui).await?,
-        Some(Commands::Store {
-            topic,
-            content,
-            importance,
-            keywords,
-        }) => commands::handle_store(&config, topic, content, importance, keywords)?,
         Some(Commands::Ingest {
             content,
             file,
