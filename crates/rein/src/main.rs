@@ -71,14 +71,6 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
-    /// Update a memory
-    Update {
-        id: String,
-        #[arg(short, long)]
-        content: String,
-        #[arg(short = 'I', long)]
-        importance: Option<String>,
-    },
     // Stats + Health migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
     // main() intercepts them before clap::Parser so they're invoked via OpsCliEntry.
     // Doctor migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
@@ -288,11 +280,6 @@ async fn main() -> anyhow::Result<()> {
             keyword,
             limit,
         }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
-        Some(Commands::Update {
-            id,
-            content,
-            importance,
-        }) => commands::handle_update(&config, id, content, importance)?,
         // Commands::Organize migrated to #[op] inventory — intercepted via OpsCliEntry above.
         Some(Commands::Export {
             format,
