@@ -82,10 +82,27 @@ pub struct OpsMcpEntry {
     ) -> Pin<Box<dyn Future<Output = ReinResult<String>> + Send>>,
 }
 
+/// A single parsed segment of an op's REST path template.
+///
+/// For a path like `/api/memories/{id}` the segment list is:
+/// `[Literal("api"), Literal("memories"), Param("id")]`.
+///
+/// T1 scope: the enum is defined here so downstream code can reference it, but
+/// the `#[op]` macro still emits `&[]` for every entry. T2 will parse `{seg}`
+/// occupants at macro expansion time; T3 will use the populated list in the
+/// REST dispatcher's template-match pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathSegment {
+    /// A fixed path component, e.g. `"api"` or `"memories"`.
+    Literal(&'static str),
+    /// A named path parameter placeholder, e.g. `"id"` for `{id}`.
+    Param(&'static str),
+}
+
 pub struct OpsRestEntry {
     pub method: hyper::Method,
     pub path_template: &'static str,
-    pub path_params: &'static [&'static str],
+    pub path_segments: &'static [PathSegment],
     pub op_name: &'static str,
     /// Duplicated from `OpsMetadata::auth_policy` so the REST dispatcher can
     /// pick the gate in O(1) without a metadata scan per request.
