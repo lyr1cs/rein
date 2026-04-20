@@ -1,0 +1,68 @@
+error: path template must not contain empty segments (no consecutive // or trailing /)
+  --> tests/ui/fail_path_trailing_slash.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "trailing slash in path template is not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/{id}/"),
+11 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `inventory` in the list of imported crates
+  --> tests/ui/fail_path_trailing_slash.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "trailing slash in path template is not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/{id}/"),
+11 | |     )]
+   | |______^ could not find `inventory` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `schemars` in the list of imported crates
+  --> tests/ui/fail_path_trailing_slash.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "trailing slash in path template is not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/{id}/"),
+11 | |     )]
+   | |______^ could not find `schemars` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `serde_json` in the list of imported crates
+  --> tests/ui/fail_path_trailing_slash.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "trailing slash in path template is not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/{id}/"),
+11 | |     )]
+   | |______^ could not find `serde_json` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: could not find `serde_json` in the list of imported crates
+  --> tests/ui/fail_path_trailing_slash.rs:6:5
+   |
+ 6 | /     #[op(
+ 7 | |         name = "x",
+ 8 | |         category = "diagnostics",
+ 9 | |         description = "trailing slash in path template is not allowed",
+10 | |         rest(method = "GET", path = "/api/foo/{id}/"),
+11 | |     )]
+   | |______^ could not find `serde_json` in the list of imported crates
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider importing this struct
+   |
+ 1 + use std::iter::Map;
+   |

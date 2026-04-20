@@ -397,7 +397,11 @@ fn check_rest_registry() -> DoctorCheck {
     let registry_count = registry::rest_operations().len();
     // A1: migrated ops appear via OpsRestEntry inventory; remaining legacy
     // routes still live in src/mcp/rest.rs as `(&Method::*, "/api/...")` arms.
-    let inventory_count = inventory::iter::<crate::ops::OpsRestEntry>().count();
+    // Exclude test-support ops (op_name starts with "__test_") from the count
+    // so the check is stable whether or not the test-support feature is active.
+    let inventory_count = inventory::iter::<crate::ops::OpsRestEntry>()
+        .filter(|e| !e.op_name.starts_with("__test_"))
+        .count();
     let derived_count = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
     let source_count = derived_count + inventory_count;
     if registry_count != source_count {
@@ -1726,7 +1730,11 @@ provider = "inherit"
         let inventory_mcp = inventory::iter::<crate::ops::OpsMcpEntry>().count();
         assert_eq!(derived_mcp + inventory_mcp, registry::mcp_operations().len());
         let derived_rest = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
-        let inventory_rest = inventory::iter::<crate::ops::OpsRestEntry>().count();
+        // Exclude test-support ops so this assertion holds regardless of whether
+        // the test-support feature is active.
+        let inventory_rest = inventory::iter::<crate::ops::OpsRestEntry>()
+            .filter(|e| !e.op_name.starts_with("__test_"))
+            .count();
         assert_eq!(derived_rest + inventory_rest, registry::rest_operations().len());
         assert_eq!(
             parse_agents_overview_version("rein v1.2.3 — demo release"),

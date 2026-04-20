@@ -132,8 +132,6 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "knowledge", "POST /api/consolidate"),
     op!(Rest, "maintenance", "POST /api/cleanup"),
     op!(Rest, "adaptive", "POST /api/feedback"),
-    // Test-only op for Phase 2.5 path-template framework (T5). Delete in Phase 3.
-    op!(Rest, "diagnostics", "GET /api/test_path_template/{id}"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -234,7 +232,6 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[30],
     REST_OPERATIONS[31],
     REST_OPERATIONS[32],
-    REST_OPERATIONS[33],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -290,33 +287,14 @@ mod tests {
     #[test]
     fn registry_counts_match_expected_values() {
         assert_eq!(cli_operations().len(), 33);
-        // Phase 2.3: evidence phantom→real inventory (+1). rein_concept_history added as
-        // phantom rebalance (same pattern as rein_timeline in Task 9). 29→30.
-        // Phase 2.3 Task 4: rein_dedup_concepts phantom→real inventory (+1).
-        // rein_upgrade added as phantom rebalance. 30→31.
-        // H1 fix: rein_feedback catch-up (was missing) + rein_upgrade phantom removed
-        // (no backing handler). Net: 31→31 (swap, not growth). Count unchanged.
         assert_eq!(mcp_operations().len(), 31);
-        // Phase 2.2 (H5 body-JSON landed): POST /api/ingest_session added
-        // and POST /api/doctor moved from legacy to inventory. Both counted
-        // here via the registry source-of-truth list.
-        // Phase 2.3: GET /api/canonicals added (canonicals op migrated to #[op]).
-        // Phase 2.3: GET /api/evidence added (evidence op migrated to #[op]).
-        // Phase 2.3: POST /api/gc added (gc op migrated to #[op] inventory).
-        // Phase 2.3: POST /api/dedup added (dedup op migrated to #[op] inventory).
-        // Phase 2.3: POST /api/dedup_concepts added (dedup_concepts migrated to #[op] inventory).
-        // Phase 2.3: POST /api/organize added (organize op migrated to #[op] inventory).
-        // Phase 2.3: POST /api/consolidate added (consolidate op migrated to #[op] inventory).
-        // Phase 2.3: POST /api/cleanup added (cleanup op migrated to #[op] inventory).
-        // Phase 2.4: POST /api/feedback added (feedback op migrated to #[op] inventory).
-        // Phase 2.5 T5: GET /api/test_path_template/{id} test-only op added (delete in Phase 3).
-        assert_eq!(rest_operations().len(), 34);
+        assert_eq!(rest_operations().len(), 33);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 31,
-                rest: 34
+                rest: 33
             }
         );
     }
