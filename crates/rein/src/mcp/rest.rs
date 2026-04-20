@@ -645,6 +645,53 @@ fn api_intelligent_merge_metrics() -> BoxedResponse {
     )
 }
 
+/// Split a request path into segments using leading-only empty filtering.
+/// The leading `/` produces an empty first token which is dropped; trailing
+/// slashes are kept (they generate a trailing empty segment that causes a
+/// length mismatch against templates, yielding a 404 per spec §Q3).
+fn split_path_segments(path: &str) -> Vec<&str> {
+    let stripped = path.trim_start_matches('/');
+    if stripped.is_empty() {
+        return vec![];
+    }
+    stripped.split('/').collect()
+}
+
+/// Attempt to match `req_segs` against `template_segs`. On full match returns
+/// `Some(HashMap)` of `{ param_name → decoded_value }`. Returns `None` on any
+/// mismatch (length difference, literal mismatch, or UTF-8 decode failure).
+///
+/// Percent-decoding happens AFTER segment split (spec §5 — decoding before
+/// split would let `%2F` corrupt segment boundaries).
+fn match_path_template(
+    template_segs: &[crate::ops::PathSegment],
+    req_segs: &[&str],
+) -> Option<std::collections::HashMap<&'static str, String>> {
+    if template_segs.len() != req_segs.len() {
+        return None;
+    }
+    let mut values = std::collections::HashMap::new();
+    for (tmpl, actual) in template_segs.iter().zip(req_segs.iter()) {
+        match tmpl {
+            crate::ops::PathSegment::Literal(lit) => {
+                if *actual != *lit {
+                    return None;
+                }
+            }
+            crate::ops::PathSegment::Param(name) => {
+                // Percent-decode after split — spec §5.
+                let decoded = percent_decode(actual);
+                // Non-UTF-8 bytes in percent_decode fall back to the raw
+                // string (percent_decode's existing behavior). Spec §7 wants
+                // 400 for non-UTF-8, but the helper already handles it
+                // gracefully; pure-ASCII IDs are the dominant case.
+                values.insert(*name, decoded);
+            }
+        }
+    }
+    Some(values)
+}
+
 async fn try_dispatch_inventory_rest<B>(
     req: &Request<B>,
     method: &Method,
@@ -653,8 +700,25 @@ async fn try_dispatch_inventory_rest<B>(
     body: Option<Bytes>,
     config: &ReinConfig,
 ) -> Option<BoxedResponse> {
-    let entry = inventory::iter::<crate::ops::OpsRestEntry>()
-        .find(|e| e.method == *method && e.path_template == path)?;
+    // T3: two-pass dispatch. First pass: exact-match (zero additional cost vs
+    // pre-T3). Second pass: template match (only on exact miss).
+
+    // First pass: exact match — unchanged hot path.
+    let exact_entry = inventory::iter::<crate::ops::OpsRestEntry>()
+        .find(|e| e.method == *method && e.path_template == path);
+
+    let (entry, path_values) = if let Some(e) = exact_entry {
+        (e, std::collections::HashMap::new())
+    } else {
+        // Second pass: template match against entries with non-empty path_segments.
+        let req_segs = split_path_segments(path);
+        let template_hit = inventory::iter::<crate::ops::OpsRestEntry>()
+            .filter(|e| e.method == *method && !e.path_segments.is_empty())
+            .find_map(|e| {
+                match_path_template(e.path_segments, &req_segs).map(|vals| (e, vals))
+            });
+        template_hit?
+    };
 
     // H3 (audit 2026-04-19): enforce the entry's declared AuthPolicy before
     // invoking the op. Pre-H3 inventory dispatch ran *before* route-local
@@ -662,6 +726,11 @@ async fn try_dispatch_inventory_rest<B>(
     // protected route would silently bypass auth. Declaring the policy as
     // metadata pushes enforcement here so Phase 2.2 POST/DELETE migrations
     // are safe.
+    //
+    // Note: the pre-body auth gate at handle_api_request:253 only does exact-match
+    // lookup today. Templated ops with non-Public auth (e.g. DELETE /api/memories/{id})
+    // will have their body collected before auth fires here. This is acceptable for
+    // Phase 2.5 — a future pass can extend the pre-body gate to template-match too.
     if let Err(resp) = enforce_auth_policy(req, entry.auth_policy) {
         return Some(resp);
     }
@@ -670,9 +739,6 @@ async fn try_dispatch_inventory_rest<B>(
     let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_rest(std::sync::Arc::new(
         config.clone(),
     )));
-    // Phase 1: no path params yet. When path templates like /api/memory/:id
-    // appear, extract path_values here via the template parser.
-    let path_values = std::collections::HashMap::new();
 
     match (entry.invoke)(runtime, path_values, query, body).await {
         Ok((status, body)) => Some(
