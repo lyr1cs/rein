@@ -119,6 +119,8 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "memory", "GET /api/memories/{id}"),
     op!(Rest, "knowledge", "GET /api/memoirs"),
     op!(Rest, "knowledge", "GET /api/memoirs/{name}"),
+    op!(Rest, "knowledge", "GET /api/memoirs/{name}/export"),
+    op!(Rest, "knowledge", "GET /api/memoirs/{name}/inspect/{concept}"),
     op!(Rest, "timeline", "GET /api/timeline"),
     op!(Rest, "timeline", "GET /api/episodes"),
     op!(Rest, "artifacts", "GET /api/artifacts"),
@@ -236,6 +238,8 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[30],
     REST_OPERATIONS[31],
     REST_OPERATIONS[32],
+    REST_OPERATIONS[33],
+    REST_OPERATIONS[34],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -292,13 +296,13 @@ mod tests {
     fn registry_counts_match_expected_values() {
         assert_eq!(cli_operations().len(), 35);
         assert_eq!(mcp_operations().len(), 31);
-        assert_eq!(rest_operations().len(), 33);
+        assert_eq!(rest_operations().len(), 35);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 35,
                 mcp: 31,
-                rest: 33
+                rest: 35
             }
         );
     }
