@@ -24,7 +24,7 @@ pub use adaptive::*;
 pub use consolidation::*;
 pub use dedup::*;
 pub use error::OpsErrorKind;
-pub use inventory::{AuthPolicy, OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry};
+pub use inventory::{AuthPolicy, OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry, PathSegment};
 pub use registry::*;
 pub use render::{IntoCliText, IntoJson, IntoMarkdown};
 pub use runtime::{OpsRuntime, SurfaceKind};
