@@ -13,7 +13,7 @@ use rein_macros::op;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ops::{IntoCliText, IntoMarkdown, OpsRuntime};
+use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsRuntime};
 use crate::types::ReinResult;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -24,6 +24,12 @@ pub struct TestPathTemplateParams {
 #[derive(Debug, Serialize)]
 pub struct TestPathTemplateOutput {
     pub echoed_id: String,
+}
+
+impl IntoJson for TestPathTemplateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "echoed_id": self.echoed_id })
+    }
 }
 
 impl IntoMarkdown for TestPathTemplateOutput {
