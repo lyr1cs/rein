@@ -432,42 +432,61 @@ impl SqliteStore {
             .get_memoir(memoir_name)?
             .ok_or_else(|| ReinError::NotFound(format!("memoir '{memoir_name}' not found")))?;
 
-        // Snapshot current state as a revision before overwriting
-        if let Some(old) = self.get_concept(memoir_name, concept_name)? {
-            let rev_id = ulid::Ulid::new().to_string();
-            let labels_json = serde_json::to_string(&old.labels).unwrap_or_default();
-            let source_json = serde_json::to_string(&old.source_memory_ids).unwrap_or_default();
-            if let Err(e) = self.conn().execute(
-                "INSERT INTO concept_revisions (id, concept_id, revision, definition, confidence, labels, source_memory_ids, episode_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    rev_id, old.id, old.revision, old.definition, old.confidence,
-                    labels_json, source_json, old.last_episode_id,
-                    old.updated_at.to_rfc3339(),
-                ],
-            ) {
-                tracing::warn!("failed to snapshot concept revision for '{}': {e}", concept_name);
+        // Phase 3 F3 hardening: snapshot + update run inside the same
+        // transaction so a partial write cannot leave the revision log and
+        // the concept row out of sync. Matches Phase 2.4 F2 / Phase 2.5 H2
+        // discipline. A snapshot insert failure now aborts the update,
+        // which is a stricter contract than the pre-A1 behaviour (where a
+        // `tracing::warn!` quietly swallowed the snapshot error); callers
+        // get a surfaced error instead of a silently half-written concept.
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> ReinResult<()> {
+            if let Some(old) = self.get_concept(memoir_name, concept_name)? {
+                let rev_id = ulid::Ulid::new().to_string();
+                let labels_json = serde_json::to_string(&old.labels).unwrap_or_default();
+                let source_json =
+                    serde_json::to_string(&old.source_memory_ids).unwrap_or_default();
+                conn.execute(
+                    "INSERT INTO concept_revisions (id, concept_id, revision, definition, confidence, labels, source_memory_ids, episode_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        rev_id, old.id, old.revision, old.definition, old.confidence,
+                        labels_json, source_json, old.last_episode_id,
+                        old.updated_at.to_rfc3339(),
+                    ],
+                )?;
+            }
+
+            let now = Utc::now();
+            let rows = conn.execute(
+                "UPDATE concepts
+                 SET definition = ?1,
+                     revision = revision + 1,
+                     confidence = MIN(confidence + 0.1, 1.0),
+                     updated_at = ?2
+                 WHERE memoir_id = ?3 AND name = ?4",
+                rusqlite::params![new_definition, now.to_rfc3339(), memoir.id, concept_name],
+            )?;
+
+            if rows == 0 {
+                return Err(ReinError::NotFound(format!(
+                    "concept '{concept_name}' not found in memoir '{memoir_name}'"
+                )));
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
             }
         }
-
-        let now = Utc::now();
-        let rows = self.conn().execute(
-            "UPDATE concepts
-             SET definition = ?1,
-                 revision = revision + 1,
-                 confidence = MIN(confidence + 0.1, 1.0),
-                 updated_at = ?2
-             WHERE memoir_id = ?3 AND name = ?4",
-            rusqlite::params![new_definition, now.to_rfc3339(), memoir.id, concept_name],
-        )?;
-
-        if rows == 0 {
-            return Err(ReinError::NotFound(format!(
-                "concept '{concept_name}' not found in memoir '{memoir_name}'"
-            )));
-        }
-
-        Ok(())
     }
 
     /// FTS search for concepts within a memoir.
