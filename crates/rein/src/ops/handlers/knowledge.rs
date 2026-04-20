@@ -267,6 +267,78 @@ impl IntoCliText for MemoirInspectOutput {
     }
 }
 
+// ── memoir_search / memoir_search_all ────────────────────────────────────────
+//
+// Both ops are MCP-only under A1 — pre-A1 had no REST surface and Phase 2.6
+// follows the "don't add what wasn't there" rule. Concept output rendering
+// is shared between the two ops below via `format_concepts_*`.
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct MemoirSearchParams {
+    /// Name of the memoir to search in.
+    pub memoir: String,
+    /// Full-text search query.
+    pub query: String,
+    /// Maximum number of results (default 10, max 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct MemoirSearchAllParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Maximum number of results (default 10, max 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ConceptSearchOutput {
+    pub concepts: Vec<crate::types::Concept>,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for ConceptSearchOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "concepts": self.concepts })
+    }
+}
+
+impl IntoMarkdown for ConceptSearchOutput {
+    fn to_markdown(&self) -> String {
+        if self.concepts.is_empty() {
+            return if self.compact {
+                "none".to_string()
+            } else {
+                "No concepts found.".to_string()
+            };
+        }
+        let mut text = String::new();
+        for c in &self.concepts {
+            if self.compact {
+                text.push_str(&format!(
+                    "{}:{}:r{}:c{:.1}\n",
+                    c.name, c.definition, c.revision, c.confidence
+                ));
+            } else {
+                text.push_str(&format!(
+                    "- {} (rev:{}, conf:{:.1}) — {}\n",
+                    c.name, c.revision, c.confidence, c.definition
+                ));
+            }
+        }
+        text
+    }
+}
+
+impl IntoCliText for ConceptSearchOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
 impl OpsRuntime {
     #[op(
         name = "memoir_list",
@@ -309,6 +381,45 @@ impl OpsRuntime {
                 json_value,
                 compact,
             })
+        })
+    }
+
+    #[op(
+        name = "memoir_search",
+        category = "knowledge",
+        description = "Full-text search for concepts within a single memoir.",
+        mcp(name = "rein_memoir_search"),
+    )]
+    pub fn memoir_search(
+        &self,
+        params: MemoirSearchParams,
+    ) -> ReinResult<ConceptSearchOutput> {
+        let compact = self.compact();
+        let limit = params.limit.unwrap_or(10).min(100);
+        let memoir = params.memoir.clone();
+        let query = params.query.clone();
+        self.with_store(|store| {
+            let concepts = store.search_concepts(&memoir, &query, limit)?;
+            Ok(ConceptSearchOutput { concepts, compact })
+        })
+    }
+
+    #[op(
+        name = "memoir_search_all",
+        category = "knowledge",
+        description = "Full-text search for concepts across all memoirs.",
+        mcp(name = "rein_memoir_search_all"),
+    )]
+    pub fn memoir_search_all(
+        &self,
+        params: MemoirSearchAllParams,
+    ) -> ReinResult<ConceptSearchOutput> {
+        let compact = self.compact();
+        let limit = params.limit.unwrap_or(10).min(100);
+        let query = params.query.clone();
+        self.with_store(|store| {
+            let concepts = store.search_all_concepts(&query, limit)?;
+            Ok(ConceptSearchOutput { concepts, compact })
         })
     }
 
