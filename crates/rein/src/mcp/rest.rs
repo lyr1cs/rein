@@ -1246,7 +1246,7 @@ fn api_artifact_detail(
 // Helpers
 // ===========================================================================
 
-fn memory_to_json(m: &crate::types::Memory) -> serde_json::Value {
+pub(crate) fn memory_to_json(m: &crate::types::Memory) -> serde_json::Value {
     let summary_short: String = m.summary.chars().take(110).collect();
     json!({
         "id": m.id,
@@ -1259,6 +1259,7 @@ fn memory_to_json(m: &crate::types::Memory) -> serde_json::Value {
         "importance": format!("{}", m.importance),
         "source": format!("{}", m.source),
         "strength": m.strength,
+        "decay_lambda": m.decay_lambda,
         "tier": format!("{}", m.tier),
         "cluster_id": m.cluster_id,
         "access_count": m.access_count,

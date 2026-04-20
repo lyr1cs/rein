@@ -86,8 +86,8 @@ impl IntoCliText for ListTopicsOutput {
 
 #[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
 pub struct RecentParams {
-    /// Maximum number of recent memories to return (default 10, max 100).
-    #[arg(short, long, default_value = "10")]
+    /// Maximum number of recent memories to return (default 20, max 100).
+    #[arg(short, long, default_value = "20")]
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -102,7 +102,7 @@ pub struct RecentOutput {
 impl IntoJson for RecentOutput {
     fn to_json(&self) -> serde_json::Value {
         let items: Vec<serde_json::Value> =
-            self.memories.iter().map(memory_to_json_internal).collect();
+            self.memories.iter().map(crate::mcp::rest::memory_to_json).collect();
         json!({ "memories": items })
     }
 }
@@ -146,7 +146,21 @@ impl IntoCliText for RecentOutput {
         }
         self.memories
             .iter()
-            .map(|m| format_recent_line(m, self.compact))
+            .map(|m| {
+                if self.compact {
+                    format!("[{}] {}", m.topic, m.summary)
+                } else {
+                    let age = chrono::Utc::now().signed_duration_since(m.created_at);
+                    let age_str = if age.num_days() > 0 {
+                        format!("{}d ago", age.num_days())
+                    } else if age.num_hours() > 0 {
+                        format!("{}h ago", age.num_hours())
+                    } else {
+                        format!("{}m ago", age.num_minutes())
+                    };
+                    format!("[{}] {} ({}, {})", m.topic, m.summary, m.importance, age_str)
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -526,28 +540,6 @@ impl IntoCliText for GetMemoryOutput {
     }
 }
 
-fn memory_to_json_internal(m: &crate::types::Memory) -> serde_json::Value {
-    let summary_short: String = m.summary.chars().take(110).collect();
-    json!({
-        "id": m.id,
-        "layer": format!("{}", m.layer),
-        "topic": m.topic,
-        "summary": m.summary,
-        "summary_short": summary_short,
-        "content": m.content,
-        "keywords": m.keywords,
-        "importance": format!("{}", m.importance),
-        "source": format!("{}", m.source),
-        "strength": m.strength,
-        "decay_lambda": m.decay_lambda,
-        "access_count": m.access_count,
-        "canonical_id": m.canonical_id,
-        "support_count": m.support_count,
-        "status": format!("{}", m.status),
-        "created_at": m.created_at.to_rfc3339(),
-        "updated_at": m.updated_at.to_rfc3339(),
-    })
-}
 
 impl OpsRuntime {
     #[op(
@@ -562,7 +554,7 @@ impl OpsRuntime {
         self.with_store(|store| {
             let m = store.get(&id)?;
             let canonical_id = m.canonical_id.clone().unwrap_or_else(|| m.id.clone());
-            let mut body = memory_to_json_internal(&m);
+            let mut body = crate::mcp::rest::memory_to_json(&m);
             let evidence = store
                 .list_memory_evidence(&canonical_id, 12)
                 .unwrap_or_default()
@@ -584,7 +576,7 @@ impl OpsRuntime {
                 })
                 .collect::<Vec<_>>();
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("memory".to_string(), memory_to_json_internal(&m));
+                obj.insert("memory".to_string(), crate::mcp::rest::memory_to_json(&m));
                 obj.insert("evidence".to_string(), json!(evidence));
             }
             Ok(GetMemoryOutput(body))
@@ -656,12 +648,21 @@ impl OpsRuntime {
             )
             .with_kind(crate::types::OpsErrorKind::BadRequest));
         }
-        let importance: crate::types::Importance = params
+        let importance: crate::types::Importance = match params
             .importance
             .as_deref()
             .unwrap_or("medium")
             .parse()
-            .unwrap_or(crate::types::Importance::Medium);
+        {
+            Ok(imp) => imp,
+            Err(_) => {
+                return Err(crate::types::ReinError::Config(format!(
+                    "invalid importance {:?}: must be one of low, medium, high, critical",
+                    params.importance.as_deref().unwrap_or("")
+                ))
+                .with_kind(crate::types::OpsErrorKind::BadRequest))
+            }
+        };
         let keywords = params.keywords.unwrap_or_default();
         let memory = crate::ops::build_memory(
             &self.config,
@@ -690,24 +691,52 @@ impl OpsRuntime {
     pub fn update(&self, params: UpdateParams) -> ReinResult<UpdateOutput> {
         let base_lambda = self.config.decay.base_lambda;
         let id = params.id.clone();
+        // M2: validate importance early before opening a transaction.
+        let new_importance: Option<crate::types::Importance> =
+            match params.importance.as_deref() {
+                None => None,
+                Some(s) => match s.parse::<crate::types::Importance>() {
+                    Ok(imp) => Some(imp),
+                    Err(_) => {
+                        return Err(crate::types::ReinError::Config(format!(
+                            "invalid importance {:?}: must be one of low, medium, high, critical",
+                            s
+                        ))
+                        .with_kind(crate::types::OpsErrorKind::BadRequest))
+                    }
+                },
+            };
         self.with_store(|store| {
-            let mut memory = store.get(&id)?;
-            memory.content = params.content.clone();
-            memory.summary = params
-                .content
-                .chars()
-                .take(crate::types::SUMMARY_MAX_CHARS)
-                .collect();
-            if let Some(ref imp_str) = params.importance {
-                if let Ok(imp) = imp_str.parse::<crate::types::Importance>() {
+            // H2: wrap read-modify-write in BEGIN IMMEDIATE to prevent lost updates.
+            let conn = store.conn();
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> ReinResult<UpdateOutput> {
+                let mut memory = store.get(&id)?;
+                memory.content = params.content.clone();
+                memory.summary = params
+                    .content
+                    .chars()
+                    .take(crate::types::SUMMARY_MAX_CHARS)
+                    .collect();
+                if let Some(imp) = new_importance {
                     memory.importance = imp;
                     memory.layer = imp.auto_layer();
                     memory.decay_lambda = base_lambda * imp.decay_factor();
                 }
+                memory.updated_at = chrono::Utc::now();
+                store.update(&memory)?;
+                Ok(UpdateOutput { id: id.clone(), updated: true })
+            })();
+            match result {
+                Ok(out) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(out)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
             }
-            memory.updated_at = chrono::Utc::now();
-            store.update(&memory)?;
-            Ok(UpdateOutput { id: id.clone(), updated: true })
         })
     }
 
@@ -980,7 +1009,7 @@ impl OpsRuntime {
         rest(method = "GET", path = "/api/recent"),
     )]
     pub fn recent(&self, params: RecentParams) -> ReinResult<RecentOutput> {
-        let limit = params.limit.unwrap_or(10).clamp(1, 100);
+        let limit = params.limit.unwrap_or(20).clamp(1, 100);
         let compact = self.compact();
         self.with_store(|store| {
             let memories = store.recent(limit)?;
