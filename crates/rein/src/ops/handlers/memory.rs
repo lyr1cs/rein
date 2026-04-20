@@ -152,6 +152,46 @@ impl IntoCliText for RecentOutput {
     }
 }
 
+// ── update ──────────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct UpdateParams {
+    /// The memory ID to update.
+    #[arg()]
+    pub id: String,
+    /// New content for the memory.
+    #[arg(short, long)]
+    pub content: String,
+    /// New importance level (low, medium, high, critical).
+    #[arg(short = 'I', long)]
+    #[serde(default)]
+    pub importance: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct UpdateOutput {
+    pub id: String,
+    pub updated: bool,
+}
+
+impl IntoJson for UpdateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "id": self.id, "updated": self.updated })
+    }
+}
+
+impl IntoMarkdown for UpdateOutput {
+    fn to_markdown(&self) -> String {
+        format!("ok:{}", self.id)
+    }
+}
+
+impl IntoCliText for UpdateOutput {
+    fn to_cli_text(&self) -> String {
+        format!("Updated memory: {}", self.id)
+    }
+}
+
 // ── timeline ────────────────────────────────────────────────────────────────
 
 #[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
@@ -406,6 +446,38 @@ impl OpsRuntime {
                 obj.insert("evidence".to_string(), json!(evidence));
             }
             Ok(GetMemoryOutput(body))
+        })
+    }
+
+    #[op(
+        name = "update",
+        category = "memory",
+        description = "Update the content of an existing memory by ID. Optionally reassign importance, which adjusts the decay layer.",
+        mutating = true,
+        cli(name = "update"),
+        mcp(name = "rein_update"),
+    )]
+    pub fn update(&self, params: UpdateParams) -> ReinResult<UpdateOutput> {
+        let base_lambda = self.config.decay.base_lambda;
+        let id = params.id.clone();
+        self.with_store(|store| {
+            let mut memory = store.get(&id)?;
+            memory.content = params.content.clone();
+            memory.summary = params
+                .content
+                .chars()
+                .take(crate::types::SUMMARY_MAX_CHARS)
+                .collect();
+            if let Some(ref imp_str) = params.importance {
+                if let Ok(imp) = imp_str.parse::<crate::types::Importance>() {
+                    memory.importance = imp;
+                    memory.layer = imp.auto_layer();
+                    memory.decay_lambda = base_lambda * imp.decay_factor();
+                }
+            }
+            memory.updated_at = chrono::Utc::now();
+            store.update(&memory)?;
+            Ok(UpdateOutput { id: id.clone(), updated: true })
         })
     }
 

@@ -137,17 +137,6 @@ pub struct IngestSessionParams {
     pub async_mode: Option<bool>,
 }
 
-/// Parameters for rein_update tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct UpdateParams {
-    /// The memory ID to update.
-    pub id: String,
-    /// New content for the memory.
-    pub content: String,
-    /// New importance level (optional).
-    pub importance: Option<String>,
-}
-
 // FeedbackParams removed — rein_feedback migrated to #[op] inventory (Phase 2.4).
 // See ops/handlers/adaptive.rs for the new FeedbackParams + FeedbackOutput structs.
 

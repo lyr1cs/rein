@@ -199,31 +199,6 @@ pub fn handle_recall(
 // main.rs intercepts those subcommands before Cli::parse() and dispatches through
 // OpsCliEntry inventory.
 
-pub fn handle_update(
-    config: &ReinConfig,
-    id: String,
-    content: String,
-    importance: Option<String>,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let mut mem = store.get(&id)?;
-    mem.content = content.clone();
-    mem.summary = content
-        .chars()
-        .take(rein::types::SUMMARY_MAX_CHARS)
-        .collect();
-    if let Some(imp_str) = importance {
-        let imp: types::Importance = imp_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        mem.importance = imp;
-        mem.layer = imp.auto_layer();
-        mem.decay_lambda = config.decay.base_lambda * imp.decay_factor();
-    }
-    mem.updated_at = chrono::Utc::now();
-    store.update(&mem)?;
-    println!("Updated memory: {id}");
-    Ok(())
-}
-
 // handle_organize removed — rein organize migrated to #[op] inventory.
 // handle_dedup_concepts removed — rein dedup-concepts migrated to #[op] inventory.
 
