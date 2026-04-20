@@ -193,8 +193,8 @@ impl IntoCliText for MemoirExportOutput {
 /// No REST surface: `/api/memoirs/{name}/inspect/{concept}` needs two path
 /// parameters and the path-template framework currently caps at one (spec
 /// §Q2). That endpoint continues to be served by the derived handler at
-/// `mcp/rest.rs::handle_memoir_path` and is registered in
-/// `registry::REST_OPERATIONS` to keep drift checks accurate.
+/// `mcp/rest.rs::handle_memoir_path`; Phase 3 drift-checks treat it as a
+/// derived REST arm directly counted by `count_rest_operations_in_source`.
 #[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
 pub struct MemoirInspectParams {
     /// Name of the memoir.
