@@ -8,7 +8,6 @@ use crate::config::{Provider, ReinConfig};
 use crate::embed;
 use crate::extract::hooks::buffer;
 use crate::extract::hooks::queue::{collect_queue_diagnostics, QueueGroupDiagnostics};
-use crate::ops::registry;
 use crate::search::warmup;
 use crate::store::hnsw::HnswIndex;
 use crate::store::sqlite::SqliteStore;
@@ -329,51 +328,32 @@ fn check_overview_version() -> DoctorCheck {
     }
 }
 
+// Phase 3 dropped the hand-maintained `ops::registry::*_OPERATIONS` arrays
+// that used to sit between inventory and the drift check. Now the checks
+// compare inventory counts (authoritative) against source-scanned derived
+// counts directly. The MCP check retains the doc-drift warning against
+// README / AGENTS.md MCP tool counts.
+
 fn check_cli_registry() -> DoctorCheck {
-    let registry_count = registry::cli_operations().len();
-    // A1: migrated ops no longer appear as `Some(Commands::*)` arms in main.rs —
-    // they register through `OpsCliEntry` inventory. Sum both sources so the
-    // drift check stays honest during the incremental migration.
     let inventory_count = inventory::iter::<crate::ops::OpsCliEntry>().count();
     let derived_count = count_cli_operations_in_source(include_str!("main.rs"));
     let source_count = derived_count + inventory_count;
-    if registry_count != source_count {
-        return fail_in(
-            DoctorCategory::Architecture,
-            "cli_registry",
-            format!(
-                "registry has {registry_count} CLI operations but main.rs exposes {derived_count} derived + {inventory_count} inventory = {source_count}"
-            ),
-        );
-    }
     ok_in(
         DoctorCategory::Architecture,
         "cli_registry",
         format!(
-            "{registry_count} CLI operations match source ({derived_count} derived + {inventory_count} inventory)"
+            "{source_count} CLI operations in source ({derived_count} derived + {inventory_count} inventory)"
         ),
     )
 }
 
 fn check_mcp_registry() -> DoctorCheck {
-    let registry_count = registry::mcp_operations().len();
-    // A1: migrated tools register via OpsMcpEntry inventory and are served by
-    // the custom ServerHandler impl, not via `#[tool(...)]` on ReinServer.
     let inventory_count = inventory::iter::<crate::ops::OpsMcpEntry>().count();
     let derived_count = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
     let source_count = derived_count + inventory_count;
-    if registry_count != source_count {
-        return fail_in(
-            DoctorCategory::Architecture,
-            "mcp_registry",
-            format!(
-                "registry has {registry_count} MCP tools but src/mcp/server.rs exposes {derived_count} derived + {inventory_count} inventory = {source_count}"
-            ),
-        );
-    }
 
     let doc_counts = documented_mcp_tool_counts();
-    if !doc_counts.is_empty() && doc_counts.iter().any(|(_, count)| *count != registry_count) {
+    if !doc_counts.is_empty() && doc_counts.iter().any(|(_, count)| *count != source_count) {
         let doc_summary = doc_counts
             .iter()
             .map(|(name, count)| format!("{name}={count}"))
@@ -382,21 +362,22 @@ fn check_mcp_registry() -> DoctorCheck {
         return warn_in(
             DoctorCategory::Architecture,
             "mcp_registry",
-            format!("{registry_count} MCP tools match source, but docs still say {doc_summary}"),
+            format!(
+                "{source_count} MCP tools in source ({derived_count} derived + {inventory_count} inventory), but docs still say {doc_summary}"
+            ),
         );
     }
 
     ok_in(
         DoctorCategory::Architecture,
         "mcp_registry",
-        format!("{registry_count} MCP tools match source"),
+        format!(
+            "{source_count} MCP tools in source ({derived_count} derived + {inventory_count} inventory)"
+        ),
     )
 }
 
 fn check_rest_registry() -> DoctorCheck {
-    let registry_count = registry::rest_operations().len();
-    // A1: migrated ops appear via OpsRestEntry inventory; remaining legacy
-    // routes still live in src/mcp/rest.rs as `(&Method::*, "/api/...")` arms.
     // Exclude test-support ops (op_name starts with "__test_") from the count
     // so the check is stable whether or not the test-support feature is active.
     let inventory_count = inventory::iter::<crate::ops::OpsRestEntry>()
@@ -404,20 +385,11 @@ fn check_rest_registry() -> DoctorCheck {
         .count();
     let derived_count = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
     let source_count = derived_count + inventory_count;
-    if registry_count != source_count {
-        return fail_in(
-            DoctorCategory::Architecture,
-            "rest_registry",
-            format!(
-                "registry has {registry_count} REST operations but src/mcp/rest.rs exposes {derived_count} derived + {inventory_count} inventory = {source_count}"
-            ),
-        );
-    }
     ok_in(
         DoctorCategory::Architecture,
         "rest_registry",
         format!(
-            "{registry_count} REST operations match source ({derived_count} derived + {inventory_count} inventory)"
+            "{source_count} REST operations in source ({derived_count} derived + {inventory_count} inventory)"
         ),
     )
 }
@@ -1723,19 +1695,32 @@ provider = "inherit"
 
     #[test]
     fn test_architecture_drift_helpers_match_source_counts() {
+        // Phase 3 dropped `ops::registry::*_OPERATIONS`; the helpers now
+        // report counts directly from source + inventory. The test asserts
+        // the helpers return sensible non-zero values and that the docs
+        // counter parsers still work.
         let derived = count_cli_operations_in_source(include_str!("main.rs"));
         let inventory_count = inventory::iter::<crate::ops::OpsCliEntry>().count();
-        assert_eq!(derived + inventory_count, registry::cli_operations().len());
+        assert!(
+            derived + inventory_count > 0,
+            "CLI source scan + inventory should report at least one op"
+        );
         let derived_mcp = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
         let inventory_mcp = inventory::iter::<crate::ops::OpsMcpEntry>().count();
-        assert_eq!(derived_mcp + inventory_mcp, registry::mcp_operations().len());
+        assert!(
+            derived_mcp + inventory_mcp > 0,
+            "MCP source scan + inventory should report at least one tool"
+        );
         let derived_rest = count_rest_operations_in_source(include_str!("mcp/rest.rs"));
         // Exclude test-support ops so this assertion holds regardless of whether
         // the test-support feature is active.
         let inventory_rest = inventory::iter::<crate::ops::OpsRestEntry>()
             .filter(|e| !e.op_name.starts_with("__test_"))
             .count();
-        assert_eq!(derived_rest + inventory_rest, registry::rest_operations().len());
+        assert!(
+            derived_rest + inventory_rest > 0,
+            "REST source scan + inventory should report at least one route"
+        );
         assert_eq!(
             parse_agents_overview_version("rein v1.2.3 — demo release"),
             Some("1.2.3".to_string())

@@ -10,7 +10,6 @@ use crate::types::*;
 pub mod adaptive;
 pub mod consolidation;
 pub mod dedup;
-pub mod registry;
 pub mod system_health;
 
 // v0.21 A1 unified-ops infrastructure. Handlers populated incrementally.
@@ -25,7 +24,6 @@ pub use consolidation::*;
 pub use dedup::*;
 pub use error::OpsErrorKind;
 pub use inventory::{AuthPolicy, OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry, PathSegment};
-pub use registry::*;
 pub use render::{IntoCliText, IntoJson, IntoMarkdown};
 pub use runtime::{OpsRuntime, SurfaceKind};
 
