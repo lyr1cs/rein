@@ -92,7 +92,7 @@ async fn canonicals_returns_consistent_output_across_surfaces() {
         let entry = inventory::iter::<OpsRestEntry>()
             .find(|e| e.op_name == "canonicals")
             .expect("canonicals REST entry registered");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             "limit=20".to_string(),
@@ -240,7 +240,7 @@ async fn evidence_returns_consistent_output_across_surfaces() {
         let entry = inventory::iter::<OpsRestEntry>()
             .find(|e| e.op_name == "evidence")
             .expect("evidence REST entry registered");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             "canonical_id=ev_canon1&limit=20".to_string(),
@@ -381,7 +381,7 @@ async fn gc_dry_run_parity_across_surfaces_respects_auth() {
             .expect("gc REST entry registered");
         let body = serde_json::to_vec(&serde_json::json!({ "dry_run": true, "threshold": 0.99 }))
             .expect("serialize body");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
@@ -705,7 +705,7 @@ async fn dedup_dry_run_parity_across_surfaces_respects_auth() {
         let body =
             serde_json::to_vec(&serde_json::json!({ "dry_run": true, "merge_variants": false }))
                 .expect("serialize body");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
@@ -847,7 +847,7 @@ async fn dedup_log_returns_consistent_output_across_surfaces() {
         let entry = inventory::iter::<OpsRestEntry>()
             .find(|e| e.op_name == "dedup_log")
             .expect("dedup_log REST entry registered");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             "limit=50".to_string(),
@@ -1070,7 +1070,7 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
         let entry = inventory::iter::<OpsRestEntry>()
             .find(|e| e.op_name == "dedup_concepts")
             .expect("dedup_concepts REST entry registered");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
@@ -1249,7 +1249,7 @@ async fn organize_parity_across_surfaces() {
             .expect("organize REST entry registered");
         let body = serde_json::to_vec(&serde_json::json!({ "max_links": 5 }))
             .expect("serialize body");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
@@ -1390,7 +1390,7 @@ async fn consolidate_dry_run_parity_across_surfaces_respects_auth() {
             &serde_json::json!({ "dry_run": true, "topic": "consolidate-test" }),
         )
         .expect("serialize body");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
@@ -1559,7 +1559,7 @@ async fn cleanup_dry_run_parity_across_surfaces_respects_auth() {
             &serde_json::json!({ "dry_run": true, "topic": "cleanup-test" }),
         )
         .expect("serialize body");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
@@ -2289,7 +2289,7 @@ async fn feedback_records_consistent_across_surfaces() {
             "helpful": true
         }))
         .expect("serialize body");
-        let (status, bytes) = (entry.invoke)(
+        let (status, bytes, _content_type) = (entry.invoke)(
             runtime,
             std::collections::HashMap::new(),
             String::new(),
