@@ -152,6 +152,80 @@ impl IntoCliText for RecentOutput {
     }
 }
 
+// ── recall ──────────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct RecallMemoryParams {
+    /// The search query string.
+    #[arg()]
+    pub query: String,
+    /// Optional topic filter.
+    #[arg(short, long)]
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Optional keyword filter.
+    #[arg(short, long)]
+    #[serde(default)]
+    pub keyword: Option<String>,
+    /// Maximum number of results to return (default 10, max 200).
+    #[arg(short, long)]
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Filter memories created after this date (YYYY-MM-DD or RFC3339).
+    #[arg(long)]
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Filter memories created before this date.
+    #[arg(long)]
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Override query expansion: true=force, false=disable, null=use config default.
+    #[arg(long)]
+    #[serde(default)]
+    pub expand: Option<bool>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct RecallMemoryOutput {
+    pub results: Vec<crate::search::recall::RecallResult>,
+    pub route: String,
+    pub request_id: String,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for RecallMemoryOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for RecallMemoryOutput {
+    fn to_markdown(&self) -> String {
+        let mut text = crate::mcp::compact::format_recall_results_mcp(&self.results, self.compact);
+        if text.is_empty() {
+            text = if self.compact {
+                "none".to_string()
+            } else {
+                "No memories found.".to_string()
+            };
+        }
+        if !self.compact && !self.results.is_empty() {
+            text = format!(
+                "[route: {} | request_id: {}] {}",
+                self.route, self.request_id, text
+            );
+        }
+        text
+    }
+}
+
+impl IntoCliText for RecallMemoryOutput {
+    fn to_cli_text(&self) -> String {
+        crate::mcp::compact::format_recall_results(&self.results, self.compact)
+    }
+}
+
 // ── store ───────────────────────────────────────────────────────────────────
 
 fn deserialize_keywords<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -514,6 +588,56 @@ impl OpsRuntime {
                 obj.insert("evidence".to_string(), json!(evidence));
             }
             Ok(GetMemoryOutput(body))
+        })
+    }
+
+    #[op(
+        name = "recall",
+        category = "memory",
+        description = "Search and recall memories by semantic query. 3-channel waterfall: FTS5 (Tantivy BM25) → HNSW vectors → Gemini API, fused via RRF/CC with query expansion, LLM reranking, and Ebbinghaus decay weighting.",
+        cli(name = "recall"),
+        mcp(name = "rein_recall"),
+    )]
+    pub fn recall(&self, params: RecallMemoryParams) -> ReinResult<RecallMemoryOutput> {
+        let limit = params.limit.unwrap_or(10).min(200);
+        let time_from = params.from.as_deref().and_then(parse_dt_start);
+        let time_to = params.to.as_deref().and_then(parse_dt_end);
+        let request_id = ulid::Ulid::new().to_string();
+        let query = params.query.clone();
+        let topic = params.topic.clone();
+        let keyword = params.keyword.clone();
+        let expand = params.expand;
+        let compact = self.compact();
+
+        let route = crate::search::classify::classify(
+            &query,
+            time_from.is_some(),
+            time_to.is_some(),
+        );
+        let route_name = route.query_type.to_string();
+        let req_id_clone = request_id.clone();
+
+        self.with_store(|store| {
+            let results = crate::search::recall::recall_temporal_with_request_id(
+                store,
+                &self.config,
+                &query,
+                topic.as_deref(),
+                keyword.as_deref(),
+                limit,
+                time_from,
+                time_to,
+                expand,
+                false,
+                Some(req_id_clone.clone()),
+            )
+            .map_err(|e| crate::types::ReinError::Config(format!("{e}")))?;
+            Ok(RecallMemoryOutput {
+                results,
+                route: route_name.clone(),
+                request_id: req_id_clone.clone(),
+                compact,
+            })
         })
     }
 

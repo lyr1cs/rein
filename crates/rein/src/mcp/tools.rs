@@ -77,25 +77,8 @@ pub struct SessionTurnParams {
     pub content: String,
 }
 
-/// Parameters for rein_recall tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RecallParams {
-    /// The search query string.
-    pub query: String,
-    /// Optional topic filter.
-    pub topic: Option<String>,
-    /// Optional keyword filter.
-    pub keyword: Option<String>,
-    /// Maximum number of results to return (default 10).
-    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
-    pub limit: Option<usize>,
-    /// Filter memories created after this date (YYYY-MM-DD or RFC3339).
-    pub from: Option<String>,
-    /// Filter memories created before this date (YYYY-MM-DD or RFC3339).
-    pub to: Option<String>,
-    /// Override query expansion: true=force, false=disable, null=use config default.
-    pub expand: Option<bool>,
-}
+// RecallParams removed — rein_recall migrated to #[op] inventory.
+// See ops/handlers/memory.rs for the new RecallMemoryParams.
 
 /// Parameters for rein_ingest_session tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -242,19 +225,7 @@ pub struct ExportParams {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
-
-    #[test]
-    fn recall_params_accept_numeric_string_limit() {
-        let params: RecallParams = serde_json::from_value(json!({
-            "query": "release history",
-            "limit": "100"
-        }))
-        .unwrap();
-
-        assert_eq!(params.limit, Some(100));
-    }
 
     #[test]
     fn consolidate_params_accept_comma_separated_topics() {
