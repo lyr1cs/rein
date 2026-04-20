@@ -71,8 +71,6 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
-    /// Delete a memory
-    Forget { id: String },
     /// Update a memory
     Update {
         id: String,
@@ -299,7 +297,6 @@ async fn main() -> anyhow::Result<()> {
             limit,
         }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
         Some(Commands::Topics) => commands::handle_topics(&config)?,
-        Some(Commands::Forget { id }) => commands::handle_forget(&config, id)?,
         Some(Commands::Update {
             id,
             content,
