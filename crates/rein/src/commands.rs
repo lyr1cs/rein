@@ -147,29 +147,6 @@ pub async fn handle_ingest(
     Ok(())
 }
 
-pub fn handle_recall(
-    config: &ReinConfig,
-    query: String,
-    topic: Option<String>,
-    keyword: Option<String>,
-    limit: usize,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let results = search::recall::recall(
-        &store,
-        config,
-        &query,
-        topic.as_deref(),
-        keyword.as_deref(),
-        limit,
-    )?;
-    println!(
-        "{}",
-        mcp::compact::format_recall_results(&results, config.server.compact)
-    );
-    Ok(())
-}
-
 // handle_stats / handle_health migrated to #[op] (see ops/handlers/diagnostics.rs).
 // main.rs intercepts those subcommands before Cli::parse() and dispatches through
 // OpsCliEntry inventory.
