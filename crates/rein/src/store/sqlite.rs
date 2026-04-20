@@ -30,6 +30,11 @@ pub struct SqliteStore {
     pub(crate) dims: usize,
     /// Cached Tantivy index — avoids reopening + allocating 15MB IndexWriter per operation.
     tantivy_cache: std::cell::RefCell<Option<super::tantivy_fts::TantivyFts>>,
+    /// v0.22 P1 optional pool reference. When set, recall's background
+    /// channels (Vec / KG) check this out instead of opening a fresh
+    /// `SqliteStore::new(db_path)` per thread — saves ~1-2ms per
+    /// channel per recall (schema init + model check elided).
+    pool: Option<std::sync::Arc<super::pool::ConnPool>>,
 }
 
 pub(crate) const MEMORY_SELECT_COLUMNS: &str = "m.id, m.layer, m.topic, m.summary, m.content, \
@@ -101,6 +106,7 @@ impl SqliteStore {
             db_path: path.to_path_buf(),
             dims,
             tantivy_cache: std::cell::RefCell::new(None),
+            pool: None,
         })
     }
 
@@ -115,6 +121,69 @@ impl SqliteStore {
             db_path: PathBuf::from(":memory:"),
             dims: 3072,
             tantivy_cache: std::cell::RefCell::new(None),
+            pool: None,
+        })
+    }
+
+    /// Build a `SqliteStore` around a pre-opened `Connection` — the v0.22
+    /// pool path. Caller is responsible for having already applied WAL +
+    /// FK pragmas (see `store::pool::open_conn`) and for returning the
+    /// `Connection` to the pool via `into_conn()` after use.
+    ///
+    /// Unlike `new()`, this constructor does **not** call `init_schema` —
+    /// the schema is assumed to exist (the pool opens against an already
+    /// migrated DB). It also does **not** warn on embedding-model change,
+    /// since the pool path targets hot recall where that check would add
+    /// per-request latency. Run `rein doctor` or `rein migrate --reindex`
+    /// if the embedding model changed.
+    pub fn from_conn(conn: Connection, db_path: PathBuf, dims: usize) -> Self {
+        Self {
+            conn,
+            db_path,
+            dims,
+            tantivy_cache: std::cell::RefCell::new(None),
+            pool: None,
+        }
+    }
+
+    /// Extract the underlying `Connection`, consuming the store. Used by
+    /// the pool path to return the conn to the pool after a request
+    /// finishes. The per-store `tantivy_cache` is dropped here, but that
+    /// only releases the cached `Index`/`IndexReader` handle — the
+    /// underlying Tantivy index directory is shared, and no
+    /// `IndexWriter` is held across operations (writers are opened per
+    /// commit and dropped immediately), so concurrent stores see no
+    /// disruption.
+    pub fn into_conn(self) -> Connection {
+        self.conn
+    }
+
+    /// Like `from_conn`, but also runs `init_schema` (idempotent) and
+    /// surfaces a warning if the embedding model recorded on disk no
+    /// longer matches the caller's expected `model`/`dims`. Use this
+    /// when you're constructing a pool-sourced store for a code path
+    /// that must respect the embedding-model-drift diagnostic (e.g. the
+    /// MCP tool entry point). Hot inner recall loops can keep using the
+    /// unchecked `from_conn` for latency reasons.
+    pub fn from_conn_checked(
+        conn: Connection,
+        db_path: PathBuf,
+        model: &str,
+        dims: usize,
+    ) -> ReinResult<Self> {
+        schema::init_schema(&conn, dims)?;
+        if schema::check_embedding_model(&conn, model, dims)? {
+            eprintln!(
+                "rein: WARNING — embedding model changed to '{model}' ({dims}d). \
+                 Existing vectors may be incompatible. Run 'rein migrate --reindex' to rebuild."
+            );
+        }
+        Ok(Self {
+            conn,
+            db_path,
+            dims,
+            tantivy_cache: std::cell::RefCell::new(None),
+            pool: None,
         })
     }
     /// Access the underlying SQLite connection (for direct queries).
@@ -125,6 +194,27 @@ impl SqliteStore {
     /// The path to the database file (or ":memory:" for in-memory databases).
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// Attach a process-level connection pool. When set, `recall`'s
+    /// background channels (Vec / KG) check out from this pool instead
+    /// of opening a fresh `SqliteStore::new(db_path)` per std::thread,
+    /// eliminating the schema-init + model-check overhead per channel
+    /// per recall. Consumes self; returns by value — builder style.
+    ///
+    /// The pool is expected to target the same `db_path` as this store;
+    /// rein does not enforce this. A mismatched pool would serve
+    /// connections for a different database and silently break recall.
+    pub fn with_pool(mut self, pool: std::sync::Arc<super::pool::ConnPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Access the attached pool, if any. Used by recall.rs to decide
+    /// whether to use the v0.22 pool path or fall back to the pre-v0.22
+    /// `std::thread::spawn + SqliteStore::new` path.
+    pub fn pool(&self) -> Option<&std::sync::Arc<super::pool::ConnPool>> {
+        self.pool.as_ref()
     }
 
     pub fn collapse_to_canonicals(
