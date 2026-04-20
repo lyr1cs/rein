@@ -261,29 +261,8 @@ pub struct ExportParams {
     pub format: Option<String>,
 }
 
-/// Parameters for rein_timeline tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TimelineParams {
-    /// Start date (YYYY-MM-DD or RFC3339).
-    pub from: Option<String>,
-    /// End date (YYYY-MM-DD or RFC3339).
-    pub to: Option<String>,
-    /// Maximum entries (default 20).
-    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
-    pub limit: Option<usize>,
-}
-
-/// Parameters for rein_concept_history tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ConceptHistoryParams {
-    /// Memoir containing the concept.
-    pub memoir: String,
-    /// Name of the concept.
-    pub name: String,
-    /// Maximum revisions to return (default 10).
-    #[serde(default, deserialize_with = "deserialize_option_usize_from_string")]
-    pub limit: Option<usize>,
-}
+// TimelineParams + ConceptHistoryParams removed — migrated to #[op] inventory.
+// See ops/handlers/memory.rs for the new definitions.
 
 #[cfg(test)]
 mod tests {
