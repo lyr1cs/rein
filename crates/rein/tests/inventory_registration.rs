@@ -138,7 +138,7 @@ async fn stats_rest_invoke_fn_pointer_returns_json() {
     let entry = inventory::iter::<OpsRestEntry>()
         .find(|e| e.op_name == "stats")
         .expect("stats REST registered");
-    let (status, body) = (entry.invoke)(
+    let (status, body, _content_type) = (entry.invoke)(
         runtime,
         std::collections::HashMap::new(),
         String::new(),
@@ -308,7 +308,7 @@ async fn health_rest_preserves_legacy_top_level_health_key() {
     let entry = inventory::iter::<OpsRestEntry>()
         .find(|e| e.op_name == "health")
         .expect("health REST registered");
-    let (status, body) = (entry.invoke)(
+    let (status, body, _content_type) = (entry.invoke)(
         runtime,
         std::collections::HashMap::new(),
         String::new(),

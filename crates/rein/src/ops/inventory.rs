@@ -112,7 +112,12 @@ pub struct OpsRestEntry {
         path_values: HashMap<&'static str, String>,
         query: String,
         body: Option<Bytes>,
-    ) -> Pin<Box<dyn Future<Output = ReinResult<(hyper::StatusCode, Bytes)>> + Send>>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = ReinResult<(hyper::StatusCode, Bytes, &'static str)>>
+                + Send,
+        >,
+    >,
 }
 
 pub struct OpsMetadata {

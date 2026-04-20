@@ -58,7 +58,7 @@ async fn invoke_rest(op_name: &str, query: &str) -> (hyper::StatusCode, Value) {
     let entry = inventory::iter::<OpsRestEntry>()
         .find(|e| e.op_name == op_name)
         .expect("REST entry registered");
-    let (status, bytes) = (entry.invoke)(
+    let (status, bytes, _content_type) = (entry.invoke)(
         runtime,
         std::collections::HashMap::new(),
         query.to_string(),
