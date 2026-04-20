@@ -1,0 +1,13 @@
+error: #[op] mutating = true with REST POST on '/api/wipe' must set auth = "mutation_marker" (or a stricter policy); public writes bypass REST auth enforcement
+  --> tests/ui/fail_mutating_public_rest.rs:9:5
+   |
+ 9 | /     #[op(
+10 | |         name = "wipe_memories",
+11 | |         category = "maintenance",
+12 | |         description = "destructive op missing mutation_marker",
+...  |
+15 | |         rest(method = "POST", path = "/api/wipe"),
+16 | |     )]
+   | |______^
+   |
+   = note: this error originates in the attribute macro `op` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -17,11 +17,15 @@ use serde_json::Value;
 fn config_for_test() -> (Arc<ReinConfig>, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     (Arc::new(config), tmp)
 }
 
-async fn invoke_cli(op_name: &str, args: &[&str]) -> Value {
+async fn invoke_cli(op_name: &str, args: &[&str]) -> String {
     let (config, _tmp) = config_for_test();
     let runtime = Arc::new(OpsRuntime::for_cli(config));
     let entry = inventory::iter::<OpsCliEntry>()
@@ -30,14 +34,7 @@ async fn invoke_cli(op_name: &str, args: &[&str]) -> Value {
     let matches = (entry.build_clap)()
         .try_get_matches_from(std::iter::once(op_name).chain(args.iter().copied()))
         .expect("parse CLI args");
-    // CLI renders through IntoCliText; we don't parse that back. This helper
-    // just exists so parity tests can confirm the CLI path runs to completion.
-    let _out = (entry.invoke)(runtime, &matches)
-        .await
-        .expect("CLI invoke");
-    // Return an empty object — the real parity check uses the MCP and REST
-    // paths, which emit structured data. CLI path is smoke-checked.
-    Value::Object(Default::default())
+    (entry.invoke)(runtime, &matches).await.expect("CLI invoke")
 }
 
 async fn invoke_mcp(op_name: &str, args: Value) -> Value {
@@ -46,9 +43,7 @@ async fn invoke_mcp(op_name: &str, args: Value) -> Value {
     let entry = inventory::iter::<OpsMcpEntry>()
         .find(|e| e.op_name == op_name)
         .expect("MCP entry registered");
-    let out = (entry.invoke)(runtime, args)
-        .await
-        .expect("MCP invoke");
+    let out = (entry.invoke)(runtime, args).await.expect("MCP invoke");
     serde_json::from_str(&out).expect("MCP output is valid JSON")
 }
 
@@ -105,7 +100,11 @@ async fn stats_parity_mcp_and_rest_emit_identical_fields() {
 
 #[tokio::test]
 async fn stats_parity_cli_dispatch_runs_to_completion() {
-    let _ = invoke_cli("stats", &[]).await;
+    let out = invoke_cli("stats", &[]).await;
+    assert!(
+        out.contains("Memory stats") && out.contains("total:"),
+        "stats CLI output drifted: {out}"
+    );
 }
 
 #[tokio::test]
@@ -143,14 +142,8 @@ async fn health_parity_mcp_and_rest_share_shape() {
 
     // system_health fields must be present on both.
     for required in ["indexes", "queues", "grayzone", "status"] {
-        assert!(
-            mcp_obj.contains_key(required),
-            "MCP missing `{required}`"
-        );
-        assert!(
-            rest_obj.contains_key(required),
-            "REST missing `{required}`"
-        );
+        assert!(mcp_obj.contains_key(required), "MCP missing `{required}`");
+        assert!(rest_obj.contains_key(required), "REST missing `{required}`");
     }
 }
 
@@ -227,7 +220,11 @@ async fn adaptive_status_parity_mcp_and_rest_share_shape() {
 
 #[tokio::test]
 async fn adaptive_status_parity_cli_dispatch_runs_to_completion() {
-    let _ = invoke_cli("adaptive_status", &[]).await;
+    let out = invoke_cli("adaptive_status", &[]).await;
+    assert!(
+        out.contains("learned_alphas") || out.contains("cluster_info"),
+        "adaptive_status CLI output drifted: {out}"
+    );
 }
 
 #[tokio::test]

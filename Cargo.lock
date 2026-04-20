@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "rein-macros"
-version = "0.21.0-dev"
+version = "0.21.0"
 dependencies = [
  "proc-macro2",
  "quote",

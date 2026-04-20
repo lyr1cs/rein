@@ -242,7 +242,15 @@ pub fn load_weights(conn: &rusqlite::Connection) -> RerankWeights {
         + weights.w_keyword
         + weights.w_topic_match
         + weights.w_brevity
-        + weights.w_channel_coverage;
+        + weights.w_channel_coverage
+        + weights.w_canonical_support
+        + weights.w_source_diversity
+        + weights.w_usage_recency
+        + weights.w_connectivity
+        + weights.w_concept_richness
+        + weights.w_tier_score
+        + weights.w_is_current
+        + weights.w_cluster_survival;
     if sum <= 0.0 || sum > 5.0 || sum.is_nan() {
         tracing::warn!("rerank weights sum is {sum:.3} (out of valid range), using defaults");
         return default_weights();

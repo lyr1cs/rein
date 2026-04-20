@@ -758,10 +758,13 @@ impl SqliteStore {
         self.conn.execute_batch("SAVEPOINT record_access")?;
         let result = (|| -> ReinResult<()> {
             let now = Utc::now();
-            self.conn.execute(
-            "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
-            rusqlite::params![now.to_rfc3339(), id],
-        )?;
+            let updated = self.conn.execute(
+                "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
+                rusqlite::params![now.to_rfc3339(), id],
+            )?;
+            if updated == 0 {
+                return Err(ReinError::NotFound(format!("memory {id} not found")));
+            }
 
             let promotion_row: Option<(u32, Option<u32>)> = self
                 .conn

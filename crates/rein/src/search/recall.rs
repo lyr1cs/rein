@@ -882,9 +882,29 @@ pub fn recall_temporal_with_request_id(
         } else {
             vec_norm_log
         };
-    let kg_norm_log: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
-    let episode_norm_log: std::collections::HashMap<String, f32> =
-        episode_ranked.iter().cloned().collect();
+    // Max-normalize KG/episode channels to match the [0,1] scale of fts/vec after
+    // CC normalization. Before v0.21.0 these were raw clones, so the 0.5/0.65
+    // boost weights below were not scale-comparable to the CC output and could
+    // dominate or vanish depending on the raw magnitude of the upstream scorers.
+    let kg_norm_log: std::collections::HashMap<String, f32> = {
+        let map: std::collections::HashMap<String, f32> = kg_ranked.iter().cloned().collect();
+        let max = map.values().copied().fold(0.0f32, f32::max);
+        if max.is_finite() && max > 1.0 {
+            map.into_iter().map(|(id, s)| (id, s / max)).collect()
+        } else {
+            map
+        }
+    };
+    let episode_norm_log: std::collections::HashMap<String, f32> = {
+        let map: std::collections::HashMap<String, f32> =
+            episode_ranked.iter().cloned().collect();
+        let max = map.values().copied().fold(0.0f32, f32::max);
+        if max.is_finite() && max > 1.0 {
+            map.into_iter().map(|(id, s)| (id, s / max)).collect()
+        } else {
+            map
+        }
+    };
 
     let fused = if config.search.fusion_method == "cc" {
         let alpha = adaptive_alpha
@@ -893,25 +913,46 @@ pub fn recall_temporal_with_request_id(
         // Run CC normalization on clean vec/fts channels first, then boost with KG/episode
         let mut fused =
             crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha);
-        // Post-fusion KG/episode boost (applied after normalization to avoid distorting score distributions)
+        // Post-fusion KG/episode boost.
+        //
+        // Invariant: `alpha` controls BM25 weight vs. every other channel. The
+        // KG and episode channels are "every other channel", so their
+        // contribution must vary with alpha to honor route intent
+        // (e.g. ExactKeyword sets alpha=0.85 specifically to suppress non-BM25
+        // channels; an unscaled +0.5 KG-only boost used to override that).
+        //
+        // We use `2 * (1 - alpha)` — NOT `(1 - alpha)` alone — so the
+        // balanced routes (Episodic/Exploratory alpha=0.5) still see the
+        // full base weight: a naive `(1-alpha)` halves the boost at
+        // alpha=0.5 and silently regresses episodic recall ranking. The
+        // `2*` factor anchors the scaling at the pre-existing calibrated
+        // point:
+        //   alpha=0.5 (Episodic, Exploratory) → factor 1.0 (unchanged)
+        //   alpha=0.85 (ExactKeyword)         → factor 0.30 (suppressed)
+        //   alpha=0.70 (Temporal)             → factor 0.60
+        //   alpha=0.40 (Preference)           → factor 1.20
+        //   alpha=0.30 (Semantic)             → factor 1.40
+        // Base weights (0.5 for KG, 0.65 for episode) were calibrated at
+        // alpha=0.5 and still apply there today.
         if use_kg || use_episode {
-            let fused_map: std::collections::HashMap<String, f32> = fused.iter().cloned().collect();
-            for (id, kg_score) in &kg_ranked {
+            let non_bm25_factor = (2.0 * (1.0 - alpha)).max(0.0);
+            let kg_weight = 0.5 * non_bm25_factor;
+            let episode_weight = 0.65 * non_bm25_factor;
+            for (id, kg_score) in kg_norm_log.iter() {
                 if let Some(pos) = fused.iter().position(|(fid, _)| fid == id) {
-                    fused[pos].1 += *kg_score * 0.5;
+                    fused[pos].1 += *kg_score * kg_weight;
                 } else {
-                    fused.push((id.clone(), *kg_score * 0.5));
+                    fused.push((id.clone(), *kg_score * kg_weight));
                 }
             }
-            for (id, episode_score) in &episode_ranked {
+            for (id, episode_score) in episode_norm_log.iter() {
                 if let Some(pos) = fused.iter().position(|(fid, _)| fid == id) {
-                    fused[pos].1 += *episode_score * 0.65;
+                    fused[pos].1 += *episode_score * episode_weight;
                 } else {
-                    fused.push((id.clone(), *episode_score * 0.65));
+                    fused.push((id.clone(), *episode_score * episode_weight));
                 }
             }
-            let _ = fused_map; // consumed above
-                               // Re-sort after boost so boosted items are not stuck at the tail
+            // Re-sort after boost so boosted items are not stuck at the tail.
             fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         }
         fused
@@ -1037,6 +1078,38 @@ pub fn recall_temporal_with_request_id(
         }
     }
 
+    // === M5: Tier filtering — exclude Cold memories unless Exploratory query ===
+    //
+    // Applied **before** the take/limit so Cold memories don't consume top-N
+    // slots. The previous implementation retained() after take(limit * 2),
+    // which meant any Cold memories surfacing in the top 2N (possible under
+    // KG/episode boosts) truncated the result set instead of being replaced
+    // by Warm/Hot candidates that would otherwise make the cut.
+    let include_cold = strategy.query_type == crate::search::classify::QueryType::Exploratory;
+    let mut cold_filtered: usize = 0;
+    let fused: Vec<(String, f32)> = if include_cold {
+        fused
+    } else {
+        fused
+            .into_iter()
+            .filter(|(id, _)| match memory_map.get(id) {
+                Some(mem) => {
+                    let is_cold = mem.tier == crate::store::tiering::MemoryTier::Cold;
+                    if is_cold {
+                        cold_filtered += 1;
+                    }
+                    !is_cold
+                }
+                // Unknown IDs (shouldn't happen in practice) pass through so
+                // the downstream loop's memory_map.remove can no-op cleanly.
+                None => true,
+            })
+            .collect()
+    };
+    if cold_filtered > 0 {
+        tracing::debug!(cold_filtered, "cold tier memories excluded pre-take");
+    }
+
     let has_temporal = time_from.is_some() || time_to.is_some();
     let take_count = if has_temporal { usize::MAX } else { limit * 2 };
     let mut local_results: Vec<(Memory, f32)> = Vec::new();
@@ -1065,17 +1138,6 @@ pub fn recall_temporal_with_request_id(
         }
     }
     local_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // === M5: Tier filtering — exclude Cold memories unless Exploratory query ===
-    let include_cold = strategy.query_type == crate::search::classify::QueryType::Exploratory;
-    if !include_cold {
-        let before = local_results.len();
-        local_results.retain(|(mem, _)| mem.tier != crate::store::tiering::MemoryTier::Cold);
-        let filtered = before - local_results.len();
-        if filtered > 0 {
-            tracing::debug!(filtered, "cold tier memories excluded");
-        }
-    }
 
     // === R2: Multi-feature reranking — overwrite scores so downstream ordering uses rerank ===
     if local_results.len() > 1 {
