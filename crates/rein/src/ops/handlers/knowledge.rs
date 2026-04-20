@@ -171,6 +171,102 @@ impl IntoCliText for MemoirExportOutput {
     }
 }
 
+// ── memoir_inspect ───────────────────────────────────────────────────────────
+
+/// Parameters for the memoir_inspect op (MCP-only under A1).
+///
+/// No REST surface: `/api/memoirs/{name}/inspect/{concept}` needs two path
+/// parameters and the path-template framework currently caps at one (spec
+/// §Q2). That endpoint continues to be served by the derived handler at
+/// `mcp/rest.rs::handle_memoir_path` and is registered in
+/// `registry::REST_OPERATIONS` to keep drift checks accurate.
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct MemoirInspectParams {
+    /// Name of the memoir.
+    pub memoir: String,
+    /// Name of the concept to inspect.
+    pub name: String,
+    /// BFS depth (default 1, max 5).
+    #[serde(default)]
+    pub depth: Option<usize>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct MemoirInspectOutput {
+    pub center: crate::types::Concept,
+    pub neighbors: Vec<crate::types::Concept>,
+    pub links: Vec<crate::types::ConceptLink>,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for MemoirInspectOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "center": self.center,
+            "neighbors": self.neighbors,
+            "links": self.links,
+        })
+    }
+}
+
+impl IntoMarkdown for MemoirInspectOutput {
+    fn to_markdown(&self) -> String {
+        let mut text = String::new();
+        if self.compact {
+            text.push_str(&format!(
+                "center:{}:c{:.1}:r{}\n",
+                self.center.name, self.center.confidence, self.center.revision
+            ));
+            for n in &self.neighbors {
+                text.push_str(&format!(
+                    "neighbor:{}:c{:.1}:r{}\n",
+                    n.name, n.confidence, n.revision
+                ));
+            }
+            for l in &self.links {
+                text.push_str(&format!(
+                    "link:{}->{}:{}\n",
+                    l.source_id, l.target_id, l.relation
+                ));
+            }
+        } else {
+            text.push_str(&format!(
+                "Center: {} (conf:{:.1}, rev:{})\n  {}\n\n",
+                self.center.name,
+                self.center.confidence,
+                self.center.revision,
+                self.center.definition
+            ));
+            if !self.neighbors.is_empty() {
+                text.push_str("Neighbors:\n");
+                for n in &self.neighbors {
+                    text.push_str(&format!(
+                        "  - {} (conf:{:.1}, rev:{}) — {}\n",
+                        n.name, n.confidence, n.revision, n.definition
+                    ));
+                }
+            }
+            if !self.links.is_empty() {
+                text.push_str("\nLinks:\n");
+                for l in &self.links {
+                    text.push_str(&format!(
+                        "  {} --{}-> {}\n",
+                        l.source_id, l.relation, l.target_id
+                    ));
+                }
+            }
+        }
+        text
+    }
+}
+
+impl IntoCliText for MemoirInspectOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
 impl OpsRuntime {
     #[op(
         name = "memoir_list",
@@ -211,6 +307,31 @@ impl OpsRuntime {
                 memoir,
                 ascii,
                 json_value,
+                compact,
+            })
+        })
+    }
+
+    #[op(
+        name = "memoir_inspect",
+        category = "knowledge",
+        description = "Inspect a concept's neighborhood via BFS traversal. Returns the concept, its neighbors, and connecting links up to the specified depth.",
+        mcp(name = "rein_memoir_inspect"),
+    )]
+    pub fn memoir_inspect(
+        &self,
+        params: MemoirInspectParams,
+    ) -> ReinResult<MemoirInspectOutput> {
+        let compact = self.compact();
+        let depth = params.depth.unwrap_or(1).min(5);
+        let memoir = params.memoir.clone();
+        let name = params.name.clone();
+        self.with_store(|store| {
+            let (center, neighbors, links) = store.inspect_concept(&memoir, &name, depth)?;
+            Ok(MemoirInspectOutput {
+                center,
+                neighbors,
+                links,
                 compact,
             })
         })
