@@ -448,7 +448,15 @@ pub fn recall_temporal_with_request_id(
         );
         VecSearchState::Sync(results)
     } else if !fast && !strong_signal {
-        // Cache miss + normal mode + no strong FTS signal: background thread overlaps with KG
+        // Cache miss + normal mode + no strong FTS signal: background thread overlaps with KG.
+        //
+        // v0.22 P1 pool path: if the store has a pool attached AND we are
+        // executing inside a Tokio runtime, check out a conn from the pool
+        // instead of opening a fresh `SqliteStore::new(db_path)`. This
+        // elides the per-channel schema init (~1-2ms) and the embedding-
+        // model check. Falls back to the pre-v0.22 `SqliteStore::new` path
+        // when either condition is not met, so existing callers without a
+        // pool keep working exactly as before (serial fallback per I4).
         let vec_db_path = store.db_path().to_path_buf();
         let vec_config = config.clone();
         let vec_query_str = query.to_string();
@@ -456,7 +464,38 @@ pub fn recall_temporal_with_request_id(
         let vec_model = config.embedding_model();
         let vec_dims = config.embedding.dimensions;
         let vec_limit = effective_limit;
+        let vec_pool = store.pool().cloned();
+        let vec_rt_handle = tokio::runtime::Handle::try_current().ok();
         VecSearchState::Thread(std::thread::spawn(move || {
+            // Pool path: checkout a conn, wrap in from_conn (no schema
+            // init), run the search, return the conn. The pool.get()
+            // future is driven via block_on on this std thread — we are
+            // not a tokio worker, so this doesn't block the runtime.
+            if let (Some(pool), Some(handle)) = (vec_pool.as_ref(), vec_rt_handle.as_ref()) {
+                match handle.block_on(pool.get()) {
+                    Ok(guard) => {
+                        let (conn, detached) = guard.detach();
+                        let s = SqliteStore::from_conn(conn, vec_db_path.clone(), vec_dims);
+                        let result = try_vector_search(
+                            &s,
+                            &vec_config,
+                            &vec_query_str,
+                            vec_topic_str.as_deref(),
+                            vec_limit,
+                        );
+                        let conn_back = s.into_conn();
+                        detached.put_back(conn_back);
+                        return result;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "vec channel pool checkout failed; falling back to SqliteStore::new"
+                        );
+                    }
+                }
+            }
+            // Fallback: the pre-v0.22 path. Unchanged behavior.
             let Ok(s) = SqliteStore::new(&vec_db_path, &vec_model, vec_dims) else {
                 return vec![];
             };
