@@ -5,6 +5,7 @@
 
 pub mod adaptive;
 pub mod diagnostics;
+pub mod knowledge;
 pub mod maintenance;
 pub mod memory;
 pub mod session;
