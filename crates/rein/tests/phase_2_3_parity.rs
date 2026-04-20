@@ -2106,3 +2106,82 @@ async fn cleanup_empty_scope_signals_no_match() {
         "N2: cleanup with matching pattern must have matched=true; got: {pattern_match_json}"
     );
 }
+
+// ── L1: --asynchronous compatibility alias ────────────────────────────────────
+
+/// L1: `rein cleanup --asynchronous` clap flag parses correctly.
+///
+/// `CleanupParams` derives `Args`, not `Parser`, so we wrap it in a local
+/// `Parser` to drive `try_parse_from`.
+#[test]
+fn cleanup_asynchronous_flag_parses_from_clap() {
+    use clap::Parser as _;
+    use rein::ops::handlers::maintenance::CleanupParams;
+
+    #[derive(clap::Parser)]
+    struct W {
+        #[command(flatten)]
+        p: CleanupParams,
+    }
+
+    // Flag alone
+    let w = W::try_parse_from(["rein", "--asynchronous"]).expect("--asynchronous must parse");
+    assert!(w.p.asynchronous, "--asynchronous should be true");
+    assert!(!w.p.dry_run, "dry_run should default to false");
+
+    // Flag combined with --dry-run
+    let w2 = W::try_parse_from(["rein", "--asynchronous", "--dry-run"])
+        .expect("--asynchronous --dry-run must parse");
+    assert!(w2.p.asynchronous, "--asynchronous should be true");
+    assert!(w2.p.dry_run, "--dry-run should be true");
+
+    // Without the flag, asynchronous is false
+    let w3 = W::try_parse_from(["rein"]).expect("no flags must parse");
+    assert!(!w3.p.asynchronous, "asynchronous must default to false");
+}
+
+/// L1: calling `cleanup` with `asynchronous=true` returns `queued=true` and
+/// zero consolidation counts, and emits the deprecation warning to stderr.
+///
+/// `spawn_cleanup_worker` is short-circuited by setting `REIN_CLEANUP_WORKER=1`
+/// in the environment so it does not attempt to spawn any child processes.
+#[test]
+fn cleanup_asynchronous_alias_queues_via_worker() {
+    use std::sync::Arc;
+    use rein::config::ReinConfig;
+    use rein::ops::OpsRuntime;
+    use rein::ops::handlers::maintenance::CleanupParams;
+
+    // Prevent spawn_cleanup_worker from actually forking a process.
+    std::env::set_var("REIN_CLEANUP_WORKER", "1");
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = ReinConfig::default();
+    // database.path inside the tempdir → resolve_buffer_dir returns tmp.path()
+    // so queue_cleanup_job writes its JSONL file there rather than ~/.rein.
+    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    let cfg = Arc::new(config);
+    let rt = OpsRuntime::for_cli(cfg);
+
+    let params = CleanupParams {
+        asynchronous: true,
+        dry_run: true,
+        ..Default::default()
+    };
+
+    let output = rt.cleanup(params).expect("cleanup with asynchronous=true must not error");
+
+    assert!(output.queued, "L1: queued must be true when --asynchronous is set");
+    assert_eq!(output.groups_consolidated, 0, "L1: groups_consolidated must be 0 (async path)");
+    assert_eq!(output.memories_consolidated, 0, "L1: memories_consolidated must be 0 (async path)");
+    assert_eq!(output.duplicates_found, 0, "L1: duplicates_found must be 0 (async path)");
+
+    // CLI render must short-circuit with the queued message, not a consolidation
+    // report or no-match signal.
+    use rein::ops::IntoCliText;
+    let cli_text = output.to_cli_text();
+    assert!(
+        cli_text.contains("Queued cleanup job"),
+        "L1: CLI text must contain 'Queued cleanup job'; got: {cli_text}"
+    );
+}

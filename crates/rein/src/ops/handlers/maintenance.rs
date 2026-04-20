@@ -1280,6 +1280,12 @@ pub struct CleanupParams {
     #[serde(default)]
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Deprecated: queue cleanup as a background job via the worker queue.
+    /// Use `rein worker cleanup` instead. Hidden to avoid advertising in `--help`.
+    #[serde(default)]
+    #[arg(long = "asynchronous", hide = true)]
+    pub asynchronous: bool,
 }
 
 /// Per-group detail line in the cleanup consolidation output.
@@ -1310,6 +1316,11 @@ pub struct CleanupOutput {
     pub duplicates_merged: u32,
     /// Echoes the dry_run flag.
     pub dry_run: bool,
+    /// `true` when the job was queued via the async worker path
+    /// (i.e. `--asynchronous` was set). When true, consolidation counts are
+    /// all zero — the actual work happens asynchronously in the worker.
+    #[serde(default)]
+    pub queued: bool,
     /// The single topic selector, if provided, carried through for rendering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
@@ -1328,6 +1339,12 @@ impl IntoJson for CleanupOutput {
 
 impl IntoMarkdown for CleanupOutput {
     fn to_markdown(&self) -> String {
+        // When the job was queued asynchronously, short-circuit before the
+        // matched/count checks — the consolidation counts are all zero and
+        // don't represent actual work.
+        if self.queued {
+            return "Queued cleanup job (async); use 'rein worker cleanup' to run inline".to_string();
+        }
         // Mirrors the pre-A1 `rein_cleanup` MCP non-compact output so MCP
         // callers that parse the string continue to work.
         // N2: when the requested scope resolved to zero topics (matched=false),
@@ -1386,6 +1403,12 @@ impl IntoMarkdown for CleanupOutput {
 
 impl IntoCliText for CleanupOutput {
     fn to_cli_text(&self) -> String {
+        // When the job was queued asynchronously, short-circuit before the
+        // matched/count checks — the consolidation counts are all zero and
+        // don't represent actual work.
+        if self.queued {
+            return "Queued cleanup job (async); use 'rein worker cleanup' to run inline".to_string();
+        }
         // Mirrors the pre-A1 `print_cleanup_report` CLI output verbatim so
         // shell scripts that parse it continue to work.
         // N2: when the requested scope resolved to zero topics (matched=false),
@@ -1428,6 +1451,38 @@ impl OpsRuntime {
         auth = "mutation_marker",
     )]
     pub fn cleanup(&self, params: CleanupParams) -> ReinResult<CleanupOutput> {
+        // Handle deprecated --asynchronous flag: queue via the worker queue
+        // instead of running inline. Emit a deprecation warning to stderr so
+        // it doesn't pollute scripted stdout output.
+        if params.asynchronous {
+            eprintln!(
+                "warning: --asynchronous is deprecated; use 'rein worker cleanup' instead"
+            );
+            crate::extract::hooks::queue::queue_cleanup_job(
+                &self.config,
+                params.topic.clone(),
+                params.topics.clone().unwrap_or_default(),
+                params.pattern.clone(),
+                params.all,
+                params.exact_topics,
+                params.dry_run,
+            )
+            .map_err(|e| ReinError::Config(format!("failed to queue cleanup job: {e}")))?;
+            crate::extract::hooks::queue::spawn_cleanup_worker(&self.config);
+            return Ok(CleanupOutput {
+                matched: true,
+                groups_consolidated: 0,
+                memories_consolidated: 0,
+                duplicates_found: 0,
+                duplicates_merged: 0,
+                dry_run: params.dry_run,
+                queued: true,
+                topic: params.topic.clone(),
+                pattern: params.pattern.clone(),
+                groups: vec![],
+            });
+        }
+
         self.set_dry_run(params.dry_run);
         let dry_run = self.dry_run();
         let merge_variants = !params.exact_topics;
@@ -1461,6 +1516,7 @@ impl OpsRuntime {
                     duplicates_found: 0,
                     duplicates_merged: 0,
                     dry_run,
+                    queued: false,
                     topic: topic.clone(),
                     pattern: pattern.clone(),
                     groups: vec![],
@@ -1489,6 +1545,7 @@ impl OpsRuntime {
                 duplicates_found: report.duplicates_found,
                 duplicates_merged: report.duplicates_merged,
                 dry_run,
+                queued: false,
                 topic: topic.clone(),
                 pattern: pattern.clone(),
                 groups: details,
