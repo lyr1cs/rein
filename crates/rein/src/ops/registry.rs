@@ -131,6 +131,7 @@ pub const REST_OPERATIONS: &[Operation] = &[
     op!(Rest, "knowledge", "POST /api/organize"),
     op!(Rest, "knowledge", "POST /api/consolidate"),
     op!(Rest, "maintenance", "POST /api/cleanup"),
+    op!(Rest, "adaptive", "POST /api/feedback"),
 ];
 
 pub const ALL_OPERATIONS: &[Operation] = &[
@@ -230,6 +231,7 @@ pub const ALL_OPERATIONS: &[Operation] = &[
     REST_OPERATIONS[29],
     REST_OPERATIONS[30],
     REST_OPERATIONS[31],
+    REST_OPERATIONS[32],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -303,13 +305,14 @@ mod tests {
         // Phase 2.3: POST /api/organize added (organize op migrated to #[op] inventory).
         // Phase 2.3: POST /api/consolidate added (consolidate op migrated to #[op] inventory).
         // Phase 2.3: POST /api/cleanup added (cleanup op migrated to #[op] inventory).
-        assert_eq!(rest_operations().len(), 32);
+        // Phase 2.4: POST /api/feedback added (feedback op migrated to #[op] inventory).
+        assert_eq!(rest_operations().len(), 33);
         assert_eq!(
             counts(),
             OperationCounts {
                 cli: 33,
                 mcp: 31,
-                rest: 32
+                rest: 33
             }
         );
     }
