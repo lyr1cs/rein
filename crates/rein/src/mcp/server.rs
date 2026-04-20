@@ -311,27 +311,6 @@ impl ReinServer {
         }
     }
 
-    /// List all topics in the memory store.
-    #[tool(name = "rein_list_topics", description = "List all memory topics.")]
-    fn rein_list_topics(&self) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-
-        let result = self.with_store(|store| store.list_topics());
-
-        match result {
-            Ok(topics) => {
-                let mut text = compact::format_topics(&topics, self.compact());
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
-
     // rein_stats + rein_health migrated to #[op] (see ops/handlers/diagnostics.rs).
     // Dispatch is handled by the custom impl ServerHandler below, which checks
     // the OpsMcpEntry inventory before delegating to tool_router for legacy tools.
@@ -749,55 +728,7 @@ impl ReinServer {
     // rein_cleanup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // POST /api/cleanup REST surface added. auth = "mutation_marker".
 
-    /// Show the most recently created memories.
-    #[tool(
-        name = "rein_recent",
-        description = "List the most recently created memories, ordered by creation time."
-    )]
-    fn rein_recent(&self, Parameters(params): Parameters<RecentParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let limit = params.limit.unwrap_or(10).min(100);
-        let compact = self.compact();
-
-        let result = self.with_store(|store| store.recent(limit));
-
-        match result {
-            Ok(memories) => {
-                if memories.is_empty() {
-                    return "No memories found.".to_string();
-                }
-                let mut text = if compact {
-                    memories
-                        .iter()
-                        .map(|m| format!("[{}] {}", m.topic, m.summary))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    memories
-                        .iter()
-                        .map(|m| {
-                            let age = chrono::Utc::now().signed_duration_since(m.created_at);
-                            let age_str = if age.num_days() > 0 {
-                                format!("{}d ago", age.num_days())
-                            } else if age.num_hours() > 0 {
-                                format!("{}h ago", age.num_hours())
-                            } else {
-                                format!("{}m ago", age.num_minutes())
-                            };
-                            format!(
-                                "[{}] {} ({}, {}, str:{:.2})\n  id: {}",
-                                m.topic, m.summary, m.importance, age_str, m.strength, m.id
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    // rein_recent migrated to #[op] inventory (see ops/handlers/memory.rs).
 
     // rein_organize migrated to #[op] inventory (see ops/handlers/maintenance.rs).
 

@@ -52,6 +52,106 @@ impl IntoCliText for ForgetOutput {
     }
 }
 
+// ── list_topics ─────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct ListTopicsParams {}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ListTopicsOutput {
+    pub topics: Vec<String>,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for ListTopicsOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "topics": self.topics })
+    }
+}
+
+impl IntoMarkdown for ListTopicsOutput {
+    fn to_markdown(&self) -> String {
+        crate::mcp::compact::format_topics(&self.topics, self.compact)
+    }
+}
+
+impl IntoCliText for ListTopicsOutput {
+    fn to_cli_text(&self) -> String {
+        crate::mcp::compact::format_topics(&self.topics, self.compact)
+    }
+}
+
+// ── recent ──────────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct RecentParams {
+    /// Maximum number of recent memories to return (default 10, max 100).
+    #[arg(short, long, default_value = "10")]
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct RecentOutput {
+    pub memories: Vec<crate::types::Memory>,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for RecentOutput {
+    fn to_json(&self) -> serde_json::Value {
+        let items: Vec<serde_json::Value> =
+            self.memories.iter().map(memory_to_json_internal).collect();
+        json!({ "memories": items })
+    }
+}
+
+fn format_recent_line(m: &crate::types::Memory, compact: bool) -> String {
+    if compact {
+        format!("[{}] {}", m.topic, m.summary)
+    } else {
+        let age = chrono::Utc::now().signed_duration_since(m.created_at);
+        let age_str = if age.num_days() > 0 {
+            format!("{}d ago", age.num_days())
+        } else if age.num_hours() > 0 {
+            format!("{}h ago", age.num_hours())
+        } else {
+            format!("{}m ago", age.num_minutes())
+        };
+        format!(
+            "[{}] {} ({}, {}, str:{:.2})\n  id: {}",
+            m.topic, m.summary, m.importance, age_str, m.strength, m.id
+        )
+    }
+}
+
+impl IntoMarkdown for RecentOutput {
+    fn to_markdown(&self) -> String {
+        if self.memories.is_empty() {
+            return "No memories found.".to_string();
+        }
+        self.memories
+            .iter()
+            .map(|m| format_recent_line(m, self.compact))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl IntoCliText for RecentOutput {
+    fn to_cli_text(&self) -> String {
+        if self.memories.is_empty() {
+            return "No memories found.".to_string();
+        }
+        self.memories
+            .iter()
+            .map(|m| format_recent_line(m, self.compact))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 // ── get_memory ──────────────────────────────────────────────────────────────
 
 #[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
@@ -149,6 +249,39 @@ impl OpsRuntime {
                 obj.insert("evidence".to_string(), json!(evidence));
             }
             Ok(GetMemoryOutput(body))
+        })
+    }
+
+    #[op(
+        name = "list_topics",
+        category = "memory",
+        description = "List all unique topics across stored memories.",
+        cli(name = "topics"),
+        mcp(name = "rein_list_topics"),
+        rest(method = "GET", path = "/api/topics"),
+    )]
+    pub fn list_topics(&self, _params: ListTopicsParams) -> ReinResult<ListTopicsOutput> {
+        let compact = self.compact();
+        self.with_store(|store| {
+            let topics = store.list_topics()?;
+            Ok(ListTopicsOutput { topics, compact })
+        })
+    }
+
+    #[op(
+        name = "recent",
+        category = "memory",
+        description = "Show the most recently created memories ordered by creation time.",
+        cli(name = "recent"),
+        mcp(name = "rein_recent"),
+        rest(method = "GET", path = "/api/recent"),
+    )]
+    pub fn recent(&self, params: RecentParams) -> ReinResult<RecentOutput> {
+        let limit = params.limit.unwrap_or(10).clamp(1, 100);
+        let compact = self.compact();
+        self.with_store(|store| {
+            let memories = store.recent(limit)?;
+            Ok(RecentOutput { memories, compact })
         })
     }
 
