@@ -683,17 +683,35 @@ fn emit_rest_block(
         ) -> ::std::pin::Pin<
             ::std::boxed::Box<
                 dyn ::std::future::Future<
-                    Output = ::rein::types::ReinResult<(::hyper::StatusCode, ::bytes::Bytes)>,
+                    Output = ::rein::types::ReinResult<(
+                        ::hyper::StatusCode,
+                        ::bytes::Bytes,
+                        &'static str,
+                    )>,
                 > + ::std::marker::Send,
             >,
         > {
             ::std::boxed::Box::pin(async move {
                 #prep
                 let out = #call_expr?;
-                let bytes = ::serde_json::to_vec(&out)?;
+                // Phase 3: ops can opt into a raw (non-JSON) body + custom
+                // content-type by overriding `IntoJson::to_raw_response`.
+                // Default impl returns `None`, preserving the pre-Phase-3
+                // JSON contract for every other op.
+                let (bytes, content_type) =
+                    match ::rein::ops::IntoJson::to_raw_response(&out) {
+                        ::std::option::Option::Some((ct, raw)) => {
+                            (::bytes::Bytes::from(raw), ct)
+                        }
+                        ::std::option::Option::None => {
+                            let json_bytes = ::serde_json::to_vec(&out)?;
+                            (::bytes::Bytes::from(json_bytes), "application/json")
+                        }
+                    };
                 ::std::result::Result::Ok((
                     ::hyper::StatusCode::OK,
-                    ::bytes::Bytes::from(bytes),
+                    bytes,
+                    content_type,
                 ))
             })
         }

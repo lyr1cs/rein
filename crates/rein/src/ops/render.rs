@@ -9,6 +9,16 @@ use serde_json::Value;
 
 pub trait IntoJson {
     fn to_json(&self) -> Value;
+
+    /// Override to emit a raw body with a specific content-type instead of
+    /// serializing `to_json()` as `application/json`. The REST dispatcher
+    /// checks this hook first; returning `None` (the default) keeps the
+    /// usual JSON contract. Phase 3 added this so ops like `memoir_export`
+    /// can serve `text/plain` ascii/dot graph bodies from inventory
+    /// without a dispatcher-side op-name guard.
+    fn to_raw_response(&self) -> Option<(&'static str, Vec<u8>)> {
+        None
+    }
 }
 
 pub trait IntoMarkdown {

@@ -35,6 +35,12 @@ pub struct ForgetOutput {
     pub deleted: bool,
 }
 
+impl IntoJson for ForgetOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "id": self.id, "deleted": self.deleted })
+    }
+}
+
 impl IntoMarkdown for ForgetOutput {
     fn to_markdown(&self) -> String {
         // Compact contract: matches the pre-A1 legacy MCP compact branch

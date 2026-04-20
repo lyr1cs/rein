@@ -152,13 +152,23 @@ pub struct MemoirExportOutput {
 
 impl IntoJson for MemoirExportOutput {
     fn to_json(&self) -> serde_json::Value {
-        if self.format == "json" {
-            // Legacy REST parsed the string as JSON and returned that directly;
-            // fall back to a wrapped string on parse failure.
-            serde_json::from_str::<serde_json::Value>(&self.output)
-                .unwrap_or_else(|_| json!({ "raw": self.output }))
-        } else {
-            json!({ "format": self.format, "output": self.output })
+        // Only reached for format=json — REST dispatcher uses to_raw_response
+        // first for ascii/dot, and MCP uses IntoMarkdown (raw string). Fall
+        // back to a wrapped string if the stored export isn't parseable JSON
+        // (mirrors legacy `api_memoir_show` tolerance).
+        serde_json::from_str::<serde_json::Value>(&self.output)
+            .unwrap_or_else(|_| json!({ "raw": self.output }))
+    }
+
+    fn to_raw_response(&self) -> Option<(&'static str, Vec<u8>)> {
+        // Pre-A1 contract: text/plain for ascii/dot, application/json for
+        // json. Phase 3 eliminated the F1 dispatcher hack (op_name guard)
+        // by pushing the content-type decision into the op itself.
+        match self.format.as_str() {
+            "ascii" | "dot" => {
+                Some(("text/plain", self.output.as_bytes().to_vec()))
+            }
+            _ => None,
         }
     }
 }
@@ -925,16 +935,37 @@ mod tests {
     }
 
     #[test]
-    fn memoir_export_output_non_json_format_wraps_in_envelope() {
+    fn memoir_export_output_ascii_uses_raw_response_text_plain() {
         let out = MemoirExportOutput {
             format: "ascii".to_string(),
             output: "=== Memoir: x ===\n".to_string(),
         };
-        let value = out.to_json();
-        assert_eq!(value.get("format").and_then(|v| v.as_str()), Some("ascii"));
-        assert_eq!(
-            value.get("output").and_then(|v| v.as_str()),
-            Some("=== Memoir: x ===\n")
-        );
+        let (content_type, body) = out
+            .to_raw_response()
+            .expect("ascii should opt into raw response path");
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "=== Memoir: x ===\n");
+    }
+
+    #[test]
+    fn memoir_export_output_dot_uses_raw_response_text_plain() {
+        let out = MemoirExportOutput {
+            format: "dot".to_string(),
+            output: "digraph x { }\n".to_string(),
+        };
+        let (content_type, body) = out
+            .to_raw_response()
+            .expect("dot should opt into raw response path");
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "digraph x { }\n");
+    }
+
+    #[test]
+    fn memoir_export_output_json_stays_on_jsonpath() {
+        let out = MemoirExportOutput {
+            format: "json".to_string(),
+            output: r#"{"memoir": {"name": "x"}}"#.to_string(),
+        };
+        assert!(out.to_raw_response().is_none(), "json must go through IntoJson::to_json");
     }
 }
