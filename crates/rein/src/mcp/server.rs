@@ -261,55 +261,6 @@ impl ReinServer {
     // Dispatch flows through the OpsMcpEntry inventory; legacy tool_router
     // delegation below is still used for tools that haven't migrated yet.
 
-    /// Update an existing memory by ID.
-    #[tool(
-        name = "rein_update",
-        description = "Update the content of an existing memory by its ID."
-    )]
-    fn rein_update(&self, Parameters(params): Parameters<UpdateParams>) -> String {
-        // Don't count update as non-store (it's a mutation, not a read)
-        self.non_store_count.store(0, Ordering::Relaxed);
-
-        let base_lambda = self.config.decay.base_lambda;
-        let compact = self.compact();
-        let id = params.id.clone();
-
-        let result = self.with_store(|store| {
-            let mut memory = store.get(&params.id)?;
-            memory.content = params.content.clone();
-            memory.summary = params
-                .content
-                .chars()
-                .take(crate::types::SUMMARY_MAX_CHARS)
-                .collect();
-            if let Some(ref imp_str) = params.importance {
-                if let Ok(imp) = imp_str.parse::<Importance>() {
-                    memory.importance = imp;
-                    memory.layer = imp.auto_layer();
-                    memory.decay_lambda = base_lambda * imp.decay_factor();
-                }
-            }
-            memory.updated_at = chrono::Utc::now();
-            store.update(&memory)
-        });
-
-        match result {
-            Ok(()) => {
-                let mut text = if compact {
-                    format!("ok:{id}")
-                } else {
-                    format!("Updated memory: {id}")
-                };
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error updating: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
 
     // rein_stats + rein_health migrated to #[op] (see ops/handlers/diagnostics.rs).
     // Dispatch is handled by the custom impl ServerHandler below, which checks
