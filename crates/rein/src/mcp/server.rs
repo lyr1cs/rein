@@ -1,8 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
 
@@ -12,10 +9,12 @@ use crate::config::ReinConfig;
 /// a single Mutex<SqliteStore>. This eliminates the Mutex bottleneck and enables
 /// concurrent read operations. SQLite with WAL mode + FULL_MUTEX handles write
 /// serialization internally.
+///
+/// Post-Phase-3: every MCP tool is served through `OpsMcpEntry` inventory. The
+/// old `#[tool_router]` scaffolding, the `non_store_count` / nudge-banner
+/// counter, and the `tool_router` fallback in `call_tool` have been removed.
 pub struct ReinServer {
     config: ReinConfig,
-    non_store_count: AtomicU32,
-    tool_router: ToolRouter<Self>,
 }
 
 impl std::fmt::Debug for ReinServer {
@@ -32,11 +31,7 @@ impl ReinServer {
     /// Stores the config so each request can open its own connection via
     /// `config.open_store()`, eliminating the Mutex bottleneck.
     pub fn new(config: ReinConfig) -> Self {
-        Self {
-            config,
-            non_store_count: AtomicU32::new(0),
-            tool_router: Self::tool_router(),
-        }
+        Self { config }
     }
 
     fn compact(&self) -> bool {
@@ -44,9 +39,8 @@ impl ReinServer {
     }
 
     /// Dispatch an inventory-registered op by MCP tool name without requiring
-    /// a `RequestContext`. Applies the same counter policy and nudge-skip logic
-    /// as `call_tool`. Used by regression tests that cannot construct a full
-    /// rmcp `RequestContext`.
+    /// a `RequestContext`. Used by regression tests that cannot construct a
+    /// full rmcp `RequestContext`.
     #[cfg(test)]
     pub async fn dispatch_inventory(
         &self,
@@ -55,25 +49,11 @@ impl ReinServer {
     ) -> Option<Result<String, String>> {
         let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
             .find(|e| e.mcp_name == tool_name)?;
-
-        if entry.mutating {
-            self.non_store_count.store(0, Ordering::Relaxed);
-        } else {
-            self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        }
-
         let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
             std::sync::Arc::new(self.config.clone()),
         ));
-        // M1: mirror compact flag so test-path dispatch honours compact rendering.
         runtime.set_compact(self.compact());
         Some((entry.invoke)(runtime, args).await.map_err(|e| e.to_string()))
-    }
-
-    /// Read the current non-store counter value. Used by regression tests.
-    #[cfg(test)]
-    pub fn non_store_count(&self) -> u32 {
-        self.non_store_count.load(Ordering::Relaxed)
     }
 }
 
@@ -115,52 +95,6 @@ fn request_has_valid_http_auth(headers: &hyper::HeaderMap, expected: &str) -> bo
         .unwrap_or(false)
 }
 
-#[tool_router]
-impl ReinServer {
-
-    // rein_ingest_session migrated to #[op] (see ops/handlers/session.rs).
-    // Dispatch flows through the OpsMcpEntry inventory; legacy tool_router
-    // delegation below is still used for tools that haven't migrated yet.
-
-
-    // rein_stats + rein_health migrated to #[op] (see ops/handlers/diagnostics.rs).
-    // Dispatch is handled by the custom impl ServerHandler below, which checks
-    // the OpsMcpEntry inventory before delegating to tool_router for legacy tools.
-
-    // rein_consolidate migrated to #[op] inventory (see ops/handlers/maintenance.rs).
-    // Dispatch is handled by the custom impl ServerHandler below, which checks
-    // the OpsMcpEntry inventory before delegating to tool_router for legacy tools.
-
-    // ===== Knowledge Graph (Memoir/Concept/Link) tools =====
-    //
-    // The full memoir family migrated to #[op] inventory in Phase 2.6
-    // (see ops/handlers/knowledge.rs). rein_memoir_inspect's REST endpoint
-    // /api/memoirs/{name}/inspect/{concept} stays derived (two path params;
-    // spec §Q2 pending double-seg support). rein_memoir_search /
-    // rein_memoir_search_all / rein_memoir_create / rein_memoir_add_concept /
-    // rein_memoir_refine / rein_memoir_link are MCP-only — pre-A1 had no
-    // REST surface for these ops and Phase 2.6 doesn't add one.
-
-    // rein_memoir_inspect migrated to #[op] inventory (see ops/handlers/knowledge.rs).
-    // REST surface stays derived in mcp/rest.rs::handle_memoir_path because the
-    // path /api/memoirs/{name}/inspect/{concept} needs two path params (spec §Q2).
-
-    // rein_dedup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
-    // POST /api/dedup REST surface added. auth = "mutation_marker".
-
-    // rein_cleanup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
-    // POST /api/cleanup REST surface added. auth = "mutation_marker".
-
-    // rein_recent migrated to #[op] inventory (see ops/handlers/memory.rs).
-
-    // rein_organize migrated to #[op] inventory (see ops/handlers/maintenance.rs).
-
-    // rein_timeline migrated to #[op] inventory (see ops/handlers/memory.rs).
-    // Note: derived REST /api/timeline remains — JSON shape differs; Phase 3 cleanup.
-
-    // rein_concept_history migrated to #[op] inventory (see ops/handlers/memory.rs).
-}
-
 impl ServerHandler for ReinServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -172,10 +106,9 @@ impl ServerHandler for ReinServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        let mut tools = self.tool_router.list_all();
-        for entry in inventory::iter::<crate::ops::OpsMcpEntry>() {
-            tools.push(inventory_entry_to_tool(entry));
-        }
+        let mut tools: Vec<rmcp::model::Tool> = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .map(inventory_entry_to_tool)
+            .collect();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rmcp::model::ListToolsResult {
             tools,
@@ -187,58 +120,41 @@ impl ServerHandler for ReinServer {
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let tool_name = request.name.as_ref();
-
-        // Inventory-dispatched (migrated #[op]) tools: apply mutating-aware
-        // counter policy and return structured JSON without the nudge banner.
-        // Legacy #[tool] handlers manage non_store_count themselves; they also
-        // append the nudge via maybe_nudge at the end of their own return string.
-        // Concatenating the banner to a serialized JSON payload (inventory path)
-        // would produce invalid JSON — so the nudge is intentionally skipped here.
-        if let Some(entry) = inventory::iter::<crate::ops::OpsMcpEntry>()
-            .find(|e| e.mcp_name == tool_name)
-        {
-            // Mutating ops reset the counter (write); read-ish ops increment it.
-            if entry.mutating {
-                self.non_store_count.store(0, Ordering::Relaxed);
-            } else {
-                self.non_store_count.fetch_add(1, Ordering::Relaxed);
-            }
-
-            let args_value = request
-                .arguments
-                .clone()
-                .map(serde_json::Value::Object)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-            let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
-                std::sync::Arc::new(self.config.clone()),
-            ));
-            // M1: propagate the server-level compact flag so the macro-emitted
-            // MCP output branch renders IntoMarkdown when compact is set.
-            runtime.set_compact(self.compact());
-            return match (entry.invoke)(runtime, args_value).await {
-                Ok(body) => Ok(rmcp::model::CallToolResult::success(vec![
-                    rmcp::model::Content::text(body),
-                ])),
-                Err(e) => Ok(rmcp::model::CallToolResult::error(vec![
-                    rmcp::model::Content::text(e.to_string()),
-                ])),
-            };
+        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .find(|e| e.mcp_name == tool_name);
+        let Some(entry) = entry else {
+            return Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::Content::text(format!("unknown tool: {tool_name}")),
+            ]));
+        };
+        let args_value = request
+            .arguments
+            .clone()
+            .map(serde_json::Value::Object)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(
+            std::sync::Arc::new(self.config.clone()),
+        ));
+        // Propagate the server-level compact flag so the macro-emitted MCP
+        // output branch renders IntoMarkdown when compact is set.
+        runtime.set_compact(self.compact());
+        match (entry.invoke)(runtime, args_value).await {
+            Ok(body) => Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(body),
+            ])),
+            Err(e) => Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::Content::text(e.to_string()),
+            ])),
         }
-
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        if let Some(entry) = inventory::iter::<crate::ops::OpsMcpEntry>()
+        inventory::iter::<crate::ops::OpsMcpEntry>()
             .find(|e| e.mcp_name == name)
-        {
-            return Some(inventory_entry_to_tool(entry));
-        }
-        self.tool_router.get(name).cloned()
+            .map(inventory_entry_to_tool)
     }
 }
 
