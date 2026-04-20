@@ -179,39 +179,7 @@ impl ReinServer {
         }
     }
 
-    /// List all memoirs.
-    #[tool(
-        name = "rein_memoir_list",
-        description = "List all memoirs (knowledge graphs)."
-    )]
-    fn rein_memoir_list(&self) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let compact = self.compact();
-
-        let result = self.with_store(|store| store.list_memoirs());
-
-        match result {
-            Ok(memoirs) => {
-                if memoirs.is_empty() {
-                    return if compact {
-                        "none".to_string()
-                    } else {
-                        "No memoirs found.".to_string()
-                    };
-                }
-                let mut text = String::new();
-                for m in &memoirs {
-                    if compact {
-                        text.push_str(&format!("{}:{}\n", m.name, m.description));
-                    } else {
-                        text.push_str(&format!("- {} — {}\n", m.name, m.description));
-                    }
-                }
-                text
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    // rein_memoir_list migrated to #[op] inventory (see ops/handlers/knowledge.rs).
 
     /// Show a memoir and all its concepts.
     #[tool(

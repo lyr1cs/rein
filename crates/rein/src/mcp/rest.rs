@@ -459,7 +459,9 @@ async fn handle_api<B>(
                 Err(response) => response,
             }
         }
-        (&Method::GET, "/api/memoirs") => api_memoirs(config),
+        // GET /api/memoirs migrated to #[op] inventory (see ops/handlers/knowledge.rs).
+        // The inventory dispatcher at try_dispatch_inventory_rest intercepts this path
+        // before the match arm below, leaving only the sub-path handler in place.
         (&Method::GET, p) if p.starts_with("/api/memoirs/") => {
             handle_memoir_path(config, p, &query)
         }
@@ -893,16 +895,7 @@ fn recall_results_response(
     }
 }
 
-fn api_memoirs(config: &ReinConfig) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.list_memoirs() {
-        Ok(memoirs) => json_response(StatusCode::OK, json!({ "memoirs": memoirs })),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
+// api_memoirs migrated to #[op] (see ops/handlers/knowledge.rs::memoir_list).
 
 fn api_memoir_show(config: &ReinConfig, name: &str) -> BoxedResponse {
     let store = match config.open_store() {
