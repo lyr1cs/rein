@@ -181,37 +181,7 @@ impl ReinServer {
 
     // rein_memoir_list migrated to #[op] inventory (see ops/handlers/knowledge.rs).
 
-    /// Show a memoir and all its concepts.
-    #[tool(
-        name = "rein_memoir_show",
-        description = "Show memoir details and list all concepts within it."
-    )]
-    fn rein_memoir_show(&self, Parameters(params): Parameters<MemoirShowParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let compact = self.compact();
-
-        let result = self.with_store(|store| {
-            let memoir = store.get_memoir(&params.name)?.ok_or_else(|| {
-                ReinError::NotFound(format!("memoir '{}' not found", params.name))
-            })?;
-            let export = store.export_memoir(&params.name, "ascii")?;
-            Ok((memoir, export))
-        });
-
-        match result {
-            Ok((memoir, export)) => {
-                if compact {
-                    export
-                } else {
-                    format!(
-                        "Memoir: {} — {}\n\n{}",
-                        memoir.name, memoir.description, export
-                    )
-                }
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    // rein_memoir_show migrated to #[op] inventory (see ops/handlers/knowledge.rs).
 
     /// Add a concept to a memoir.
     #[tool(
@@ -500,22 +470,7 @@ impl ReinServer {
         }
     }
 
-    /// Export a memoir graph.
-    #[tool(
-        name = "rein_memoir_export",
-        description = "Export a memoir's knowledge graph. Formats: json (structured), ascii (human-readable), dot (Graphviz)."
-    )]
-    fn rein_memoir_export(&self, Parameters(params): Parameters<ExportParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let format = params.format.as_deref().unwrap_or("json");
-
-        let result = self.with_store(|store| store.export_memoir(&params.memoir, format));
-
-        match result {
-            Ok(output) => output,
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    // rein_memoir_export migrated to #[op] inventory (see ops/handlers/knowledge.rs).
 
     // rein_dedup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // POST /api/dedup REST surface added. auth = "mutation_marker".

@@ -490,27 +490,29 @@ fn handle_memoir_path(
     path: &str,
     query: &std::collections::HashMap<String, String>,
 ) -> BoxedResponse {
+    // After Phase 2.6 T0-T2 migrations, the inventory dispatcher serves:
+    //   GET /api/memoirs               → memoir_list
+    //   GET /api/memoirs/{name}        → memoir_show
+    //   GET /api/memoirs/{name}/export → memoir_export
+    //
+    // Only /api/memoirs/{name}/inspect/{concept} remains here because the
+    // path-template framework enforces a single-seg contract (spec §Q2)
+    // and inspect needs two path parameters.
     let rest = &path["/api/memoirs/".len()..];
-    if let Some(slash) = rest.find('/') {
-        let name = &percent_decode_lossy(&rest[..slash]);
-        let sub = &rest[slash + 1..];
-        if sub == "export" {
-            let format = query.get("format").map(|s| s.as_str()).unwrap_or("json");
-            return api_memoir_export(config, name, format);
-        }
-        if sub.starts_with("inspect/") {
-            let concept = percent_decode_lossy(&sub["inspect/".len()..]);
-            let depth = match parse_bounded_usize(query, "depth", 1, 1, 8) {
-                Ok(depth) => depth,
-                Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
-            };
-            return api_memoir_inspect(config, name, &concept, depth);
-        }
-        error_response(StatusCode::NOT_FOUND, "unknown memoir API endpoint")
-    } else {
-        let decoded = percent_decode_lossy(rest);
-        api_memoir_show(config, &decoded)
+    let Some(slash) = rest.find('/') else {
+        return error_response(StatusCode::NOT_FOUND, "unknown memoir API endpoint");
+    };
+    let name = &percent_decode_lossy(&rest[..slash]);
+    let sub = &rest[slash + 1..];
+    if let Some(concept_rest) = sub.strip_prefix("inspect/") {
+        let concept = percent_decode_lossy(concept_rest);
+        let depth = match parse_bounded_usize(query, "depth", 1, 1, 8) {
+            Ok(depth) => depth,
+            Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        };
+        return api_memoir_inspect(config, name, &concept, depth);
     }
+    error_response(StatusCode::NOT_FOUND, "unknown memoir API endpoint")
 }
 
 // ===========================================================================
@@ -897,65 +899,14 @@ fn recall_results_response(
 
 // api_memoirs migrated to #[op] (see ops/handlers/knowledge.rs::memoir_list).
 
-fn api_memoir_show(config: &ReinConfig, name: &str) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    // Use JSON export which includes memoir + concepts + links
-    match store.export_memoir(name, "json") {
-        Ok(output) => match serde_json::from_str::<serde_json::Value>(&output) {
-            Ok(v) => json_response(StatusCode::OK, v),
-            Err(_) => json_response(StatusCode::OK, json!({ "raw": output })),
-        },
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                error_response(StatusCode::NOT_FOUND, &msg)
-            } else {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
-            }
-        }
-    }
-}
+// api_memoir_show migrated to #[op] (see ops/handlers/knowledge.rs::memoir_show).
 
-fn api_memoir_export(config: &ReinConfig, name: &str, format: &str) -> BoxedResponse {
-    if !matches!(format, "json" | "ascii" | "dot") {
-        return error_response(StatusCode::BAD_REQUEST, "invalid export format");
-    }
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.export_memoir(name, format) {
-        Ok(output) => {
-            if format == "json" {
-                // Parse JSON string into Value so we return proper JSON
-                match serde_json::from_str::<serde_json::Value>(&output) {
-                    Ok(v) => json_response(StatusCode::OK, v),
-                    Err(_) => json_response(StatusCode::OK, json!({ "raw": output })),
-                }
-            } else {
-                // DOT/ASCII: return as text
-                let body = Full::new(Bytes::from(output))
-                    .map_err(|never: std::convert::Infallible| match never {})
-                    .boxed();
-                Response::builder()
-                    .status(200)
-                    .header("content-type", "text/plain")
-                    .body(body)
-                    .unwrap_or_else(|_| {
-                        Response::new(
-                            Full::new(Bytes::new())
-                                .map_err(|never: std::convert::Infallible| match never {})
-                                .boxed(),
-                        )
-                    })
-            }
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
+// api_memoir_export migrated to #[op] (see ops/handlers/knowledge.rs::memoir_export).
+// Note: the inventory response always returns JSON (via IntoJson). Clients that
+// relied on text/plain bodies for ascii/dot formats now receive a
+// `{"format": "...", "output": "..."}` JSON envelope. The GUI only uses
+// format=json, so this change is transparent there; external clients using
+// format=ascii or format=dot must extract `.output` from the JSON body.
 
 fn api_memoir_inspect(
     config: &ReinConfig,
