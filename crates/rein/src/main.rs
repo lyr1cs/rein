@@ -79,8 +79,6 @@ enum Commands {
         #[arg(short = 'I', long)]
         importance: Option<String>,
     },
-    /// List all topics
-    Topics,
     // Stats + Health migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
     // main() intercepts them before clap::Parser so they're invoked via OpsCliEntry.
     // Doctor migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
@@ -108,12 +106,6 @@ enum Commands {
         /// Configure shell aliases for proxy (rein-proxy, claudep, codexp)
         #[arg(long)]
         proxy: bool,
-    },
-    /// Show most recently created memories
-    #[command(visible_alias = "list")]
-    Recent {
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
     },
     // Canonicals migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // main() intercepts "canonicals" via OpsCliEntry before the derived-enum path.
@@ -296,13 +288,11 @@ async fn main() -> anyhow::Result<()> {
             keyword,
             limit,
         }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
-        Some(Commands::Topics) => commands::handle_topics(&config)?,
         Some(Commands::Update {
             id,
             content,
             importance,
         }) => commands::handle_update(&config, id, content, importance)?,
-        Some(Commands::Recent { limit }) => commands::handle_recent(&config, limit)?,
         // Commands::Organize migrated to #[op] inventory — intercepted via OpsCliEntry above.
         Some(Commands::Export {
             format,

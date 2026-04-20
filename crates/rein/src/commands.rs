@@ -195,16 +195,6 @@ pub fn handle_recall(
     Ok(())
 }
 
-pub fn handle_topics(config: &ReinConfig) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let topics = store.list_topics()?;
-    println!(
-        "{}",
-        mcp::compact::format_topics(&topics, config.server.compact)
-    );
-    Ok(())
-}
-
 // handle_stats / handle_health migrated to #[op] (see ops/handlers/diagnostics.rs).
 // main.rs intercepts those subcommands before Cli::parse() and dispatches through
 // OpsCliEntry inventory.
@@ -231,30 +221,6 @@ pub fn handle_update(
     mem.updated_at = chrono::Utc::now();
     store.update(&mem)?;
     println!("Updated memory: {id}");
-    Ok(())
-}
-
-pub fn handle_recent(config: &ReinConfig, limit: usize) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let memories = store.recent(limit)?;
-    if memories.is_empty() {
-        println!("No memories found.");
-    } else {
-        for m in &memories {
-            let age = chrono::Utc::now().signed_duration_since(m.created_at);
-            let age_str = if age.num_days() > 0 {
-                format!("{}d ago", age.num_days())
-            } else if age.num_hours() > 0 {
-                format!("{}h ago", age.num_hours())
-            } else {
-                format!("{}m ago", age.num_minutes())
-            };
-            println!(
-                "[{}] {} ({}, {})",
-                m.topic, m.summary, m.importance, age_str
-            );
-        }
-    }
     Ok(())
 }
 
