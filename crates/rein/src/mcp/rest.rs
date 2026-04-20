@@ -2212,8 +2212,9 @@ mod tests {
     // accidentally bypasses H3 auth or the body-cap for a specific inventory
     // route is caught immediately.
 
-    /// The six POST routes added in Phase 2.3, each migrated to the #[op]
-    /// inventory and declared with `auth = "mutation_marker"`.
+    /// POST routes migrated to the #[op] inventory and declared with
+    /// `auth = "mutation_marker"`. Phase 2.3 added the first six; Phase 2.4
+    /// adds `/api/feedback` so the auth + body-cap matrix covers it too.
     const NEW_POST_ROUTES: &[&str] = &[
         "/api/gc",
         "/api/dedup",
@@ -2221,6 +2222,7 @@ mod tests {
         "/api/organize",
         "/api/consolidate",
         "/api/cleanup",
+        "/api/feedback",
     ];
 
     #[tokio::test]
@@ -2273,5 +2275,30 @@ mod tests {
                 "{route} should 413 for oversized body"
             );
         }
+    }
+
+    // ---- Phase 2.4 F1: feedback-specific E2E REST tests ----
+    //
+    // The Phase 2.3 M3 matrix above now covers /api/feedback for auth-marker
+    // and body-cap. This test exercises the semantic validation path
+    // (empty memory_ids → OpsErrorKind::BadRequest → 400) through the full
+    // handle_rest_request_with_body → inventory dispatch path so the
+    // BadRequest mapping is verified end-to-end for this op.
+
+    #[tokio::test]
+    async fn feedback_empty_memory_ids_returns_400() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = test_config(&db_path);
+        let body = Bytes::from(r#"{"memory_ids":[]}"#);
+        let req = build_post("/api/feedback", true, &body);
+        let resp = handle_rest_request_with_body(&req, Some(body), &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "/api/feedback with empty memory_ids should 400"
+        );
     }
 }
