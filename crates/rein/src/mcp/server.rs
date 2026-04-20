@@ -6,7 +6,6 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_router, ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
-use crate::mcp::compact;
 use crate::mcp::tools::*;
 use crate::store::SqliteStore;
 use crate::types::*;
@@ -41,17 +40,6 @@ impl ReinServer {
             config,
             non_store_count: AtomicU32::new(0),
             tool_router: Self::tool_router(),
-        }
-    }
-
-    /// Append a store nudge if the non-store counter exceeds the threshold.
-    fn maybe_nudge(&self, text: &mut String) {
-        let count = self.non_store_count.load(Ordering::Relaxed);
-        if count >= 10 {
-            text.push_str(&format!(
-                "\n\n[rein: {} tool calls since last store. Consider saving important context.]",
-                count
-            ));
         }
     }
 
@@ -144,71 +132,6 @@ fn request_has_valid_http_auth(headers: &hyper::HeaderMap, expected: &str) -> bo
 
 #[tool_router]
 impl ReinServer {
-    /// Search memories by query, topic, or keyword.
-    /// Uses full pipeline: FTS5 → cached vectors → Google API → RRF fusion → Ebbinghaus weighting → cross-validation.
-    #[tool(
-        name = "rein_recall",
-        description = "Search and recall memories by semantic query. Uses three-level waterfall search with cross-validation. Supports optional topic and keyword filters."
-    )]
-    fn rein_recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let limit = params.limit.unwrap_or(10).min(200);
-
-        // Parse optional temporal filters
-        let time_from = params.from.as_deref().and_then(parse_datetime);
-        let time_to = params.to.as_deref().and_then(parse_datetime_end);
-        let request_id = ulid::Ulid::new().to_string();
-
-        let result = self.with_store(|store| {
-            crate::search::recall::recall_temporal_with_request_id(
-                store,
-                &self.config,
-                &params.query,
-                params.topic.as_deref(),
-                params.keyword.as_deref(),
-                limit,
-                time_from,
-                time_to,
-                params.expand,
-                false, // MCP uses full pipeline
-                Some(request_id.clone()),
-            )
-            .map_err(|e| ReinError::Config(format!("{e}")))
-        });
-
-        // Re-classify for transparency (sub-microsecond, no overhead)
-        let route = crate::search::classify::classify(
-            &params.query,
-            time_from.is_some(),
-            time_to.is_some(),
-        );
-
-        match result {
-            Ok(results) => {
-                let mut text = compact::format_recall_results_mcp(&results, self.compact());
-                if text.is_empty() {
-                    text = if self.compact() {
-                        "none".to_string()
-                    } else {
-                        "No memories found.".to_string()
-                    };
-                }
-                if !self.compact() && !results.is_empty() {
-                    text = format!(
-                        "[route: {} | request_id: {}] {}",
-                        route.query_type, request_id, text
-                    );
-                }
-                self.maybe_nudge(&mut text);
-                text
-            }
-            Err(e) => {
-                let mut text = format!("Error searching: {e}");
-                self.maybe_nudge(&mut text);
-                text
-            }
-        }
-    }
 
     // rein_ingest_session migrated to #[op] (see ops/handlers/session.rs).
     // Dispatch flows through the OpsMcpEntry inventory; legacy tool_router
@@ -642,49 +565,12 @@ impl ReinServer {
     // rein_concept_history migrated to #[op] inventory (see ops/handlers/memory.rs).
 }
 
-/// Parse a date string as start-of-day (for `from` bounds).
-fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc));
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(0, 0, 0)?;
-        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            dt,
-            chrono::Utc,
-        ));
-    }
-    None
-}
-
-/// Parse a date string as end-of-day (for `to` bounds).
-/// YYYY-MM-DD becomes 23:59:59 so the entire day is included.
-fn parse_datetime_end(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc));
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(23, 59, 59)?;
-        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            dt,
-            chrono::Utc,
-        ));
-    }
-    None
-}
-
 impl ServerHandler for ReinServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("rein: Multi-source cross-validated memory for AI agents. Use rein_store to save important context and rein_recall to search memories.")
     }
 
-    // A1 Phase 1.7 — approach (B): single source of truth flows through our
-    // OpsMcpEntry inventory. list_tools merges the legacy rmcp tool_router
-    // output with inventory-derived tools; call_tool checks inventory first
-    // and only falls through to tool_router for tools that haven't been
-    // migrated yet. Mirrors what `#[tool_handler]` would emit but interleaves
-    // the inventory path.
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,

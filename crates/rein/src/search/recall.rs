@@ -9,6 +9,7 @@ use crate::types::Embedder as _;
 use crate::types::{Memory, MemoryStore, ReinResult};
 
 /// A recalled memory with score and confidence.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallResult {
     pub memory: Memory,
     pub score: f32,

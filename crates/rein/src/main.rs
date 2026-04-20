@@ -50,16 +50,6 @@ enum Commands {
         #[arg(long)]
         subagent: bool,
     },
-    /// Search memories
-    Recall {
-        query: String,
-        #[arg(short, long)]
-        topic: Option<String>,
-        #[arg(short, long)]
-        keyword: Option<String>,
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-    },
     // Stats + Health migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
     // main() intercepts them before clap::Parser so they're invoked via OpsCliEntry.
     // Doctor migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
@@ -257,12 +247,6 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Some(Commands::Recall {
-            query,
-            topic,
-            keyword,
-            limit,
-        }) => commands::handle_recall(&config, query, topic, keyword, limit)?,
         // Commands::Organize migrated to #[op] inventory — intercepted via OpsCliEntry above.
         Some(Commands::Export {
             format,
