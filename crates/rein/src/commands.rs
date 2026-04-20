@@ -209,13 +209,6 @@ pub fn handle_topics(config: &ReinConfig) -> anyhow::Result<()> {
 // main.rs intercepts those subcommands before Cli::parse() and dispatches through
 // OpsCliEntry inventory.
 
-pub fn handle_forget(config: &ReinConfig, id: String) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    store.delete(&id)?;
-    println!("Deleted memory: {id}");
-    Ok(())
-}
-
 pub fn handle_update(
     config: &ReinConfig,
     id: String,

@@ -491,17 +491,6 @@ async fn handle_api<B>(
             }
         }
 
-        // --- Mutation endpoints (placeholder for Phase 2) ---
-        (&Method::DELETE, p) if p.starts_with("/api/memories/") => {
-            match require_mutation_marker(req) {
-                Ok(()) => {
-                    let id = percent_decode_lossy(&p["/api/memories/".len()..]);
-                    api_forget(config, &id)
-                }
-                Err(response) => response,
-            }
-        }
-
         _ => error_response(StatusCode::NOT_FOUND, "unknown API endpoint"),
     }
 }
@@ -985,17 +974,6 @@ fn api_get_memory(config: &ReinConfig, id: &str) -> BoxedResponse {
             json_response(StatusCode::OK, body)
         }
         Err(e) => error_response(StatusCode::NOT_FOUND, &format!("memory not found: {e}")),
-    }
-}
-
-fn api_forget(config: &ReinConfig, id: &str) -> BoxedResponse {
-    let store = match config.open_store() {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    match store.delete(id) {
-        Ok(_) => json_response(StatusCode::OK, json!({ "deleted": id })),
-        Err(e) => error_response(StatusCode::NOT_FOUND, &e.to_string()),
     }
 }
 

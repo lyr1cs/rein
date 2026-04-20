@@ -6,6 +6,7 @@
 pub mod adaptive;
 pub mod diagnostics;
 pub mod maintenance;
+pub mod memory;
 pub mod session;
 
 /// Test-only path-template ops. Gated behind the `test-support` feature so
