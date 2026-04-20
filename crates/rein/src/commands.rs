@@ -80,31 +80,6 @@ pub async fn handle_serve(
     Ok(())
 }
 
-pub fn handle_store(
-    config: &ReinConfig,
-    topic: String,
-    content: String,
-    importance: String,
-    keywords: Option<Vec<String>>,
-) -> anyhow::Result<()> {
-    let store = config.open_store()?;
-    let imp: types::Importance = importance.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let memory = ops::build_memory(
-        config,
-        topic,
-        content.clone(),
-        imp,
-        keywords.unwrap_or_default(),
-        types::Source::Manual,
-    );
-    let id = ops::store_memory(&store, config, memory)?;
-    println!(
-        "{}",
-        mcp::compact::format_store_result(&id, config.server.compact)
-    );
-    Ok(())
-}
-
 pub async fn handle_ingest(
     config: &ReinConfig,
     content: Option<String>,

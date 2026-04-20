@@ -97,19 +97,6 @@ pub struct RecallParams {
     pub expand: Option<bool>,
 }
 
-/// Parameters for rein_store tool.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct StoreParams {
-    /// Topic/category for the memory.
-    pub topic: String,
-    /// The content to store.
-    pub content: String,
-    /// Importance level: low, medium, high, or critical.
-    pub importance: Option<String>,
-    /// Comma-separated keywords for the memory.
-    pub keywords: Option<String>,
-}
-
 /// Parameters for rein_ingest_session tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IngestSessionParams {
