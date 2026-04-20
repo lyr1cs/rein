@@ -210,53 +210,6 @@ impl ReinServer {
         }
     }
 
-    /// Store a new memory with topic, content, importance, and keywords.
-    #[tool(
-        name = "rein_store",
-        description = "Store a new memory. Automatically deduplicates against existing memories."
-    )]
-    fn rein_store(&self, Parameters(params): Parameters<StoreParams>) -> String {
-        self.non_store_count.store(0, Ordering::Relaxed);
-
-        if params.content.len() > 100_000 {
-            return "Error: content too large (max 100KB)".to_string();
-        }
-
-        let importance: Importance = params
-            .importance
-            .as_deref()
-            .unwrap_or("medium")
-            .parse()
-            .unwrap_or(Importance::Medium);
-
-        let keywords: Vec<String> = params
-            .keywords
-            .map(|k| {
-                k.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let memory = crate::ops::build_memory(
-            &self.config,
-            params.topic,
-            params.content.clone(),
-            importance,
-            keywords,
-            Source::Manual,
-        );
-
-        let config = self.config.clone();
-        let result = self.with_store(|store| crate::ops::store_memory(store, &config, memory));
-
-        match result {
-            Ok(id) => compact::format_store_result(&id, self.compact()),
-            Err(e) => format!("Error storing: {e}"),
-        }
-    }
-
     // rein_ingest_session migrated to #[op] (see ops/handlers/session.rs).
     // Dispatch flows through the OpsMcpEntry inventory; legacy tool_router
     // delegation below is still used for tools that haven't migrated yet.

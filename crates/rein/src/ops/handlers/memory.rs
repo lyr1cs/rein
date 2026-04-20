@@ -152,6 +152,74 @@ impl IntoCliText for RecentOutput {
     }
 }
 
+// ── store ───────────────────────────────────────────────────────────────────
+
+fn deserialize_keywords<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Vec(Vec<String>),
+        String(String),
+    }
+    match Option::<StringOrVec>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(StringOrVec::Vec(v)) => Ok(Some(v)),
+        Some(StringOrVec::String(s)) => Ok(Some(
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )),
+    }
+}
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct StoreMemoryParams {
+    /// Topic/category for the memory.
+    #[arg(short, long)]
+    pub topic: String,
+    /// The content to store.
+    #[arg(short, long)]
+    pub content: String,
+    /// Importance level: low, medium, high, or critical (default medium).
+    #[arg(short = 'I', long, default_value = "medium")]
+    #[serde(default)]
+    pub importance: Option<String>,
+    /// Keywords (comma-separated on CLI, array or comma-string on MCP).
+    #[arg(short, long, value_delimiter = ',')]
+    #[serde(default, deserialize_with = "deserialize_keywords")]
+    pub keywords: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct StoreMemoryOutput {
+    pub id: String,
+    #[serde(skip)]
+    pub compact: bool,
+}
+
+impl IntoJson for StoreMemoryOutput {
+    fn to_json(&self) -> serde_json::Value {
+        json!({ "id": self.id })
+    }
+}
+
+impl IntoMarkdown for StoreMemoryOutput {
+    fn to_markdown(&self) -> String {
+        crate::mcp::compact::format_store_result(&self.id, self.compact)
+    }
+}
+
+impl IntoCliText for StoreMemoryOutput {
+    fn to_cli_text(&self) -> String {
+        crate::mcp::compact::format_store_result(&self.id, self.compact)
+    }
+}
+
 // ── update ──────────────────────────────────────────────────────────────────
 
 #[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
@@ -446,6 +514,44 @@ impl OpsRuntime {
                 obj.insert("evidence".to_string(), json!(evidence));
             }
             Ok(GetMemoryOutput(body))
+        })
+    }
+
+    #[op(
+        name = "store",
+        category = "memory",
+        description = "Store a new memory with topic, content, importance, and keywords. Automatically deduplicates against existing memories.",
+        mutating = true,
+        cli(name = "store"),
+        mcp(name = "rein_store"),
+    )]
+    pub fn store_memory(&self, params: StoreMemoryParams) -> ReinResult<StoreMemoryOutput> {
+        if params.content.len() > 100_000 {
+            return Err(crate::types::ReinError::Config(
+                "content too large (max 100KB)".to_string(),
+            )
+            .with_kind(crate::types::OpsErrorKind::BadRequest));
+        }
+        let importance: crate::types::Importance = params
+            .importance
+            .as_deref()
+            .unwrap_or("medium")
+            .parse()
+            .unwrap_or(crate::types::Importance::Medium);
+        let keywords = params.keywords.unwrap_or_default();
+        let memory = crate::ops::build_memory(
+            &self.config,
+            params.topic,
+            params.content.clone(),
+            importance,
+            keywords,
+            crate::types::Source::Manual,
+        );
+        let config = self.config.clone();
+        let compact = self.compact();
+        self.with_store(|store| {
+            let id = crate::ops::store_memory(store, &config, memory)?;
+            Ok(StoreMemoryOutput { id, compact })
         })
     }
 
