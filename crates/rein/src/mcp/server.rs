@@ -1,14 +1,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_router, ServerHandler, ServiceExt};
+use rmcp::{tool_router, ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
-use crate::mcp::tools::*;
-use crate::store::SqliteStore;
-use crate::types::*;
 
 /// MCP server for rein memory system.
 ///
@@ -45,17 +41,6 @@ impl ReinServer {
 
     fn compact(&self) -> bool {
         self.config.server.compact
-    }
-
-    /// Open a per-request SqliteStore, run a synchronous closure, return the result.
-    /// Each call gets its own SQLite connection — no Mutex needed.
-    /// SQLite WAL mode handles concurrent readers and serializes writers.
-    fn with_store<F, R>(&self, f: F) -> Result<R, String>
-    where
-        F: FnOnce(&SqliteStore) -> Result<R, ReinError>,
-    {
-        let store = self.config.open_store().map_err(|e| format!("{e}"))?;
-        f(&store).map_err(|e| format!("{e}"))
     }
 
     /// Dispatch an inventory-registered op by MCP tool name without requiring
@@ -147,188 +132,18 @@ impl ReinServer {
     // the OpsMcpEntry inventory before delegating to tool_router for legacy tools.
 
     // ===== Knowledge Graph (Memoir/Concept/Link) tools =====
-
-    /// Create a new memoir (knowledge graph container).
-    #[tool(
-        name = "rein_memoir_create",
-        description = "Create a new memoir (named knowledge graph). Use to organize concepts and their relationships."
-    )]
-    fn rein_memoir_create(&self, Parameters(params): Parameters<MemoirCreateParams>) -> String {
-        self.non_store_count.store(0, Ordering::Relaxed);
-        let compact = self.compact();
-
-        let memoir = crate::types::Memoir {
-            id: String::new(),
-            name: params.name.clone(),
-            description: params.description.unwrap_or_default(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        let result = self.with_store(|store| store.create_memoir(memoir));
-
-        match result {
-            Ok(id) => {
-                if compact {
-                    format!("ok:{id}")
-                } else {
-                    format!("Created memoir '{}': {id}", params.name)
-                }
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-
-    // rein_memoir_list migrated to #[op] inventory (see ops/handlers/knowledge.rs).
-
-    // rein_memoir_show migrated to #[op] inventory (see ops/handlers/knowledge.rs).
-
-    /// Add a concept to a memoir.
-    #[tool(
-        name = "rein_memoir_add_concept",
-        description = "Add a concept (knowledge node) to a memoir with name, definition, and optional labels."
-    )]
-    fn rein_memoir_add_concept(&self, Parameters(params): Parameters<ConceptAddParams>) -> String {
-        self.non_store_count.store(0, Ordering::Relaxed);
-        let compact = self.compact();
-
-        let labels: Vec<String> = params
-            .labels
-            .map(|l| {
-                l.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let concept = crate::types::Concept {
-            id: String::new(),
-            memoir_id: params.memoir.clone(),
-            name: params.name.clone(),
-            definition: params.definition,
-            labels,
-            source_memory_ids: vec![],
-            confidence: 0.5,
-            revision: 1,
-            last_episode_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        let result = self.with_store(|store| store.add_concept(concept));
-
-        match result {
-            Ok(id) => {
-                if compact {
-                    format!("ok:{id}")
-                } else {
-                    format!(
-                        "Added concept '{}' to memoir '{}': {id}",
-                        params.name, params.memoir
-                    )
-                }
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-
-    /// Refine a concept's definition.
-    #[tool(
-        name = "rein_memoir_refine",
-        description = "Refine a concept: update definition, increment revision, boost confidence."
-    )]
-    fn rein_memoir_refine(&self, Parameters(params): Parameters<ConceptRefineParams>) -> String {
-        self.non_store_count.store(0, Ordering::Relaxed);
-        let compact = self.compact();
-
-        let result = self.with_store(|store| {
-            store.refine_concept(&params.memoir, &params.name, &params.definition)
-        });
-
-        match result {
-            Ok(()) => {
-                if compact {
-                    format!("ok:{}", params.name)
-                } else {
-                    format!(
-                        "Refined concept '{}' in memoir '{}'",
-                        params.name, params.memoir
-                    )
-                }
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-
-    // rein_memoir_search + rein_memoir_search_all migrated to #[op] inventory
-    // (see ops/handlers/knowledge.rs). MCP-only — no REST surface in pre-A1.
-
-    /// Create a typed relation between two concepts.
-    #[tool(
-        name = "rein_memoir_link",
-        description = "Create a typed relation (edge) between two concepts in a memoir. Relations: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by."
-    )]
-    fn rein_memoir_link(&self, Parameters(params): Parameters<LinkParams>) -> String {
-        self.non_store_count.store(0, Ordering::Relaxed);
-        let compact = self.compact();
-
-        let relation = match params.relation.parse::<crate::types::Relation>() {
-            Ok(r) => r,
-            Err(e) => return format!("Error: {e}"),
-        };
-
-        let result = self.with_store(|store| {
-            let from = store
-                .get_concept(&params.memoir, &params.from)?
-                .ok_or_else(|| {
-                    ReinError::NotFound(format!(
-                        "concept '{}' not found in memoir '{}'",
-                        params.from, params.memoir
-                    ))
-                })?;
-            let to = store
-                .get_concept(&params.memoir, &params.to)?
-                .ok_or_else(|| {
-                    ReinError::NotFound(format!(
-                        "concept '{}' not found in memoir '{}'",
-                        params.to, params.memoir
-                    ))
-                })?;
-
-            let link = crate::types::ConceptLink {
-                id: String::new(),
-                source_id: from.id,
-                target_id: to.id,
-                relation,
-                weight: 1.0,
-                created_at: chrono::Utc::now(),
-                valid_from: None,
-                valid_until: None,
-            };
-            store.add_link(link)
-        });
-
-        match result {
-            Ok(id) => {
-                if compact {
-                    format!("ok:{id}")
-                } else {
-                    format!(
-                        "Linked '{}' --{}-> '{}': {id}",
-                        params.from, params.relation, params.to
-                    )
-                }
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    //
+    // The full memoir family migrated to #[op] inventory in Phase 2.6
+    // (see ops/handlers/knowledge.rs). rein_memoir_inspect's REST endpoint
+    // /api/memoirs/{name}/inspect/{concept} stays derived (two path params;
+    // spec §Q2 pending double-seg support). rein_memoir_search /
+    // rein_memoir_search_all / rein_memoir_create / rein_memoir_add_concept /
+    // rein_memoir_refine / rein_memoir_link are MCP-only — pre-A1 had no
+    // REST surface for these ops and Phase 2.6 doesn't add one.
 
     // rein_memoir_inspect migrated to #[op] inventory (see ops/handlers/knowledge.rs).
     // REST surface stays derived in mcp/rest.rs::handle_memoir_path because the
     // path /api/memoirs/{name}/inspect/{concept} needs two path params (spec §Q2).
-
-    // rein_memoir_export migrated to #[op] inventory (see ops/handlers/knowledge.rs).
 
     // rein_dedup migrated to #[op] inventory (see ops/handlers/maintenance.rs).
     // POST /api/dedup REST surface added. auth = "mutation_marker".
