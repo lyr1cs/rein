@@ -407,68 +407,9 @@ impl ReinServer {
         }
     }
 
-    /// Inspect a concept's neighborhood via BFS.
-    #[tool(
-        name = "rein_memoir_inspect",
-        description = "Inspect a concept's neighborhood via BFS traversal. Returns the concept, its neighbors, and connecting links up to the specified depth."
-    )]
-    fn rein_memoir_inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
-        self.non_store_count.fetch_add(1, Ordering::Relaxed);
-        let compact = self.compact();
-        let depth = params.depth.unwrap_or(1).min(5);
-
-        let result =
-            self.with_store(|store| store.inspect_concept(&params.memoir, &params.name, depth));
-
-        match result {
-            Ok((center, neighbors, links)) => {
-                let mut text = String::new();
-                if compact {
-                    text.push_str(&format!(
-                        "center:{}:c{:.1}:r{}\n",
-                        center.name, center.confidence, center.revision
-                    ));
-                    for n in &neighbors {
-                        text.push_str(&format!(
-                            "neighbor:{}:c{:.1}:r{}\n",
-                            n.name, n.confidence, n.revision
-                        ));
-                    }
-                    for l in &links {
-                        text.push_str(&format!(
-                            "link:{}->{}:{}\n",
-                            l.source_id, l.target_id, l.relation
-                        ));
-                    }
-                } else {
-                    text.push_str(&format!(
-                        "Center: {} (conf:{:.1}, rev:{})\n  {}\n\n",
-                        center.name, center.confidence, center.revision, center.definition
-                    ));
-                    if !neighbors.is_empty() {
-                        text.push_str("Neighbors:\n");
-                        for n in &neighbors {
-                            text.push_str(&format!(
-                                "  - {} (conf:{:.1}, rev:{}) — {}\n",
-                                n.name, n.confidence, n.revision, n.definition
-                            ));
-                        }
-                    }
-                    if !links.is_empty() {
-                        text.push_str("\nLinks:\n");
-                        for l in &links {
-                            text.push_str(&format!(
-                                "  {} --{}-> {}\n",
-                                l.source_id, l.relation, l.target_id
-                            ));
-                        }
-                    }
-                }
-                text
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
+    // rein_memoir_inspect migrated to #[op] inventory (see ops/handlers/knowledge.rs).
+    // REST surface stays derived in mcp/rest.rs::handle_memoir_path because the
+    // path /api/memoirs/{name}/inspect/{concept} needs two path params (spec §Q2).
 
     // rein_memoir_export migrated to #[op] inventory (see ops/handlers/knowledge.rs).
 
