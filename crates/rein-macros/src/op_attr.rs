@@ -162,10 +162,10 @@ fn emit_inventory_block(attr: &OpAttr, fi: &FnInfo) -> syn::Result<TokenStream> 
         .mcp
         .as_ref()
         .map(|mcp| emit_mcp_block(mcp, op_name, description, fn_name, fi, mutating));
-    let rest_block = attr
-        .rest
-        .as_ref()
-        .map(|rest| emit_rest_block(rest, op_name, fn_name, fi, &auth_variant));
+    let rest_block = match attr.rest.as_ref() {
+        Some(rest) => Some(emit_rest_block(rest, op_name, fn_name, fi, &auth_variant)?),
+        None => None,
+    };
 
     let cli_visible = attr.cli.is_some();
     let mcp_visible = attr.mcp.is_some();
@@ -426,7 +426,8 @@ fn emit_mcp_block(
                 let body = if runtime.compact() {
                     <_ as ::rein::ops::IntoMarkdown>::to_markdown(&out)
                 } else {
-                    ::serde_json::to_string(&out)?
+                    let json_value = <_ as ::rein::ops::IntoJson>::to_json(&out);
+                    ::serde_json::to_string(&json_value)?
                 };
                 ::std::result::Result::Ok(body)
             })
@@ -550,11 +551,8 @@ fn emit_rest_block(
     fn_name: &syn::Ident,
     fi: &FnInfo,
     auth_variant: &TokenStream,
-) -> TokenStream {
-    let method_ident = match method_ident(&rest.method) {
-        Ok(id) => id,
-        Err(e) => return e.to_compile_error(),
-    };
+) -> syn::Result<TokenStream> {
+    let method_ident = method_ident(&rest.method)?;
 
     // T2: parse path segments at macro expansion time, emitting PathSegment literals.
     // Static paths with no placeholders keep path_segments: &[] (leading-only split,
@@ -565,12 +563,8 @@ fn emit_rest_block(
     // Check whether the path contains any placeholders at all before parsing.
     let has_placeholder = path.contains('{');
     let path_segments_tokens = if has_placeholder {
-        match parse_path_segments(path, path_span) {
-            Ok(segs) => {
-                quote! { &[ #( #segs ),* ] }
-            }
-            Err(e) => return e.to_compile_error(),
-        }
+        let segs = parse_path_segments(path, path_span)?;
+        quote! { &[ #( #segs ),* ] }
     } else {
         // Literal-only path — no segments needed; exact-match pass handles it.
         quote! { &[] }
@@ -674,7 +668,7 @@ fn emit_rest_block(
         (None, _) => quote! {},
     };
 
-    quote! {
+    Ok(quote! {
         fn __op_rest_invoke(
             runtime: ::std::sync::Arc<::rein::ops::OpsRuntime>,
             _path_values: ::std::collections::HashMap<&'static str, ::std::string::String>,
@@ -704,7 +698,8 @@ fn emit_rest_block(
                             (::bytes::Bytes::from(raw), ct)
                         }
                         ::std::option::Option::None => {
-                            let json_bytes = ::serde_json::to_vec(&out)?;
+                            let json_value = ::rein::ops::IntoJson::to_json(&out);
+                            let json_bytes = ::serde_json::to_vec(&json_value)?;
                             (::bytes::Bytes::from(json_bytes), "application/json")
                         }
                     };
@@ -728,7 +723,7 @@ fn emit_rest_block(
                 invoke: __op_rest_invoke,
             }
         }
-    }
+    })
 }
 
 fn method_ident(method: &str) -> syn::Result<syn::Ident> {
@@ -864,13 +859,17 @@ fn parse_op_attr(attr: TokenStream) -> syn::Result<OpAttr> {
     let auth = auth.unwrap_or_else(|| "public".to_string());
 
     Ok(OpAttr {
-        name: name
-            .ok_or_else(|| syn::Error::new(Span::call_site(), "missing required #[op] key 'name'"))?,
+        name: name.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "missing required #[op] key 'name'")
+        })?,
         category: category.ok_or_else(|| {
             syn::Error::new(Span::call_site(), "missing required #[op] key 'category'")
         })?,
         description: description.ok_or_else(|| {
-            syn::Error::new(Span::call_site(), "missing required #[op] key 'description'")
+            syn::Error::new(
+                Span::call_site(),
+                "missing required #[op] key 'description'",
+            )
         })?,
         kind,
         mutating,
@@ -1024,7 +1023,10 @@ fn parse_rest_block(tokens: TokenStream) -> syn::Result<RestBlock> {
     }
     Ok(RestBlock {
         method: method.ok_or_else(|| {
-            syn::Error::new(Span::call_site(), "rest block missing required key 'method'")
+            syn::Error::new(
+                Span::call_site(),
+                "rest block missing required key 'method'",
+            )
         })?,
         path: path.ok_or_else(|| {
             syn::Error::new(Span::call_site(), "rest block missing required key 'path'")

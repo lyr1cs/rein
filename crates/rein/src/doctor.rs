@@ -335,6 +335,17 @@ fn check_overview_version() -> DoctorCheck {
 // README / AGENTS.md MCP tool counts.
 
 fn check_cli_registry() -> DoctorCheck {
+    let duplicates = crate::ops::inventory::duplicate_report();
+    if !duplicates.cli_names.is_empty() {
+        return fail_in(
+            DoctorCategory::Architecture,
+            "cli_registry",
+            format!(
+                "CLI inventory duplicates detected: {}",
+                duplicates.cli_names.join(", ")
+            ),
+        );
+    }
     let inventory_count = inventory::iter::<crate::ops::OpsCliEntry>().count();
     let derived_count = count_cli_operations_in_source(include_str!("main.rs"));
     let source_count = derived_count + inventory_count;
@@ -348,6 +359,17 @@ fn check_cli_registry() -> DoctorCheck {
 }
 
 fn check_mcp_registry() -> DoctorCheck {
+    let duplicates = crate::ops::inventory::duplicate_report();
+    if !duplicates.mcp_names.is_empty() {
+        return fail_in(
+            DoctorCategory::Architecture,
+            "mcp_registry",
+            format!(
+                "MCP inventory duplicates detected: {}",
+                duplicates.mcp_names.join(", ")
+            ),
+        );
+    }
     let inventory_count = inventory::iter::<crate::ops::OpsMcpEntry>().count();
     let derived_count = count_mcp_tools_in_source(include_str!("mcp/server.rs"));
     let source_count = derived_count + inventory_count;
@@ -363,7 +385,7 @@ fn check_mcp_registry() -> DoctorCheck {
             DoctorCategory::Architecture,
             "mcp_registry",
             format!(
-                "{source_count} MCP tools in source ({derived_count} derived + {inventory_count} inventory), but docs still say {doc_summary}"
+                "{source_count} MCP tools in source ({derived_count} derived + {inventory_count} inventory), uniqueness clean, but docs still say {doc_summary}"
             ),
         );
     }
@@ -372,12 +394,23 @@ fn check_mcp_registry() -> DoctorCheck {
         DoctorCategory::Architecture,
         "mcp_registry",
         format!(
-            "{source_count} MCP tools in source ({derived_count} derived + {inventory_count} inventory)"
+            "{source_count} MCP tools in source ({derived_count} derived + {inventory_count} inventory), uniqueness clean"
         ),
     )
 }
 
 fn check_rest_registry() -> DoctorCheck {
+    let duplicates = crate::ops::inventory::duplicate_report();
+    if !duplicates.rest_routes.is_empty() {
+        return fail_in(
+            DoctorCategory::Architecture,
+            "rest_registry",
+            format!(
+                "REST inventory duplicates detected: {}",
+                duplicates.rest_routes.join(", ")
+            ),
+        );
+    }
     // Exclude test-support ops (op_name starts with "__test_") from the count
     // so the check is stable whether or not the test-support feature is active.
     let inventory_count = inventory::iter::<crate::ops::OpsRestEntry>()
@@ -389,7 +422,7 @@ fn check_rest_registry() -> DoctorCheck {
         DoctorCategory::Architecture,
         "rest_registry",
         format!(
-            "{source_count} REST operations in source ({derived_count} derived + {inventory_count} inventory)"
+            "{source_count} REST operations in source ({derived_count} derived + {inventory_count} inventory), uniqueness clean"
         ),
     )
 }

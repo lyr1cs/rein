@@ -344,6 +344,105 @@ fn test_recall_uses_supplied_request_id_for_feedback_event() {
     assert_eq!(logged_request_id, request_id);
 }
 
+/// Regression: M5 Cold-tier filtering must run **before** the top-N cutoff,
+/// otherwise Cold memories that happen to surface in the top take_count
+/// crowd out Warm/Hot candidates that would otherwise make the cut.
+/// Non-Exploratory queries were silently under-retrieving (returning zero
+/// results) on tier-diverse databases.
+///
+/// Fixture is calibrated to expose the old truncation bug:
+/// - Uses a **Preference**-classified query ("what do i like about ...") so
+///   `limit_multiplier = 2.0`, giving the FTS pool enough depth that both
+///   Cold and Warm seeds land in `fused`. With a plain Semantic route the
+///   default multiplier of 1.0 caps the FTS pool at `limit * 2`, which for
+///   small `limit` is too shallow to surface Warm candidates at all.
+/// - 8 Cold seeds with heavy keyword repetition dominate BM25 and fill the
+///   top 6 of `fused` (= take_count at limit=3). Under the OLD code,
+///   `take(take_count)` would load all 6 Cold into local_results and the
+///   post-take `retain()` would drop every one, returning 0 results.
+/// - 4 Warm seeds with weaker matches sit at positions 7..10 of `fused`.
+///   Under the NEW code, the pre-take filter removes all 8 Cold from
+///   `fused` BEFORE the take so the top limit=3 Warm fill the result set.
+#[test]
+fn test_m5_cold_filter_does_not_truncate_result_set() {
+    let store = SqliteStore::in_memory().unwrap();
+
+    let make_tier = |topic: &str, content: &str, tier: MemoryTier| {
+        let mut m = make_memory(topic, topic, content, Importance::High);
+        m.tier = tier;
+        m
+    };
+
+    // Every seed must contain every query token (FTS5 is AND-mode under
+    // rein's `sanitize_fts_query`). Cold wins BM25 via keyword density.
+    for i in 0..8 {
+        store
+            .store(make_tier(
+                &format!("cold-exact-{i}"),
+                "prefer pool saturation connection \
+                 pool saturation pool saturation pool saturation \
+                 connection exhausted",
+                MemoryTier::Cold,
+            ))
+            .unwrap();
+    }
+    for i in 0..4 {
+        store
+            .store(make_tier(
+                &format!("warm-weak-{i}"),
+                "prefer pool saturation connection handler notes",
+                MemoryTier::Warm,
+            ))
+            .unwrap();
+    }
+
+    let mut config = rein::config::ReinConfig::default();
+    config.sync.supermemory_enabled = false;
+    config.sync.auto_memory_enabled = false;
+    config.search.llm_reranker = "none".to_string();
+    config.query_expansion.provider = "none".to_string();
+    config.embedding.provider = "none".to_string();
+
+    // Classified as Preference (via "prefer" token) → alpha=0.4,
+    // limit_multiplier=2.0. Wider FTS pool ⇒ Warm seeds make it into `fused`.
+    let results = rein::search::recall::recall_temporal_with_request_id(
+        &store,
+        &config,
+        "prefer pool saturation connection",
+        None,
+        None,
+        3, // limit=3 → take_count=6, Cold (8) fills it under old code
+        None,
+        None,
+        Some(false),
+        true,
+        None,
+    )
+    .unwrap();
+
+    // Post-fix: pre-take filter strips all 8 Cold from `fused` so the top
+    // 3 Warm fill the limit. Pre-fix: the first 6 slots of `fused` are
+    // Cold, retain drops all, and results.len() is 0.
+    assert!(
+        !results.is_empty(),
+        "pre-take Cold filter must backfill from Warm. got 0 results — \
+         the filter reverted to post-take"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|r| r.memory.tier != MemoryTier::Cold),
+        "Cold memories must be excluded on non-Exploratory routes"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|r| r.memory.topic.starts_with("warm-weak-")),
+        "returned memories must all be Warm seeds: {:?}",
+        results.iter().map(|r| &r.memory.topic).collect::<Vec<_>>()
+    );
+}
+
 /// Store a memory with an embedding vector, verify it can be found via
 /// vector search even when FTS returns nothing useful.
 #[test]
