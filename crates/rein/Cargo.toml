@@ -53,7 +53,11 @@ serde_urlencoded = "0.7"
 [features]
 default = []
 gui = ["rust-embed"]
+# Enables test-only inventory entries (e.g. the path-template echo op).
+# Activated automatically by dev-dependencies below so integration tests see it.
+test-support = []
 
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+rein = { path = ".", features = ["test-support"] }
