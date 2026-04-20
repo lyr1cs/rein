@@ -2,7 +2,7 @@
 
 ## Overview
 
-rein v0.20.2 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 28 MCP tools. Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only) including **Codex subscription loopback proxy** with first-party WebSocket mirror, `permessage-deflate` decoding, ChatGPT backend helper routing (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`), and `ArtifactMirrorOnly` recording gate. Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed) with `/api/artifacts` readback panel.
+rein v0.21.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 31 MCP tools. Unified operation registry (CLI / MCP / REST authored once via `#[op]` macro — Phase 2.6 closed the last legacy handler, Phase 3 deleted the hand-maintained registry middleman). Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only) including **Codex subscription loopback proxy** with first-party WebSocket mirror, `permessage-deflate` decoding, ChatGPT backend helper routing (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`), and `ArtifactMirrorOnly` recording gate. Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed) with `/api/artifacts` readback panel.
 
 ## v0.20.0 highlights (2026-04-17)
 
@@ -107,8 +107,8 @@ src/
 │   ├── policy.rs    # Extraction policy decisions
 │   └── extract.rs   # Async response extraction + queue integration
 └── mcp/
-    ├── server.rs    # MCP server (28 tools, stdio + HTTP/SSE + GUI)
-    ├── rest.rs      # REST API layer (21 JSON endpoints for GUI)
+    ├── server.rs    # MCP server (31 tools, stdio + HTTP/SSE + GUI)
+    ├── rest.rs      # REST API layer (33 inventory routes + 2 legacy derived)
     ├── tools.rs     # Tool parameter structs
     └── compact.rs   # Output formatters
 

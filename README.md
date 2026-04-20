@@ -16,7 +16,8 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 | Feature | Description |
 |---------|-------------|
-| **28 MCP tools** | 13 core memory tools + 10 knowledge graph tools + 2 temporal tools + 2 adaptive + 1 session ingest |
+| **31 MCP tools** | 8 core memory + 8 maintenance + 10 knowledge graph + 2 temporal + 2 adaptive + 1 session ingest |
+| **Unified operation registry** | One `#[op]` declaration drives CLI / MCP / REST surfaces (v0.21, A1). Inventory-based dispatch; zero hand-maintained lists. |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
 | **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights — global, per-query-type, and per-cluster (M2) |
@@ -233,7 +234,7 @@ Operator inspection commands:
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 28 tools are exposed.
+When running as an MCP server (`rein serve`), 31 tools are exposed.
 
 #### Core Tools (13)
 
@@ -796,7 +797,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 flowchart TD
     U[User / AI Agent]
     CLI[CLI\n20+ commands]
-    MCP[MCP Server\n28 tools · stdio / HTTP / SSE]
+    MCP[MCP Server\n31 tools · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[Proxy\nClaude · Codex subscription · record-only]
 
