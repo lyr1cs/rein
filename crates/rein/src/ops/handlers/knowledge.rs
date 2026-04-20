@@ -125,9 +125,14 @@ impl IntoCliText for MemoirShowOutput {
 ///
 /// The `name` field is bound from the `{name}` path segment on REST;
 /// `format` comes from `?format=` query string (REST) or the MCP payload.
+///
+/// Phase 2.6 F2: `#[serde(alias = "memoir")]` preserves the pre-A1 MCP
+/// wire format where clients sent `{"memoir": "..."}`. The canonical field
+/// name is `name` so the path-template binding still works.
 #[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
 pub struct MemoirExportParams {
     /// Name of the memoir to export.
+    #[serde(alias = "memoir")]
     pub name: String,
     /// Export format: json, ascii, or dot (default json).
     #[serde(default)]
@@ -187,7 +192,13 @@ pub struct MemoirInspectParams {
     /// Name of the concept to inspect.
     pub name: String,
     /// BFS depth (default 1, max 5).
-    #[serde(default)]
+    ///
+    /// Phase 2.6 F2: accepts both `{"depth": 2}` and `{"depth": "2"}` on
+    /// the MCP wire for pre-A1 client compatibility.
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::tools::deserialize_option_usize_from_string"
+    )]
     pub depth: Option<usize>,
 }
 
@@ -280,7 +291,13 @@ pub struct MemoirSearchParams {
     /// Full-text search query.
     pub query: String,
     /// Maximum number of results (default 10, max 100).
-    #[serde(default)]
+    ///
+    /// Phase 2.6 F2: accepts both `{"limit": 10}` and `{"limit": "10"}` on
+    /// the MCP wire for pre-A1 client compatibility.
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::tools::deserialize_option_usize_from_string"
+    )]
     pub limit: Option<usize>,
 }
 
@@ -289,7 +306,10 @@ pub struct MemoirSearchAllParams {
     /// Full-text search query.
     pub query: String,
     /// Maximum number of results (default 10, max 100).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::tools::deserialize_option_usize_from_string"
+    )]
     pub limit: Option<usize>,
 }
 
@@ -817,5 +837,104 @@ impl OpsRuntime {
             let output = store.export_memoir(&name, &format)?;
             Ok(MemoirExportOutput { format, output })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── F2 wire-compat regression tests ─────────────────────────────────────
+
+    #[test]
+    fn memoir_export_params_accepts_legacy_memoir_field_alias() {
+        let params: MemoirExportParams =
+            serde_json::from_value(json!({"memoir": "foo"})).expect("alias should deserialize");
+        assert_eq!(params.name, "foo");
+        assert_eq!(params.format, None);
+    }
+
+    #[test]
+    fn memoir_export_params_accepts_canonical_name_field() {
+        let params: MemoirExportParams = serde_json::from_value(
+            json!({"name": "foo", "format": "ascii"}),
+        )
+        .expect("canonical field should deserialize");
+        assert_eq!(params.name, "foo");
+        assert_eq!(params.format.as_deref(), Some("ascii"));
+    }
+
+    #[test]
+    fn memoir_search_params_accepts_string_limit() {
+        let params: MemoirSearchParams = serde_json::from_value(
+            json!({"memoir": "m", "query": "q", "limit": "10"}),
+        )
+        .expect("string limit should deserialize");
+        assert_eq!(params.limit, Some(10));
+    }
+
+    #[test]
+    fn memoir_search_params_accepts_number_limit() {
+        let params: MemoirSearchParams = serde_json::from_value(
+            json!({"memoir": "m", "query": "q", "limit": 10}),
+        )
+        .expect("number limit should deserialize");
+        assert_eq!(params.limit, Some(10));
+    }
+
+    #[test]
+    fn memoir_search_all_params_accepts_string_limit() {
+        let params: MemoirSearchAllParams =
+            serde_json::from_value(json!({"query": "q", "limit": "25"}))
+                .expect("string limit should deserialize");
+        assert_eq!(params.limit, Some(25));
+    }
+
+    #[test]
+    fn memoir_inspect_params_accepts_string_depth() {
+        let params: MemoirInspectParams = serde_json::from_value(
+            json!({"memoir": "m", "name": "c", "depth": "2"}),
+        )
+        .expect("string depth should deserialize");
+        assert_eq!(params.depth, Some(2));
+    }
+
+    #[test]
+    fn memoir_inspect_params_accepts_number_depth() {
+        let params: MemoirInspectParams = serde_json::from_value(
+            json!({"memoir": "m", "name": "c", "depth": 2}),
+        )
+        .expect("number depth should deserialize");
+        assert_eq!(params.depth, Some(2));
+    }
+
+    // ── F1 IntoJson envelope shape (guards the fallback rendering) ──────────
+
+    #[test]
+    fn memoir_export_output_json_format_returns_parsed_json() {
+        let out = MemoirExportOutput {
+            format: "json".to_string(),
+            output: r#"{"memoir": {"name": "x"}}"#.to_string(),
+        };
+        let value = out.to_json();
+        assert_eq!(
+            value.get("memoir").and_then(|m| m.get("name")).and_then(|n| n.as_str()),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn memoir_export_output_non_json_format_wraps_in_envelope() {
+        let out = MemoirExportOutput {
+            format: "ascii".to_string(),
+            output: "=== Memoir: x ===\n".to_string(),
+        };
+        let value = out.to_json();
+        assert_eq!(value.get("format").and_then(|v| v.as_str()), Some("ascii"));
+        assert_eq!(
+            value.get("output").and_then(|v| v.as_str()),
+            Some("=== Memoir: x ===\n")
+        );
     }
 }
