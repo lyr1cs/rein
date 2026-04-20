@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 
@@ -116,10 +117,7 @@ pub struct OpsRestEntry {
         query: String,
         body: Option<Bytes>,
     ) -> Pin<
-        Box<
-            dyn Future<Output = ReinResult<(hyper::StatusCode, Bytes, &'static str)>>
-                + Send,
-        >,
+        Box<dyn Future<Output = ReinResult<(hyper::StatusCode, Bytes, &'static str)>> + Send>,
     >,
 }
 
@@ -137,6 +135,99 @@ pub struct OpsMetadata {
     pub rest_path: Option<&'static str>,
     pub auth_policy: AuthPolicy,
     pub params_schema: fn() -> schemars::Schema,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InventoryDuplicateReport {
+    pub cli_names: Vec<String>,
+    pub mcp_names: Vec<String>,
+    pub rest_routes: Vec<String>,
+}
+
+impl InventoryDuplicateReport {
+    pub fn is_empty(&self) -> bool {
+        self.cli_names.is_empty() && self.mcp_names.is_empty() && self.rest_routes.is_empty()
+    }
+
+    pub fn messages(&self) -> Vec<String> {
+        let mut messages = Vec::new();
+        if !self.cli_names.is_empty() {
+            messages.push(format!(
+                "duplicate CLI command names: {}",
+                self.cli_names.join(", ")
+            ));
+        }
+        if !self.mcp_names.is_empty() {
+            messages.push(format!(
+                "duplicate MCP tool names: {}",
+                self.mcp_names.join(", ")
+            ));
+        }
+        if !self.rest_routes.is_empty() {
+            messages.push(format!(
+                "duplicate REST method/path registrations: {}",
+                self.rest_routes.join(", ")
+            ));
+        }
+        messages
+    }
+}
+
+pub fn duplicate_report() -> InventoryDuplicateReport {
+    let mut report = InventoryDuplicateReport::default();
+
+    let mut cli_seen: HashMap<&'static str, &'static str> = HashMap::new();
+    for entry in inventory::iter::<OpsCliEntry>() {
+        if let Some(prev) = cli_seen.insert(entry.name, entry.op_name) {
+            report
+                .cli_names
+                .push(format!("{} ({} vs {})", entry.name, prev, entry.op_name));
+        }
+    }
+
+    let mut mcp_seen: HashMap<&'static str, &'static str> = HashMap::new();
+    for entry in inventory::iter::<OpsMcpEntry>() {
+        if let Some(prev) = mcp_seen.insert(entry.mcp_name, entry.op_name) {
+            report.mcp_names.push(format!(
+                "{} ({} vs {})",
+                entry.mcp_name, prev, entry.op_name
+            ));
+        }
+    }
+
+    let mut rest_seen: HashMap<(String, &'static str), &'static str> = HashMap::new();
+    for entry in inventory::iter::<OpsRestEntry>() {
+        let key = (entry.method.as_str().to_string(), entry.path_template);
+        if let Some(prev) = rest_seen.insert(key.clone(), entry.op_name) {
+            report.rest_routes.push(format!(
+                "{} {} ({} vs {})",
+                key.0, key.1, prev, entry.op_name
+            ));
+        }
+    }
+
+    report.cli_names.sort();
+    report.cli_names.dedup();
+    report.mcp_names.sort();
+    report.mcp_names.dedup();
+    report.rest_routes.sort();
+    report.rest_routes.dedup();
+    report
+}
+
+pub fn ensure_unique_registrations() {
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = RESULT.get_or_init(|| {
+        let report = duplicate_report();
+        if report.is_empty() {
+            Ok(())
+        } else {
+            Err(report.messages().join("; "))
+        }
+    });
+    if let Err(message) = result {
+        panic!("duplicate inventory registration detected: {message}");
+    }
 }
 
 inventory::collect!(OpsCliEntry);

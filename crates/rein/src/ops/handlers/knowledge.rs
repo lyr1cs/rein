@@ -165,9 +165,7 @@ impl IntoJson for MemoirExportOutput {
         // json. Phase 3 eliminated the F1 dispatcher hack (op_name guard)
         // by pushing the content-type decision into the op itself.
         match self.format.as_str() {
-            "ascii" | "dot" => {
-                Some(("text/plain", self.output.as_bytes().to_vec()))
-            }
+            "ascii" | "dot" => Some(("text/plain", self.output.as_bytes().to_vec())),
             _ => None,
         }
     }
@@ -445,7 +443,10 @@ impl IntoMarkdown for ConceptAddOutput {
         if self.compact {
             format!("ok:{}", self.id)
         } else {
-            format!("Added concept '{}' to memoir '{}': {}", self.name, self.memoir, self.id)
+            format!(
+                "Added concept '{}' to memoir '{}': {}",
+                self.name, self.memoir, self.id
+            )
         }
     }
 }
@@ -487,7 +488,10 @@ impl IntoMarkdown for ConceptRefineOutput {
         if self.compact {
             format!("ok:{}", self.name)
         } else {
-            format!("Refined concept '{}' in memoir '{}'", self.name, self.memoir)
+            format!(
+                "Refined concept '{}' in memoir '{}'",
+                self.name, self.memoir
+            )
         }
     }
 }
@@ -559,7 +563,7 @@ impl OpsRuntime {
         category = "knowledge",
         description = "List all memoirs (named knowledge graphs).",
         mcp(name = "rein_memoir_list"),
-        rest(method = "GET", path = "/api/memoirs"),
+        rest(method = "GET", path = "/api/memoirs")
     )]
     pub fn memoir_list(&self, _params: MemoirListParams) -> ReinResult<MemoirListOutput> {
         let compact = self.compact();
@@ -574,7 +578,7 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Show a memoir's details and list all its concepts + links.",
         mcp(name = "rein_memoir_show"),
-        rest(method = "GET", path = "/api/memoirs/{name}"),
+        rest(method = "GET", path = "/api/memoirs/{name}")
     )]
     pub fn memoir_show(&self, params: MemoirShowParams) -> ReinResult<MemoirShowOutput> {
         let compact = self.compact();
@@ -603,12 +607,9 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Create a new memoir (named knowledge graph container).",
         mutating = true,
-        mcp(name = "rein_memoir_create"),
+        mcp(name = "rein_memoir_create")
     )]
-    pub fn memoir_create(
-        &self,
-        params: MemoirCreateParams,
-    ) -> ReinResult<MemoirCreateOutput> {
+    pub fn memoir_create(&self, params: MemoirCreateParams) -> ReinResult<MemoirCreateOutput> {
         let compact = self.compact();
         let name = params.name.clone();
         self.with_store(|store| {
@@ -629,12 +630,9 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Add a concept (knowledge node) to a memoir with name, definition, and optional comma-separated labels.",
         mutating = true,
-        mcp(name = "rein_memoir_add_concept"),
+        mcp(name = "rein_memoir_add_concept")
     )]
-    pub fn memoir_add_concept(
-        &self,
-        params: ConceptAddParams,
-    ) -> ReinResult<ConceptAddOutput> {
+    pub fn memoir_add_concept(&self, params: ConceptAddParams) -> ReinResult<ConceptAddOutput> {
         let compact = self.compact();
         let name = params.name.clone();
         let memoir = params.memoir.clone();
@@ -663,7 +661,12 @@ impl OpsRuntime {
                 updated_at: chrono::Utc::now(),
             };
             let id = store.add_concept(concept)?;
-            Ok(ConceptAddOutput { id, name, memoir, compact })
+            Ok(ConceptAddOutput {
+                id,
+                name,
+                memoir,
+                compact,
+            })
         })
     }
 
@@ -672,18 +675,19 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Refine a concept: update definition, increment revision, snapshot prior revision, boost confidence.",
         mutating = true,
-        mcp(name = "rein_memoir_refine"),
+        mcp(name = "rein_memoir_refine")
     )]
-    pub fn memoir_refine(
-        &self,
-        params: ConceptRefineParams,
-    ) -> ReinResult<ConceptRefineOutput> {
+    pub fn memoir_refine(&self, params: ConceptRefineParams) -> ReinResult<ConceptRefineOutput> {
         let compact = self.compact();
         let name = params.name.clone();
         let memoir = params.memoir.clone();
         self.with_store(|store| {
             store.refine_concept(&memoir, &name, &params.definition)?;
-            Ok(ConceptRefineOutput { name, memoir, compact })
+            Ok(ConceptRefineOutput {
+                name,
+                memoir,
+                compact,
+            })
         })
     }
 
@@ -692,7 +696,7 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Create a typed relation (edge) between two concepts in the same memoir. Cross-memoir links are forbidden. Relations: part_of, depends_on, related_to, contradicts, refines, alternative_to, caused_by, instance_of, superseded_by.",
         mutating = true,
-        mcp(name = "rein_memoir_link"),
+        mcp(name = "rein_memoir_link")
     )]
     pub fn memoir_link(&self, params: LinkParams) -> ReinResult<LinkOutput> {
         let compact = self.compact();
@@ -702,9 +706,7 @@ impl OpsRuntime {
         let relation_str = params.relation.clone();
         let relation = relation_str
             .parse::<crate::types::Relation>()
-            .map_err(|e| {
-                ReinError::Config(e.to_string()).with_kind(OpsErrorKind::BadRequest)
-            })?;
+            .map_err(|e| ReinError::Config(e.to_string()).with_kind(OpsErrorKind::BadRequest))?;
         self.with_store(|store| {
             // Wrap the name→id lookups + add_link in BEGIN IMMEDIATE so a
             // concurrent delete cannot make the link reference a stale ID
@@ -713,20 +715,16 @@ impl OpsRuntime {
             let conn = store.conn();
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> ReinResult<LinkOutput> {
-                let from = store
-                    .get_concept(&memoir, &from_name)?
-                    .ok_or_else(|| {
-                        ReinError::NotFound(format!(
-                            "concept '{from_name}' not found in memoir '{memoir}'"
-                        ))
-                    })?;
-                let to = store
-                    .get_concept(&memoir, &to_name)?
-                    .ok_or_else(|| {
-                        ReinError::NotFound(format!(
-                            "concept '{to_name}' not found in memoir '{memoir}'"
-                        ))
-                    })?;
+                let from = store.get_concept(&memoir, &from_name)?.ok_or_else(|| {
+                    ReinError::NotFound(format!(
+                        "concept '{from_name}' not found in memoir '{memoir}'"
+                    ))
+                })?;
+                let to = store.get_concept(&memoir, &to_name)?.ok_or_else(|| {
+                    ReinError::NotFound(format!(
+                        "concept '{to_name}' not found in memoir '{memoir}'"
+                    ))
+                })?;
                 let link = crate::types::ConceptLink {
                     id: String::new(),
                     source_id: from.id,
@@ -763,12 +761,9 @@ impl OpsRuntime {
         name = "memoir_search",
         category = "knowledge",
         description = "Full-text search for concepts within a single memoir.",
-        mcp(name = "rein_memoir_search"),
+        mcp(name = "rein_memoir_search")
     )]
-    pub fn memoir_search(
-        &self,
-        params: MemoirSearchParams,
-    ) -> ReinResult<ConceptSearchOutput> {
+    pub fn memoir_search(&self, params: MemoirSearchParams) -> ReinResult<ConceptSearchOutput> {
         let compact = self.compact();
         let limit = params.limit.unwrap_or(10).min(100);
         let memoir = params.memoir.clone();
@@ -783,7 +778,7 @@ impl OpsRuntime {
         name = "memoir_search_all",
         category = "knowledge",
         description = "Full-text search for concepts across all memoirs.",
-        mcp(name = "rein_memoir_search_all"),
+        mcp(name = "rein_memoir_search_all")
     )]
     pub fn memoir_search_all(
         &self,
@@ -802,12 +797,9 @@ impl OpsRuntime {
         name = "memoir_inspect",
         category = "knowledge",
         description = "Inspect a concept's neighborhood via BFS traversal. Returns the concept, its neighbors, and connecting links up to the specified depth.",
-        mcp(name = "rein_memoir_inspect"),
+        mcp(name = "rein_memoir_inspect")
     )]
-    pub fn memoir_inspect(
-        &self,
-        params: MemoirInspectParams,
-    ) -> ReinResult<MemoirInspectOutput> {
+    pub fn memoir_inspect(&self, params: MemoirInspectParams) -> ReinResult<MemoirInspectOutput> {
         let compact = self.compact();
         let depth = params.depth.unwrap_or(1).min(5);
         let memoir = params.memoir.clone();
@@ -828,7 +820,7 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Export a memoir's knowledge graph. Formats: json (structured), ascii (human-readable), dot (Graphviz).",
         mcp(name = "rein_memoir_export"),
-        rest(method = "GET", path = "/api/memoirs/{name}/export"),
+        rest(method = "GET", path = "/api/memoirs/{name}/export")
     )]
     pub fn memoir_export(&self, params: MemoirExportParams) -> ReinResult<MemoirExportOutput> {
         let format = params
@@ -854,8 +846,48 @@ impl OpsRuntime {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     // ── F2 wire-compat regression tests ─────────────────────────────────────
+
+    fn runtime_with_seeded_memoir(
+        memoir_name: &str,
+    ) -> (Arc<crate::ops::OpsRuntime>, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        let config = Arc::new(config);
+        let store = config.open_store().expect("open seeded store");
+        store
+            .create_memoir(crate::types::Memoir {
+                id: String::new(),
+                name: memoir_name.to_string(),
+                description: "seeded memoir".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .expect("create memoir");
+        store
+            .add_concept(crate::types::Concept {
+                id: String::new(),
+                memoir_id: memoir_name.to_string(),
+                name: "concept-alpha".to_string(),
+                definition: "seeded concept".to_string(),
+                labels: vec!["seed".to_string()],
+                source_memory_ids: vec![],
+                confidence: 0.9,
+                revision: 1,
+                last_episode_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .expect("add concept");
+        (Arc::new(crate::ops::OpsRuntime::for_rest(config)), tmp)
+    }
 
     #[test]
     fn memoir_export_params_accepts_legacy_memoir_field_alias() {
@@ -867,29 +899,26 @@ mod tests {
 
     #[test]
     fn memoir_export_params_accepts_canonical_name_field() {
-        let params: MemoirExportParams = serde_json::from_value(
-            json!({"name": "foo", "format": "ascii"}),
-        )
-        .expect("canonical field should deserialize");
+        let params: MemoirExportParams =
+            serde_json::from_value(json!({"name": "foo", "format": "ascii"}))
+                .expect("canonical field should deserialize");
         assert_eq!(params.name, "foo");
         assert_eq!(params.format.as_deref(), Some("ascii"));
     }
 
     #[test]
     fn memoir_search_params_accepts_string_limit() {
-        let params: MemoirSearchParams = serde_json::from_value(
-            json!({"memoir": "m", "query": "q", "limit": "10"}),
-        )
-        .expect("string limit should deserialize");
+        let params: MemoirSearchParams =
+            serde_json::from_value(json!({"memoir": "m", "query": "q", "limit": "10"}))
+                .expect("string limit should deserialize");
         assert_eq!(params.limit, Some(10));
     }
 
     #[test]
     fn memoir_search_params_accepts_number_limit() {
-        let params: MemoirSearchParams = serde_json::from_value(
-            json!({"memoir": "m", "query": "q", "limit": 10}),
-        )
-        .expect("number limit should deserialize");
+        let params: MemoirSearchParams =
+            serde_json::from_value(json!({"memoir": "m", "query": "q", "limit": 10}))
+                .expect("number limit should deserialize");
         assert_eq!(params.limit, Some(10));
     }
 
@@ -903,19 +932,17 @@ mod tests {
 
     #[test]
     fn memoir_inspect_params_accepts_string_depth() {
-        let params: MemoirInspectParams = serde_json::from_value(
-            json!({"memoir": "m", "name": "c", "depth": "2"}),
-        )
-        .expect("string depth should deserialize");
+        let params: MemoirInspectParams =
+            serde_json::from_value(json!({"memoir": "m", "name": "c", "depth": "2"}))
+                .expect("string depth should deserialize");
         assert_eq!(params.depth, Some(2));
     }
 
     #[test]
     fn memoir_inspect_params_accepts_number_depth() {
-        let params: MemoirInspectParams = serde_json::from_value(
-            json!({"memoir": "m", "name": "c", "depth": 2}),
-        )
-        .expect("number depth should deserialize");
+        let params: MemoirInspectParams =
+            serde_json::from_value(json!({"memoir": "m", "name": "c", "depth": 2}))
+                .expect("number depth should deserialize");
         assert_eq!(params.depth, Some(2));
     }
 
@@ -929,7 +956,10 @@ mod tests {
         };
         let value = out.to_json();
         assert_eq!(
-            value.get("memoir").and_then(|m| m.get("name")).and_then(|n| n.as_str()),
+            value
+                .get("memoir")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str()),
             Some("x")
         );
     }
@@ -966,6 +996,57 @@ mod tests {
             format: "json".to_string(),
             output: r#"{"memoir": {"name": "x"}}"#.to_string(),
         };
-        assert!(out.to_raw_response().is_none(), "json must go through IntoJson::to_json");
+        assert!(
+            out.to_raw_response().is_none(),
+            "json must go through IntoJson::to_json"
+        );
+    }
+
+    #[tokio::test]
+    async fn memoir_export_rest_invoke_uses_into_json_contract() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("wire-export");
+        let entry = inventory::iter::<crate::ops::OpsRestEntry>()
+            .find(|e| e.op_name == "memoir_export")
+            .expect("memoir_export REST entry");
+        let (_status, body, content_type) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::from([("name", "wire-export".to_string())]),
+            "format=json".to_string(),
+            None,
+        )
+        .await
+        .expect("memoir_export invoke");
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("memoir_export body is valid JSON");
+        assert!(
+            value.get("concepts").is_some(),
+            "REST adapter must serialize IntoJson::to_json() output, got {value}"
+        );
+        assert!(
+            value.get("format").is_none() && value.get("output").is_none(),
+            "REST adapter must not leak the raw Serialize shape, got {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memoir_show_mcp_invoke_uses_into_json_contract() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("wire-show");
+        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .find(|e| e.op_name == "memoir_show")
+            .expect("memoir_show MCP entry");
+        let out = (entry.invoke)(runtime, json!({ "name": "wire-show" }))
+            .await
+            .expect("memoir_show invoke");
+        let value: serde_json::Value =
+            serde_json::from_str(&out).expect("memoir_show MCP output is valid JSON");
+        assert!(
+            value.get("concepts").is_some(),
+            "MCP adapter must serialize IntoJson::to_json() output, got {value}"
+        );
+        assert!(
+            value.get("ascii").is_none(),
+            "MCP adapter must not leak the raw Serialize shape, got {value}"
+        );
     }
 }

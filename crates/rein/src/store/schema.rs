@@ -4,6 +4,34 @@ use std::sync::Once;
 
 static SQLITE_VEC_INIT: Once = Once::new();
 
+/// DDL for every trigger that hangs off the `memories` table.
+///
+/// Any migration that renames/drops `memories` MUST re-run this block —
+/// SQLite tears down all triggers when the owning table is dropped, and
+/// if any trigger is missing after the migration, its side-effects
+/// (FTS population, `memory_canonical_state` backfill) silently stop
+/// firing for every row inserted afterward.
+const MEMORIES_TRIGGERS_SQL: &str = "\
+    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN \
+        INSERT INTO memories_fts(id, topic, summary, content, keywords) \
+        VALUES (new.id, new.topic, new.summary, new.content, new.keywords); \
+    END; \
+    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories \
+        WHEN old.content != new.content OR old.topic != new.topic \
+          OR old.summary != new.summary OR old.keywords != new.keywords \
+    BEGIN \
+        DELETE FROM memories_fts WHERE id = old.id; \
+        INSERT INTO memories_fts(id, topic, summary, content, keywords) \
+        VALUES (new.id, new.topic, new.summary, new.content, new.keywords); \
+    END; \
+    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN \
+        DELETE FROM memories_fts WHERE id = old.id; \
+    END; \
+    CREATE TRIGGER IF NOT EXISTS memories_canonical_ai AFTER INSERT ON memories BEGIN \
+        INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id) \
+        VALUES (new.id, new.id); \
+    END;";
+
 /// Initialize sqlite-vec extension. Must be called before creating any connection.
 ///
 /// # Safety
@@ -62,7 +90,9 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             tokenize='unicode61'
         );
 
-        -- Triggers to keep FTS in sync
+        -- Triggers to keep FTS + canonical_state in sync.
+        -- DDL duplicated as MEMORIES_TRIGGERS_SQL below; any `DROP TABLE memories`
+        -- migration MUST re-run that const or canonical bookkeeping silently stops.
         CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
             INSERT INTO memories_fts(id, topic, summary, content, keywords)
             VALUES (new.id, new.topic, new.summary, new.content, new.keywords);
@@ -577,6 +607,36 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
         return Ok(());
     }
 
+    // SQLite's default `ALTER TABLE … RENAME` (since 3.25) rewrites every
+    // reference to the renamed table in other objects — including the
+    // `REFERENCES memories(id)` clauses on `memory_canonical_state`,
+    // `memory_evidence`, and `dedup_decisions`. Those get rewritten to
+    // `REFERENCES memories_old`, and when we subsequently DROP
+    // `memories_old` the dependent FKs become dangling pointers that
+    // cascade into "no such table: memories_old" errors on the next
+    // INSERT into the new `memories` (via trigger-driven
+    // INSERT INTO memory_canonical_state).
+    //
+    // Setting `legacy_alter_table = 1` restores pre-3.25 behavior: the
+    // rename updates ONLY the renamed table, leaving every `REFERENCES
+    // memories(id)` in dependent schemas correctly pointing at whatever
+    // table we create next under the name `memories`. That is exactly the
+    // semantics this migration wants.
+    //
+    // We also toggle `foreign_keys` off so the transaction body can
+    // execute DDL without intermediate FK checks; both pragmas are
+    // restored to their caller-observed state before returning.
+    let fk_was_on: bool = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    let legacy_was_on: bool = conn
+        .query_row("PRAGMA legacy_alter_table", [], |r| r.get::<_, i64>(0))
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = 1;")
+        .map_err(crate::types::ReinError::Database)?;
+
     // Wrap entire migration in an EXCLUSIVE transaction to prevent corruption on crash
     conn.execute_batch("BEGIN EXCLUSIVE")
         .map_err(crate::types::ReinError::Database)?;
@@ -653,39 +713,59 @@ fn migrate_source_check(conn: &Connection) -> ReinResult<()> {
         )
         .map_err(crate::types::ReinError::Database)?;
 
-        // Recreate FTS triggers destroyed by table rename (they reference the old table)
+        // Recreate every trigger destroyed by the table rename. Before v0.21.0
+        // this only covered the three FTS triggers, silently leaving
+        // `memories_canonical_ai` gone on migrated databases — new inserts then
+        // failed to populate `memory_canonical_state`, breaking canonical_id_for,
+        // support/diversity signals, and dedup bookkeeping. Now sourced from the
+        // single `MEMORIES_TRIGGERS_SQL` const so future migrations can't drift.
+        // Explicitly drop any triggers SQLite auto-renamed to `memories_old`
+        // during step 1. Without this, `CREATE TRIGGER IF NOT EXISTS` below
+        // is a no-op (name already in sqlite_master), the trigger stays
+        // bound to `memories_old`, and gets silently destroyed by the
+        // subsequent `DROP TABLE memories_old` — leaving `memories` with no
+        // triggers at all after migration.
         conn.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN \
-                INSERT INTO memories_fts(id, topic, summary, content, keywords) \
-                VALUES (new.id, new.topic, new.summary, new.content, new.keywords); \
-             END; \
-             CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories \
-                WHEN old.content != new.content OR old.topic != new.topic \
-                  OR old.summary != new.summary OR old.keywords != new.keywords \
-             BEGIN \
-                DELETE FROM memories_fts WHERE id = old.id; \
-                INSERT INTO memories_fts(id, topic, summary, content, keywords) \
-                VALUES (new.id, new.topic, new.summary, new.content, new.keywords); \
-             END; \
-             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN \
-                DELETE FROM memories_fts WHERE id = old.id; \
-             END;",
+            "DROP TRIGGER IF EXISTS memories_ai; \
+             DROP TRIGGER IF EXISTS memories_au; \
+             DROP TRIGGER IF EXISTS memories_ad; \
+             DROP TRIGGER IF EXISTS memories_canonical_ai;",
+        )
+        .map_err(crate::types::ReinError::Database)?;
+
+        conn.execute_batch(MEMORIES_TRIGGERS_SQL)
+            .map_err(crate::types::ReinError::Database)?;
+
+        // Backfill canonical_state for rows copied in above so they match what
+        // the trigger would have inserted on a fresh write.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id) \
+             SELECT id, id FROM memories;",
         )
         .map_err(crate::types::ReinError::Database)?;
 
         Ok(())
     })();
 
-    match migration_result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")
-                .map_err(crate::types::ReinError::Database)?;
-        }
+    let commit_result = match migration_result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(crate::types::ReinError::Database),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
+            Err(e)
         }
+    };
+
+    // Restore the pragmas to caller-observed state regardless of outcome.
+    if fk_was_on {
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
     }
+    if !legacy_was_on {
+        let _ = conn.execute_batch("PRAGMA legacy_alter_table = 0");
+    }
+
+    commit_result?;
 
     tracing::info!("migrated source CHECK to include 'proxy'");
     Ok(())
@@ -934,4 +1014,129 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
         let _ = conn.execute_batch("RELEASE replace_vector_index_staged");
     }
     result
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Builds a file-backed DB that looks like a pre-proxy v0.9.3 database:
+    /// `source` CHECK without 'proxy', so the next `init_schema` triggers
+    /// `migrate_source_check` — the exact path that used to drop the
+    /// `memories_canonical_ai` trigger without recreating it.
+    fn seed_pre_proxy_db() -> NamedTempFile {
+        let file = NamedTempFile::new().expect("tempfile");
+        let conn = Connection::open(file.path()).expect("open");
+        init_sqlite_vec();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 layer TEXT NOT NULL,
+                 topic TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 keywords TEXT NOT NULL DEFAULT '[]',
+                 importance TEXT NOT NULL,
+                 source TEXT NOT NULL CHECK(source IN ('manual','hook','migration','supermemory')),
+                 strength REAL NOT NULL,
+                 decay_lambda REAL NOT NULL,
+                 access_count INTEGER NOT NULL DEFAULT 0,
+                 superseded_by TEXT,
+                 related_ids TEXT NOT NULL DEFAULT '[]',
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_accessed TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 concept_ids TEXT NOT NULL DEFAULT '[]',
+                 tier TEXT NOT NULL DEFAULT 'warm',
+                 cluster_id INTEGER,
+                 needs_vec_dedup INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO memories (id, layer, topic, summary, content, importance, source,
+                 strength, decay_lambda, created_at, updated_at, last_accessed)
+             VALUES ('legacy-1', 'LTM', 't', 's', 'c', 'medium', 'manual',
+                 1.0, 0.0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .expect("seed");
+        file
+    }
+
+    /// Regression test for the v0.21.0 migration-trigger bug:
+    /// after `migrate_source_check` drops+recreates `memories`, every trigger
+    /// on the table must still fire. Previously only FTS triggers were
+    /// recreated, so `memories_canonical_ai` was silently lost and
+    /// `memory_canonical_state` rows for new inserts were never created.
+    #[test]
+    fn migrate_source_check_recreates_canonical_trigger() {
+        let file = seed_pre_proxy_db();
+        let conn = Connection::open(file.path()).unwrap();
+        // Running init_schema triggers migrate_source_check on a file-backed
+        // DB whose `source` CHECK doesn't allow 'proxy'.
+        init_schema(&conn, 4).expect("init_schema after migration");
+
+        // Dump post-migration schema — any object whose SQL still references
+        // `memories_old` is a dangling reference that will explode on the
+        // next INSERT into `memories`.
+        let dangling: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_master \
+                      WHERE sql LIKE '%memories_old%'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            dangling.is_empty(),
+            "schema objects still reference memories_old after migration: {:?}",
+            dangling
+        );
+
+        // A fresh insert post-migration must populate memory_canonical_state
+        // via the canonical_ai trigger — this is what used to silently fail.
+        conn.execute_batch(
+            "INSERT INTO memories (id, layer, topic, summary, content, importance, source,
+                 strength, decay_lambda, created_at, updated_at, last_accessed)
+             VALUES ('post-mig-1', 'LTM', 't', 's', 'c', 'medium', 'proxy',
+                 1.0, 0.0, '2026-04-20T00:00:00Z', '2026-04-20T00:00:00Z', '2026-04-20T00:00:00Z');",
+        )
+        .unwrap();
+
+        let canonical: Option<String> = conn
+            .query_row(
+                "SELECT canonical_id FROM memory_canonical_state WHERE memory_id = 'post-mig-1'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(
+            canonical.as_deref(),
+            Some("post-mig-1"),
+            "memories_canonical_ai trigger must fire on post-migration inserts"
+        );
+
+        // Pre-existing rows carried through the migration are backfilled.
+        let backfilled: Option<String> = conn
+            .query_row(
+                "SELECT canonical_id FROM memory_canonical_state WHERE memory_id = 'legacy-1'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(backfilled.as_deref(), Some("legacy-1"));
+
+        // FTS triggers must still be intact too — sanity check against future regressions.
+        let fts_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE id = 'post-mig-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_hit, 1, "memories_ai trigger must also survive migration");
+    }
 }

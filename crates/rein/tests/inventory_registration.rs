@@ -51,7 +51,10 @@ fn stats_schema_is_empty_object() {
     let value: serde_json::Value = serde_json::to_value(schema).expect("schema to json");
     assert_eq!(value["type"], "object");
     assert!(
-        value["properties"].as_object().map(|o| o.is_empty()).unwrap_or(false),
+        value["properties"]
+            .as_object()
+            .map(|o| o.is_empty())
+            .unwrap_or(false),
         "no-params op should have empty properties object"
     );
 }
@@ -84,7 +87,11 @@ fn health_registers_with_params_schema() {
 fn runtime_for_test() -> (Arc<OpsRuntime>, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let runtime = Arc::new(OpsRuntime::for_cli(Arc::new(config)));
     (runtime, tmp)
 }
@@ -132,7 +139,11 @@ async fn health_cli_invoke_fn_pointer_handles_no_topic() {
 async fn stats_rest_invoke_fn_pointer_returns_json() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let runtime = Arc::new(OpsRuntime::for_rest(Arc::new(config)));
 
     let entry = inventory::iter::<OpsRestEntry>()
@@ -182,6 +193,16 @@ fn migrated_ops_default_to_public_auth_policy() {
             "REST entry for '{op_name}' must mirror metadata auth_policy"
         );
     }
+}
+
+#[test]
+fn inventory_registrations_are_unique_across_all_surfaces() {
+    let report = rein::ops::inventory::duplicate_report();
+    assert!(
+        report.is_empty(),
+        "inventory registrations must be unique across CLI/MCP/REST, got {:?}",
+        report.messages()
+    );
 }
 
 #[test]
@@ -302,7 +323,11 @@ fn adaptive_status_registers_on_all_three_surfaces() {
 async fn health_rest_preserves_legacy_top_level_health_key() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = ReinConfig::default();
-    config.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    config.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     let runtime = Arc::new(OpsRuntime::for_rest(Arc::new(config)));
 
     let entry = inventory::iter::<OpsRestEntry>()

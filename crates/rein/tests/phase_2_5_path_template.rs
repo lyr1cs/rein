@@ -78,7 +78,11 @@ fn path_template_emits_path_segments() {
     assert_eq!(entry.path_template, "/api/test_path_template/{id}");
 
     let segs = entry.path_segments;
-    assert_eq!(segs.len(), 3, "expected 3 segments for /api/test_path_template/{{id}}");
+    assert_eq!(
+        segs.len(),
+        3,
+        "expected 3 segments for /api/test_path_template/{{id}}"
+    );
     assert_eq!(segs[0], PathSegment::Literal("api"));
     assert_eq!(segs[1], PathSegment::Literal("test_path_template"));
     assert_eq!(segs[2], PathSegment::Param("id"));
@@ -104,7 +108,11 @@ async fn dispatcher_exact_match_still_works() {
     let cfg = test_config();
     let req = get_req("/api/stats");
     let (status, _) = dispatch(&req, &cfg).await.expect("stats should respond");
-    assert_eq!(status, StatusCode::OK, "exact-match stats should return 200");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "exact-match stats should return 200"
+    );
 }
 
 #[tokio::test]
@@ -114,7 +122,11 @@ async fn dispatcher_matches_template_path() {
     let (status, body) = dispatch(&req, &cfg)
         .await
         .expect("template route should respond");
-    assert_eq!(status, StatusCode::OK, "template match should return 200, body={body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "template match should return 200, body={body}"
+    );
     assert_eq!(
         body["echoed_id"].as_str(),
         Some("hello"),
@@ -142,9 +154,7 @@ async fn path_value_overrides_query_string() {
     let cfg = test_config();
     // Path says "abc", query says "xyz" — path must win.
     let req = get_req("/api/test_path_template/abc?id=xyz");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
     assert_eq!(
         body["echoed_id"].as_str(),
@@ -160,14 +170,29 @@ async fn percent_encoded_segment_decodes_correctly() {
     let cfg = test_config();
     // %20 = space
     let req = get_req("/api/test_path_template/hello%20world");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should decode space, body={body}");
     assert_eq!(
         body["echoed_id"].as_str(),
         Some("hello world"),
         "percent-encoded space should decode to ' '"
+    );
+}
+
+#[tokio::test]
+async fn literal_plus_in_path_segment_is_preserved() {
+    let cfg = test_config();
+    let req = get_req("/api/test_path_template/C++");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "should preserve literal plus signs, body={body}"
+    );
+    assert_eq!(
+        body["echoed_id"].as_str(),
+        Some("C++"),
+        "path binding must preserve literal '+' in path segments"
     );
 }
 
@@ -178,9 +203,7 @@ async fn percent_encoded_slash_does_not_cross_segment_boundary() {
     // a 3-segment path after leading-strip, matching the template exactly.
     // The decoded id should be "a/b" (a slash character as value).
     let req = get_req("/api/test_path_template/a%2Fb");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should match template, body={body}");
     // The id includes the decoded slash literal.
     let echoed = body["echoed_id"].as_str().unwrap_or("");
@@ -260,9 +283,7 @@ async fn get_path_param_with_encoded_ampersand_does_not_inject() {
     // The fix (serde_urlencoded::to_string re-encodes values) ensures the full
     // decoded value is bound as `id`.
     let req = get_req("/api/test_path_template/a%26admin%3D1");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
     assert_eq!(
         body["echoed_id"].as_str(),
@@ -278,9 +299,7 @@ async fn get_path_param_with_encoded_equals_does_not_forge_key() {
     // serde_urlencoded would parse as id="foo=bar" — but only because the '='
     // is already encoded. The re-encoding path must still produce the right id.
     let req = get_req("/api/test_path_template/foo%3Dbar");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
     assert_eq!(
         body["echoed_id"].as_str(),
@@ -294,9 +313,7 @@ async fn get_path_param_with_percent_literal_survives_roundtrip() {
     let cfg = test_config();
     // %25 decodes to '%'. Re-encoding must produce %25 again.
     let req = get_req("/api/test_path_template/100%25pure");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
     assert_eq!(
         body["echoed_id"].as_str(),
@@ -311,9 +328,7 @@ async fn get_path_param_with_encoded_hash_does_not_split_fragment() {
     // %23 decodes to '#' (URL fragment delimiter). Naive string concat could
     // confuse URL parsers; structured re-encoding preserves the literal '#'.
     let req = get_req("/api/test_path_template/tag%23123");
-    let (status, body) = dispatch(&req, &cfg)
-        .await
-        .expect("route should respond");
+    let (status, body) = dispatch(&req, &cfg).await.expect("route should respond");
     assert_eq!(status, StatusCode::OK, "should succeed, body={body}");
     assert_eq!(
         body["echoed_id"].as_str(),
@@ -395,7 +410,11 @@ async fn templated_mutation_route_auth_rejects_before_body_cap() {
     use tempfile::tempdir;
     let dir = tempdir().unwrap();
     let mut cfg = ReinConfig::default();
-    cfg.database.path = dir.path().join("memories.db").to_string_lossy().into_owned();
+    cfg.database.path = dir
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
 
     let big_body = Bytes::from(vec![b'x'; 2 * 1024 * 1024]);
     let req = post_req_with_body("/api/test_path_template_mut/abc", big_body);
