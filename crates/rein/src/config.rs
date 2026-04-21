@@ -1,5 +1,7 @@
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Typed provider enum for compile-time safety.
 /// Parsed from String in config, prevents typo-driven misconfiguration.
@@ -1127,12 +1129,44 @@ impl ReinConfig {
     }
 
     /// Open a SqliteStore with the current config's model and dimensions.
+    ///
+    /// v0.22 P1: when the caller is inside a Tokio runtime AND the DB is
+    /// file-backed AND `REIN_ASYNC_P1` is not `0`, attach a process-level
+    /// connection pool keyed by path. `recall`'s 3-channel fanout uses the
+    /// pool to elide per-channel schema-init + embedding-model checks.
+    /// Non-tokio callers (CLI direct invocations) and `:memory:` DBs
+    /// bypass the pool entirely and use the pre-v0.22 path.
     pub fn open_store(&self) -> crate::types::ReinResult<crate::store::SqliteStore> {
-        crate::store::SqliteStore::new(
-            &self.resolve_db_path(),
+        let db_path = self.resolve_db_path();
+        let store = crate::store::SqliteStore::new(
+            &db_path,
             &self.embedding_model(),
             self.embedding.dimensions,
-        )
+        )?;
+
+        // Opt-out: REIN_ASYNC_P1=0 disables the pool path entirely.
+        // Read per-call (not cached): tests and `doctor --fix` can toggle it
+        // mid-process. The cost is a ~100ns env lookup against a ~ms-scale
+        // store open — negligible, and preserves test-time controllability.
+        if std::env::var("REIN_ASYNC_P1").ok().as_deref() == Some("0") {
+            return Ok(store);
+        }
+        // In-memory DBs cannot share connections — each new conn opens a
+        // distinct empty DB. Bypass the pool at init time, not at recall
+        // use site, so the `is_memory_db` guards in recall.rs stay
+        // consistent with the store carrying no pool.
+        if db_path.to_str() == Some(":memory:") {
+            return Ok(store);
+        }
+        // Non-tokio callers (e.g. the CLI direct path) would have the pool
+        // ignored by recall.rs via `Handle::try_current()` anyway; skipping
+        // cache+build here saves the setup cost and keeps those paths
+        // bit-identical to the pre-v0.22 behavior.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Ok(store);
+        }
+        let pool = pool_for_path(&db_path)?;
+        Ok(store.with_pool(pool))
     }
 
     /// Resolve the database path. `"auto"` → `~/.rein/memories.db`
@@ -1165,6 +1199,49 @@ impl ReinConfig {
             PathBuf::from(&self.database.path)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.22 P1 process-level pool cache (keyed by DB path).
+//
+// Keyed by PathBuf, not singleton: cargo integration tests run in parallel
+// inside one process, each with its own `TempDir::new()` → unique db_path.
+// A singleton pool would pin to whichever path wins the init race and silently
+// serve every subsequent test from the wrong DB.
+//
+// Weak<ConnPool>, not Arc<ConnPool>: when the last `SqliteStore` holding the
+// strong ref drops (e.g. a test's TempDir destructor tears down with it), the
+// pool and its connections drop with it → file descriptors are reclaimed
+// promptly. Without `Weak`, 58 tempdir tests would leak ~464 fds across a run.
+// Opportunistic `retain` in `pool_for_path` prunes dead weak entries so the
+// map stays bounded by live pools, not ever-seen pools.
+// ---------------------------------------------------------------------------
+
+static OPEN_STORE_POOL_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, Weak<crate::store::pool::ConnPool>>>,
+> = OnceLock::new();
+
+fn pool_cache() -> &'static Mutex<HashMap<PathBuf, Weak<crate::store::pool::ConnPool>>> {
+    OPEN_STORE_POOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pool_for_path(
+    db_path: &Path,
+) -> crate::types::ReinResult<Arc<crate::store::pool::ConnPool>> {
+    let mut map = pool_cache()
+        .lock()
+        .expect("open_store pool cache mutex poisoned");
+    // Opportunistic prune: drop entries whose `SqliteStore` holders are gone.
+    map.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(weak) = map.get(db_path) {
+        if let Some(pool) = weak.upgrade() {
+            return Ok(pool);
+        }
+    }
+    let size = crate::store::pool::default_pool_size();
+    let pool = Arc::new(crate::store::pool::ConnPool::new(db_path, size)?);
+    map.insert(db_path.to_path_buf(), Arc::downgrade(&pool));
+    Ok(pool)
 }
 
 fn validate_provider_name(field: &str, value: &str) -> anyhow::Result<()> {

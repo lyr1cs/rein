@@ -465,35 +465,30 @@ pub fn recall_temporal_with_request_id(
         let vec_dims = config.embedding.dimensions;
         let vec_limit = effective_limit;
         let vec_pool = store.pool().cloned();
-        let vec_rt_handle = tokio::runtime::Handle::try_current().ok();
         VecSearchState::Thread(std::thread::spawn(move || {
-            // Pool path: checkout a conn, wrap in from_conn (no schema
-            // init), run the search, return the conn. The pool.get()
-            // future is driven via block_on on this std thread — we are
-            // not a tokio worker, so this doesn't block the runtime.
-            if let (Some(pool), Some(handle)) = (vec_pool.as_ref(), vec_rt_handle.as_ref()) {
-                match handle.block_on(pool.get()) {
-                    Ok(guard) => {
-                        let (conn, detached) = guard.detach();
-                        let s = SqliteStore::from_conn(conn, vec_db_path.clone(), vec_dims);
-                        let result = try_vector_search(
-                            &s,
-                            &vec_config,
-                            &vec_query_str,
-                            vec_topic_str.as_deref(),
-                            vec_limit,
-                        );
-                        let conn_back = s.into_conn();
-                        detached.put_back(conn_back);
-                        return result;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "vec channel pool checkout failed; falling back to SqliteStore::new"
-                        );
-                    }
+            // Pool path: non-blocking `try_get` — on saturation fall
+            // through to the pre-v0.22 fresh-conn path rather than
+            // queueing on the semaphore and eating the per-channel
+            // budget (spec I1: pool checkout must not degrade recall
+            // semantics under load).
+            if let Some(pool) = vec_pool.as_ref() {
+                if let Some(guard) = pool.try_get() {
+                    let (conn, detached) = guard.detach();
+                    let s = SqliteStore::from_conn(conn, vec_db_path.clone(), vec_dims);
+                    let result = try_vector_search(
+                        &s,
+                        &vec_config,
+                        &vec_query_str,
+                        vec_topic_str.as_deref(),
+                        vec_limit,
+                    );
+                    let conn_back = s.into_conn();
+                    detached.put_back(conn_back);
+                    return result;
                 }
+                tracing::debug!(
+                    "vec channel pool saturated; falling back to SqliteStore::new"
+                );
             }
             // Fallback: the pre-v0.22 path. Unchanged behavior.
             let Ok(s) = SqliteStore::new(&vec_db_path, &vec_model, vec_dims) else {
@@ -587,7 +582,13 @@ pub fn recall_temporal_with_request_id(
         );
         KgState::Sync(kg_scores, episode_scores)
     } else {
-        // Normal mode: background thread, budget measured from spawn time
+        // Normal mode: background thread, budget measured from spawn time.
+        //
+        // v0.22 P1 pool path: mirror the Vec-channel treatment above —
+        // when a pool is attached AND we are inside a Tokio runtime,
+        // checkout a conn instead of opening a fresh SqliteStore. Elides
+        // schema-init + embedding-model check per channel per recall.
+        // Fallback to pre-v0.22 SqliteStore::new path otherwise.
         let kg_db_path = store.db_path().to_path_buf();
         let kg_query_str = query.to_string();
         let kg_model = config.embedding_model();
@@ -595,14 +596,41 @@ pub fn recall_temporal_with_request_id(
         let kg_effective_limit = effective_limit;
         let kg_time_from = time_from;
         let kg_time_to = time_to;
+        let kg_pool = store.pool().cloned();
         let (kg_tx, kg_rx) = std::sync::mpsc::channel();
         let kg_spawn_time = std::time::Instant::now();
         std::thread::spawn(move || {
+            let empty = || {
+                (
+                    std::collections::HashMap::<String, f32>::new(),
+                    std::collections::HashMap::<String, f32>::new(),
+                )
+            };
+            // Pool path (non-blocking — see Vec channel for rationale).
+            if let Some(pool) = kg_pool.as_ref() {
+                if let Some(guard) = pool.try_get() {
+                    let (conn, detached) = guard.detach();
+                    let s = SqliteStore::from_conn(conn, kg_db_path.clone(), kg_dims);
+                    let result = run_kg_search(
+                        &s,
+                        &kg_query_str,
+                        kg_effective_limit,
+                        kg_is_episodic,
+                        kg_time_from,
+                        kg_time_to,
+                    );
+                    let conn_back = s.into_conn();
+                    detached.put_back(conn_back);
+                    let _ = kg_tx.send(result);
+                    return;
+                }
+                tracing::debug!(
+                    "kg channel pool saturated; falling back to SqliteStore::new"
+                );
+            }
+            // Fallback path (unchanged pre-v0.22 behavior).
             let Ok(s) = SqliteStore::new(&kg_db_path, &kg_model, kg_dims) else {
-                let _ = kg_tx.send((
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                ));
+                let _ = kg_tx.send(empty());
                 return;
             };
             let result = run_kg_search(
@@ -762,6 +790,8 @@ pub fn recall_temporal_with_request_id(
                 }
             }
         } else {
+            // v0.22 P1 pool path (same rationale as Vec / normal-mode KG above).
+            let shared_pool = store.pool().cloned();
             let kg_handles: Vec<_> = deduped_queries
                 .iter()
                 .map(|eq| {
@@ -773,12 +803,30 @@ pub fn recall_temporal_with_request_id(
                     let is_ep = kg_is_episodic;
                     let t_from = time_from;
                     let t_to = time_to;
+                    let pool = shared_pool.clone();
                     std::thread::spawn(move || {
-                        let Ok(s) = SqliteStore::new(&db_path, &model, dims) else {
-                            return (
+                        let empty = || {
+                            (
                                 std::collections::HashMap::<String, f32>::new(),
                                 std::collections::HashMap::<String, f32>::new(),
+                            )
+                        };
+                        if let Some(pool) = pool.as_ref() {
+                            if let Some(guard) = pool.try_get() {
+                                let (conn, detached) = guard.detach();
+                                let s = SqliteStore::from_conn(conn, db_path.clone(), dims);
+                                let result =
+                                    run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to);
+                                let conn_back = s.into_conn();
+                                detached.put_back(conn_back);
+                                return result;
+                            }
+                            tracing::debug!(
+                                "expanded kg pool saturated; falling back to SqliteStore::new"
                             );
+                        }
+                        let Ok(s) = SqliteStore::new(&db_path, &model, dims) else {
+                            return empty();
                         };
                         run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to)
                     })
