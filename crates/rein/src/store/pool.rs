@@ -115,6 +115,33 @@ impl ConnPool {
         })
     }
 
+    /// Non-blocking acquire: return `Some(PoolGuard)` if a permit + conn
+    /// are immediately available, `None` otherwise. Unlike `get()` this
+    /// does not await, so it is safe to call from a `std::thread` without
+    /// `block_on` and does not queue under saturation.
+    ///
+    /// Used by `search/recall.rs` 3-channel fanout: when the pool is
+    /// saturated (e.g. under concurrent recall load) the channel falls
+    /// back to `SqliteStore::new` instead of queueing on the semaphore
+    /// and silently blowing its per-channel budget. This preserves the
+    /// v2.1 spec I1 "pool checkout does not degrade recall semantics"
+    /// invariant under load.
+    pub fn try_get(&self) -> Option<PoolGuard> {
+        let permit = self.inner.permits.clone().try_acquire_owned().ok()?;
+        let conn = self
+            .inner
+            .free
+            .lock()
+            .expect("pool free-list mutex poisoned")
+            .pop()
+            .expect("semaphore invariant: permit acquired implies free conn available");
+        Some(PoolGuard {
+            pool: self.inner.clone(),
+            conn: Some(conn),
+            _permit: Some(permit),
+        })
+    }
+
     pub fn size(&self) -> usize {
         self.inner.size
     }
