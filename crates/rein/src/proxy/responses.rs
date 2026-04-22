@@ -249,7 +249,8 @@ mod tests {
 
     #[test]
     fn test_extract_ws_request_query() {
-        let msg = r#"{"type":"response.create","input":[{"role":"user","content":"Hello from ws"}]}"#;
+        let msg =
+            r#"{"type":"response.create","input":[{"role":"user","content":"Hello from ws"}]}"#;
         assert_eq!(
             extract_query_ws_message(msg),
             Some("Hello from ws".to_string())

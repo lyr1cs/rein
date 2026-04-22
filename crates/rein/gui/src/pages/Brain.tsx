@@ -117,10 +117,27 @@ export default function Brain() {
   }, []);
 
   useEffect(() => {
-    const intervalId = window.setInterval(refreshGraph, getPollingIntervalMs());
-    return () => window.clearInterval(intervalId);
-  }, [refreshGraph]);
+    let cancelled = false;
+    let timeoutId: number | null = null;
 
+    // Read localStorage each cycle so Settings changes apply to the next poll.
+    const scheduleNextPoll = () => {
+      timeoutId = window.setTimeout(() => {
+        refreshGraph();
+        if (!cancelled) {
+          scheduleNextPoll();
+        }
+      }, getPollingIntervalMs());
+    };
+
+    scheduleNextPoll();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [refreshGraph]);
 
   /* ---- Fetch all data on mount ---- */
   useEffect(() => {

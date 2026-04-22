@@ -23,7 +23,9 @@ pub use adaptive::*;
 pub use consolidation::*;
 pub use dedup::*;
 pub use error::OpsErrorKind;
-pub use inventory::{AuthPolicy, OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry, PathSegment};
+pub use inventory::{
+    AuthPolicy, OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry, PathSegment,
+};
 pub use render::{IntoCliText, IntoJson, IntoMarkdown};
 pub use runtime::{OpsRuntime, SurfaceKind};
 
@@ -360,12 +362,15 @@ fn auto_concept_candidates(memory: &Memory) -> Vec<(String, &'static str)> {
     let topic = normalize_auto_concept_name(&memory.topic);
     push_auto_concept_candidate(&mut out, &mut seen, topic, "topic");
 
-    for raw in memory.keywords.iter().cloned().chain(
-        crate::extract::extract_keywords_from_text(
+    for raw in memory
+        .keywords
+        .iter()
+        .cloned()
+        .chain(crate::extract::extract_keywords_from_text(
             &format!("{} {}", memory.summary, memory.content),
             AUTO_CONCEPT_MAX_KEYWORDS,
-        ),
-    ) {
+        ))
+    {
         if out.len() >= AUTO_CONCEPT_MAX {
             break;
         }
@@ -578,12 +583,16 @@ fn build_conflict_query(memory: &Memory) -> String {
     }
 
     if parts.is_empty() {
-        for raw in memory.keywords.iter().cloned().chain(
-            crate::extract::extract_keywords_from_text(
-                &format!("{} {}", memory.summary, memory.content.replace('-', " ")),
-                AUTO_CONCEPT_MAX_KEYWORDS,
-            ),
-        ) {
+        for raw in
+            memory
+                .keywords
+                .iter()
+                .cloned()
+                .chain(crate::extract::extract_keywords_from_text(
+                    &format!("{} {}", memory.summary, memory.content.replace('-', " ")),
+                    AUTO_CONCEPT_MAX_KEYWORDS,
+                ))
+        {
             let term = normalize_conflict_query_token(&raw);
             if !is_useful_conflict_query_token(&term) || !seen.insert(term.clone()) {
                 continue;

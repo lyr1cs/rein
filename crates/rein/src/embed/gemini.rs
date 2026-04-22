@@ -95,7 +95,10 @@ async fn send_with_retry(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
                 let transient = status.as_u16() == 429 || status.is_server_error();
-                let text_body = resp.text().await.map_err(|e| ReinError::Embedding(e.to_string()))?;
+                let text_body = resp
+                    .text()
+                    .await
+                    .map_err(|e| ReinError::Embedding(e.to_string()))?;
                 if !transient || attempt >= MAX_RETRIES {
                     return Ok((status, text_body));
                 }

@@ -12,7 +12,9 @@
 //!    stale and the next `open_store` rebuilds a fresh pool.
 //! 5. `:memory:` DBs bypass the pool (store.pool() is None).
 //! 6. `REIN_ASYNC_P1=0` opt-out bypasses the pool.
-//! 7. Non-tokio (`#[test]`) callers bypass the pool.
+//! 7. Plain non-tokio (`#[test]`) callers bypass the pool.
+//! 8. A synchronous call site entered from a Tokio runtime still attaches
+//!    the pool, matching the real `#[tokio::main]` CLI behavior.
 
 use std::sync::Arc;
 
@@ -117,8 +119,29 @@ fn non_tokio_caller_bypasses_pool() {
     let store = cfg.open_store().expect("open_store in non-tokio thread");
     assert!(
         store.pool().is_none(),
-        "non-tokio caller must bypass the pool (CLI direct path)"
+        "plain non-tokio caller must bypass the pool"
     );
+}
+
+#[test]
+fn sync_call_inside_tokio_runtime_attaches_pool_like_cli_main() {
+    // `rein` uses `#[tokio::main]`, so even synchronous command handlers
+    // execute with an entered runtime. Mirror that shape with a plain
+    // `Runtime::block_on(async { ... cfg.open_store() ... })` instead of a
+    // `#[tokio::test]`, which makes the CLI/runtime contract explicit.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("cli-main.db");
+    let cfg = config_for(&db_path);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let store = runtime
+        .block_on(async { cfg.open_store() })
+        .expect("open_store inside tokio runtime");
+
+    let pool = store
+        .pool()
+        .expect("sync call site inside tokio runtime should attach pool");
+    assert_eq!(pool.db_path(), db_path);
 }
 
 // The REIN_ASYNC_P1=0 opt-out is intentionally not tested here. `set_var` is

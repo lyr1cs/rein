@@ -17,7 +17,11 @@ use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, So
 
 fn make_config(tmp: &tempfile::TempDir) -> Arc<ReinConfig> {
     let mut c = ReinConfig::default();
-    c.database.path = tmp.path().join("memories.db").to_string_lossy().into_owned();
+    c.database.path = tmp
+        .path()
+        .join("memories.db")
+        .to_string_lossy()
+        .into_owned();
     Arc::new(c)
 }
 
@@ -120,7 +124,11 @@ fn forget_rest_entry_has_correct_path_segments() {
     assert_eq!(entry.path_template, "/api/memories/{id}");
 
     let segs = entry.path_segments;
-    assert_eq!(segs.len(), 3, "expected 3 segments for /api/memories/{{id}}");
+    assert_eq!(
+        segs.len(),
+        3,
+        "expected 3 segments for /api/memories/{{id}}"
+    );
     assert_eq!(segs[0], PathSegment::Literal("api"));
     assert_eq!(segs[1], PathSegment::Literal("memories"));
     assert_eq!(segs[2], PathSegment::Param("id"));
@@ -156,7 +164,11 @@ async fn forget_rest_deletes_memory_and_returns_200() {
         Some("mem-rest-1"),
         "response id must match"
     );
-    assert_eq!(body["deleted"].as_bool(), Some(true), "deleted must be true");
+    assert_eq!(
+        body["deleted"].as_bool(),
+        Some(true),
+        "deleted must be true"
+    );
 
     assert_not_in_store(&cfg, "mem-rest-1");
 }

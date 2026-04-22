@@ -158,7 +158,7 @@ impl OpsRuntime {
         mutating = true,
         mcp(name = "rein_ingest_session"),
         rest(method = "POST", path = "/api/ingest_session"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub async fn ingest_session(
         &self,
@@ -170,8 +170,7 @@ impl OpsRuntime {
 
         let report = match (params.turns, params.content) {
             (Some(turns), _) => {
-                let total_chars: usize =
-                    turns.iter().map(|t| t.role.len() + t.content.len()).sum();
+                let total_chars: usize = turns.iter().map(|t| t.role.len() + t.content.len()).sum();
                 if total_chars > INGEST_SESSION_MAX_CHARS {
                     return Err(ReinError::Config(format!(
                         "turns too large (max {} bytes aggregate)",

@@ -482,9 +482,7 @@ mod tests {
         let pool = ConnPool::new(&path, 1).unwrap();
         let guard = pool.get().await.unwrap();
         let mode: String = guard
-            .interact(|c| {
-                Ok(c.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?)
-            })
+            .interact(|c| Ok(c.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?))
             .await
             .unwrap();
         assert_eq!(mode, "wal");
@@ -559,7 +557,10 @@ mod tests {
     #[tokio::test]
     async fn default_size_respects_cpu_count() {
         let size = default_pool_size();
-        assert!((2..=8).contains(&size), "default_pool_size out of range: {size}");
+        assert!(
+            (2..=8).contains(&size),
+            "default_pool_size out of range: {size}"
+        );
     }
 
     #[tokio::test]
@@ -584,7 +585,10 @@ mod tests {
         // Invariant: pool is back to full size via replacement conn.
         let m = pool.metrics();
         assert_eq!(m.size, 2);
-        assert_eq!(m.idle, 2, "panic should not shrink pool if replacement succeeds");
+        assert_eq!(
+            m.idle, 2,
+            "panic should not shrink pool if replacement succeeds"
+        );
 
         // And the next get() on the repopulated slot must not panic.
         let g1 = pool.get().await.unwrap();
@@ -674,8 +678,7 @@ mod tests {
         for _ in 0..5 {
             let guard = pool.get().await.unwrap();
             let (conn, detached) = guard.detach();
-            let store =
-                SqliteStore::from_conn(conn, PathBuf::from(&path), 3072);
+            let store = SqliteStore::from_conn(conn, PathBuf::from(&path), 3072);
             // A trivial schema-level query — confirms we're really on the
             // migrated DB, not an in-memory throwaway.
             let count: i64 = store
@@ -728,7 +731,10 @@ mod tests {
             m.shrunk_count, 1,
             "shrunk_count must advance when replacement open fails"
         );
-        assert_eq!(m.size, 2, "configured size is immutable; shrink reflected elsewhere");
+        assert_eq!(
+            m.size, 2,
+            "configured size is immutable; shrink reflected elsewhere"
+        );
         assert_eq!(
             m.available_permits, 1,
             "effective capacity drops by one after forget()"
