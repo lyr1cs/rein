@@ -65,11 +65,13 @@ impl ReinServer {
 const HTTP_SESSION_COOKIE: &str = "rein_http_token";
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.bytes()
-        .zip(right.bytes())
+    use sha2::{Digest, Sha256};
+
+    let left_hash = Sha256::digest(left.as_bytes());
+    let right_hash = Sha256::digest(right.as_bytes());
+    left_hash
+        .iter()
+        .zip(right_hash.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
@@ -409,6 +411,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constant_time_eq_matches_proxy_digest_style() {
+        assert!(constant_time_eq("secret-token", "secret-token"));
+        assert!(!constant_time_eq("secret-token", "secret"));
+        assert!(!constant_time_eq("secret-token", "secret-token-longer"));
+    }
+
+    #[test]
     fn request_auth_accepts_matching_cookie() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
@@ -434,6 +443,16 @@ mod tests {
         headers.insert(
             "cookie",
             hyper::header::HeaderValue::from_static("rein_http_token="),
+        );
+        assert!(!request_has_valid_http_auth(&headers, "secret-token"));
+    }
+
+    #[test]
+    fn request_auth_rejects_wrong_length_bearer_token() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            hyper::header::HeaderValue::from_static("Bearer secret-token-longer"),
         );
         assert!(!request_has_valid_http_auth(&headers, "secret-token"));
     }

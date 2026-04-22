@@ -354,11 +354,13 @@ fn enforce_auth_policy<B>(
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.bytes()
-        .zip(right.bytes())
+    use sha2::{Digest, Sha256};
+
+    let left_hash = Sha256::digest(left.as_bytes());
+    let right_hash = Sha256::digest(right.as_bytes());
+    left_hash
+        .iter()
+        .zip(right_hash.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
@@ -1431,6 +1433,13 @@ mod tests {
     }
 
     #[test]
+    fn constant_time_eq_matches_proxy_digest_style() {
+        assert!(constant_time_eq("secret-token", "secret-token"));
+        assert!(!constant_time_eq("secret-token", "secret"));
+        assert!(!constant_time_eq("secret-token", "secret-token-longer"));
+    }
+
+    #[test]
     fn enforce_auth_public_always_passes() {
         let req: Request<String> = req_with(None);
         assert!(enforce_auth_policy(&req, crate::ops::AuthPolicy::Public).is_ok());
@@ -1505,6 +1514,37 @@ mod tests {
         assert!(
             enforce_auth_policy(&cookie_req, crate::ops::AuthPolicy::ReadToken).is_ok(),
             "session cookie should satisfy read_token policy"
+        );
+
+        match original {
+            Some(v) => unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            },
+            None => unsafe {
+                std::env::remove_var("REIN_HTTP_TOKEN");
+            },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(rein_http_token_env)]
+    fn enforce_auth_read_token_rejects_wrong_length_values() {
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::set_var("REIN_HTTP_TOKEN", "secret-token");
+        }
+
+        let short_req: Request<String> = req_with(Some(("x-rein-token", "secret")));
+        assert!(
+            enforce_auth_policy(&short_req, crate::ops::AuthPolicy::ReadToken).is_err(),
+            "short x-rein-token must be rejected"
+        );
+
+        let long_bearer: Request<String> =
+            req_with(Some(("authorization", "Bearer secret-token-longer")));
+        assert!(
+            enforce_auth_policy(&long_bearer, crate::ops::AuthPolicy::ReadToken).is_err(),
+            "wrong-length bearer token must be rejected"
         );
 
         match original {
@@ -2395,7 +2435,11 @@ mod tests {
         let config = test_config(&db_path);
         let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
         store
-            .store(test_memory("debug", "pool fix", "connection pool saturation"))
+            .store(test_memory(
+                "debug",
+                "pool fix",
+                "connection pool saturation",
+            ))
             .unwrap();
 
         let req = Request::builder()

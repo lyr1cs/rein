@@ -54,6 +54,16 @@ pub(crate) fn memory_select_base() -> String {
 }
 
 impl SqliteStore {
+    fn cached_embedding_for_memory(&self, memory: &Memory) -> Option<Vec<f32>> {
+        let config = crate::config::ReinConfig::load().ok()?;
+        let model = config.embedding_model();
+        let enriched =
+            crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
+        crate::embed::EmbedCache::get(self.conn(), &enriched, &model)
+            .ok()
+            .flatten()
+    }
+
     fn infer_cluster_from_cache(&self, memory: &Memory) -> Option<u32> {
         let config = crate::config::ReinConfig::load().ok()?;
         let model = config.embedding_model();
@@ -487,11 +497,7 @@ impl SqliteStore {
         limit: usize,
     ) -> ReinResult<Vec<DedupDecision>> {
         let map_err = |e: ReinError| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         };
         let decisions = match (canonical_id, operator) {
             (Some(cid), Some(op)) => {
@@ -500,10 +506,9 @@ impl SqliteStore {
                      WHERE canonical_id = ?1 AND operator = ?2 \
                      ORDER BY created_at DESC LIMIT ?3",
                 )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![cid, op, limit as i64],
-                    |row| row_to_dedup_decision(row).map_err(map_err),
-                )?;
+                let rows = stmt.query_map(rusqlite::params![cid, op, limit as i64], |row| {
+                    row_to_dedup_decision(row).map_err(map_err)
+                })?;
                 rows.filter_map(|r| r.ok()).collect()
             }
             (Some(cid), None) => {
@@ -511,10 +516,9 @@ impl SqliteStore {
                     "SELECT * FROM dedup_decisions WHERE canonical_id = ?1 \
                      ORDER BY created_at DESC LIMIT ?2",
                 )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![cid, limit as i64],
-                    |row| row_to_dedup_decision(row).map_err(map_err),
-                )?;
+                let rows = stmt.query_map(rusqlite::params![cid, limit as i64], |row| {
+                    row_to_dedup_decision(row).map_err(map_err)
+                })?;
                 rows.filter_map(|r| r.ok()).collect()
             }
             (None, Some(op)) => {
@@ -522,20 +526,18 @@ impl SqliteStore {
                     "SELECT * FROM dedup_decisions WHERE operator = ?1 \
                      ORDER BY created_at DESC LIMIT ?2",
                 )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![op, limit as i64],
-                    |row| row_to_dedup_decision(row).map_err(map_err),
-                )?;
+                let rows = stmt.query_map(rusqlite::params![op, limit as i64], |row| {
+                    row_to_dedup_decision(row).map_err(map_err)
+                })?;
                 rows.filter_map(|r| r.ok()).collect()
             }
             (None, None) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT * FROM dedup_decisions ORDER BY created_at DESC LIMIT ?1",
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![limit as i64],
-                    |row| row_to_dedup_decision(row).map_err(map_err),
-                )?;
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT * FROM dedup_decisions ORDER BY created_at DESC LIMIT ?1")?;
+                let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+                    row_to_dedup_decision(row).map_err(map_err)
+                })?;
                 rows.filter_map(|r| r.ok()).collect()
             }
         };
@@ -870,10 +872,14 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update(&self, memory: &Memory) -> ReinResult<()> {
+        let previous = self.get(&memory.id)?;
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_ids_json = serde_json::to_string(&memory.related_ids)?;
         let concept_ids_json = serde_json::to_string(&memory.concept_ids)?;
         let now = Utc::now();
+        let semantic_changed = previous.topic != memory.topic
+            || previous.summary != memory.summary
+            || previous.content != memory.content;
 
         let layer_db = match memory.layer {
             MemoryLayer::LTM => "LTM",
@@ -922,9 +928,21 @@ impl MemoryStore for SqliteStore {
             )));
         }
 
-        if let Some(ref emb) = memory.embedding {
-            vec::insert_embedding(&self.conn, &memory.id, emb)?;
-        }
+        let refreshed_embedding = if let Some(embedding) = memory.embedding.clone() {
+            vec::insert_embedding(&self.conn, &memory.id, &embedding)?;
+            Some(embedding)
+        } else if semantic_changed {
+            if let Some(cached) = self.cached_embedding_for_memory(memory) {
+                vec::insert_embedding(&self.conn, &memory.id, &cached)?;
+                Some(cached)
+            } else {
+                // Never leave a stale vector row behind when the semantic fields changed.
+                vec::delete_embedding(&self.conn, &memory.id)?;
+                None
+            }
+        } else {
+            None
+        };
 
         // Update side indexes (reuse keywords_json from above)
         self.update_tantivy(
@@ -934,7 +952,11 @@ impl MemoryStore for SqliteStore {
             &memory.content,
             &keywords_json,
         );
-        self.update_hnsw(&memory.id, memory.embedding.as_deref());
+        if let Some(embedding) = refreshed_embedding.as_deref() {
+            self.update_hnsw(&memory.id, Some(embedding));
+        } else if semantic_changed {
+            self.remove_from_hnsw(&memory.id);
+        }
 
         Ok(())
     }
@@ -2415,8 +2437,7 @@ pub(super) fn clean_memory_refs(conn: &Connection, memory_id: &str) -> ReinResul
 /// - `episodes.concept_ids`
 ///
 /// `concept_links` and `concept_revisions` are handled via ON DELETE CASCADE.
-#[allow(dead_code)]
-fn clean_concept_refs(conn: &Connection, concept_id: &str) -> ReinResult<()> {
+pub(super) fn clean_concept_refs(conn: &Connection, concept_id: &str) -> ReinResult<()> {
     let quoted = format!("\"{concept_id}\"");
     let like = format!("%{quoted}%");
 
@@ -3217,6 +3238,73 @@ enabled = true
         assert!(
             after.related_ids.iter().any(|id| id == "untouched"),
             "unrelated related_ids entries must be preserved"
+        );
+    }
+
+    #[test]
+    fn consolidate_by_ids_atomic_archives_deleted_memories_and_clears_vec_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("consolidate-evidence.db");
+        let store = SqliteStore::new(&path, "text-embedding-3-large", 3).unwrap();
+
+        let mut first = test_memory("topic-a", "first", Importance::Medium);
+        first.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let first_id = first.id.clone();
+        store.store(first).unwrap();
+
+        let mut second = test_memory("topic-a", "second", Importance::Medium);
+        second.embedding = Some(vec![0.0, 1.0, 0.0]);
+        let second_id = second.id.clone();
+        store.store(second).unwrap();
+
+        let mut replacement = test_memory("topic-a", "merged", Importance::High);
+        replacement.embedding = Some(vec![0.5, 0.5, 0.0]);
+        let replacement_id = replacement.id.clone();
+
+        store
+            .consolidate_by_ids_atomic(&[first_id.clone(), second_id.clone()], replacement)
+            .unwrap();
+
+        assert!(vec::get_embedding(store.conn(), &first_id)
+            .unwrap()
+            .is_none());
+        assert!(vec::get_embedding(store.conn(), &second_id)
+            .unwrap()
+            .is_none());
+
+        let evidence = store.list_memory_evidence(&replacement_id, 10).unwrap();
+        assert_eq!(evidence.len(), 3, "replacement + two deleted memories");
+        assert!(evidence.iter().any(|item| item.summary == "first"));
+        assert!(evidence.iter().any(|item| item.summary == "second"));
+
+        let canonical = store.get(&replacement_id).unwrap();
+        assert_eq!(canonical.support_count, 3);
+    }
+
+    #[test]
+    fn update_semantic_change_without_embedding_clears_stale_vector_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("update-vectors.db");
+        let store = SqliteStore::new(&path, "text-embedding-3-large", 3).unwrap();
+
+        let mut memory = test_memory("topic-a", "original", Importance::Medium);
+        memory.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let memory_id = memory.id.clone();
+        store.store(memory).unwrap();
+        assert!(vec::get_embedding(store.conn(), &memory_id)
+            .unwrap()
+            .is_some());
+
+        let mut fetched = store.get(&memory_id).unwrap();
+        fetched.summary = "updated".to_string();
+        fetched.content = "content changed enough to require a new embedding".to_string();
+        store.update(&fetched).unwrap();
+
+        assert!(
+            vec::get_embedding(store.conn(), &memory_id)
+                .unwrap()
+                .is_none(),
+            "semantic edits without a replacement embedding must not leave stale vec rows behind"
         );
     }
 

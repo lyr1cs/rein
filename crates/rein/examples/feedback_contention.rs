@@ -103,9 +103,26 @@ fn setup_fixture() -> (TempDir, PathBuf) {
 
     // Seed 1000 memories with word-diverse content (so FTS inside dedup check has real work)
     let words = [
-        "memory", "recall", "vector", "embedding", "search", "fusion", "pool",
-        "connection", "parallel", "concurrent", "async", "tokio", "rusqlite",
-        "tantivy", "hnsw", "sqlite", "adaptive", "feedback", "dedup", "concept",
+        "memory",
+        "recall",
+        "vector",
+        "embedding",
+        "search",
+        "fusion",
+        "pool",
+        "connection",
+        "parallel",
+        "concurrent",
+        "async",
+        "tokio",
+        "rusqlite",
+        "tantivy",
+        "hnsw",
+        "sqlite",
+        "adaptive",
+        "feedback",
+        "dedup",
+        "concept",
     ];
     let tx = conn.unchecked_transaction().unwrap();
     for i in 0..FIXTURE_ROWS {
@@ -127,7 +144,8 @@ fn setup_fixture() -> (TempDir, PathBuf) {
         .unwrap();
     }
     tx.commit().unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+        .unwrap();
     eprintln!(
         "[fixture] {FIXTURE_ROWS} memories seeded at {}",
         db_path.display()
@@ -316,8 +334,12 @@ fn main() {
     if p99_b < Duration::from_millis(50) {
         eprintln!("  → D (do nothing)           p99 < 50ms, spec §F1 premise does NOT hold");
     } else if p99_b < Duration::from_millis(500) {
-        eprintln!("  → E (spawn_blocking)       50 < p99 < 500ms, fire-and-forget ~30 LoC sufficient");
+        eprintln!(
+            "  → E (spawn_blocking)       50 < p99 < 500ms, fire-and-forget ~30 LoC sufficient"
+        );
     } else {
-        eprintln!("  → C (shrink BEGIN IMMEDIATE) or A (separate DB)  p99 > 500ms, real bottleneck");
+        eprintln!(
+            "  → C (shrink BEGIN IMMEDIATE) or A (separate DB)  p99 > 500ms, real bottleneck"
+        );
     }
 }

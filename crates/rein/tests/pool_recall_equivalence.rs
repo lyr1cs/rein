@@ -20,9 +20,9 @@ use chrono::Utc;
 use rein::config::ReinConfig;
 use rein::search::recall::recall_temporal_with_request_id;
 use rein::store::pool::ConnPool;
+use rein::store::tiering::MemoryTier;
 use rein::store::SqliteStore;
 use rein::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
-use rein::store::tiering::MemoryTier;
 use tempfile::TempDir;
 
 fn build_memory(topic: &str, summary: &str, content: &str) -> Memory {
@@ -208,8 +208,7 @@ async fn store_with_pool_exercises_vec_channel_pool_branch_nonfast() {
 
     // Baseline: fresh store, no pool — Vec thread falls back to
     // `SqliteStore::new(&db_path, ...)` inside std::thread::spawn.
-    let baseline_store =
-        SqliteStore::new(&db_path, "text-embedding-3-large", 3072).unwrap();
+    let baseline_store = SqliteStore::new(&db_path, "text-embedding-3-large", 3072).unwrap();
     let queries = [
         "pool design concurrency",
         "knowledge graph fusion",
@@ -261,8 +260,7 @@ async fn store_with_pool_attached_produces_same_recall_as_serial_fallback() {
     let config = seed_fixture(&db_path);
 
     // Baseline: fresh store, no pool — Vec channel uses SqliteStore::new.
-    let baseline_store =
-        SqliteStore::new(&db_path, "text-embedding-3-large", 3072).unwrap();
+    let baseline_store = SqliteStore::new(&db_path, "text-embedding-3-large", 3072).unwrap();
     let queries = [
         "pool design concurrency",
         "HNSW vector search",
@@ -280,7 +278,10 @@ async fn store_with_pool_attached_produces_same_recall_as_serial_fallback() {
     let pooled_store = SqliteStore::new(&db_path, "text-embedding-3-large", 3072)
         .unwrap()
         .with_pool(Arc::clone(&pool));
-    assert!(pooled_store.pool().is_some(), "with_pool should attach pool");
+    assert!(
+        pooled_store.pool().is_some(),
+        "with_pool should attach pool"
+    );
 
     for (i, q) in queries.iter().enumerate() {
         let ids = recall_ids(&pooled_store, &config, q);

@@ -400,25 +400,6 @@ pub async fn resolve_dedup_job_async(
     }
 }
 
-pub(crate) fn record_deleted_memory_as_evidence(
-    store: &SqliteStore,
-    canonical_id: &str,
-    memory: &Memory,
-) {
-    let _ = store.add_memory_evidence(MemoryEvidence {
-        id: String::new(),
-        canonical_id: canonical_id.to_string(),
-        memory_id: None,
-        source_topic: memory.topic.clone(),
-        summary: memory.summary.clone(),
-        content: memory.content.clone(),
-        keywords: memory.keywords.clone(),
-        source: memory.source,
-        created_at: memory.created_at,
-        imported_at: chrono::Utc::now(),
-    });
-}
-
 fn vec_dedup_run_limit(config: &ReinConfig) -> usize {
     config.async_memory.batch_size.max(1).saturating_mul(2)
 }
@@ -1621,7 +1602,10 @@ mod tests {
         let source = "Stop\nA short note\nDistinct fact";
         let target = "Stopwatch measurements were logged.\nUnrelated text that mentions a short-note in prose.\n";
         let unique = extract_unique_lines(source, target);
-        assert!(unique.contains("Stop"), "short line 'Stop' must be preserved");
+        assert!(
+            unique.contains("Stop"),
+            "short line 'Stop' must be preserved"
+        );
         assert!(
             unique.contains("A short note"),
             "distinct multi-word line must be preserved even if its hyphenated form appears inside another word"

@@ -136,8 +136,26 @@ export default function Graph() {
   }, []);
 
   useEffect(() => {
-    const intervalId = window.setInterval(refreshGraph, getPollingIntervalMs());
-    return () => window.clearInterval(intervalId);
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    // Read localStorage each cycle so Settings changes apply to the next poll.
+    const scheduleNextPoll = () => {
+      timeoutId = window.setTimeout(() => {
+        refreshGraph();
+        if (!cancelled) {
+          scheduleNextPoll();
+        }
+      }, getPollingIntervalMs());
+    };
+
+    scheduleNextPoll();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
   }, [refreshGraph]);
 
   /* ---- Fetch memoirs on mount and on each refresh (polling / manual Refresh) ----

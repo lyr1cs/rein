@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use rein_macros::op;
 
 use crate::doctor::{self, DoctorOptions, DoctorReport};
-use crate::ops::SurfaceKind;
 use crate::ops::system_health::{
     self, GrayzoneSnapshot, IndexesSnapshot, QueuesSnapshot, SystemStatus,
 };
+use crate::ops::SurfaceKind;
 use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsRuntime};
 use crate::types::{HealthReport, MemoryStore, ReinResult, StoreStats};
 
@@ -91,7 +91,7 @@ impl OpsRuntime {
         description = "Show store statistics — counts, layers, tiers",
         cli(name = "stats"),
         mcp(name = "rein_stats"),
-        rest(method = "GET", path = "/api/stats"),
+        rest(method = "GET", path = "/api/stats")
     )]
     pub fn stats(&self) -> ReinResult<StatsOutput> {
         let stats = self.with_store(|s| s.stats())?;
@@ -176,7 +176,10 @@ impl IntoMarkdown for HealthOutput {
             self.queues.dedup.pending, self.queues.dedup.inflight, self.queues.dedup.dead_letters,
             self.queues.merge_refinement.pending, self.queues.merge_refinement.inflight, self.queues.merge_refinement.dead_letters,
         ));
-        out.push_str(&format!("\n**Grayzone pending**: {}", self.grayzone.pending));
+        out.push_str(&format!(
+            "\n**Grayzone pending**: {}",
+            self.grayzone.pending
+        ));
         out
     }
 }
@@ -194,7 +197,7 @@ impl OpsRuntime {
         description = "Per-topic memory health + system index/queue lag",
         cli(name = "health"),
         mcp(name = "rein_health"),
-        rest(method = "GET", path = "/api/health"),
+        rest(method = "GET", path = "/api/health")
     )]
     pub fn health(&self, params: HealthParams) -> ReinResult<HealthOutput> {
         let topic = params.topic.as_deref();
@@ -270,7 +273,7 @@ impl OpsRuntime {
         category = "diagnostics",
         description = "Run system diagnostics: database, indexes, queues, provider readiness. CLI supports --json/--network/--fix; REST GET is read-only (ignores fix); POST /api/doctor applies fixes — see `doctor_fix` op.",
         cli(name = "doctor"),
-        rest(method = "GET", path = "/api/doctor"),
+        rest(method = "GET", path = "/api/doctor")
     )]
     pub async fn doctor(&self, params: DoctorParams) -> ReinResult<DoctorOutput> {
         let report = doctor::run(
@@ -333,7 +336,7 @@ impl OpsRuntime {
         description = "Run the doctor diagnostic with mutation authorization; defaults to applying fixes. Pass `fix: false` for an authed dry run. REST-only POST counterpart to the read-only GET /api/doctor.",
         mutating = true,
         rest(method = "POST", path = "/api/doctor"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub async fn doctor_fix(&self, params: DoctorFixParams) -> ReinResult<DoctorOutput> {
         // The H3 auth framework enforces `x-rein-action: 1` on this route
@@ -438,7 +441,7 @@ impl OpsRuntime {
         name = "config",
         category = "diagnostics",
         description = "Show non-secret configuration: database path, providers, models, and tunable knobs. CLI-only to avoid accidental exposure over the network.",
-        cli(name = "config"),
+        cli(name = "config")
     )]
     pub fn config_snapshot(&self) -> ReinResult<ConfigSnapshot> {
         let cfg = self.config.as_ref();

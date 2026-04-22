@@ -60,7 +60,9 @@ fn normalize_string_list(mut values: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-pub(crate) fn deserialize_option_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+pub(crate) fn deserialize_option_string_list<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {

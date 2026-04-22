@@ -1,7 +1,16 @@
 //! Payload parsing for Claude Code hook JSON formats.
 
 use regex::Regex;
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::sync::OnceLock;
+
+/// Hard cap on hook transcript files loaded via `transcript_path`.
+///
+/// Hook payloads are untrusted input, so never follow an arbitrary path into an
+/// unbounded `read_to_string`. 16 MiB is far above real transcript sizes while
+/// still preventing accidental or malicious large-file ingestion.
+const MAX_HOOK_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Check if a line likely contains secrets
 pub fn looks_like_secret(line: &str) -> bool {
@@ -11,6 +20,8 @@ pub fn looks_like_secret(line: &str) -> bool {
         "api-key=",
         "apikey=",
         "token=",
+        "access_token=",
+        "client_secret=",
         "secret=",
         "password=",
         "authorization:",
@@ -52,7 +63,15 @@ fn secret_redactors() -> &'static Vec<(Regex, &'static str)> {
                 "$1 [REDACTED]",
             ),
             (
-                Regex::new(r#"(?i)\b((?:api[_-]?key|token|secret|password)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s]+)"#).unwrap(),
+                Regex::new(r#"(?i)(["'](?:api[_-]?key|access[_-]?token|client[_-]?secret|token|secret|password)["']\s*:\s*")([^"]*)(")"#).unwrap(),
+                "$1[REDACTED]$3",
+            ),
+            (
+                Regex::new(r#"(?i)(["'](?:api[_-]?key|access[_-]?token|client[_-]?secret|token|secret|password)["']\s*:\s*')([^']*)(')"#).unwrap(),
+                "$1[REDACTED]$3",
+            ),
+            (
+                Regex::new(r#"(?i)\b((?:api[_-]?key|access[_-]?token|client[_-]?secret|token|secret|password)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s]+)"#).unwrap(),
                 "$1[REDACTED]",
             ),
             (
@@ -160,8 +179,8 @@ pub fn extract_hook_text(input: &str) -> String {
             return output.to_string();
         }
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-            if let Ok(transcript_content) = std::fs::read_to_string(path) {
-                return extract_transcript_text(&transcript_content);
+            if let Some(reader) = open_transcript_reader(path, "extract_hook_text") {
+                return extract_transcript_text(reader);
             }
         }
         if let Some(transcript) = json.get("transcript").and_then(|v| v.as_str()) {
@@ -182,8 +201,8 @@ pub fn extract_hook_text_for_llm(input: &str) -> String {
             return output.to_string();
         }
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-            if let Ok(transcript_content) = std::fs::read_to_string(path) {
-                return extract_transcript_text_for_llm(&transcript_content);
+            if let Some(reader) = open_transcript_reader(path, "extract_hook_text_for_llm") {
+                return extract_transcript_text_for_llm(reader);
             }
         }
         if let Some(transcript) = json.get("transcript").and_then(|v| v.as_str()) {
@@ -197,48 +216,127 @@ pub fn extract_hook_text_for_llm(input: &str) -> String {
     input.to_string()
 }
 
-fn extract_transcript_text_with_limits(
-    jsonl: &str,
+fn open_transcript_reader(path: &str, context: &str) -> Option<BufReader<std::fs::File>> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let transcript_path = std::path::Path::new(trimmed);
+    let has_jsonl_ext = transcript_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jsonl" | "ndjson"))
+        .unwrap_or(false);
+    if !has_jsonl_ext {
+        tracing::warn!(
+            context = context,
+            path = %trimmed,
+            "hook transcript_path rejected: expected .jsonl/.ndjson file"
+        );
+        return None;
+    }
+
+    let metadata = match std::fs::symlink_metadata(transcript_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(
+                context = context,
+                path = %trimmed,
+                error = %error,
+                "hook transcript_path unreadable"
+            );
+            return None;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        tracing::warn!(
+            context = context,
+            path = %trimmed,
+            "hook transcript_path rejected: not a regular file"
+        );
+        return None;
+    }
+    if metadata.len() > MAX_HOOK_TRANSCRIPT_BYTES {
+        tracing::warn!(
+            context = context,
+            path = %trimmed,
+            size = metadata.len(),
+            cap = MAX_HOOK_TRANSCRIPT_BYTES,
+            "hook transcript_path rejected: file exceeds size cap"
+        );
+        return None;
+    }
+
+    match std::fs::File::open(transcript_path) {
+        Ok(file) => Some(BufReader::new(file)),
+        Err(error) => {
+            tracing::warn!(
+                context = context,
+                path = %trimmed,
+                error = %error,
+                "hook transcript_path open failed"
+            );
+            None
+        }
+    }
+}
+
+fn extract_transcript_turn(entry: &serde_json::Value) -> Option<(&'static str, String)> {
+    let msg_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if msg_type != "human" && msg_type != "assistant" {
+        return None;
+    }
+    let content = if let Some(msg) = entry.get("message") {
+        extract_message_content(msg.get("content"))
+    } else {
+        extract_message_content(entry.get("content"))
+    };
+    if content.is_empty() {
+        return None;
+    }
+    let role = if msg_type == "human" {
+        "User"
+    } else {
+        "Assistant"
+    };
+    Some((role, content))
+}
+
+fn extract_transcript_text_with_limits<R: BufRead>(
+    reader: R,
     max_turns: usize,
     max_chars_per_turn: usize,
 ) -> String {
-    let mut turns = Vec::new();
-    for line in jsonl.lines() {
-        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-            let msg_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if msg_type != "human" && msg_type != "assistant" {
-                continue;
+    if max_turns == 0 {
+        return String::new();
+    }
+
+    let mut turns = VecDeque::with_capacity(max_turns.min(64));
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some((role, content)) = extract_transcript_turn(&entry) {
+            let truncated: String = content.chars().take(max_chars_per_turn).collect();
+            if turns.len() == max_turns {
+                turns.pop_front();
             }
-            let content = if let Some(msg) = entry.get("message") {
-                extract_message_content(msg.get("content"))
-            } else {
-                extract_message_content(entry.get("content"))
-            };
-            if !content.is_empty() {
-                let prefix = if msg_type == "human" {
-                    "User"
-                } else {
-                    "Assistant"
-                };
-                let truncated: String = content.chars().take(max_chars_per_turn).collect();
-                turns.push(format!("{}: {}", prefix, truncated));
-            }
+            turns.push_back(format!("{role}: {truncated}"));
         }
     }
-    let start = if turns.len() > max_turns {
-        turns.len() - max_turns
-    } else {
-        0
-    };
-    turns[start..].join("\n\n")
+    turns.into_iter().collect::<Vec<_>>().join("\n\n")
 }
 
-fn extract_transcript_text(jsonl: &str) -> String {
-    extract_transcript_text_with_limits(jsonl, 20, 500)
+fn extract_transcript_text<R: BufRead>(reader: R) -> String {
+    extract_transcript_text_with_limits(reader, 20, 500)
 }
 
-fn extract_transcript_text_for_llm(jsonl: &str) -> String {
-    extract_transcript_text_with_limits(jsonl, 200, 4000)
+fn extract_transcript_text_for_llm<R: BufRead>(reader: R) -> String {
+    extract_transcript_text_with_limits(reader, 200, 4000)
 }
 
 fn extract_message_content(content: Option<&serde_json::Value>) -> String {
@@ -267,19 +365,12 @@ fn extract_message_content(content: Option<&serde_json::Value>) -> String {
 pub fn count_transcript_turns(input: &str) -> usize {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(input) {
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                return content
+            if let Some(reader) = open_transcript_reader(path, "count_transcript_turns") {
+                return reader
                     .lines()
-                    .filter(|line| {
-                        serde_json::from_str::<serde_json::Value>(line)
-                            .ok()
-                            .and_then(|e| {
-                                e.get("type")
-                                    .and_then(|t| t.as_str())
-                                    .map(|t| t == "human" || t == "assistant")
-                            })
-                            .unwrap_or(false)
-                    })
+                    .map_while(Result::ok)
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+                    .filter(|entry| extract_transcript_turn(entry).is_some())
                     .count();
             }
         }
@@ -296,37 +387,20 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
         .map(|s| s.to_string());
 
     if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-        let transcript_content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("session ingest: failed to read transcript {}: {}", path, e);
-                return None;
-            }
-        };
+        let reader = open_transcript_reader(path, "extract_hook_session_ingest")?;
         let mut turns = Vec::new();
         const MAX_HOOK_TURNS: usize = 500;
         const MAX_HOOK_CHARS: usize = 500_000;
         let mut total_chars = 0usize;
-        for line in transcript_content.lines() {
-            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+        for line in reader.lines() {
+            let Ok(line) = line else {
                 continue;
             };
-            let msg_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if msg_type != "human" && msg_type != "assistant" {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
-            }
-            let content = if let Some(msg) = entry.get("message") {
-                extract_message_content(msg.get("content"))
-            } else {
-                extract_message_content(entry.get("content"))
             };
-            if content.trim().is_empty() {
+            let Some((role, content)) = extract_transcript_turn(&entry) else {
                 continue;
-            }
-            let role = if msg_type == "human" {
-                "User"
-            } else {
-                "Assistant"
             };
             total_chars += content.len();
             turns.push(crate::types::SessionTurn {
@@ -378,7 +452,12 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_secret, redact_secrets};
+    use super::{
+        count_transcript_turns, extract_hook_session_ingest, extract_hook_text,
+        extract_hook_text_for_llm, looks_like_secret, redact_secrets, MAX_HOOK_TRANSCRIPT_BYTES,
+    };
+    use std::io::Write;
+    use tempfile::tempdir;
 
     #[test]
     fn redact_masks_assignment_and_bearer_values() {
@@ -400,5 +479,60 @@ mod tests {
         assert!(!looks_like_secret(
             "We chose PostgreSQL for the billing database."
         ));
+    }
+
+    #[test]
+    fn redact_masks_json_quoted_secret_keys() {
+        let input = r#"{"token":"plain-secret","access_token":"rot-secret","client_secret":"shh"}"#;
+        let output = redact_secrets(input);
+        assert!(!output.contains("plain-secret"));
+        assert!(!output.contains("rot-secret"));
+        assert!(!output.contains("shh"));
+        assert!(output.contains(r#""token":"[REDACTED]""#));
+        assert!(output.contains(r#""access_token":"[REDACTED]""#));
+        assert!(output.contains(r#""client_secret":"[REDACTED]""#));
+    }
+
+    #[test]
+    fn transcript_path_rejects_non_jsonl_files_and_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.txt");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"secret transcript"}}}}"#
+        )
+        .unwrap();
+
+        let payload = serde_json::json!({
+            "transcript_path": path,
+            "summary": "fallback summary",
+            "transcript": "fallback transcript"
+        })
+        .to_string();
+
+        assert_eq!(extract_hook_text(&payload), "fallback transcript");
+        assert_eq!(extract_hook_text_for_llm(&payload), "fallback transcript");
+        assert_eq!(count_transcript_turns(&payload), 0);
+        assert!(extract_hook_session_ingest(&payload).is_none());
+    }
+
+    #[test]
+    fn transcript_path_rejects_oversize_files_and_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_HOOK_TRANSCRIPT_BYTES + 1).unwrap();
+
+        let payload = serde_json::json!({
+            "transcript_path": path,
+            "summary": "fallback summary",
+        })
+        .to_string();
+
+        assert_eq!(extract_hook_text(&payload), "fallback summary");
+        assert_eq!(extract_hook_text_for_llm(&payload), "fallback summary");
+        assert_eq!(count_transcript_turns(&payload), 0);
+        assert!(extract_hook_session_ingest(&payload).is_none());
     }
 }

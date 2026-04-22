@@ -486,9 +486,7 @@ pub fn recall_temporal_with_request_id(
                     detached.put_back(conn_back);
                     return result;
                 }
-                tracing::debug!(
-                    "vec channel pool saturated; falling back to SqliteStore::new"
-                );
+                tracing::debug!("vec channel pool saturated; falling back to SqliteStore::new");
             }
             // Fallback: the pre-v0.22 path. Unchanged behavior.
             let Ok(s) = SqliteStore::new(&vec_db_path, &vec_model, vec_dims) else {
@@ -624,9 +622,7 @@ pub fn recall_temporal_with_request_id(
                     let _ = kg_tx.send(result);
                     return;
                 }
-                tracing::debug!(
-                    "kg channel pool saturated; falling back to SqliteStore::new"
-                );
+                tracing::debug!("kg channel pool saturated; falling back to SqliteStore::new");
             }
             // Fallback path (unchanged pre-v0.22 behavior).
             let Ok(s) = SqliteStore::new(&kg_db_path, &kg_model, kg_dims) else {
@@ -714,8 +710,7 @@ pub fn recall_temporal_with_request_id(
             if word_jaccard(query, eq) > 0.8 {
                 continue;
             }
-            let too_similar_to_sibling =
-                kept.iter().any(|prev| word_jaccard(prev, eq) > 0.8);
+            let too_similar_to_sibling = kept.iter().any(|prev| word_jaccard(prev, eq) > 0.8);
             if !too_similar_to_sibling {
                 kept.push(eq);
             }
@@ -815,8 +810,7 @@ pub fn recall_temporal_with_request_id(
                             if let Some(guard) = pool.try_get() {
                                 let (conn, detached) = guard.detach();
                                 let s = SqliteStore::from_conn(conn, db_path.clone(), dims);
-                                let result =
-                                    run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to);
+                                let result = run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to);
                                 let conn_back = s.into_conn();
                                 detached.put_back(conn_back);
                                 return result;
@@ -983,8 +977,7 @@ pub fn recall_temporal_with_request_id(
         }
     };
     let episode_norm_log: std::collections::HashMap<String, f32> = {
-        let map: std::collections::HashMap<String, f32> =
-            episode_ranked.iter().cloned().collect();
+        let map: std::collections::HashMap<String, f32> = episode_ranked.iter().cloned().collect();
         let max = map.values().copied().fold(0.0f32, f32::max);
         if max.is_finite() && max > 1.0 {
             map.into_iter().map(|(id, s)| (id, s / max)).collect()
@@ -1596,7 +1589,6 @@ pub fn recall_temporal_with_request_id(
     );
     Ok(results)
 }
-
 
 /// Try vector search: check cache first, then call API if available.
 /// Returns empty vec on any failure (graceful degradation).

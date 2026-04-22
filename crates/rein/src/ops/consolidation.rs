@@ -7,7 +7,7 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 use super::adaptive::run_adaptive_pipeline;
-use super::dedup::{emit_cleanup_event, record_deleted_memory_as_evidence, run_dedup_scoped};
+use super::dedup::{emit_cleanup_event, run_dedup_scoped};
 
 fn normalize_summary(summary: &str) -> String {
     let normalized = summary.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -758,7 +758,6 @@ fn emit_consolidation_events(
     );
 
     for old_memory in old_memories {
-        record_deleted_memory_as_evidence(store, new_id, old_memory);
         let _ = store.record_dedup_decision(DedupDecision {
             id: String::new(),
             winner_id: Some(new_id.to_string()),

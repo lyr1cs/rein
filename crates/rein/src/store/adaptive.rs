@@ -824,8 +824,7 @@ mod tests {
         state.save_snapshot(&conn).unwrap();
 
         // Load into cache with a very short TTL
-        let mut cache =
-            CachedAdaptiveState::load(&conn, std::time::Duration::from_millis(20));
+        let mut cache = CachedAdaptiveState::load(&conn, std::time::Duration::from_millis(20));
         assert_eq!(cache.get(&conn).version, 1);
         assert!(!cache.is_stale());
 
