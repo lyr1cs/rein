@@ -24,6 +24,7 @@
 //!   so sync rusqlite calls never stall the reactor.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OpenFlags};
@@ -55,6 +56,11 @@ struct PoolInner {
     size: usize,
     free: Mutex<Vec<Connection>>,
     permits: Arc<Semaphore>,
+    /// Count of permits permanently forgotten via `permit.forget()` after
+    /// a panic + replacement-open failure.  Each increment means the pool's
+    /// effective capacity has shrunk by one.  Surfaced via `PoolMetrics`
+    /// for health reporting and post-mortem diagnosis.
+    shrunk_count: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -79,6 +85,7 @@ impl ConnPool {
                 size,
                 free: Mutex::new(conns),
                 permits: Arc::new(Semaphore::new(size)),
+                shrunk_count: AtomicUsize::new(0),
             }),
         })
     }
@@ -160,21 +167,33 @@ impl ConnPool {
             .expect("pool free-list mutex poisoned")
             .len();
         let available_permits = self.inner.permits.available_permits();
+        let shrunk_count = self.inner.shrunk_count.load(Ordering::Relaxed);
         PoolMetrics {
             size: self.inner.size,
             idle,
             in_use: self.inner.size - idle,
             available_permits,
+            shrunk_count,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PoolMetrics {
+    /// Pool's configured max capacity (set at `ConnPool::new`; immutable).
     pub size: usize,
     pub idle: usize,
     pub in_use: usize,
     pub available_permits: usize,
+    /// Number of times a permit has been permanently forgotten due to
+    /// replacement-open failure after panic.  Nonzero values indicate the
+    /// pool's effective capacity has degraded below `size`: operators
+    /// should investigate log entries tagged
+    /// `"pool interact panicked and replacement conn open failed"` or
+    /// `"DetachedGuard dropped without put_back AND replacement conn \
+    /// open failed"`.  The value is monotonic across a single process
+    /// lifetime; it resets on restart.
+    pub shrunk_count: usize,
 }
 
 /// A borrowed connection. Drops back into the pool on `Drop` (fallback if
@@ -247,6 +266,7 @@ impl PoolGuard {
                         // is the owned permit — forget() shrinks the
                         // semaphore by one.
                         permit.forget();
+                        pool.shrunk_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(ReinError::Config(format!(
@@ -343,9 +363,18 @@ impl Drop for DetachedGuard {
         // also fails — otherwise repeated detach-path panics would
         // monotonically shrink the pool until `get()` blocks forever
         // with no user-visible error (Codex F3 HIGH).
+        //
+        // Because this runs during a `Drop`, any panic from `open_conn`
+        // here would unwind into an already-panicking frame and abort
+        // the process (double-panic).  Wrap in `catch_unwind` so a
+        // panic in the replacement path is treated identically to
+        // `Err(..)` (Codex v0.22 round-2 LOW finding #1).
         if let Some(permit) = self.permit.take() {
-            match open_conn(&self.inner.db_path) {
-                Ok(fresh) => {
+            let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                open_conn(&self.inner.db_path)
+            }));
+            match opened {
+                Ok(Ok(fresh)) => {
                     tracing::warn!(
                         pool_db = %self.inner.db_path.display(),
                         "DetachedGuard dropped without put_back; opened replacement conn"
@@ -353,7 +382,7 @@ impl Drop for DetachedGuard {
                     return_conn(&self.inner, fresh);
                     drop(permit); // release slot normally — conn available
                 }
-                Err(open_err) => {
+                Ok(Err(open_err)) => {
                     tracing::error!(
                         pool_db = %self.inner.db_path.display(),
                         err = %open_err,
@@ -361,6 +390,20 @@ impl Drop for DetachedGuard {
                          open failed; pool size shrinks by one"
                     );
                     permit.forget();
+                    self.inner.shrunk_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_panic) => {
+                    // `open_conn` panicked inside a Drop.  Suppress to avoid
+                    // double-panic / abort; shrink the pool as if the open
+                    // failed.  Payload is intentionally dropped — emitting
+                    // it via `Debug` could itself panic.
+                    tracing::error!(
+                        pool_db = %self.inner.db_path.display(),
+                        "DetachedGuard dropped without put_back AND replacement conn \
+                         open PANICKED; pool size shrinks by one (double-panic suppressed)"
+                    );
+                    permit.forget();
+                    self.inner.shrunk_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -649,5 +692,46 @@ mod tests {
         assert_eq!(m.size, 2);
         assert_eq!(m.idle, 2);
         assert_eq!(m.available_permits, 2);
+    }
+
+    #[tokio::test]
+    async fn shrunk_count_increments_when_replacement_open_fails() {
+        // Codex v0.22 round-2 LOW finding #2: when the replacement
+        // `open_conn` in `DetachedGuard::Drop` fails, `permit.forget()`
+        // permanently shrinks the pool.  Before this patch there was no
+        // operator-visible counter for that event.  Force the shrink by
+        // removing the backing directory before drop, then assert the
+        // counter advanced.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shrink.db");
+        let pool = ConnPool::new(&path, 2).unwrap();
+        assert_eq!(
+            pool.metrics().shrunk_count,
+            0,
+            "fresh pool reports 0 shrinks"
+        );
+
+        let guard = pool.get().await.unwrap();
+        let (conn, detached) = guard.detach();
+        drop(conn);
+
+        // Nuke the temp dir — the next open_conn will fail with
+        // "no such file or directory" (or similar).  This simulates the
+        // real-world scenarios (disk full / permission lost / DB file
+        // removed under us) that trigger the shrink branch.
+        drop(dir);
+
+        drop(detached); // Drop without put_back → replacement open fails
+
+        let m = pool.metrics();
+        assert_eq!(
+            m.shrunk_count, 1,
+            "shrunk_count must advance when replacement open fails"
+        );
+        assert_eq!(m.size, 2, "configured size is immutable; shrink reflected elsewhere");
+        assert_eq!(
+            m.available_permits, 1,
+            "effective capacity drops by one after forget()"
+        );
     }
 }
