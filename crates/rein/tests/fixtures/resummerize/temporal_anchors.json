@@ -1,0 +1,82 @@
+[
+  {
+    "case_id": "temporal_001",
+    "category": "temporal_anchors",
+    "description": "Release timeline across multiple versions — all must persist",
+    "evidence": [
+      {"content": "rein v0.20.2 was the last released tag on 2026-03-15 before A1 work started.", "merged_at": "2026-03-16T10:00:00Z"},
+      {"content": "v0.21.0 landed on 2026-04-20 with the A1 operation registry migration.", "merged_at": "2026-04-20T10:00:00Z"},
+      {"content": "v0.22.0 shipped on 2026-04-22 after 7 Codex audit rounds and 675 tests.", "merged_at": "2026-04-22T10:00:00Z"}
+    ],
+    "current_canonical": "rein release timeline: v0.20.2 (2026-03-15, last pre-A1 tag), v0.21.0 (2026-04-20, A1 operation registry), v0.22.0 (2026-04-22, 675 tests green, 7 Codex audit rounds, 0 HIGH/MEDIUM findings).",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "length_bounded", "no_new_facts"]
+  },
+  {
+    "case_id": "temporal_002",
+    "category": "temporal_anchors",
+    "description": "Repeated date across two evidence entries — must survive",
+    "evidence": [
+      {"content": "D5 brainstorm session happened on 2026-04-19 with advisor feedback.", "merged_at": "2026-04-19T10:00:00Z"},
+      {"content": "the 2026-04-19 bench measured p99=54µs and max=4.57ms.", "merged_at": "2026-04-19T15:00:00Z"},
+      {"content": "the 2026-04-19 result killed spec §F1's complexity-of-lock assumption.", "merged_at": "2026-04-19T18:00:00Z"}
+    ],
+    "current_canonical": "On 2026-04-19, D5 bench results (p99=54µs, max=4.57mes) refuted spec §F1's assumption about lock complexity. The 0 LoC option D was chosen.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "length_bounded"]
+  },
+  {
+    "case_id": "temporal_003",
+    "category": "temporal_anchors",
+    "description": "Bare year recurrence with full dates layered in",
+    "evidence": [
+      {"content": "the project started in 2026 with the initial v0.1.0 prototype.", "merged_at": "2026-01-05T10:00:00Z"},
+      {"content": "by mid-2026 we had shipped through v0.11.0 (Neural Wiki GUI).", "merged_at": "2026-02-15T10:00:00Z"},
+      {"content": "late 2026 phase began with v0.21.0 A1 registry on 2026-04-20.", "merged_at": "2026-04-20T10:00:00Z"}
+    ],
+    "current_canonical": "rein timeline summary: project began 2026 with v0.1.0, v0.11.0 shipped mid-2026 (Neural Wiki GUI), late-2026 phase started with v0.21.0 A1 registry on 2026-04-20.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "length_bounded", "no_new_facts"]
+  },
+  {
+    "case_id": "temporal_004",
+    "category": "temporal_anchors",
+    "description": "Version recurrence — v0.22 appears three times",
+    "evidence": [
+      {"content": "v0.22 plan was drafted after v0.21.0 shipped.", "merged_at": "2026-04-21T10:00:00Z"},
+      {"content": "v0.22 scope included D4 memoir pool and D5 bench work.", "merged_at": "2026-04-21T12:00:00Z"},
+      {"content": "v0.22 shipped with 675 tests and zero HIGH findings.", "merged_at": "2026-04-22T10:00:00Z"}
+    ],
+    "current_canonical": "v0.22 plan followed v0.21.0, scope covered D4 memoir pool + D5 bench; v0.22 shipped 2026-04-22 with 675 tests, zero HIGH findings.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "length_bounded"]
+  },
+  {
+    "case_id": "temporal_005",
+    "category": "temporal_anchors",
+    "description": "Mixed dates and versions, some singletons, some recurring",
+    "evidence": [
+      {"content": "feedback_events schema was introduced in v0.5.0 on 2026-02-01.", "merged_at": "2026-02-02T10:00:00Z"},
+      {"content": "v0.5.0 counterfactual alpha optimization replay landed.", "merged_at": "2026-02-05T10:00:00Z"},
+      {"content": "M3 survival analysis extended v0.5.0 without schema changes.", "merged_at": "2026-02-10T10:00:00Z"}
+    ],
+    "current_canonical": "v0.5.0 M1 event sourcing introduced feedback_events on 2026-02-01. v0.5.0 M2 counterfactual alpha optimization replay also landed. M3 survival analysis extended v0.5.0 without schema changes.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "no_new_facts"]
+  },
+  {
+    "case_id": "temporal_006",
+    "category": "temporal_anchors",
+    "description": "Four dates, only two recurring (2026-04-22, 2026-04-20)",
+    "evidence": [
+      {"content": "A1 phase 3 cleanup deleted ops/registry.rs on 2026-04-20.", "merged_at": "2026-04-20T10:00:00Z"},
+      {"content": "on 2026-04-20 drift check moved to pure source+inventory scan.", "merged_at": "2026-04-20T15:00:00Z"},
+      {"content": "v0.22.0 tag was cut on 2026-04-22 with commit 6e7d4b2.", "merged_at": "2026-04-22T10:00:00Z"},
+      {"content": "GitHub release was published on 2026-04-22 alongside the tag.", "merged_at": "2026-04-22T12:00:00Z"},
+      {"content": "2026-04-15 was a standalone brainstorming day for v0.23 anchor.", "merged_at": "2026-04-15T10:00:00Z"}
+    ],
+    "current_canonical": "A1 phase 3 cleanup on 2026-04-20 deleted ops/registry.rs and moved drift check to pure source+inventory. v0.22.0 tag cut on 2026-04-22 with commit 6e7d4b2; GitHub release published same day.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "no_new_facts"]
+  }
+]

@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "0.22.0"
+version = "0.23.0-rc1"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
 license = "MIT"
@@ -56,6 +56,11 @@ gui = ["rust-embed"]
 # Enables test-only inventory entries (e.g. the path-template echo op).
 # Activated automatically by dev-dependencies below so integration tests see it.
 test-support = []
+
+# v0.23 evaluation harness — paired McNemar scoring for resummerize.
+[[bin]]
+name = "rein-eval"
+path = "src/bin/rein_eval.rs"
 
 [dev-dependencies]
 tempfile = "3"

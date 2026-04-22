@@ -579,13 +579,41 @@ fn build_none_bucket_ann_candidates(
 /// Computes embeddings (if missing), searches vec_memories for near-duplicates,
 /// and merges/supersedes matches. Runs in the GC slow channel (zero hot-path cost).
 pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
+    run_vec_dedup_inner(store, config, None);
+}
+
+/// Test-only entry point that injects a caller-provided `EmbedderKind`
+/// (typically `MockEmbedder`) instead of calling `create_embedder` so
+/// integration tests can drive this sweep end-to-end without real API
+/// credentials. Available under `test-support`.
+#[cfg(feature = "test-support")]
+pub fn run_vec_dedup_with_embedder(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    embedder: crate::embed::EmbedderKind,
+) {
+    run_vec_dedup_inner(store, config, Some(embedder));
+}
+
+fn run_vec_dedup_inner(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    embedder_override: Option<crate::embed::EmbedderKind>,
+) {
     let conn = store.conn();
     // A1: Load per-cluster dedup thresholds once for this run.
     let adaptive = crate::store::adaptive::AdaptiveState::restore_snapshot(conn);
     let pending_limit = vec_dedup_pending_limit(config);
+    // `status IN ('active', 'updated')`: round-5 H-1. Merged canonicals
+    // are promoted from `active` to `updated` by the merge trigger; both
+    // states represent live canonicals and `needs_vec_dedup = 1` must be
+    // swept regardless of which state the row is in or a resummerize +
+    // subsequent merge can strand `needs_vec_dedup = 1` forever.
     let pending: Vec<VecDedupItem> = match conn.prepare(
         "SELECT id, topic, summary, content FROM memories
-         WHERE needs_vec_dedup = 1 AND status = 'active' AND superseded_by IS NULL
+         WHERE needs_vec_dedup = 1
+           AND status IN ('active', 'updated')
+           AND superseded_by IS NULL
          LIMIT ?1",
     ) {
         Ok(mut stmt) => stmt
@@ -609,7 +637,9 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
         deferred
     );
 
-    let embedder = match crate::embed::create_embedder(config) {
+    let embedder = match embedder_override
+        .or_else(|| crate::embed::create_embedder(config))
+    {
         Some(e) => e,
         None => {
             tracing::debug!(
@@ -665,20 +695,35 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
 
     for (id, _topic, _summary, content) in &pending {
         let Some(embedding) = embeddings_by_id.get(id).cloned() else {
-            tracing::debug!("vec_dedup: failed to compute embedding for {id}");
-            let _ = conn.execute(
-                "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
-                rusqlite::params![id],
+            // Codex round-5 H-2: preserve `needs_vec_dedup = 1` on embed
+            // failure so a transient network blip doesn't permanently
+            // strip the row's vector recall. The next slow-channel pass
+            // will retry.
+            tracing::debug!(
+                "vec_dedup: failed to compute embedding for {id}; preserving flag for retry"
             );
             continue;
         };
 
+        // Codex round-5 H-3: `apply_resummerize` evicts the stale HNSW
+        // entry so recall doesn't serve pre-rewrite semantics; after
+        // re-embed, re-insert into HNSW explicitly. `update_hnsw` is a
+        // no-op for `:memory:` stores and self-heals via the dirty-flag
+        // mechanism on lock/save failure.
+        store.update_hnsw_for_vec_dedup(id, &embedding);
+
+        // Track whether the end-of-loop `needs_vec_dedup = 0` clear is
+        // safe to apply for this row (Codex round-6 MEDIUM, companion to
+        // round-5 H-2). Set to `false` by any write-failure path that
+        // wants to preserve the flag for retry.
+        let mut flag_clear_ok = true;
+
         let vec_results = match crate::store::vec::search_vec(conn, &embedding, 10) {
             Ok(r) => r,
             Err(_) => {
-                let _ = conn.execute(
-                    "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
-                    rusqlite::params![id],
+                // Codex round-5 H-2: keep the flag set so next sweep retries.
+                tracing::debug!(
+                    "vec_dedup: search_vec failed for {id}; preserving flag for retry"
                 );
                 continue;
             }
@@ -715,8 +760,20 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            // Codex round-6 HIGH: accept both `Active` and `Updated` as
+            // live canonical states. The pending selector widened to
+            // `status IN ('active', 'updated')` in round-5 H-1, but this
+            // candidate gate still required `Active`. A canonical that
+            // was legitimately merged (status promoted to `Updated`)
+            // could never be chosen as a dedup target, and the
+            // end-of-loop flag clear would then prematurely drop
+            // `needs_vec_dedup` for rows where the dedup pass was
+            // effectively a no-op.
             if candidate.superseded_by.is_some()
-                || candidate.status != crate::types::MemoryStatus::Active
+                || !matches!(
+                    candidate.status,
+                    crate::types::MemoryStatus::Active | crate::types::MemoryStatus::Updated
+                )
             {
                 continue;
             }
@@ -752,9 +809,18 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                         )
                     };
 
-                // Wrap in SAVEPOINT for atomicity
-                if store.conn().execute_batch("SAVEPOINT vec_strong").is_err() {
-                    continue;
+                // Any strong-match write failure must preserve
+                // `needs_vec_dedup = 1` for retry; otherwise a rolled-back
+                // merge can still strand the row unprocessed.
+                if let Err(err) = store.conn().execute_batch("SAVEPOINT vec_strong") {
+                    tracing::warn!(
+                        error = %err,
+                        source_id = %id,
+                        candidate_id = %candidate.id,
+                        "vec_dedup: failed to open strong-match savepoint; preserving needs_vec_dedup flag for retry"
+                    );
+                    flag_clear_ok = false;
+                    break;
                 }
                 let merge_ok = (|| -> ReinResult<()> {
                     let discard_mem = store.get(discard_id)?;
@@ -812,7 +878,8 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
                         tracing::warn!("vec_dedup: strong-match merge failed, rolling back: {e}");
                         let _ = store.conn().execute_batch("ROLLBACK TO vec_strong");
                         let _ = store.conn().execute_batch("RELEASE vec_strong");
-                        continue;
+                        flag_clear_ok = false;
+                        break;
                     }
                 }
 
@@ -846,7 +913,29 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             llm_verdicts_used += 1;
 
             if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
-                let _ = store.mark_superseded(id, &candidate.id);
+                // Codex round-6 MEDIUM: treat `mark_superseded` failure as
+                // a write-failure and preserve `needs_vec_dedup` for retry
+                // rather than silently counting it as a successful merge.
+                // Before this, a supersede error logged success, incremented
+                // `merged`, broke out of the loop, and the end-of-loop
+                // clear dropped the flag — the row ended up both
+                // un-superseded AND un-flagged.
+                if let Err(err) = store.mark_superseded(id, &candidate.id) {
+                    tracing::warn!(
+                        error = %err,
+                        source_id = %id,
+                        winner_id = %candidate.id,
+                        "vec_dedup: mark_superseded failed; preserving needs_vec_dedup flag for retry"
+                    );
+                    // Skip the end-of-loop flag clear by continuing the
+                    // OUTER `for (id, ...)` loop via `continue 'pending`.
+                    // We don't have a labeled loop yet, so the simplest
+                    // correct behavior: jump past the flag-clearing
+                    // UPDATE for this row. Handled by the `flag_clear_ok`
+                    // local below.
+                    flag_clear_ok = false;
+                    break;
+                }
                 if let Ok(discard_memory) = store.get(id) {
                     record_dedup_artifacts(
                         store,
@@ -869,10 +958,12 @@ pub(crate) fn run_vec_dedup(store: &SqliteStore, config: &ReinConfig) {
             }
         }
 
-        let _ = conn.execute(
-            "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
-            rusqlite::params![id],
-        );
+        if flag_clear_ok {
+            let _ = conn.execute(
+                "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                rusqlite::params![id],
+            );
+        }
     }
 
     if merged > 0 {

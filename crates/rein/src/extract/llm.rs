@@ -427,13 +427,22 @@ impl OmlxExtractor {
 pub enum ExtractorKind {
     Gemini(GeminiExtractor),
     Omlx(OmlxExtractor),
+    /// Test-only scripted responder. Lets integration tests drive the real
+    /// `run_resummerize` / extract pipelines end-to-end without a live API
+    /// key. Implementation only covers `raw_with_prompt`; the other methods
+    /// panic, which surfaces misuse in tests loudly rather than silently
+    /// returning degenerate values.
+    #[cfg(feature = "test-support")]
+    Mock(MockExtractor),
 }
 
 impl ExtractorKind {
-    async fn raw_with_prompt(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
+    pub async fn raw_with_prompt(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
         match self {
             Self::Gemini(e) => e.call_api(system_prompt, text).await,
             Self::Omlx(e) => e.call_and_extract_content(text, system_prompt).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.respond(system_prompt, text).await,
         }
     }
 
@@ -441,6 +450,8 @@ impl ExtractorKind {
         match self {
             Self::Gemini(e) => e.extract(text).await,
             Self::Omlx(e) => e.extract(text).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(_) => panic!("MockExtractor does not implement extract(); use raw_with_prompt()"),
         }
     }
 
@@ -457,6 +468,75 @@ impl ExtractorKind {
         match self {
             Self::Gemini(e) => e.extract_full(text).await,
             Self::Omlx(e) => e.extract_full(text).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(_) => panic!("MockExtractor does not implement extract_full(); use raw_with_prompt()"),
+        }
+    }
+}
+
+/// Scripted test extractor.
+///
+/// Feeds FIFO responses to `raw_with_prompt`. Each call consumes one queued
+/// response; when the queue is empty the extractor returns an
+/// `LLM queue exhausted` error so tests fail loudly on under-provisioning
+/// rather than silently looping on stale output. The call counter lets
+/// tests assert exact LLM invocation counts.
+#[cfg(feature = "test-support")]
+pub struct MockExtractor {
+    responses: std::sync::Mutex<std::collections::VecDeque<Result<String, String>>>,
+    call_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-support")]
+impl MockExtractor {
+    /// Build a mock that returns `responses` in order. `Err` variants become
+    /// `ReinError::Config` errors — distinguishable from successful responses
+    /// and matches what real LLM backends look like to upstream code paths.
+    pub fn with_responses(responses: Vec<Result<String, String>>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into()),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Convenience: a mock that returns the same `Ok(response)` once.
+    pub fn with_fixed_response(response: impl Into<String>) -> Self {
+        Self::with_responses(vec![Ok(response.into())])
+    }
+
+    /// Convenience: a mock that always errors (simulates LLM outage).
+    pub fn with_persistent_error(message: impl Into<String>) -> Self {
+        // Queue four copies so the 3-strike fuse path is exercisable too.
+        let msg = message.into();
+        Self::with_responses(vec![
+            Err(msg.clone()),
+            Err(msg.clone()),
+            Err(msg.clone()),
+            Err(msg),
+        ])
+    }
+
+    /// Number of times `raw_with_prompt` has been invoked against this mock.
+    pub fn call_count(&self) -> usize {
+        self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn respond(&self, _system: &str, _text: &str) -> ReinResult<String> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let next = self
+            .responses
+            .lock()
+            .expect("MockExtractor mutex poisoned")
+            .pop_front();
+        match next {
+            Some(Ok(s)) => Ok(s),
+            Some(Err(e)) => Err(crate::types::ReinError::Config(format!(
+                "mock extractor scripted error: {e}"
+            ))),
+            None => Err(crate::types::ReinError::Config(
+                "mock extractor: LLM queue exhausted".to_string(),
+            )),
         }
     }
 }
@@ -870,6 +950,11 @@ fn resolve_max_input_for_kind(config: &ReinConfig, extractor: &ExtractorKind) ->
                 SAFE_DEFAULT_MAX_CHARS
             }
         }
+        // Mock has no real input-size constraint; use the largest
+        // reasonable value so tests can pass arbitrary content without
+        // being silently truncated.
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => LARGE_CONTEXT_DEFAULT_CAP,
     }
 }
 
@@ -898,6 +983,8 @@ fn prepare_input_for_kind(config: &ReinConfig, text: &str, extractor: &Extractor
                 SAFE_DEFAULT_MAX_CHARS
             }
         }
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => LARGE_CONTEXT_DEFAULT_CAP,
     };
     if max_chars > 0 {
         text.chars().take(max_chars).collect()
@@ -1311,7 +1398,7 @@ fn parse_llm_json(text: &str) -> ReinResult<Vec<ExtractedMemory>> {
 }
 
 /// Strip markdown code fences (```json ... ```) from LLM output.
-fn strip_code_fences(text: &str) -> String {
+pub fn strip_code_fences(text: &str) -> String {
     // Strip Qwen3 <think>...</think> reasoning blocks first
     let trimmed = if let Some(idx) = text.find("</think>") {
         text[idx + 8..].trim()
