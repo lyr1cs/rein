@@ -17,9 +17,11 @@
 // both inside this crate and in external trybuild tests that path-dep on rein.
 extern crate self as rein;
 
+pub mod compression;
 pub mod config;
 pub mod doctor;
 pub mod embed;
+pub mod eval;
 pub mod extract;
 pub mod init;
 pub mod mcp;

@@ -10,6 +10,17 @@ use crate::types::*;
 
 use super::{fts, schema, vec};
 
+/// Byte cap on canonical `content` after a `MergeInto` append.
+///
+/// Semantics: compared against `String::len()` (UTF-8 byte count), **not**
+/// `.chars().count()`. Downstream resummerize targets (`target_bytes` +
+/// `MAX_RESUMMERIZE_TARGET`) and the contract's `length_bounded` gate are
+/// all byte-based to match this, so a CJK-heavy compressed canonical
+/// cannot pass the contract and then immediately blow this cap on the
+/// next merge. If this constant moves, audit every downstream that
+/// derives from it.
+pub const MERGE_CONTENT_CAP: usize = 10_000;
+
 /// Report from store_knowledge_units().
 #[derive(Debug, Default)]
 pub struct KnowledgeStoreReport {
@@ -1936,7 +1947,10 @@ impl SqliteStore {
                     // pass that avoids dropping either end; see project
                     // backlog. Emit a warn so operators can correlate the
                     // event with merge-count drift during the interim.
-                    const MERGE_CONTENT_CAP: usize = 10_000;
+                    //
+                    // `MERGE_CONTENT_CAP` is module-level pub so the
+                    // resummerize path (contract + target_bytes + length
+                    // gate) can derive from the single source of truth.
                     if existing.content.len() > MERGE_CONTENT_CAP {
                         let original_len = existing.content.len();
                         let skip = original_len - MERGE_CONTENT_CAP;
@@ -1953,7 +1967,19 @@ impl SqliteStore {
                         tracing::warn!(
                             canonical_id = %canonical_id,
                             dropped_bytes = split_at,
-                            "merge content exceeded cap; oldest bytes dropped (v0.22 TODO: resummarize)"
+                            "merge content exceeded cap; oldest bytes dropped (resummerize pending)"
+                        );
+                        // v0.23: flag canonical for slow-channel resummerize.
+                        // The keep-tail above guarantees forward progress; the
+                        // resummerize op replaces the truncated content with
+                        // LLM-compressed text on a later GC sweep, gated by the
+                        // Lossless Compression Contract. On contract failure
+                        // the canonical is left untouched and keep-tail remains
+                        // the effective state, so this flag is idempotent and
+                        // safe to retry.
+                        let _ = self.conn.execute(
+                            "UPDATE memories SET needs_resummerize = 1 WHERE id = ?1",
+                            rusqlite::params![&canonical_id],
                         );
                     }
                     existing.summary = existing
@@ -2064,11 +2090,28 @@ impl SqliteStore {
         }
         let mut cache = self.tantivy_cache.borrow_mut();
         if cache.is_none() {
-            *cache = super::tantivy_fts::TantivyFts::open(&self.tantivy_path()).ok();
+            match super::tantivy_fts::TantivyFts::open(&self.tantivy_path()) {
+                Ok(tantivy) => *cache = Some(tantivy),
+                Err(error) => {
+                    tracing::warn!("tantivy open failed: {error}");
+                    self.mark_tantivy_dirty();
+                }
+            }
         }
         if let Some(ref tantivy) = *cache {
             f(tantivy);
         }
+    }
+
+    fn mark_tantivy_dirty(&self) {
+        if self.db_path.to_str() == Some(":memory:") {
+            return;
+        }
+        let dirty_path = crate::search::warmup::tantivy_dirty_path(&self.db_path);
+        if let Some(parent) = dirty_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(dirty_path, b"dirty");
     }
 
     /// Backfill `session_artifacts.episode_id` for rows orphaned by a crash
@@ -2157,7 +2200,10 @@ impl SqliteStore {
     /// Fire-and-forget: update Tantivy index after a write.
     fn update_tantivy(&self, id: &str, topic: &str, summary: &str, content: &str, keywords: &str) {
         self.with_tantivy(|t| {
-            let _ = t.insert(id, topic, summary, content, keywords);
+            if let Err(error) = t.insert(id, topic, summary, content, keywords) {
+                tracing::warn!("tantivy insert failed for {id}: {error}");
+                self.mark_tantivy_dirty();
+            }
         });
     }
 
@@ -2216,6 +2262,15 @@ impl SqliteStore {
     /// If the lock can't be acquired (contention, flock failure) the index is
     /// marked dirty so the next rebuild will pick up the missed write, rather
     /// than silently serving a stale index.
+    pub(crate) fn update_hnsw_for_vec_dedup(&self, id: &str, embedding: &[f32]) {
+        self.update_hnsw(id, Some(embedding));
+    }
+
+    /// Fire-and-forget: update HNSW index after a write (if embedding available).
+    ///
+    /// If the lock can't be acquired (contention, flock failure) the index is
+    /// marked dirty so the next rebuild will pick up the missed write, rather
+    /// than silently serving a stale index.
     fn update_hnsw(&self, id: &str, embedding: Option<&[f32]>) {
         if let Some(emb) = embedding {
             match self.with_hnsw_lock(emb.len(), |index| index.insert(id, emb)) {
@@ -2236,6 +2291,39 @@ impl SqliteStore {
                 }
             }
         }
+    }
+
+    /// After a canonical rewrite that bypassed `update()` (e.g. resummerize,
+    /// which must avoid the trigger-driven `support_count` / `merge_count`
+    /// inflation per Codex M8), refresh the external side indexes so they
+    /// don't keep serving pre-rewrite semantics.
+    ///
+    /// Tantivy gets a full reindex of `(topic, summary, content, keywords)`
+    /// for the updated row. SQLite's `memories_fts` virtual table is handled
+    /// by the `memories_au` trigger automatically, so we don't need to touch
+    /// it here — only Tantivy, which has no SQL-trigger equivalent.
+    ///
+    /// HNSW's stored embedding was generated from the pre-rewrite
+    /// content; leaving it in place means approximate vector recall
+    /// would surface this canonical with wrong semantics. The primary
+    /// sqlite-vec row must already have been invalidated inside the
+    /// caller's transaction; this helper only removes the external HNSW
+    /// side index entry. An operator-visible dirty flag fires on lock
+    /// failures per the existing `remove_from_hnsw` contract.
+    ///
+    /// Codex round-3 HIGH.
+    pub(crate) fn refresh_indexes_after_canonical_rewrite(
+        &self,
+        id: &str,
+        topic: &str,
+        summary: &str,
+        content: &str,
+        keywords: &[String],
+    ) {
+        let keywords_json =
+            serde_json::to_string(keywords).unwrap_or_else(|_| "[]".to_string());
+        self.update_tantivy(id, topic, summary, content, &keywords_json);
+        self.remove_from_hnsw(id);
     }
 
     /// Fire-and-forget: remove from Tantivy index after a delete.

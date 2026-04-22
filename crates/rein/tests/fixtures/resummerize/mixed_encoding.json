@@ -1,0 +1,77 @@
+[
+  {
+    "case_id": "mixed_001",
+    "category": "mixed_encoding",
+    "description": "URLs and GitHub paths interleaved with plain text",
+    "evidence": [
+      {"content": "the repo lives at https://github.com/lyr1cs/rein with full workflow on push to master.", "merged_at": "2026-04-01T10:00:00Z"},
+      {"content": "release page https://github.com/lyr1cs/rein/releases/tag/v0.22.0 has the binary artifact.", "merged_at": "2026-04-22T10:00:00Z"}
+    ],
+    "current_canonical": "rein repo: https://github.com/lyr1cs/rein (master branch, CI on push). v0.22.0 release: https://github.com/lyr1cs/rein/releases/tag/v0.22.0 has the binary artifact.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["no_new_facts", "length_bounded", "temporal_anchors_preserved"]
+  },
+  {
+    "case_id": "mixed_002",
+    "category": "mixed_encoding",
+    "description": "File paths with /Users/ prefix and tilde-home variants",
+    "evidence": [
+      {"content": "config lives at ~/.rein/config.toml and the db at ~/.rein/memories.db.", "merged_at": "2026-04-05T10:00:00Z"},
+      {"content": "source tree is at /Users/user/Desktop/rein-vault/source/rein with 2-crate workspace.", "merged_at": "2026-04-06T10:00:00Z"},
+      {"content": "binary installs to ~/.cargo/bin/rein via cargo install --path crates/rein.", "merged_at": "2026-04-07T10:00:00Z"}
+    ],
+    "current_canonical": "File layout: config ~/.rein/config.toml, db ~/.rein/memories.db, source /Users/user/Desktop/rein-vault/source/rein (2-crate workspace), binary ~/.cargo/bin/rein via cargo install --path crates/rein.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["no_new_facts", "length_bounded"]
+  },
+  {
+    "case_id": "mixed_003",
+    "category": "mixed_encoding",
+    "description": "Unicode quotation marks and Chinese brackets",
+    "evidence": [
+      {"content": "reviewer said 「这个设计需要更多 benchmark 验证」 before merging.", "merged_at": "2026-04-10T10:00:00Z"},
+      {"content": "the decision doc uses 『lossless contract』 as a section heading.", "merged_at": "2026-04-11T10:00:00Z"},
+      {"content": "a later comment 「我同意需要 benchmark」 confirmed the direction.", "merged_at": "2026-04-12T10:00:00Z"}
+    ],
+    "current_canonical": "Reviewer feedback thread on v0.23 compression: 「这个设计需要更多 benchmark 验证」 followed by 「我同意需要 benchmark」. The decision doc uses 『lossless contract』 as a section heading.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "no_new_facts"]
+  },
+  {
+    "case_id": "mixed_004",
+    "category": "mixed_encoding",
+    "description": "Release announcement style prose with internal terminology (emoji deliberately omitted per userinstructions - kept minimal and realistic)",
+    "evidence": [
+      {"content": "v0.21 release announcement included a small celebration marker in internal channels.", "merged_at": "2026-04-20T10:00:00Z"},
+      {"content": "the A1 migration moved 38 ops behind #[op] — a substantial structural change.", "merged_at": "2026-04-20T12:00:00Z"}
+    ],
+    "current_canonical": "v0.21.0 release (2026-04-20) was announced in internal channels. A1 migration moved 38 ops behind #[op] macro, a substantial structural change.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["length_bounded", "temporal_anchors_preserved", "no_new_facts"]
+  },
+  {
+    "case_id": "mixed_005",
+    "category": "mixed_encoding",
+    "description": "Environment variable names with underscores",
+    "evidence": [
+      {"content": "REIN_HTTP_TOKEN must be set when HTTP server binds to non-localhost.", "merged_at": "2026-03-15T10:00:00Z"},
+      {"content": "REIN_HTTP_TOKEN is validated on every request against the hard-coded allowlist.", "merged_at": "2026-03-16T10:00:00Z"},
+      {"content": "GEMINI_API_KEY controls LLM extraction and query expansion; optional.", "merged_at": "2026-03-17T10:00:00Z"}
+    ],
+    "current_canonical": "Environment variables: REIN_HTTP_TOKEN required for non-localhost HTTP bind (validated per-request). GEMINI_API_KEY optional, controls LLM extraction and query expansion.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["no_new_facts", "length_bounded"]
+  },
+  {
+    "case_id": "mixed_006",
+    "category": "mixed_encoding",
+    "description": "Mixed EU/US date format discussions with URLs",
+    "evidence": [
+      {"content": "the audit report at https://example.com/audit/2026-04-22.pdf mentions TOCTOU in v0.22.", "merged_at": "2026-04-22T10:00:00Z"},
+      {"content": "a follow-up scan on 2026-04-22 reported 0 HIGH, 0 MEDIUM findings.", "merged_at": "2026-04-22T15:00:00Z"}
+    ],
+    "current_canonical": "v0.22 security audit (2026-04-22) at https://example.com/audit/2026-04-22.pdf reported 0 HIGH and 0 MEDIUM findings.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["temporal_anchors_preserved", "no_new_facts", "length_bounded"]
+  }
+]

@@ -142,6 +142,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_vector_coverage(config, &snapshot, indexed_vectors));
                             checks.push(check_tantivy(&store, snapshot.active_memories));
                             checks.push(hnsw_check);
+                            checks.push(check_resummerize(&store));
                         }
                         Err(e) => checks.push(fail_in(
                             DoctorCategory::Storage,
@@ -1088,6 +1089,41 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
             ),
             None,
         ),
+    }
+}
+
+fn check_resummerize(store: &SqliteStore) -> DoctorCheck {
+    // v0.23: surface resummerize backlog + recent failure rate. Backlog
+    // alone is not an error — it just means the LLM hasn't yet processed
+    // rows flagged by MergeInto cap hits. A high failure rate indicates
+    // a broken prompt / model / contract tuning and should be triaged.
+    let backlog = crate::ops::resummerize::backlog_count(store).unwrap_or(0);
+    let failure_rate =
+        crate::store::resummerize_audit::recent_failure_rate(store.conn(), chrono::Duration::hours(24))
+            .unwrap_or(0.0);
+    let total_recent = crate::store::resummerize_audit::recent_run_count(
+        store.conn(),
+        chrono::Duration::hours(24),
+    )
+    .unwrap_or(0);
+
+    let message = format!(
+        "backlog={backlog} needing resummerize; last 24h: {total_recent} runs, failure_rate={:.1}%",
+        failure_rate * 100.0
+    );
+
+    // Thresholds are structural, not tuned: failure rate ≥ 50% over ≥ 5
+    // runs is a strong signal that contract is failing systematically;
+    // < 5 runs is insufficient evidence to warn.
+    if total_recent >= 5 && failure_rate >= 0.5 {
+        warn_with_hint(
+            DoctorCategory::Queue,
+            "resummerize",
+            message,
+            "check [resummerize] config + recent resummarize_runs rows; a systematic failure usually means the LLM prompt or contract needs adjustment",
+        )
+    } else {
+        ok_in(DoctorCategory::Queue, "resummerize", message)
     }
 }
 

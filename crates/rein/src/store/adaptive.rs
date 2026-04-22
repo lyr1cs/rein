@@ -201,6 +201,70 @@ pub fn event_count(conn: &Connection) -> u64 {
         .unwrap_or(0)
 }
 
+/// v0.23: Recompute per-cluster and global canonical-content length
+/// percentiles from the current set of live canonicals.
+///
+/// A "canonical" is a row where `canonical_id = id AND status IN
+/// ('active', 'updated')` — both states are live canonicals (`updated`
+/// is the post-merge state auto-promoted by `store.update()`'s trigger).
+/// Intended to be invoked by the slow-channel GC pass before
+/// `AdaptiveState::save_snapshot`. Codex round-5 H-1 + round-6 LOW.
+pub fn recompute_canonical_length_stats(
+    conn: &Connection,
+) -> ReinResult<(HashMap<u32, CanonicalLengthStats>, Option<CanonicalLengthStats>)> {
+    // Canonicals are identified by the `memory_canonical_state` table rather
+    // than a column on `memories` itself — a row is canonical when its own
+    // `memory_id` equals its `canonical_id` entry. See `canonical_id_for` in
+    // `store/sqlite.rs` for the same join pattern.
+    // Length is measured in BYTES (CAST to BLOB) to match the upstream
+    // MergeInto byte-cap at `store/sqlite.rs:1939`. Previously this was
+    // SQLite's `length()` on TEXT which returns codepoints — for a
+    // CJK-heavy corpus that produced target_bytes values ~3× too permissive
+    // and let compressed output blow the merge cap. Codex audit H3.
+    //
+    // `status IN ('active', 'updated')`: round-5 H-1. Merged canonicals
+    // are promoted from `active` to `updated` by the merge trigger;
+    // filtering only `active` here underreports post-merge canonicals
+    // and skews the per-cluster length distribution on corpora with
+    // heavy merge activity. Both states are live canonicals.
+    let mut stmt = conn.prepare(
+        "SELECT m.cluster_id, length(CAST(m.content AS BLOB)) \
+         FROM memories m \
+         JOIN memory_canonical_state cs ON cs.memory_id = m.id \
+         WHERE cs.canonical_id = m.id \
+           AND m.status IN ('active', 'updated')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let cid: Option<i64> = row.get(0)?;
+        let len: i64 = row.get(1)?;
+        Ok((cid, len))
+    })?;
+
+    let mut per_cluster: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut global: Vec<usize> = Vec::new();
+    for row in rows {
+        let (cluster_id, len) = row?;
+        if len < 0 {
+            continue;
+        }
+        let len_u = len as usize;
+        global.push(len_u);
+        if let Some(cid) = cluster_id {
+            if cid >= 0 {
+                per_cluster.entry(cid as u32).or_default().push(len_u);
+            }
+        }
+    }
+
+    let per_cluster_stats: HashMap<u32, CanonicalLengthStats> = per_cluster
+        .into_iter()
+        .filter_map(|(cid, lens)| CanonicalLengthStats::from_lengths(lens).map(|s| (cid, s)))
+        .collect();
+    let global_stats = CanonicalLengthStats::from_lengths(global);
+
+    Ok((per_cluster_stats, global_stats))
+}
+
 // ── AdaptiveState ────────────────────────────────────────────────────────────
 
 /// Central cache for all learned parameters. Stored as RefCell on SqliteStore.
@@ -235,6 +299,17 @@ pub struct AdaptiveState {
     #[serde(default)]
     pub centroid_version: u64,
 
+    /// v0.23: Per-cluster canonical content length percentiles. Drives
+    /// adaptive `target_bytes` for resummerize compression. Populated by
+    /// the slow-channel via `recompute_canonical_length_stats`.
+    #[serde(default)]
+    pub canonical_length_stats: HashMap<u32, CanonicalLengthStats>,
+
+    /// v0.23: Global canonical content length percentiles. Fallback when
+    /// a cluster lacks sufficient samples or no cluster is assigned.
+    #[serde(default)]
+    pub global_canonical_length: Option<CanonicalLengthStats>,
+
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
 }
@@ -243,12 +318,78 @@ fn default_global_dedup_threshold() -> f32 {
     0.70
 }
 
+/// Minimum target bytes for resummerize output (v0.23). Below this,
+/// compression is structurally meaningless — a single merge entry often
+/// already exceeds this.
+pub const MIN_RESUMMERIZE_TARGET: usize = 2_000;
+/// Maximum target bytes for resummerize output (v0.23). Derived from
+/// `MERGE_CONTENT_CAP` so the two constants can't drift silently (Codex
+/// round-2 LOW). Compressing above the cap is a no-op and would
+/// immediately re-enter keep-tail on the next merge.
+pub const MAX_RESUMMERIZE_TARGET: usize = crate::store::sqlite::MERGE_CONTENT_CAP;
+// Compile-time guard: any future edit that decouples the two constants
+// will fail the build here rather than leak a budget mismatch to
+// production.
+const _: () = assert!(MAX_RESUMMERIZE_TARGET <= crate::store::sqlite::MERGE_CONTENT_CAP);
+/// Bootstrap target used until enough per-cluster or global canonical
+/// length data accumulates. Anchored to the min/max constants rather than
+/// a free-floating magic number (MIN + 75% of range = 8_000).
+pub const RESUMMERIZE_BOOTSTRAP_TARGET: usize =
+    MIN_RESUMMERIZE_TARGET + (MAX_RESUMMERIZE_TARGET - MIN_RESUMMERIZE_TARGET) * 3 / 4;
+/// Minimum cluster sample count before we trust a per-cluster p25.
+pub const RESUMMERIZE_CLUSTER_MIN_SAMPLES: usize = 5;
+/// Minimum global sample count before we trust the global p25 fallback.
+pub const RESUMMERIZE_GLOBAL_MIN_SAMPLES: usize = 10;
+
 /// A learned alpha entry with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedAlphaEntry {
     pub value: f64,
     pub sample_count: usize,
     pub last_updated: String, // RFC3339
+}
+
+/// Per-cluster (and global) canonical content length percentiles (v0.23).
+///
+/// Drives adaptive `target_bytes` for resummerize compression.
+/// Percentiles use linear interpolation between sorted order statistics,
+/// which matches the default used by NumPy and most statistical software.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalLengthStats {
+    /// Number of canonicals contributing to the percentile.
+    /// Callers must compare against `RESUMMERIZE_*_MIN_SAMPLES` before
+    /// trusting the p25 value.
+    pub count: usize,
+    pub p25: usize,
+    pub p50: usize,
+    pub p75: usize,
+}
+
+impl CanonicalLengthStats {
+    /// Compute stats from canonical content lengths (bytes).
+    /// Returns `None` when `lengths` is empty.
+    pub fn from_lengths(mut lengths: Vec<usize>) -> Option<Self> {
+        if lengths.is_empty() {
+            return None;
+        }
+        lengths.sort_unstable();
+        let n = lengths.len();
+        let pct = |p: f64| -> usize {
+            let rank = p * (n.saturating_sub(1)) as f64;
+            let lo = rank.floor() as usize;
+            let hi = (lo + 1).min(n - 1);
+            let frac = rank - lo as f64;
+            let lo_v = lengths[lo] as f64;
+            let hi_v = lengths[hi] as f64;
+            (lo_v + frac * (hi_v - lo_v)).round() as usize
+        };
+        Some(Self {
+            count: n,
+            p25: pct(0.25),
+            p50: pct(0.50),
+            p75: pct(0.75),
+        })
+    }
 }
 
 impl AdaptiveState {
@@ -313,6 +454,39 @@ impl AdaptiveState {
         }
     }
 
+    /// v0.23: Per-cluster canonical length p25, with minimum-sample guard.
+    /// Returns `None` when the cluster has fewer than
+    /// `RESUMMERIZE_CLUSTER_MIN_SAMPLES` observations.
+    pub fn cluster_canonical_length_p25(&self, cluster_id: u32) -> Option<usize> {
+        self.canonical_length_stats
+            .get(&cluster_id)
+            .filter(|s| s.count >= RESUMMERIZE_CLUSTER_MIN_SAMPLES)
+            .map(|s| s.p25)
+    }
+
+    /// v0.23: Target byte count for resummerize output. Fully data-driven
+    /// with a three-tier fallback:
+    ///
+    /// 1. per-cluster p25 (≥ 5 samples in the cluster)
+    /// 2. global p25 (≥ 10 samples globally)
+    /// 3. bootstrap constant (`RESUMMERIZE_BOOTSTRAP_TARGET`)
+    ///
+    /// Always clamped to `[MIN_RESUMMERIZE_TARGET, MAX_RESUMMERIZE_TARGET]`
+    /// so structurally meaningless targets (too short to carry evidence,
+    /// or above the merge cap) are impossible regardless of input data.
+    pub fn resummerize_target_bytes(&self, cluster_id: Option<u32>) -> usize {
+        let from_cluster = cluster_id.and_then(|c| self.cluster_canonical_length_p25(c));
+        let from_global = self
+            .global_canonical_length
+            .as_ref()
+            .filter(|s| s.count >= RESUMMERIZE_GLOBAL_MIN_SAMPLES)
+            .map(|s| s.p25);
+        let raw = from_cluster
+            .or(from_global)
+            .unwrap_or(RESUMMERIZE_BOOTSTRAP_TARGET);
+        raw.clamp(MIN_RESUMMERIZE_TARGET, MAX_RESUMMERIZE_TARGET)
+    }
+
     /// Save state snapshot to metadata table with optimistic concurrency control.
     /// Checks that the stored version matches our base version to prevent lost updates
     /// when two concurrent GC runs modify the state simultaneously.
@@ -373,6 +547,9 @@ impl AdaptiveState {
                     if self.cluster_version >= current.cluster_version {
                         current.memory_clusters = self.memory_clusters.clone();
                         current.dedup_thresholds = self.dedup_thresholds.clone();
+                        // v0.23: canonical_length_stats is cluster-keyed, treat the
+                        // same as dedup_thresholds across a recluster boundary.
+                        current.canonical_length_stats = self.canonical_length_stats.clone();
                         // Replace all cluster-scoped alpha keys (contain ':') with ours
                         current.learned_alpha.retain(|k, _| !k.contains(':'));
                         for (key, entry) in &self.learned_alpha {
@@ -387,6 +564,15 @@ impl AdaptiveState {
                         }
                         for (&cid, &threshold) in &self.dedup_thresholds {
                             current.dedup_thresholds.insert(cid, threshold);
+                        }
+                        // v0.23: additive merge — newer stats win per-cluster.
+                        // Same-version concurrent writers will end up with a
+                        // non-deterministic last-write-wins, which is fine since
+                        // both computed from overlapping corpus snapshots.
+                        for (&cid, stats) in &self.canonical_length_stats {
+                            current
+                                .canonical_length_stats
+                                .insert(cid, stats.clone());
                         }
                     }
 
@@ -410,6 +596,9 @@ impl AdaptiveState {
                     current.hot_threshold = self.hot_threshold;
                     current.cold_threshold = self.cold_threshold;
                     current.global_dedup_threshold = self.global_dedup_threshold;
+                    // v0.23: global canonical length stats — take ours (latest
+                    // slow-channel recompute wins; older computation is stale).
+                    current.global_canonical_length = self.global_canonical_length.clone();
                     current.version = db_version + 1;
 
                     let merged_json =
