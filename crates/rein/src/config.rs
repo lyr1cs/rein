@@ -1228,19 +1228,37 @@ fn pool_cache() -> &'static Mutex<HashMap<PathBuf, Weak<crate::store::pool::Conn
 fn pool_for_path(
     db_path: &Path,
 ) -> crate::types::ReinResult<Arc<crate::store::pool::ConnPool>> {
+    // Normalize the path spelling for cache keying so that `./rein.db`,
+    // `rein.db`, and `/abs/rein.db` (all pointing at the same file)
+    // resolve to the same pool (Codex v0.22 round-2 LOW #3).
+    //
+    // `std::path::absolute` handles relative→absolute without requiring
+    // the file to exist — unlike `canonicalize`, which errors on
+    // first-run when the DB file is about to be created by
+    // `ConnPool::new` below.  Symlinks and `.`/`..` components are NOT
+    // resolved; callers needing full canonicalization should
+    // `canonicalize` upstream.
+    //
+    // Key resolution runs INSIDE the Mutex guard so concurrent callers
+    // can never race to create two pools for the same file (Codex
+    // round-2 clarification).  `absolute()` is fast (no syscall on the
+    // happy path) so holding the lock across it is cheap.
     let mut map = pool_cache()
         .lock()
         .expect("open_store pool cache mutex poisoned");
+    let key = std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf());
     // Opportunistic prune: drop entries whose `SqliteStore` holders are gone.
     map.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(weak) = map.get(db_path) {
+    if let Some(weak) = map.get(&key) {
         if let Some(pool) = weak.upgrade() {
             return Ok(pool);
         }
     }
     let size = crate::store::pool::default_pool_size();
+    // Pass the original `db_path` to `ConnPool::new`; cache keying is the
+    // only place we need the normalized form.
     let pool = Arc::new(crate::store::pool::ConnPool::new(db_path, size)?);
-    map.insert(db_path.to_path_buf(), Arc::downgrade(&pool));
+    map.insert(key, Arc::downgrade(&pool));
     Ok(pool)
 }
 
