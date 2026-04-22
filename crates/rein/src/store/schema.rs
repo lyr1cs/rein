@@ -1137,6 +1137,9 @@ mod migration_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(fts_hit, 1, "memories_ai trigger must also survive migration");
+        assert_eq!(
+            fts_hit, 1,
+            "memories_ai trigger must also survive migration"
+        );
     }
 }

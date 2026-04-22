@@ -429,9 +429,7 @@ fn test_m5_cold_filter_does_not_truncate_result_set() {
          the filter reverted to post-take"
     );
     assert!(
-        results
-            .iter()
-            .all(|r| r.memory.tier != MemoryTier::Cold),
+        results.iter().all(|r| r.memory.tier != MemoryTier::Cold),
         "Cold memories must be excluded on non-Exploratory routes"
     );
     assert!(

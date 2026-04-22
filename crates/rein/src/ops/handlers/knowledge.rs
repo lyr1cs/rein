@@ -16,7 +16,7 @@
 
 use rein_macros::op;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsErrorKind, OpsRuntime};
@@ -126,17 +126,42 @@ impl IntoCliText for MemoirShowOutput {
 /// The `name` field is bound from the `{name}` path segment on REST;
 /// `format` comes from `?format=` query string (REST) or the MCP payload.
 ///
-/// Phase 2.6 F2: `#[serde(alias = "memoir")]` preserves the pre-A1 MCP
-/// wire format where clients sent `{"memoir": "..."}`. The canonical field
-/// name is `name` so the path-template binding still works.
-#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+/// Phase 2.6 F2: manual deserialization preserves the pre-A1 MCP wire format
+/// where clients sent `{"memoir": "..."}` while still preferring canonical
+/// `name` when both keys are present. That keeps REST path binding dominant
+/// even if a legacy `memoir=` query alias is supplied.
+#[derive(clap::Args, JsonSchema, Debug, Clone, Default)]
 pub struct MemoirExportParams {
     /// Name of the memoir to export.
-    #[serde(alias = "memoir")]
     pub name: String,
     /// Export format: json, ascii, or dot (default json).
-    #[serde(default)]
     pub format: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for MemoirExportParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MemoirExportParamsWire {
+            name: Option<String>,
+            memoir: Option<String>,
+            #[serde(default)]
+            format: Option<String>,
+        }
+
+        let wire = MemoirExportParamsWire::deserialize(deserializer)?;
+        let name = wire
+            .name
+            .or(wire.memoir)
+            .ok_or_else(|| serde::de::Error::missing_field("name"))?;
+
+        Ok(Self {
+            name,
+            format: wire.format,
+        })
+    }
 }
 
 /// Output shape for `memoir_export`. REST surface returns the raw body as
@@ -907,6 +932,14 @@ mod tests {
     }
 
     #[test]
+    fn memoir_export_params_prefer_canonical_name_over_legacy_alias() {
+        let params: MemoirExportParams =
+            serde_json::from_value(json!({"memoir": "legacy", "name": "canonical"}))
+                .expect("canonical field should take precedence");
+        assert_eq!(params.name, "canonical");
+    }
+
+    #[test]
     fn memoir_search_params_accepts_string_limit() {
         let params: MemoirSearchParams =
             serde_json::from_value(json!({"memoir": "m", "query": "q", "limit": "10"}))
@@ -1026,6 +1059,33 @@ mod tests {
         assert!(
             value.get("format").is_none() && value.get("output").is_none(),
             "REST adapter must not leak the raw Serialize shape, got {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memoir_export_rest_path_value_overrides_legacy_query_alias() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("wire-export");
+        let entry = inventory::iter::<crate::ops::OpsRestEntry>()
+            .find(|e| e.op_name == "memoir_export")
+            .expect("memoir_export REST entry");
+        let (_status, body, content_type) = (entry.invoke)(
+            runtime,
+            std::collections::HashMap::from([("name", "wire-export".to_string())]),
+            "memoir=wrong-memoir&format=json".to_string(),
+            None,
+        )
+        .await
+        .expect("memoir_export invoke");
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("memoir_export body is valid JSON");
+        assert_eq!(
+            value
+                .get("memoir")
+                .and_then(|memoir| memoir.get("name"))
+                .and_then(|name| name.as_str()),
+            Some("wire-export"),
+            "REST path binding must beat the legacy memoir query alias"
         );
     }
 

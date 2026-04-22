@@ -264,9 +264,10 @@ impl SqliteStore {
                 };
 
                 if sim > 0.8 {
+                    self.mark_superseded(&old.id, new_id)?;
                     self.conn.execute(
-                        "UPDATE memories SET superseded_by = ?1, status = 'deprecated' WHERE id = ?2",
-                        rusqlite::params![new_id, old.id],
+                        "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                        rusqlite::params![old.id],
                     )?;
                     evolved += 1;
                     tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
@@ -681,6 +682,12 @@ impl SqliteStore {
                     .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
                 return Err(e.into());
             }
+            if let Err(e) = crate::store::vec::delete_embedding(&self.conn, id) {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
+                return Err(e);
+            }
         }
 
         // Insert replacement
@@ -723,6 +730,22 @@ impl SqliteStore {
                 }
             }
         }
+
+        for memory in &old_memories {
+            self.add_memory_evidence(MemoryEvidence {
+                id: String::new(),
+                canonical_id: replacement_id.clone(),
+                memory_id: None,
+                source_topic: memory.topic.clone(),
+                summary: memory.summary.clone(),
+                content: memory.content.clone(),
+                keywords: memory.keywords.clone(),
+                source: memory.source,
+                created_at: memory.created_at,
+                imported_at: Utc::now(),
+            })?;
+        }
+        self.refresh_canonical_state(&replacement_id)?;
 
         self.conn.execute_batch("RELEASE consolidate_by_ids")?;
 
@@ -831,5 +854,109 @@ impl SqliteStore {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_memory(id: &str, topic: &str, summary: &str, content: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: summary.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::High,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::default(),
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn store_knowledge_units_refines_existing_concepts_inside_outer_savepoint() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let first = crate::extract::ExtractedConcept {
+            name: "ownership".to_string(),
+            definition: "Initial definition".to_string(),
+            labels: vec!["rust".to_string()],
+            memoir: "rust-lang".to_string(),
+            concept_type: "fact".to_string(),
+            quality_confidence: 0.8,
+        };
+        store
+            .store_knowledge_units_with_sources(&[first], &[], &[])
+            .unwrap();
+
+        let refined = crate::extract::ExtractedConcept {
+            name: "ownership".to_string(),
+            definition: "Refined definition".to_string(),
+            labels: vec!["rust".to_string(), "memory".to_string()],
+            memoir: "rust-lang".to_string(),
+            concept_type: "fact".to_string(),
+            quality_confidence: 0.9,
+        };
+        let report = store
+            .store_knowledge_units_with_sources(&[refined], &[], &["mem-1".to_string()])
+            .unwrap();
+
+        assert_eq!(report.concepts_refined, 1);
+        let concept = store
+            .get_concept("rust-lang", "ownership")
+            .unwrap()
+            .expect("concept exists");
+        assert_eq!(concept.definition, "Refined definition");
+        assert_eq!(concept.revision, 2);
+        assert!(concept.source_memory_ids.iter().any(|id| id == "mem-1"));
+    }
+
+    #[test]
+    fn apply_evolution_updates_canonical_state_when_superseding() {
+        let store = SqliteStore::in_memory().unwrap();
+        let old_id = store
+            .store(test_memory(
+                "old-id",
+                "topic-a",
+                "legacy summary",
+                "shared evolution content",
+            ))
+            .unwrap();
+        let new_id = store
+            .store(test_memory(
+                "new-id",
+                "topic-a",
+                "new summary",
+                "shared evolution content",
+            ))
+            .unwrap();
+
+        store
+            .apply_evolution(&new_id, "shared evolution content", None)
+            .unwrap();
+
+        let old = store.get(&old_id).unwrap();
+        assert_eq!(old.superseded_by.as_deref(), Some(new_id.as_str()));
+        assert_eq!(store.canonical_id_for(&old_id).unwrap(), new_id);
     }
 }

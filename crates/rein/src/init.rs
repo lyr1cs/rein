@@ -571,5 +571,4 @@ mod tests {
         assert!(doc.contains("proxy_returns_426_when_codex_websocket_upstream_is_unavailable"));
         assert!(doc.contains("codexsubp"));
     }
-
 }

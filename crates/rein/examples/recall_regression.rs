@@ -242,7 +242,9 @@ async fn main() {
     eprintln!("  p50 serial (a):   {p50_a:?}");
     eprintln!("  p50 parallel (b): {p50_b:?}  ({ratio:.3}x, regression {regression_pct:+.2}%)");
     eprintln!("  p95 serial (a):   {p95_a:?}");
-    eprintln!("  p95 parallel (b): {p95_b:?}  ({p95_ratio:.3}x, regression {p95_regression_pct:+.2}%)");
+    eprintln!(
+        "  p95 parallel (b): {p95_b:?}  ({p95_ratio:.3}x, regression {p95_regression_pct:+.2}%)"
+    );
     eprintln!();
     if regression_pct <= 2.0 {
         eprintln!("  → PASS — D4 pool + internal parallelism preserves single-user latency");

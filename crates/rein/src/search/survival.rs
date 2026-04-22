@@ -660,7 +660,10 @@ mod tests {
             median_survival: None,
         };
         let p = curve.probability_at(10.0);
-        assert!(p.is_finite(), "tied-step curve must return finite probability");
+        assert!(
+            p.is_finite(),
+            "tied-step curve must return finite probability"
+        );
         assert!((0.0..=1.0).contains(&p));
     }
 

@@ -465,9 +465,7 @@ pub fn check_dedup(
     if best_vec_sim > 0.85 {
         if let Some(memory) = best_vec_memory {
             let age_days = (chrono::Utc::now() - memory.created_at).num_days();
-            if age_days < time_window_days
-                && !new_strongly_contains_old(content, &memory.content)
-            {
+            if age_days < time_window_days && !new_strongly_contains_old(content, &memory.content) {
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
@@ -493,9 +491,7 @@ pub fn check_dedup(
                     true,
                 );
             }
-            if age_days < time_window_days
-                && !new_strongly_contains_old(content, &memory.content)
-            {
+            if age_days < time_window_days && !new_strongly_contains_old(content, &memory.content) {
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
