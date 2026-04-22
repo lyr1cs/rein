@@ -107,8 +107,11 @@ pub struct RecentOutput {
 
 impl IntoJson for RecentOutput {
     fn to_json(&self) -> serde_json::Value {
-        let items: Vec<serde_json::Value> =
-            self.memories.iter().map(crate::mcp::rest::memory_to_json).collect();
+        let items: Vec<serde_json::Value> = self
+            .memories
+            .iter()
+            .map(crate::mcp::rest::memory_to_json)
+            .collect();
         json!({ "memories": items })
     }
 }
@@ -164,7 +167,10 @@ impl IntoCliText for RecentOutput {
                     } else {
                         format!("{}m ago", age.num_minutes())
                     };
-                    format!("[{}] {} ({}, {})", m.topic, m.summary, m.importance, age_str)
+                    format!(
+                        "[{}] {} ({}, {})",
+                        m.topic, m.summary, m.importance, age_str
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -546,14 +552,13 @@ impl IntoCliText for GetMemoryOutput {
     }
 }
 
-
 impl OpsRuntime {
     #[op(
         name = "get_memory",
         category = "memory",
         description = "Fetch a single memory by ID with linked evidence.",
         rest(method = "GET", path = "/api/memories/{id}"),
-        auth = "read_token",
+        auth = "read_token"
     )]
     pub fn get_memory(&self, params: GetMemoryParams) -> ReinResult<GetMemoryOutput> {
         let id = params.id.clone();
@@ -594,7 +599,7 @@ impl OpsRuntime {
         category = "memory",
         description = "Search and recall memories by semantic query. 3-channel waterfall: FTS5 (Tantivy BM25) → HNSW vectors → Gemini API, fused via RRF/CC with query expansion, LLM reranking, and Ebbinghaus decay weighting.",
         cli(name = "recall"),
-        mcp(name = "rein_recall"),
+        mcp(name = "rein_recall")
     )]
     pub fn recall(&self, params: RecallMemoryParams) -> ReinResult<RecallMemoryOutput> {
         let limit = params.limit.unwrap_or(10).min(200);
@@ -607,11 +612,8 @@ impl OpsRuntime {
         let expand = params.expand;
         let compact = self.compact();
 
-        let route = crate::search::classify::classify(
-            &query,
-            time_from.is_some(),
-            time_to.is_some(),
-        );
+        let route =
+            crate::search::classify::classify(&query, time_from.is_some(), time_to.is_some());
         let route_name = route.query_type.to_string();
         let req_id_clone = request_id.clone();
 
@@ -645,7 +647,7 @@ impl OpsRuntime {
         description = "Store a new memory with topic, content, importance, and keywords. Automatically deduplicates against existing memories.",
         mutating = true,
         cli(name = "store"),
-        mcp(name = "rein_store"),
+        mcp(name = "rein_store")
     )]
     pub fn store_memory(&self, params: StoreMemoryParams) -> ReinResult<StoreMemoryOutput> {
         if params.content.len() > 100_000 {
@@ -654,21 +656,17 @@ impl OpsRuntime {
             )
             .with_kind(crate::types::OpsErrorKind::BadRequest));
         }
-        let importance: crate::types::Importance = match params
-            .importance
-            .as_deref()
-            .unwrap_or("medium")
-            .parse()
-        {
-            Ok(imp) => imp,
-            Err(_) => {
-                return Err(crate::types::ReinError::Config(format!(
-                    "invalid importance {:?}: must be one of low, medium, high, critical",
-                    params.importance.as_deref().unwrap_or("")
-                ))
-                .with_kind(crate::types::OpsErrorKind::BadRequest))
-            }
-        };
+        let importance: crate::types::Importance =
+            match params.importance.as_deref().unwrap_or("medium").parse() {
+                Ok(imp) => imp,
+                Err(_) => {
+                    return Err(crate::types::ReinError::Config(format!(
+                        "invalid importance {:?}: must be one of low, medium, high, critical",
+                        params.importance.as_deref().unwrap_or("")
+                    ))
+                    .with_kind(crate::types::OpsErrorKind::BadRequest))
+                }
+            };
         let keywords = params.keywords.unwrap_or_default();
         let memory = crate::ops::build_memory(
             &self.config,
@@ -692,26 +690,25 @@ impl OpsRuntime {
         description = "Update the content of an existing memory by ID. Optionally reassign importance, which adjusts the decay layer.",
         mutating = true,
         cli(name = "update"),
-        mcp(name = "rein_update"),
+        mcp(name = "rein_update")
     )]
     pub fn update(&self, params: UpdateParams) -> ReinResult<UpdateOutput> {
         let base_lambda = self.config.decay.base_lambda;
         let id = params.id.clone();
         // M2: validate importance early before opening a transaction.
-        let new_importance: Option<crate::types::Importance> =
-            match params.importance.as_deref() {
-                None => None,
-                Some(s) => match s.parse::<crate::types::Importance>() {
-                    Ok(imp) => Some(imp),
-                    Err(_) => {
-                        return Err(crate::types::ReinError::Config(format!(
-                            "invalid importance {:?}: must be one of low, medium, high, critical",
-                            s
-                        ))
-                        .with_kind(crate::types::OpsErrorKind::BadRequest))
-                    }
-                },
-            };
+        let new_importance: Option<crate::types::Importance> = match params.importance.as_deref() {
+            None => None,
+            Some(s) => match s.parse::<crate::types::Importance>() {
+                Ok(imp) => Some(imp),
+                Err(_) => {
+                    return Err(crate::types::ReinError::Config(format!(
+                        "invalid importance {:?}: must be one of low, medium, high, critical",
+                        s
+                    ))
+                    .with_kind(crate::types::OpsErrorKind::BadRequest))
+                }
+            },
+        };
         self.with_store(|store| {
             // H2: wrap read-modify-write in BEGIN IMMEDIATE to prevent lost updates.
             let conn = store.conn();
@@ -731,7 +728,10 @@ impl OpsRuntime {
                 }
                 memory.updated_at = chrono::Utc::now();
                 store.update(&memory)?;
-                Ok(UpdateOutput { id: id.clone(), updated: true })
+                Ok(UpdateOutput {
+                    id: id.clone(),
+                    updated: true,
+                })
             })();
             match result {
                 Ok(out) => {
@@ -751,7 +751,7 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Chronological timeline of knowledge events: episodes, concept revisions, memory creation. Supports date-range filtering.",
         cli(name = "timeline"),
-        mcp(name = "rein_timeline"),
+        mcp(name = "rein_timeline")
     )]
     pub fn timeline(&self, params: TimelineParams) -> ReinResult<TimelineOutput> {
         let limit = params.limit.unwrap_or(20).min(200);
@@ -955,7 +955,7 @@ impl OpsRuntime {
         category = "knowledge",
         description = "Show revision history of a concept — when and how its definition changed over time.",
         cli(name = "concept-history"),
-        mcp(name = "rein_concept_history"),
+        mcp(name = "rein_concept_history")
     )]
     pub fn concept_history(
         &self,
@@ -996,7 +996,7 @@ impl OpsRuntime {
         description = "List all unique topics across stored memories.",
         cli(name = "topics"),
         mcp(name = "rein_list_topics"),
-        rest(method = "GET", path = "/api/topics"),
+        rest(method = "GET", path = "/api/topics")
     )]
     pub fn list_topics(&self, _params: ListTopicsParams) -> ReinResult<ListTopicsOutput> {
         let compact = self.compact();
@@ -1012,7 +1012,7 @@ impl OpsRuntime {
         description = "Show the most recently created memories ordered by creation time.",
         cli(name = "recent"),
         mcp(name = "rein_recent"),
-        rest(method = "GET", path = "/api/recent"),
+        rest(method = "GET", path = "/api/recent")
     )]
     pub fn recent(&self, params: RecentParams) -> ReinResult<RecentOutput> {
         let limit = params.limit.unwrap_or(20).clamp(1, 100);
@@ -1031,13 +1031,16 @@ impl OpsRuntime {
         cli(name = "forget"),
         mcp(name = "rein_forget"),
         rest(method = "DELETE", path = "/api/memories/{id}"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn forget(&self, params: ForgetParams) -> ReinResult<ForgetOutput> {
         let id = params.id.clone();
         self.with_store(|store| {
             store.delete(&id)?;
-            Ok(ForgetOutput { id: id.clone(), deleted: true })
+            Ok(ForgetOutput {
+                id: id.clone(),
+                deleted: true,
+            })
         })
     }
 }

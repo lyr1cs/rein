@@ -5,7 +5,7 @@ use std::str::FromStr;
 use crate::store::fts::sanitize_fts_query;
 use crate::types::*;
 
-use super::sqlite::SqliteStore;
+use super::sqlite::{clean_concept_refs, SqliteStore};
 
 /// Normalize a concept name for dedup-safe lookup.
 /// Lowercases, replaces underscores and spaces with hyphens, collapses runs of hyphens.
@@ -287,33 +287,11 @@ impl SqliteStore {
                 return Err(ReinError::NotFound(format!("memoir '{name}' not found")));
             }
 
-            // Strip deleted concept IDs from memories' concept_ids JSON arrays
+            // Strip deleted concept IDs from every JSON array that may still
+            // reference them before the memoir delete cascades the concepts away.
             if !concept_ids.is_empty() {
-                let deleted_set: std::collections::HashSet<&str> =
-                    concept_ids.iter().map(|s| s.as_str()).collect();
-                let mut stmt = self
-                    .conn()
-                    .prepare("SELECT id, concept_ids FROM memories WHERE concept_ids != '[]'")?;
-                let rows: Vec<(String, String)> = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                drop(stmt);
-                for (mem_id, cids_json) in rows {
-                    if let Ok(cids) = serde_json::from_str::<Vec<String>>(&cids_json) {
-                        let filtered: Vec<String> = cids
-                            .into_iter()
-                            .filter(|c| !deleted_set.contains(c.as_str()))
-                            .collect();
-                        let new_json = serde_json::to_string(&filtered)?;
-                        if new_json != cids_json {
-                            self.conn().execute(
-                                "UPDATE memories SET concept_ids = ?1 WHERE id = ?2",
-                                rusqlite::params![new_json, mem_id],
-                            )?;
-                        }
-                    }
+                for concept_id in &concept_ids {
+                    clean_concept_refs(self.conn(), concept_id)?;
                 }
             }
 
@@ -433,20 +411,17 @@ impl SqliteStore {
             .ok_or_else(|| ReinError::NotFound(format!("memoir '{memoir_name}' not found")))?;
 
         // Phase 3 F3 hardening: snapshot + update run inside the same
-        // transaction so a partial write cannot leave the revision log and
-        // the concept row out of sync. Matches Phase 2.4 F2 / Phase 2.5 H2
-        // discipline. A snapshot insert failure now aborts the update,
-        // which is a stricter contract than the pre-A1 behaviour (where a
-        // `tracing::warn!` quietly swallowed the snapshot error); callers
-        // get a surfaced error instead of a silently half-written concept.
+        // savepoint so a partial write cannot leave the revision log and
+        // the concept row out of sync. Savepoint form keeps the path
+        // nesting-safe when knowledge ingestion already holds an outer
+        // transaction on the same connection.
         let conn = self.conn();
-        conn.execute_batch("BEGIN IMMEDIATE")?;
+        conn.execute_batch("SAVEPOINT refine_concept")?;
         let result = (|| -> ReinResult<()> {
             if let Some(old) = self.get_concept(memoir_name, concept_name)? {
                 let rev_id = ulid::Ulid::new().to_string();
                 let labels_json = serde_json::to_string(&old.labels).unwrap_or_default();
-                let source_json =
-                    serde_json::to_string(&old.source_memory_ids).unwrap_or_default();
+                let source_json = serde_json::to_string(&old.source_memory_ids).unwrap_or_default();
                 conn.execute(
                     "INSERT INTO concept_revisions (id, concept_id, revision, definition, confidence, labels, source_memory_ids, episode_id, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -478,20 +453,17 @@ impl SqliteStore {
         })();
 
         match result {
-            Ok(()) => match conn.execute_batch("COMMIT") {
+            Ok(()) => match conn.execute_batch("RELEASE refine_concept") {
                 Ok(()) => Ok(()),
-                Err(commit_err) => {
-                    // If COMMIT itself fails (SQLITE_BUSY, I/O error, disk
-                    // full), the transaction is still open on this
-                    // connection. Best-effort ROLLBACK closes it so the
-                    // per-request SqliteStore does not poison the next call
-                    // on the same connection before the request ends.
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(commit_err.into())
+                Err(release_err) => {
+                    let _ = conn.execute_batch("ROLLBACK TO refine_concept");
+                    let _ = conn.execute_batch("RELEASE refine_concept");
+                    Err(release_err.into())
                 }
             },
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                let _ = conn.execute_batch("ROLLBACK TO refine_concept");
+                let _ = conn.execute_batch("RELEASE refine_concept");
                 Err(e)
             }
         }
@@ -1786,6 +1758,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(link_count, 0);
+    }
+
+    #[test]
+    fn test_delete_memoir_cleans_episode_concept_ids() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("rust-lang", "Rust"))
+            .unwrap();
+        let concept_id = store
+            .add_concept(make_concept(&memoir_id, "ownership", "Ownership model"))
+            .unwrap();
+
+        let episode_id = store
+            .create_episode(Episode {
+                id: String::new(),
+                title: "ownership discussion".to_string(),
+                outcome: String::new(),
+                decisions: vec![],
+                primary_topics: vec![],
+                tags: vec![],
+                involved_agents: vec![],
+                important_paths: vec![],
+                temporal_keywords: vec![],
+                source_session_id: None,
+                concept_ids: vec![concept_id.clone()],
+                memory_ids: vec![],
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        store.delete_memoir("rust-lang").unwrap();
+
+        let episode = store
+            .get_episode(&episode_id)
+            .unwrap()
+            .expect("episode survives memoir delete");
+        assert!(
+            !episode.concept_ids.contains(&concept_id),
+            "episode.concept_ids must not retain deleted concept ids"
+        );
     }
 
     #[test]

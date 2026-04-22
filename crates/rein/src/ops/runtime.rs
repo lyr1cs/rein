@@ -4,8 +4,8 @@
 //! and REST. Runtime carries the active surface and lazily opens per-request
 //! store handles via `with_store`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
 
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;

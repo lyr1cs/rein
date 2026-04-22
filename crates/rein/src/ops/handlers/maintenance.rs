@@ -96,7 +96,7 @@ impl OpsRuntime {
         description = "List canonical memories — one row per canonical, ordered by recency. Includes support count, merge count, source diversity, and dedup confidence.",
         cli(name = "canonicals"),
         mcp(name = "rein_canonicals"),
-        rest(method = "GET", path = "/api/canonicals"),
+        rest(method = "GET", path = "/api/canonicals")
     )]
     pub fn canonicals(&self, params: CanonicalsParams) -> ReinResult<CanonicalsOutput> {
         self.with_store(|store| {
@@ -182,7 +182,7 @@ impl OpsRuntime {
         description = "List evidence snapshots for a canonical memory, ordered by import time descending.",
         cli(name = "evidence"),
         mcp(name = "rein_evidence"),
-        rest(method = "GET", path = "/api/evidence"),
+        rest(method = "GET", path = "/api/evidence")
     )]
     pub fn evidence(&self, params: EvidenceParams) -> ReinResult<EvidenceOutput> {
         let canonical_id = params.canonical_id.clone();
@@ -288,7 +288,7 @@ impl OpsRuntime {
         cli(name = "gc"),
         mcp(name = "rein_gc"),
         rest(method = "POST", path = "/api/gc"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn gc(&self, params: GcParams) -> ReinResult<GcOutput> {
         self.set_dry_run(params.dry_run);
@@ -406,7 +406,7 @@ impl OpsRuntime {
         category = "maintenance",
         description = "Dry-run intelligent merge: classify the relationship between two candidate memories (Ignore / Update / Merge / CreateNew), report the decision path, without committing changes.",
         mutating = false,
-        cli(name = "intelligent-merge-try"),
+        cli(name = "intelligent-merge-try")
     )]
     pub fn intelligent_merge_try(
         &self,
@@ -510,7 +510,7 @@ impl OpsRuntime {
         cli(name = "dedup"),
         mcp(name = "rein_dedup"),
         rest(method = "POST", path = "/api/dedup"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn dedup(&self, params: DedupParams) -> ReinResult<DedupOutput> {
         self.set_dry_run(params.dry_run);
@@ -590,7 +590,7 @@ impl OpsRuntime {
         cli(name = "dedup-concepts"),
         mcp(name = "rein_dedup_concepts"),
         rest(method = "POST", path = "/api/dedup_concepts"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn dedup_concepts(&self, _params: DedupConceptsParams) -> ReinResult<DedupConceptsOutput> {
         self.with_store(|store| {
@@ -666,7 +666,8 @@ pub struct DedupDecisionRow {
 
 impl DedupDecisionRow {
     fn from_decision(d: crate::types::DedupDecision) -> Self {
-        let novel_facts = serde_json::to_string(&d.novel_facts).unwrap_or_else(|_| "[]".to_string());
+        let novel_facts =
+            serde_json::to_string(&d.novel_facts).unwrap_or_else(|_| "[]".to_string());
         let created_at = d.created_at.to_rfc3339();
         Self {
             id: d.id,
@@ -738,7 +739,7 @@ impl OpsRuntime {
         category = "maintenance",
         description = "Show recent deduplication decisions (kept/merged/skipped with reasons). Read-only trace for debugging dedup behavior.",
         cli(name = "dedup-log"),
-        rest(method = "GET", path = "/api/dedup_decisions"),
+        rest(method = "GET", path = "/api/dedup_decisions")
     )]
     pub fn dedup_log(&self, params: DedupLogParams) -> ReinResult<DedupLogOutput> {
         let canonical = params.canonical.clone();
@@ -751,7 +752,10 @@ impl OpsRuntime {
                 limit,
             )?;
             Ok(DedupLogOutput {
-                decisions: decisions.into_iter().map(DedupDecisionRow::from_decision).collect(),
+                decisions: decisions
+                    .into_iter()
+                    .map(DedupDecisionRow::from_decision)
+                    .collect(),
             })
         })
     }
@@ -824,7 +828,7 @@ impl OpsRuntime {
         cli(name = "organize"),
         mcp(name = "rein_organize"),
         rest(method = "POST", path = "/api/organize"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn organize(&self, params: OrganizeParams) -> ReinResult<OrganizeOutput> {
         let max_links = params.max_links;
@@ -899,7 +903,7 @@ impl OpsRuntime {
         category = "maintenance",
         description = "Import data from a QMD SQLite database into rein memories, or reindex all memories with the current embedding model. Admin-only: CLI surface, no MCP/REST exposure.",
         mutating = true,
-        cli(name = "migrate"),
+        cli(name = "migrate")
     )]
     pub fn migrate(&self, params: MigrateParams) -> ReinResult<MigrateOutput> {
         let config = self.config.clone();
@@ -923,14 +927,19 @@ impl OpsRuntime {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
+                    .map_err(|e| {
+                        ReinError::Config(format!("failed to build tokio runtime: {e}"))
+                    })?;
                 rt.block_on(run)
             }
         } else {
-            let qmd_path = params.from_qmd.map(std::path::PathBuf::from).unwrap_or_else(|| {
-                let home = std::env::var("HOME").unwrap_or_default();
-                std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
-            });
+            let qmd_path = params
+                .from_qmd
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    std::path::PathBuf::from(home).join(".cache/qmd/index.sqlite")
+                });
             let store = config.open_store()?;
             let embedder = crate::embed::create_embedder(&config);
             let run = async move {
@@ -956,7 +965,9 @@ impl OpsRuntime {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
+                    .map_err(|e| {
+                        ReinError::Config(format!("failed to build tokio runtime: {e}"))
+                    })?;
                 rt.block_on(run)
             }
         }
@@ -983,7 +994,10 @@ pub struct ConsolidateParams {
     pub topic: Option<String>,
 
     /// Optional comma-separated topic list to consolidate.
-    #[serde(default, deserialize_with = "crate::mcp::tools::deserialize_option_string_list")]
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::tools::deserialize_option_string_list"
+    )]
     #[arg(long, value_delimiter = ',')]
     pub topics: Option<Vec<String>>,
 
@@ -1106,7 +1120,10 @@ impl IntoMarkdown for ConsolidateOutput {
         }
         let total_non_empty = self.details.iter().filter(|g| g.memory_count > 0).count();
         if total_non_empty > visible.len() {
-            text.push_str(&format!("\n... {} more groups", total_non_empty - visible.len()));
+            text.push_str(&format!(
+                "\n... {} more groups",
+                total_non_empty - visible.len()
+            ));
         }
         text
     }
@@ -1171,7 +1188,7 @@ impl OpsRuntime {
         cli(name = "consolidate"),
         mcp(name = "rein_consolidate"),
         rest(method = "POST", path = "/api/consolidate"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn consolidate(&self, params: ConsolidateParams) -> ReinResult<ConsolidateOutput> {
         self.set_dry_run(params.dry_run);
@@ -1257,7 +1274,10 @@ pub struct CleanupParams {
     pub topic: Option<String>,
 
     /// Optional comma-separated topic list to clean.
-    #[serde(default, deserialize_with = "crate::mcp::tools::deserialize_option_string_list")]
+    #[serde(
+        default,
+        deserialize_with = "crate::mcp::tools::deserialize_option_string_list"
+    )]
     #[arg(long, value_delimiter = ',')]
     pub topics: Option<Vec<String>>,
 
@@ -1343,7 +1363,8 @@ impl IntoMarkdown for CleanupOutput {
         // matched/count checks — the consolidation counts are all zero and
         // don't represent actual work.
         if self.queued {
-            return "Queued cleanup job (async); use 'rein worker cleanup' to run inline".to_string();
+            return "Queued cleanup job (async); use 'rein worker cleanup' to run inline"
+                .to_string();
         }
         // Mirrors the pre-A1 `rein_cleanup` MCP non-compact output so MCP
         // callers that parse the string continue to work.
@@ -1394,7 +1415,10 @@ impl IntoMarkdown for CleanupOutput {
             }
             let total_non_empty = self.groups.iter().filter(|g| g.memory_count > 0).count();
             if total_non_empty > visible.len() {
-                text.push_str(&format!("\n... {} more groups", total_non_empty - visible.len()));
+                text.push_str(&format!(
+                    "\n... {} more groups",
+                    total_non_empty - visible.len()
+                ));
             }
             text
         }
@@ -1407,7 +1431,8 @@ impl IntoCliText for CleanupOutput {
         // matched/count checks — the consolidation counts are all zero and
         // don't represent actual work.
         if self.queued {
-            return "Queued cleanup job (async); use 'rein worker cleanup' to run inline".to_string();
+            return "Queued cleanup job (async); use 'rein worker cleanup' to run inline"
+                .to_string();
         }
         // Mirrors the pre-A1 `print_cleanup_report` CLI output verbatim so
         // shell scripts that parse it continue to work.
@@ -1448,16 +1473,14 @@ impl OpsRuntime {
         cli(name = "cleanup"),
         mcp(name = "rein_cleanup"),
         rest(method = "POST", path = "/api/cleanup"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn cleanup(&self, params: CleanupParams) -> ReinResult<CleanupOutput> {
         // Handle deprecated --asynchronous flag: queue via the worker queue
         // instead of running inline. Emit a deprecation warning to stderr so
         // it doesn't pollute scripted stdout output.
         if params.asynchronous {
-            eprintln!(
-                "warning: --asynchronous is deprecated; use 'rein worker cleanup' instead"
-            );
+            eprintln!("warning: --asynchronous is deprecated; use 'rein worker cleanup' instead");
             crate::extract::hooks::queue::queue_cleanup_job(
                 &self.config,
                 params.topic.clone(),

@@ -49,7 +49,7 @@ impl OpsRuntime {
         name = "__test_path_template",
         category = "diagnostics",
         description = "Test-only op: echoes the {id} path param.",
-        rest(method = "GET", path = "/api/test_path_template/{id}"),
+        rest(method = "GET", path = "/api/test_path_template/{id}")
     )]
     pub fn __test_path_template(
         &self,
@@ -65,7 +65,7 @@ impl OpsRuntime {
         category = "diagnostics",
         description = "Test-only op: mutation-auth templated route for H3 regression tests.",
         rest(method = "POST", path = "/api/test_path_template_mut/{id}"),
-        auth = "mutation_marker",
+        auth = "mutation_marker"
     )]
     pub fn __test_path_template_mut(
         &self,

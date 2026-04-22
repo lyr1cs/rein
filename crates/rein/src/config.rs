@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Typed provider enum for compile-time safety.
@@ -1134,8 +1136,10 @@ impl ReinConfig {
     /// file-backed AND `REIN_ASYNC_P1` is not `0`, attach a process-level
     /// connection pool keyed by path. `recall`'s 3-channel fanout uses the
     /// pool to elide per-channel schema-init + embedding-model checks.
-    /// Non-tokio callers (CLI direct invocations) and `:memory:` DBs
-    /// bypass the pool entirely and use the pre-v0.22 path.
+    /// Plain non-tokio callers (for example `#[test]` or std-thread code)
+    /// and `:memory:` DBs bypass the pool entirely and use the pre-v0.22
+    /// path. `#[tokio::main]` CLI entrypoints do run inside a runtime, so
+    /// they follow the same best-effort attach path as async services.
     pub fn open_store(&self) -> crate::types::ReinResult<crate::store::SqliteStore> {
         let db_path = self.resolve_db_path();
         let store = crate::store::SqliteStore::new(
@@ -1158,15 +1162,24 @@ impl ReinConfig {
         if db_path.to_str() == Some(":memory:") {
             return Ok(store);
         }
-        // Non-tokio callers (e.g. the CLI direct path) would have the pool
-        // ignored by recall.rs via `Handle::try_current()` anyway; skipping
-        // cache+build here saves the setup cost and keeps those paths
-        // bit-identical to the pre-v0.22 behavior.
+        // Non-tokio callers would have the pool ignored by recall.rs via
+        // `Handle::try_current()` anyway; skipping cache+build here saves
+        // the setup cost and keeps those paths bit-identical to the
+        // pre-v0.22 behavior.
         if tokio::runtime::Handle::try_current().is_err() {
             return Ok(store);
         }
-        let pool = pool_for_path(&db_path)?;
-        Ok(store.with_pool(pool))
+        match pool_for_path(&db_path) {
+            Ok(pool) => Ok(store.with_pool(pool)),
+            Err(err) => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    err = %err,
+                    "open_store pool initialization failed; falling back to single connection"
+                );
+                Ok(store)
+            }
+        }
     }
 
     /// Resolve the database path. `"auto"` → `~/.rein/memories.db`
@@ -1221,13 +1234,21 @@ static OPEN_STORE_POOL_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, Weak<crate::store::pool::ConnPool>>>,
 > = OnceLock::new();
 
+#[cfg(test)]
+static FAIL_NEXT_POOL_FOR_PATH: AtomicBool = AtomicBool::new(false);
+
 fn pool_cache() -> &'static Mutex<HashMap<PathBuf, Weak<crate::store::pool::ConnPool>>> {
     OPEN_STORE_POOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn pool_for_path(
-    db_path: &Path,
-) -> crate::types::ReinResult<Arc<crate::store::pool::ConnPool>> {
+fn pool_for_path(db_path: &Path) -> crate::types::ReinResult<Arc<crate::store::pool::ConnPool>> {
+    #[cfg(test)]
+    if FAIL_NEXT_POOL_FOR_PATH.swap(false, Ordering::SeqCst) {
+        return Err(crate::types::ReinError::Config(
+            "synthetic pool init failure for test".into(),
+        ));
+    }
+
     // Normalize the path spelling for cache keying so that `./rein.db`,
     // `rein.db`, and `/abs/rein.db` (all pointing at the same file)
     // resolve to the same pool (Codex v0.22 round-2 LOW #3).
@@ -1407,6 +1428,7 @@ fn deep_merge(base: &mut toml::Value, overlay: &toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_default_config() {
@@ -1582,6 +1604,35 @@ api_key = "test-sync-key"
             cfg.sync.api_key.as_deref(),
             Some("test-sync-key"),
             "sync api_key lost"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn open_store_falls_back_to_single_store_when_pool_init_fails() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("fallback.db");
+        let mut cfg = ReinConfig::default();
+        cfg.database.path = db_path.to_string_lossy().into_owned();
+
+        FAIL_NEXT_POOL_FOR_PATH.store(true, Ordering::SeqCst);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = runtime
+            .block_on(async { cfg.open_store() })
+            .expect("open_store should succeed even if pool init fails");
+
+        assert_eq!(store.db_path(), db_path);
+        assert!(
+            store.pool().is_none(),
+            "pool init failure should fall back to the already-open store"
+        );
+        assert!(
+            store
+                .conn()
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .is_ok(),
+            "fallback store must remain usable"
         );
     }
 }

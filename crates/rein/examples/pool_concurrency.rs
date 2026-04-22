@@ -89,11 +89,38 @@ fn setup_fixture() -> (TempDir, PathBuf) {
     // Realistic-shaped content: ~200 chars each, word-diverse enough for FTS5
     let tx = conn.unchecked_transaction().unwrap();
     let words = [
-        "memory", "recall", "vector", "embedding", "search", "fusion", "pool",
-        "connection", "parallel", "concurrent", "async", "tokio", "rusqlite",
-        "tantivy", "hnsw", "sqlite", "adaptive", "feedback", "dedup", "concept",
-        "episode", "temporal", "cluster", "survival", "decay", "canonical",
-        "evidence", "knowledge", "graph", "traversal", "ranking", "rerank",
+        "memory",
+        "recall",
+        "vector",
+        "embedding",
+        "search",
+        "fusion",
+        "pool",
+        "connection",
+        "parallel",
+        "concurrent",
+        "async",
+        "tokio",
+        "rusqlite",
+        "tantivy",
+        "hnsw",
+        "sqlite",
+        "adaptive",
+        "feedback",
+        "dedup",
+        "concept",
+        "episode",
+        "temporal",
+        "cluster",
+        "survival",
+        "decay",
+        "canonical",
+        "evidence",
+        "knowledge",
+        "graph",
+        "traversal",
+        "ranking",
+        "rerank",
     ];
     for i in 0..FIXTURE_ROWS {
         let topic = format!("topic-{}", i % 50);
@@ -111,7 +138,8 @@ fn setup_fixture() -> (TempDir, PathBuf) {
         .unwrap();
     }
     tx.commit().unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+        .unwrap();
     eprintln!(
         "[fixture] seeded {FIXTURE_ROWS} rows at {}",
         db_path.display()
@@ -134,7 +162,11 @@ fn do_one_query(conn: &Connection, query_word: &str) -> usize {
         .unwrap();
     let rows: Vec<(i64, String, String)> = stmt
         .query_map([query_word], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })
         .unwrap()
         .filter_map(|r| r.ok())
@@ -144,9 +176,25 @@ fn do_one_query(conn: &Connection, query_word: &str) -> usize {
 
 fn query_words() -> Vec<&'static str> {
     vec![
-        "memory", "recall", "vector", "embedding", "pool", "tokio", "tantivy",
-        "hnsw", "adaptive", "feedback", "concept", "episode", "ranking",
-        "parallel", "concurrent", "async", "cluster", "survival", "graph",
+        "memory",
+        "recall",
+        "vector",
+        "embedding",
+        "pool",
+        "tokio",
+        "tantivy",
+        "hnsw",
+        "adaptive",
+        "feedback",
+        "concept",
+        "episode",
+        "ranking",
+        "parallel",
+        "concurrent",
+        "async",
+        "cluster",
+        "survival",
+        "graph",
         "canonical",
     ]
 }
@@ -178,7 +226,12 @@ async fn scenario_a_serial_one_conn(db_path: &Path) {
         do_one_query(&conn, w2);
         times.push(t0.elapsed());
     }
-    report("(a) 1 conn × 3 serial reads", &mut times, started, BENCH_ITERS);
+    report(
+        "(a) 1 conn × 3 serial reads",
+        &mut times,
+        started,
+        BENCH_ITERS,
+    );
 }
 
 async fn scenario_b_shared_conn_join(db_path: &Path) {
@@ -292,9 +345,15 @@ async fn scenario_d_pool_scale(db_path: &Path) {
             let w2 = words[(seed * 3) % words.len()].to_string();
             tasks.push(tokio::spawn(async move {
                 let (r0, r1, r2) = tokio::join!(
-                    tokio::task::spawn_blocking(move || with_tl_conn(&p0, |c| do_one_query(c, &w0))),
-                    tokio::task::spawn_blocking(move || with_tl_conn(&p1, |c| do_one_query(c, &w1))),
-                    tokio::task::spawn_blocking(move || with_tl_conn(&p2, |c| do_one_query(c, &w2))),
+                    tokio::task::spawn_blocking(move || with_tl_conn(&p0, |c| do_one_query(
+                        c, &w0
+                    ))),
+                    tokio::task::spawn_blocking(move || with_tl_conn(&p1, |c| do_one_query(
+                        c, &w1
+                    ))),
+                    tokio::task::spawn_blocking(move || with_tl_conn(&p2, |c| do_one_query(
+                        c, &w2
+                    ))),
                 );
                 (r0.unwrap(), r1.unwrap(), r2.unwrap())
             }));
@@ -335,5 +394,7 @@ async fn main() {
     eprintln!();
 
     eprintln!("[go/no-go rule] (c).mean vs (a).mean improvement ≥ 30% → proceed to D1.");
-    eprintln!("[go/no-go rule] (c).mean vs (a).mean improvement < 30% → revisit γ, consider v0.23 δ.");
+    eprintln!(
+        "[go/no-go rule] (c).mean vs (a).mean improvement < 30% → revisit γ, consider v0.23 δ."
+    );
 }

@@ -211,7 +211,11 @@ mod tests {
         assert!(!snap.indexes.hnsw.index_exists);
         assert!(!snap.indexes.tantivy.dirty);
         assert_eq!(snap.grayzone.pending, 0);
-        assert!(snap.status.ok, "expected ok=true, issues={:?}", snap.status.issues);
+        assert!(
+            snap.status.ok,
+            "expected ok=true, issues={:?}",
+            snap.status.issues
+        );
         assert!(snap.status.issues.is_empty());
     }
 
