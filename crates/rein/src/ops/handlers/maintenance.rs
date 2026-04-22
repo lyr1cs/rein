@@ -1576,3 +1576,128 @@ impl OpsRuntime {
         })
     }
 }
+
+// ── resummerize (v0.23) ──────────────────────────────────────────────────────
+
+#[derive(clap::Args, serde::Deserialize, schemars::JsonSchema, Debug, Clone, Default)]
+pub struct ResummerizeParams {
+    /// Preview without applying compression: reports what would run but
+    /// does not call the LLM or mutate any canonical.
+    #[serde(default)]
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Run against a specific canonical id instead of the batch selector.
+    /// Primarily for targeted retry after a contract violation has been
+    /// diagnosed.
+    #[serde(default)]
+    #[arg(long)]
+    pub canonical_id: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ResummerizeOutput {
+    pub attempted: u32,
+    pub succeeded: u32,
+    pub contract_failed: u32,
+    pub llm_failed: u32,
+    pub length_exceeded: u32,
+    pub exhausted: u32,
+    /// Canonicals whose claim was lost to a concurrent worker between the
+    /// LLM call and the commit — rewrite was rolled back, other worker's
+    /// output stands. Nonzero here suggests stale-timeout tuning may be
+    /// too aggressive for your LLM latency distribution.
+    pub claim_lost: u32,
+    pub skipped_no_llm: bool,
+    pub skipped_disabled: bool,
+    pub dry_run: bool,
+}
+
+impl IntoJson for ResummerizeOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ResummerizeOutput {
+    fn to_markdown(&self) -> String {
+        if self.skipped_disabled {
+            return "Resummerize disabled in config ([resummerize].enabled = false)".to_string();
+        }
+        if self.skipped_no_llm {
+            return "Resummerize skipped: no LLM provider configured".to_string();
+        }
+        format!(
+            "Resummerize{}: attempted {}, succeeded {}, contract {}, length {}, llm_err {}, exhausted {}, claim_lost {}",
+            if self.dry_run { " (dry run)" } else { "" },
+            self.attempted,
+            self.succeeded,
+            self.contract_failed,
+            self.length_exceeded,
+            self.llm_failed,
+            self.exhausted,
+            self.claim_lost,
+        )
+    }
+}
+
+impl IntoCliText for ResummerizeOutput {
+    fn to_cli_text(&self) -> String {
+        if self.skipped_disabled {
+            return "resummerize disabled in [resummerize].enabled".to_string();
+        }
+        if self.skipped_no_llm {
+            return "resummerize skipped (no LLM provider available)".to_string();
+        }
+        format!(
+            "attempted={} succeeded={} contract_failed={} length_exceeded={} llm_failed={} exhausted={} claim_lost={}{}",
+            self.attempted,
+            self.succeeded,
+            self.contract_failed,
+            self.length_exceeded,
+            self.llm_failed,
+            self.exhausted,
+            self.claim_lost,
+            if self.dry_run { " (dry run)" } else { "" },
+        )
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "resummerize",
+        category = "maintenance",
+        description = "Run LLM-driven canonical recompression on rows flagged needs_resummerize=1. Gated by the Lossless Compression Contract — on any failure the keep-tail fallback remains in place. Use dry_run=true to preview.",
+        mutating = true,
+        cli(name = "resummerize"),
+        mcp(name = "rein_resummerize"),
+        rest(method = "POST", path = "/api/resummerize"),
+        auth = "mutation_marker"
+    )]
+    pub fn resummerize(&self, params: ResummerizeParams) -> ReinResult<ResummerizeOutput> {
+        self.set_dry_run(params.dry_run);
+        let dry_run = self.dry_run();
+        let canonical_id = params.canonical_id.clone();
+        let config = self.config.clone();
+
+        self.with_store(|store| {
+            let outcome = crate::ops::resummerize::run_resummerize(
+                store,
+                &config,
+                canonical_id.as_deref(),
+                dry_run,
+            )?;
+            Ok(ResummerizeOutput {
+                attempted: outcome.attempted,
+                succeeded: outcome.succeeded,
+                contract_failed: outcome.contract_failed,
+                llm_failed: outcome.llm_failed,
+                length_exceeded: outcome.length_exceeded,
+                exhausted: outcome.exhausted,
+                claim_lost: outcome.claim_lost,
+                skipped_no_llm: outcome.skipped_no_llm,
+                skipped_disabled: outcome.skipped_disabled,
+                dry_run: outcome.dry_run,
+            })
+        })
+    }
+}

@@ -144,6 +144,17 @@ impl HnswIndex {
     }
 
     /// Save the index and metadata to disk.
+    ///
+    /// NOTE: save() does NOT clear the `.dirty` marker (Codex round-5 M-2).
+    /// An incremental save after a missed write only proves THIS write
+    /// landed — earlier writes that set `.dirty` (open failures, lock
+    /// contention, crash recovery gaps) may still need a full rebuild
+    /// to reconcile. The rebuild path is the only legitimate clearer of
+    /// `.dirty`: `take_dirty_for_rebuild` renames `.dirty` → `.rebuilding`
+    /// as it starts, and a successful rebuild completes by dropping the
+    /// `.rebuilding` marker via `clear_rebuilding`. Incremental writes
+    /// that succeed while `.dirty` exists should leave the marker alone
+    /// so warmup still triggers the recovery rebuild.
     pub fn save(&self) -> ReinResult<()> {
         let index_path = self.path.with_extension("usearch");
         self.index
@@ -155,8 +166,6 @@ impl HnswIndex {
         let meta = serialize_meta(&self.id_to_key, self.next_key);
         std::fs::write(&meta_path, meta)
             .map_err(|e| ReinError::Config(format!("hnsw meta save: {e}")))?;
-
-        let _ = std::fs::remove_file(Self::dirty_marker_path(&self.path));
 
         Ok(())
     }
@@ -286,6 +295,45 @@ mod tests {
         let index = HnswIndex::open(&path, 3).unwrap();
         let results = index.search(&[1.0, 0.0, 0.0], 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn incremental_save_does_not_clear_pre_existing_dirty_marker() {
+        // Codex round-5 M-2: an unrelated write-failure somewhere upstream
+        // marks `.dirty`. A later successful incremental save on a
+        // DIFFERENT entry must NOT clear the marker — the dirty signal
+        // records "something somewhere in this index may be out of sync
+        // with the source of truth and only a full rebuild can
+        // reconcile." If `save()` cleared `.dirty`, the recovery rebuild
+        // would never fire.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_dirty_preservation");
+
+        // Simulate an earlier missed write setting the marker (e.g., lock
+        // contention during `update_hnsw`). The index itself is fine.
+        let mut index = HnswIndex::open(&path, 3).unwrap();
+        index.insert("mem1", &[1.0, 0.0, 0.0]).unwrap();
+        HnswIndex::mark_dirty(&path);
+        assert!(HnswIndex::is_dirty(&path));
+
+        // A subsequent successful incremental save (maybe from a
+        // different op path, e.g. resummerize's delete) proceeds
+        // normally but must NOT clear the dirty marker.
+        index.save().unwrap();
+        assert!(
+            HnswIndex::is_dirty(&path),
+            "incremental save must preserve pre-existing dirty marker; \
+             only take_dirty_for_rebuild / clear_rebuilding may clear it"
+        );
+
+        // The legitimate clearer of `.dirty` is the rebuild claim.
+        assert!(HnswIndex::take_dirty_for_rebuild(&path));
+        assert!(
+            !HnswIndex::dirty_marker_path(&path).exists(),
+            "take_dirty_for_rebuild must rename .dirty → .rebuilding"
+        );
+        HnswIndex::clear_rebuilding(&path);
+        assert!(!HnswIndex::is_dirty(&path));
     }
 
     #[test]

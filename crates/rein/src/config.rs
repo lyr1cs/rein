@@ -59,6 +59,8 @@ pub struct ReinConfig {
     pub cleanup: CleanupConfig,
     #[serde(default)]
     pub intelligent_merge: IntelligentMergeConfig,
+    #[serde(default)]
+    pub resummerize: ResummerizeConfig,
 }
 
 /// Config for the LLM-driven intelligent-merge classifier (opt-in).
@@ -109,6 +111,62 @@ impl IntelligentMergeConfig {
             "google" | "gemini" => Provider::Google,
             "omlx" | "local" => Provider::Omlx,
             _ => Provider::None,
+        }
+    }
+}
+
+/// Config for the v0.23 resummerize slow-channel op.
+///
+/// When triggered by a MergeInto cap hit, the op reads `memory_evidence`,
+/// calls the configured LLM, validates the output against the Lossless
+/// Compression Contract, and rewrites the canonical only on contract pass.
+/// On any failure the keep-tail fallback already committed at merge time
+/// remains in place, so the op is safe to retry.
+///
+/// `llm_backend = "inherit"` (the default) reuses `[extract].provider`.
+/// Explicit values `"google"` / `"omlx"` override for this op only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResummerizeConfig {
+    /// Feature flag. Default `false` until adversarial evaluation in v0.23
+    /// confirms the LLM path beats keep-tail on the scorecard.
+    #[serde(default)]
+    pub enabled: bool,
+    /// LLM provider: `"inherit"` | `"google"` | `"omlx"`.
+    #[serde(default = "default_resummerize_backend")]
+    pub llm_backend: String,
+    /// Max canonicals processed per slow-channel invocation.
+    #[serde(default = "default_resummerize_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_resummerize_backend() -> String {
+    "inherit".to_string()
+}
+
+fn default_resummerize_batch_size() -> usize {
+    16
+}
+
+impl Default for ResummerizeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            llm_backend: default_resummerize_backend(),
+            batch_size: default_resummerize_batch_size(),
+        }
+    }
+}
+
+impl ResummerizeConfig {
+    /// Resolve the backend: `"inherit"` defers to `[extract].provider`,
+    /// everything else matches the same provider names used elsewhere.
+    pub fn resolved_provider(&self, fallback_extract_provider: Provider) -> Provider {
+        match self.llm_backend.to_lowercase().as_str() {
+            "google" | "gemini" => Provider::Google,
+            "omlx" | "local" => Provider::Omlx,
+            "none" => Provider::None,
+            _ => fallback_extract_provider, // "inherit" or unknown → fall back
         }
     }
 }

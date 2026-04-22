@@ -1,0 +1,80 @@
+[
+  {
+    "case_id": "conflict_001",
+    "category": "contradictions",
+    "description": "Preference flip across sessions - prefer A then prefer B",
+    "evidence": [
+      {"content": "user prefers rust for the main binary and all shared libraries.", "merged_at": "2026-03-01T10:00:00Z"},
+      {"content": "user prefers python for evaluation scripts and notebooks.", "merged_at": "2026-03-15T10:00:00Z"},
+      {"content": "user prefers typescript only for the Neural Wiki GUI frontend.", "merged_at": "2026-03-20T10:00:00Z"}
+    ],
+    "current_canonical": "Language preferences per layer: user prefers rust for the core binary and libraries, user prefers python for eval scripts, user prefers typescript for GUI frontend only.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["conflict_not_silenced", "length_bounded", "no_new_facts"]
+  },
+  {
+    "case_id": "conflict_002",
+    "category": "contradictions",
+    "description": "Positive vs negative preference for same object (postgres)",
+    "evidence": [
+      {"content": "team chose postgres for the shared staging environment.", "merged_at": "2026-02-10T10:00:00Z"},
+      {"content": "team chose sqlite for local dev after postgres deployment complexity.", "merged_at": "2026-02-20T10:00:00Z"},
+      {"content": "team avoid postgres in single-node deployments from now on.", "merged_at": "2026-03-01T10:00:00Z"}
+    ],
+    "current_canonical": "Storage decision evolved: team initially chose postgres for staging (2026-02-10), then chose sqlite for local dev due to deploy cost, and finally decided to avoid postgres in single-node setups.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["conflict_not_silenced", "temporal_anchors_preserved"]
+  },
+  {
+    "case_id": "conflict_003",
+    "category": "contradictions",
+    "description": "Three contested objects under the same verb - need >=50% retained",
+    "evidence": [
+      {"content": "the team likes rrf for fusion because it's parameter-free.", "merged_at": "2026-01-10T10:00:00Z"},
+      {"content": "the team likes cc because learned alpha outperforms rrf.", "merged_at": "2026-01-20T10:00:00Z"},
+      {"content": "the team likes both when the dataset is small enough.", "merged_at": "2026-01-30T10:00:00Z"}
+    ],
+    "current_canonical": "Fusion strategy preferences: team likes rrf (parameter-free) and likes cc (learned alpha outperforms rrf). Team likes both for small datasets.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["conflict_not_silenced", "length_bounded"]
+  },
+  {
+    "case_id": "conflict_004",
+    "category": "contradictions",
+    "description": "Verb 'decided' with contested objects (compression strategy)",
+    "evidence": [
+      {"content": "the team decided compression for cold-tier memories.", "merged_at": "2026-03-05T10:00:00Z"},
+      {"content": "the team decided archival to object storage for audit trails.", "merged_at": "2026-03-10T10:00:00Z"},
+      {"content": "the team decided resummerize as the default compression path.", "merged_at": "2026-03-15T10:00:00Z"}
+    ],
+    "current_canonical": "Memory-management decisions: team decided compression for cold-tier, team decided archival for audit trails, team decided resummerize as the default compression path.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["conflict_not_silenced", "no_new_facts"]
+  },
+  {
+    "case_id": "conflict_005",
+    "category": "contradictions",
+    "description": "Avoid pattern for different libraries",
+    "evidence": [
+      {"content": "we avoid tokio block_in_place except inside blocking reqwest calls.", "merged_at": "2026-02-05T10:00:00Z"},
+      {"content": "we avoid reqwest blocking inside tokio async contexts directly.", "merged_at": "2026-02-06T10:00:00Z"},
+      {"content": "we avoid adding new sync dependencies without a profiler-backed case.", "merged_at": "2026-02-07T10:00:00Z"}
+    ],
+    "current_canonical": "Async hygiene rules: avoid tokio block_in_place except for reqwest, avoid reqwest blocking directly in tokio contexts, avoid adding new sync dependencies without profiling justification.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["conflict_not_silenced", "length_bounded"]
+  },
+  {
+    "case_id": "conflict_006",
+    "category": "contradictions",
+    "description": "Reject pattern with three distinct targets",
+    "evidence": [
+      {"content": "we reject subjective params in the adaptive engine, everything must be learned.", "merged_at": "2026-01-01T10:00:00Z"},
+      {"content": "we reject devlog content leaking into source code comments.", "merged_at": "2026-01-05T10:00:00Z"},
+      {"content": "we reject future-plan copy in public release notes.", "merged_at": "2026-01-10T10:00:00Z"}
+    ],
+    "current_canonical": "Core philosophy rejections: reject subjective params (all data-driven), reject devlog content in source code, reject future-plan copy in public release notes.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["conflict_not_silenced", "no_new_facts"]
+  }
+]

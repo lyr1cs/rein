@@ -8,6 +8,7 @@ pub mod memoir;
 pub mod migrate;
 pub mod pool;
 pub mod quality;
+pub mod resummerize_audit;
 pub mod schema;
 pub mod sqlite;
 pub mod tantivy_fts;

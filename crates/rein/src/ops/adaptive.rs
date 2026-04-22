@@ -45,6 +45,18 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         compute_per_cluster_dedup_thresholds(store, &mut state);
     }
 
+    // Step 1c: v0.23 — per-cluster + global canonical length percentiles.
+    // Drives adaptive `target_bytes` for resummerize compression. Cheap DB
+    // scan; runs even without clusters so the global fallback accumulates
+    // from day one.
+    match crate::store::adaptive::recompute_canonical_length_stats(store.conn()) {
+        Ok((per_cluster, global)) => {
+            state.canonical_length_stats = per_cluster;
+            state.global_canonical_length = global;
+        }
+        Err(e) => tracing::warn!("failed to recompute canonical_length_stats: {e}"),
+    }
+
     // Step 2: M3 — Build per-cluster survival curves from access data
     if !state.memory_clusters.is_empty() {
         build_survival_curves(store, &state);
