@@ -15,4 +15,6 @@ pub use llm::{
     DedupVerdict, EpisodeSummary, ExtractedConcept, ExtractedLink, ExtractedMemory,
     ExtractionResult, ExtractorKind,
 };
+#[cfg(feature = "test-support")]
+pub use llm::MockExtractor;
 pub use patterns::{extract_facts, score_sentence};

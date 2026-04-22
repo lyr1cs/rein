@@ -6,6 +6,12 @@ pub use cache::EmbedCache;
 pub use gemini::GeminiEmbedder;
 pub use omlx::OmlxEmbedder;
 
+#[cfg(feature = "test-support")]
+pub use mock::MockEmbedder;
+
+#[cfg(feature = "test-support")]
+pub mod mock;
+
 use crate::types::error::ReinResult;
 use crate::types::traits::Embedder;
 
@@ -20,6 +26,13 @@ pub fn prepend_metadata(topic: &str, summary: &str, text: &str) -> String {
 pub enum EmbedderKind {
     Gemini(GeminiEmbedder),
     Omlx(OmlxEmbedder),
+    /// Test-only scripted embedder. Lets integration tests drive the
+    /// real `run_vec_dedup` / HNSW / sqlite-vec pipelines end-to-end
+    /// without a live API key. Gated behind `test-support` so it never
+    /// ships in release binaries. See `embed/mock.rs` for the
+    /// scripted-response contract.
+    #[cfg(feature = "test-support")]
+    Mock(MockEmbedder),
 }
 
 impl Embedder for EmbedderKind {
@@ -27,6 +40,8 @@ impl Embedder for EmbedderKind {
         match self {
             Self::Gemini(e) => e.model_name(),
             Self::Omlx(e) => e.model_name(),
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.model_name(),
         }
     }
 
@@ -34,6 +49,8 @@ impl Embedder for EmbedderKind {
         match self {
             Self::Gemini(e) => e.dimensions(),
             Self::Omlx(e) => e.dimensions(),
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.dimensions(),
         }
     }
 
@@ -41,6 +58,8 @@ impl Embedder for EmbedderKind {
         match self {
             Self::Gemini(e) => e.embed(text).await,
             Self::Omlx(e) => e.embed(text).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.embed(text).await,
         }
     }
 
@@ -48,6 +67,8 @@ impl Embedder for EmbedderKind {
         match self {
             Self::Gemini(e) => e.embed_batch(texts).await,
             Self::Omlx(e) => e.embed_batch(texts).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.embed_batch(texts).await,
         }
     }
 }

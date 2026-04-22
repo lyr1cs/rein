@@ -1,0 +1,79 @@
+[
+  {
+    "case_id": "cjk_001",
+    "category": "cjk",
+    "description": "Simple Chinese preference statements appended sequentially",
+    "evidence": [
+      {"content": "用户偏好简洁输出，不希望看到冗长的解释。", "merged_at": "2026-04-01T10:00:00Z"},
+      {"content": "用户偏好中文回复，尤其是在项目文档讨论中。", "merged_at": "2026-04-02T10:00:00Z"},
+      {"content": "用户偏好在周末减少工作时通知。", "merged_at": "2026-04-03T10:00:00Z"}
+    ],
+    "current_canonical": "用户偏好简洁输出，不希望看到冗长的解释。\n\n[merged 2026-04-02] 用户偏好中文回复，尤其是在项目文档讨论中。\n\n[merged 2026-04-03] 用户偏好在周末减少工作时通知。",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "length_bounded", "no_new_facts"]
+  },
+  {
+    "case_id": "cjk_002",
+    "category": "cjk",
+    "description": "Mixed Chinese/English technical decisions (rein v0.22 scope notes)",
+    "evidence": [
+      {"content": "v0.22 scope: D4 (memoir pool + service wiring) 完成 commit 371683d, 658 tests green", "merged_at": "2026-04-18T10:00:00Z"},
+      {"content": "D5 bench 实测 p99=54µs, max=4.57ms 压倒性推翻 spec §F1 假设", "merged_at": "2026-04-19T10:00:00Z"},
+      {"content": "方案 D (0 LoC) 胜出, v0.22 timeline 从 5-7 天缩到 3-4 天", "merged_at": "2026-04-20T10:00:00Z"}
+    ],
+    "current_canonical": "v0.22 D4 完成 commit 371683d (memoir pool + service wiring), 658 tests green. D5 bench 实测 p99=54µs, max=4.57ms 压倒性推翻 spec §F1 假设, 方案 D (0 LoC) 胜出, timeline 从 5-7 天缩到 3-4 天.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "length_bounded", "temporal_anchors_preserved"]
+  },
+  {
+    "case_id": "cjk_003",
+    "category": "cjk",
+    "description": "Japanese technical log entries with katakana and hiragana",
+    "evidence": [
+      {"content": "キャッシュのヒット率を計測する必要がある。トラフィックが高い時間帯で調査する。", "merged_at": "2026-04-05T10:00:00Z"},
+      {"content": "キャッシュ層のデータ整合性に関してバグが報告された。", "merged_at": "2026-04-06T10:00:00Z"},
+      {"content": "キャッシュを無効化せず、トラフィック移行で検証する方針に決定した。", "merged_at": "2026-04-07T10:00:00Z"}
+    ],
+    "current_canonical": "キャッシュのヒット率計測とデータ整合性バグ調査を 2026-04-05 から開始。2026-04-07 にトラフィック移行での検証方針を決定。",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "length_bounded"]
+  },
+  {
+    "case_id": "cjk_004",
+    "category": "cjk",
+    "description": "Korean hangul in code review feedback context",
+    "evidence": [
+      {"content": "리뷰어가 커밋 메시지 형식에 대해 피드백을 남겼습니다.", "merged_at": "2026-04-10T10:00:00Z"},
+      {"content": "커밋 메시지는 한국어와 영어를 함께 사용해도 됩니다.", "merged_at": "2026-04-11T10:00:00Z"}
+    ],
+    "current_canonical": "리뷰어 피드백: 커밋 메시지 형식은 한국어와 영어를 함께 사용해도 좋음.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "length_bounded"]
+  },
+  {
+    "case_id": "cjk_005",
+    "category": "cjk",
+    "description": "Chinese contradiction - preference flipped mid-project",
+    "evidence": [
+      {"content": "团队最初决定使用 SQLite 作为存储层。", "merged_at": "2026-04-01T10:00:00Z"},
+      {"content": "团队后来改为使用 PostgreSQL 因为并发要求更高。", "merged_at": "2026-04-15T10:00:00Z"},
+      {"content": "团队最终回到 SQLite 因为部署复杂度不值得。", "merged_at": "2026-04-20T10:00:00Z"}
+    ],
+    "current_canonical": "存储层选型经历三次变化: 初期 SQLite (2026-04-01), 中途改为 PostgreSQL (2026-04-15), 最终回到 SQLite (2026-04-20). 关键原因: 部署复杂度.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "temporal_anchors_preserved", "length_bounded"]
+  },
+  {
+    "case_id": "cjk_006",
+    "category": "cjk",
+    "description": "Mixed CJK with rein-specific terms (memoir, canonical, evidence)",
+    "evidence": [
+      {"content": "canonical 读模型: 默认返回 canonical memory, evidence 在 recall 中预览并按需展开。", "merged_at": "2026-04-12T10:00:00Z"},
+      {"content": "memoir 内不允许 cross-memoir 链接, 这条不变量在 add_link 中强制验证。", "merged_at": "2026-04-13T10:00:00Z"},
+      {"content": "memoir 的 concept_id 作为 KG search 种子, 避免跨 memoir 冲突。", "merged_at": "2026-04-14T10:00:00Z"}
+    ],
+    "current_canonical": "Canonical-first 读模型: memoir 内不允许 cross-memoir 链接 (在 add_link 中强制验证), concept_id 作为 KG search 种子避免跨 memoir 冲突. Evidence 在 recall 中预览按需展开.",
+    "target_bytes": 8000,
+    "expected_must_pass": ["cjk_integrity", "length_bounded", "no_new_facts"]
+  }
+]

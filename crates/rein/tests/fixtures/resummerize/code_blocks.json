@@ -1,0 +1,74 @@
+[
+  {
+    "case_id": "code_001",
+    "category": "code_blocks",
+    "description": "Rust fence with distinctive identifier from ops/handlers",
+    "evidence": [
+      {"content": "the A1 macro expands #[op] into inventory entries:\n\n```rust\n#[op(cli = \"recall\", mcp = \"rein_recall\")]\npub fn recall(&self, query: &str) -> OpsResult<Vec<Memory>> {\n    self.store.recall(query)\n}\n```", "merged_at": "2026-04-10T10:00:00Z"},
+      {"content": "the macro also registers AuthPolicy for REST:\n\n```rust\ninventory::submit!(AuthPolicy::localhost_only(\"recall\"));\n```", "merged_at": "2026-04-11T10:00:00Z"}
+    ],
+    "current_canonical": "A1 #[op] macro expands methods on OpsRuntime into inventory-registered entries dispatched by CLI/MCP/REST adapters. Example:\n\n```rust\n#[op(cli = \"recall\", mcp = \"rein_recall\")]\npub fn recall(&self, query: &str) -> OpsResult<Vec<Memory>> {\n    self.store.recall(query)\n}\n```\n\n```rust\ninventory::submit!(AuthPolicy::localhost_only(\"recall\"));\n```",
+    "target_bytes": 8000,
+    "expected_must_pass": ["code_block_preserved", "no_new_facts", "length_bounded"]
+  },
+  {
+    "case_id": "code_002",
+    "category": "code_blocks",
+    "description": "SQL fences for schema discussion (dedup with BEGIN IMMEDIATE)",
+    "evidence": [
+      {"content": "the dedup path uses BEGIN IMMEDIATE to prevent concurrent races:\n\n```sql\nBEGIN IMMEDIATE;\nSELECT id FROM memories WHERE jaccard_sim(content, ?) > 0.70;\nCOMMIT;\n```", "merged_at": "2026-04-12T10:00:00Z"},
+      {"content": "the feedback_events table is append-only with offsets per consumer:\n\n```sql\nCREATE TABLE feedback_events (\n  id INTEGER PRIMARY KEY,\n  event_type TEXT NOT NULL,\n  payload BLOB,\n  created_at INTEGER NOT NULL\n);\n```", "merged_at": "2026-04-13T10:00:00Z"}
+    ],
+    "current_canonical": "store_with_dedup uses BEGIN IMMEDIATE to prevent concurrent dedup races. The feedback_events table is append-only.\n\n```sql\nBEGIN IMMEDIATE;\nSELECT id FROM memories WHERE jaccard_sim(content, ?) > 0.70;\nCOMMIT;\n```\n\n```sql\nCREATE TABLE feedback_events (\n  id INTEGER PRIMARY KEY,\n  event_type TEXT NOT NULL,\n  payload BLOB,\n  created_at INTEGER NOT NULL\n);\n```",
+    "target_bytes": 8000,
+    "expected_must_pass": ["code_block_preserved", "no_new_facts"]
+  },
+  {
+    "case_id": "code_003",
+    "category": "code_blocks",
+    "description": "Python fence for hook integration (Claude Code PostToolUse)",
+    "evidence": [
+      {"content": "hook invocation is configured in settings.json; rein hook post runs extraction async:\n\n```python\ndef on_post_tool_use(event):\n    subprocess.Popen([\"rein\", \"hook\", \"post\"], stdin=subprocess.PIPE).communicate(json.dumps(event).encode())\n```", "merged_at": "2026-04-05T10:00:00Z"},
+      {"content": "the stop hook creates Episode nodes from session summaries:\n\n```python\ndef on_stop(session):\n    summary = compile_summary(session)\n    subprocess.run([\"rein\", \"hook\", \"stop\"], input=json.dumps(summary).encode())\n```", "merged_at": "2026-04-06T10:00:00Z"}
+    ],
+    "current_canonical": "rein hooks are configured in ~/.claude/settings.json and invoked by Claude Code for PostToolUse and Stop events. Production is record-first and async.\n\n```python\ndef on_post_tool_use(event):\n    subprocess.Popen([\"rein\", \"hook\", \"post\"], stdin=subprocess.PIPE).communicate(json.dumps(event).encode())\n```\n\n```python\ndef on_stop(session):\n    summary = compile_summary(session)\n    subprocess.run([\"rein\", \"hook\", \"stop\"], input=json.dumps(summary).encode())\n```",
+    "target_bytes": 8000,
+    "expected_must_pass": ["code_block_preserved", "length_bounded"]
+  },
+  {
+    "case_id": "code_004",
+    "category": "code_blocks",
+    "description": "Shell commands with no language tag (bare fence)",
+    "evidence": [
+      {"content": "basic build and test from source/rein:\n\n```\ncargo test --workspace\ncargo clippy --workspace --all-targets -- -D warnings\n```", "merged_at": "2026-04-01T10:00:00Z"},
+      {"content": "install steps and docker:\n\n```\ncargo install --path crates/rein\ndocker build -t rein .\n```", "merged_at": "2026-04-02T10:00:00Z"}
+    ],
+    "current_canonical": "Build, test, and install commands run from source/rein (workspace root):\n\n```\ncargo test --workspace\ncargo clippy --workspace --all-targets -- -D warnings\n```\n\n```\ncargo install --path crates/rein\ndocker build -t rein .\n```",
+    "target_bytes": 8000,
+    "expected_must_pass": ["code_block_preserved"]
+  },
+  {
+    "case_id": "code_005",
+    "category": "code_blocks",
+    "description": "TOML fence for Cargo.toml fragment",
+    "evidence": [
+      {"content": "the workspace adds a proc-macro dependency path:\n\n```toml\n[dependencies]\nrein-macros = { path = \"../rein-macros\" }\ninventory = { workspace = true }\n```", "merged_at": "2026-04-15T10:00:00Z"},
+      {"content": "feature flags for the optional GUI build:\n\n```toml\n[features]\ngui = [\"rust-embed\"]\n```", "merged_at": "2026-04-16T10:00:00Z"}
+    ],
+    "current_canonical": "crates/rein/Cargo.toml depends on rein-macros via path and uses the gui feature flag for optional rust-embed.\n\n```toml\n[dependencies]\nrein-macros = { path = \"../rein-macros\" }\ninventory = { workspace = true }\n```\n\n```toml\n[features]\ngui = [\"rust-embed\"]\n```",
+    "target_bytes": 8000,
+    "expected_must_pass": ["code_block_preserved", "no_new_facts"]
+  },
+  {
+    "case_id": "code_006",
+    "category": "code_blocks",
+    "description": "JSON fence for MCP tool schema snippets",
+    "evidence": [
+      {"content": "rein_recall takes a query and optional limit:\n\n```json\n{\n  \"name\": \"rein_recall\",\n  \"description\": \"Search memories with waterfall pipeline\",\n  \"inputSchema\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}}\n}\n```", "merged_at": "2026-04-18T10:00:00Z"},
+      {"content": "rein_store schema includes optional tags:\n\n```json\n{\n  \"name\": \"rein_store\",\n  \"description\": \"Persist a memory with optional topic and tags\"\n}\n```", "merged_at": "2026-04-19T10:00:00Z"}
+    ],
+    "current_canonical": "MCP tool schemas for rein_recall and rein_store (28 total MCP tools in v0.22):\n\n```json\n{\n  \"name\": \"rein_recall\",\n  \"description\": \"Search memories with waterfall pipeline\",\n  \"inputSchema\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}}\n}\n```\n\n```json\n{\n  \"name\": \"rein_store\",\n  \"description\": \"Persist a memory with optional topic and tags\"\n}\n```",
+    "target_bytes": 8000,
+    "expected_must_pass": ["code_block_preserved", "no_new_facts"]
+  }
+]

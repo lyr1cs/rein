@@ -10,6 +10,7 @@ use crate::types::*;
 pub mod adaptive;
 pub mod consolidation;
 pub mod dedup;
+pub mod resummerize;
 pub mod system_health;
 
 // v0.21 A1 unified-ops infrastructure. Handlers populated incrementally.

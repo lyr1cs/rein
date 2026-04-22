@@ -542,6 +542,108 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     ",
     )?;
 
+    // v0.23: canonical resummerize flag + audit log. Must run AFTER
+    // migrate_source_check — that path recreates `memories` with a hardcoded
+    // column list and would silently drop the new columns on the first pass
+    // if the ALTER ran first. The no-backfill rule means even that race is
+    // harmless (rows default to 0), but keeping the order correct avoids a
+    // first-vs-second-boot drift in the schema.
+    migrate_resummerize(conn)?;
+
+    Ok(())
+}
+
+/// v0.23 resummerize migration: adds `memories.needs_resummerize` /
+/// `memories.last_resummarized_at` and creates the `resummerize_runs` audit
+/// table. Idempotent: safe to call on fresh DBs and on already-migrated DBs.
+///
+/// No backfill for `needs_resummerize` — rows default to 0. The flag flips
+/// only on new `MergeInto` cap hits and is cleared by the resummerize worker;
+/// we don't retroactively mark pre-migration canonicals as needing a sweep.
+fn migrate_resummerize(conn: &Connection) -> ReinResult<()> {
+    // ── memories.needs_resummerize ────────────────────────────────────────
+    let has_needs: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='needs_resummerize'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_needs {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN needs_resummerize INTEGER NOT NULL DEFAULT 0",
+        )
+        .ok();
+    }
+
+    // ── memories.last_resummarized_at ─────────────────────────────────────
+    let has_last: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='last_resummarized_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_last {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN last_resummarized_at TEXT")
+            .ok();
+    }
+
+    // ── memories.in_progress_resummerize_at ───────────────────────────────
+    // Lease column for atomic claim-then-process (Codex audit H6). A
+    // worker claims a row by setting this to the current timestamp; no
+    // other worker may claim the same row until either the current holder
+    // clears it (success/failure path) or the lease goes stale (> 5 min
+    // old — see `STALE_CLAIM_TIMEOUT_SECS` in `ops/resummerize.rs`).
+    let has_ipr: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='in_progress_resummerize_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_ipr {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN in_progress_resummerize_at TEXT")
+            .ok();
+    }
+
+    // ── resummerize_runs audit table ──────────────────────────────────────
+    // * `output_chars` / `output_hash` are nullable (missing on LLM failure).
+    // * `violations` is a JSON array persisted as TEXT (see
+    //   `store/resummerize_audit.rs::finish_resummerize_run`).
+    // * `status` is free-form TEXT rather than a CHECK-constrained enum so
+    //   adding a new terminal status in a future release doesn't require a
+    //   schema migration. `ResummerizeRunStatus::from_str` is the authoritative
+    //   enum boundary.
+    // * ON DELETE CASCADE: when the canonical is purged (gc/forget), its
+    //   audit rows go with it — we never surface orphaned audit entries.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS resummerize_runs (
+            id TEXT PRIMARY KEY,
+            canonical_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            input_evidence_count INTEGER NOT NULL DEFAULT 0,
+            input_canonical_chars INTEGER NOT NULL DEFAULT 0,
+            output_chars INTEGER,
+            output_hash TEXT,
+            target_bytes INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            violations TEXT,
+            error TEXT,
+            llm_backend TEXT,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_resummerize_runs_canonical
+            ON resummerize_runs(canonical_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_resummerize_runs_status
+            ON resummerize_runs(status, created_at DESC);
+    ",
+    )?;
+
     Ok(())
 }
 
