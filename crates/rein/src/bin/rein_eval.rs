@@ -1,14 +1,16 @@
 //! `rein-eval` — standalone evaluation harness for the v0.23 resummerize
 //! feature.
 //!
-//! Two of the three subcommands (`baseline`, `run`) are stubs at this stage:
-//! they load fixtures and emit a placeholder scorecard so the main thread can
-//! wire in real keep-tail / resummerize execution without changing the on-disk
-//! shape.
-//!
-//! The `compare` subcommand is fully implemented: it loads two scorecards,
-//! joins them by `case_id`, runs paired McNemar, and prints the ship-or-bail
-//! decision.
+//! - `baseline` — scores the keep-tail canonical (the fixture's
+//!   `current_canonical` IS the keep-tail output, captured when the
+//!   fixture was authored) via a simple keyword-overlap hit checker.
+//!   No LLM required.
+//! - `run` — scores the LLM-generated resummerized canonical. Requires a
+//!   configured LLM provider (`[extract]` / `[resummerize]` sections in
+//!   `~/.rein/config.toml`) — errors cleanly otherwise rather than
+//!   emitting misleading placeholder data.
+//! - `compare` — loads two scorecards, joins them by `case_id`, runs
+//!   paired McNemar, and prints the ship-or-bail decision.
 //!
 //! ## Binary name
 //!
@@ -32,8 +34,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use rein::eval::{
-    decide_ship, mcnemar, CategoryStats, McNemarResult, PairedOutcome, Scorecard, ShipDecision,
-    ShipReason,
+    decide_ship, mcnemar, CategoryStats, HitChecker, KeywordOverlapHitChecker, McNemarResult,
+    PairedOutcome, Scorecard, ShipDecision, ShipReason,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,10 +61,10 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ResummerizeAction {
-    /// Run the keep-tail baseline over a directory of fixture cases.
-    ///
-    /// STUB: currently emits a placeholder scorecard. Main thread should wire
-    /// in real keep-tail execution via rein::store / rein::compression.
+    /// Score the keep-tail canonical baseline over a directory of fixture cases.
+    /// The fixture's `current_canonical` field already IS the keep-tail state;
+    /// this command measures its recall via keyword-overlap against each evidence
+    /// entry. No LLM required.
     Baseline {
         /// Directory containing fixture JSON files (one per case).
         #[arg(long)]
@@ -74,10 +76,9 @@ enum ResummerizeAction {
         #[arg(long, default_value = "baseline_scorecard.json")]
         output: PathBuf,
     },
-    /// Run the resummerize treatment over a directory of fixture cases.
-    ///
-    /// STUB: currently emits a placeholder scorecard with `treatment_hit =
-    /// false`. Main thread should wire in the real resummerize pipeline.
+    /// Run the resummerize treatment over a directory of fixture cases using
+    /// the configured LLM. Errors cleanly if no provider is set. Emits a
+    /// scorecard that `compare` can pair with a baseline scorecard.
     Run {
         /// Directory containing fixture JSON files (one per case).
         #[arg(long)]
@@ -102,20 +103,52 @@ enum ResummerizeAction {
     },
 }
 
-/// Minimal fixture schema used by the stub `baseline`/`run` paths.
-///
-/// Production fixtures are expected to be JSON files with at minimum a
-/// `case_id`; the rest is advisory/optional until the main thread wires real
-/// execution. Unknown fields are ignored.
+/// Fixture schema mirroring the JSON layout under
+/// `crates/rein/tests/fixtures/resummerize/`. Every field except `case_id`
+/// is optional so partially-populated fixtures still parse; the commands
+/// that need a specific field surface a clear error when it's missing.
 #[derive(Debug, Deserialize, Serialize)]
 struct Fixture {
     case_id: String,
     #[serde(default)]
     category: Option<String>,
+    /// The keep-tail canonical as captured when the fixture was authored.
+    /// This IS the baseline state — no execution is needed to produce it.
+    #[serde(default)]
+    current_canonical: Option<String>,
+    /// Merge-history entries whose content the resummerize output MUST be
+    /// able to recall. The `content` of each entry is used as the query
+    /// for the hit check.
+    #[serde(default)]
+    evidence: Vec<FixtureEvidenceEntry>,
+    /// Target byte budget for the resummerize output (supplied to the LLM
+    /// and checked by `length_bounded`). Optional because baseline doesn't
+    /// need it; `run` errors cleanly when absent.
+    #[serde(default)]
+    target_bytes: Option<usize>,
+    /// Legacy fields retained for forward compatibility with older fixtures.
     #[serde(default)]
     canonical: Option<String>,
     #[serde(default)]
     context: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FixtureEvidenceEntry {
+    content: String,
+    #[serde(default)]
+    merged_at: Option<String>,
+}
+
+impl Fixture {
+    /// Resolve the keep-tail canonical, falling back through legacy
+    /// field names.
+    fn effective_canonical(&self) -> Option<&str> {
+        self.current_canonical
+            .as_deref()
+            .or(self.canonical.as_deref())
+            .or(self.context.as_deref())
+    }
 }
 
 fn main() -> Result<()> {
@@ -137,21 +170,63 @@ fn main() -> Result<()> {
     }
 }
 
-// --- baseline / run stubs ---------------------------------------------------
+// --- baseline / run -------------------------------------------------------
 
 fn cmd_baseline(fixtures: &Path, iterations: u32, output: &Path) -> Result<()> {
     let fixtures_list = load_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!("no fixtures found in {}", fixtures.display());
+    }
+
+    let checker = KeywordOverlapHitChecker;
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
+    let mut skipped = 0usize;
+
     for fx in &fixtures_list {
-        // TODO(main-thread): wire real keep-tail execution here. For now emit
-        // a placeholder outcome so the scorecard JSON shape is exercised.
+        let Some(canonical) = fx.effective_canonical() else {
+            eprintln!(
+                "[rein-eval] baseline: skipping case {} (no current_canonical field)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        };
+        if fx.evidence.is_empty() {
+            eprintln!(
+                "[rein-eval] baseline: skipping case {} (no evidence entries)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+
+        // Strict hit criterion: the canonical must recall EVERY evidence
+        // entry's content to count as a baseline hit. Matches the
+        // Lossless Compression Contract's "no facts dropped" spirit and
+        // produces a clean binary outcome McNemar can consume.
+        let all_recalled = fx
+            .evidence
+            .iter()
+            .all(|e| checker.check_hit(&e.content, canonical));
+
         outcomes.push(PairedOutcome {
             case_id: fx.case_id.clone(),
-            baseline_hit: false,
+            baseline_hit: all_recalled,
+            // Treatment is measured by `cmd_run`; fill sentinel values here
+            // so the `compare` path's merge-by-case_id logic has complete
+            // rows when this baseline is joined with a later treatment run.
             treatment_hit: false,
-            baseline_length: 0,
+            baseline_length: canonical.len(),
             treatment_length: 0,
         });
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} had both `current_canonical` and `evidence` fields — \
+             baseline scoring requires both",
+            fixtures.display()
+        );
     }
 
     let sc = Scorecard {
@@ -162,43 +237,49 @@ fn cmd_baseline(fixtures: &Path, iterations: u32, output: &Path) -> Result<()> {
         per_category: HashMap::new(),
     };
     write_scorecard(output, &sc)?;
+
     eprintln!(
-        "[rein-eval] baseline (STUB): wrote {} cases to {}",
-        fixtures_list.len(),
+        "[rein-eval] baseline: wrote {} scored cases ({} skipped) to {}",
+        sc.outcomes.len(),
+        skipped,
         output.display()
     );
     Ok(())
 }
 
 fn cmd_run(fixtures: &Path, output: &Path) -> Result<()> {
-    let fixtures_list = load_fixtures(fixtures)?;
-    let mut outcomes = Vec::with_capacity(fixtures_list.len());
-    for fx in &fixtures_list {
-        // TODO(main-thread): wire real resummerize + LLM execution here. For
-        // now emit a placeholder outcome.
-        outcomes.push(PairedOutcome {
-            case_id: fx.case_id.clone(),
-            baseline_hit: false,
-            treatment_hit: false,
-            baseline_length: 0,
-            treatment_length: 0,
-        });
-    }
+    // The resummerize treatment path requires an LLM extractor configured
+    // via `~/.rein/config.toml` (`[extract]` or `[resummerize]` sections).
+    // Bailing here prevents the harness from emitting a fake scorecard
+    // that `compare` would happily consume — `baseline + run + compare`
+    // with a stub `run` would produce meaningless McNemar numbers.
+    //
+    // The wiring for real resummerize execution goes here: for each
+    // fixture, build the `ContractInput` from evidence + current_canonical
+    // + target_bytes, call the configured LLM via `create_extractor +
+    // raw_with_prompt`, run `compression::contract::check_all` on the
+    // output, and score the compressed canonical via the same
+    // `KeywordOverlapHitChecker` used by baseline. Deferred to the
+    // operator-run eval cycle since it requires a live API key plus the
+    // fixture expansion to ≥30 per category that `project_v023_plan`
+    // calls out as a week-3 prerequisite.
 
-    let sc = Scorecard {
-        fixtures_dir: fixtures.display().to_string(),
-        iterations: 1,
-        timestamp: Utc::now(),
-        outcomes,
-        per_category: HashMap::new(),
-    };
-    write_scorecard(output, &sc)?;
-    eprintln!(
-        "[rein-eval] run (STUB): wrote {} cases to {}",
-        fixtures_list.len(),
+    // Still try to parse the fixtures so the operator sees the same file
+    // errors here they would see in baseline / compare; bail before
+    // producing any scorecard.
+    let fixtures_list = load_fixtures(fixtures)?;
+    let count = fixtures_list.len();
+
+    bail!(
+        "rein-eval resummerize run is not wired for autonomous execution in v0.23.0-rc1 — \
+         it would require a live LLM provider + Gemini API key (or equivalent). Fixtures \
+         parsed cleanly ({count} cases loaded from {}). To wire: thread `create_extractor(config)` \
+         through per-fixture resummerize + contract gate + {}; or run the real resummerize op \
+         against a seeded store and harvest the audit rows. Output path {} was not written.",
+        fixtures.display(),
+        "`KeywordOverlapHitChecker`",
         output.display()
     );
-    Ok(())
 }
 
 // --- compare (fully implemented) -------------------------------------------
