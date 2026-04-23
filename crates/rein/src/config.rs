@@ -1341,6 +1341,27 @@ fn pool_for_path(db_path: &Path) -> crate::types::ReinResult<Arc<crate::store::p
     Ok(pool)
 }
 
+/// Read-only access to a path's pool metrics, IF a live pool exists for it.
+/// Used by `doctor::check_pool_saturation` to surface saturation counts
+/// without forcing a fresh pool open (which would race the recall fanout's
+/// own first-touch). Returns `None` when no live pool is registered for the
+/// path — typically means no recall traffic has hit this DB this process.
+pub fn pool_metrics_for_path(
+    db_path: &Path,
+) -> crate::types::ReinResult<crate::store::pool::PoolMetrics> {
+    let map = pool_cache()
+        .lock()
+        .expect("open_store pool cache mutex poisoned");
+    let key = std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let weak = map
+        .get(&key)
+        .ok_or_else(|| crate::types::ReinError::Config("no pool registered for path".into()))?;
+    let pool = weak
+        .upgrade()
+        .ok_or_else(|| crate::types::ReinError::Config("pool dropped".into()))?;
+    Ok(pool.metrics())
+}
+
 fn validate_provider_name(field: &str, value: &str) -> anyhow::Result<()> {
     match value.to_lowercase().as_str() {
         "google" | "omlx" | "none" => Ok(()),

@@ -143,6 +143,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_tantivy(&store, snapshot.active_memories));
                             checks.push(hnsw_check);
                             checks.push(check_resummerize(&store));
+                            checks.push(check_pool_saturation(config));
                         }
                         Err(e) => checks.push(fail_in(
                             DoctorCategory::Storage,
@@ -1092,15 +1093,105 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
     }
 }
 
+/// Surface ConnPool saturation count from `PoolMetrics::try_get_saturated_count`.
+/// `try_get` is the non-blocking acquire used by `search/recall.rs`'s 3-channel
+/// fanout; on saturation it falls back to a fresh `SqliteStore::new`, which
+/// preserves correctness but degrades into per-channel connection churn rather
+/// than clean backpressure. Sustained nonzero growth here is the operator's
+/// signal that pool size is undersized for the recall workload. Agent D Q10
+/// (post-v0.23.0 architecture audit). The check is informational-only —
+/// saturation isn't an error, but operators who never look at the count don't
+/// know to investigate. Threshold (≥ 1000 events) is structural ("more than a
+/// rare burst"), not a tunable.
+fn check_pool_saturation(config: &ReinConfig) -> DoctorCheck {
+    let db_path = std::path::PathBuf::from(&config.database.path);
+    let metrics = match crate::config::pool_metrics_for_path(&db_path) {
+        Ok(m) => m,
+        Err(_) => {
+            return ok_in(
+                DoctorCategory::Storage,
+                "pool_saturation",
+                "pool not initialized for this path (no recall traffic yet)".to_string(),
+            );
+        }
+    };
+    // Post-fix audit L-2: warn only when saturation is BOTH frequent
+    // (lifetime count over threshold) AND recent (event in the last hour).
+    // A bursty load test that crossed 1000 events two hours ago should
+    // NOT keep warning — the degraded regime has passed and the lifetime
+    // counter alone can't tell operators when to care.
+    //
+    // Audit round-2 LOW 9: handle the NTP rollback edge case. If the
+    // wall clock stepped backward (NTP correction, manual set, DST
+    // oddity on systems that ignore UTC), `last_saturation_at` can end
+    // up AFTER `now_s` — `saturating_sub` would then return 0 and the
+    // recency check would falsely fire. Treat future timestamps as
+    // "unknown" and skip the recency gate (same behavior as the
+    // never-saturated path).
+    let now_s = chrono::Utc::now().timestamp();
+    let seconds_since_last_saturation = if metrics.last_saturation_at <= 0
+        || metrics.last_saturation_at > now_s
+    {
+        i64::MAX
+    } else {
+        now_s - metrics.last_saturation_at
+    };
+    let message = format!(
+        "size={} idle={} in_use={} permits={} shrunk={} saturated={} recent={}",
+        metrics.size,
+        metrics.idle,
+        metrics.in_use,
+        metrics.available_permits,
+        metrics.shrunk_count,
+        metrics.try_get_saturated_count,
+        if seconds_since_last_saturation == i64::MAX {
+            "never".to_string()
+        } else {
+            format!("{}s ago", seconds_since_last_saturation)
+        }
+    );
+    const RECENT_WINDOW_SECS: i64 = 3600;
+    if metrics.try_get_saturated_count >= 1000
+        && seconds_since_last_saturation <= RECENT_WINDOW_SECS
+    {
+        warn_with_hint(
+            DoctorCategory::Storage,
+            "pool_saturation",
+            message,
+            "many recall fanout calls have fallen back from the pool to fresh \
+             SqliteStore::new in the last hour — consider increasing pool size \
+             in config",
+        )
+    } else {
+        ok_in(DoctorCategory::Storage, "pool_saturation", message)
+    }
+}
+
 fn check_resummerize(store: &SqliteStore) -> DoctorCheck {
     // v0.23: surface resummerize backlog + recent failure rate. Backlog
     // alone is not an error — it just means the LLM hasn't yet processed
     // rows flagged by MergeInto cap hits. A high failure rate indicates
     // a broken prompt / model / contract tuning and should be triaged.
+    //
+    // Post-audit round-2 MED-2: ALSO surface `claim_lost` rate as a
+    // separate signal. `recent_failure_rate` (quality metric) filters
+    // claim_lost out so a contention spike doesn't page an operator
+    // about "failing LLM quality" when the real issue is concurrent
+    // workers. `recent_claim_lost_rate` (contention metric) is the
+    // missing signal: high value = workers racing + burning LLM budget
+    // without progress. Warn on its own threshold independent of the
+    // quality gate.
     let backlog = crate::ops::resummerize::backlog_count(store).unwrap_or(0);
-    let failure_rate =
-        crate::store::resummerize_audit::recent_failure_rate(store.conn(), chrono::Duration::hours(24))
-            .unwrap_or(0.0);
+    let failure_rate = crate::store::resummerize_audit::recent_failure_rate(
+        store.conn(),
+        chrono::Duration::hours(24),
+    )
+    .unwrap_or(0.0);
+    let claim_lost_rate = crate::store::resummerize_audit::recent_claim_lost_rate(
+        store.conn(),
+        chrono::Duration::hours(24),
+    )
+    .unwrap_or(0.0);
     let total_recent = crate::store::resummerize_audit::recent_run_count(
         store.conn(),
         chrono::Duration::hours(24),
@@ -1108,19 +1199,57 @@ fn check_resummerize(store: &SqliteStore) -> DoctorCheck {
     .unwrap_or(0);
 
     let message = format!(
-        "backlog={backlog} needing resummerize; last 24h: {total_recent} runs, failure_rate={:.1}%",
-        failure_rate * 100.0
+        "backlog={backlog} needing resummerize; last 24h: {total_recent} runs, \
+         failure_rate={:.1}%, claim_lost_rate={:.1}%",
+        failure_rate * 100.0,
+        claim_lost_rate * 100.0,
     );
 
-    // Thresholds are structural, not tuned: failure rate ≥ 50% over ≥ 5
-    // runs is a strong signal that contract is failing systematically;
-    // < 5 runs is insufficient evidence to warn.
-    if total_recent >= 5 && failure_rate >= 0.5 {
+    // Thresholds are structural, not tuned:
+    //   * failure rate ≥ 50% over ≥ 5 runs ⇒ contract/prompt/model is failing
+    //   * claim_lost rate ≥ 30% over ≥ 10 total (quality + contention) ⇒
+    //     workers are racing on the same canonicals; reduce batch
+    //     overlap or serialize further. 30% is a looser gate than the
+    //     failure threshold because some claim_lost under concurrent
+    //     MergeInto load is normal; 30% over 10 runs is "unusually
+    //     contentious", not "broken".
+    //
+    // `recent_run_count` excludes claim_lost (M-3), so the quality gate
+    // uses `total_recent`, and the contention gate uses the full 24h
+    // total (claim_lost + quality classes).
+    let full_24h_total: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM resummerize_runs \
+               WHERE finished_at IS NOT NULL AND finished_at >= ?1",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    let quality_alert = total_recent >= 5 && failure_rate >= 0.5;
+    let contention_alert = full_24h_total >= 10 && claim_lost_rate >= 0.3;
+
+    if quality_alert {
         warn_with_hint(
             DoctorCategory::Queue,
             "resummerize",
             message,
-            "check [resummerize] config + recent resummarize_runs rows; a systematic failure usually means the LLM prompt or contract needs adjustment",
+            "check [resummerize] config + recent resummarize_runs rows; a \
+             systematic failure usually means the LLM prompt or contract \
+             needs adjustment",
+        )
+    } else if contention_alert {
+        warn_with_hint(
+            DoctorCategory::Queue,
+            "resummerize",
+            message,
+            "many resummerize runs lost their claim to peer workers in the \
+             last 24h — LLM tokens are being spent without progress. \
+             Reduce worker batch size overlap or serialize resummerize \
+             further (lower concurrency).",
         )
     } else {
         ok_in(DoctorCategory::Queue, "resummerize", message)

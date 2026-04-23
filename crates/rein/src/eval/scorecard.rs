@@ -28,6 +28,23 @@ pub struct Scorecard {
     pub outcomes: Vec<PairedOutcome>,
     #[serde(default)]
     pub per_category: HashMap<String, CategoryStats>,
+    /// Optional `case_id -> category` map populated by `baseline` and `run`
+    /// from the fixture's `category` field. `compare` uses this to group
+    /// joined paired outcomes when computing per-category McNemar (the
+    /// pre-fixture-category fallback parsed `case_id` prefix-before-colon,
+    /// which doesn't fit fixtures whose case_ids use underscores).
+    /// `#[serde(default)]` keeps older scorecards readable.
+    #[serde(default)]
+    pub category_map: HashMap<String, String>,
+    /// Version of the `KeywordOverlapHitChecker` used to produce the hit
+    /// outcomes. `#[serde(default)]` → `0` means "pre-version-tracking
+    /// scorecard" (the first cut of v0.23 eval, before the CJK tokenizer
+    /// fix added `HIT_CHECKER_VERSION`). `compare` bails if baseline and
+    /// treatment scorecards were produced under different versions, so
+    /// operators can't unknowingly run McNemar across incompatible
+    /// scoring methodologies. Post-fix audit M-2.
+    #[serde(default)]
+    pub hit_checker_version: u32,
 }
 
 /// Per-category aggregate: hit rates, mean lengths, and a category-scoped

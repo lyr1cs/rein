@@ -46,10 +46,81 @@ const STOP_WORDS: &[&str] = &[
     "and", "or", "but", "not",
 ];
 
-/// Tokenize into lowercase alphanumeric words, filtering stop words and
-/// very-short tokens. Deliberately simple — see [`HitChecker`] docs for the
-/// Phase 1 caveat.
+/// CJK function words / filler that jieba's `cut` emits as distinct tokens
+/// but which carry no discriminating signal for keyword overlap. Without
+/// this filter, top-5 frequency selection on Chinese input gets dominated
+/// by 这个 / 可以 / 那么 / 就是 and similar — the Chinese equivalents of
+/// STOP_WORDS above. Post-fix audit L-3. Covers common Mandarin + a few
+/// cross-CJK picks; extensible via corpus-frequency filtering later.
+const CJK_STOP_WORDS: &[&str] = &[
+    // Simplified Chinese multi-char function words (the Latin `chars()
+    // .count() > 1` filter already drops single-char tokens, so
+    // single-char entries like 的/是/在 listed in the pre-fix version
+    // were redundant — audit round-2 LOW #10 removed them).
+    "这个", "那个", "可以", "那么", "就是", "一个", "一些", "没有", "但是",
+    "而且", "所以", "因为", "如果", "虽然", "然后", "之后", "之前", "可能",
+    "我们", "你们", "他们", "她们", "它们", "这样", "那样", "这里", "那里",
+    "什么", "怎么", "为什么", "哪里", "哪个",
+    // Traditional Chinese variants (post-fix audit round-2 LOW #10 gap —
+    // missing these let 這個 / 那個 / 沒有 dominate top-5 on Traditional
+    // fixtures). Round-3 audit Finding 8 added `什麼` and `為什麼` —
+    // the Taiwan-standard orthography for "what" / "why" that the
+    // round-2 pass missed (it only had the 甚 variants which are more
+    // common in Hong Kong).
+    "這個", "那個", "可以", "沒有", "但是", "而且", "所以", "因為", "如果",
+    "雖然", "然後", "之後", "之前", "我們", "你們", "他們", "她們", "它們",
+    "這樣", "那樣", "這裡", "那裡", "甚麼", "怎麼", "為甚麼", "什麼",
+    "為什麼", "哪裡", "哪個", "一個", "一些",
+    // Japanese particles + common filler (multi-char; single-char
+    // particles are already filtered by the length > 1 predicate)
+    "です", "ます", "この", "その", "あの", "これ", "それ", "あれ", "する",
+    "した", "している", "ように", "ための", "ことが", "ことは",
+    // Korean particles + common filler (same story — single-char ones
+    // drop out via the length filter)
+    "그것", "이것", "저것", "합니다", "있습니다", "없습니다", "그리고",
+    "하지만", "때문에", "그래서",
+];
+
+/// Hit-checker version. Bumped whenever `tokenize` or the overlap predicate
+/// changes meaning. v1 was Latin-only `is_alphanumeric` split (every CJK
+/// character was treated as alphanumeric, so a whole sentence tokenized as
+/// a single token — making the eval's `cjk` category numbers noise).
+/// v2 routes CJK content through `extract::dedup::tokenize_for_search`
+/// (jieba + bigrams), making the scorer fair to CJK fixtures. Scorecards
+/// produced under different versions must NOT be compared via `compare`
+/// without acknowledging the methodology change.
+pub const HIT_CHECKER_VERSION: u32 = 2;
+
+/// Tokenize text for keyword overlap. Routes CJK-containing input through
+/// `jieba` segmentation so the eval scorer doesn't collapse CJK sentences
+/// into single mega-tokens. Returned Vec preserves duplicates so the
+/// frequency-counting in `KeywordOverlapHitChecker::check_hit` works the
+/// same on both paths. Latin/ASCII input keeps the simple `is_alphanumeric`
+/// split for backward-comparable v1 behavior on the existing fixture set's
+/// non-CJK cases.
 fn tokenize(s: &str) -> Vec<String> {
+    if crate::extract::dedup::contains_cjk(s) {
+        // CJK path — call jieba directly so duplicates are preserved (the
+        // production `tokenize_for_search` returns a sorted dedup'd Vec via
+        // an internal HashSet, which would collapse "用户" appearing 5×
+        // into a single token and break the top-5 frequency selection).
+        // Filter pure-punctuation, single-char, and stop-word tokens for
+        // parity with the Latin path's `len > 2 && !stop_word` filter.
+        // Also filter CJK function words via CJK_STOP_WORDS (post-fix
+        // audit L-3) so the top-5 aren't dominated by 这个/可以/那么.
+        return crate::extract::dedup::jieba()
+            .cut(s, true)
+            .into_iter()
+            .map(|t| t.to_lowercase().trim().to_string())
+            .filter(|t| {
+                !t.is_empty()
+                    && t.chars().count() > 1
+                    && !STOP_WORDS.contains(&t.as_str())
+                    && !CJK_STOP_WORDS.contains(&t.as_str())
+                    && t.chars().any(|c| c.is_alphanumeric())
+            })
+            .collect();
+    }
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty() && w.len() > 2 && !STOP_WORDS.contains(w))
@@ -62,7 +133,9 @@ fn tokenize(s: &str) -> Vec<String> {
 /// appear in the canonical text.
 ///
 /// This is intentionally simple and expected to be replaced by a better
-/// (LLM-backed / semantic) oracle in later phases.
+/// (LLM-backed / semantic) oracle in later phases. v2 of `tokenize` makes
+/// the scorer CJK-aware (see [`HIT_CHECKER_VERSION`]); the top-5/≥3
+/// predicate is unchanged from v1.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeywordOverlapHitChecker;
 
@@ -126,5 +199,43 @@ mod tests {
     fn keyword_checker_empty_evidence_misses() {
         let checker = KeywordOverlapHitChecker;
         assert!(!checker.check_hit("", "anything here"));
+    }
+
+    #[test]
+    fn keyword_checker_cjk_word_level_hit() {
+        // v2 (HIT_CHECKER_VERSION = 2) routes CJK input through jieba.
+        // v1 used `is_alphanumeric` which collapsed every Chinese sentence
+        // into a single mega-token (CJK chars are alphanumeric in
+        // Unicode), making the eval's `cjk` category numbers noise.
+        // After the fix, repeated CJK words like "用户偏好" are
+        // distinguishable tokens that the top-5/≥3-overlap predicate can
+        // actually score.
+        let evidence =
+            "用户偏好简洁输出 用户偏好中文回复 用户偏好周末减少通知 用户偏好简洁输出";
+        let canonical =
+            "用户偏好简洁输出和中文回复，周末减少通知";
+        let checker = KeywordOverlapHitChecker;
+        assert!(
+            checker.check_hit(evidence, canonical),
+            "CJK content with shared `用户`/`偏好`/`简洁`/`输出` tokens between \
+             evidence and canonical must score as a hit; v1 always returned \
+             false here because tokenize() emitted a single mega-token"
+        );
+    }
+
+    #[test]
+    fn keyword_checker_cjk_paraphrase_miss() {
+        // Same shape as keyword_checker_miss_case but in CJK — Korean
+        // evidence vs unrelated Chinese canonical. v1 would return true
+        // (single-token degenerate equality on long strings); v2 correctly
+        // separates words and finds no overlap.
+        let evidence = "리뷰어가 커밋 메시지 형식에 대해 피드백을 남겼습니다";
+        let canonical = "用户偏好简洁输出和中文回复";
+        let checker = KeywordOverlapHitChecker;
+        assert!(
+            !checker.check_hit(evidence, canonical),
+            "evidence and canonical share no meaningful tokens; checker \
+             must return false"
+        );
     }
 }
