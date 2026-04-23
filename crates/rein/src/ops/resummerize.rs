@@ -48,6 +48,11 @@ const STALE_CLAIM_TIMEOUT_SECS: i64 = 300;
 /// of truth for "what the output must preserve". The prompt only needs to
 /// steer the model toward the same goals. Contract violations are caught
 /// post-hoc; the prompt is a hint, not a guarantee.
+/// Stays private: the eval harness uses `call_llm_sync` as its entry point,
+/// and `call_llm_sync` embeds `SYSTEM_PROMPT` internally, so production and
+/// eval naturally share this string without a public export. McNemar
+/// comparability is guaranteed as long as `call_llm_sync` is the sole
+/// caller.
 const SYSTEM_PROMPT: &str = "You are a canonical memory compression engine. \
 Given a current canonical text plus its merge evidence, emit a shorter \
 canonical replacement that preserves every distinct fact, every date and \
@@ -212,7 +217,17 @@ struct Claim {
 /// used Gemini — the override was ignored (Codex audit M7). Now we build
 /// the extractor directly from the resolved resummerize provider so the
 /// override actually takes effect.
-fn create_resummerize_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
+/// `pub` so `bin/rein_eval.rs::cmd_run` can reuse the same backend-selection
+/// path as production. Pre-fix the eval used `create_extractor` (which
+/// follows `[extract].provider`) while production used
+/// `create_resummerize_extractor` (which follows
+/// `[resummerize].llm_backend`). If an operator configured
+/// `extract.provider = "google"` with
+/// `resummerize.llm_backend = "omlx"`, the eval scorecard would have
+/// tested Gemini while production ran OMLX — the `compare` verdict is
+/// meaningless against a different backend. Post-fix audit M-1.
+/// **Not a stable public API.**
+pub fn create_resummerize_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
     let extract_provider = config.extract_provider();
     match config.resummerize.resolved_provider(extract_provider) {
         Provider::None => None,
@@ -464,7 +479,13 @@ fn resummerize_one_inner(
         rusqlite::params![canonical_id],
         |row| row.get(0),
     );
-    let evidence_result = store.list_memory_evidence(canonical_id, 1_000);
+    // Full evidence history, oldest-first. Prior versions called
+    // `list_memory_evidence(id, 1_000)` which silently truncated long
+    // histories AND returned newest-first despite the prompt's claim of
+    // "oldest first — newer merges appear later" — a long-lived canonical
+    // could pass the contract while the LLM never saw the older facts.
+    // Agent A adversarial finding A-2 (post-v0.23.0).
+    let evidence_result = store.list_all_memory_evidence_oldest_first(canonical_id);
     // COMMIT closes the read lock; deferred txns in WAL mode don't strictly
     // need explicit commit but doing it cleanly releases the snapshot
     // immediately rather than at statement-scope drop. Codex round-7 LOW:
@@ -575,20 +596,30 @@ fn resummerize_one_inner(
         .min(crate::store::sqlite::MERGE_CONTENT_CAP);
     let output_bytes = llm_output.len();
     if output_bytes > tolerance {
-        resummerize_audit::finish_resummerize_run(
-            store.conn(),
+        // Post-audit round-2 MED-1: atomically recheck ownership AND write
+        // the terminal status under one `BEGIN IMMEDIATE`. Pre-fix had a
+        // window between the recheck SELECT and the `finish_resummerize_run`
+        // UPDATE where a peer `MergeInto` could commit and our write would
+        // still land as `LengthExceeded` (countable → fuse). IMMEDIATE
+        // grabs a reserved lock so no concurrent writer slips in until we
+        // commit.
+        let verdict = finish_with_ownership_check(
+            store,
             &run_id,
-            Some(output_bytes as u32),
-            Some(sha256_hex(&llm_output)),
+            &claim.canonical_id,
+            &claim.token,
+            &canonical_updated_at_raw,
+            output_bytes as u32,
+            &sha256_hex(&llm_output),
             ResummerizeRunStatus::LengthExceeded,
             &["length_bounded".to_string()],
             Some(format!(
                 "output {} bytes exceeded tolerance {}",
                 output_bytes, tolerance,
             )),
-            Utc::now(),
+            "length check raced with concurrent writer",
         )?;
-        return Ok(Verdict::LengthExceeded);
+        return Ok(verdict);
     }
 
     match contract::check_all(&input, &llm_output) {
@@ -611,33 +642,92 @@ fn resummerize_one_inner(
                         None,
                         Utc::now(),
                     )?;
+                    // Agent D Q6 — KG concept revisions can drift when
+                    // resummerize materially changes canonical wording.
+                    // `concepts.source_memory_ids` still points at this
+                    // canonical ID but the underlying content has
+                    // shifted. The full fix (automatic re-extraction of
+                    // concepts from the new canonical) is v0.24 — it
+                    // requires an LLM call, a refresh queue, and
+                    // backpressure coordination. For now, flag affected
+                    // concepts so operators have a handle + doctor can
+                    // surface the drift backlog.
+                    if let Ok(count) = mark_concepts_needing_refresh_for_canonical(
+                        store,
+                        &claim.canonical_id,
+                    ) {
+                        if count > 0 {
+                            tracing::warn!(
+                                canonical_id = %claim.canonical_id,
+                                concepts_affected = count,
+                                "resummerize: KG concepts reference this canonical; \
+                                 their definitions may now be semantically stale. \
+                                 Re-run concept extraction via `rein memoir refine` \
+                                 or wait for v0.24 automatic refresh."
+                            );
+                        }
+                    }
+                    // Agent D Q7 — episode replay fidelity. Episodes
+                    // reference memory IDs; after resummerize, replaying
+                    // an episode returns the NEW canonical content even
+                    // if the episode was captured against the old
+                    // content. The full fix (content-hash snapshot at
+                    // episode creation) is v0.24 — it needs a schema
+                    // change and a replay-path refactor to check hashes.
+                    // For now, flag episodes that may have drifted so
+                    // operators can audit before acting on replayed
+                    // episode content.
+                    if let Ok(count) = count_episodes_referencing_canonical(
+                        store,
+                        &claim.canonical_id,
+                    ) {
+                        if count > 0 {
+                            tracing::warn!(
+                                canonical_id = %claim.canonical_id,
+                                episodes_affected = count,
+                                "resummerize: episodes reference this canonical \
+                                 (episode replay will now return the rewritten \
+                                 content, not the content captured at session \
+                                 time). Full replay fidelity requires content \
+                                 snapshots — see v0.24 plan."
+                            );
+                        }
+                    }
                     Ok(Verdict::Success)
                 }
                 ApplyResult::ClaimLost => {
                     // Another worker reclaimed the row, or a different
                     // writer changed the canonical after we built the LLM
                     // input snapshot. Discard this output — newer state
-                    // is authoritative and we must not overwrite it. No
-                    // audit row: there was no committed rewrite to
-                    // record.
+                    // is authoritative and we must not overwrite it.
                     tracing::info!(
                         canonical_id = %claim.canonical_id,
                         our_token = %claim.token,
                         "resummerize: claim lost or canonical changed \
                          concurrently; discarding output"
                     );
-                    // Cancel the open audit row we opened with
-                    // `insert_resummerize_run` so the fuse doesn't count
-                    // this as a consecutive failure. Best-effort — if the
-                    // delete fails, the row lingers but its status is
-                    // `llm_error` (the starting placeholder), which over
-                    // time may trip the 3-strike fuse unnecessarily. This
-                    // is acceptable for Phase 1; a cleaner "claim_lost"
-                    // terminal status is future work.
-                    let _ = store.conn().execute(
-                        "DELETE FROM resummerize_runs WHERE id = ?1",
-                        rusqlite::params![&run_id],
-                    );
+                    // Terminal-update the open audit row to `claim_lost`
+                    // rather than deleting it. Prior versions best-effort
+                    // DELETEd and commented that "if the delete fails,
+                    // the row lingers but its status is `llm_error`
+                    // (the starting placeholder), which over time may
+                    // trip the 3-strike fuse unnecessarily" — Agent D
+                    // Q2/Q15 picked that up in the post-v0.23.0 review.
+                    // With an explicit terminal status, the fuse counter
+                    // (see `count_recent_consecutive_failures` treatment
+                    // of `ClaimLost` below) correctly classifies this as
+                    // a non-failure, AND the audit row stays durable so
+                    // the sunk LLM cost is visible to `rein doctor`.
+                    resummerize_audit::finish_resummerize_run(
+                        store.conn(),
+                        &run_id,
+                        Some(output_bytes as u32),
+                        Some(sha256_hex(&llm_output)),
+                        ResummerizeRunStatus::ClaimLost,
+                        &[],
+                        None,
+                        Utc::now(),
+                    )?;
                     Ok(Verdict::ClaimLost)
                 }
             }
@@ -652,17 +742,33 @@ fn resummerize_one_inner(
                 .map(|v| format!("{}: {}", v.invariant, v.detail))
                 .collect::<Vec<_>>()
                 .join("; ");
-            resummerize_audit::finish_resummerize_run(
-                store.conn(),
+            // Post-audit round-2 MED-1: same atomic recheck-and-finish as
+            // the length path above. A concurrent MergeInto that updated
+            // the canonical after our snapshot can cause the LLM — which
+            // saw stale evidence + an older canonical — to produce
+            // output that doesn't satisfy the NEW canonical's contract
+            // input. `finish_with_ownership_check` ensures the audit row
+            // says `ClaimLost` (non-counting) when that happens rather
+            // than `ContractViolation` (countable → fuse).
+            let race_detail = format!(
+                "contract check raced with concurrent writer; \
+                 original violations would have been: {}",
+                detail
+            );
+            let verdict = finish_with_ownership_check(
+                store,
                 &run_id,
-                Some(output_bytes as u32),
-                Some(sha256_hex(&llm_output)),
+                &claim.canonical_id,
+                &claim.token,
+                &canonical_updated_at_raw,
+                output_bytes as u32,
+                &sha256_hex(&llm_output),
                 ResummerizeRunStatus::ContractViolation,
                 &violation_names,
                 Some(detail),
-                Utc::now(),
+                &race_detail,
             )?;
-            Ok(Verdict::ContractViolation)
+            Ok(verdict)
         }
     }
 }
@@ -806,12 +912,37 @@ fn apply_resummerize(
                     // and evict the stale HNSW entry. SQLite's
                     // `memories_fts` trigger already kept FTS5 in sync
                     // with the content change.
+                    //
+                    // STALE-INDEX WINDOW (Agent D Q3):
+                    // Between COMMIT and `refresh_indexes_after_canonical_rewrite`
+                    // returning (~10-50ms on warm caches), a concurrent recall on
+                    // a separate connection can:
+                    //   * read the NEW canonical content from SQLite (WAL is
+                    //     read-consistent — content correctness is safe), AND
+                    //   * receive HNSW / Tantivy SCORES that reflect the OLD
+                    //     embedding / posting. Functionally the row is still
+                    //     returned with the right ID; only the relevance
+                    //     ranking is briefly off.
+                    // Self-heals on the next `run_vec_dedup` sweep (re-embed +
+                    // HNSW re-insert via `update_hnsw_for_vec_dedup`) and on
+                    // the next Tantivy commit (`update_tantivy` issues one
+                    // synchronously below). The fully invariant fix —
+                    // version-check `updated_at` in the recall fusion path —
+                    // is recall.rs work, deferred to v0.24.
+                    let refresh_started = std::time::Instant::now();
                     store.refresh_indexes_after_canonical_rewrite(
                         &canonical_id,
                         &canonical_topic,
                         &new_summary,
                         new_content,
                         &canonical_keywords,
+                    );
+                    let refresh_micros = refresh_started.elapsed().as_micros();
+                    tracing::debug!(
+                        canonical_id = %canonical_id,
+                        refresh_micros,
+                        "resummerize: side-index refresh complete \
+                         (recall observed stale scores for at most this window)"
                     );
                     Ok(ApplyResult::Applied)
                 }
@@ -880,6 +1011,19 @@ pub mod test_hooks {
         Ok(claims.into_iter().next().map(|c| c.token))
     }
 
+    /// Pure ownership check — same semantics as the production helper
+    /// used before writing a countable terminal status. Exposed so the
+    /// Codex H-1 regression test can directly exercise the drift-detection
+    /// logic without staging a real cross-thread race.
+    pub fn check_claim_still_held_for_test(
+        store: &SqliteStore,
+        canonical_id: &str,
+        claim_token: &str,
+        snapshot_updated_at_raw: &str,
+    ) -> ReinResult<bool> {
+        super::check_claim_still_held(store, canonical_id, claim_token, snapshot_updated_at_raw)
+    }
+
     /// Run `apply_resummerize` directly with a caller-provided token.
     /// Integration tests pass a token that has since been reassigned in
     /// the DB to exercise the claim-lost ROLLBACK path. Reads the raw
@@ -913,6 +1057,249 @@ pub mod test_hooks {
             ApplyResult::ClaimLost => Ok(ApplyOutcome::ClaimLost),
         }
     }
+}
+
+/// Post-audit round-2 MED-1: atomically (under `BEGIN IMMEDIATE`) verify
+/// ownership and write the appropriate terminal audit row. If ownership
+/// is still held, writes the `intended_status` (`LengthExceeded` or
+/// `ContractViolation`); otherwise writes `ClaimLost` with `race_detail`
+/// as the error text. Returns the matching `Verdict`.
+///
+/// Why atomic: before the audit's round-2 MED-1 fix, the call sequence
+/// was `check_claim_still_held()` → `finish_resummerize_run()` as TWO
+/// separate statements. A peer `MergeInto` could commit in the window
+/// between them, so `check` returned `true` but the row we were about to
+/// write the `ContractViolation` audit entry AGAINST had already moved
+/// on. IMMEDIATE grabs a reserved lock; concurrent writers wait until
+/// our COMMIT.
+///
+/// Returns `Ok(Verdict::ClaimLost | Verdict::LengthExceeded |
+/// Verdict::ContractViolation)`. The `Success` variant is not a valid
+/// `intended_status` for this helper — it's handled on the Ok-contract
+/// branch of `apply_resummerize`, which uses its own 5-way CAS rather
+/// than this wrapper.
+#[allow(clippy::too_many_arguments)]
+fn finish_with_ownership_check(
+    store: &SqliteStore,
+    run_id: &str,
+    canonical_id: &str,
+    claim_token: &str,
+    snapshot_updated_at_raw: &str,
+    output_bytes: u32,
+    output_hash: &str,
+    intended_status: ResummerizeRunStatus,
+    intended_violations: &[String],
+    intended_error: Option<String>,
+    race_detail: &str,
+) -> ReinResult<Verdict> {
+    let conn = store.conn();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let now = Utc::now();
+    let result: ReinResult<Verdict> = (|| {
+        let still_ours = check_claim_still_held(
+            store,
+            canonical_id,
+            claim_token,
+            snapshot_updated_at_raw,
+        )?;
+        if still_ours {
+            resummerize_audit::finish_resummerize_run(
+                conn,
+                run_id,
+                Some(output_bytes),
+                Some(output_hash.to_string()),
+                intended_status,
+                intended_violations,
+                intended_error,
+                now,
+            )?;
+            let verdict = match intended_status {
+                ResummerizeRunStatus::LengthExceeded => Verdict::LengthExceeded,
+                ResummerizeRunStatus::ContractViolation => Verdict::ContractViolation,
+                _ => {
+                    return Err(ReinError::Config(format!(
+                        "finish_with_ownership_check called with unsupported \
+                         intended_status={intended_status:?}"
+                    )));
+                }
+            };
+            Ok(verdict)
+        } else {
+            resummerize_audit::finish_resummerize_run(
+                conn,
+                run_id,
+                Some(output_bytes),
+                Some(output_hash.to_string()),
+                ResummerizeRunStatus::ClaimLost,
+                &[],
+                Some(race_detail.to_string()),
+                now,
+            )?;
+            Ok(Verdict::ClaimLost)
+        }
+    })();
+    match result {
+        Ok(verdict) => {
+            if let Err(commit_err) = conn.execute_batch("COMMIT") {
+                tracing::warn!(
+                    run_id = %run_id,
+                    canonical_id = %canonical_id,
+                    error = %commit_err,
+                    "finish_with_ownership_check: COMMIT failed; attempting ROLLBACK"
+                );
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(commit_err.into());
+            }
+            Ok(verdict)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            // Post-audit round-2 LOW #2: if the recheck SQL errors (I/O,
+            // schema corruption, whatever), the starter row that
+            // `insert_resummerize_run` opened would be left with
+            // `finished_at = NULL`. That's silently invisible to doctor
+            // / fuse / failure_rate, so operators can't even SEE that
+            // this run attempted. Best-effort write an `llm_error`
+            // terminal status (non-counting per M-3) so the run is at
+            // least durable in the audit table. If the best-effort write
+            // ALSO fails, we propagate the original error — doctor may
+            // miss this one case but the process isn't wedged.
+            //
+            // Round-3 audit Finding 6: log the secondary failure too, so
+            // an operator digging into the original error has a trail of
+            // the orphan-row cause. Prior `let _ = ...` silently dropped
+            // the secondary error; if both the recheck and the finish
+            // failed (e.g. the connection itself died), there was no
+            // evidence of it in logs.
+            let best_effort_err = format!(
+                "ownership recheck SQL failed during terminal status write: {e}"
+            );
+            if let Err(finish_err) = resummerize_audit::finish_resummerize_run(
+                conn,
+                run_id,
+                Some(output_bytes),
+                Some(output_hash.to_string()),
+                ResummerizeRunStatus::LlmError,
+                &[],
+                Some(best_effort_err),
+                now,
+            ) {
+                tracing::warn!(
+                    run_id = %run_id,
+                    canonical_id = %canonical_id,
+                    recheck_err = %e,
+                    finish_err = %finish_err,
+                    "finish_with_ownership_check: best-effort llm_error \
+                     finish ALSO failed; starter row will remain with \
+                     finished_at=NULL until a janitor picks it up"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Codex post-fix audit H-1: before writing a countable terminal status
+/// (`LengthExceeded` / `ContractViolation`), verify that this worker still
+/// owns the claim AND the canonical's `updated_at` still matches the
+/// snapshot we based the LLM call on. If either has drifted, a concurrent
+/// `MergeInto` or stale-claim takeover has already invalidated our work —
+/// and the `apply_resummerize` 5-way CAS would have rejected our rewrite
+/// anyway. Writing `ContractViolation` in that case is a false positive
+/// that counts toward the 3-strike fuse and can permanently strand a row.
+///
+/// Returns `Ok(true)` when ownership + snapshot are both still valid,
+/// `Ok(false)` on any mismatch. The recheck is a read-only SELECT on the
+/// same connection; it may race again with a subsequent writer, but the
+/// window between this check and the audit-row write is microseconds and
+/// a race at that granularity is indistinguishable from "ownership was
+/// still held when we decided." The `apply_resummerize` path's
+/// `BEGIN IMMEDIATE` + 5-way CAS remains the authoritative safety net.
+fn check_claim_still_held(
+    store: &SqliteStore,
+    canonical_id: &str,
+    claim_token: &str,
+    snapshot_updated_at_raw: &str,
+) -> ReinResult<bool> {
+    let row: Option<(Option<String>, String, String)> = store
+        .conn()
+        .query_row(
+            "SELECT in_progress_resummerize_at, updated_at, status \
+               FROM memories WHERE id = ?1",
+            rusqlite::params![canonical_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((in_progress_at, updated_at, status)) = row else {
+        return Ok(false);
+    };
+    let still_claimed = in_progress_at.as_deref() == Some(claim_token);
+    let snapshot_matches = updated_at == snapshot_updated_at_raw;
+    let live_status = status == "active" || status == "updated";
+    Ok(still_claimed && snapshot_matches && live_status)
+}
+
+/// Agent D Q7: count episodes whose `memory_ids` contain this canonical.
+/// Episodes persist only memory IDs + concept IDs; there's no content
+/// snapshot. After resummerize, replaying an episode dereferences the ID
+/// to the CURRENT canonical content, not the content captured at session
+/// time. Full replay fidelity requires a content-hash schema addition to
+/// episodes (v0.24). For now this counter is emitted via `tracing::warn`
+/// from the resummerize success path so operators have a drift signal.
+fn count_episodes_referencing_canonical(
+    store: &SqliteStore,
+    canonical_id: &str,
+) -> ReinResult<u64> {
+    // `episodes.memory_ids` is a JSON array column. Using `json_each`
+    // with `value = ?1` avoids the LIKE escape pitfalls of
+    // `%"<id>"%`-style probes (double-quote wasn't escaped in the pre-fix
+    // implementation; a canonical_id containing `"` would have been
+    // stored as `\"` in the array and missed by the probe). Post-fix
+    // audit L-1.
+    let count: i64 = store.conn().query_row(
+        "SELECT COUNT(DISTINCT e.id) \
+           FROM episodes e, json_each(e.memory_ids) \
+           WHERE json_each.value = ?1",
+        rusqlite::params![canonical_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+/// Agent D Q6: count KG concepts whose `source_memory_ids` references
+/// this canonical. The column stores a JSON array of memory IDs, so we
+/// use the same LIKE-with-quoted-id pattern established by
+/// `store/knowledge.rs` when it needs to find concept back-references.
+///
+/// Currently the count is emitted via a `tracing::warn` so operators
+/// have a signal that concept definitions may now be stale relative to
+/// the rewritten canonical. Full automatic re-extraction is v0.24 work
+/// — it needs an LLM call, a refresh queue, and shared quota
+/// coordination with the other LLM features.
+fn mark_concepts_needing_refresh_for_canonical(
+    store: &SqliteStore,
+    canonical_id: &str,
+) -> ReinResult<u64> {
+    // `concepts.source_memory_ids` is a JSON array column. Using
+    // `json_each` with `value = ?1` avoids the LIKE escape pitfalls of
+    // `%"<id>"%`-style probes (double-quote wasn't escaped in the
+    // pre-fix implementation; an id containing `"` would have been
+    // stored as `\"` in the array and missed by the probe). Post-fix
+    // audit L-1.
+    let count: i64 = store.conn().query_row(
+        "SELECT COUNT(DISTINCT c.id) \
+           FROM concepts c, json_each(c.source_memory_ids) \
+           WHERE json_each.value = ?1",
+        rusqlite::params![canonical_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
 }
 
 /// Clear the `needs_resummerize` flag and release any claim on the row.
@@ -959,14 +1346,19 @@ fn record_exhaustion(
 
 // ── LLM wiring ───────────────────────────────────────────────────────────────
 
-fn call_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<String> {
+/// `pub` so the `rein-eval` binary (a separate crate target) can drive the
+/// same async-bridging pattern used in production. Drift here = eval running
+/// under different runtime semantics than prod (e.g. blocking vs.
+/// block_in_place), which would invalidate latency / failure-mode
+/// comparisons. **Not a stable public API.**
+pub fn call_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<String> {
     // Mirrors `ops/dedup.rs:452` / `consolidation.rs:643` pattern so this op
     // runs correctly whether invoked from inside an existing tokio runtime
     // (MCP/REST) or a fresh sync context (CLI).
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
-                extractor.raw_with_prompt(SYSTEM_PROMPT, prompt).await
+                extractor.raw_text_with_prompt(SYSTEM_PROMPT, prompt).await
             })
         })
     } else {
@@ -975,7 +1367,7 @@ fn call_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<String> 
             .build()
             .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
         rt.block_on(async {
-            extractor.raw_with_prompt(SYSTEM_PROMPT, prompt).await
+            extractor.raw_text_with_prompt(SYSTEM_PROMPT, prompt).await
         })
     }
 }
@@ -992,7 +1384,12 @@ fn extractor_backend_tag(extractor: &ExtractorKind) -> Option<String> {
     )
 }
 
-fn build_prompt(input: &ContractInput) -> String {
+/// `pub` so the `rein-eval` binary (a separate crate target) can build the
+/// prompt the same way production does. Sharing this function (rather than
+/// duplicating it in the eval bin) is the load-bearing piece that makes
+/// baseline and treatment scorecards comparable. **Not a stable public
+/// API.**
+pub fn build_prompt(input: &ContractInput) -> String {
     let mut buf = String::with_capacity(
         input.current_canonical.len()
             + input.evidence.iter().map(|e| e.content.len()).sum::<usize>()

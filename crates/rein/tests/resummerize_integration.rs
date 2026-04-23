@@ -381,32 +381,46 @@ fn mock_llm_error_leaves_canonical_untouched() {
     assert_eq!(audit_statuses(&store, &canonical_id), vec!["llm_error"]);
 }
 
-/// 3-strike exhaustion fuse. After three consecutive non-success runs
+/// 3-strike exhaustion fuse. After three consecutive **contract** failures
 /// against the same canonical, the flag is cleared (so the LLM stops
 /// being hit on a structurally broken case) and one audit row is written
 /// with status=`exhausted`.
+///
+/// Post-fix semantics (Agent A HIGH + Agent D Q14): `llm_error` rows are
+/// treated as transient and do NOT count toward the fuse; only the
+/// deterministic LLM-quality failures (`contract_violation`,
+/// `length_exceeded`) count. See the companion test
+/// `mock_llm_errors_do_not_trip_three_strike_fuse` for that non-counting
+/// path, and the unit test
+/// `store::resummerize_audit::tests::consecutive_failures_fuse_logic`
+/// for the full matrix.
 #[test]
-fn mock_three_strike_fuse_exhausts_after_consecutive_failures() {
+fn mock_three_strike_fuse_exhausts_after_consecutive_contract_failures() {
     let (store, config, canonical_id) =
-        setup_flagged_canonical("canonical body subject to repeated LLM failure");
+        setup_flagged_canonical("canonical body subject to repeated contract failure");
 
-    // Drive three separate run invocations, each picking up a fresh
-    // single-error mock. The 3-strike counter is stored in
-    // `resummarize_runs`, so consecutive llm_error audit rows accumulate
-    // across these three calls.
+    // Drive three separate run invocations, each mocking an LLM response
+    // that will fail the Lossless Compression Contract (empty string fails
+    // `no_new_facts` trivially among other invariants). Each recorded
+    // audit row is `contract_violation`, which DOES count toward the
+    // fuse.
     for attempt in 0..3 {
-        let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_responses(vec![
-            Err(format!("failure #{}", attempt + 1)),
-        ]));
+        let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response(
+            format!("bogus-{attempt}"),
+        ));
         let outcome =
             run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock)
                 .unwrap();
-        assert_eq!(outcome.llm_failed, 1, "attempt {attempt}: should record llm failure");
+        assert_eq!(
+            outcome.contract_failed, 1,
+            "attempt {attempt}: should record contract failure"
+        );
     }
 
-    // Fourth run: count_recent_consecutive_failures sees 3 and the fuse
-    // records exhaustion, clears the flag. The mock is never actually
-    // called on this attempt because the fuse runs before the LLM call.
+    // Fourth run: count_recent_consecutive_failures sees 3 contract
+    // violations and the fuse records exhaustion, clears the flag. The
+    // mock is never actually called on this attempt because the fuse runs
+    // before the LLM call.
     let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_responses(vec![]));
     let outcome =
         run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock).unwrap();
@@ -421,9 +435,50 @@ fn mock_three_strike_fuse_exhausts_after_consecutive_failures() {
     assert_eq!(statuses.len(), 4);
     assert_eq!(
         statuses[..3],
-        ["llm_error".to_string(), "llm_error".to_string(), "llm_error".to_string()]
+        [
+            "contract_violation".to_string(),
+            "contract_violation".to_string(),
+            "contract_violation".to_string()
+        ]
     );
     assert_eq!(statuses[3], "exhausted");
+}
+
+/// Agent A HIGH finding: transient LLM errors (network blip / 429 / 5xx)
+/// must NOT count toward the 3-strike exhaustion fuse — otherwise a
+/// provider outage permanently strands every flagged canonical. Only the
+/// deterministic LLM-quality failure classes (`contract_violation`,
+/// `length_exceeded`) count. Persistent API issues stay operator-visible
+/// via `recent_failure_rate`, which still counts `llm_error`.
+#[test]
+fn mock_llm_errors_do_not_trip_three_strike_fuse() {
+    let (store, config, canonical_id) =
+        setup_flagged_canonical("canonical body subject to LLM outage");
+
+    // Drive five separate run invocations, each raising an LLM error.
+    // Pre-fix behavior: fuse trips after 3 and the flag clears. Post-fix
+    // behavior: none count, flag stays set, canonical stays eligible.
+    for attempt in 0..5 {
+        let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_persistent_error(
+            format!("outage #{}", attempt + 1),
+        ));
+        let outcome =
+            run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock)
+                .unwrap();
+        assert_eq!(outcome.llm_failed, 1, "attempt {attempt}: should record llm failure");
+        assert_eq!(outcome.exhausted, 0, "attempt {attempt}: transient errors must not exhaust");
+    }
+
+    assert_eq!(
+        needs_resummerize_flag(&store, &canonical_id),
+        1,
+        "flag must stay set — transient LLM errors should not strand the row"
+    );
+    let statuses = audit_statuses(&store, &canonical_id);
+    assert_eq!(statuses.len(), 5);
+    for s in &statuses {
+        assert_eq!(s, "llm_error");
+    }
 }
 
 /// When a single `canonical_id` is targeted but the row is ineligible
@@ -1129,6 +1184,97 @@ fn rfc3339_offset_variant_updated_at_does_not_spuriously_claim_lost() {
 
     // Canonical actually rewritten.
     assert_eq!(store.get(&canonical_id).unwrap().content, "compressed canonical body");
+}
+
+/// Codex post-fix audit H-1: `check_claim_still_held` must return false
+/// when (a) the claim token no longer matches, (b) the snapshot
+/// `updated_at` has drifted, or (c) the row has been demoted to a
+/// non-live status. Ensures the length-check and contract-check paths in
+/// `run_resummerize_inner` don't classify a concurrent-MergeInto race as
+/// a countable `LengthExceeded` / `ContractViolation`.
+#[test]
+fn check_claim_still_held_detects_all_three_drift_cases() {
+    use rein::ops::resummerize::test_hooks::{
+        check_claim_still_held_for_test, claim_for_test,
+    };
+
+    let (store, _config, canonical_id) = setup_flagged_canonical("body");
+    let token = claim_for_test(&store, &canonical_id)
+        .unwrap()
+        .expect("fresh flagged row must be claimable");
+    let snapshot_updated_at: String = store
+        .conn()
+        .query_row(
+            "SELECT updated_at FROM memories WHERE id = ?1",
+            rusqlite::params![&canonical_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Happy path — ownership held, snapshot matches, status live.
+    assert!(
+        check_claim_still_held_for_test(
+            &store,
+            &canonical_id,
+            &token,
+            &snapshot_updated_at
+        )
+        .unwrap(),
+        "unchanged row must report ownership still held"
+    );
+
+    // (a) Claim token mismatch — simulate a peer worker reclaiming.
+    assert!(
+        !check_claim_still_held_for_test(
+            &store,
+            &canonical_id,
+            "some-other-token",
+            &snapshot_updated_at
+        )
+        .unwrap(),
+        "token mismatch must report ownership lost"
+    );
+
+    // (b) Snapshot updated_at mismatch — simulate a concurrent MergeInto
+    // bumping the row's updated_at while our worker was mid-LLM-call.
+    store
+        .conn()
+        .execute(
+            "UPDATE memories SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params!["2027-01-01T00:00:00Z", &canonical_id],
+        )
+        .unwrap();
+    assert!(
+        !check_claim_still_held_for_test(
+            &store,
+            &canonical_id,
+            &token,
+            &snapshot_updated_at
+        )
+        .unwrap(),
+        "updated_at drift must report ownership lost"
+    );
+
+    // (c) Status demoted to non-live — simulate `cleanup` marking the row
+    // deprecated while we held the claim. Reset updated_at first so (b)
+    // isn't also tripping the check.
+    store
+        .conn()
+        .execute(
+            "UPDATE memories SET updated_at = ?1, status = 'deprecated' WHERE id = ?2",
+            rusqlite::params![&snapshot_updated_at, &canonical_id],
+        )
+        .unwrap();
+    assert!(
+        !check_claim_still_held_for_test(
+            &store,
+            &canonical_id,
+            &token,
+            &snapshot_updated_at
+        )
+        .unwrap(),
+        "non-live status must report ownership lost"
+    );
 }
 
 /// Codex round-2 HIGH regression guard: if a stale worker returns from

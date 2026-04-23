@@ -44,6 +44,15 @@ pub enum ResummerizeRunStatus {
     ContractViolation,
     LengthExceeded,
     Exhausted,
+    /// Worker completed the LLM call but the 5-way CAS in `apply_resummerize`
+    /// rejected its commit because a peer worker (or a concurrent `MergeInto`)
+    /// mutated the row in the meantime. The LLM spend is sunk but the
+    /// canonical is safe. Prior versions `DELETE`d the audit row on this
+    /// path, which discarded the cost-observability trail and, if the
+    /// delete failed, left the placeholder `llm_error` row inflating the
+    /// 3-strike counter. Agent D architecture finding Q2/Q15 (v0.23.0
+    /// post-ship review).
+    ClaimLost,
 }
 
 impl ResummerizeRunStatus {
@@ -54,6 +63,7 @@ impl ResummerizeRunStatus {
             Self::ContractViolation => "contract_violation",
             Self::LengthExceeded => "length_exceeded",
             Self::Exhausted => "exhausted",
+            Self::ClaimLost => "claim_lost",
         }
     }
 
@@ -64,6 +74,7 @@ impl ResummerizeRunStatus {
             "contract_violation" => Some(Self::ContractViolation),
             "length_exceeded" => Some(Self::LengthExceeded),
             "exhausted" => Some(Self::Exhausted),
+            "claim_lost" => Some(Self::ClaimLost),
             _ => None,
         }
     }
@@ -231,6 +242,37 @@ pub fn count_recent_consecutive_failures(
     canonical_id: &str,
     max: usize,
 ) -> rusqlite::Result<usize> {
+    // Agent A HIGH + Agent D Q14 fixes (post-v0.23.0):
+    //
+    //   (a) `llm_error` is treated as **transient** and does NOT count
+    //       toward the fuse. A network blip / 429 / 5xx is not evidence
+    //       that the LLM structurally can't satisfy this case, and
+    //       counting it permanently strands canonicals when the API has a
+    //       bad hour. A persistent API issue is instead operator-visible
+    //       via `rein doctor`'s `recent_failure_rate`, which DOES count
+    //       `llm_error` toward the rate metric so the signal isn't lost.
+    //
+    //   (b) `claim_lost` is a concurrent-write collision, not a resummerize
+    //       failure; skipped entirely.
+    //
+    //   (c) `exhausted` marks the end of a prior generation. Prior versions
+    //       treated exhausted + 3 failures as 4 strikes; after the fuse
+    //       cleared the flag and `MergeInto` re-set it, the counter still
+    //       saw those old rows and tripped the fuse on the very next
+    //       attempt. We now BREAK on `exhausted` so the current epoch
+    //       starts clean. Covered by the regression test below.
+    //
+    //   (d) `success` breaks (unchanged — marks a successful run; any
+    //       failures before that are from an even older epoch).
+    //
+    //   (e) `contract_violation` and `length_exceeded` are the only two
+    //       statuses that count toward the streak. Both are deterministic
+    //       LLM-quality signals — "model structurally can't satisfy this
+    //       case" — which is exactly what the fuse is for.
+    //
+    // Scan more rows than `max` because non-counting statuses (llm_error,
+    // claim_lost) should be skipped rather than tripping the fuse.
+    let scan_limit = (max * 4).max(32);
     let mut stmt = conn.prepare(
         "SELECT status FROM resummerize_runs
           WHERE canonical_id = ?1
@@ -239,16 +281,24 @@ pub fn count_recent_consecutive_failures(
           LIMIT ?2",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![canonical_id, max as i64],
+        rusqlite::params![canonical_id, scan_limit as i64],
         |row| row.get::<_, String>(0),
     )?;
     let mut consecutive = 0usize;
     for r in rows {
         let status = r?;
-        if status == "success" {
-            break;
+        match status.as_str() {
+            "success" | "exhausted" => break,
+            "llm_error" | "claim_lost" => continue, // transient / race — skip
+            // contract_violation, length_exceeded, or any unknown new
+            // status — conservative default is "counts toward fuse".
+            _ => {
+                consecutive += 1;
+                if consecutive >= max {
+                    break;
+                }
+            }
         }
-        consecutive += 1;
     }
     Ok(consecutive)
 }
@@ -274,10 +324,14 @@ pub fn count_needs_resummerize(conn: &Connection) -> rusqlite::Result<u64> {
 /// Recent failure rate of resummerize runs within `window`, computed over
 /// finished runs only (i.e. `finished_at` is non-null).
 ///
-/// A "failure" is any terminal status other than `success` — `llm_error`,
-/// `contract_violation`, `length_exceeded`, or `exhausted`. Returns 0.0 when
-/// there are no finished runs in the window (so doctor doesn't page on an
-/// empty log).
+/// A "failure" is `llm_error`, `contract_violation`, `length_exceeded`, or
+/// `exhausted`. `claim_lost` is **excluded** — it indicates a successful LLM
+/// call that lost the 5-way CAS race to a peer worker, which is the system
+/// behaving as designed (concurrency-safe overwrite prevention). A high
+/// `claim_lost` rate is observability-worthy as a contention signal but it
+/// shouldn't page the operator as a quality regression. Returns 0.0 when
+/// there are no relevant finished runs in the window (so doctor doesn't
+/// page on an empty log).
 ///
 /// The shorter name `recent_failure_rate` mirrors the doctor call site at
 /// `doctor.rs::check_resummerize`; within the `resummerize_audit::` module
@@ -285,9 +339,13 @@ pub fn count_needs_resummerize(conn: &Connection) -> rusqlite::Result<u64> {
 /// `recent_resummerize_failure_rate` originally specified.
 pub fn recent_failure_rate(conn: &Connection, window: Duration) -> rusqlite::Result<f64> {
     let cutoff = (Utc::now() - window).to_rfc3339();
+    // Both numerator and denominator exclude `claim_lost` so its presence
+    // in the audit table doesn't shift the rate either direction.
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM resummerize_runs
-          WHERE finished_at IS NOT NULL AND finished_at >= ?1",
+          WHERE finished_at IS NOT NULL
+            AND finished_at >= ?1
+            AND status != 'claim_lost'",
         rusqlite::params![cutoff],
         |row| row.get(0),
     )?;
@@ -298,21 +356,63 @@ pub fn recent_failure_rate(conn: &Connection, window: Duration) -> rusqlite::Res
         "SELECT COUNT(*) FROM resummerize_runs
           WHERE finished_at IS NOT NULL
             AND finished_at >= ?1
-            AND status != 'success'",
+            AND status NOT IN ('success', 'claim_lost')",
         rusqlite::params![cutoff],
         |row| row.get(0),
     )?;
     Ok(failures as f64 / total as f64)
 }
 
+/// Proportion of finished resummerize runs within `window` that ended as
+/// `claim_lost`. Separate from `recent_failure_rate` which filters
+/// `claim_lost` OUT (quality metric). This metric is the contention
+/// signal: a high `recent_claim_lost_rate` means workers are racing on
+/// the same canonicals, burning LLM budget without making progress.
+///
+/// Post-audit round-2 MED-2 fix. `claim_lost` is not a quality failure,
+/// but without a dedicated metric it disappears from operator visibility
+/// entirely once M-3 stopped folding it into `recent_failure_rate`.
+/// Returns 0.0 when no runs in the window (doctor won't page on empty).
+pub fn recent_claim_lost_rate(conn: &Connection, window: Duration) -> rusqlite::Result<f64> {
+    let cutoff = (Utc::now() - window).to_rfc3339();
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resummerize_runs
+          WHERE finished_at IS NOT NULL AND finished_at >= ?1",
+        rusqlite::params![cutoff],
+        |row| row.get(0),
+    )?;
+    if total == 0 {
+        return Ok(0.0);
+    }
+    let claim_lost: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resummerize_runs
+          WHERE finished_at IS NOT NULL
+            AND finished_at >= ?1
+            AND status = 'claim_lost'",
+        rusqlite::params![cutoff],
+        |row| row.get(0),
+    )?;
+    Ok(claim_lost as f64 / total as f64)
+}
+
 /// Number of finished resummerize runs within `window`. Used by doctor to
 /// gate "failure rate" warnings on a minimum sample size — a single failure
 /// out of one run shouldn't page.
+///
+/// Post-fix audit M-3: excludes `claim_lost` so the gate matches the
+/// population used by `recent_failure_rate`. Without this alignment, a
+/// burst of concurrency races (`claim_lost`) would inflate the sample
+/// count past the `>= 5` threshold while simultaneously shrinking the
+/// failure-rate denominator to just the real quality failures — letting
+/// a single `contract_violation` alongside 4 `claim_lost` races pass
+/// doctor's significance gate as "100% failure rate over 5 runs."
 pub fn recent_run_count(conn: &Connection, window: Duration) -> rusqlite::Result<u64> {
     let cutoff = (Utc::now() - window).to_rfc3339();
     conn.query_row(
         "SELECT COUNT(*) FROM resummerize_runs
-          WHERE finished_at IS NOT NULL AND finished_at >= ?1",
+          WHERE finished_at IS NOT NULL
+            AND finished_at >= ?1
+            AND status != 'claim_lost'",
         rusqlite::params![cutoff],
         |row| row.get::<_, i64>(0),
     )
@@ -670,43 +770,81 @@ mod tests {
             0
         );
 
-        // Sequence: success, llm_error, llm_error — counting back from
-        // newest hits two failures before the success → 2.
+        // Post-fix semantics (Agent A HIGH + Agent D Q14):
+        //
+        // Sequence: success, llm_error, llm_error — llm_error is treated as
+        // **transient** (network blip / 429 / 5xx, not LLM-quality signal)
+        // and does NOT count toward the fuse. So 0, not 2.
         push(ResummerizeRunStatus::Success);
         push(ResummerizeRunStatus::LlmError);
         push(ResummerizeRunStatus::LlmError);
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
-            2
+            0,
+            "llm_error must not count toward fuse — transient errors should \
+             not strand canonicals; persistent API issues are visible via \
+             `recent_failure_rate` instead"
         );
 
-        // Add a third failure (contract_violation). Fuse threshold of 3 now
-        // trips.
+        // Add a contract_violation — that DOES count.
+        push(ResummerizeRunStatus::ContractViolation);
+        assert_eq!(
+            count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
+            1
+        );
+
+        // Two more contract violations to trip the fuse.
+        push(ResummerizeRunStatus::ContractViolation);
         push(ResummerizeRunStatus::ContractViolation);
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
             3
         );
 
-        // A success resets the count (walking back stops at the success).
-        push(ResummerizeRunStatus::Success);
+        // Now simulate the production path: record_exhaustion fires and
+        // inserts an `exhausted` audit row + clears the flag. After
+        // MergeInto re-sets needs_resummerize=1, the next worker should see
+        // a CLEAN streak (epoch reset). Prior buggy behavior: streak still
+        // counted those 3 contract violations → fuse trips immediately.
+        push(ResummerizeRunStatus::Exhausted);
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
-            0
+            0,
+            "exhausted marker must terminate the prior epoch — Agent D Q14"
         );
 
-        // Then a single failure after success → 1.
-        push(ResummerizeRunStatus::LlmError);
+        // After the epoch reset, a single contract failure → streak=1.
+        push(ResummerizeRunStatus::ContractViolation);
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
             1
         );
 
-        // Exhausted counts as a failure (it's terminal non-success).
-        push(ResummerizeRunStatus::Exhausted);
+        // claim_lost is a concurrency race, not a quality failure — must
+        // not count.
+        push(ResummerizeRunStatus::ClaimLost);
+        push(ResummerizeRunStatus::ClaimLost);
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
-            2
+            1,
+            "claim_lost must not count toward fuse — it indicates concurrency \
+             loss, not LLM quality"
+        );
+
+        // Add length_exceeded → counts.
+        push(ResummerizeRunStatus::LengthExceeded);
+        assert_eq!(
+            count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
+            2,
+            "length_exceeded must count — it's a deterministic LLM quality \
+             signal, same class as contract_violation"
+        );
+
+        // A success after the partial streak still resets.
+        push(ResummerizeRunStatus::Success);
+        assert_eq!(
+            count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
+            0
         );
 
         // Unfinished rows don't trip the fuse even if they'd look like
@@ -719,7 +857,7 @@ mod tests {
             output_chars: None,
             output_hash: None,
             target_bytes: 64,
-            status: ResummerizeRunStatus::LlmError,
+            status: ResummerizeRunStatus::ContractViolation,
             violations: vec![],
             error: None,
             llm_backend: Some("gemini".to_string()),
@@ -729,7 +867,7 @@ mod tests {
         insert_resummerize_run(&conn, &inflight).unwrap();
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-1", 3).unwrap(),
-            2,
+            0,
             "inflight rows must not count toward consecutive failures"
         );
 
@@ -738,6 +876,54 @@ mod tests {
         assert_eq!(
             count_recent_consecutive_failures(&conn, "mem-2", 3).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn recent_failure_rate_excludes_claim_lost() {
+        // Agent D Q2/Q15 fix: `claim_lost` is the system working as designed
+        // (concurrency-safe rejection of a stale CAS), not a quality
+        // failure. The doctor's failure-rate metric must exclude it from
+        // both numerator and denominator so a high contention period
+        // doesn't page the operator with a misleading "resummerize is
+        // failing" alert.
+        let conn = setup_db();
+        insert_memory(&conn, "mem-1", 0);
+        let now = Utc::now();
+        let mk = |status: ResummerizeRunStatus, id: &str| ResummerizeRunRow {
+            id: id.to_string(),
+            canonical_id: "mem-1".to_string(),
+            input_evidence_count: 1,
+            input_canonical_chars: 100,
+            output_chars: Some(80),
+            output_hash: Some("x".to_string()),
+            target_bytes: 128,
+            status,
+            violations: vec![],
+            error: None,
+            llm_backend: Some("gemini".to_string()),
+            created_at: now,
+            finished_at: Some(now),
+        };
+        // 1 success, 1 contract_violation → without any claim_lost: 50%
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::Success, "r1")).unwrap();
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::ContractViolation, "r2")).unwrap();
+        let rate1 = recent_failure_rate(&conn, Duration::seconds(60)).unwrap();
+        assert!((rate1 - 0.5).abs() < 1e-9, "baseline 50%, got {rate1}");
+
+        // Add 8 claim_lost rows. Old behavior would count them as failures
+        // → 9/10 = 90%. New behavior excludes them entirely → still 50%.
+        for i in 0..8 {
+            insert_resummerize_run(
+                &conn,
+                &mk(ResummerizeRunStatus::ClaimLost, &format!("cl-{i}")),
+            )
+            .unwrap();
+        }
+        let rate2 = recent_failure_rate(&conn, Duration::seconds(60)).unwrap();
+        assert!(
+            (rate2 - 0.5).abs() < 1e-9,
+            "claim_lost must not shift the failure rate, got {rate2}"
         );
     }
 
@@ -789,5 +975,109 @@ mod tests {
         assert_eq!(status, "success");
         assert!(error.is_none(), "error must be cleared on success finish");
         assert_eq!(finished_set, 1, "finished_at must be set by finish call");
+    }
+
+    #[test]
+    fn recent_run_count_excludes_claim_lost() {
+        // Post-audit round-2 LOW #7: parallel guard for the
+        // recent_run_count denominator filter. Prior to M-3 this
+        // counter included claim_lost rows; doctor's "≥5 runs to warn"
+        // gate could fire on a single real contract_violation alongside
+        // 4 claim_lost races, producing a misleading "100% failure
+        // rate" page. This test locks the filter alignment so a future
+        // refactor can't silently reintroduce the mismatch.
+        let conn = setup_db();
+        insert_memory(&conn, "mem-rrc", 0);
+        let now = Utc::now();
+        let mk = |status: ResummerizeRunStatus, id: &str| ResummerizeRunRow {
+            id: id.to_string(),
+            canonical_id: "mem-rrc".to_string(),
+            input_evidence_count: 1,
+            input_canonical_chars: 100,
+            output_chars: Some(80),
+            output_hash: Some("x".to_string()),
+            target_bytes: 128,
+            status,
+            violations: vec![],
+            error: None,
+            llm_backend: Some("gemini".to_string()),
+            created_at: now,
+            finished_at: Some(now),
+        };
+
+        // 2 success, 1 contract_violation → recent_run_count = 3.
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::Success, "r1")).unwrap();
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::Success, "r2")).unwrap();
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::ContractViolation, "r3")).unwrap();
+        assert_eq!(
+            recent_run_count(&conn, Duration::seconds(60)).unwrap(),
+            3,
+            "baseline count"
+        );
+
+        // 5 more claim_lost rows → run_count must stay at 3, NOT jump to 8.
+        for i in 0..5 {
+            insert_resummerize_run(
+                &conn,
+                &mk(ResummerizeRunStatus::ClaimLost, &format!("cl-{i}")),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            recent_run_count(&conn, Duration::seconds(60)).unwrap(),
+            3,
+            "claim_lost rows must be excluded from recent_run_count"
+        );
+    }
+
+    #[test]
+    fn recent_claim_lost_rate_tracks_contention() {
+        // Post-audit round-2 MED-2: separate contention metric for
+        // doctor. `recent_failure_rate` filters claim_lost OUT (quality
+        // metric); `recent_claim_lost_rate` measures the ratio.
+        let conn = setup_db();
+        insert_memory(&conn, "mem-cl", 0);
+        let now = Utc::now();
+        let mk = |status: ResummerizeRunStatus, id: &str| ResummerizeRunRow {
+            id: id.to_string(),
+            canonical_id: "mem-cl".to_string(),
+            input_evidence_count: 1,
+            input_canonical_chars: 100,
+            output_chars: Some(80),
+            output_hash: Some("x".to_string()),
+            target_bytes: 128,
+            status,
+            violations: vec![],
+            error: None,
+            llm_backend: Some("gemini".to_string()),
+            created_at: now,
+            finished_at: Some(now),
+        };
+
+        // Empty → 0.
+        assert_eq!(
+            recent_claim_lost_rate(&conn, Duration::seconds(60)).unwrap(),
+            0.0
+        );
+
+        // 2 success + 2 claim_lost → rate = 0.5.
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::Success, "s1")).unwrap();
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::Success, "s2")).unwrap();
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::ClaimLost, "cl1")).unwrap();
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::ClaimLost, "cl2")).unwrap();
+        let rate = recent_claim_lost_rate(&conn, Duration::seconds(60)).unwrap();
+        assert!(
+            (rate - 0.5).abs() < 1e-9,
+            "expected 0.5 claim_lost rate, got {rate}"
+        );
+
+        // Adding a contract_violation moves the denominator to 5 →
+        // rate = 2/5 = 0.4.
+        insert_resummerize_run(&conn, &mk(ResummerizeRunStatus::ContractViolation, "cv")).unwrap();
+        let rate2 = recent_claim_lost_rate(&conn, Duration::seconds(60)).unwrap();
+        assert!(
+            (rate2 - 2.0 / 5.0).abs() < 1e-9,
+            "expected 0.4 (2/5) after adding a quality failure, got {rate2}"
+        );
     }
 }
