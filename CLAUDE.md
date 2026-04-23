@@ -18,7 +18,7 @@ cargo install --path crates/rein     # install to ~/.cargo/bin/rein
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (**29 MCP tools** as of v0.23.0-rc1, evidence-aware canonical-first memory flow). Key modules:
+rein is a multi-source cross-validated memory MCP server (**29 MCP tools** as of v0.23.0; evidence-aware canonical-first memory flow). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based; `MockExtractor` under `test-support` feature
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop); admission and memory surfaces are cluster/canonical-aware
@@ -77,17 +77,22 @@ Post-fusion multi-feature reranking (canonical support/diversity included in lea
 Extraction postprocess: algorithmic date/preference/knowledge-update detection + LLM prompt rules.
 Automatic prompt injection is disabled. `hook_prompt` remains as a compatibility no-op while memory production flows through record-only proxy + async worker + layered memory surfaces.
 
-## Resummerize (v0.23.0-rc1)
+## Resummerize (v0.23.0 shipped, v0.23.1-candidate in working tree)
 
 LLM-driven canonical recompression replacing v0.21's keep-tail truncation at the 10KB `MergeInto` cap, gated by the 7-invariant Lossless Compression Contract.
 
 - **Feature flag**: `[resummerize].enabled = false` by default; operator must opt in
 - **Trigger**: `MergeInto` cap hit → `needs_resummerize = 1` flag set alongside keep-tail stopgap
-- **Slow-channel op**: `ops/resummerize.rs::run_resummerize` picks flagged rows, atomically claims via `in_progress_resummerize_at` timestamp, reads a consistent snapshot of `(canonical, raw updated_at, evidence)` under `BEGIN DEFERRED`, calls the configured LLM, validates against the Lossless Contract, and applies only if the contract passes AND a 5-way CAS still matches (claim token + snapshot updated_at + live status). On any failure keep-tail remains the effective state
+- **Slow-channel op**: `ops/resummerize.rs::run_resummerize` picks flagged rows, atomically claims via `in_progress_resummerize_at` timestamp, reads a consistent snapshot of `(canonical, raw updated_at, evidence)` under `BEGIN DEFERRED`, calls the configured LLM via `raw_text_with_prompt` (NOT `raw_with_prompt` — see note below), validates against the Lossless Contract, and applies only if the contract passes AND a 5-way CAS still matches (claim token + snapshot updated_at + live status). On any failure keep-tail remains the effective state
+- **LLM-mode discipline (v0.23.1 candidate)**: `ExtractorKind::raw_with_prompt` stays JSON-mode (used by `extract_with_prompt` + `llm_dedup_verdict` whose downstream parsers expect JSON); `raw_text_with_prompt` is prose-mode (used by resummerize + `llm_refine_merged_content`). The v0.23.0 release had both callers on the JSON path, so every resummerize output came back as `{"canonical": "..."}` and the Lossless Contract rejected the JSON-wrapper trigrams on `no_new_facts` — flipping `enabled = true` was a silent no-op. Fixed in v0.23.1 candidate. Pure body-builder helpers (`build_gemini_body` + `build_omlx_body`) let a regression test catch any future JSON-mode leak without a live provider.
+- **Evidence collection (v0.23.1 candidate)**: use `list_all_memory_evidence_oldest_first(canonical_id)` — no LIMIT, `ORDER BY imported_at ASC`. The v0.23.0 path used `list_memory_evidence(id, 1_000)` which silently truncated long histories AND returned DESC despite the prompt claiming "oldest first"; a canonical with >1000 evidence rows could pass the contract while the LLM never saw older facts.
 - **Side-index discipline**: Tantivy refresh + sqlite-vec delete (in-transaction) + `needs_vec_dedup = 1` (triggers adaptive pipeline's re-embed path which also re-inserts into HNSW)
-- **Audit**: `resummarize_runs` table with per-run row (status + violations JSON + output_hash + finished_at)
-- **Safety fuses**: 3-strike exhaustion clears flag after 3 consecutive failures; 5-minute stale-claim timeout for worker-crash recovery
-- **Eval harness**: `cargo run --bin rein-eval -- resummerize {baseline,run,compare}` — McNemar paired non-inferiority test; `baseline` + `compare` work without LLM, `run` errors cleanly when no provider is configured
+- **Audit**: `resummarize_runs` table with per-run row (status + violations JSON + output_hash + finished_at). Status values: `Success` / `LlmError` (transient — doesn't count toward fuse) / `ContractViolation` / `LengthExceeded` / `Exhausted` / `ClaimLost` (v0.23.1 candidate — concurrent-write collision, not a quality failure)
+- **Safety fuses (v0.23.1 candidate refinement)**: 3-strike exhaustion counts only `ContractViolation` + `LengthExceeded` (deterministic LLM-quality signals); `LlmError` and `ClaimLost` are non-counting; `Exhausted` breaks the streak (epoch reset on the next `MergeInto` re-flag). 5-minute stale-claim timeout for worker-crash recovery
+- **Atomic recheck+finish (v0.23.1 candidate)**: `finish_with_ownership_check` wraps ownership recheck + terminal-status write in one `BEGIN IMMEDIATE` so a peer `MergeInto` can't race in between — without this a concurrent write would produce a false-strike `ContractViolation` audit row
+- **Global LLM semaphore (v0.23.1 candidate)**: `acquire_llm_permit()` bounds concurrent Gemini/OMLX calls across resummerize + extract hooks + query expansion + LLM reranker + dedup verdict + merge refinement. Default 8 permits; configurable via `REIN_LLM_CONCURRENCY` env
+- **Eval harness**: `cargo run --bin rein-eval -- resummerize {baseline,run,compare}` — McNemar paired non-inferiority test. v0.23.0-rc1 shipped `run` as a `bail!` stub; v0.23.1 candidate wires it end-to-end. Honors `[resummerize].llm_backend` (not just `[extract].provider`). `HIT_CHECKER_VERSION = 2` constant; `compare` bails on version mismatch. CJK input routes through jieba (v1 was broken — `is_alphanumeric` treated CJK chars as alphanumeric, collapsing every Chinese sentence into a single mega-token)
+- **Doctor (v0.23.1 candidate)**: `check_resummerize` surfaces both `recent_failure_rate` (quality — excludes claim_lost) AND `recent_claim_lost_rate` (contention — isolated). Pool saturation check warns only when `try_get_saturated_count >= 1000` AND last event within the last hour (NTP rollback safe)
 
 ## Adaptive Engine (v0.5.0)
 

@@ -24,7 +24,7 @@
 //!   so sync rusqlite calls never stall the reactor.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OpenFlags};
@@ -61,6 +61,21 @@ struct PoolInner {
     /// effective capacity has shrunk by one.  Surfaced via `PoolMetrics`
     /// for health reporting and post-mortem diagnosis.
     shrunk_count: AtomicUsize,
+    /// Counts non-blocking `try_get` calls that failed because the pool
+    /// was saturated. Recall's 3-channel fanout falls back to a fresh
+    /// `SqliteStore::new` on this path (see `try_get`'s doc comment) —
+    /// which avoids hangs but degrades into per-channel connection churn
+    /// rather than clean backpressure. Sustained nonzero growth here is
+    /// the operator's signal that pool capacity is undersized for the
+    /// workload. Agent D Q10 (post-v0.23.0 architecture audit).
+    try_get_saturated_count: AtomicUsize,
+    /// Epoch-seconds of the most recent `try_get` saturation event. Paired
+    /// with `try_get_saturated_count` in `PoolMetrics` so doctor can warn
+    /// only when saturation is RECENT (within the last hour) rather than
+    /// on the lifetime-monotonic count alone — a bursty load test that
+    /// crosses 1000 saturation events once would otherwise leave doctor
+    /// permanently warning until process restart. Post-fix audit L-2.
+    last_saturation_at: AtomicI64,
 }
 
 #[derive(Clone)]
@@ -86,6 +101,8 @@ impl ConnPool {
                 free: Mutex::new(conns),
                 permits: Arc::new(Semaphore::new(size)),
                 shrunk_count: AtomicUsize::new(0),
+                try_get_saturated_count: AtomicUsize::new(0),
+                last_saturation_at: AtomicI64::new(0),
             }),
         })
     }
@@ -134,7 +151,27 @@ impl ConnPool {
     /// v2.1 spec I1 "pool checkout does not degrade recall semantics"
     /// invariant under load.
     pub fn try_get(&self) -> Option<PoolGuard> {
-        let permit = self.inner.permits.clone().try_acquire_owned().ok()?;
+        let permit = match self.inner.permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // Saturation observability — the caller will fall back to a
+                // fresh `SqliteStore::new`. Operators see sustained growth
+                // here via `rein doctor` / `/api/health` and know to bump
+                // pool size. Agent D Q10. Also stamp `last_saturation_at`
+                // so doctor can warn only when saturation is RECENT
+                // rather than when a lifetime-monotonic counter has
+                // crossed some threshold at any point in process history
+                // (post-fix audit L-2).
+                self.inner
+                    .try_get_saturated_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let now_s = chrono::Utc::now().timestamp();
+                self.inner
+                    .last_saturation_at
+                    .store(now_s, Ordering::Relaxed);
+                return None;
+            }
+        };
         let conn = self
             .inner
             .free
@@ -168,12 +205,19 @@ impl ConnPool {
             .len();
         let available_permits = self.inner.permits.available_permits();
         let shrunk_count = self.inner.shrunk_count.load(Ordering::Relaxed);
+        let try_get_saturated_count = self
+            .inner
+            .try_get_saturated_count
+            .load(Ordering::Relaxed);
+        let last_saturation_at = self.inner.last_saturation_at.load(Ordering::Relaxed);
         PoolMetrics {
             size: self.inner.size,
             idle,
             in_use: self.inner.size - idle,
             available_permits,
             shrunk_count,
+            try_get_saturated_count,
+            last_saturation_at,
         }
     }
 }
@@ -194,6 +238,22 @@ pub struct PoolMetrics {
     /// open failed"`.  The value is monotonic across a single process
     /// lifetime; it resets on restart.
     pub shrunk_count: usize,
+    /// Number of times `try_get` failed because the pool was saturated.
+    /// The caller (typically the recall 3-channel fanout) falls back to a
+    /// fresh `SqliteStore::new` on this path — correctness is preserved
+    /// but operators see sustained growth here when pool size is
+    /// undersized for concurrent recall load. Monotonic across process
+    /// lifetime; resets on restart. Agent D Q10.
+    #[serde(default)]
+    pub try_get_saturated_count: usize,
+    /// Epoch-seconds of the most recent saturation event, or `0` if none
+    /// have occurred this process lifetime. Paired with
+    /// `try_get_saturated_count` in doctor's warning gate so a bursty
+    /// load test that spiked the count hours ago doesn't permanently
+    /// trip the warning — doctor checks "recent AND over threshold"
+    /// rather than "lifetime count over threshold." Post-fix audit L-2.
+    #[serde(default)]
+    pub last_saturation_at: i64,
 }
 
 /// A borrowed connection. Drops back into the pool on `Drop` (fallback if

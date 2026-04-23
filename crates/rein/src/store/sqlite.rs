@@ -457,6 +457,33 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Full evidence history for a canonical, ordered oldest-first. No
+    /// LIMIT — the caller (e.g. `ops/resummerize.rs`) needs every row so the
+    /// Lossless Compression Contract's `no_new_facts` check sees the entire
+    /// input corpus and `build_prompt` renders evidence in chronological
+    /// order. The v0.23.0-rc1 bug was that resummerize used
+    /// `list_memory_evidence(id, 1_000)`, which silently truncated long
+    /// histories and returned them newest-first despite the prompt text
+    /// claiming "oldest first — newer merges appear later".
+    pub fn list_all_memory_evidence_oldest_first(
+        &self,
+        canonical_id: &str,
+    ) -> ReinResult<Vec<MemoryEvidence>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM memory_evidence WHERE canonical_id = ?1 ORDER BY imported_at ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![canonical_id], |row| {
+            row_to_memory_evidence(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn record_dedup_decision(&self, decision: DedupDecision) -> ReinResult<String> {
         let id = if decision.id.is_empty() {
             ulid::Ulid::new().to_string()
@@ -3585,5 +3612,67 @@ enabled = true
             "newest merged fact must survive the cap (keep-tail); \
              if this asserts, the truncation reverted to keep-head"
         );
+    }
+
+    #[test]
+    fn list_all_memory_evidence_oldest_first_returns_full_history_ordered() {
+        // Guards Agent A adversarial finding A-2: resummerize was calling
+        // list_memory_evidence(id, 1_000) which silently truncated and
+        // returned newest-first. The new method must return every row and
+        // order by imported_at ASC so `build_prompt`'s "oldest first"
+        // promise matches reality.
+        let store = SqliteStore::in_memory().unwrap();
+        let canonical = test_memory_with_content(
+            "history",
+            "evidence-history",
+            "seed",
+            Importance::Medium,
+        );
+        let canonical_id = store.store(canonical).unwrap();
+
+        // Insert 5 evidence rows with explicit monotonically-increasing
+        // imported_at (not just now() — the sort is strictly timestamped).
+        let base = Utc::now();
+        for i in 0..5 {
+            let ev = MemoryEvidence {
+                id: String::new(),
+                canonical_id: canonical_id.clone(),
+                memory_id: Some(format!("src-{i}")),
+                source_topic: "history".to_string(),
+                summary: format!("summary-{i}"),
+                content: format!("fact-{i}"),
+                keywords: vec![],
+                source: Source::Manual,
+                created_at: base + chrono::Duration::seconds(i as i64),
+                imported_at: base + chrono::Duration::seconds(i as i64),
+            };
+            store.add_memory_evidence(ev).unwrap();
+        }
+
+        let all = store
+            .list_all_memory_evidence_oldest_first(&canonical_id)
+            .unwrap();
+        // store() may insert an initial seed evidence row representing the
+        // canonical's own first content; that row's imported_at is at or
+        // before our explicit insertions, so it (if present) appears first.
+        assert!(
+            all.len() >= 5,
+            "no silent truncation: expected ≥5 explicit rows, got {}",
+            all.len()
+        );
+        // Filter to only our explicit fact-{i} rows for ordering check.
+        let facts: Vec<&str> = all
+            .iter()
+            .filter(|e| e.content.starts_with("fact-"))
+            .map(|e| e.content.as_str())
+            .collect();
+        assert_eq!(facts.len(), 5, "all 5 explicit rows must be present");
+        for (i, content) in facts.iter().enumerate() {
+            assert_eq!(
+                *content,
+                format!("fact-{i}"),
+                "explicit rows must be oldest-first by imported_at ASC"
+            );
+        }
     }
 }
