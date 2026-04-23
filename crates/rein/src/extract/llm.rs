@@ -4,7 +4,58 @@ use crate::types::{DedupRelation, Memory};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+// ---------------------------------------------------------------------------
+// Global LLM-call semaphore (Agent D Q9 coordination fix)
+//
+// Across resummerize, extract hooks, query expansion, LLM reranker, dedup
+// verdict, and async merge refinement, every Gemini/OMLX call goes through
+// `reqwest::Client::post` against the same operator-configured API key with
+// no per-feature quota coordination. Under concurrent load (e.g. a recall
+// triggers expansion + rerank while a Stop hook fires extract + resummerize
+// worker picks up the next batch), we'd simultaneously hit the provider
+// with N calls and collect 429s that no single caller knows to back off
+// from.
+//
+// The global semaphore here is the minimal coordination surface: every LLM
+// HTTP call acquires a permit before `.send().await`, releases on drop. It
+// does NOT implement retry or bucket refill — just concurrency bounding.
+// A 429 response still propagates as an error to the caller, who decides
+// whether to retry.
+//
+// Default permit count is 8 — rough match for Gemini Flash Lite's typical
+// concurrency ceiling under the Google free tier. Operators on paid tiers
+// or local OMLX can raise it via `REIN_LLM_CONCURRENCY`. Setting to `0`
+// effectively disables all LLM calls (not recommended; use
+// `provider = "none"` in config instead for that).
+// ---------------------------------------------------------------------------
+
+fn llm_global_semaphore() -> std::sync::Arc<Semaphore> {
+    static SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("REIN_LLM_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8);
+        std::sync::Arc::new(Semaphore::new(n))
+    })
+    .clone()
+}
+
+/// Acquire a permit from the global LLM semaphore. Callers hold the returned
+/// `OwnedSemaphorePermit` across their HTTP call; dropping it releases
+/// capacity back to the pool. Never errors in practice — the static
+/// semaphore is never closed — but returns `ReinResult` for future-proofing.
+async fn acquire_llm_permit() -> ReinResult<OwnedSemaphorePermit> {
+    llm_global_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| ReinError::Config(format!("LLM semaphore closed: {e}")))
+}
 
 const EXTRACT_SYSTEM_PROMPT: &str = r#"You are a memory extraction system. Analyze the following text from a coding session and extract facts worth remembering long-term.
 
@@ -242,6 +293,114 @@ Rules:
 - Return {"memories":[],"concepts":[],"links":[],"episode":null} if nothing worth extracting"#;
 
 // ---------------------------------------------------------------------------
+// Request-body builders (pure — unit-testable without a live HTTP call)
+//
+// These were factored out of `GeminiExtractor::call_api_inner` and
+// `OmlxExtractor::call_with_mode` so a provider-shaped regression test can
+// assert that the prose-mode call paths never ship `responseMimeType` /
+// `response_format: json_object`. The v0.23.0-rc1 bug was that both
+// prose-expecting callers (resummerize, merge refinement) went through
+// JSON-mode paths, so the backend wrapped their output in
+// `{"canonical": "..."}` envelopes — fatal for the Lossless Compression
+// Contract (`no_new_facts` rejects JSON-wrapper trigrams). Covered by a
+// pure test in the `body_tests` module below.
+// ---------------------------------------------------------------------------
+
+fn build_gemini_body(system_prompt: &str, text: &str, force_json_mime: bool) -> Value {
+    let mut generation_config = json!({"temperature": 0.1});
+    if force_json_mime {
+        generation_config["responseMimeType"] = json!("application/json");
+    }
+    json!({
+        "contents": [{
+            "parts": [{"text": format!("{}\n\n---\n\n{}", system_prompt, text)}]
+        }],
+        "generationConfig": generation_config
+    })
+}
+
+fn build_omlx_body(
+    model: &str,
+    prefixed_system_prompt: &str,
+    user_text: &str,
+    use_json_mode: bool,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prefixed_system_prompt},
+            {"role": "user", "content": user_text}
+        ],
+        "temperature": 0.1
+    });
+    if use_json_mode {
+        body["response_format"] = json!({"type": "json_object"});
+    }
+    body
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    #[test]
+    fn gemini_text_mode_omits_response_mime_type() {
+        let body = build_gemini_body("sys", "user", false);
+        assert!(
+            body["generationConfig"].get("responseMimeType").is_none(),
+            "prose-mode Gemini bodies must never force JSON output — the v0.23 \
+             resummerize bug was that this key leaked into every call"
+        );
+        assert_eq!(body["generationConfig"]["temperature"], 0.1);
+    }
+
+    #[test]
+    fn gemini_json_mode_still_forces_response_mime_type() {
+        let body = build_gemini_body("sys", "user", true);
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn gemini_body_concatenates_system_prompt_and_text() {
+        let body = build_gemini_body("SYSTEM", "USER", false);
+        let combined = body["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(combined.contains("SYSTEM"));
+        assert!(combined.contains("USER"));
+        assert!(combined.contains("\n\n---\n\n"));
+    }
+
+    #[test]
+    fn omlx_no_json_mode_omits_response_format() {
+        let body = build_omlx_body("llama-3", "sys", "user", false);
+        assert!(
+            body.get("response_format").is_none(),
+            "prose-mode OMLX bodies must never force response_format=json_object"
+        );
+    }
+
+    #[test]
+    fn omlx_json_mode_sets_response_format() {
+        let body = build_omlx_body("llama-3", "sys", "user", true);
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn omlx_body_has_two_messages_system_then_user() {
+        let body = build_omlx_body("m", "SYSTEM", "USER", false);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "SYSTEM");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "USER");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gemini extractor (Google generateContent API)
 // ---------------------------------------------------------------------------
 
@@ -266,22 +425,44 @@ impl GeminiExtractor {
         }
     }
 
-    /// Common Gemini API call: send prompt + text, return raw content text from response.
+    /// Common Gemini API call: send prompt + text, return raw content text
+    /// from response. Forces JSON response mime — for `extract` /
+    /// `extract_full` paths whose downstream parsers want valid JSON.
     async fn call_api(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
+        self.call_api_inner(system_prompt, text, true).await
+    }
+
+    /// Same wire format as `call_api` but with `responseMimeType` omitted,
+    /// so Gemini returns prose-mode text instead of wrapping the answer in
+    /// a JSON envelope. Used by `raw_with_prompt` for callers like the v0.23
+    /// resummerize op whose system prompt explicitly instructs the model to
+    /// return raw text. Without this, every resummerize output came back as
+    /// `{"canonical": "..."}`, tripped the Lossless Compression Contract's
+    /// `no_new_facts` invariant on the JSON wrapper trigrams, and got
+    /// silently rejected — turning the feature into a no-op despite
+    /// `[resummerize].enabled = true`.
+    async fn call_api_text(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
+        self.call_api_inner(system_prompt, text, false).await
+    }
+
+    async fn call_api_inner(
+        &self,
+        system_prompt: &str,
+        text: &str,
+        force_json_mime: bool,
+    ) -> ReinResult<String> {
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.endpoint, self.model
         );
-        let body = json!({
-            "contents": [{
-                "parts": [{"text": format!("{}\n\n---\n\n{}", system_prompt, text)}]
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.1
-            }
-        });
+        let body = build_gemini_body(system_prompt, text, force_json_mime);
 
+        // Acquire a global LLM permit before the HTTP call (Agent D Q9).
+        // Permit is released when `_permit` drops at end of scope, which
+        // is AFTER the response body is fully read (important — a 429
+        // from one request should not release capacity early and allow a
+        // second caller to immediately retry into the same rate limit).
+        let _permit = acquire_llm_permit().await?;
         let resp = self
             .client
             .post(&url)
@@ -365,6 +546,30 @@ impl OmlxExtractor {
         text: &str,
         system_prompt: &str,
     ) -> ReinResult<String> {
+        // Default extract path: prefer JSON mode (downstream parsers want
+        // structured output), fall back to no-mode when the model rejects.
+        self.call_with_mode(text, system_prompt, /* prefer_json */ true).await
+    }
+
+    /// Prose-mode variant for callers (resummerize) whose system prompt
+    /// explicitly asks for raw text. Skips the JSON-mode primary attempt
+    /// entirely so the model isn't pushed into wrapping the answer in
+    /// `{"foo": "..."}`. See `GeminiExtractor::call_api_text` for the
+    /// matching reasoning on the Gemini side.
+    async fn call_and_extract_content_text(
+        &self,
+        text: &str,
+        system_prompt: &str,
+    ) -> ReinResult<String> {
+        self.call_with_mode(text, system_prompt, /* prefer_json */ false).await
+    }
+
+    async fn call_with_mode(
+        &self,
+        text: &str,
+        system_prompt: &str,
+        prefer_json: bool,
+    ) -> ReinResult<String> {
         let url = format!("{}/chat/completions", self.endpoint);
         let prefixed_prompt = if self.disable_thinking {
             format!("/no_think\n{}", system_prompt)
@@ -372,41 +577,57 @@ impl OmlxExtractor {
             system_prompt.to_string()
         };
         let make_body = |use_json_mode: bool| {
-            let mut body = json!({
-                "model": &self.model,
-                "messages": [
-                    {"role": "system", "content": &prefixed_prompt},
-                    {"role": "user", "content": text}
-                ],
-                "temperature": 0.1
-            });
-            if use_json_mode {
-                body["response_format"] = json!({"type": "json_object"});
-            }
-            body
+            build_omlx_body(&self.model, &prefixed_prompt, text, use_json_mode)
         };
 
-        // Try with JSON mode first; retry without if the model rejects it
-        let text_body = match self.client.post(&url).json(&make_body(true)).send().await {
-            Ok(resp) if resp.status().is_success() => resp.text().await?,
-            _ => {
-                tracing::info!("OMLX JSON mode failed, retrying without response_format");
-                let resp = self
-                    .client
-                    .post(&url)
-                    .json(&make_body(false))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let body = resp.text().await?;
-                if !status.is_success() {
-                    let truncated: String = body.chars().take(500).collect();
-                    return Err(ReinError::Extract(format!(
-                        "OMLX API returned {}: {truncated}",
-                        status
-                    )));
+        // Acquire a global LLM permit before either HTTP attempt (Agent D
+        // Q9). A single permit covers both the JSON-mode primary and any
+        // no-JSON-mode fallback within this call so the JSON-rejection
+        // retry doesn't race into a released-then-re-acquired permit.
+        let _permit = acquire_llm_permit().await?;
+
+        // Prose callers skip the JSON primary attempt entirely; structured
+        // callers preserve the existing "try JSON, retry without on
+        // rejection" behavior.
+        let text_body = if !prefer_json {
+            let resp = self
+                .client
+                .post(&url)
+                .json(&make_body(false))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                let truncated: String = body.chars().take(500).collect();
+                return Err(ReinError::Extract(format!(
+                    "OMLX API returned {}: {truncated}",
+                    status
+                )));
+            }
+            body
+        } else {
+            match self.client.post(&url).json(&make_body(true)).send().await {
+                Ok(resp) if resp.status().is_success() => resp.text().await?,
+                _ => {
+                    tracing::info!("OMLX JSON mode failed, retrying without response_format");
+                    let resp = self
+                        .client
+                        .post(&url)
+                        .json(&make_body(false))
+                        .send()
+                        .await?;
+                    let status = resp.status();
+                    let body = resp.text().await?;
+                    if !status.is_success() {
+                        let truncated: String = body.chars().take(500).collect();
+                        return Err(ReinError::Extract(format!(
+                            "OMLX API returned {}: {truncated}",
+                            status
+                        )));
+                    }
+                    body
                 }
-                body
             }
         };
 
@@ -437,10 +658,44 @@ pub enum ExtractorKind {
 }
 
 impl ExtractorKind {
+    /// JSON-mode entry point. Forces `responseMimeType: application/json`
+    /// on Gemini and `response_format: json_object` on OMLX so downstream
+    /// parsers (`parse_llm_json`, `parse_dedup_verdict`,
+    /// `parse_extraction_result`) receive valid JSON. Callers whose system
+    /// prompt instructs prose output — e.g. resummerize, async post-merge
+    /// synthesis — must use `raw_text_with_prompt` instead; otherwise the
+    /// backend wraps their output in `{"...": "..."}` envelopes that look
+    /// like contract / downstream violations.
     pub async fn raw_with_prompt(&self, system_prompt: &str, text: &str) -> ReinResult<String> {
         match self {
             Self::Gemini(e) => e.call_api(system_prompt, text).await,
             Self::Omlx(e) => e.call_and_extract_content(text, system_prompt).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.respond(system_prompt, text).await,
+        }
+    }
+
+    /// Prose-mode entry point. Omits `responseMimeType` / `response_format`
+    /// so the model is free to follow a system prompt that asks for raw
+    /// text (no preamble, no JSON envelope). Used by resummerize and
+    /// `llm_refine_merged_content` whose system prompts explicitly say
+    /// "Return only the synthesized text" / "Output only the new canonical
+    /// text". The v0.23.0-rc1 bug here was that the prose-expecting paths
+    /// all routed through JSON-mode `raw_with_prompt`, so backends wrapped
+    /// the answer in `{"canonical": "..."}` — the Lossless Compression
+    /// Contract then rejected the JSON wrapper trigrams on `no_new_facts`
+    /// and silently kept-tail every canonical. The 2026-04-23 seed-30
+    /// eval run caught this (28/30 contract fails universally on
+    /// `no_new_facts`); fixing the routing dropped contract fails to
+    /// 14/30 and surfaced the real paraphrasing-vs-contract signal.
+    pub async fn raw_text_with_prompt(
+        &self,
+        system_prompt: &str,
+        text: &str,
+    ) -> ReinResult<String> {
+        match self {
+            Self::Gemini(e) => e.call_api_text(system_prompt, text).await,
+            Self::Omlx(e) => e.call_and_extract_content_text(text, system_prompt).await,
             #[cfg(feature = "test-support")]
             Self::Mock(e) => e.respond(system_prompt, text).await,
         }
@@ -709,8 +964,13 @@ pub async fn llm_refine_merged_content(
 
     let input = content.chars().take(4000).collect::<String>();
     let prepared = prepare_input_for_kind(config, &input, &extractor);
+    // Prose mode — `MERGE_REFINEMENT_SYSTEM_PROMPT` explicitly instructs
+    // "Return only the synthesized text, no JSON, no preamble". Using
+    // `raw_with_prompt` here would force the backend into JSON mode and
+    // wrap the synthesized canonical in a JSON envelope (same class of
+    // bug the 2026-04-23 resummerize eval uncovered).
     let refined = extractor
-        .raw_with_prompt(MERGE_REFINEMENT_SYSTEM_PROMPT, &prepared)
+        .raw_text_with_prompt(MERGE_REFINEMENT_SYSTEM_PROMPT, &prepared)
         .await?;
 
     let trimmed = refined.trim().to_string();
