@@ -956,7 +956,7 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 
 | 特性 | 说明 |
 |------|------|
-| **28 个 MCP 工具** | 13 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 + 3 个自适应/会话 |
+| **29 个 MCP 工具** | 13 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 + 4 个自适应/会话（含 v0.23 `rein_resummerize`） |
 | **自适应引擎** | M1-M6 + A1：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
 | **反事实 Alpha 优化** | 回放历史 recall，学习全局 / 按查询类型 / **按聚类** 的最优 CC 融合权重（M2） |
 | **Per-cluster KM 衰减 + 全局先验** | Kaplan-Meier 生存曲线替代固定遗忘曲线；全局先验曲线覆盖冷启动新聚类（M3） |
@@ -1139,7 +1139,7 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），共暴露 28 个工具。
+以 MCP 服务运行时（`rein serve`），共暴露 29 个工具。
 
 #### 核心工具（13 个）
 
@@ -1601,7 +1601,7 @@ flowchart TD
 flowchart TD
     U[用户 / AI 智能体]
     CLI[CLI\n20+ 命令]
-    MCP[MCP 服务\n28 工具 · stdio / HTTP / SSE]
+    MCP[MCP 服务\n29 工具 · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[代理\nClaude · Codex 订阅 · record-only]
 
