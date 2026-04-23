@@ -139,6 +139,7 @@ rein serve
 | `gc` | Garbage collect weak STM memories | `rein gc [--dry-run]` |
 | `organize` | Auto-link related memories | `rein organize` |
 | `dedup-concepts` | Merge duplicate concepts (case/separator variants) | `rein dedup-concepts` |
+| `resummerize` | Run LLM-driven canonical recompression (v0.23) | `rein resummerize [--dry-run] [--canonical-id ID]` |
 | `upgrade` | Upgrade old memories to knowledge graph | `rein upgrade [--topic X] [--dry-run]` |
 | `hook post` | Extract facts from tool output | `rein hook post` |
 | `hook compact` | Save context before compaction | `rein hook compact` |
@@ -234,9 +235,9 @@ Operator inspection commands:
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 31 tools are exposed.
+When running as an MCP server (`rein serve`), 32 tools are exposed.
 
-#### Core Tools (13)
+#### Core Tools (17)
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
@@ -253,6 +254,10 @@ When running as an MCP server (`rein serve`), 31 tools are exposed.
 | `rein_recent` | `limit?` | List most recently created memories |
 | `rein_gc` | `dry_run?` | Garbage collect weak STM memories |
 | `rein_organize` | `max_links?` | Auto-link related memories |
+| `rein_canonicals` | `limit?` | List canonical memories with support count, merge count, source diversity, and dedup confidence |
+| `rein_evidence` | `canonical_id`, `limit?` | List evidence snapshots absorbed into a canonical memory |
+| `rein_dedup_concepts` | *(none)* | Merge duplicate concepts in the knowledge graph (same normalized name within each memoir) |
+| `rein_resummerize` | `canonical_id?`, `dry_run?` | Run LLM-driven canonical recompression on `needs_resummerize` rows, gated by the Lossless Compression Contract (v0.23) |
 
 #### Knowledge Graph Tools (10)
 
@@ -797,7 +802,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 flowchart TD
     U[User / AI Agent]
     CLI[CLI\n20+ commands]
-    MCP[MCP Server\n31 tools · stdio / HTTP / SSE]
+    MCP[MCP Server\n32 tools · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[Proxy\nClaude · Codex subscription · record-only]
 
@@ -956,7 +961,7 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 
 | 特性 | 说明 |
 |------|------|
-| **32 个 MCP 工具** | 13 个核心记忆工具 + 10 个知识图谱工具 + 2 个时序工具 + 4 个自适应/会话（含 v0.23 `rein_resummerize`）+ 3 个其它 |
+| **32 个 MCP 工具** | 8 个核心记忆 + 9 个维护（含 v0.23 `rein_resummerize`）+ 10 个知识图谱 + 2 个时序 + 2 个自适应 + 1 个会话摄入 |
 | **自适应引擎** | M1-M6 + A1：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
 | **反事实 Alpha 优化** | 回放历史 recall，学习全局 / 按查询类型 / **按聚类** 的最优 CC 融合权重（M2） |
 | **Per-cluster KM 衰减 + 全局先验** | Kaplan-Meier 生存曲线替代固定遗忘曲线；全局先验曲线覆盖冷启动新聚类（M3） |
@@ -1072,14 +1077,12 @@ rein serve
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
 | `hook prompt` | UserPromptSubmit 兼容性空操作 | `rein hook prompt` |
+| `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
 | `recent` | 显示最近记忆 | `rein recent [-l 20]` |
 | `gc` | 垃圾回收弱 STM 记忆 | `rein gc [--dry-run]` |
 | `organize` | 自动关联记忆 | `rein organize` |
 | `upgrade` | 将旧记忆升级为知识图谱 | `rein upgrade [--topic X] [--dry-run]` |
-| `hook post` | 从工具输出提取事实 | `rein hook post` |
-| `hook compact` | 压缩前保存上下文 | `rein hook compact` |
-| `hook prompt` | 自动注入已取消，仅保留命令入口 | `rein hook prompt` |
-| `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
+| `resummerize` | LLM 驱动的 canonical 重压缩（v0.23） | `rein resummerize [--dry-run] [--canonical-id ID]` |
 | `worker memory` | 清空异步记忆队列 | `rein worker memory` |
 | `worker dedup-queue` | 清空 store 灰区 dedup 任务队列 | `rein worker dedup-queue` |
 | `worker cleanup-queue` | 清空 cleanup 任务队列 | `rein worker cleanup-queue` |
@@ -1141,7 +1144,7 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 
 以 MCP 服务运行时（`rein serve`），共暴露 32 个工具。
 
-#### 核心工具（13 个）
+#### 核心工具（17 个）
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
@@ -1158,6 +1161,10 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 | `rein_recent` | `limit?` | 查看最近创建的记忆 |
 | `rein_gc` | `dry_run?` | 垃圾回收弱 STM 记忆 |
 | `rein_organize` | `max_links?` | 自动关联记忆 |
+| `rein_canonicals` | `limit?` | 列出 canonical 记忆，含 support count、merge count、来源多样性和去重置信度 |
+| `rein_evidence` | `canonical_id`, `limit?` | 列出某 canonical 吸收的 evidence 快照 |
+| `rein_dedup_concepts` | *(无)* | 合并知识图谱中同名重复概念（同一 memoir 内按最早创建保留） |
+| `rein_resummerize` | `canonical_id?`, `dry_run?` | 对 `needs_resummerize` 行执行 LLM 驱动的 canonical 重压缩，受 Lossless Compression Contract 约束（v0.23） |
 
 #### 知识图谱工具（10 个）
 
