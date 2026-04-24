@@ -205,10 +205,7 @@ impl ConnPool {
             .len();
         let available_permits = self.inner.permits.available_permits();
         let shrunk_count = self.inner.shrunk_count.load(Ordering::Relaxed);
-        let try_get_saturated_count = self
-            .inner
-            .try_get_saturated_count
-            .load(Ordering::Relaxed);
+        let try_get_saturated_count = self.inner.try_get_saturated_count.load(Ordering::Relaxed);
         let last_saturation_at = self.inner.last_saturation_at.load(Ordering::Relaxed);
         PoolMetrics {
             size: self.inner.size,

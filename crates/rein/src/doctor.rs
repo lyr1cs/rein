@@ -1129,13 +1129,12 @@ fn check_pool_saturation(config: &ReinConfig) -> DoctorCheck {
     // "unknown" and skip the recency gate (same behavior as the
     // never-saturated path).
     let now_s = chrono::Utc::now().timestamp();
-    let seconds_since_last_saturation = if metrics.last_saturation_at <= 0
-        || metrics.last_saturation_at > now_s
-    {
-        i64::MAX
-    } else {
-        now_s - metrics.last_saturation_at
-    };
+    let seconds_since_last_saturation =
+        if metrics.last_saturation_at <= 0 || metrics.last_saturation_at > now_s {
+            i64::MAX
+        } else {
+            now_s - metrics.last_saturation_at
+        };
     let message = format!(
         "size={} idle={} in_use={} permits={} shrunk={} saturated={} recent={}",
         metrics.size,
@@ -1222,9 +1221,7 @@ fn check_resummerize(store: &SqliteStore) -> DoctorCheck {
         .query_row(
             "SELECT COUNT(*) FROM resummerize_runs \
                WHERE finished_at IS NOT NULL AND finished_at >= ?1",
-            rusqlite::params![
-                (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()
-            ],
+            rusqlite::params![(chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0);

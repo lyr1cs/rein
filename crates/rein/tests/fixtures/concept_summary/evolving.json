@@ -1,0 +1,26 @@
+[
+  {
+    "case_id": "ev_001",
+    "category": "evolving",
+    "name": "rein storage backend",
+    "definition": "rein's storage backend is SQLite with the FTS5 full-text extension and sqlite-vec for 3072-dim cosine vectors. WAL mode plus SQLITE_OPEN_FULL_MUTEX provides per-connection isolation; a per-request connection model avoids a shared mutex on the SqliteStore. The original PostgreSQL prototype was rejected: deployment overhead outweighed the concurrency headroom for a single-user agent workload.",
+    "revisions": [
+      { "revision": 1, "definition": "rein's storage backend is PostgreSQL with pgvector for vector similarity and a standard btree index for keyword lookup. PostgreSQL was chosen for its mature concurrency story and the existing pgvector ecosystem.", "created_at": "2025-11-10T09:00:00Z" },
+      { "revision": 2, "definition": "rein's storage backend was migrated from PostgreSQL to SQLite with sqlite-vec. Rationale: deployment complexity of PostgreSQL was not justified for a single-user agent; SQLite with WAL mode handles the expected write throughput, and sqlite-vec ships cosine search without a separate server.", "created_at": "2025-12-20T09:00:00Z" },
+      { "revision": 3, "definition": "rein's storage backend is SQLite with the FTS5 full-text extension and sqlite-vec for 3072-dim cosine vectors. WAL mode plus SQLITE_OPEN_FULL_MUTEX provides per-connection isolation; a per-request connection model avoids a shared mutex on the SqliteStore. The original PostgreSQL prototype was rejected: deployment overhead outweighed the concurrency headroom for a single-user agent workload.", "created_at": "2026-03-05T09:00:00Z" }
+    ],
+    "evidence_keywords": ["pgvector", "migrated", "btree", "throughput", "server"]
+  },
+  {
+    "case_id": "ev_002",
+    "category": "evolving",
+    "name": "MergeInto cap handling",
+    "definition": "The MergeInto cap is 10KB per canonical memory body. When a merge would push the body past the cap, v0.23 dispatches the canonical to the resummerize slow-channel op (gated by the 7-invariant Lossless Compression Contract and feature-flagged off by default). Keep-tail truncation remains the synchronous stopgap: needs_resummerize is flagged alongside keep-tail so the effective body is always well-formed even before the slow channel runs.",
+    "revisions": [
+      { "revision": 1, "definition": "The MergeInto cap is 10KB. When a merge exceeds it, the incoming evidence is appended and the oldest portion of the canonical body is hard-truncated in place. This keep-tail strategy preserves the most recent context at the cost of historical evidence.", "created_at": "2026-02-14T09:00:00Z" },
+      { "revision": 2, "definition": "The MergeInto cap is 10KB. v0.21 ships keep-tail truncation as the primary strategy. An LLM-driven alternative (resummerize) is under design but not yet implemented; keep-tail remains the production path.", "created_at": "2026-03-28T09:00:00Z" },
+      { "revision": 3, "definition": "The MergeInto cap is 10KB per canonical memory body. When a merge would push the body past the cap, v0.23 dispatches the canonical to the resummerize slow-channel op (gated by the 7-invariant Lossless Compression Contract and feature-flagged off by default). Keep-tail truncation remains the synchronous stopgap: needs_resummerize is flagged alongside keep-tail so the effective body is always well-formed even before the slow channel runs.", "created_at": "2026-04-22T09:00:00Z" }
+    ],
+    "evidence_keywords": ["hard-truncated", "appended", "primary", "historical", "implemented"]
+  }
+]

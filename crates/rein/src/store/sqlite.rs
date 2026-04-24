@@ -2347,8 +2347,7 @@ impl SqliteStore {
         content: &str,
         keywords: &[String],
     ) {
-        let keywords_json =
-            serde_json::to_string(keywords).unwrap_or_else(|_| "[]".to_string());
+        let keywords_json = serde_json::to_string(keywords).unwrap_or_else(|_| "[]".to_string());
         self.update_tantivy(id, topic, summary, content, &keywords_json);
         self.remove_from_hnsw(id);
     }
@@ -3622,12 +3621,8 @@ enabled = true
         // order by imported_at ASC so `build_prompt`'s "oldest first"
         // promise matches reality.
         let store = SqliteStore::in_memory().unwrap();
-        let canonical = test_memory_with_content(
-            "history",
-            "evidence-history",
-            "seed",
-            Importance::Medium,
-        );
+        let canonical =
+            test_memory_with_content("history", "evidence-history", "seed", Importance::Medium);
         let canonical_id = store.store(canonical).unwrap();
 
         // Insert 5 evidence rows with explicit monotonically-increasing
