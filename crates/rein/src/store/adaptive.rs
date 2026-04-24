@@ -211,7 +211,10 @@ pub fn event_count(conn: &Connection) -> u64 {
 /// `AdaptiveState::save_snapshot`. Codex round-5 H-1 + round-6 LOW.
 pub fn recompute_canonical_length_stats(
     conn: &Connection,
-) -> ReinResult<(HashMap<u32, CanonicalLengthStats>, Option<CanonicalLengthStats>)> {
+) -> ReinResult<(
+    HashMap<u32, CanonicalLengthStats>,
+    Option<CanonicalLengthStats>,
+)> {
     // Canonicals are identified by the `memory_canonical_state` table rather
     // than a column on `memories` itself — a row is canonical when its own
     // `memory_id` equals its `canonical_id` entry. See `canonical_id_for` in
@@ -309,6 +312,14 @@ pub struct AdaptiveState {
     /// a cluster lacks sufficient samples or no cluster is assigned.
     #[serde(default)]
     pub global_canonical_length: Option<CanonicalLengthStats>,
+
+    /// v0.24 ARS: concept living-summary refresh statistics. Populated by
+    /// the slow-channel from post-refresh feedback. `None` on fresh
+    /// install; [`Self::concept_refresh_revision_threshold`] and
+    /// [`Self::concept_refresh_age_threshold_secs`] fall back to bootstrap
+    /// constants until enough data accumulates.
+    #[serde(default)]
+    pub concept_refresh_stats: Option<ConceptRefreshStats>,
 
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
@@ -570,9 +581,7 @@ impl AdaptiveState {
                         // non-deterministic last-write-wins, which is fine since
                         // both computed from overlapping corpus snapshots.
                         for (&cid, stats) in &self.canonical_length_stats {
-                            current
-                                .canonical_length_stats
-                                .insert(cid, stats.clone());
+                            current.canonical_length_stats.insert(cid, stats.clone());
                         }
                     }
 
@@ -837,6 +846,60 @@ pub fn assign_to_nearest_centroid(
         best_id
     } else {
         None
+    }
+}
+
+// ── v0.24 ARS — Concept Living Summary refresh parameters ───────────────────
+
+/// Bootstrap revisions-since-last-summary threshold. One handful — matches
+/// rein's "minimum of ten" default pattern (M1 min_samples etc.).
+/// Fires a refresh every 5 revisions while learned stats are empty.
+pub const CONCEPT_REFRESH_BOOTSTRAP_REVISION: u32 = 5;
+
+/// Bootstrap age threshold in seconds. 7 days keeps slow-moving concepts
+/// alive with at least weekly refresh while learned stats accumulate.
+pub const CONCEPT_REFRESH_BOOTSTRAP_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Minimum sample count before trusting learned concept-refresh stats.
+/// Matches the "ten samples" default used across M1-M6.
+pub const CONCEPT_REFRESH_MIN_SAMPLES: usize = 10;
+
+/// v0.24 ARS: learned statistics for concept living-summary refresh.
+/// Populated by the slow-channel from post-refresh feedback. `None` on
+/// fresh install; helper thresholds fall back to bootstrap constants
+/// until `count >= CONCEPT_REFRESH_MIN_SAMPLES`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConceptRefreshStats {
+    /// Number of concepts contributing to the percentile. Callers must
+    /// compare against [`CONCEPT_REFRESH_MIN_SAMPLES`] before trusting.
+    pub count: usize,
+    /// p75 of revisions-since-last-summary among refreshed concepts.
+    pub revision_p75: u32,
+    /// p50 of time-since-last-summary (seconds) among refreshed concepts.
+    pub age_p50_secs: i64,
+}
+
+impl AdaptiveState {
+    /// v0.24 ARS: revisions-since-last-summary threshold. Uses learned
+    /// stats if at least [`CONCEPT_REFRESH_MIN_SAMPLES`] observations are
+    /// available, otherwise falls back to
+    /// [`CONCEPT_REFRESH_BOOTSTRAP_REVISION`].
+    pub fn concept_refresh_revision_threshold(&self) -> u32 {
+        self.concept_refresh_stats
+            .as_ref()
+            .filter(|s| s.count >= CONCEPT_REFRESH_MIN_SAMPLES)
+            .map(|s| s.revision_p75)
+            .unwrap_or(CONCEPT_REFRESH_BOOTSTRAP_REVISION)
+    }
+
+    /// v0.24 ARS: age-since-last-summary threshold in seconds. Same
+    /// fallback pattern as [`Self::concept_refresh_revision_threshold`].
+    pub fn concept_refresh_age_threshold_secs(&self) -> i64 {
+        self.concept_refresh_stats
+            .as_ref()
+            .filter(|s| s.count >= CONCEPT_REFRESH_MIN_SAMPLES)
+            .map(|s| s.age_p50_secs)
+            .unwrap_or(CONCEPT_REFRESH_BOOTSTRAP_AGE_SECS)
     }
 }
 

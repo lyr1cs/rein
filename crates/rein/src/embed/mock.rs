@@ -32,10 +32,7 @@ pub struct MockEmbedder {
 impl MockEmbedder {
     /// Build a mock that returns `responses` in FIFO order. `Err` variants
     /// become `ReinError::Config` errors.
-    pub fn with_responses(
-        dims: usize,
-        responses: Vec<Result<Vec<f32>, String>>,
-    ) -> Self {
+    pub fn with_responses(dims: usize, responses: Vec<Result<Vec<f32>, String>>) -> Self {
         Self {
             model: "mock-embedder".to_string(),
             dims,

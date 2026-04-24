@@ -141,10 +141,7 @@ impl ResummerizeRunRow {
 /// `finish_resummerize_run` — both are supported; an emit-then-update flow
 /// inserts with a tentative status such as `LlmError` and overwrites it on
 /// success).
-pub fn insert_resummerize_run(
-    conn: &Connection,
-    row: &ResummerizeRunRow,
-) -> rusqlite::Result<()> {
+pub fn insert_resummerize_run(conn: &Connection, row: &ResummerizeRunRow) -> rusqlite::Result<()> {
     let violations_json = if row.violations.is_empty() {
         None
     } else {
@@ -280,10 +277,9 @@ pub fn count_recent_consecutive_failures(
           ORDER BY finished_at DESC
           LIMIT ?2",
     )?;
-    let rows = stmt.query_map(
-        rusqlite::params![canonical_id, scan_limit as i64],
-        |row| row.get::<_, String>(0),
-    )?;
+    let rows = stmt.query_map(rusqlite::params![canonical_id, scan_limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
     let mut consecutive = 0usize;
     for r in rows {
         let status = r?;
@@ -492,10 +488,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            has_last_col, 1,
-            "last_resummarized_at column should exist"
-        );
+        assert_eq!(has_last_col, 1, "last_resummarized_at column should exist");
 
         // And the audit table must exist.
         let has_runs_tbl: i64 = conn
@@ -701,8 +694,7 @@ mod tests {
         );
 
         // Broadening the window to include r5 pulls it in → 3/5 = 0.6.
-        let rate_wide =
-            recent_failure_rate(&conn, Duration::seconds(7200)).unwrap();
+        let rate_wide = recent_failure_rate(&conn, Duration::seconds(7200)).unwrap();
         assert!(
             (rate_wide - 0.6).abs() < 1e-9,
             "expected 0.6 failure rate in 2h window, got {rate_wide}"

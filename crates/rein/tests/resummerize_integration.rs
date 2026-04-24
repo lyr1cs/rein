@@ -238,16 +238,18 @@ fn mock_success_rewrites_canonical_and_clears_flag() {
     // `store.store()` in `setup_flagged_canonical` created an initial
     // evidence snapshot; resummerize must add one MORE (the pre-rewrite
     // canonical). We record the before-count to verify the delta.
-    let evidence_before = store.list_memory_evidence(&canonical_id, 100).unwrap().len();
+    let evidence_before = store
+        .list_memory_evidence(&canonical_id, 100)
+        .unwrap()
+        .len();
 
     // Compressed output is a literal substring of the pre content, so all
     // its trigrams are present in the reference set and `no_new_facts`
     // trivially passes (the test is about plumbing, not about stressing
     // the contract's heuristics — those have their own unit coverage).
     let compressed = "canonical with distinctive token XYZZY".to_string();
-    let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response(
-        compressed.clone(),
-    ));
+    let mock =
+        rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response(compressed.clone()));
     let outcome =
         run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock).unwrap();
 
@@ -293,7 +295,9 @@ fn mock_success_rewrites_canonical_and_clears_flag() {
         "resummerize must add exactly one pre-rewrite evidence row"
     );
     assert!(
-        evidence_after.iter().any(|e| e.content.contains("XYZZY") && e.content.contains("distinctive")),
+        evidence_after
+            .iter()
+            .any(|e| e.content.contains("XYZZY") && e.content.contains("distinctive")),
         "pre-resummerize canonical content must be present in memory_evidence"
     );
 
@@ -317,7 +321,10 @@ fn mock_contract_violation_leaves_canonical_untouched() {
     // Baseline BEFORE the run: the initial store() snapshot is already
     // present. Contract-violation path must NOT add a phantom pre-snapshot
     // (H2 atomicity + Codex round-2 L2 ordering fix).
-    let evidence_before = store.list_memory_evidence(&canonical_id, 100).unwrap().len();
+    let evidence_before = store
+        .list_memory_evidence(&canonical_id, 100)
+        .unwrap()
+        .len();
 
     // Mock response drops the anchor entirely → `temporal_anchors_preserved`
     // fails → contract gate rejects.
@@ -343,7 +350,10 @@ fn mock_contract_violation_leaves_canonical_untouched() {
     );
     // No phantom pre-snapshot from the failed run.
     assert_eq!(
-        store.list_memory_evidence(&canonical_id, 100).unwrap().len(),
+        store
+            .list_memory_evidence(&canonical_id, 100)
+            .unwrap()
+            .len(),
         evidence_before,
         "contract violation must not write a pre-snapshot evidence row"
     );
@@ -360,7 +370,10 @@ fn mock_llm_error_leaves_canonical_untouched() {
     // Capture baseline BEFORE the run (Codex round-2 L2): if we capture
     // after, a regression that writes a phantom snapshot would still
     // pass because both the "before" and "after" reads include it.
-    let evidence_before = store.list_memory_evidence(&canonical_id, 100).unwrap().len();
+    let evidence_before = store
+        .list_memory_evidence(&canonical_id, 100)
+        .unwrap()
+        .len();
 
     let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_persistent_error(
         "simulated API outage",
@@ -374,7 +387,10 @@ fn mock_llm_error_leaves_canonical_untouched() {
     assert_eq!(needs_resummerize_flag(&store, &canonical_id), 1);
     assert_eq!(canonical_in_progress(&store, &canonical_id), None);
     assert_eq!(
-        store.list_memory_evidence(&canonical_id, 100).unwrap().len(),
+        store
+            .list_memory_evidence(&canonical_id, 100)
+            .unwrap()
+            .len(),
         evidence_before,
         "LLM error path must not write a pre-snapshot evidence row"
     );
@@ -405,9 +421,9 @@ fn mock_three_strike_fuse_exhausts_after_consecutive_contract_failures() {
     // audit row is `contract_violation`, which DOES count toward the
     // fuse.
     for attempt in 0..3 {
-        let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response(
-            format!("bogus-{attempt}"),
-        ));
+        let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response(format!(
+            "bogus-{attempt}"
+        )));
         let outcome =
             run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock)
                 .unwrap();
@@ -465,8 +481,14 @@ fn mock_llm_errors_do_not_trip_three_strike_fuse() {
         let outcome =
             run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock)
                 .unwrap();
-        assert_eq!(outcome.llm_failed, 1, "attempt {attempt}: should record llm failure");
-        assert_eq!(outcome.exhausted, 0, "attempt {attempt}: transient errors must not exhaust");
+        assert_eq!(
+            outcome.llm_failed, 1,
+            "attempt {attempt}: should record llm failure"
+        );
+        assert_eq!(
+            outcome.exhausted, 0,
+            "attempt {attempt}: transient errors must not exhaust"
+        );
     }
 
     assert_eq!(
@@ -498,11 +520,13 @@ fn mock_targeted_canonical_ineligible_is_skipped() {
     // now so a regression that writes a phantom snapshot during an
     // ineligible run would be detectable. Capturing after the run
     // defeats the check (both samples would include any phantom row).
-    let evidence_before = store.list_memory_evidence(&canonical_id, 100).unwrap().len();
+    let evidence_before = store
+        .list_memory_evidence(&canonical_id, 100)
+        .unwrap()
+        .len();
 
-    let mock = rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response(
-        "would-rewrite",
-    ));
+    let mock =
+        rein::extract::ExtractorKind::Mock(MockExtractor::with_fixed_response("would-rewrite"));
     let outcome =
         run_resummerize_with_extractor(&store, &config, Some(&canonical_id), false, mock).unwrap();
 
@@ -516,7 +540,10 @@ fn mock_targeted_canonical_ineligible_is_skipped() {
     // No NEW evidence snapshot was taken (ineligible row never reaches
     // apply_resummerize's pre-snapshot).
     assert_eq!(
-        store.list_memory_evidence(&canonical_id, 100).unwrap().len(),
+        store
+            .list_memory_evidence(&canonical_id, 100)
+            .unwrap()
+            .len(),
         evidence_before
     );
 }
@@ -529,8 +556,7 @@ fn resummerize_skipped_when_disabled() {
     let config = ReinConfig::default();
     assert!(!config.resummerize.enabled, "default must be disabled");
 
-    let outcome =
-        rein::ops::resummerize::run_resummerize(&store, &config, None, false).unwrap();
+    let outcome = rein::ops::resummerize::run_resummerize(&store, &config, None, false).unwrap();
 
     assert!(outcome.skipped_disabled);
     assert!(!outcome.skipped_no_llm);
@@ -548,8 +574,7 @@ fn resummerize_skipped_when_no_llm_configured() {
     config.resummerize.enabled = true;
     // extract.google.api_key defaults to None → create_extractor() → None.
 
-    let outcome =
-        rein::ops::resummerize::run_resummerize(&store, &config, None, false).unwrap();
+    let outcome = rein::ops::resummerize::run_resummerize(&store, &config, None, false).unwrap();
 
     assert!(outcome.skipped_no_llm);
     assert!(!outcome.skipped_disabled);
@@ -755,14 +780,13 @@ fn tempfile_resummerize_syncs_side_indexes_end_to_end() {
     // Seed canonical with a PRE-only marker (in content) and a SHARED
     // token (in both pre and post) so we can tell which content the FTS
     // is actually indexing.
-    let pre_content = "Pre-rewrite canonical body: SHAREDTOKEN, plus PREONLYMARKER for distinction.";
+    let pre_content =
+        "Pre-rewrite canonical body: SHAREDTOKEN, plus PREONLYMARKER for distinction.";
     let memory = make_memory("resummerize-tempfile-test", pre_content);
     let canonical_id = store.store(memory).unwrap();
 
     // Sanity: both tokens visible in FTS before resummerize runs.
-    let hits_pre = store
-        .search_fts("PREONLYMARKER", None, 10)
-        .unwrap();
+    let hits_pre = store.search_fts("PREONLYMARKER", None, 10).unwrap();
     assert!(
         hits_pre.iter().any(|m| m.id == canonical_id),
         "fixture precondition: PREONLYMARKER should be findable before resummerize"
@@ -1007,7 +1031,10 @@ async fn vec_dedup_accepts_updated_canonical_as_strong_match_candidate() {
         .unwrap();
 
     let pending_id = store
-        .store(make_memory("h1-updated-candidate", "incoming near-duplicate body"))
+        .store(make_memory(
+            "h1-updated-candidate",
+            "incoming near-duplicate body",
+        ))
         .unwrap();
     store
         .conn()
@@ -1048,7 +1075,10 @@ async fn vec_dedup_preserves_flag_when_strong_merge_mark_superseded_fails() {
     let candidate_id = store.store(candidate).unwrap();
 
     let pending_id = store
-        .store(make_memory("m2-strong-merge-failure", "incoming near-duplicate body"))
+        .store(make_memory(
+            "m2-strong-merge-failure",
+            "incoming near-duplicate body",
+        ))
         .unwrap();
     store
         .conn()
@@ -1126,8 +1156,7 @@ fn merged_status_updated_canonical_is_eligible_for_resummerize() {
     assert!(!token.is_empty());
 
     // The audit-layer count helper must also include this row.
-    let count =
-        rein::store::resummerize_audit::count_needs_resummerize(store.conn()).unwrap();
+    let count = rein::store::resummerize_audit::count_needs_resummerize(store.conn()).unwrap();
     assert_eq!(
         count, 1,
         "count_needs_resummerize must include 'updated'-status rows; round-5 H-1"
@@ -1135,7 +1164,10 @@ fn merged_status_updated_canonical_is_eligible_for_resummerize() {
 
     // backlog_count (the doctor-facing helper) must too.
     let backlog = rein::ops::resummerize::backlog_count(&store).unwrap();
-    assert_eq!(backlog, 1, "backlog_count must include 'updated'-status rows; round-5 H-1");
+    assert_eq!(
+        backlog, 1,
+        "backlog_count must include 'updated'-status rows; round-5 H-1"
+    );
 }
 
 /// Codex round-5 M-1 regression guard: the 5-way CAS in `apply_resummerize`
@@ -1183,7 +1215,10 @@ fn rfc3339_offset_variant_updated_at_does_not_spuriously_claim_lost() {
     );
 
     // Canonical actually rewritten.
-    assert_eq!(store.get(&canonical_id).unwrap().content, "compressed canonical body");
+    assert_eq!(
+        store.get(&canonical_id).unwrap().content,
+        "compressed canonical body"
+    );
 }
 
 /// Codex post-fix audit H-1: `check_claim_still_held` must return false
@@ -1194,9 +1229,7 @@ fn rfc3339_offset_variant_updated_at_does_not_spuriously_claim_lost() {
 /// a countable `LengthExceeded` / `ContractViolation`.
 #[test]
 fn check_claim_still_held_detects_all_three_drift_cases() {
-    use rein::ops::resummerize::test_hooks::{
-        check_claim_still_held_for_test, claim_for_test,
-    };
+    use rein::ops::resummerize::test_hooks::{check_claim_still_held_for_test, claim_for_test};
 
     let (store, _config, canonical_id) = setup_flagged_canonical("body");
     let token = claim_for_test(&store, &canonical_id)
@@ -1213,13 +1246,8 @@ fn check_claim_still_held_detects_all_three_drift_cases() {
 
     // Happy path — ownership held, snapshot matches, status live.
     assert!(
-        check_claim_still_held_for_test(
-            &store,
-            &canonical_id,
-            &token,
-            &snapshot_updated_at
-        )
-        .unwrap(),
+        check_claim_still_held_for_test(&store, &canonical_id, &token, &snapshot_updated_at)
+            .unwrap(),
         "unchanged row must report ownership still held"
     );
 
@@ -1245,13 +1273,8 @@ fn check_claim_still_held_detects_all_three_drift_cases() {
         )
         .unwrap();
     assert!(
-        !check_claim_still_held_for_test(
-            &store,
-            &canonical_id,
-            &token,
-            &snapshot_updated_at
-        )
-        .unwrap(),
+        !check_claim_still_held_for_test(&store, &canonical_id, &token, &snapshot_updated_at)
+            .unwrap(),
         "updated_at drift must report ownership lost"
     );
 
@@ -1266,13 +1289,8 @@ fn check_claim_still_held_detects_all_three_drift_cases() {
         )
         .unwrap();
     assert!(
-        !check_claim_still_held_for_test(
-            &store,
-            &canonical_id,
-            &token,
-            &snapshot_updated_at
-        )
-        .unwrap(),
+        !check_claim_still_held_for_test(&store, &canonical_id, &token, &snapshot_updated_at)
+            .unwrap(),
         "non-live status must report ownership lost"
     );
 }
@@ -1286,9 +1304,8 @@ fn check_claim_still_held_detects_all_three_drift_cases() {
 fn apply_with_stale_claim_token_rolls_back_to_claim_lost() {
     use rein::ops::resummerize::test_hooks::{apply_for_test, claim_for_test, ApplyOutcome};
 
-    let (store, _config, canonical_id) = setup_flagged_canonical(
-        "original canonical body that must survive a stolen claim",
-    );
+    let (store, _config, canonical_id) =
+        setup_flagged_canonical("original canonical body that must survive a stolen claim");
 
     // Worker A claims the row (simulates the first part of
     // `run_resummerize_inner` executing).
@@ -1309,7 +1326,10 @@ fn apply_with_stale_claim_token_rolls_back_to_claim_lost() {
 
     // Baseline captured BEFORE A's doomed commit attempt.
     let content_before = store.get(&canonical_id).unwrap().content.clone();
-    let evidence_before = store.list_memory_evidence(&canonical_id, 100).unwrap().len();
+    let evidence_before = store
+        .list_memory_evidence(&canonical_id, 100)
+        .unwrap()
+        .len();
 
     // A returns from its LLM call and tries to commit with its (now
     // stale) token. The CAS clause in the UPDATE fails to match any
@@ -1330,7 +1350,10 @@ fn apply_with_stale_claim_token_rolls_back_to_claim_lost() {
         "stale worker overwrote canonical despite claim mismatch"
     );
     assert_eq!(
-        store.list_memory_evidence(&canonical_id, 100).unwrap().len(),
+        store
+            .list_memory_evidence(&canonical_id, 100)
+            .unwrap()
+            .len(),
         evidence_before,
         "stale worker left a phantom pre-snapshot despite ROLLBACK"
     );

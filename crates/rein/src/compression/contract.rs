@@ -132,7 +132,10 @@ pub fn check_each(
             "temporal_anchors_preserved",
             temporal_anchors_preserved(input, output),
         ),
-        ("conflict_not_silenced", conflict_not_silenced(input, output)),
+        (
+            "conflict_not_silenced",
+            conflict_not_silenced(input, output),
+        ),
         ("length_bounded", length_bounded(input, output)),
         ("evidence_immutable", evidence_immutable(input, output)),
         ("cjk_integrity", cjk_integrity(input, output)),
@@ -236,10 +239,7 @@ fn extract_anchors(text: &str, bag: &mut HashMap<String, u32>) {
 /// evidence must appear ≥ 1 time in the output. Note that a full date
 /// (`2026-04-22`) and its bare-year substring (`2026`) are tracked as
 /// separate anchors — overlap is fine and both counts are kept independently.
-pub fn temporal_anchors_preserved(
-    input: &ContractInput,
-    output: &str,
-) -> Result<(), Violation> {
+pub fn temporal_anchors_preserved(input: &ContractInput, output: &str) -> Result<(), Violation> {
     let mut evidence_anchors: HashMap<String, u32> = HashMap::new();
     for e in input.evidence {
         extract_anchors(&e.content, &mut evidence_anchors);
@@ -294,10 +294,7 @@ fn negative_pref_regex() -> &'static Regex {
 ///   considered one object under `prefer` and one object under
 ///   `don't`/`do not`, not a contradiction between them. That gap is
 ///   documented and left for a future invariant that reasons about polarity.
-pub fn conflict_not_silenced(
-    input: &ContractInput,
-    output: &str,
-) -> Result<(), Violation> {
+pub fn conflict_not_silenced(input: &ContractInput, output: &str) -> Result<(), Violation> {
     let mut per_verb: HashMap<String, HashSet<String>> = HashMap::new();
     for e in input.evidence {
         collect_prefs(&e.content, &mut per_verb);
@@ -333,16 +330,28 @@ pub fn conflict_not_silenced(
 
 fn collect_prefs(text: &str, out: &mut HashMap<String, HashSet<String>>) {
     for cap in positive_pref_regex().captures_iter(text) {
-        let verb = cap.get(1).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
-        let obj = cap.get(2).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        let verb = cap
+            .get(1)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
+        let obj = cap
+            .get(2)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
         if !verb.is_empty() && !obj.is_empty() {
             out.entry(verb).or_default().insert(obj);
         }
     }
     for cap in negative_pref_regex().captures_iter(text) {
-        let verb_raw = cap.get(1).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        let verb_raw = cap
+            .get(1)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
         let verb = verb_raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        let obj = cap.get(2).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        let obj = cap
+            .get(2)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
         if !verb.is_empty() && !obj.is_empty() {
             out.entry(verb).or_default().insert(obj);
         }
@@ -409,7 +418,7 @@ fn is_cjk(ch: char) -> bool {
         || (0x20000..=0x2A6DF).contains(&c)   // CJK Extension B
         || (0x3040..=0x309F).contains(&c)     // Hiragana
         || (0x30A0..=0x30FF).contains(&c)     // Katakana
-        || (0xAC00..=0xD7AF).contains(&c)     // Hangul syllables
+        || (0xAC00..=0xD7AF).contains(&c) // Hangul syllables
 }
 
 /// Every CJK / kana / hangul codepoint appearing ≥ 2 times across evidence
@@ -501,10 +510,7 @@ fn parse_code_blocks(text: &str) -> Vec<(String, String)> {
                 None => {
                     // Open a new block. Info string = everything after the
                     // backticks on the opening fence line, trimmed.
-                    let info_string = trimmed
-                        .trim_start_matches('`')
-                        .trim()
-                        .to_string();
+                    let info_string = trimmed.trim_start_matches('`').trim().to_string();
                     current = Some((info_string, Vec::new()));
                 }
             }
@@ -539,10 +545,7 @@ fn parse_code_blocks(text: &str) -> Vec<(String, String)> {
 /// - Nested triple-backtick content produces two separate blocks; both
 ///   evidence and output get the same treatment, so equality still
 ///   works for typical cases.
-pub fn code_block_preserved(
-    input: &ContractInput,
-    output: &str,
-) -> Result<(), Violation> {
+pub fn code_block_preserved(input: &ContractInput, output: &str) -> Result<(), Violation> {
     let mut needed: HashSet<(String, String)> = HashSet::new();
     for e in input.evidence {
         for block in parse_code_blocks(&e.content) {
@@ -675,10 +678,7 @@ mod tests {
         // Codex audit H4: the prior ≥50% threshold allowed "user prefers
         // rust / user prefers python" to silently resolve to just "rust"
         // and pass. A single contested object dropped must now fail.
-        let evidence = vec![
-            ev("user prefers rust", 1),
-            ev("user prefers python", 2),
-        ];
+        let evidence = vec![ev("user prefers rust", 1), ev("user prefers python", 2)];
         let input = input_from(&evidence, "", 8000);
         let output = "user prefers rust in some contexts";
         let err = conflict_not_silenced(&input, output).unwrap_err();
@@ -687,10 +687,7 @@ mod tests {
 
     #[test]
     fn conflict_passes_when_all_objects_remain() {
-        let evidence = vec![
-            ev("user prefers rust", 1),
-            ev("user prefers python", 2),
-        ];
+        let evidence = vec![ev("user prefers rust", 1), ev("user prefers python", 2)];
         let input = input_from(&evidence, "", 8000);
         let output = "user prefers rust for systems, python for scripts";
         assert!(conflict_not_silenced(&input, output).is_ok());
@@ -776,10 +773,7 @@ mod tests {
 
     #[test]
     fn cjk_kept_when_output_retains_recurring_chars() {
-        let evidence = vec![
-            ev("用户偏好中文输出", 1),
-            ev("用户偏好简洁", 2),
-        ];
+        let evidence = vec![ev("用户偏好中文输出", 1), ev("用户偏好简洁", 2)];
         let input = input_from(&evidence, "", 8000);
         // 用户偏好 each appear ≥ 2 times in evidence
         let output = "用户偏好中文输出且简洁";
@@ -788,10 +782,7 @@ mod tests {
 
     #[test]
     fn cjk_fails_when_recurring_char_dropped() {
-        let evidence = vec![
-            ev("用户偏好中文", 1),
-            ev("用户偏好简洁", 2),
-        ];
+        let evidence = vec![ev("用户偏好中文", 1), ev("用户偏好简洁", 2)];
         let input = input_from(&evidence, "", 8000);
         let output = "user prefers cjk";
         let err = cjk_integrity(&input, output).unwrap_err();
@@ -809,10 +800,7 @@ mod tests {
 
     #[test]
     fn code_fences_preserved_when_output_has_them() {
-        let evidence = vec![ev(
-            "example:\n```rust\nfn main() {}\n```",
-            1,
-        )];
+        let evidence = vec![ev("example:\n```rust\nfn main() {}\n```", 1)];
         let input = input_from(&evidence, "", 8000);
         let output = "example:\n```rust\nfn main() {}\n```";
         assert!(code_block_preserved(&input, output).is_ok());
@@ -820,10 +808,7 @@ mod tests {
 
     #[test]
     fn code_fences_fail_when_output_drops_them() {
-        let evidence = vec![ev(
-            "example:\n```rust\nfn main() {}\n```",
-            1,
-        )];
+        let evidence = vec![ev("example:\n```rust\nfn main() {}\n```", 1)];
         let input = input_from(&evidence, "", 8000);
         let output = "example: fn main() {}";
         let err = code_block_preserved(&input, output).unwrap_err();
@@ -857,10 +842,7 @@ mod tests {
         // so the body still counts as a block. Prevents a subtle
         // truncation-by-EOF exploit where dropping the closing fence
         // would (pre-parser) erase the block.
-        let evidence = vec![ev(
-            "```rust\nfn retained() {}\n",
-            1,
-        )];
+        let evidence = vec![ev("```rust\nfn retained() {}\n", 1)];
         let input = input_from(&evidence, "", 8000);
         // Output also unclosed but same body → passes.
         let output = "```rust\nfn retained() {}\n";

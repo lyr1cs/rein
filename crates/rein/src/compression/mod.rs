@@ -9,6 +9,4 @@
 
 pub mod contract;
 
-pub use contract::{
-    check_all, check_each, ContractInput, EvidenceEntry, Violation,
-};
+pub use contract::{check_all, check_each, ContractInput, EvidenceEntry, Violation};

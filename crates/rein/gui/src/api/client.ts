@@ -1,3 +1,5 @@
+import type { ConceptState } from './types';
+
 const BASE = '';
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -26,3 +28,11 @@ export const apiPut = <T>(path: string, body: unknown) =>
   api<T>(path, { method: 'PUT', body: JSON.stringify(body) });
 export const apiDelete = <T>(path: string) =>
   api<T>(path, { method: 'DELETE' });
+
+/**
+ * Fetch the current state of a concept — includes the auto-refreshed
+ * `living_summary` (v0.24 ARS Capability A). Backed by
+ * `GET /api/concepts/{concept_id}/state`.
+ */
+export const getConceptState = (conceptId: string): Promise<ConceptState> =>
+  apiGet<ConceptState>(`/api/concepts/${encodeURIComponent(conceptId)}/state`);

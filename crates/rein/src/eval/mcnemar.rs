@@ -28,13 +28,20 @@ use serde::{Deserialize, Serialize};
 /// the hit-checker's caller chose — the eval harness currently counts chars of
 /// the surfaced context). They drive the `avg_length_ratio` computation in
 /// `decide_ship`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PairedOutcome {
     pub case_id: String,
     pub baseline_hit: bool,
     pub treatment_hit: bool,
     pub baseline_length: usize,
     pub treatment_length: usize,
+    /// v0.24 ARS: LLM-produced treatment text (e.g. a `living_summary`),
+    /// captured when the harness can afford the extra scorecard size. Used
+    /// for qualitative debug review of failing cases. `None` for scorecards
+    /// written by the resummerize path (which does not capture output text)
+    /// and baseline scorecards (nothing was synthesized).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treatment_summary: Option<String>,
 }
 
 /// Summary of a paired-comparison McNemar test.
@@ -237,6 +244,7 @@ mod tests {
             treatment_hit: t,
             baseline_length: 1000,
             treatment_length: 500,
+            treatment_summary: None,
         }
     }
 
