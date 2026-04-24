@@ -10,11 +10,11 @@ pub use dedup::{
     similarity, tokenize_for_fts, tokenize_for_search, topics_are_variants, DedupAction,
 };
 pub use hooks::{hook_compact, hook_post, hook_prompt, hook_stop};
+#[cfg(feature = "test-support")]
+pub use llm::MockExtractor;
 pub use llm::{
     create_extractor, extract_full_with_fallback, extract_with_fallback, llm_dedup_verdict,
     DedupVerdict, EpisodeSummary, ExtractedConcept, ExtractedLink, ExtractedMemory,
     ExtractionResult, ExtractorKind,
 };
-#[cfg(feature = "test-support")]
-pub use llm::MockExtractor;
 pub use patterns::{extract_facts, score_sentence};

@@ -8,6 +8,7 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 pub mod adaptive;
+pub mod concept_summary;
 pub mod consolidation;
 pub mod dedup;
 pub mod resummerize;

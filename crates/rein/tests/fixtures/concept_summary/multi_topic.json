@@ -1,0 +1,27 @@
+[
+  {
+    "case_id": "mt_001",
+    "category": "multi_topic",
+    "name": "query expansion pipeline",
+    "definition": "Query expansion (v0.9.0) rewrites the user query into 2-3 variants via an LLM. Variant searches run alongside the original; results are fused downstream by the recall waterfall. The pipeline honors the resummerize backend-selection path so operators can swap providers without touching expansion code.",
+    "revisions": [
+      { "revision": 1, "definition": "Query expansion rewrites the user query into variants for multi-query search. Intended to cover lexical gaps between the query and indexed content.", "created_at": "2026-02-01T09:00:00Z" },
+      { "revision": 2, "definition": "Query expansion rewrites queries into 2-3 variants using Gemini Flash Lite. The expansion worker writes to a shared channel consumed by the recall waterfall. Stopword filtering and query-type-specific templates were considered but rejected as subjective params.", "created_at": "2026-02-18T09:00:00Z" },
+      { "revision": 3, "definition": "Query expansion (v0.9.0) rewrites into 2-3 variants via Gemini Flash Lite or OMLX. The variant searches run in parallel with the original. Early bench showed 17% recall lift on the LongMemEval exploratory category. Strong-signal queries bypass expansion when the BM25 top-1 score exceeds a learned threshold.", "created_at": "2026-03-02T09:00:00Z" },
+      { "revision": 4, "definition": "Query expansion (v0.9.0) rewrites the user query into 2-3 variants via an LLM. Variant searches run alongside the original; results are fused downstream by the recall waterfall. The pipeline honors the resummerize backend-selection path so operators can swap providers without touching expansion code.", "created_at": "2026-03-25T09:00:00Z" }
+    ],
+    "evidence_keywords": ["Gemini", "LongMemEval", "strong-signal", "parallel", "stopword"]
+  },
+  {
+    "case_id": "mt_002",
+    "category": "multi_topic",
+    "name": "sqlite-vec HNSW cache",
+    "definition": "The sqlite-vec HNSW cache is rein's vector side index: 3072-dim cosine embeddings backing approximate nearest neighbor at recall time. Side-index refresh is triggered by every write and by the v0.23 resummerize rewrite path. The dirty-marker lifecycle is load-bearing: only full rebuilds clear the .dirty flag.",
+    "revisions": [
+      { "revision": 1, "definition": "sqlite-vec HNSW cache holds 3072-dim cosine embeddings for approximate nearest neighbor search over stored memories.", "created_at": "2026-01-05T10:00:00Z" },
+      { "revision": 2, "definition": "sqlite-vec HNSW cache: embeddings live in the sqlite-vec extension table; the usearch HNSW instance is rebuilt on startup from that table. Side-index refresh runs fire-and-forget on every store/update/delete to keep the HNSW in sync. A per-request connection model avoids a shared mutex on the HNSW handle.", "created_at": "2026-02-10T10:00:00Z" },
+      { "revision": 3, "definition": "The sqlite-vec HNSW cache is rein's vector side index: 3072-dim cosine embeddings backing approximate nearest neighbor at recall time. Side-index refresh is triggered by every write and by the v0.23 resummerize rewrite path. The dirty-marker lifecycle is load-bearing: only full rebuilds clear the .dirty flag.", "created_at": "2026-04-18T10:00:00Z" }
+    ],
+    "evidence_keywords": ["usearch", "fire-and-forget", "mutex", "per-request", "extension"]
+  }
+]

@@ -414,7 +414,7 @@ pub struct GeminiExtractor {
 impl GeminiExtractor {
     pub fn new(api_key: String, endpoint: String, model: String) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_default();
         Self {
@@ -548,7 +548,8 @@ impl OmlxExtractor {
     ) -> ReinResult<String> {
         // Default extract path: prefer JSON mode (downstream parsers want
         // structured output), fall back to no-mode when the model rejects.
-        self.call_with_mode(text, system_prompt, /* prefer_json */ true).await
+        self.call_with_mode(text, system_prompt, /* prefer_json */ true)
+            .await
     }
 
     /// Prose-mode variant for callers (resummerize) whose system prompt
@@ -561,7 +562,8 @@ impl OmlxExtractor {
         text: &str,
         system_prompt: &str,
     ) -> ReinResult<String> {
-        self.call_with_mode(text, system_prompt, /* prefer_json */ false).await
+        self.call_with_mode(text, system_prompt, /* prefer_json */ false)
+            .await
     }
 
     async fn call_with_mode(
@@ -706,7 +708,9 @@ impl ExtractorKind {
             Self::Gemini(e) => e.extract(text).await,
             Self::Omlx(e) => e.extract(text).await,
             #[cfg(feature = "test-support")]
-            Self::Mock(_) => panic!("MockExtractor does not implement extract(); use raw_with_prompt()"),
+            Self::Mock(_) => {
+                panic!("MockExtractor does not implement extract(); use raw_with_prompt()")
+            }
         }
     }
 
@@ -724,7 +728,9 @@ impl ExtractorKind {
             Self::Gemini(e) => e.extract_full(text).await,
             Self::Omlx(e) => e.extract_full(text).await,
             #[cfg(feature = "test-support")]
-            Self::Mock(_) => panic!("MockExtractor does not implement extract_full(); use raw_with_prompt()"),
+            Self::Mock(_) => {
+                panic!("MockExtractor does not implement extract_full(); use raw_with_prompt()")
+            }
         }
     }
 }
@@ -737,9 +743,44 @@ impl ExtractorKind {
 /// rather than silently looping on stale output. The call counter lets
 /// tests assert exact LLM invocation counts.
 #[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+pub struct MockExtractorProbe {
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl MockExtractorProbe {
+    fn record(&self, system: &str, text: &str) {
+        self.calls
+            .lock()
+            .expect("MockExtractorProbe mutex poisoned")
+            .push((system.to_string(), text.to_string()));
+    }
+
+    /// Last system prompt passed to the mock extractor.
+    pub fn last_system_prompt(&self) -> Option<String> {
+        self.calls
+            .lock()
+            .expect("MockExtractorProbe mutex poisoned")
+            .last()
+            .map(|(system, _)| system.clone())
+    }
+
+    /// Last user/text prompt passed to the mock extractor.
+    pub fn last_text_prompt(&self) -> Option<String> {
+        self.calls
+            .lock()
+            .expect("MockExtractorProbe mutex poisoned")
+            .last()
+            .map(|(_, text)| text.clone())
+    }
+}
+
+#[cfg(feature = "test-support")]
 pub struct MockExtractor {
     responses: std::sync::Mutex<std::collections::VecDeque<Result<String, String>>>,
     call_count: std::sync::atomic::AtomicUsize,
+    probe: Option<MockExtractorProbe>,
 }
 
 #[cfg(feature = "test-support")]
@@ -751,12 +792,35 @@ impl MockExtractor {
         Self {
             responses: std::sync::Mutex::new(responses.into()),
             call_count: std::sync::atomic::AtomicUsize::new(0),
+            probe: None,
         }
+    }
+
+    /// Build a mock plus a probe that records system/text prompts per call.
+    pub fn with_responses_and_probe(
+        responses: Vec<Result<String, String>>,
+    ) -> (Self, MockExtractorProbe) {
+        let probe = MockExtractorProbe::default();
+        (
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                probe: Some(probe.clone()),
+            },
+            probe,
+        )
     }
 
     /// Convenience: a mock that returns the same `Ok(response)` once.
     pub fn with_fixed_response(response: impl Into<String>) -> Self {
         Self::with_responses(vec![Ok(response.into())])
+    }
+
+    /// Convenience: a one-shot successful mock plus prompt probe.
+    pub fn with_fixed_response_and_probe(
+        response: impl Into<String>,
+    ) -> (Self, MockExtractorProbe) {
+        Self::with_responses_and_probe(vec![Ok(response.into())])
     }
 
     /// Convenience: a mock that always errors (simulates LLM outage).
@@ -776,9 +840,12 @@ impl MockExtractor {
         self.call_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn respond(&self, _system: &str, _text: &str) -> ReinResult<String> {
+    async fn respond(&self, system: &str, text: &str) -> ReinResult<String> {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(probe) = &self.probe {
+            probe.record(system, text);
+        }
         let next = self
             .responses
             .lock()

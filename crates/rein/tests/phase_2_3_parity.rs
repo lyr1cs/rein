@@ -1018,6 +1018,9 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
             last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            living_summary: None,
+            living_summary_updated_at: None,
+            living_summary_source_revision: None,
         };
 
         store
@@ -1077,6 +1080,9 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
             last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            living_summary: None,
+            living_summary_updated_at: None,
+            living_summary_source_revision: None,
         };
         store
             .add_concept(make_concept("dc_c1", "adaptive engine"))
@@ -1131,6 +1137,9 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
             last_episode_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            living_summary: None,
+            living_summary_updated_at: None,
+            living_summary_source_revision: None,
         };
         store
             .add_concept(make_concept("dc_c1", "adaptive engine"))

@@ -74,9 +74,13 @@ pub enum ShipDecision {
 
 /// Why the treatment was accepted.
 ///
-/// `Superior` fires only when we have a statistically significant win on
-/// hit-rate. `NonInferiorAndShorter` fires when we can't distinguish hit-rates
-/// (within the baseline noise floor) but the treatment is materially shorter.
+/// `Superior` fires on a statistically significant hit-rate win.
+/// `NonInferiorAndShorter` applies to the v0.23 resummerize regime where
+/// the treatment must both tie on quality AND materially shorten context.
+/// `NonInferior` applies to the v0.24 ARS regime where the treatment is
+/// additive by design (a `living_summary` is appended to the baseline
+/// surface, so the treatment's byte length will always exceed baseline);
+/// only hit-rate non-inferiority matters.
 #[derive(Debug, Clone, Serialize)]
 pub enum ShipReason {
     Superior {
@@ -87,29 +91,50 @@ pub enum ShipReason {
         ci_lower: f64,
         noise_floor: f64,
     },
+    NonInferior {
+        ci_lower: f64,
+        noise_floor: f64,
+    },
 }
 
-/// Apply the v0.23 ship policy to an overall McNemar result and per-category
+/// Selects the ship-decision rule family. Different evaluation regimes have
+/// materially different length semantics, so the non-inferiority tail of the
+/// policy differs.
+#[derive(Debug, Clone, Copy)]
+pub enum DecideShipKind {
+    /// v0.23 resummerize rule. Non-inferiority ship requires the treatment
+    /// to also be materially shorter (≥10% reduction) — because the entire
+    /// point of resummerize is compression.
+    Compression,
+    /// v0.24 ARS rule. Non-inferiority ship does NOT require shorter
+    /// output — living summaries are additive content. `avg_length_ratio`
+    /// is ignored here; callers can still inspect it manually for
+    /// runaway-length signals.
+    Synthesis,
+}
+
+/// Apply the ship policy to an overall McNemar result and per-category
 /// stats. Rule ordering:
 ///   1. Superior — `p_value < 0.05 AND diff_point > 0`
 ///   2. Category regression — any category significantly worse → BailOut
-///   3. NonInferiorAndShorter — CI lower bound above `-noise_floor` AND
-///      treatment length is <90% of baseline
+///   3. Non-inferiority (kind-dependent):
+///      - `Compression` → CI lower bound above `-noise_floor` AND treatment
+///        length is <90% of baseline
+///      - `Synthesis` → CI lower bound above `-noise_floor` (length ignored)
 ///   4. Otherwise — BailOut
 ///
-/// `noise_floor` (δ₀) comes from baseline variance runs; it bounds how much
-/// hit-rate we're willing to trade for a shorter context. `avg_length_ratio`
-/// is mean(treatment_length)/mean(baseline_length) over the full set.
+/// `noise_floor` (δ₀) bounds how much hit-rate we'll trade away.
+/// `avg_length_ratio` is `mean(treatment_length)/mean(baseline_length)`;
+/// only consulted under `Compression`.
 ///
-/// NaN inputs are handled conservatively: NaN-comparisons are all false, so
-/// a NaN `ci_lower` naturally lands in BailOut.
+/// NaN inputs land in BailOut (NaN-comparisons are all false).
 pub fn decide_ship(
     overall: &McNemarResult,
     per_category: &HashMap<String, CategoryStats>,
     noise_floor: f64,
     avg_length_ratio: f64,
+    kind: DecideShipKind,
 ) -> ShipDecision {
-    // 1. Superior.
     if overall.p_value < 0.05 && overall.diff_point > 0.0 {
         return ShipDecision::Ship {
             reason: ShipReason::Superior {
@@ -119,7 +144,6 @@ pub fn decide_ship(
         };
     }
 
-    // 2. Category regression — outranks non-inferiority ship.
     for (cat, stats) in per_category {
         if stats.mcnemar.p_value < 0.05 && stats.mcnemar.diff_point < 0.0 {
             return ShipDecision::BailOut {
@@ -129,23 +153,39 @@ pub fn decide_ship(
         }
     }
 
-    // 3. Non-inferior and shorter.
-    if overall.ci_lower > -noise_floor && avg_length_ratio < 0.9 {
-        let avg_length_reduction_pct = (1.0 - avg_length_ratio) * 100.0;
-        return ShipDecision::Ship {
-            reason: ShipReason::NonInferiorAndShorter {
-                avg_length_reduction_pct,
-                ci_lower: overall.ci_lower,
-                noise_floor,
-            },
-            overall: overall.clone(),
-        };
-    }
-
-    // 4. Neither superior nor non-inferior-and-shorter.
-    ShipDecision::BailOut {
-        reason: "neither superior nor non-inferior-and-shorter".into(),
-        overall: overall.clone(),
+    match kind {
+        DecideShipKind::Compression => {
+            if overall.ci_lower > -noise_floor && avg_length_ratio < 0.9 {
+                let avg_length_reduction_pct = (1.0 - avg_length_ratio) * 100.0;
+                return ShipDecision::Ship {
+                    reason: ShipReason::NonInferiorAndShorter {
+                        avg_length_reduction_pct,
+                        ci_lower: overall.ci_lower,
+                        noise_floor,
+                    },
+                    overall: overall.clone(),
+                };
+            }
+            ShipDecision::BailOut {
+                reason: "neither superior nor non-inferior-and-shorter".into(),
+                overall: overall.clone(),
+            }
+        }
+        DecideShipKind::Synthesis => {
+            if overall.ci_lower > -noise_floor {
+                return ShipDecision::Ship {
+                    reason: ShipReason::NonInferior {
+                        ci_lower: overall.ci_lower,
+                        noise_floor,
+                    },
+                    overall: overall.clone(),
+                };
+            }
+            ShipDecision::BailOut {
+                reason: "neither superior nor non-inferior".into(),
+                overall: overall.clone(),
+            }
+        }
     }
 }
 
@@ -186,7 +226,13 @@ mod tests {
         // Significant win: p < 0.05, diff > 0.
         let overall = m(0.001, 0.08, 0.02, 0.14);
         let per_category = HashMap::new();
-        let d = decide_ship(&overall, &per_category, 0.03, 0.95);
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            0.03,
+            0.95,
+            DecideShipKind::Compression,
+        );
         match d {
             ShipDecision::Ship {
                 reason: ShipReason::Superior { p_value },
@@ -206,7 +252,13 @@ mod tests {
         let per_category = HashMap::new();
         let noise_floor = 0.03;
         let length_ratio = 0.6;
-        let d = decide_ship(&overall, &per_category, noise_floor, length_ratio);
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            noise_floor,
+            length_ratio,
+            DecideShipKind::Compression,
+        );
         match d {
             ShipDecision::Ship {
                 reason:
@@ -226,6 +278,59 @@ mod tests {
     }
 
     #[test]
+    fn synthesis_non_inferior_ships_despite_longer_length() {
+        // ARS regime: treatment_length >> baseline_length is expected and not
+        // a bail reason. Non-inferior hit-rate CI alone is sufficient to ship.
+        let overall = m(0.3, -0.005, -0.02, 0.01);
+        let per_category = HashMap::new();
+        let noise_floor = 0.03;
+        let length_ratio = 2.7; // synthesis is additive
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            noise_floor,
+            length_ratio,
+            DecideShipKind::Synthesis,
+        );
+        match d {
+            ShipDecision::Ship {
+                reason:
+                    ShipReason::NonInferior {
+                        ci_lower,
+                        noise_floor: nf,
+                    },
+                ..
+            } => {
+                assert!((ci_lower - (-0.02)).abs() < 1e-9);
+                assert!((nf - 0.03).abs() < 1e-9);
+            }
+            other => panic!("expected NonInferior, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesis_bails_when_ci_below_noise_floor() {
+        // Treatment regresses beyond the allowed δ₀ → BailOut even in
+        // Synthesis mode.
+        let overall = m(0.3, -0.10, -0.20, 0.01);
+        let per_category = HashMap::new();
+        let noise_floor = 0.03;
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            noise_floor,
+            2.7,
+            DecideShipKind::Synthesis,
+        );
+        match d {
+            ShipDecision::BailOut { reason, .. } => {
+                assert!(reason.contains("neither superior nor non-inferior"));
+            }
+            other => panic!("expected BailOut, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn category_regression_bailout() {
         // Overall looks fine for non-inferiority (CI > -noise, length ratio low),
         // but one category is significantly worse → BailOut outranks the ship.
@@ -235,8 +340,17 @@ mod tests {
             "single_session".to_string(),
             cat_stats(m(0.01, -0.1, -0.15, -0.05)),
         );
-        per_category.insert("multi_session".to_string(), cat_stats(m(0.4, 0.01, -0.03, 0.05)));
-        let d = decide_ship(&overall, &per_category, 0.03, 0.6);
+        per_category.insert(
+            "multi_session".to_string(),
+            cat_stats(m(0.4, 0.01, -0.03, 0.05)),
+        );
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            0.03,
+            0.6,
+            DecideShipKind::Compression,
+        );
         match d {
             ShipDecision::BailOut { reason, .. } => {
                 assert!(
@@ -254,7 +368,13 @@ mod tests {
         // Not significantly better AND not materially shorter.
         let overall = m(0.3, -0.005, -0.02, 0.01);
         let per_category = HashMap::new();
-        let d = decide_ship(&overall, &per_category, 0.03, 0.95);
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            0.03,
+            0.95,
+            DecideShipKind::Compression,
+        );
         match d {
             ShipDecision::BailOut { reason, .. } => {
                 assert_eq!(reason, "neither superior nor non-inferior-and-shorter");
@@ -270,7 +390,13 @@ mod tests {
         let overall = m(0.001, 0.08, 0.02, 0.14);
         let mut per_category = HashMap::new();
         per_category.insert("x".to_string(), cat_stats(m(0.01, -0.1, -0.15, -0.05)));
-        let d = decide_ship(&overall, &per_category, 0.03, 0.95);
+        let d = decide_ship(
+            &overall,
+            &per_category,
+            0.03,
+            0.95,
+            DecideShipKind::Compression,
+        );
         assert!(matches!(
             d,
             ShipDecision::Ship {

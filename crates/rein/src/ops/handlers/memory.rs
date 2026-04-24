@@ -435,6 +435,13 @@ pub struct ConceptHistoryOutput {
     pub current_revision: u32,
     pub current_confidence: f32,
     pub current_definition: String,
+    /// v0.24 ARS: rolling LLM-generated summary of the concept's current state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub living_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub living_summary_updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub living_summary_source_revision: Option<u32>,
     pub history: Vec<ConceptRevisionSummary>,
 }
 
@@ -461,6 +468,9 @@ impl IntoMarkdown for ConceptHistoryOutput {
             self.current_confidence,
             self.current_definition
         )];
+        if let Some(summary) = &self.living_summary {
+            lines.push(format!("### Living summary\n{summary}\n"));
+        }
         if self.history.is_empty() {
             lines.push("No revision history (concept has not been refined yet).".to_string());
         } else {
@@ -977,6 +987,11 @@ impl OpsRuntime {
                 current_revision: current.revision,
                 current_confidence: current.confidence,
                 current_definition: current.definition,
+                living_summary: current.living_summary,
+                living_summary_updated_at: current
+                    .living_summary_updated_at
+                    .map(|dt| dt.to_rfc3339()),
+                living_summary_source_revision: current.living_summary_source_revision,
                 history: history
                     .into_iter()
                     .map(|rev| ConceptRevisionSummary {

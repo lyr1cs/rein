@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { LinkObject, NodeObject } from 'react-force-graph-2d';
-import { apiGet } from '../api/client';
-import type { Concept, ConceptLink } from '../api/types';
+import { apiGet, getConceptState } from '../api/client';
+import type { Concept, ConceptLink, ConceptState } from '../api/types';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -77,6 +77,25 @@ function getPollingIntervalMs(): number {
   return Number.isFinite(seconds) ? seconds * 1000 : 5000;
 }
 
+/**
+ * Relative-time formatter for the "Auto-refreshed {X ago}" meta line of the
+ * living_summary card. Mirrors the `timeAgo` helper in `Memories.tsx` so the
+ * whole app reads dates consistently (shy of pulling in date-fns).
+ */
+function timeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(diff) || diff < 0) return 'just now';
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  return `${months}mo ago`;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Relation-type colors                                              */
 /* ------------------------------------------------------------------ */
@@ -123,6 +142,12 @@ export default function Graph() {
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [search, setSearch] = useState('');
   const [reloadVersion, setReloadVersion] = useState(0);
+
+  /* Concept state (v0.24 ARS Capability A): living_summary snapshot for the
+   * currently-selected concept. Null when no node selected, the fetch is
+   * in-flight, or the fetch failed — the UI treats all three as "hide the
+   * section" per the silent-fallback contract. */
+  const [conceptState, setConceptState] = useState<ConceptState | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState(() => ({
@@ -234,6 +259,29 @@ export default function Graph() {
 
     return () => { cancelled = true; };
   }, [selectedMemoir, reloadVersion]);
+
+  /* ---- Fetch concept state when a node is selected ----
+   *
+   * v0.24 ARS Capability A: surface `living_summary` alongside the concept
+   * detail. Any fetch failure silently collapses the section (no toast, no
+   * placeholder) so the rest of the panel remains functional if the REST
+   * endpoint is missing (e.g. pre-v0.24 backend). */
+  useEffect(() => {
+    if (!selectedNode) {
+      setConceptState(null);
+      return;
+    }
+    let cancelled = false;
+    setConceptState(null);
+    getConceptState(selectedNode.id)
+      .then((state) => {
+        if (!cancelled) setConceptState(state);
+      })
+      .catch(() => {
+        if (!cancelled) setConceptState(null);
+      });
+    return () => { cancelled = true; };
+  }, [selectedNode]);
 
   /* ---- Resize observer ---- */
   useEffect(() => {
@@ -515,6 +563,28 @@ export default function Graph() {
                 x
               </button>
             </div>
+
+            {/* Current state — living_summary card (v0.24 ARS Capability A).
+                Rendered only when the REST fetch returned a non-null summary;
+                on null / fetch failure the section is hidden entirely. */}
+            {conceptState?.living_summary && (
+              <div className="mb-4 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)]/60 p-3">
+                <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider mb-1.5">
+                  Current state
+                </div>
+                <div className="text-xs text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap line-clamp-5">
+                  {conceptState.living_summary}
+                </div>
+                {conceptState.living_summary_updated_at && (
+                  <div className="text-[10px] text-[var(--text-muted)] mt-2">
+                    Auto-refreshed {timeAgo(conceptState.living_summary_updated_at)}
+                    {conceptState.living_summary_source_revision != null && (
+                      <> from revision #{conceptState.living_summary_source_revision}</>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Revision + confidence */}
             <div className="flex items-center gap-3 text-xs text-[var(--text-muted)] mb-3">

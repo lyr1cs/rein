@@ -14,17 +14,8 @@
 //!
 //! ## Binary name
 //!
-//! Cargo auto-discovers `src/bin/rein_eval.rs` as a binary target named
-//! `rein_eval` (underscore). If the hyphenated name `rein-eval` is desired,
-//! the main thread needs to add a `[[bin]]` entry in `crates/rein/Cargo.toml`:
-//!
-//! ```toml
-//! [[bin]]
-//! name = "rein-eval"
-//! path = "src/bin/rein_eval.rs"
-//! ```
-//!
-//! Until then, invoke as `cargo run -p rein --bin rein_eval -- ...`.
+//! Cargo uses the explicit `[[bin]]` entry in `crates/rein/Cargo.toml`, so
+//! invoke as `cargo run -p rein --bin rein-eval -- ...`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -35,18 +26,26 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use rein::compression::contract::{self, ContractInput, EvidenceEntry};
 use rein::config::ReinConfig;
+use rein::eval::concept_summary::score_concept_case;
 use rein::eval::{
-    decide_ship, mcnemar, CategoryStats, HitChecker, KeywordOverlapHitChecker, McNemarResult,
-    PairedOutcome, Scorecard, ShipDecision, ShipReason,
+    decide_ship, mcnemar, CategoryStats, DecideShipKind, HitChecker, KeywordOverlapHitChecker,
+    McNemarResult, PairedOutcome, Scorecard, ShipDecision, ShipReason,
 };
-use rein::extract::llm::strip_code_fences;
+use rein::extract::llm::{strip_code_fences, ExtractorKind};
 // NOTE: `call_llm_sync` in ops::resummerize uses SYSTEM_PROMPT internally —
 // the eval bin doesn't need to import it directly. Importing `build_prompt`
 // and `call_llm_sync` is enough; the system prompt travels with the call.
 // `create_resummerize_extractor` is used instead of `create_extractor` so
 // the eval honors `[resummerize].llm_backend` the same way production
 // does (post-fix audit M-1).
-use rein::ops::resummerize::{build_prompt, call_llm_sync, create_resummerize_extractor};
+use rein::ops::concept_summary::{
+    build_concept_summary_prompt, call_llm_sync as call_concept_summary_llm_sync,
+    create_concept_summary_extractor,
+};
+use rein::ops::resummerize::{
+    build_prompt, call_llm_sync as call_resummerize_llm_sync, create_resummerize_extractor,
+};
+use rein::types::{Concept, ConceptRevision};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -66,6 +65,15 @@ enum Commands {
     Resummerize {
         #[command(subcommand)]
         action: ResummerizeAction,
+    },
+    /// Evaluation routines for the v0.24 ARS Capability A concept living-summary
+    /// feature. Parallel to `resummerize`: baseline scores the raw concept
+    /// definition, `run` invokes the LLM to produce a living summary and
+    /// scores `definition + " " + living_summary`, and `compare` runs paired
+    /// McNemar + ship/bail-out.
+    ConceptSummary {
+        #[command(subcommand)]
+        action: ConceptSummaryAction,
     },
 }
 
@@ -124,6 +132,53 @@ enum ResummerizeAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ConceptSummaryAction {
+    /// Score the raw concept `definition` (no living summary) against each
+    /// fixture's `evidence_keywords`. No LLM required — the fixture's
+    /// `definition` IS the baseline state.
+    Baseline {
+        /// Directory containing concept-summary fixture JSON files.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Output path for the scorecard JSON.
+        #[arg(long, default_value = "concept_summary_baseline_scorecard.json")]
+        output: PathBuf,
+    },
+    /// Run the living-summary treatment: construct a synthetic `Concept` +
+    /// revision list from each fixture, call the configured LLM via
+    /// `build_concept_summary_prompt` + `create_concept_summary_extractor`,
+    /// and score `definition + " " + living_summary` against the fixture's
+    /// `evidence_keywords`. Errors cleanly if no LLM provider is configured.
+    Run {
+        /// Directory containing concept-summary fixture JSON files.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Output path for the scorecard JSON.
+        #[arg(long, default_value = "concept_summary_treatment_scorecard.json")]
+        output: PathBuf,
+        /// Print per-case LLM output previews (200-char snippet) on failure
+        /// or empty response. Useful for diagnosing a low hit rate without
+        /// re-running the costly LLM passes. Off by default.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+    /// Compare a baseline and a treatment scorecard via paired McNemar and
+    /// apply the ship-or-bail policy (reuses the resummerize decision path).
+    Compare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        treatment: PathBuf,
+        /// Hit-rate difference tolerated as noise when calling
+        /// non-inferiority. Tighter than resummerize's 0.03 default because
+        /// ARS Capability A is expected to materially improve keyword
+        /// recall rather than hold hit-rate flat.
+        #[arg(long, default_value_t = 0.02)]
+        noise_floor: f64,
+    },
+}
+
 /// Fixture schema mirroring the JSON layout under
 /// `crates/rein/tests/fixtures/resummerize/`. Every field except `case_id`
 /// is optional so partially-populated fixtures still parse; the commands
@@ -172,6 +227,102 @@ impl Fixture {
     }
 }
 
+/// Fixture schema for the v0.24 ARS Capability A concept-summary eval.
+///
+/// `definition` is the current canonical definition of the concept (what
+/// `Concept.definition` would hold in the DB). `revisions` carries the
+/// historical snapshots (oldest first; the last entry's `definition` should
+/// equal the top-level `definition` — mirrors the DB invariant that
+/// `concept_revisions` includes a row for the current state). The harness
+/// synthesizes a `Concept` + `Vec<ConceptRevision>` from these to feed
+/// `build_concept_summary_prompt`.
+///
+/// `evidence_keywords` are the terms whose presence in `definition` +
+/// optional `living_summary` determines a scored hit — see
+/// [`rein::eval::concept_summary::score_concept_case`].
+#[derive(Debug, Deserialize, Serialize)]
+struct ConceptFixture {
+    case_id: String,
+    #[serde(default)]
+    category: Option<String>,
+    name: String,
+    definition: String,
+    #[serde(default)]
+    revisions: Vec<ConceptFixtureRevision>,
+    #[serde(default)]
+    evidence_keywords: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ConceptFixtureRevision {
+    revision: u32,
+    definition: String,
+    created_at: String,
+}
+
+impl ConceptFixture {
+    /// Build a synthetic `Concept` for `build_concept_summary_prompt`. The
+    /// `revision` field is taken from the last revision's number so a
+    /// downstream "revisions since last summary" computation (if Agent 1
+    /// uses it) sees a consistent value.
+    fn to_concept(&self) -> Concept {
+        let now = Utc::now();
+        let last_rev = self.revisions.last().map(|r| r.revision).unwrap_or(1);
+        Concept {
+            id: format!("concept:{}", self.case_id),
+            memoir_id: "eval_memoir".to_string(),
+            name: self.name.clone(),
+            definition: self.definition.clone(),
+            labels: vec![],
+            source_memory_ids: vec![],
+            confidence: 1.0,
+            revision: last_rev,
+            last_episode_id: None,
+            created_at: self
+                .revisions
+                .first()
+                .and_then(|r| DateTime::parse_from_rfc3339(&r.created_at).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now),
+            updated_at: self
+                .revisions
+                .last()
+                .and_then(|r| DateTime::parse_from_rfc3339(&r.created_at).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now),
+            living_summary: None,
+            living_summary_updated_at: None,
+            living_summary_source_revision: None,
+        }
+    }
+
+    /// Build the synthetic `Vec<ConceptRevision>` for the prompt. Ordered
+    /// oldest-first, which is how the DB returns revisions when queried
+    /// via `list_concept_revisions`.
+    fn to_revisions(&self) -> Vec<ConceptRevision> {
+        let concept_id = format!("concept:{}", self.case_id);
+        self.revisions
+            .iter()
+            .map(|r| {
+                let created = DateTime::parse_from_rfc3339(&r.created_at)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                ConceptRevision {
+                    id: format!("{concept_id}:rev:{}", r.revision),
+                    concept_id: concept_id.clone(),
+                    revision: r.revision,
+                    definition: r.definition.clone(),
+                    confidence: 1.0,
+                    labels: vec![],
+                    source_memory_ids: vec![],
+                    episode_id: None,
+                    created_at: created,
+                }
+            })
+            .collect()
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -191,7 +342,32 @@ fn main() -> Result<()> {
                 baseline,
                 treatment,
                 noise_floor,
-            } => cmd_compare(&baseline, &treatment, noise_floor),
+            } => cmd_compare(
+                &baseline,
+                &treatment,
+                noise_floor,
+                DecideShipKind::Compression,
+            ),
+        },
+        Commands::ConceptSummary { action } => match action {
+            ConceptSummaryAction::Baseline { fixtures, output } => {
+                cmd_concept_summary_baseline(&fixtures, &output)
+            }
+            ConceptSummaryAction::Run {
+                fixtures,
+                output,
+                verbose,
+            } => cmd_concept_summary_run(&fixtures, &output, verbose),
+            ConceptSummaryAction::Compare {
+                baseline,
+                treatment,
+                noise_floor,
+            } => cmd_compare(
+                &baseline,
+                &treatment,
+                noise_floor,
+                DecideShipKind::Synthesis,
+            ),
         },
     }
 }
@@ -244,6 +420,7 @@ fn cmd_baseline(fixtures: &Path, iterations: u32, output: &Path) -> Result<()> {
             treatment_hit: false,
             baseline_length: canonical.len(),
             treatment_length: 0,
+            treatment_summary: None,
         });
     }
 
@@ -316,7 +493,14 @@ fn cmd_run(fixtures: &Path, iterations: u32, output: &Path, verbose: bool) -> Re
         iterations,
     );
 
-    run_treatment_with_extractor(&fixtures_list, &extractor, iterations, output, fixtures, verbose)
+    run_treatment_with_extractor(
+        &fixtures_list,
+        &extractor,
+        iterations,
+        output,
+        fixtures,
+        verbose,
+    )
 }
 
 /// Treatment loop extracted so unit tests can drive it with a `MockExtractor`
@@ -346,10 +530,7 @@ fn run_treatment_with_extractor(
             continue;
         };
         if fx.evidence.is_empty() {
-            eprintln!(
-                "[rein-eval] run: skipping {} (no evidence)",
-                fx.case_id
-            );
+            eprintln!("[rein-eval] run: skipping {} (no evidence)", fx.case_id);
             skipped += 1;
             continue;
         }
@@ -390,7 +571,7 @@ fn run_treatment_with_extractor(
         let mut last_output: Option<String> = None;
         let mut last_err: Option<String> = None;
         for _ in 0..iterations.max(1) {
-            match call_llm_sync(extractor, &prompt) {
+            match call_resummerize_llm_sync(extractor, &prompt) {
                 Ok(text) => {
                     last_output = Some(strip_code_fences(&text));
                     last_err = None;
@@ -427,6 +608,7 @@ fn run_treatment_with_extractor(
                 // Keep-tail stays in effect → effective treatment ==
                 // baseline length.
                 treatment_length: canonical_len,
+                treatment_summary: None,
             });
             continue;
         };
@@ -479,6 +661,7 @@ fn run_treatment_with_extractor(
             treatment_hit,
             baseline_length: canonical_len,
             treatment_length,
+            treatment_summary: None,
         });
     }
 
@@ -548,7 +731,12 @@ fn build_category_map(fixtures_list: &[Fixture]) -> HashMap<String, String> {
 
 // --- compare (fully implemented) -------------------------------------------
 
-fn cmd_compare(baseline: &Path, treatment: &Path, noise_floor: f64) -> Result<()> {
+fn cmd_compare(
+    baseline: &Path,
+    treatment: &Path,
+    noise_floor: f64,
+    kind: DecideShipKind,
+) -> Result<()> {
     let base: Scorecard = load_scorecard(baseline)?;
     let treat: Scorecard = load_scorecard(treatment)?;
 
@@ -579,10 +767,16 @@ fn cmd_compare(baseline: &Path, treatment: &Path, noise_floor: f64) -> Result<()
     // Merge by case_id. Take baseline_hit/baseline_length from the baseline
     // scorecard and treatment_hit/treatment_length from the treatment
     // scorecard. Cases that only appear in one file are counted and reported.
-    let base_by_id: HashMap<&str, &PairedOutcome> =
-        base.outcomes.iter().map(|o| (o.case_id.as_str(), o)).collect();
-    let treat_by_id: HashMap<&str, &PairedOutcome> =
-        treat.outcomes.iter().map(|o| (o.case_id.as_str(), o)).collect();
+    let base_by_id: HashMap<&str, &PairedOutcome> = base
+        .outcomes
+        .iter()
+        .map(|o| (o.case_id.as_str(), o))
+        .collect();
+    let treat_by_id: HashMap<&str, &PairedOutcome> = treat
+        .outcomes
+        .iter()
+        .map(|o| (o.case_id.as_str(), o))
+        .collect();
 
     let mut paired: Vec<PairedOutcome> = Vec::new();
     for (id, base_o) in &base_by_id {
@@ -593,12 +787,19 @@ fn cmd_compare(baseline: &Path, treatment: &Path, noise_floor: f64) -> Result<()
                 treatment_hit: treat_o.treatment_hit,
                 baseline_length: base_o.baseline_length,
                 treatment_length: treat_o.treatment_length,
+                treatment_summary: None,
             });
         }
     }
 
-    let only_in_baseline = base_by_id.keys().filter(|k| !treat_by_id.contains_key(*k)).count();
-    let only_in_treatment = treat_by_id.keys().filter(|k| !base_by_id.contains_key(*k)).count();
+    let only_in_baseline = base_by_id
+        .keys()
+        .filter(|k| !treat_by_id.contains_key(*k))
+        .count();
+    let only_in_treatment = treat_by_id
+        .keys()
+        .filter(|k| !base_by_id.contains_key(*k))
+        .count();
     if only_in_baseline > 0 || only_in_treatment > 0 {
         eprintln!(
             "[rein-eval] case_id mismatch: {only_in_baseline} only in baseline, \
@@ -626,9 +827,16 @@ fn cmd_compare(baseline: &Path, treatment: &Path, noise_floor: f64) -> Result<()
         f64::NAN
     };
 
-    let decision = decide_ship(&overall, &per_category, noise_floor, ratio);
+    let decision = decide_ship(&overall, &per_category, noise_floor, ratio, kind);
 
-    print_summary(&paired, &overall, &per_category, mean_base_len, mean_treat_len, ratio);
+    print_summary(
+        &paired,
+        &overall,
+        &per_category,
+        mean_base_len,
+        mean_treat_len,
+        ratio,
+    );
     print_decision(&decision, noise_floor);
     Ok(())
 }
@@ -674,7 +882,11 @@ fn compute_per_category(
         // ':' (e.g. "single_session:case_3" -> "single_session"). If a
         // case_id has no colon, we skip it for per-category analysis.
         for o in paired {
-            if let Some(cat) = o.case_id.split_once(':').map(|(prefix, _)| prefix.to_string()) {
+            if let Some(cat) = o
+                .case_id
+                .split_once(':')
+                .map(|(prefix, _)| prefix.to_string())
+            {
                 groups.entry(cat).or_default().push(o.clone());
             }
         }
@@ -717,7 +929,9 @@ fn print_summary(
     mean_treat_len: f64,
     ratio: f64,
 ) {
-    println!("=== rein-eval: resummerize compare ===");
+    // Header kept generic: `cmd_compare` is shared by the resummerize and
+    // concept-summary subcommands, so the banner must not claim either one.
+    println!("=== rein-eval: compare ===");
     println!("paired cases : {}", paired.len());
     println!(
         "avg length   : baseline={mean_base_len:.1}  treatment={mean_treat_len:.1}  \
@@ -746,7 +960,11 @@ fn print_summary(
             let s = &per_category[k];
             println!(
                 "  {k:30} n={:<4}  hit base/treat={:.3}/{:.3}  diff={:+.4}  p={:.4}",
-                s.n, s.baseline_hit_rate, s.treatment_hit_rate, s.mcnemar.diff_point, s.mcnemar.p_value
+                s.n,
+                s.baseline_hit_rate,
+                s.treatment_hit_rate,
+                s.mcnemar.diff_point,
+                s.mcnemar.p_value
             );
         }
     }
@@ -771,11 +989,299 @@ fn print_decision(d: &ShipDecision, noise_floor: f64) {
                      CI lower {ci_lower:.4} > -{nf:.3}"
                 );
             }
+            ShipReason::NonInferior {
+                ci_lower,
+                noise_floor: nf,
+            } => {
+                println!(
+                    "SHIP (NonInferior): CI lower {ci_lower:.4} > -{nf:.3} \
+                     (length ignored — synthesis regime)"
+                );
+            }
         },
         ShipDecision::BailOut { reason, .. } => {
             println!("BAIL OUT: {reason}");
         }
     }
+}
+
+// --- concept-summary subcommand -------------------------------------------
+
+/// Score each fixture's `definition` against its `evidence_keywords` with
+/// no living-summary component. Produces a baseline scorecard comparable
+/// against a treatment run via `cmd_compare` (reused from resummerize).
+fn cmd_concept_summary_baseline(fixtures: &Path, output: &Path) -> Result<()> {
+    let fixtures_list = load_concept_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!(
+            "no concept-summary fixtures found in {}",
+            fixtures.display()
+        );
+    }
+
+    let checker = KeywordOverlapHitChecker;
+    let mut outcomes = Vec::with_capacity(fixtures_list.len());
+    let mut skipped = 0usize;
+
+    for fx in &fixtures_list {
+        if fx.evidence_keywords.is_empty() {
+            eprintln!(
+                "[rein-eval] concept-summary baseline: skipping {} (no evidence_keywords)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+        // Baseline: score definition alone — no living summary. Mirrors
+        // the asymmetry documented on `score_concept_case`:
+        // baseline_length = definition.len().
+        let hit = score_concept_case(&fx.definition, None, &fx.evidence_keywords, &checker);
+        outcomes.push(PairedOutcome {
+            case_id: fx.case_id.clone(),
+            baseline_hit: hit,
+            treatment_hit: false,
+            baseline_length: fx.definition.len(),
+            treatment_length: 0,
+            treatment_summary: None,
+        });
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} had evidence_keywords — baseline scoring requires keywords",
+            fixtures.display()
+        );
+    }
+
+    let category_map = build_concept_category_map(&fixtures_list);
+    let sc = Scorecard {
+        fixtures_dir: fixtures.display().to_string(),
+        iterations: 1,
+        timestamp: Utc::now(),
+        outcomes,
+        per_category: HashMap::new(),
+        category_map,
+        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+    };
+    write_scorecard(output, &sc)?;
+
+    eprintln!(
+        "[rein-eval] concept-summary baseline: wrote {} scored cases ({} skipped) to {}",
+        sc.outcomes.len(),
+        skipped,
+        output.display()
+    );
+    Ok(())
+}
+
+/// Drive the living-summary treatment: synthesize Concept+revisions from
+/// each fixture, invoke `build_concept_summary_prompt` + the configured
+/// LLM (`create_concept_summary_extractor`), then score
+/// `definition + " " + living_summary` against `evidence_keywords`.
+fn cmd_concept_summary_run(fixtures: &Path, output: &Path, verbose: bool) -> Result<()> {
+    let config = ReinConfig::load().context("loading rein config for concept-summary run")?;
+    let extractor = create_concept_summary_extractor(&config).ok_or_else(|| {
+        anyhow!(
+            "no LLM extractor available for concept-summary — configure \
+             `[extract].provider` with a valid API key, or point Agent 1's \
+             concept-summary backend-selection at a live provider."
+        )
+    })?;
+
+    let fixtures_list = load_concept_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!(
+            "no concept-summary fixtures found in {}",
+            fixtures.display()
+        );
+    }
+
+    let extractor_tag = match &extractor {
+        ExtractorKind::Gemini(_) => "gemini",
+        ExtractorKind::Omlx(_) => "omlx",
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => "mock",
+    };
+    eprintln!(
+        "[rein-eval] concept-summary run: {} fixtures, extractor={}",
+        fixtures_list.len(),
+        extractor_tag,
+    );
+
+    let checker = KeywordOverlapHitChecker;
+    let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
+    let mut llm_failed = 0usize;
+    let mut empty_output = 0usize;
+    let mut skipped = 0usize;
+
+    for fx in &fixtures_list {
+        if fx.evidence_keywords.is_empty() {
+            eprintln!(
+                "[rein-eval] concept-summary run: skipping {} (no evidence_keywords)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+        if fx.revisions.is_empty() {
+            eprintln!(
+                "[rein-eval] concept-summary run: skipping {} (no revisions to summarize)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let concept = fx.to_concept();
+        let revisions = fx.to_revisions();
+        let prompt = build_concept_summary_prompt(&concept, &revisions);
+
+        // Use the production concept-summary LLM bridge so eval and
+        // canary exercise the same system prompt and provider shape.
+        let llm_result = call_concept_summary_llm_sync(&extractor, &prompt);
+        let baseline_len = fx.definition.len();
+
+        match llm_result {
+            Ok(text) => {
+                let living = strip_code_fences(&text);
+                if living.trim().is_empty() {
+                    if verbose {
+                        eprintln!(
+                            "[rein-eval] concept-summary run: {} empty LLM output",
+                            fx.case_id
+                        );
+                    }
+                    empty_output += 1;
+                    outcomes.push(PairedOutcome {
+                        case_id: fx.case_id.clone(),
+                        baseline_hit: false,
+                        treatment_hit: false,
+                        baseline_length: baseline_len,
+                        // Empty living_summary → treatment reads like
+                        // baseline alone; length reflects that.
+                        treatment_length: baseline_len,
+                        treatment_summary: None,
+                    });
+                    continue;
+                }
+                let hit = score_concept_case(
+                    &fx.definition,
+                    Some(&living),
+                    &fx.evidence_keywords,
+                    &checker,
+                );
+                // Treatment length: definition + " " + living_summary —
+                // the exact text that was scored (see
+                // `score_concept_case` docs on the asymmetry).
+                let treatment_len = baseline_len + 1 + living.len();
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: hit,
+                    baseline_length: baseline_len,
+                    treatment_length: treatment_len,
+                    treatment_summary: Some(living),
+                });
+            }
+            Err(e) => {
+                if verbose {
+                    let snippet: String = format!("{e}").chars().take(200).collect();
+                    eprintln!(
+                        "[rein-eval] concept-summary run: {} LLM error: {}",
+                        fx.case_id, snippet
+                    );
+                }
+                llm_failed += 1;
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: false,
+                    baseline_length: baseline_len,
+                    // Match resummerize's LLM-error convention: treatment
+                    // falls back to baseline-equivalent length.
+                    treatment_length: baseline_len,
+                    treatment_summary: None,
+                });
+            }
+        }
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} produced a scorable concept-summary treatment outcome (skipped={})",
+            fixtures.display(),
+            skipped,
+        );
+    }
+
+    let category_map = build_concept_category_map(&fixtures_list);
+    let sc = Scorecard {
+        fixtures_dir: fixtures.display().to_string(),
+        iterations: 1,
+        timestamp: Utc::now(),
+        outcomes,
+        per_category: HashMap::new(),
+        category_map,
+        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+    };
+    write_scorecard(output, &sc)?;
+
+    eprintln!(
+        "[rein-eval] concept-summary run: wrote {} scored cases ({} skipped, \
+         {} llm_failed, {} empty_output) to {}",
+        sc.outcomes.len(),
+        skipped,
+        llm_failed,
+        empty_output,
+        output.display()
+    );
+    Ok(())
+}
+
+fn build_concept_category_map(fixtures_list: &[ConceptFixture]) -> HashMap<String, String> {
+    fixtures_list
+        .iter()
+        .filter_map(|fx| {
+            fx.category
+                .as_ref()
+                .map(|c| (fx.case_id.clone(), c.clone()))
+        })
+        .collect()
+}
+
+fn load_concept_fixtures(dir: &Path) -> Result<Vec<ConceptFixture>> {
+    if !dir.exists() {
+        bail!("fixtures directory does not exist: {}", dir.display());
+    }
+    if !dir.is_dir() {
+        bail!("fixtures path is not a directory: {}", dir.display());
+    }
+    let mut out = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("reading fixtures dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading fixture {}", path.display()))?;
+        let cases: Vec<ConceptFixture> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing fixture {}", path.display()))?;
+        out.extend(cases);
+    }
+    if out.is_empty() {
+        return Err(anyhow!(
+            "no .json concept-summary fixtures found in {}",
+            dir.display()
+        ));
+    }
+    out.sort_by(|a, b| a.case_id.cmp(&b.case_id));
+    Ok(out)
 }
 
 // --- I/O helpers -----------------------------------------------------------
@@ -788,8 +1294,8 @@ fn load_fixtures(dir: &Path) -> Result<Vec<Fixture>> {
         bail!("fixtures path is not a directory: {}", dir.display());
     }
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("reading fixtures dir {}", dir.display()))?
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("reading fixtures dir {}", dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -799,8 +1305,8 @@ fn load_fixtures(dir: &Path) -> Result<Vec<Fixture>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let bytes = fs::read(&path)
-            .with_context(|| format!("reading fixture {}", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading fixture {}", path.display()))?;
         // Each seed fixture file is a JSON array of cases (per Agent B's
         // schema in `tests/fixtures/resummerize/*.json`). The previous
         // single-object parse failed on every shipped fixture; Codex
@@ -818,8 +1324,7 @@ fn load_fixtures(dir: &Path) -> Result<Vec<Fixture>> {
 }
 
 fn load_scorecard(path: &Path) -> Result<Scorecard> {
-    let bytes =
-        fs::read(path).with_context(|| format!("reading scorecard {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("reading scorecard {}", path.display()))?;
     let sc: Scorecard = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing scorecard {}", path.display()))?;
     Ok(sc)
@@ -871,7 +1376,11 @@ mod tests {
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rein_eval_test_{}_{}.json", name, std::process::id()));
+        p.push(format!(
+            "rein_eval_test_{}_{}.json",
+            name,
+            std::process::id()
+        ));
         p
     }
 
@@ -916,7 +1425,10 @@ mod tests {
             assert_eq!(o.treatment_length, mock_output.len());
         }
         // category_map populated from Fixture.category.
-        assert_eq!(sc.category_map.get("cjk_001").map(String::as_str), Some("cjk"));
+        assert_eq!(
+            sc.category_map.get("cjk_001").map(String::as_str),
+            Some("cjk")
+        );
         // per_category empty — `compare` derives it from joined data.
         assert!(sc.per_category.is_empty());
         let _ = fs::remove_file(&out_path);
@@ -930,9 +1442,8 @@ mod tests {
         let mut fx = mini_fixture("contradictions_001", "contradictions");
         fx.target_bytes = Some(200);
         let oversize_output = "x".repeat(3000) + " concise output brief replies user wants";
-        let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
-            oversize_output,
-        )]));
+        let extractor =
+            ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(oversize_output)]));
         let out_path = tmp_path("contract_violation");
         let res = run_treatment_with_extractor(
             &[fx],
@@ -997,7 +1508,7 @@ mod tests {
         let mock_output =
             "user prefers concise output user wants brief concise replies and short summaries";
         let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
-            mock_output.to_string(),
+            mock_output.to_string()
         )]));
         let out_path = tmp_path("skip_no_target");
         let res = run_treatment_with_extractor(
@@ -1033,6 +1544,7 @@ mod tests {
                     treatment_hit: false,
                     baseline_length: 100,
                     treatment_length: 0,
+                    treatment_summary: None,
                 },
                 PairedOutcome {
                     case_id: "cjk_002".into(),
@@ -1040,6 +1552,7 @@ mod tests {
                     treatment_hit: false,
                     baseline_length: 200,
                     treatment_length: 0,
+                    treatment_summary: None,
                 },
             ],
             per_category: HashMap::new(),
@@ -1062,6 +1575,7 @@ mod tests {
                     treatment_hit: true,
                     baseline_length: 100,
                     treatment_length: 50,
+                    treatment_summary: None,
                 },
                 PairedOutcome {
                     case_id: "cjk_002".into(),
@@ -1069,6 +1583,7 @@ mod tests {
                     treatment_hit: true,
                     baseline_length: 200,
                     treatment_length: 80,
+                    treatment_summary: None,
                 },
             ],
             per_category: HashMap::new(),
@@ -1095,6 +1610,7 @@ mod tests {
                         treatment_hit: t.treatment_hit,
                         baseline_length: b.baseline_length,
                         treatment_length: t.treatment_length,
+                        treatment_summary: None,
                     })
             })
             .collect();
@@ -1112,5 +1628,58 @@ mod tests {
         assert_eq!(cjk.mcnemar.b, 0);
         assert_eq!(cjk.mcnemar.c, 1);
         assert_eq!(cjk.mcnemar.d, 0);
+    }
+
+    #[test]
+    fn concept_summary_eval_uses_production_system_prompt() {
+        let (mock, probe) = MockExtractor::with_fixed_response_and_probe("summary");
+        let extractor = ExtractorKind::Mock(mock);
+
+        let output = call_concept_summary_llm_sync(&extractor, "concept prompt").unwrap();
+
+        assert_eq!(output, "summary");
+        let system = probe
+            .last_system_prompt()
+            .expect("mock should record the system prompt");
+        assert!(
+            system.contains("concept-state synthesizer"),
+            "eval must use the production concept-summary system prompt; got: {system}"
+        );
+        assert!(
+            system.contains("preserve exact identifiers"),
+            "eval must preserve the identifier-preservation instructions; got: {system}"
+        );
+    }
+
+    #[test]
+    fn resummerize_phase2_fixtures_parse() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/resummerize-phase2");
+        let fixtures = load_fixtures(&dir).expect("phase2 resummerize fixtures should parse");
+
+        assert_eq!(fixtures.len(), 30);
+        assert!(
+            fixtures.iter().all(|f| f.target_bytes.is_some()),
+            "phase2 fixtures must set target_bytes so treatment scoring is deterministic"
+        );
+        assert!(
+            fixtures.iter().all(|f| !f.evidence.is_empty()),
+            "phase2 fixtures must include evidence rows"
+        );
+    }
+
+    #[test]
+    fn concept_summary_fixtures_parse() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/concept_summary");
+        let fixtures = load_concept_fixtures(&dir).expect("concept-summary fixtures should parse");
+
+        assert_eq!(fixtures.len(), 6);
+        assert!(
+            fixtures.iter().all(|f| !f.revisions.is_empty()),
+            "concept-summary fixtures must include revision history"
+        );
+        assert!(
+            fixtures.iter().all(|f| !f.evidence_keywords.is_empty()),
+            "concept-summary fixtures must include evidence keywords"
+        );
     }
 }

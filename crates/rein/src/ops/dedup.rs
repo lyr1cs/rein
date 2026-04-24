@@ -637,9 +637,7 @@ fn run_vec_dedup_inner(
         deferred
     );
 
-    let embedder = match embedder_override
-        .or_else(|| crate::embed::create_embedder(config))
-    {
+    let embedder = match embedder_override.or_else(|| crate::embed::create_embedder(config)) {
         Some(e) => e,
         None => {
             tracing::debug!(
@@ -722,9 +720,7 @@ fn run_vec_dedup_inner(
             Ok(r) => r,
             Err(_) => {
                 // Codex round-5 H-2: keep the flag set so next sweep retries.
-                tracing::debug!(
-                    "vec_dedup: search_vec failed for {id}; preserving flag for retry"
-                );
+                tracing::debug!("vec_dedup: search_vec failed for {id}; preserving flag for retry");
                 continue;
             }
         };
