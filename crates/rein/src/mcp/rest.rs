@@ -816,7 +816,21 @@ fn api_recall(
     query: &std::collections::HashMap<String, String>,
 ) -> BoxedResponse {
     match run_recall_query(config, query, None) {
-        Ok((results, request_id)) => recall_results_response(results, 0, None, &request_id),
+        Ok((results, request_id, synthesize_query)) => {
+            // Cap B (v0.25): when ?synthesize=true is set on /api/memories,
+            // run recall-time synthesis. The LLM call sits OUTSIDE the store
+            // open block above (results already collected) so block_in_place
+            // never nests inside any store transaction guard. Returns None
+            // when the param is not Some(true).
+            let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
+                &results,
+                &synthesize_query.original_query,
+                config,
+                synthesize_query.synthesize,
+                None,
+            );
+            recall_results_response(results, 0, None, &request_id, synthesis)
+        }
         Err(response) => response,
     }
 }
@@ -836,11 +850,23 @@ fn api_recall_stream(
 
     let fetch_limit = offset.saturating_add(page_limit).saturating_add(1);
     match run_recall_query(config, query, Some(fetch_limit)) {
-        Ok((results, request_id)) => {
-            recall_results_response(results, offset, Some(page_limit), &request_id)
+        Ok((results, request_id, _)) => {
+            // Synthesis intentionally NOT wired into recall_stream: paginated
+            // streams are stateless across pages, and synthesizing on each
+            // page would duplicate LLM cost. Callers wanting synthesis use
+            // /api/memories (single-page) instead.
+            recall_results_response(results, offset, Some(page_limit), &request_id, None)
         }
         Err(response) => response,
     }
+}
+
+/// Inputs the synthesis path needs that aren't already in the results tuple:
+/// the original query string (for the synthesis prompt + `query` field on
+/// `RecallSynthesisOutcome`) and the parsed `synthesize` flag.
+struct RecallSynthesisInputs {
+    original_query: String,
+    synthesize: Option<bool>,
 }
 
 #[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body.
@@ -848,7 +874,14 @@ fn run_recall_query(
     config: &ReinConfig,
     query: &std::collections::HashMap<String, String>,
     limit_override: Option<usize>,
-) -> Result<(Vec<crate::search::recall::RecallResult>, String), BoxedResponse> {
+) -> Result<
+    (
+        Vec<crate::search::recall::RecallResult>,
+        String,
+        RecallSynthesisInputs,
+    ),
+    BoxedResponse,
+> {
     let q = match query.get("q") {
         Some(q) if !q.is_empty() => q.clone(),
         _ => {
@@ -869,6 +902,15 @@ fn run_recall_query(
     };
     let from = query.get("from").and_then(|s| parse_datetime(s));
     let to = query.get("to").and_then(|s| parse_datetime_end(s));
+    // Cap B (v0.25): parse ?synthesize=true|false. Anything else (or absent)
+    // is treated as "not requested" — `run_recall_synthesis` returns None,
+    // so the response shape stays bit-identical to pre-Cap-B for legacy
+    // callers that never pass this param.
+    let synthesize = query.get("synthesize").and_then(|s| match s.as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    });
 
     let store = match config.open_store() {
         Ok(s) => s,
@@ -898,7 +940,14 @@ fn run_recall_query(
         Some(request_id.clone()),
     )
     .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    Ok((results, request_id))
+    Ok((
+        results,
+        request_id,
+        RecallSynthesisInputs {
+            original_query: q,
+            synthesize,
+        },
+    ))
 }
 
 fn recall_result_to_json(r: &crate::search::recall::RecallResult) -> serde_json::Value {
@@ -918,6 +967,7 @@ fn recall_results_response(
     offset: usize,
     page_limit: Option<usize>,
     request_id: &str,
+    synthesis: Option<crate::ops::recall_synthesis::RecallSynthesisOutcome>,
 ) -> BoxedResponse {
     let page = match page_limit {
         Some(limit) => {
@@ -937,31 +987,44 @@ fn recall_results_response(
             .collect::<Vec<_>>(),
     };
 
+    // Cap B: serialize the synthesis outcome only if present. Pre-Cap-B
+    // callers that never pass ?synthesize=true get None here, so the
+    // response shape stays bit-identical (no `synthesis` field emitted).
+    let synthesis_value = synthesis
+        .as_ref()
+        .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null));
+
     if page_limit.is_some() {
         let end = offset.saturating_add(page.len());
         let has_more = results.len() > end;
         let next_offset = if has_more { Some(end) } else { None };
-        json_response(
-            StatusCode::OK,
-            json!({
-                "results": page,
-                "count": page.len(),
-                "offset": offset,
-                "limit": page_limit,
-                "next_offset": next_offset,
-                "has_more": has_more,
-                "request_id": request_id,
-            }),
-        )
+        let mut body = json!({
+            "results": page,
+            "count": page.len(),
+            "offset": offset,
+            "limit": page_limit,
+            "next_offset": next_offset,
+            "has_more": has_more,
+            "request_id": request_id,
+        });
+        if let Some(s) = synthesis_value {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("synthesis".to_string(), s);
+            }
+        }
+        json_response(StatusCode::OK, body)
     } else {
-        json_response(
-            StatusCode::OK,
-            json!({
-                "results": page,
-                "count": page.len(),
-                "request_id": request_id,
-            }),
-        )
+        let mut body = json!({
+            "results": page,
+            "count": page.len(),
+            "request_id": request_id,
+        });
+        if let Some(s) = synthesis_value {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("synthesis".to_string(), s);
+            }
+        }
+        json_response(StatusCode::OK, body)
     }
 }
 
