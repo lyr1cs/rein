@@ -57,6 +57,38 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         Err(e) => tracing::warn!("failed to recompute canonical_length_stats: {e}"),
     }
 
+    // v0.24 peek+commit: collect (consumer, max_event_id) batches from
+    // any event-sourced helper that mutates `state`. Each batch is
+    // committed only after `state.save_snapshot()` succeeds (Step 6),
+    // so a crash mid-pipeline replays cleanly on the next pass — the
+    // events are NOT marked consumed unless the derived state change is
+    // durable. Module-level invariant in `store/adaptive.rs`.
+    //
+    // Each helper returns `Vec<(&'static str, i64)>` of pending offsets
+    // (size 1 for L3/M6, size 2 for M2 alpha pair). The orchestrator
+    // routes each batch to a single `commit_offset` call so paired
+    // consumers advance atomically.
+    let mut pending_offset_batches: Vec<Vec<(&'static str, i64)>> = Vec::new();
+
+    // Step 1d: v0.24 ARS L3 — concept refresh-interval percentiles. Drains
+    // any new `ConceptSummaryRefreshed` events into the rolling reservoir
+    // and recomputes the cached p75/p50. Until at least
+    // `CONCEPT_REFRESH_MIN_SAMPLES` samples accumulate, the trigger
+    // threshold helpers fall back to bootstrap constants — see
+    // `AdaptiveState::concept_refresh_revision_threshold`.
+    match crate::store::adaptive::recompute_concept_refresh_stats(
+        store.conn(),
+        state.concept_refresh_stats.clone(),
+    ) {
+        Ok((stats, max_id)) => {
+            state.concept_refresh_stats = Some(stats);
+            if let Some(id) = max_id {
+                pending_offset_batches.push(vec![("concept_refresh_stats", id)]);
+            }
+        }
+        Err(e) => tracing::warn!("failed to recompute concept_refresh_stats: {e}"),
+    }
+
     // Step 2: M3 — Build per-cluster survival curves from access data
     if !state.memory_clusters.is_empty() {
         build_survival_curves(store, &state);
@@ -67,24 +99,60 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         run_tiering(store, &mut state, config);
     }
 
-    // Step 4: M2 — Counterfactual alpha optimization (consume events, learn alphas)
-    run_alpha_learning(store, &mut state, config);
+    // Step 4: M2 — Counterfactual alpha optimization (peek events, learn alphas)
+    if let Some(batch) = run_alpha_learning(store, &mut state, config) {
+        pending_offset_batches.push(batch);
+    }
 
-    // Step 4a: Reranker weight learning from agent feedback
+    // Step 4a: Reranker weight learning from agent feedback. Self-contained
+    // peek+commit (writes to `weights` table, not `adaptive_state`), so it
+    // commits its own offsets in-function and does NOT contribute to the
+    // post-save batch list.
     run_reranker_weight_learning(store);
 
     // Step 4b: M6 — Consume threshold exploration data + co-recall signal → update dedup thresholds
-    run_m6_threshold_learning(store, &mut state);
+    if let Some(batch) = run_m6_threshold_learning(store, &mut state) {
+        pending_offset_batches.push(batch);
+    }
 
     // Step 5: Embedding-based dedup for memories marked needs_vec_dedup
     run_vec_dedup(store, config);
 
     // Step 6: Persist snapshot + emit param_update event
     state.version += 1;
-    if let Err(e) = state.save_snapshot(store.conn()) {
-        tracing::warn!("failed to save adaptive state: {e}");
-    } else {
-        tracing::debug!("adaptive state v{} saved", state.version);
+    let snapshot_saved = match state.save_snapshot(store.conn()) {
+        Ok(()) => {
+            tracing::debug!("adaptive state v{} saved", state.version);
+            true
+        }
+        Err(e) => {
+            tracing::warn!("failed to save adaptive state: {e}");
+            false
+        }
+    };
+
+    // Step 6b: Post-save offset commits. Honor the module invariant —
+    // never advance a consumer's cursor unless the derived state change
+    // is durable. If save_snapshot failed, all pending batches are
+    // discarded; the next pipeline pass will re-peek and replay.
+    if snapshot_saved {
+        for batch in &pending_offset_batches {
+            let pairs: Vec<(&str, i64)> =
+                batch.iter().map(|(c, id)| (*c, *id)).collect();
+            if let Err(e) = crate::store::adaptive::commit_offset(store.conn(), &pairs) {
+                tracing::warn!(
+                    consumers = ?batch.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+                    error = %e,
+                    "post-save commit_offset failed; events will be re-peeked next pass"
+                );
+            }
+        }
+    } else if !pending_offset_batches.is_empty() {
+        tracing::warn!(
+            batches = pending_offset_batches.len(),
+            "snapshot save failed; deferring {} pending offset batches for replay",
+            pending_offset_batches.len()
+        );
     }
 
     // Convergence health summary
@@ -929,12 +997,12 @@ fn run_alpha_learning(
     store: &SqliteStore,
     state: &mut crate::store::adaptive::AdaptiveState,
     config: &ReinConfig,
-) {
+) -> Option<Vec<(&'static str, i64)>> {
     let conn = store.conn();
 
     let events = peek_recall_events(conn);
     if events.is_empty() {
-        return;
+        return None;
     }
 
     // Peek recall_access events WITHOUT advancing their offset. Advancement
@@ -942,6 +1010,45 @@ fn run_alpha_learning(
     // alpha_optimizer cursor, so the two offsets cannot disagree across a
     // process crash.
     let access_events = peek_access_events(conn, 500);
+
+    // Replay-safety (Codex Tier-B+C round-2 HIGH): if a prior pass
+    // applied alpha shrinkage and the post-save `commit_offset` failed,
+    // replay must NOT double-apply. Filter by the durable watermark.
+    //
+    // Codex Tier-B+C round-3 HIGH: the watermark is bumped LATER (after
+    // the prefix-safe walk computes `advance_to`/`access_advance_to`) —
+    // NOT to the raw peek-max — so late-arriving access events for
+    // already-peeked recall ids are never silently discarded.
+    let prior_alpha_water = state.alpha_optimizer_last_id;
+    let prior_access_water = state.alpha_optimizer_access_last_id;
+    let raw_events_was_nonempty = !events.is_empty();
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.id > prior_alpha_water)
+        .collect();
+    let access_events: Vec<_> = access_events
+        .into_iter()
+        .filter(|e| e.id > prior_access_water)
+        .collect();
+    if events.is_empty() {
+        // Codex Tier-B+C round-3 HIGH (livelock fix): pure replay — all
+        // peeked events were already applied in a prior pass whose
+        // `commit_offset` failed. The stale offset would loop forever
+        // unless we drain it now. Returning the prior watermarks lets
+        // the orchestrator's `commit_offset` advance the consumer
+        // cursor past the already-applied prefix.
+        if raw_events_was_nonempty {
+            let mut pending: Vec<(&'static str, i64)> = Vec::new();
+            if prior_alpha_water > 0 {
+                pending.push(("alpha_optimizer", prior_alpha_water));
+            }
+            if prior_access_water > 0 {
+                pending.push(("alpha_optimizer_access", prior_access_water));
+            }
+            return if pending.is_empty() { None } else { Some(pending) };
+        }
+        return None;
+    }
 
     // Build RecallEvent structs from stored events
     let recall_events: Vec<crate::search::alpha_optimizer::RecallEvent> = events
@@ -1015,38 +1122,32 @@ fn run_alpha_learning(
         }
     }
 
-    if advance_to.is_some() || access_advance_to.is_some() {
-        if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
-            let tx_result = (|| -> rusqlite::Result<()> {
-                if let Some(new_offset) = advance_to {
-                    conn.execute(
-                        "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
-                         VALUES ('alpha_optimizer', ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                         ON CONFLICT(consumer) DO UPDATE SET last_event_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                        rusqlite::params![new_offset],
-                    )?;
-                }
-                if let Some(access_offset) = access_advance_to {
-                    conn.execute(
-                        "INSERT INTO consumer_offsets (consumer, last_event_id, updated_at)
-                         VALUES ('alpha_optimizer_access', ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                         ON CONFLICT(consumer) DO UPDATE SET last_event_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                        rusqlite::params![access_offset],
-                    )?;
-                }
-                Ok(())
-            })();
-            match tx_result {
-                Ok(()) => {
-                    let _ = conn.execute_batch("COMMIT");
-                }
-                Err(err) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    tracing::warn!(error = %err, "M2: offset advance failed, rolling back");
-                    return;
-                }
-            }
-        }
+    // v0.24 peek+commit migration: instead of advancing both offsets here
+    // mid-function, return the pending pair to the orchestrator. The pair
+    // is committed atomically (single `commit_offset` call wraps both in
+    // BEGIN IMMEDIATE) only after `state.save_snapshot()` succeeds. The
+    // intra-pair atomicity invariant from the prior B5 fix is preserved.
+    //
+    // Codex Tier-B+C round-3 HIGH: bump the in-memory replay watermarks
+    // ONLY for the prefix we actually applied (advance_to /
+    // access_advance_to), not the raw peek-max. Otherwise a late-
+    // arriving access event for a recall we walked past as "orphan"
+    // would be filtered out on its next peek and never contribute to
+    // alpha learning.
+    if let Some(off) = advance_to {
+        state.alpha_optimizer_last_id = state.alpha_optimizer_last_id.max(off);
+    }
+    if let Some(off) = access_advance_to {
+        state.alpha_optimizer_access_last_id =
+            state.alpha_optimizer_access_last_id.max(off);
+    }
+
+    let mut pending: Vec<(&'static str, i64)> = Vec::new();
+    if let Some(off) = advance_to {
+        pending.push(("alpha_optimizer", off));
+    }
+    if let Some(off) = access_advance_to {
+        pending.push(("alpha_optimizer_access", off));
     }
 
     if events_with_access.is_empty() {
@@ -1054,10 +1155,17 @@ fn run_alpha_learning(
             "M2: peeked {} events but none had access data yet (will retry)",
             events.len()
         );
-        return;
+        // Even with no learnable signal yet we still return any pending
+        // offset advances — `expired-by-cutoff` events should not loop.
+        return if pending.is_empty() { None } else { Some(pending) };
     }
 
     compute_counterfactual_alphas(&events_with_access, &events, state, config);
+    if pending.is_empty() {
+        None
+    } else {
+        Some(pending)
+    }
 }
 
 /// Non-advancing peek for `recall_access` events. Mirrors `peek_recall_events`
@@ -1109,10 +1217,32 @@ fn peek_access_events(
 // ===========================================================================
 
 fn run_reranker_weight_learning(store: &SqliteStore) {
+    // **Known limitation (v0.24.x backlog)**: `save_weights` and
+    // `commit_offset` here are NOT in one transaction. If `save_weights`
+    // succeeds and the immediately-following `commit_offset` fails (DB
+    // I/O race / lock failure), the same gradient window will replay
+    // and apply a second step (lr=0.005, single epoch). Per-step deltas
+    // are bounded by renormalization to sum=1.0; cumulative
+    // over-application is bounded only by eventual successful commit
+    // (Codex Tier-B+C round-3 LOW). A proper fix requires either:
+    //   (a) a `weights_last_id` column on the `weights` table
+    //       persisted in the same transaction as `save_weights`, or
+    //   (b) folding the reranker's writes into the M1 `feedback_events`
+    //       → `AdaptiveState` pipeline so it benefits from the existing
+    //       watermark + CAS-merge protections.
+    // Both approaches are out of scope for v0.24.0 (Codex Tier-B+C
+    // round-2 MEDIUM, deferred).
     let conn = store.conn();
 
-    // Consume feedback events (RecallAccess with source=agent_feedback)
-    let events = match crate::store::adaptive::consume_events(
+    // Peek feedback events (RecallAccess with source=agent_feedback). Self-
+    // contained peek+commit: this helper writes to the `weights` table
+    // (NOT `adaptive_state`), so it commits its own consumer offsets.
+    // Codex Tier-B+C round-1 MEDIUM: commit each peek's offset *after
+    // evaluation* (not gated on `updates > 0`). Filtered-out events have
+    // been evaluated → safe to mark consumed; otherwise they stuck
+    // behind the 200-row peek limit forever when no agent-feedback rows
+    // arrived.
+    let events = match crate::store::adaptive::peek_events(
         conn,
         "reranker_weights",
         &["recall_access"],
@@ -1120,10 +1250,11 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     ) {
         Ok(evts) => evts,
         Err(e) => {
-            tracing::warn!("reranker weight learning: failed to consume events: {e}");
+            tracing::warn!("reranker weight learning: failed to peek events: {e}");
             return;
         }
     };
+    let weights_max_id = events.last().map(|e| e.id);
 
     // Filter to agent_feedback source only
     let feedback_events: Vec<_> = events
@@ -1141,7 +1272,13 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         })
         .collect();
 
+    let weights_pair: Option<(&str, i64)> = weights_max_id.map(|id| ("reranker_weights", id));
     if feedback_events.is_empty() {
+        // Evaluated this batch (no agent-feedback rows applied) →
+        // commit the offset so the same window isn't re-peeked forever.
+        if let Some(pair) = weights_pair {
+            let _ = crate::store::adaptive::commit_offset(conn, &[pair]);
+        }
         return;
     }
     if feedback_events.len() < 10 {
@@ -1158,19 +1295,28 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         .collect();
 
     if used_ids.is_empty() {
+        if let Some(pair) = weights_pair {
+            let _ = crate::store::adaptive::commit_offset(conn, &[pair]);
+        }
         return;
     }
 
-    // Find recent recall_complete events to get candidate features
-    let recall_events = match crate::store::adaptive::consume_events(
+    // Peek recent recall_complete events to get candidate features.
+    let recall_events = match crate::store::adaptive::peek_events(
         conn,
         "reranker_weights_recall",
         &["recall_complete"],
         100,
     ) {
         Ok(evts) => evts,
-        Err(_) => return,
+        Err(_) => {
+            if let Some(pair) = weights_pair {
+                let _ = crate::store::adaptive::commit_offset(conn, &[pair]);
+            }
+            return;
+        }
     };
+    let recall_max_id = recall_events.last().map(|e| e.id);
 
     // Build training pairs: for each recall, which candidates were used (positive) vs not (negative)
     let mut weights = crate::search::rerank::load_weights(conn);
@@ -1321,6 +1467,27 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         crate::search::rerank::save_weights(conn, &weights);
         tracing::info!(updates, "reranker weights updated from agent feedback");
     }
+
+    // Post-evaluation commit (Codex Tier-B+C MEDIUM): always commit
+    // both consumer offsets after we've evaluated the batch — even if
+    // no `updates` happened (e.g. no candidate-vs-used-id overlap).
+    // Skipping the commit here was the bug that pinned events behind
+    // the peek limit. Both offsets advance atomically.
+    let mut pairs: Vec<(&str, i64)> = Vec::with_capacity(2);
+    if let Some(pair) = weights_pair {
+        pairs.push(pair);
+    }
+    if let Some(id) = recall_max_id {
+        pairs.push(("reranker_weights_recall", id));
+    }
+    if !pairs.is_empty() {
+        if let Err(e) = crate::store::adaptive::commit_offset(conn, &pairs) {
+            tracing::warn!(
+                error = %e,
+                "reranker weights: commit_offset failed; events will be re-peeked"
+            );
+        }
+    }
 }
 
 // ===========================================================================
@@ -1330,13 +1497,34 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
 fn run_m6_threshold_learning(
     store: &SqliteStore,
     state: &mut crate::store::adaptive::AdaptiveState,
-) {
+) -> Option<Vec<(&'static str, i64)>> {
     let conn = store.conn();
+    let mut pending: Vec<(&'static str, i64)> = Vec::new();
 
-    // --- Part 1: Consume threshold_exploration events (from randomized A/B test) ---
+    // --- Part 1: Peek threshold_exploration events (from randomized A/B test) ---
+    // peek+commit: state mutation lands in `state.global_dedup_threshold`
+    // which is only durable after `state.save_snapshot()` in
+    // `run_adaptive_pipeline`. Caller commits the returned offsets only
+    // on save success.
     let events =
-        crate::store::adaptive::consume_events(conn, "m6_threshold", &["param_update"], 200)
+        crate::store::adaptive::peek_events(conn, "m6_threshold", &["param_update"], 200)
             .unwrap_or_default();
+    let max_threshold_id = events.last().map(|e| e.id);
+    if let Some(id) = max_threshold_id {
+        pending.push(("m6_threshold", id));
+    }
+    // Replay-safety (Codex Tier-B+C round-1 HIGH): if a prior pass's
+    // commit_offset failed after save_snapshot succeeded, those events
+    // are re-peeked. Skip ones whose threshold nudge is already in the
+    // durable snapshot (id <= state.m6_threshold_last_id).
+    let prior_threshold_water = state.m6_threshold_last_id;
+    if let Some(id) = max_threshold_id {
+        state.m6_threshold_last_id = state.m6_threshold_last_id.max(id);
+    }
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.id > prior_threshold_water)
+        .collect();
 
     // Filter to threshold_exploration events only
     let explore_events: Vec<_> = events
@@ -1423,8 +1611,21 @@ fn run_m6_threshold_learning(
     // If two memories always appear together in recall results, they might be duplicates
     // that slipped through dedup (threshold was too high).
     let recall_events =
-        crate::store::adaptive::consume_events(conn, "m6_corecall", &["recall_complete"], 100)
+        crate::store::adaptive::peek_events(conn, "m6_corecall", &["recall_complete"], 100)
             .unwrap_or_default();
+    let max_corecall_id = recall_events.last().map(|e| e.id);
+    if let Some(id) = max_corecall_id {
+        pending.push(("m6_corecall", id));
+    }
+    // Replay-safety (Codex Tier-B+C round-1 HIGH): same dedup as Part 1.
+    let prior_corecall_water = state.m6_corecall_last_id;
+    if let Some(id) = max_corecall_id {
+        state.m6_corecall_last_id = state.m6_corecall_last_id.max(id);
+    }
+    let recall_events: Vec<_> = recall_events
+        .into_iter()
+        .filter(|e| e.id > prior_corecall_water)
+        .collect();
 
     if recall_events.len() >= 5 {
         // Count pair co-occurrences in recall results
@@ -1542,6 +1743,12 @@ fn run_m6_threshold_learning(
                 );
             }
         }
+    }
+
+    if pending.is_empty() {
+        None
+    } else {
+        Some(pending)
     }
 }
 
@@ -1894,11 +2101,36 @@ mod tests {
         }
 
         let mut state = AdaptiveState::default();
-        // Should not panic
-        run_alpha_learning(&store, &mut state, &config);
+        // v0.24 peek+commit: run_alpha_learning returns the pending
+        // (consumer, max_id) batch; the caller is responsible for
+        // committing after save_snapshot succeeds. The function no
+        // longer advances the offset itself.
+        let pending = run_alpha_learning(&store, &mut state, &config);
+        let pending = pending.expect("alpha_optimizer should report pending offsets after learning");
+        assert!(
+            pending.iter().any(|(c, off)| *c == "alpha_optimizer" && *off > 0),
+            "alpha_optimizer pending offset should be present and > 0, got {pending:?}"
+        );
 
-        // After learning, the consumer offset should have advanced
-        let offset: i64 = store
+        // Pre-commit: DB offset still at 0.
+        let offset_before: i64 = store
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'alpha_optimizer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(
+            offset_before, 0,
+            "peek+commit: offset must not advance until commit_offset runs"
+        );
+
+        // Simulate orchestrator commit after save_snapshot success.
+        let pairs: Vec<(&str, i64)> = pending.iter().map(|(c, id)| (*c, *id)).collect();
+        crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+
+        let offset_after: i64 = store
             .conn()
             .query_row(
                 "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'alpha_optimizer'",
@@ -1907,8 +2139,8 @@ mod tests {
             )
             .unwrap_or(0);
         assert!(
-            offset > 0,
-            "alpha_optimizer offset should have advanced, got {offset}"
+            offset_after > 0,
+            "alpha_optimizer offset should have advanced after commit, got {offset_after}"
         );
     }
 
@@ -2309,7 +2541,12 @@ mod tests {
         );
 
         let mut state = AdaptiveState::default();
-        run_alpha_learning(&store, &mut state, &config);
+        // v0.24 peek+commit: pending offsets returned, must commit
+        // to land them in DB.
+        let pending = run_alpha_learning(&store, &mut state, &config)
+            .expect("pending offsets expected when alpha_optimizer has work to do");
+        let pairs: Vec<(&str, i64)> = pending.iter().map(|(c, id)| (*c, *id)).collect();
+        crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
 
         let alpha_off: i64 = store
             .conn()

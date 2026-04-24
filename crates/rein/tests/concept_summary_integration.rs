@@ -240,6 +240,83 @@ fn batch_mode_respects_batch_size_cap() {
 }
 
 #[test]
+fn successful_refresh_emits_concept_summary_refreshed_event_and_populates_stats() {
+    // L3 wiring end-to-end: a successful refresh should
+    //   1. emit a ConceptSummaryRefreshed feedback event with sample payload
+    //   2. recompute_concept_refresh_stats consumes that event into the
+    //      AdaptiveState reservoir.
+    let (store, config, id) = setup(10);
+    let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response("current state synthesis"));
+    let outcome =
+        run_concept_summary_with_extractor(&store, &config, Some(&id), false, mock).unwrap();
+    assert_eq!(outcome.succeeded, 1);
+
+    // (1) feedback event was written.
+    let event_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM feedback_events WHERE event_type = 'concept_summary_refreshed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1, "exactly one refresh event expected");
+
+    let payload: String = store
+        .conn()
+        .query_row(
+            "SELECT payload FROM feedback_events WHERE event_type = 'concept_summary_refreshed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    // First-refresh semantics: revisions_since_last anchored to 0
+    // (no prior `living_summary_source_revision`), so it equals
+    // the concept's current revision (10). first_refresh = true so
+    // recompute can exclude this sample's age from the percentile
+    // (Codex round-2 MEDIUM).
+    assert_eq!(parsed["revisions_since_last"], 10);
+    assert!(parsed["age_secs_since_last"].as_i64().unwrap() >= 0);
+    assert_eq!(parsed["first_refresh"], true);
+
+    // (2) recompute drains the event into the reservoir; the sample
+    // counts toward `count` (gates revision threshold) but NOT toward
+    // `count_steady_state` (gates age threshold).
+    let (stats, max_id) =
+        rein::store::adaptive::recompute_concept_refresh_stats(store.conn(), None).unwrap();
+    assert_eq!(stats.count, 1);
+    assert_eq!(stats.count_steady_state, 0);
+    assert_eq!(stats.samples[0].revisions_since_last, 10);
+    assert!(stats.samples[0].first_refresh);
+    assert!(
+        max_id.is_some(),
+        "recompute should report event id for caller to commit"
+    );
+}
+
+#[test]
+fn failed_refresh_does_not_emit_event() {
+    // LLM error path must not emit a ConceptSummaryRefreshed event — the
+    // event represents a *successful* refresh observation, not an attempt.
+    let (store, config, id) = setup(10);
+    let mock = ExtractorKind::Mock(MockExtractor::with_persistent_error("simulated outage"));
+    let outcome =
+        run_concept_summary_with_extractor(&store, &config, Some(&id), false, mock).unwrap();
+    assert_eq!(outcome.llm_failed, 1);
+
+    let event_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM feedback_events WHERE event_type = 'concept_summary_refreshed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 0, "failed refresh must not emit refresh event");
+}
+
+#[test]
 fn summary_prompt_uses_most_recent_revisions_when_history_exceeds_limit() {
     let store = SqliteStore::in_memory().unwrap();
     store.create_memoir(make_memoir("integ-memoir")).unwrap();

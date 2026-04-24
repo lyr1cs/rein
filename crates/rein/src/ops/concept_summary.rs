@@ -1,6 +1,8 @@
 use crate::config::{Provider, ReinConfig};
 use crate::extract::llm::{strip_code_fences, ExtractorKind};
-use crate::store::adaptive::AdaptiveState;
+use crate::store::adaptive::{
+    emit_event, AdaptiveState, EventType, FeedbackEvent, RefreshSample,
+};
 use crate::store::memoir::{row_to_concept, should_refresh_living_summary};
 use crate::store::SqliteStore;
 use crate::types::{Concept, ConceptRevision, OpsErrorKind, ReinError, ReinResult};
@@ -204,12 +206,21 @@ fn summarize_one(
         )));
     }
 
+    let now = Utc::now();
+    // L4 CAS: pass the prior `living_summary_source_revision` so a peer
+    // refresh that committed first cannot be silently overwritten. Two
+    // concurrent refreshes started against the same `concept.revision`
+    // both see the same prior; whichever commits first wins, the loser
+    // gets 0 rows and surfaces a Conflict (no LLM cost wasted on the
+    // path back, just a stale write).
+    let prior_source_revision = concept.living_summary_source_revision;
     let wrote = write_living_summary_if_revision_unchanged(
         store,
         &concept.id,
         source_revision,
+        prior_source_revision,
         summary,
-        Utc::now(),
+        now,
     )
     .map_err(SummaryError::Store)?;
     if !wrote {
@@ -222,29 +233,101 @@ fn summarize_one(
         ));
     }
 
+    // L3 wiring: emit a `ConceptSummaryRefreshed` feedback event so the
+    // adaptive slow-channel can learn refresh-interval percentiles.
+    // Anchored to the prior summary if one exists; otherwise to concept
+    // creation (see `RefreshSample` doc comment for rationale). Best-effort
+    // — a failed event emit doesn't roll back the successful summary write.
+    //
+    // The `first_refresh` flag lets `recompute_concept_refresh_stats`
+    // exclude the inception-anchored age from its percentile (Codex
+    // round-2 MEDIUM) while still counting the sample for revision-side
+    // bootstrap exit.
+    let first_refresh = concept.living_summary_source_revision.is_none();
+    let prior_revision = concept.living_summary_source_revision.unwrap_or(0);
+    let revisions_since_last = source_revision.saturating_sub(prior_revision);
+    let prior_anchor = concept
+        .living_summary_updated_at
+        .unwrap_or(concept.created_at);
+    let age_secs_since_last = (now - prior_anchor).num_seconds().max(0);
+    let sample = RefreshSample {
+        revisions_since_last,
+        age_secs_since_last,
+        first_refresh,
+    };
+    if let Err(e) = emit_refresh_event(store, &concept.id, sample) {
+        tracing::warn!(
+            concept_id = %concept.id,
+            error = %e,
+            "concept_summary: failed to emit ConceptSummaryRefreshed event (non-fatal)"
+        );
+    }
+
     Ok(())
 }
 
+fn emit_refresh_event(
+    store: &SqliteStore,
+    concept_id: &str,
+    sample: RefreshSample,
+) -> ReinResult<()> {
+    let payload = serde_json::to_value(sample).map_err(|e| {
+        ReinError::Config(format!("failed to serialize RefreshSample: {e}"))
+    })?;
+    emit_event(
+        store.conn(),
+        FeedbackEvent {
+            event_type: EventType::ConceptSummaryRefreshed,
+            request_id: None,
+            memory_id: None,
+            concept_id: Some(concept_id.to_string()),
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: Some(payload),
+        },
+    )?;
+    Ok(())
+}
+
+/// L4 CAS write: succeeds only when the concept's `revision` AND its
+/// `living_summary_source_revision` both match what we observed at the
+/// start of the refresh.
+///
+/// - `revision` predicate (existing): a `refine_concept` racing with us
+///   bumps revision and we abort — the new revision deserves a fresh
+///   summary derived from the post-refine state, not our stale prompt.
+/// - `living_summary_source_revision` predicate (L4): two concurrent
+///   refreshes that both observed the same prior source_revision can
+///   only have one winner. The first to commit advances the column;
+///   the second's predicate fails and returns 0 rows. NULL is matched
+///   via `IS` (SQLite's NULL-safe equality), so a first-ever refresh
+///   races correctly against another first-ever refresh.
 fn write_living_summary_if_revision_unchanged(
     store: &SqliteStore,
     concept_id: &str,
     source_revision: u32,
+    prior_source_revision: Option<u32>,
     summary: &str,
     now: DateTime<Utc>,
 ) -> ReinResult<bool> {
     let now = now.to_rfc3339();
+    let prior_param: Option<i64> = prior_source_revision.map(|v| v as i64);
     let rows = store.conn().execute(
         "UPDATE concepts \
          SET living_summary = ?1, \
              living_summary_updated_at = ?2, \
              living_summary_source_revision = ?3 \
-         WHERE id = ?4 AND revision = ?5",
+         WHERE id = ?4 \
+           AND revision = ?5 \
+           AND living_summary_source_revision IS ?6",
         rusqlite::params![
             summary,
             &now,
             source_revision as i64,
             concept_id,
-            source_revision as i64
+            source_revision as i64,
+            prior_param,
         ],
     )?;
     Ok(rows > 0)
@@ -419,6 +502,7 @@ mod tests {
             &store,
             &concept_id,
             1,
+            None,
             "stale summary",
             Utc::now(),
         )
@@ -436,6 +520,7 @@ mod tests {
             &store,
             &concept_id,
             2,
+            None,
             "fresh summary",
             Utc::now(),
         )
@@ -448,5 +533,110 @@ mod tests {
             .expect("concept exists");
         assert_eq!(current.living_summary.as_deref(), Some("fresh summary"));
         assert_eq!(current.living_summary_source_revision, Some(2));
+    }
+
+    /// L4 CAS: two concurrent refreshes that both observed
+    /// `living_summary_source_revision = None` simulate the first-refresh
+    /// race. Whoever commits first wins; the loser's predicate fails and
+    /// returns `Ok(false)` without overwriting the winner's summary.
+    #[test]
+    fn concurrent_first_refresh_loser_does_not_overwrite_winner() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.create_memoir(make_memoir("test-memoir")).unwrap();
+        let concept_id = store
+            .add_concept(make_concept("test-memoir", "race-concept"))
+            .unwrap();
+
+        // Winner: passes prior=None (matches initial NULL) → commits.
+        let winner_wrote = write_living_summary_if_revision_unchanged(
+            &store,
+            &concept_id,
+            1,
+            None,
+            "winner summary",
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(winner_wrote);
+
+        // Loser: also passes prior=None (its observation predates the
+        // winner's commit). Predicate `living_summary_source_revision IS
+        // NULL` now fails because the column is `Some(1)` → 0 rows.
+        let loser_wrote = write_living_summary_if_revision_unchanged(
+            &store,
+            &concept_id,
+            1,
+            None,
+            "loser summary",
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(!loser_wrote, "loser must not overwrite winner");
+
+        let after = store
+            .get_concept_by_id(&concept_id)
+            .unwrap()
+            .expect("concept exists");
+        assert_eq!(after.living_summary.as_deref(), Some("winner summary"));
+        assert_eq!(after.living_summary_source_revision, Some(1));
+    }
+
+    /// L4 CAS: same race in steady state — both refreshes observed
+    /// `living_summary_source_revision = Some(prior)` from a prior summary.
+    #[test]
+    fn concurrent_steady_state_refresh_loser_does_not_overwrite_winner() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.create_memoir(make_memoir("test-memoir")).unwrap();
+        let concept_id = store
+            .add_concept(make_concept("test-memoir", "race-concept-steady"))
+            .unwrap();
+        // Seed an initial summary so prior_source_revision = Some(1).
+        write_living_summary_if_revision_unchanged(
+            &store,
+            &concept_id,
+            1,
+            None,
+            "initial",
+            Utc::now(),
+        )
+        .unwrap();
+        // Bump to revision 5 (two refines).
+        for _ in 0..4 {
+            store
+                .refine_concept("test-memoir", "race-concept-steady", "refined")
+                .unwrap();
+        }
+
+        // Winner: prior = Some(1), source = 5 → commits, advances column to 5.
+        let winner_wrote = write_living_summary_if_revision_unchanged(
+            &store,
+            &concept_id,
+            5,
+            Some(1),
+            "winner",
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(winner_wrote);
+
+        // Loser: also observed prior = Some(1) before winner commit.
+        // After winner: column is now Some(5) → loser predicate `IS Some(1)` fails.
+        let loser_wrote = write_living_summary_if_revision_unchanged(
+            &store,
+            &concept_id,
+            5,
+            Some(1),
+            "loser",
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(!loser_wrote);
+
+        let after = store
+            .get_concept_by_id(&concept_id)
+            .unwrap()
+            .expect("concept exists");
+        assert_eq!(after.living_summary.as_deref(), Some("winner"));
+        assert_eq!(after.living_summary_source_revision, Some(5));
     }
 }
