@@ -2,7 +2,12 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useMemoryDetail, useRecent, useRecall, useTopics } from '../hooks/useApi';
 import { apiDelete } from '../api/client';
-import type { Memory, MemoryDetailResponse, RecallResult } from '../api/types';
+import type {
+  Memory,
+  MemoryDetailResponse,
+  RecallResult,
+  RecallSynthesisOutcome,
+} from '../api/types';
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -369,6 +374,10 @@ export default function Memories() {
   const [sortMode, setSortMode] = useState<SortMode>('recent');
   const [selected, setSelected] = useState<(Memory | RecallResult) | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // v0.25 ARS Cap B: opt-in narrative synthesis over the recall results. Off
+  // by default — the LLM round-trip adds latency and only pays off for
+  // multi-result queries, so we only flip it on when the user explicitly asks.
+  const [synthesize, setSynthesize] = useState(false);
   const {
     data: selectedDetail,
     isLoading: selectedLoading,
@@ -386,6 +395,7 @@ export default function Memories() {
   const { data: recallData, isLoading: recallLoading } = useRecall(debouncedQuery, {
     topic: topicFilter || undefined,
     limit: 50,
+    synthesize,
   });
 
   const isSearching = debouncedQuery.length > 0;
@@ -514,6 +524,28 @@ export default function Memories() {
             <span className="text-xs text-[var(--text-muted)] ml-auto">
               {isLoading ? 'Loading...' : `${memories.length} memories`}
             </span>
+
+            {/* Synthesize toggle (v0.25 ARS Cap B). Only meaningful when the
+                user is actually searching — disabled in browse mode to keep the
+                affordance honest. */}
+            <label
+              className={`flex items-center gap-1.5 text-xs select-none ${
+                isSearching
+                  ? 'text-[var(--text-secondary)] cursor-pointer'
+                  : 'text-[var(--text-muted)] cursor-not-allowed opacity-60'
+              }`}
+              title="Use LLM to combine top results into one narrative answer."
+            >
+              <input
+                type="checkbox"
+                checked={synthesize}
+                onChange={(e) => setSynthesize(e.target.checked)}
+                disabled={!isSearching}
+                className="accent-[var(--accent)] cursor-pointer disabled:cursor-not-allowed"
+              />
+              Synthesize results (LLM, slower)
+            </label>
+
             <select
               value={sortMode}
               onChange={(e) => setSortMode(e.target.value as SortMode)}
@@ -529,6 +561,15 @@ export default function Memories() {
 
         {/* Card grid */}
         <div className="flex-1 overflow-y-auto px-6 pb-6">
+          {/* Synthesis card (v0.25 ARS Cap B). Mirrors the Graph "Current
+              state" card pattern (rounded border, bg-primary/60 panel, muted
+              uppercase header, leading-relaxed body, footer meta). Renders
+              only when the user has the toggle on AND we have something to
+              say — otherwise the recall flow looks identical to v0.24. */}
+          {isSearching && synthesize && !recallLoading && (
+            <SynthesisCard outcome={recallData?.synthesis} />
+          )}
+
           {isLoading ? (
             <div className="flex items-center justify-center py-20 text-[var(--text-muted)]">
               Loading...
