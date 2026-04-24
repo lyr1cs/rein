@@ -2219,8 +2219,11 @@ mod tests {
         let mut adaptive = crate::store::adaptive::AdaptiveState::default();
         adaptive.concept_refresh_stats = Some(crate::store::adaptive::ConceptRefreshStats {
             count: crate::store::adaptive::CONCEPT_REFRESH_MIN_SAMPLES - 1,
+            count_steady_state: crate::store::adaptive::CONCEPT_REFRESH_MIN_SAMPLES - 1,
             revision_p75: 42,
             age_p50_secs: 12345,
+            samples: Vec::new(),
+            last_consumed_event_id: 0,
         });
         assert_eq!(
             adaptive.concept_refresh_revision_threshold(),
@@ -2231,11 +2234,16 @@ mod tests {
             crate::store::adaptive::CONCEPT_REFRESH_BOOTSTRAP_AGE_SECS
         );
 
-        // With enough samples, learned values take over.
+        // With enough samples, learned values take over. Both counts must
+        // cross the gate; the age helper specifically gates on
+        // `count_steady_state` (Codex round-2 MEDIUM).
         adaptive.concept_refresh_stats = Some(crate::store::adaptive::ConceptRefreshStats {
             count: crate::store::adaptive::CONCEPT_REFRESH_MIN_SAMPLES,
+            count_steady_state: crate::store::adaptive::CONCEPT_REFRESH_MIN_SAMPLES,
             revision_p75: 42,
             age_p50_secs: 12345,
+            samples: Vec::new(),
+            last_consumed_event_id: 0,
         });
         assert_eq!(adaptive.concept_refresh_revision_threshold(), 42);
         assert_eq!(adaptive.concept_refresh_age_threshold_secs(), 12345);
