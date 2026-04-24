@@ -1252,7 +1252,10 @@ fn prepare_with_context_for_kind(
     }
 }
 
-fn resolve_max_input_for_kind(config: &ReinConfig, extractor: &ExtractorKind) -> usize {
+pub(crate) fn resolve_max_input_for_kind(
+    config: &ReinConfig,
+    extractor: &ExtractorKind,
+) -> usize {
     match extractor {
         ExtractorKind::Gemini(_) => {
             let configured = config.extract.google.max_input_chars;

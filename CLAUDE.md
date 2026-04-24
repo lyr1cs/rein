@@ -18,7 +18,7 @@ cargo install --path crates/rein     # install to ~/.cargo/bin/rein
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (**29 MCP tools** as of v0.23.0; evidence-aware canonical-first memory flow). Key modules:
+rein is a multi-source cross-validated memory MCP server (**34 MCP tools** as of v0.24.0; v0.25.0 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) without adding a new tool; evidence-aware canonical-first memory flow). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based; `MockExtractor` under `test-support` feature
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop); admission and memory surfaces are cluster/canonical-aware

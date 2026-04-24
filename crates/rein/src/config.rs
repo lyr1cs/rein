@@ -173,27 +173,37 @@ impl ResummerizeConfig {
     }
 }
 
-/// Config for the v0.24 ARS (Adaptive Retention / Synthesis) Capability A:
-/// the concept living-summary slow-channel op.
+/// Config for the v0.24+ ARS (Adaptive Retention / Synthesis).
 ///
-/// When triggered by `should_refresh_living_summary`, the op reads the
-/// concept's revision history, calls the configured LLM to synthesize a
-/// 3-5 sentence current-state summary, and writes it back atomically.
-/// Lower-stakes than resummerize (no contract gate, no claim-token CAS) —
-/// the living summary is an advisory field rendered alongside the
-/// canonical definition.
+/// **Cap A** (v0.24) — Concept Living Summary: background refresh of
+/// `living_summary` on Concept nodes via `should_refresh_living_summary`.
+///
+/// **Cap B** (v0.25) — Recall-time Synthesis: opt-in `synthesize=true` param
+/// on `rein_recall` / `/api/memories`. When enabled, the LLM produces a
+/// short narrative over the top-N recall results and returns it as
+/// `RecallSynthesisOutcome` alongside the normal results list.
 ///
 /// `llm_backend = "inherit"` (the default) reuses `[extract].provider`.
-/// Explicit values `"google"` / `"omlx"` override for this op only.
+/// Explicit values `"google"` / `"omlx"` override for this section only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsConfig {
+    // ── Cap A ────────────────────────────────────────────────────────────────
     #[serde(default)]
     pub concept_summary_enabled: bool,
     #[serde(default = "default_ars_backend")]
     pub llm_backend: String,
     #[serde(default = "default_ars_batch_size")]
     pub batch_size: usize,
+    // ── Cap B ────────────────────────────────────────────────────────────────
+    /// Enable recall-time synthesis (Cap B). Default `false` (opt-in).
+    #[serde(default)]
+    pub recall_synthesis_enabled: bool,
+    /// Minimum number of results required before synthesis is attempted.
+    /// Synthesis over 0-2 results is not useful and increases latency.
+    /// Default: 3.
+    #[serde(default = "default_recall_synthesis_min_results")]
+    pub recall_synthesis_min_results: usize,
 }
 
 fn default_ars_backend() -> String {
@@ -204,12 +214,18 @@ fn default_ars_batch_size() -> usize {
     16
 }
 
+fn default_recall_synthesis_min_results() -> usize {
+    3
+}
+
 impl Default for ArsConfig {
     fn default() -> Self {
         Self {
             concept_summary_enabled: false,
             llm_backend: default_ars_backend(),
             batch_size: default_ars_batch_size(),
+            recall_synthesis_enabled: false,
+            recall_synthesis_min_results: default_recall_synthesis_min_results(),
         }
     }
 }
