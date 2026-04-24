@@ -16,7 +16,7 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 | Feature | Description |
 |---------|-------------|
-| **34 MCP tools** | 8 core memory + 9 maintenance (incl. v0.23 `rein_resummerize`) + 10 knowledge graph + 2 temporal + 2 adaptive + 1 session ingest + 2 ARS concept-summary (v0.24) |
+| **34 MCP tools** | 8 core memory + 9 maintenance + 10 knowledge graph + 2 temporal + 2 adaptive + 1 session ingest + 2 ARS concept-summary (v0.24). v0.25 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) — no new tool added. |
 | **Unified operation registry** | One `#[op]` declaration drives CLI / MCP / REST surfaces (v0.21, A1). Inventory-based dispatch; zero hand-maintained lists. |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
@@ -961,7 +961,7 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 
 | 特性 | 说明 |
 |------|------|
-| **32 个 MCP 工具** | 8 个核心记忆 + 9 个维护（含 v0.23 `rein_resummerize`）+ 10 个知识图谱 + 2 个时序 + 2 个自适应 + 1 个会话摄入 |
+| **34 个 MCP 工具** | 8 个核心记忆 + 9 个维护 + 10 个知识图谱 + 2 个时序 + 2 个自适应 + 1 个会话摄入 + 2 个 ARS 概念摘要（v0.24）。v0.25 在 `rein_recall` 上新增可选参数 `synthesize=true`，用于召回时 LLM 叙事合成（Cap B）— 不新增工具。 |
 | **自适应引擎** | M1-M6 + A1：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
 | **反事实 Alpha 优化** | 回放历史 recall，学习全局 / 按查询类型 / **按聚类** 的最优 CC 融合权重（M2） |
 | **Per-cluster KM 衰减 + 全局先验** | Kaplan-Meier 生存曲线替代固定遗忘曲线；全局先验曲线覆盖冷启动新聚类（M3） |

@@ -11,6 +11,7 @@ pub mod adaptive;
 pub mod concept_summary;
 pub mod consolidation;
 pub mod dedup;
+pub mod recall_synthesis;
 pub mod resummerize;
 pub mod system_health;
 
