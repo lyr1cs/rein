@@ -4,6 +4,7 @@ target/
 .claude/*.log
 bench/
 reviews/
+eval-results/
 bench/results*.jsonl
 bench/results*.jsonl.*
 __pycache__/
