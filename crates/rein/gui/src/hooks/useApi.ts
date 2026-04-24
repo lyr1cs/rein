@@ -5,7 +5,7 @@ import type {
   AdaptiveStatus,
   DoctorReport,
   Memory,
-  RecallResult,
+  RecallMemoryOutput,
   RecallPageResponse,
   Episode,
   Artifact,
@@ -50,14 +50,21 @@ export function useRecent(limit = 20) {
   });
 }
 
-export function useRecall(query: string, options?: { topic?: string; limit?: number }) {
+export function useRecall(
+  query: string,
+  options?: { topic?: string; limit?: number; synthesize?: boolean },
+) {
   return useQuery({
     queryKey: ['recall', query, options],
     queryFn: () => {
       const params = new URLSearchParams({ q: query });
       if (options?.topic) params.set('topic', options.topic);
       if (options?.limit) params.set('limit', String(options.limit));
-      return apiGet<{ results: RecallResult[]; count: number }>(`/api/memories?${params}`);
+      // v0.25 ARS Cap B opt-in synthesis. Server defaults to false; we only
+      // forward the flag when the user toggles it on so legacy URL inspection
+      // stays clean.
+      if (options?.synthesize) params.set('synthesize', 'true');
+      return apiGet<RecallMemoryOutput>(`/api/memories?${params}`);
     },
     enabled: query.length > 0,
   });
