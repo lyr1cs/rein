@@ -209,6 +209,13 @@ pub struct RecallMemoryParams {
     #[arg(long)]
     #[serde(default)]
     pub expand: Option<bool>,
+    /// Cap B (v0.25): when true, the LLM synthesizes a concise narrative over the
+    /// top results and returns it alongside the normal results list. Opt-in via the
+    /// `[ars].recall_synthesis_enabled` config flag — without that flag this param
+    /// has no effect (the outcome will report `skipped_disabled`).
+    #[arg(long)]
+    #[serde(default)]
+    pub synthesize: Option<bool>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -216,6 +223,10 @@ pub struct RecallMemoryOutput {
     pub results: Vec<crate::search::recall::RecallResult>,
     pub route: String,
     pub request_id: String,
+    /// Cap B (v0.25): present only when `synthesize=true` was requested.
+    /// `None` means caller did not request synthesis (default behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthesis: Option<crate::ops::recall_synthesis::RecallSynthesisOutcome>,
     #[serde(skip)]
     pub compact: bool,
 }
@@ -242,13 +253,40 @@ impl IntoMarkdown for RecallMemoryOutput {
                 self.route, self.request_id, text
             );
         }
+        // Cap B: prepend synthesis narrative when present so MCP clients see
+        // the answer first, then the supporting memory list. Skip in compact
+        // mode (the compact contract is a single short line).
+        if !self.compact {
+            if let Some(synth) = self.synthesis.as_ref() {
+                if let Some(prose) = synth.synthesis.as_deref() {
+                    if !prose.is_empty() {
+                        text = format!("[synthesis] {prose}\n\n{text}");
+                    }
+                }
+            }
+        }
         text
     }
 }
 
 impl IntoCliText for RecallMemoryOutput {
     fn to_cli_text(&self) -> String {
-        crate::mcp::compact::format_recall_results(&self.results, self.compact)
+        let body = crate::mcp::compact::format_recall_results(&self.results, self.compact);
+        // Cap B: prepend the synthesized narrative when present so the CLI
+        // user sees the LLM-produced answer first, then the supporting list.
+        // Without this prepend, `rein recall --synthesize` would pay the LLM
+        // latency/API cost without any visible benefit on the CLI surface
+        // (Codex audit Round 1 finding P2-2).
+        if !self.compact {
+            if let Some(synth) = self.synthesis.as_ref() {
+                if let Some(prose) = synth.synthesis.as_deref() {
+                    if !prose.is_empty() {
+                        return format!("[synthesis]\n{prose}\n\n{body}");
+                    }
+                }
+            }
+        }
+        body
     }
 }
 
@@ -620,6 +658,7 @@ impl OpsRuntime {
         let topic = params.topic.clone();
         let keyword = params.keyword.clone();
         let expand = params.expand;
+        let synthesize = params.synthesize;
         let compact = self.compact();
 
         let route =
@@ -627,8 +666,12 @@ impl OpsRuntime {
         let route_name = route.query_type.to_string();
         let req_id_clone = request_id.clone();
 
-        self.with_store(|store| {
-            let results = crate::search::recall::recall_temporal_with_request_id(
+        // Phase 1: pull results out of `with_store`. Synthesis is called
+        // outside the store closure because it (a) needs no DB access and
+        // (b) wraps a `block_in_place` call to drive the LLM that should
+        // not be nested inside any store transaction guard.
+        let results = self.with_store(|store| {
+            crate::search::recall::recall_temporal_with_request_id(
                 store,
                 &self.config,
                 &query,
@@ -641,13 +684,26 @@ impl OpsRuntime {
                 false,
                 Some(req_id_clone.clone()),
             )
-            .map_err(|e| crate::types::ReinError::Config(format!("{e}")))?;
-            Ok(RecallMemoryOutput {
-                results,
-                route: route_name.clone(),
-                request_id: req_id_clone.clone(),
-                compact,
-            })
+            .map_err(|e| crate::types::ReinError::Config(format!("{e}")))
+        })?;
+
+        // Phase 2: optional synthesis (Cap B). Returns `None` when caller
+        // did not request synthesis; returns `Some(outcome)` otherwise — the
+        // outcome's `skipped_*` flags explain what happened.
+        let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
+            &results,
+            &query,
+            &self.config,
+            synthesize,
+            None,
+        );
+
+        Ok(RecallMemoryOutput {
+            results,
+            route: route_name,
+            request_id,
+            synthesis,
+            compact,
         })
     }
 
