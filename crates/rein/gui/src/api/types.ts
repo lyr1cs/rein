@@ -44,6 +44,39 @@ export interface RecallPageResponse {
   has_more: boolean;
 }
 
+/**
+ * Outcome of an opt-in recall-time synthesis pass (v0.25 ARS Capability B).
+ *
+ * The server attaches this on `RecallMemoryOutput` whenever the request
+ * carried `synthesize=true`. The optional `skipped_*` flags tell the UI why
+ * no narrative was produced — the synthesis pipeline emits exactly one
+ * branch (synthesis text OR a single skipped flag) so the GUI can decide
+ * between rendering the prose, a muted reason note, or a generic fallback.
+ */
+export interface RecallSynthesisOutcome {
+  synthesis?: string;
+  query: string;
+  source_count: number;
+  model_used?: string;
+  skipped_disabled?: boolean;
+  skipped_no_llm?: boolean;
+  skipped_too_few_results?: boolean;
+}
+
+/**
+ * Shape of `GET /api/memories?...` once Cap B lands. The legacy 24.x
+ * response (`{ results, count }`) is a structural subset — the new
+ * `synthesis` / `route` / `request_id` fields are optional so older
+ * backends still type-check.
+ */
+export interface RecallMemoryOutput {
+  results: RecallResult[];
+  count?: number;
+  route?: string;
+  request_id?: string;
+  synthesis?: RecallSynthesisOutcome;
+}
+
 export interface MemoryEvidence {
   id: string;
   canonical_id: string;
