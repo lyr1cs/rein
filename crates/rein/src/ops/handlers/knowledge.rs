@@ -582,6 +582,112 @@ impl IntoCliText for LinkOutput {
     }
 }
 
+// ── concept_state ────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct ConceptStateParams {
+    /// Concept ID to fetch.
+    pub concept_id: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ConceptStateOutput {
+    pub id: String,
+    pub memoir_id: String,
+    pub name: String,
+    pub definition: String,
+    pub revision: u32,
+    pub last_episode_id: Option<String>,
+    pub living_summary: Option<String>,
+    pub living_summary_updated_at: Option<String>,
+    pub living_summary_source_revision: Option<u32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl IntoJson for ConceptStateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ConceptStateOutput {
+    fn to_markdown(&self) -> String {
+        let mut text = format!(
+            "## {} (r{})\n{}\n",
+            self.name, self.revision, self.definition
+        );
+        if let Some(summary) = &self.living_summary {
+            text.push_str(&format!("\n### Living summary\n{summary}\n"));
+            if let Some(ts) = &self.living_summary_updated_at {
+                text.push_str(&format!("_updated at {ts}"));
+                if let Some(rev) = self.living_summary_source_revision {
+                    text.push_str(&format!(", source revision r{rev}"));
+                }
+                text.push_str("_\n");
+            }
+        }
+        text
+    }
+}
+
+impl IntoCliText for ConceptStateOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
+// ── concept_summary_refresh ──────────────────────────────────────────────────
+
+#[derive(clap::Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct ConceptSummaryRefreshParams {
+    /// Concept ID to refresh. None = batch mode over all eligible concepts.
+    #[serde(default)]
+    pub concept_id: Option<String>,
+    /// If true, run eligibility selection only and do not call the LLM or write.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// Wrapper around `ops::concept_summary::ConceptSummaryOutcome` so this crate
+/// can attach the `IntoJson` / `IntoMarkdown` / `IntoCliText` impls that the
+/// `#[op]` adapter requires, without colliding with impls Agent 1 may add on
+/// the bare outcome type.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConceptSummaryRefreshOutput(pub crate::ops::concept_summary::ConceptSummaryOutcome);
+
+impl IntoJson for ConceptSummaryRefreshOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.0).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ConceptSummaryRefreshOutput {
+    fn to_markdown(&self) -> String {
+        let o = &self.0;
+        if o.skipped_disabled {
+            return "Concept summary refresh disabled in config".to_string();
+        }
+        if o.skipped_no_llm {
+            return "Concept summary refresh skipped: no LLM provider configured".to_string();
+        }
+        format!(
+            "Concept summary refresh{}: attempted {}, succeeded {}, ineligible {}, llm_failed {}",
+            if o.dry_run { " (dry run)" } else { "" },
+            o.attempted,
+            o.succeeded,
+            o.skipped_not_eligible,
+            o.llm_failed,
+        )
+    }
+}
+
+impl IntoCliText for ConceptSummaryRefreshOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
 impl OpsRuntime {
     #[op(
         name = "memoir_list",
@@ -684,6 +790,9 @@ impl OpsRuntime {
                 last_episode_id: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                living_summary: None,
+                living_summary_updated_at: None,
+                living_summary_source_revision: None,
             };
             let id = store.add_concept(concept)?;
             Ok(ConceptAddOutput {
@@ -865,6 +974,65 @@ impl OpsRuntime {
             Ok(MemoirExportOutput { format, output })
         })
     }
+
+    #[op(
+        name = "concept_state",
+        category = "knowledge",
+        description = "Fetch a concept's full state by ID, including its living summary (v0.24 ARS).",
+        mcp(name = "rein_concept_state"),
+        rest(method = "GET", path = "/api/concepts/{concept_id}/state")
+    )]
+    pub fn concept_state(&self, params: ConceptStateParams) -> ReinResult<ConceptStateOutput> {
+        let concept_id = params.concept_id.clone();
+        self.with_store(|store| {
+            let concept = store
+                .get_concept_by_id(&concept_id)?
+                .ok_or_else(|| ReinError::NotFound(format!("concept '{concept_id}' not found")))?;
+            Ok(ConceptStateOutput {
+                id: concept.id,
+                memoir_id: concept.memoir_id,
+                name: concept.name,
+                definition: concept.definition,
+                revision: concept.revision,
+                last_episode_id: concept.last_episode_id,
+                living_summary: concept.living_summary,
+                living_summary_updated_at: concept
+                    .living_summary_updated_at
+                    .map(|dt| dt.to_rfc3339()),
+                living_summary_source_revision: concept.living_summary_source_revision,
+                created_at: concept.created_at.to_rfc3339(),
+                updated_at: concept.updated_at.to_rfc3339(),
+            })
+        })
+    }
+
+    #[op(
+        name = "concept_summary_refresh",
+        category = "knowledge",
+        description = "Regenerate concept living_summary via LLM. Single-concept when concept_id is set, otherwise batch over all eligible concepts. Use dry_run=true to preview.",
+        mutating = true,
+        mcp(name = "rein_concept_summary_refresh"),
+        rest(method = "POST", path = "/api/concepts/summary_refresh"),
+        auth = "mutation_marker"
+    )]
+    pub fn concept_summary_refresh(
+        &self,
+        params: ConceptSummaryRefreshParams,
+    ) -> ReinResult<ConceptSummaryRefreshOutput> {
+        let dry_run = params.dry_run.unwrap_or(false);
+        self.set_dry_run(dry_run);
+        let concept_id = params.concept_id.clone();
+        let config = self.config.clone();
+        self.with_store(|store| {
+            let outcome = crate::ops::concept_summary::run_concept_summary(
+                store,
+                &config,
+                concept_id.as_deref(),
+                dry_run,
+            )?;
+            Ok(ConceptSummaryRefreshOutput(outcome))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -909,6 +1077,9 @@ mod tests {
                 last_episode_id: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                living_summary: None,
+                living_summary_updated_at: None,
+                living_summary_source_revision: None,
             })
             .expect("add concept");
         (Arc::new(crate::ops::OpsRuntime::for_rest(config)), tmp)
@@ -1108,5 +1279,126 @@ mod tests {
             value.get("ascii").is_none(),
             "MCP adapter must not leak the raw Serialize shape, got {value}"
         );
+    }
+
+    // ── v0.24 ARS handler tests ──────────────────────────────────────────────
+
+    /// Helper: look up the seeded concept's id from `runtime_with_seeded_memoir`.
+    fn seeded_concept_id(runtime: &crate::ops::OpsRuntime, memoir_name: &str) -> String {
+        let store = runtime.config().open_store().expect("open store");
+        let concept = store
+            .get_concept(memoir_name, "concept-alpha")
+            .expect("lookup")
+            .expect("concept-alpha exists");
+        concept.id
+    }
+
+    #[test]
+    fn concept_state_surfaces_living_summary_fields_when_present() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("ars-state");
+        let concept_id = seeded_concept_id(&runtime, "ars-state");
+        // Seed living_summary directly — simulates a prior concept_summary_refresh.
+        runtime
+            .config()
+            .open_store()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE concepts SET living_summary = ?1, \
+                 living_summary_updated_at = ?2, living_summary_source_revision = ?3 \
+                 WHERE id = ?4",
+                rusqlite::params![
+                    "rolling summary prose",
+                    "2026-04-24T12:00:00Z",
+                    1i64,
+                    &concept_id,
+                ],
+            )
+            .unwrap();
+
+        let out = runtime
+            .concept_state(ConceptStateParams {
+                concept_id: concept_id.clone(),
+            })
+            .expect("concept_state");
+        assert_eq!(out.id, concept_id);
+        assert_eq!(out.name, "concept-alpha");
+        assert_eq!(out.living_summary.as_deref(), Some("rolling summary prose"));
+        // `DateTime<Utc>::to_rfc3339()` normalizes 'Z' → '+00:00'; just check
+        // the date component survives the round-trip.
+        let ls_at = out.living_summary_updated_at.expect("timestamp present");
+        assert!(
+            ls_at.starts_with("2026-04-24T12:00:00"),
+            "living_summary_updated_at did not round-trip: {ls_at}"
+        );
+        assert_eq!(out.living_summary_source_revision, Some(1));
+    }
+
+    #[test]
+    fn concept_state_returns_none_fields_when_summary_absent() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("ars-none");
+        let concept_id = seeded_concept_id(&runtime, "ars-none");
+
+        let out = runtime
+            .concept_state(ConceptStateParams {
+                concept_id: concept_id.clone(),
+            })
+            .expect("concept_state");
+        assert_eq!(out.id, concept_id);
+        assert!(out.living_summary.is_none());
+        assert!(out.living_summary_updated_at.is_none());
+        assert!(out.living_summary_source_revision.is_none());
+    }
+
+    #[test]
+    fn concept_state_returns_not_found_for_missing_id() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("ars-404");
+        let err = runtime
+            .concept_state(ConceptStateParams {
+                concept_id: "nonexistent".to_string(),
+            })
+            .expect_err("missing concept must error");
+        // Assert the error surface carries the not-found signal (string match
+        // on the enum variant's Display is sufficient here — the REST adapter
+        // maps this to 404 via OpsErrorKind).
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains("not found"),
+            "expected NotFound-flavored error, got: {err_str}"
+        );
+    }
+
+    #[test]
+    fn concept_summary_refresh_returns_skipped_disabled_when_ars_off() {
+        let (runtime, _tmp) = runtime_with_seeded_memoir("ars-disabled");
+        // Default ReinConfig has `[ars].concept_summary_enabled = false`.
+        let out = runtime
+            .concept_summary_refresh(ConceptSummaryRefreshParams {
+                concept_id: None,
+                dry_run: Some(false),
+            })
+            .expect("refresh call");
+        assert!(
+            out.0.skipped_disabled,
+            "disabled ARS config must short-circuit before touching any LLM"
+        );
+        assert_eq!(out.0.attempted, 0);
+        assert_eq!(out.0.succeeded, 0);
+        assert_eq!(out.0.llm_failed, 0);
+    }
+
+    #[test]
+    fn concept_summary_refresh_dry_run_on_disabled_still_short_circuits() {
+        // Even dry_run must respect the enabled gate — dry_run preview is not
+        // meant to bypass configuration.
+        let (runtime, _tmp) = runtime_with_seeded_memoir("ars-disabled-dry");
+        let out = runtime
+            .concept_summary_refresh(ConceptSummaryRefreshParams {
+                concept_id: None,
+                dry_run: Some(true),
+            })
+            .expect("refresh dry_run");
+        assert!(out.0.skipped_disabled);
+        assert_eq!(out.0.attempted, 0);
     }
 }

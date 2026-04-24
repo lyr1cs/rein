@@ -163,3 +163,26 @@ export interface ConceptLink {
   valid_from: string | null;
   valid_until: string | null;
 }
+
+/**
+ * Snapshot of a concept's current state including the auto-refreshed
+ * `living_summary` (v0.24 ARS Capability A). Fetched from
+ * `GET /api/concepts/{id}/state`.
+ *
+ * `living_summary` and its companion fields are nullable — null means the
+ * living summary has not been generated yet, in which case the summary
+ * section should be hidden entirely (no placeholder).
+ */
+export interface ConceptState {
+  id: string;
+  memoir_id: string;
+  name: string;
+  definition: string;
+  revision: number;
+  last_episode_id: string | null;
+  living_summary: string | null;
+  living_summary_updated_at: string | null;
+  living_summary_source_revision: number | null;
+  created_at: string;
+  updated_at: string;
+}

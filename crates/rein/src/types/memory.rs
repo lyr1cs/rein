@@ -351,6 +351,20 @@ pub struct Concept {
     pub last_episode_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// v0.24 ARS: rolling 3-5 sentence "current state" synthesis generated
+    /// by LLM from recent revisions. `None` until the refresh trigger fires
+    /// for the first time (see `should_refresh_living_summary`).
+    #[serde(default)]
+    pub living_summary: Option<String>,
+    /// v0.24 ARS: when `living_summary` was last generated. `None` iff
+    /// `living_summary` is `None`.
+    #[serde(default)]
+    pub living_summary_updated_at: Option<DateTime<Utc>>,
+    /// v0.24 ARS: the `revision` value at the time `living_summary` was
+    /// last generated. Used to compute revisions-since-last-summary in
+    /// the refresh-decision gate.
+    #[serde(default)]
+    pub living_summary_source_revision: Option<u32>,
 }
 
 /// A typed relation between two concepts, with optional temporal validity.

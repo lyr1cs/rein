@@ -132,6 +132,9 @@ impl SqliteStore {
                             last_episode_id: None,
                             created_at: Utc::now(),
                             updated_at: Utc::now(),
+                            living_summary: None,
+                            living_summary_updated_at: None,
+                            living_summary_source_revision: None,
                         };
                         self.add_concept(concept)?;
                         report.concepts_added += 1;

@@ -61,6 +61,8 @@ pub struct ReinConfig {
     pub intelligent_merge: IntelligentMergeConfig,
     #[serde(default)]
     pub resummerize: ResummerizeConfig,
+    #[serde(default)]
+    pub ars: ArsConfig,
 }
 
 /// Config for the LLM-driven intelligent-merge classifier (opt-in).
@@ -167,6 +169,58 @@ impl ResummerizeConfig {
             "omlx" | "local" => Provider::Omlx,
             "none" => Provider::None,
             _ => fallback_extract_provider, // "inherit" or unknown → fall back
+        }
+    }
+}
+
+/// Config for the v0.24 ARS (Adaptive Retention / Synthesis) Capability A:
+/// the concept living-summary slow-channel op.
+///
+/// When triggered by `should_refresh_living_summary`, the op reads the
+/// concept's revision history, calls the configured LLM to synthesize a
+/// 3-5 sentence current-state summary, and writes it back atomically.
+/// Lower-stakes than resummerize (no contract gate, no claim-token CAS) —
+/// the living summary is an advisory field rendered alongside the
+/// canonical definition.
+///
+/// `llm_backend = "inherit"` (the default) reuses `[extract].provider`.
+/// Explicit values `"google"` / `"omlx"` override for this op only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArsConfig {
+    #[serde(default)]
+    pub concept_summary_enabled: bool,
+    #[serde(default = "default_ars_backend")]
+    pub llm_backend: String,
+    #[serde(default = "default_ars_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_ars_backend() -> String {
+    "inherit".to_string()
+}
+
+fn default_ars_batch_size() -> usize {
+    16
+}
+
+impl Default for ArsConfig {
+    fn default() -> Self {
+        Self {
+            concept_summary_enabled: false,
+            llm_backend: default_ars_backend(),
+            batch_size: default_ars_batch_size(),
+        }
+    }
+}
+
+impl ArsConfig {
+    pub fn resolved_provider(&self, fallback_extract_provider: Provider) -> Provider {
+        match self.llm_backend.to_lowercase().as_str() {
+            "google" | "gemini" => Provider::Google,
+            "omlx" | "local" => Provider::Omlx,
+            "none" => Provider::None,
+            _ => fallback_extract_provider,
         }
     }
 }
@@ -1065,6 +1119,11 @@ impl ReinConfig {
         validate_provider_name("query_expansion.provider", &self.query_expansion.provider)?;
         validate_provider_name("search.llm_reranker", &self.search.llm_reranker)?;
         validate_provider_name_or_inherit("async_memory.provider", &self.async_memory.provider)?;
+        validate_provider_name_or_inherit(
+            "resummerize.llm_backend",
+            &self.resummerize.llm_backend,
+        )?;
+        validate_provider_name_or_inherit("ars.llm_backend", &self.ars.llm_backend)?;
 
         if self.database.path.trim().is_empty() {
             anyhow::bail!("database.path must not be empty");
@@ -1183,6 +1242,12 @@ impl ReinConfig {
         }
         if c.llm_batch_size == 0 {
             anyhow::bail!("cleanup.llm_batch_size must be >= 1");
+        }
+        if self.resummerize.batch_size == 0 {
+            anyhow::bail!("resummerize.batch_size must be >= 1");
+        }
+        if self.ars.batch_size == 0 {
+            anyhow::bail!("ars.batch_size must be >= 1");
         }
 
         Ok(())
@@ -1617,6 +1682,28 @@ unknown_knob = true
     fn test_invalid_provider_rejected_by_validate() {
         let mut cfg = ReinConfig::default();
         cfg.embedding.provider = "bogus".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_slow_channel_backend_rejected_by_validate() {
+        let mut cfg = ReinConfig::default();
+        cfg.resummerize.llm_backend = "bogus".to_string();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = ReinConfig::default();
+        cfg.ars.llm_backend = "bogus".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_slow_channel_batch_size_must_be_nonzero() {
+        let mut cfg = ReinConfig::default();
+        cfg.resummerize.batch_size = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = ReinConfig::default();
+        cfg.ars.batch_size = 0;
         assert!(cfg.validate().is_err());
     }
 

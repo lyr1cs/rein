@@ -21,9 +21,7 @@ use crate::compression::contract::{self, ContractInput, EvidenceEntry};
 use crate::config::{Provider, ReinConfig};
 use crate::extract::llm::{strip_code_fences, ExtractorKind};
 use crate::store::adaptive::AdaptiveState;
-use crate::store::resummerize_audit::{
-    self, ResummerizeRunRow, ResummerizeRunStatus,
-};
+use crate::store::resummerize_audit::{self, ResummerizeRunRow, ResummerizeRunStatus};
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
 use crate::types::{ReinError, ReinResult, SUMMARY_MAX_CHARS};
@@ -293,10 +291,7 @@ fn stale_cutoff_rfc3339() -> String {
 /// Dry-run variant of batch selection: report which rows *would* be
 /// processed without mutating `in_progress_resummerize_at`. Used only by
 /// the preview path.
-fn preview_eligible(
-    store: &SqliteStore,
-    only: Option<&str>,
-) -> ReinResult<Vec<String>> {
+fn preview_eligible(store: &SqliteStore, only: Option<&str>) -> ReinResult<Vec<String>> {
     let stale = stale_cutoff_rfc3339();
     // Swap the named `?stale` marker for a positional `?1` to match what
     // rusqlite's numbered-param binding expects. (rusqlite does not
@@ -304,9 +299,7 @@ fn preview_eligible(
     let predicate = ELIGIBILITY_PREDICATE.replace("?stale", "?1");
 
     if let Some(id) = only {
-        let sql = format!(
-            "SELECT m.id FROM memories m WHERE {predicate} AND m.id = ?2",
-        );
+        let sql = format!("SELECT m.id FROM memories m WHERE {predicate} AND m.id = ?2",);
         let mut stmt = store.conn().prepare(&sql)?;
         let hit: Option<String> = stmt
             .query_row(rusqlite::params![&stale, id], |row| row.get(0))
@@ -318,8 +311,7 @@ fn preview_eligible(
          ORDER BY COALESCE(m.updated_at, m.created_at) ASC",
     );
     let mut stmt = store.conn().prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params![&stale], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params![&stale], |row| row.get::<_, String>(0))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.into())
 }
@@ -592,8 +584,7 @@ fn resummerize_one_inner(
     // `MAX_RESUMMERIZE_TARGET + 10%` (Codex round-2 MEDIUM) can't slip
     // past this gate and then immediately blow the upstream merge cap
     // on the next real merge.
-    let tolerance = (target_bytes + target_bytes / 10)
-        .min(crate::store::sqlite::MERGE_CONTENT_CAP);
+    let tolerance = (target_bytes + target_bytes / 10).min(crate::store::sqlite::MERGE_CONTENT_CAP);
     let output_bytes = llm_output.len();
     if output_bytes > tolerance {
         // Post-audit round-2 MED-1: atomically recheck ownership AND write
@@ -652,10 +643,9 @@ fn resummerize_one_inner(
                     // backpressure coordination. For now, flag affected
                     // concepts so operators have a handle + doctor can
                     // surface the drift backlog.
-                    if let Ok(count) = mark_concepts_needing_refresh_for_canonical(
-                        store,
-                        &claim.canonical_id,
-                    ) {
+                    if let Ok(count) =
+                        mark_concepts_needing_refresh_for_canonical(store, &claim.canonical_id)
+                    {
                         if count > 0 {
                             tracing::warn!(
                                 canonical_id = %claim.canonical_id,
@@ -677,10 +667,9 @@ fn resummerize_one_inner(
                     // For now, flag episodes that may have drifted so
                     // operators can audit before acting on replayed
                     // episode content.
-                    if let Ok(count) = count_episodes_referencing_canonical(
-                        store,
-                        &claim.canonical_id,
-                    ) {
+                    if let Ok(count) =
+                        count_episodes_referencing_canonical(store, &claim.canonical_id)
+                    {
                         if count > 0 {
                             tracing::warn!(
                                 canonical_id = %claim.canonical_id,
@@ -733,10 +722,8 @@ fn resummerize_one_inner(
             }
         }
         Err(violations) => {
-            let violation_names: Vec<String> = violations
-                .iter()
-                .map(|v| v.invariant.to_string())
-                .collect();
+            let violation_names: Vec<String> =
+                violations.iter().map(|v| v.invariant.to_string()).collect();
             let detail = violations
                 .iter()
                 .map(|v| format!("{}: {}", v.invariant, v.detail))
@@ -1003,10 +990,7 @@ pub mod test_hooks {
     /// Claim a single canonical and return the stamped claim token.
     /// `None` when the row is ineligible (not flagged / superseded /
     /// already claimed by a live worker).
-    pub fn claim_for_test(
-        store: &SqliteStore,
-        canonical_id: &str,
-    ) -> ReinResult<Option<String>> {
+    pub fn claim_for_test(store: &SqliteStore, canonical_id: &str) -> ReinResult<Option<String>> {
         let claims = claim_batch(store, Some(canonical_id), 1)?;
         Ok(claims.into_iter().next().map(|c| c.token))
     }
@@ -1043,16 +1027,12 @@ pub mod test_hooks {
                 rusqlite::params![canonical_id],
                 |row| row.get(0),
             )
-            .map_err(|e| crate::types::ReinError::Config(format!(
-                "apply_for_test: failed to read updated_at: {e}"
-            )))?;
-        match apply_resummerize(
-            store,
-            canonical,
-            new_content,
-            claim_token,
-            &updated_at_raw,
-        )? {
+            .map_err(|e| {
+                crate::types::ReinError::Config(format!(
+                    "apply_for_test: failed to read updated_at: {e}"
+                ))
+            })?;
+        match apply_resummerize(store, canonical, new_content, claim_token, &updated_at_raw)? {
             ApplyResult::Applied => Ok(ApplyOutcome::Applied),
             ApplyResult::ClaimLost => Ok(ApplyOutcome::ClaimLost),
         }
@@ -1096,12 +1076,8 @@ fn finish_with_ownership_check(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let now = Utc::now();
     let result: ReinResult<Verdict> = (|| {
-        let still_ours = check_claim_still_held(
-            store,
-            canonical_id,
-            claim_token,
-            snapshot_updated_at_raw,
-        )?;
+        let still_ours =
+            check_claim_still_held(store, canonical_id, claim_token, snapshot_updated_at_raw)?;
         if still_ours {
             resummerize_audit::finish_resummerize_run(
                 conn,
@@ -1171,9 +1147,8 @@ fn finish_with_ownership_check(
             // the secondary error; if both the recheck and the finish
             // failed (e.g. the connection itself died), there was no
             // evidence of it in logs.
-            let best_effort_err = format!(
-                "ownership recheck SQL failed during terminal status write: {e}"
-            );
+            let best_effort_err =
+                format!("ownership recheck SQL failed during terminal status write: {e}");
             if let Err(finish_err) = resummerize_audit::finish_resummerize_run(
                 conn,
                 run_id,
@@ -1357,18 +1332,14 @@ pub fn call_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<Stri
     // (MCP/REST) or a fresh sync context (CLI).
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                extractor.raw_text_with_prompt(SYSTEM_PROMPT, prompt).await
-            })
+            handle.block_on(async { extractor.raw_text_with_prompt(SYSTEM_PROMPT, prompt).await })
         })
     } else {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
-        rt.block_on(async {
-            extractor.raw_text_with_prompt(SYSTEM_PROMPT, prompt).await
-        })
+        rt.block_on(async { extractor.raw_text_with_prompt(SYSTEM_PROMPT, prompt).await })
     }
 }
 
@@ -1392,7 +1363,11 @@ fn extractor_backend_tag(extractor: &ExtractorKind) -> Option<String> {
 pub fn build_prompt(input: &ContractInput) -> String {
     let mut buf = String::with_capacity(
         input.current_canonical.len()
-            + input.evidence.iter().map(|e| e.content.len()).sum::<usize>()
+            + input
+                .evidence
+                .iter()
+                .map(|e| e.content.len())
+                .sum::<usize>()
             + 512,
     );
     buf.push_str(&format!(
@@ -1552,9 +1527,7 @@ mod tests {
     #[test]
     fn apply_resummerize_rolls_back_if_canonical_changed_after_snapshot() {
         let store = SqliteStore::in_memory().unwrap();
-        let canonical_id = store
-            .store(test_memory("original canonical body"))
-            .unwrap();
+        let canonical_id = store.store(test_memory("original canonical body")).unwrap();
         store
             .conn()
             .execute(
@@ -1579,7 +1552,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let evidence_before = store.list_memory_evidence(&canonical_id, 100).unwrap().len();
+        let evidence_before = store
+            .list_memory_evidence(&canonical_id, 100)
+            .unwrap()
+            .len();
 
         let concurrent_updated_at = Utc::now().to_rfc3339();
         store
@@ -1614,7 +1590,10 @@ mod tests {
             "concurrent mutation should survive the aborted resummerize apply"
         );
         assert_eq!(
-            store.list_memory_evidence(&canonical_id, 100).unwrap().len(),
+            store
+                .list_memory_evidence(&canonical_id, 100)
+                .unwrap()
+                .len(),
             evidence_before,
             "aborted apply must roll back the pre-rewrite evidence snapshot"
         );

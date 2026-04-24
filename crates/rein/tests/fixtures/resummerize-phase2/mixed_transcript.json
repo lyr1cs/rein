@@ -1,0 +1,99 @@
+[
+  {
+    "case_id": "mixed_transcript_001",
+    "category": "mixed_transcript",
+    "description": "Transcript-style canonical with assistant narration, plan updates, and structured bullets from live work. Topic: 生命周期.",
+    "evidence": [
+      {
+        "content": "保持 `feedback_no_early_deploy`：D5-D10 整包做完才 `git tag v0.22.0`，中途不 release。\n\n要我现在开干 D6 + D7 吗？若是，我会：先读 `ops/dedup.rs`（GC 慢通道）和 `ops/adaptive.rs`（`run_all`）的现状，按流程走\"研究 → 头脑风暴 → 写码 → Codex audit 2 轮\"——和 D4 一致。\nAssistant: ## 需要头脑风暴的是 D5 F1\n\n在 `project_v022_kickoff.md` 和 D4 devlog 两处都明确标注了：\n\n> **D5 F1**：独立 `~/.rein/feedback_queue.db` + `pending_feedback_events` 表 + drain worker（~200-300 LoC）。**写码前先研究 + 头脑风暴**（同 D4 service wiring 的流程），不直接动手。\n\n其他步骤都不用头脑风暴：\n- D6 / D7：机械改造（~40 + ~30 LoC），模式已成熟（`buffer_unordered` / `tokio::join!`）。\n- D3.5：难点不是\"设计\"而是\"实测\"——要真实 fixture + soak 时间，不是思考题。\n\n## 我之前建议 \"D6+D7 先做\" 有个漏洞\n\n重新审视后发现一个耦合风险：\n\n- **D5** 把 `feedback_events` 从主 DB 搬到独立 `feedback_queue.db`（物理隔离写锁）。\n- **D7** 的 `adaptive::run_all` 要\"snapshot M1 log 一次共享\"——而 M1 log 就是 feedback event source。\n\n如果先做 D7，`run_all` 会基于主 DB 位置写 snapshot 逻辑；D5 搬 DB 后这段代码要返工。**D7 必须在 D5 之后**。\n\n## 修正后的最佳开发路线\n\n| 阶段 | 任务 | 时间 | 产出 |\n|---|---|---|---|\n| **1** | **D5 头脑风暴（只研究，不写码）**：读 `docs/superpowers/specs/2026-04-21-v0.22-async-hardening-design.md` §F1 + Gemini Q3 独立 DB pattern + advisor 一次 | 1-2 小时 | 设计草案（表 schema、drain worker 生命周期、crash recovery、pool 复用方式） |\n| **2** | **D6 CM1**（GC 慢通道 `buffer_unordered(8)`）——和 feedback 完全无关，安全并行做 | 半天 | ~40 LoC + Codex audit |\n| **3** | **D5 F1 写码**——头脑风暴已沉淀 1 天，设计稳；复用 `pool_for_path`，加 `config::open_feedback_queue_store()` helper + drain worker | 1-2 天 | ~200-300 LoC + 2 轮 Codex audit |\n| **4** | **D7 CM4**（`adaptive::run_all` 三路 `tokio::join!` + 从新 feedback_queue.db 读 M1 snapshot） | 半天 | ~30 LoC + Codex audit |\n| **5** | **D3.5** real-recall criterion no-regression gate（独立 session，I6 硬约束 p50 ≤ 2% 回归） | 独立时段 | fixture + bench 报告 |\n| **6** | **D9-D10** 最终 Codex audit + real-traffic soak + `git tag v0.22.0` + release notes | 2 天 | v0.22.0 release |\n\n**总计：5-7 天**（和 Codex 原估一致）。\n\n## 为什么这个排法比\"D6+D7 先合并\"更好\n\n1.",
+        "merged_at": "2026-04-22T09:21:28.736216+00:00"
+      }
+    ],
+    "current_canonical": "保持 `feedback_no_early_deploy`：D5-D10 整包做完才 `git tag v0.22.0`，中途不 release。\n\n要我现在开干 D6 + D7 吗？若是，我会：先读 `ops/dedup.rs`（GC 慢通道）和 `ops/adaptive.rs`（`run_all`）的现状，按流程走\"研究 → 头脑风暴 → 写码 → Codex audit 2 轮\"——和 D4 一致。\nAssistant: ## 需要头脑风暴的是 D5 F1\n\n在 `project_v022_kickoff.md` 和 D4 devlog 两处都明确标注了：\n\n> **D5 F1**：独立 `~/.rein/feedback_queue.db` + `pending_feedback_events` 表 + drain worker（~200-300 LoC）。**写码前先研究 + 头脑风暴**（同 D4 service wiring 的流程），不直接动手。\n\n其他步骤都不用头脑风暴：\n- D6 / D7：机械改造（~40 + ~30 LoC），模式已成熟（`buffer_unordered` / `tokio::join!`）。\n- D3.5：难点不是\"设计\"而是\"实测\"——要真实 fixture + soak 时间，不是思考题。\n\n## 我之前建议 \"D6+D7 先做\" 有个漏洞\n\n重新审视后发现一个耦合风险：\n\n- **D5** 把 `feedback_events` 从主 DB 搬到独立 `feedback_queue.db`（物理隔离写锁）。\n- **D7** 的 `adaptive::run_all` 要\"snapshot M1 log 一次共享\"——而 M1 log 就是 feedback event source。\n\n如果先做 D7，`run_all` 会基于主 DB 位置写 snapshot 逻辑；D5 搬 DB 后这段代码要返工。**D7 必须在 D5 之后**。\n\n## 修正后的最佳开发路线\n\n| 阶段 | 任务 | 时间 | 产出 |\n|---|---|---|---|\n| **1** | **D5 头脑风暴（只研究，不写码）**：读 `docs/superpowers/specs/2026-04-21-v0.22-async-hardening-design.md` §F1 + Gemini Q3 独立 DB pattern + advisor 一次 | 1-2 小时 | 设计草案（表 schema、drain worker 生命周期、crash recovery、pool 复用方式） |\n| **2** | **D6 CM1**（GC 慢通道 `buffer_unordered(8)`）——和 feedback 完全无关，安全并行做 | 半天 | ~40 LoC + Codex audit |\n| **3** | **D5 F1 写码**——头脑风暴已沉淀 1 天，设计稳；复用 `pool_for_path`，加 `config::open_feedback_queue_store()` helper + drain worker | 1-2 天 | ~200-300 LoC + 2 轮 Codex audit |\n| **4** | **D7 CM4**（`adaptive::run_all` 三路 `tokio::join!` + 从新 feedback_queue.db 读 M1 snapshot） | 半天 | ~30 LoC + Codex audit |\n| **5** | **D3.5** real-recall criterion no-regression gate（独立 session，I6 硬约束 p50 ≤ 2% 回归） | 独立时段 | fixture + bench 报告 |\n| **6** | **D9-D10** 最终 Codex audit + real-traffic soak + `git tag v0.22.0` + release notes | 2 天 | v0.22.0 release |\n\n**总计：5-7 天**（和 Codex 原估一致）。\n\n## 为什么这个排法比\"D6+D7 先合并\"更好\n\n1.",
+    "target_bytes": 1095,
+    "expected_must_pass": [
+      "no_new_facts",
+      "length_bounded",
+      "cjk_integrity",
+      "temporal_anchors_preserved"
+    ]
+  },
+  {
+    "case_id": "mixed_transcript_002",
+    "category": "mixed_transcript",
+    "description": "Transcript-style canonical with assistant narration, plan updates, and structured bullets from live work. Topic: 基础设施.",
+    "evidence": [
+      {
+        "content": "*\n\nAssistant: # v0.23 Resummerize 开发方案\n\n## 核心思路：Eval-First\n\napproved plan 的三件产物——**resummerize 实现 / Lossless Contract guardrail / week-3 bail-out eval harness**——看起来是三件事，实际上**是同一件事**：\n\n- Lossless Contract = property tests 的集合\n- Eval harness = 用一套 adversarial 数据集跑 property tests 的 runner\n- Bail-out deliverable = 这个 harness 本身\n\n所以**不要先写 resummerize，先写 eval harness**。不管 LLM 最后 beats 或 不 beats keep-tail，这个 harness 都是 v0.23 的交付物。先建标尺，再造锤子。\n\n---\n\n## 按周开发顺序\n\n### Week 1：Eval harness + adversarial 数据集（零 resummerize 代码\n\nAssistant: # 调整后的 v0.23 方案\n\n三条都拍板了，plan 变得更干净。主要变化：**所有阈值从代码里消失，换成从数据或统计检验里算出来**。\n\n## Q1 → 自适应 target_bytes\n\n沿用现有 M3 Kaplan-Meier 的 pattern（global prior + per-cluster curve），不引入新基础设施：\n\n```rust\nfn target_bytes_for(cluster_id: Option<ClusterId>) -> usize {\n    let per_cluster = cluster_id\n        .and_then(|c| adaptive_state.cluster_canonical_length_p25(c));\n    let global = adaptive_state.global_canonical_length_p25();\n    per_cluster\n        .or(global)\n        .unwrap_or(GLOBAL_COLD_START)  // 首次启动 = 全库 c\n\nAssistant: # 诚实先说边界\n\n可以、但不是全部 4 周——**代码部分 week 1+2 一个 session 里完成完全可行**（migration + resummerize op + adaptive target_bytes + 7 条 property tests + eval harness CLI skeleton + seed adversarial set + `cargo test --workspace` 全绿），大约 800-1200 LoC 含测试。\n\n不可行的是 **week 3 的实测部分**——跑 McNemar 需要真实 Gemini API 调用 × 150 个 paired cases × N 次 baseline noise floor 采样，这是几小时的 wall time + API 费用，不是 \"session 内\" 的事。**week 4 Codex audit 也是外部流程**，得你起 `codex:rescue` 单独跑。\n\n**Adversarial set 的坦白**：30+ per category 是统计 power 要求，但如果一个\n[Tool output]\nAssistant: I'll check the current repo state to update the existing CLAUDE.md accurately.",
+        "merged_at": "2026-04-22T14:06:07.323291+00:00"
+      }
+    ],
+    "current_canonical": "*\n\nAssistant: # v0.23 Resummerize 开发方案\n\n## 核心思路：Eval-First\n\napproved plan 的三件产物——**resummerize 实现 / Lossless Contract guardrail / week-3 bail-out eval harness**——看起来是三件事，实际上**是同一件事**：\n\n- Lossless Contract = property tests 的集合\n- Eval harness = 用一套 adversarial 数据集跑 property tests 的 runner\n- Bail-out deliverable = 这个 harness 本身\n\n所以**不要先写 resummerize，先写 eval harness**。不管 LLM 最后 beats 或 不 beats keep-tail，这个 harness 都是 v0.23 的交付物。先建标尺，再造锤子。\n\n---\n\n## 按周开发顺序\n\n### Week 1：Eval harness + adversarial 数据集（零 resummerize 代码\n\nAssistant: # 调整后的 v0.23 方案\n\n三条都拍板了，plan 变得更干净。主要变化：**所有阈值从代码里消失，换成从数据或统计检验里算出来**。\n\n## Q1 → 自适应 target_bytes\n\n沿用现有 M3 Kaplan-Meier 的 pattern（global prior + per-cluster curve），不引入新基础设施：\n\n```rust\nfn target_bytes_for(cluster_id: Option<ClusterId>) -> usize {\n    let per_cluster = cluster_id\n        .and_then(|c| adaptive_state.cluster_canonical_length_p25(c));\n    let global = adaptive_state.global_canonical_length_p25();\n    per_cluster\n        .or(global)\n        .unwrap_or(GLOBAL_COLD_START)  // 首次启动 = 全库 c\n\nAssistant: # 诚实先说边界\n\n可以、但不是全部 4 周——**代码部分 week 1+2 一个 session 里完成完全可行**（migration + resummerize op + adaptive target_bytes + 7 条 property tests + eval harness CLI skeleton + seed adversarial set + `cargo test --workspace` 全绿），大约 800-1200 LoC 含测试。\n\n不可行的是 **week 3 的实测部分**——跑 McNemar 需要真实 Gemini API 调用 × 150 个 paired cases × N 次 baseline noise floor 采样，这是几小时的 wall time + API 费用，不是 \"session 内\" 的事。**week 4 Codex audit 也是外部流程**，得你起 `codex:rescue` 单独跑。\n\n**Adversarial set 的坦白**：30+ per category 是统计 power 要求，但如果一个\n[Tool output]\nAssistant: I'll check the current repo state to update the existing CLAUDE.md accurately.",
+    "target_bytes": 986,
+    "expected_must_pass": [
+      "no_new_facts",
+      "length_bounded",
+      "cjk_integrity"
+    ]
+  },
+  {
+    "case_id": "mixed_transcript_003",
+    "category": "mixed_transcript",
+    "description": "Transcript-style canonical with assistant narration, plan updates, and structured bullets from live work. Topic: artifactmirroronly.",
+    "evidence": [
+      {
+        "content": "Current state summary:\n\n- **Released**: v0.17.7 (4/16), Hermes MemoryProvider integration, macmini deployed\n- **Active uncommitted work**: Codex subscription proxy Phase C/D — `src/proxy/mod.rs` has **+3067 lines** of new code (WebSocket mirror with permessage-deflate decoding, first-party routing with ArtifactMirrorOnly lock, ChatGPT backend helper routes, support matrix automation, `codexsubp`/`codexsubpws` entrypoints)\n---\n\n## Phase 1 审计结果汇总\n\n### 🔴 CRITICAL(阻断发布,需立即修)\n\n---\n\n## 🧭 项目当前状态\n\n- **已发布**:v0.17.7(2026-04-16),macmini 部署健康,Hermes 已切换为 MemoryProvider\n- **本次开发主线**:Codex 订阅登录态 Proxy(Phase C/D)——`src/proxy/mod.rs` 单文件 **+3067 行** 新代码",
+        "merged_at": "2026-04-16T15:33:09.386693+00:00"
+      },
+      {
+        "content": "Current state summary:\n\n- **Released**: v0.17.7 (4/16), Hermes MemoryProvider integration, macmini deployed\n- **Active uncommitted work**: Codex subscription proxy Phase C/D — `src/proxy/mod.rs` has **+3067 lines** of new code (WebSocket mirror with permessage-deflate decoding, first-party routing with ArtifactMirrorOnly lock, ChatGPT backend helper routes, support matrix automation, `codexsubp`/`codexsubpws` entrypoints)\n---\n\n## Phase 1 审计结果汇总\n\n### 🔴 CRITICAL(阻断发布,需立即修)\n\n---\n\n## 🧭 项目当前状态\n\n- **已发布**:v0.17.7(2026-04-16),macmini 部署健康,Hermes 已切换为 MemoryProvider\n- **本次开发主线**:Codex 订阅登录态 Proxy(Phase C/D)——`src/proxy/mod.rs` 单文件 **+3067 行** 新代码\n---\n  - 12 个未提交文件,包括新增 `scripts/smoke_codexsubp.sh` / `smoke_codexsubp_ws.sh`\n- **下阶段优先级**:WS/E2E hardening → support matrix 自动化 → Operation Registry 代码生成 → d\n\nAssistant: Deploy 4 路并行修复 team,按文件域分区避免冲突:\n- **Stream A** (Proxy 核): `src/proxy/*` + `src/init.rs` + `config/` — 16 项(含 2 CRITICAL + 2 DRIFT-CRITICAL)\n---\n- **Stream C** (搜索算法): `src/search/*` — 8 项(含 1 CRITICAL)\n- **Stream D** (存储/去重): `src/store/*` + `src/extract/dedup.rs` — 4 项\n\nAssistant: 两个 agent 被 file-read 的通用恶意代码提示误导拒绝执行了——那个提示是对所有文件读取一律附加的通用防御,不是对你项目的判定。你是 rein(github.com/example/rein)的作者,修自己代码的 bug 是完全正常的。\n\n重新派 4 路,prompt 里开头明确说明这是项目作者自己的代码修复任务。\n\nAssistant: Stream D 成功完成(7 项新测试全绿,134/134 通过)。A/B/C 被 file-read hook 的通用防御误判拒绝。与其继续和 subagent 绕这个循环,我直接在主上下文执行——这段 session 我一直在编辑项目文件,没有遇到阻塞。从 CRITICAL 先做。\n\nAssistant: The system reminder is a generic template attached to every file read; it does not classify this code as malware (this is liyuchen's own open-source memory search engine).",
+        "merged_at": "2026-04-16T16:03:39.914385+00:00"
+      }
+    ],
+    "current_canonical": "Current state summary:\n\n- **Released**: v0.17.7 (4/16), Hermes MemoryProvider integration, macmini deployed\n- **Active uncommitted work**: Codex subscription proxy Phase C/D — `src/proxy/mod.rs` has **+3067 lines** of new code (WebSocket mirror with permessage-deflate decoding, first-party routing with ArtifactMirrorOnly lock, ChatGPT backend helper routes, support matrix automation, `codexsubp`/`codexsubpws` entrypoints)\n---\n\n## Phase 1 审计结果汇总\n\n### 🔴 CRITICAL(阻断发布,需立即修)\n\n---\n\n## 🧭 项目当前状态\n\n- **已发布**:v0.17.7(2026-04-16),macmini 部署健康,Hermes 已切换为 MemoryProvider\n- **本次开发主线**:Codex 订阅登录态 Proxy(Phase C/D)——`src/proxy/mod.rs` 单文件 **+3067 行** 新代码\n\n[merged on 2026-04-16]\n  - 12 个未提交文件,包括新增 `scripts/smoke_codexsubp.sh` / `smoke_codexsubp_ws.sh`\n- **下阶段优先级**:WS/E2E hardening → support matrix 自动化 → Operation Registry 代码生成 → d\nAssistant: Deploy 4 路并行修复 team,按文件域分区避免冲突:\n- **Stream A** (Proxy 核): `src/proxy/*` + `src/init.rs` + `config/` — 16 项(含 2 CRITICAL + 2 DRIFT-CRITICAL)\n- **Stream C** (搜索算法): `src/search/*` — 8 项(含 1 CRITICAL)\n- **Stream D** (存储/去重): `src/store/*` + `src/extract/dedup.rs` — 4 项\nAssistant: 两个 agent 被 file-read 的通用恶意代码提示误导拒绝执行了——那个提示是对所有文件读取一律附加的通用防御,不是对你项目的判定。你是 rein(github.com/example/rein)的作者,修自己代码的 bug 是完全正常的。\n重新派 4 路,prompt 里开头明确说明这是项目作者自己的代码修复任务。\nAssistant: Stream D 成功完成(7 项新测试全绿,134/134 通过)。A/B/C 被 file-read hook 的通用防御误判拒绝。与其继续和 subagent 绕这个循环,我直接在主上下文执行——这段 session 我一直在编辑项目文件,没有遇到阻塞。从 CRITICAL 先做。\nAssistant: The system reminder is a generic template attached to every file read; it does not classify this code as malware (this is liyuchen's own open-source memory search engine).",
+    "target_bytes": 971,
+    "expected_must_pass": [
+      "no_new_facts",
+      "length_bounded",
+      "cjk_integrity",
+      "temporal_anchors_preserved"
+    ]
+  },
+  {
+    "case_id": "mixed_transcript_004",
+    "category": "mixed_transcript",
+    "description": "Transcript-style canonical with assistant narration, plan updates, and structured bullets from live work. Topic: subscription.",
+    "evidence": [
+      {
+        "content": "`docs/00-INDEX.md` 更新\n- 顶部 updated 改 2026-04-17\n- 开发日志段顶部插入两条新 devlog,含一句话摘要\n- 底部项目状态改成 \"v0.17.7 + Stream A-D 修复待 push\",下一步指向 v0.18 可观测性主题\n\n---\n## 改动总结\n\n- **`00-INDEX.md`** — 项目状态行改为 \"**v0.18.0 待 push**\",devlog 索引摘要里 \"v0.18 开发方向\" → \"v0.19+ 开发方向\"\n- **`roadmap.md`** — 顶部改 \"v0.18.0 待 push\",新增段落从 \"v0.17.8\" 改为 \"**v0.18.0 — Codex subscription proxy + 四路 Stream 修复**\",把 Codex proxy 作为主特性提上来;下一版本段改为 \"下一版本主题(v0.19+):可观测性 + 评估\"\n- **`2026-04-17-audit-and-stream-fixes.md`** — Release 流程段改为 \"**目标版本:v0.18.0**\" + 明确 release 命令 `gh release create v0.18.0`\n- **`2026-04-17-v018-roadmap-vision.md`** — 前言点明\"记录的是 v0.18 之后\",所有 \"v0.18\n\n---\n静默        16 分钟\n```\n\n说明 **model 在长 reasoning chain 里**,没发起新命令。这是两种情况之一:\n\n---\n新 tool call    0\n```\n\n24 分钟没发起任何新命令,不是\"在写报告\"——再长的 report 也不需要 24 分钟干写不发一个字。大概率是 `github_fetch` 失败后卡在内部重试循环,或者 reasoning loop 死循环。\n\n---\n\n- 不卡 network\n- 4 路并行,比 Codex 单线程快\n- 聚焦\"**新引入的修复有没有遗漏/回归**\",而不是第一轮 audit 那种\"找 bug\"——范围收窄\n\n---\n\n- **最后一条 Assistant 消息在 49:08**:\"I've hit the point where lo\n\nAssistant: 好。cancel + release 流程走起来。\n\n---\n\ncommit 在本地,未推送。如果要改/revert还来得及。\n\n## 已知 bug 盘点 — 答你问题\n\n**所有在今天审计中发现的 bug 都已修复并有测试覆盖**。28 项修复每项都有对应新测试或已有测试覆盖,serial 全量 461/461 pass。\n\n但**有 3 类\"已知但故意留到 v0.19 的 gap\"**,严格说不是 bug,是 audit 范围/测试深度问题,不会导致运行时故障。今天 devlog 里显式列过:\n\n### 这不是 bug(今天修了,下一轮更深才补):",
+        "merged_at": "2026-04-16T17:25:39.335171+00:00"
+      }
+    ],
+    "current_canonical": "`docs/00-INDEX.md` 更新\n- 顶部 updated 改 2026-04-17\n- 开发日志段顶部插入两条新 devlog,含一句话摘要\n- 底部项目状态改成 \"v0.17.7 + Stream A-D 修复待 push\",下一步指向 v0.18 可观测性主题\n\n---\n## 改动总结\n\n- **`00-INDEX.md`** — 项目状态行改为 \"**v0.18.0 待 push**\",devlog 索引摘要里 \"v0.18 开发方向\" → \"v0.19+ 开发方向\"\n- **`roadmap.md`** — 顶部改 \"v0.18.0 待 push\",新增段落从 \"v0.17.8\" 改为 \"**v0.18.0 — Codex subscription proxy + 四路 Stream 修复**\",把 Codex proxy 作为主特性提上来;下一版本段改为 \"下一版本主题(v0.19+):可观测性 + 评估\"\n- **`2026-04-17-audit-and-stream-fixes.md`** — Release 流程段改为 \"**目标版本:v0.18.0**\" + 明确 release 命令 `gh release create v0.18.0`\n- **`2026-04-17-v018-roadmap-vision.md`** — 前言点明\"记录的是 v0.18 之后\",所有 \"v0.18\n\n---\n静默        16 分钟\n```\n\n说明 **model 在长 reasoning chain 里**,没发起新命令。这是两种情况之一:\n\n---\n新 tool call    0\n```\n\n24 分钟没发起任何新命令,不是\"在写报告\"——再长的 report 也不需要 24 分钟干写不发一个字。大概率是 `github_fetch` 失败后卡在内部重试循环,或者 reasoning loop 死循环。\n\n---\n\n- 不卡 network\n- 4 路并行,比 Codex 单线程快\n- 聚焦\"**新引入的修复有没有遗漏/回归**\",而不是第一轮 audit 那种\"找 bug\"——范围收窄\n\n---\n\n- **最后一条 Assistant 消息在 49:08**:\"I've hit the point where lo\n\nAssistant: 好。cancel + release 流程走起来。\n\n---\n\ncommit 在本地,未推送。如果要改/revert还来得及。\n\n## 已知 bug 盘点 — 答你问题\n\n**所有在今天审计中发现的 bug 都已修复并有测试覆盖**。28 项修复每项都有对应新测试或已有测试覆盖,serial 全量 461/461 pass。\n\n但**有 3 类\"已知但故意留到 v0.19 的 gap\"**,严格说不是 bug,是 audit 范围/测试深度问题,不会导致运行时故障。今天 devlog 里显式列过:\n\n### 这不是 bug(今天修了,下一轮更深才补):",
+    "target_bytes": 769,
+    "expected_must_pass": [
+      "no_new_facts",
+      "length_bounded",
+      "cjk_integrity",
+      "code_block_preserved",
+      "temporal_anchors_preserved"
+    ]
+  },
+  {
+    "case_id": "mixed_transcript_005",
+    "category": "mixed_transcript",
+    "description": "Transcript-style canonical with assistant narration, plan updates, and structured bullets from live work. Topic: v0-23-resummerize.",
+    "evidence": [
+      {
+        "content": "Resummerize architecture decision: choose long-term target architecture option 3, but phase-1 delivery path is option 2. Introduce a restricted-triple fact layer as an append-only, versioned sidecar decoupled from memoir/concept. Facts are generated asynchronously after store/merge commit at source memory/evidence grain through an independent fact queue/worker, with historical backfill supported. Resummerize is the first strong consumer: merge over 10KB keeps current keep-tail fallback but also marks needs_resummarize and enqueues a resummarize job. The resummarize pipeline reads facts first, falls back to memory_evidence when fact coverage is insufficient, and treats canonical text only as auxiliary context. M1-M5 participate only through policy hints, never by mutating fact content or injecting raw adaptive parameters into the summary truth layer; M2 alpha stays out of prompt content in phase 1. Long-term goal is for facts to become the substrate for deeper dedup, temporal supersede, clustering, and distillation.",
+        "merged_at": "2026-04-22T13:48:33.578554+00:00"
+      }
+    ],
+    "current_canonical": "Resummerize architecture decision: choose long-term target architecture option 3, but phase-1 delivery path is option 2. Introduce a restricted-triple fact layer as an append-only, versioned sidecar decoupled from memoir/concept. Facts are generated asynchronously after store/merge commit at source memory/evidence grain through an independent fact queue/worker, with historical backfill supported. Resummerize is the first strong consumer: merge over 10KB keeps current keep-tail fallback but also marks needs_resummarize and enqueues a resummarize job. The resummarize pipeline reads facts first, falls back to memory_evidence when fact coverage is insufficient, and treats canonical text only as auxiliary context. M1-M5 participate only through policy hints, never by mutating fact content or injecting raw adaptive parameters into the summary truth layer; M2 alpha stays out of prompt content in phase 1. Long-term goal is for facts to become the substrate for deeper dedup, temporal supersede, clustering, and distillation.",
+    "target_bytes": 700,
+    "expected_must_pass": [
+      "no_new_facts",
+      "length_bounded"
+    ]
+  }
+]

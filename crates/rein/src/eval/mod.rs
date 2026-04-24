@@ -16,11 +16,14 @@
 //! `HitChecker`) is the main thread's responsibility. This module stops at
 //! defining the shapes and the decision math.
 
+pub mod concept_summary;
 pub mod mcnemar;
 pub mod scorecard;
 
 pub use mcnemar::{mcnemar, McNemarResult, PairedOutcome};
-pub use scorecard::{decide_ship, CategoryStats, Scorecard, ShipDecision, ShipReason};
+pub use scorecard::{
+    decide_ship, CategoryStats, DecideShipKind, Scorecard, ShipDecision, ShipReason,
+};
 
 /// Oracle that decides whether a surfaced evidence/context answers the
 /// canonical expected content for a case.
@@ -57,28 +60,104 @@ const CJK_STOP_WORDS: &[&str] = &[
     // .count() > 1` filter already drops single-char tokens, so
     // single-char entries like 的/是/在 listed in the pre-fix version
     // were redundant — audit round-2 LOW #10 removed them).
-    "这个", "那个", "可以", "那么", "就是", "一个", "一些", "没有", "但是",
-    "而且", "所以", "因为", "如果", "虽然", "然后", "之后", "之前", "可能",
-    "我们", "你们", "他们", "她们", "它们", "这样", "那样", "这里", "那里",
-    "什么", "怎么", "为什么", "哪里", "哪个",
+    "这个",
+    "那个",
+    "可以",
+    "那么",
+    "就是",
+    "一个",
+    "一些",
+    "没有",
+    "但是",
+    "而且",
+    "所以",
+    "因为",
+    "如果",
+    "虽然",
+    "然后",
+    "之后",
+    "之前",
+    "可能",
+    "我们",
+    "你们",
+    "他们",
+    "她们",
+    "它们",
+    "这样",
+    "那样",
+    "这里",
+    "那里",
+    "什么",
+    "怎么",
+    "为什么",
+    "哪里",
+    "哪个",
     // Traditional Chinese variants (post-fix audit round-2 LOW #10 gap —
     // missing these let 這個 / 那個 / 沒有 dominate top-5 on Traditional
     // fixtures). Round-3 audit Finding 8 added `什麼` and `為什麼` —
     // the Taiwan-standard orthography for "what" / "why" that the
     // round-2 pass missed (it only had the 甚 variants which are more
     // common in Hong Kong).
-    "這個", "那個", "可以", "沒有", "但是", "而且", "所以", "因為", "如果",
-    "雖然", "然後", "之後", "之前", "我們", "你們", "他們", "她們", "它們",
-    "這樣", "那樣", "這裡", "那裡", "甚麼", "怎麼", "為甚麼", "什麼",
-    "為什麼", "哪裡", "哪個", "一個", "一些",
+    "這個",
+    "那個",
+    "可以",
+    "沒有",
+    "但是",
+    "而且",
+    "所以",
+    "因為",
+    "如果",
+    "雖然",
+    "然後",
+    "之後",
+    "之前",
+    "我們",
+    "你們",
+    "他們",
+    "她們",
+    "它們",
+    "這樣",
+    "那樣",
+    "這裡",
+    "那裡",
+    "甚麼",
+    "怎麼",
+    "為甚麼",
+    "什麼",
+    "為什麼",
+    "哪裡",
+    "哪個",
+    "一個",
+    "一些",
     // Japanese particles + common filler (multi-char; single-char
     // particles are already filtered by the length > 1 predicate)
-    "です", "ます", "この", "その", "あの", "これ", "それ", "あれ", "する",
-    "した", "している", "ように", "ための", "ことが", "ことは",
+    "です",
+    "ます",
+    "この",
+    "その",
+    "あの",
+    "これ",
+    "それ",
+    "あれ",
+    "する",
+    "した",
+    "している",
+    "ように",
+    "ための",
+    "ことが",
+    "ことは",
     // Korean particles + common filler (same story — single-char ones
     // drop out via the length filter)
-    "그것", "이것", "저것", "합니다", "있습니다", "없습니다", "그리고",
-    "하지만", "때문에", "그래서",
+    "그것",
+    "이것",
+    "저것",
+    "합니다",
+    "있습니다",
+    "없습니다",
+    "그리고",
+    "하지만",
+    "때문에",
+    "그래서",
 ];
 
 /// Hit-checker version. Bumped whenever `tokenize` or the overlap predicate
@@ -98,7 +177,7 @@ pub const HIT_CHECKER_VERSION: u32 = 2;
 /// same on both paths. Latin/ASCII input keeps the simple `is_alphanumeric`
 /// split for backward-comparable v1 behavior on the existing fixture set's
 /// non-CJK cases.
-fn tokenize(s: &str) -> Vec<String> {
+pub(crate) fn tokenize(s: &str) -> Vec<String> {
     if crate::extract::dedup::contains_cjk(s) {
         // CJK path — call jieba directly so duplicates are preserved (the
         // production `tokenize_for_search` returns a sorted dedup'd Vec via
@@ -147,8 +226,7 @@ impl HitChecker for KeywordOverlapHitChecker {
         }
 
         // Count frequencies.
-        let mut counts: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for t in &tokens {
             *counts.entry(t.clone()).or_insert(0) += 1;
         }
@@ -166,7 +244,10 @@ impl HitChecker for KeywordOverlapHitChecker {
         let canonical_tokens: std::collections::HashSet<String> =
             tokenize(&canonical_lower).into_iter().collect();
 
-        let overlap = top_k.iter().filter(|w| canonical_tokens.contains(*w)).count();
+        let overlap = top_k
+            .iter()
+            .filter(|w| canonical_tokens.contains(*w))
+            .count();
         overlap >= 3
     }
 }
@@ -210,10 +291,8 @@ mod tests {
         // After the fix, repeated CJK words like "用户偏好" are
         // distinguishable tokens that the top-5/≥3-overlap predicate can
         // actually score.
-        let evidence =
-            "用户偏好简洁输出 用户偏好中文回复 用户偏好周末减少通知 用户偏好简洁输出";
-        let canonical =
-            "用户偏好简洁输出和中文回复，周末减少通知";
+        let evidence = "用户偏好简洁输出 用户偏好中文回复 用户偏好周末减少通知 用户偏好简洁输出";
+        let canonical = "用户偏好简洁输出和中文回复，周末减少通知";
         let checker = KeywordOverlapHitChecker;
         assert!(
             checker.check_hit(evidence, canonical),

@@ -1,0 +1,26 @@
+[
+  {
+    "case_id": "st_001",
+    "category": "single_topic",
+    "name": "A1 operation registry",
+    "definition": "A1 operation registry centralizes operation dispatch. The three thin adapters (CLI, MCP, REST) share the same dispatch path; source-scan drift checks now compare against inventory::iter. Phase 3 deleted the old middleman and the codebase's operations are authored once.",
+    "revisions": [
+      { "revision": 1, "definition": "A1 operation registry: #[op] proc-macro expands OpsRuntime methods into inventory entries dispatched by CLI, MCP, and REST adapters.", "created_at": "2026-04-18T09:00:00Z" },
+      { "revision": 2, "definition": "A1 operation registry: the #[op] proc-macro in rein-macros expands OpsRuntime methods into inventory-registered entries. CLI/MCP/REST adapters share dispatch. AuthPolicy middleware and OpsErrorKind-to-HTTP mapping were added.", "created_at": "2026-04-19T14:00:00Z" },
+      { "revision": 3, "definition": "A1 operation registry centralizes operation dispatch. The three thin adapters (CLI, MCP, REST) share the same dispatch path; source-scan drift checks now compare against inventory::iter. Phase 3 deleted the old middleman and the codebase's operations are authored once.", "created_at": "2026-04-20T10:00:00Z" }
+    ],
+    "evidence_keywords": ["proc-macro", "OpsRuntime", "AuthPolicy", "adapters", "inventory"]
+  },
+  {
+    "case_id": "st_002",
+    "category": "single_topic",
+    "name": "HDBSCAN clustering",
+    "definition": "HDBSCAN semantic clustering in rein extracts flat clusters from a stability-scored condensed tree. The pipeline samples when n>3000 to bound cost. Output feeds M2 per-cluster alpha optimization, M3 decay, and A1 per-cluster dedup thresholds. Lives in store/hdbscan.rs.",
+    "revisions": [
+      { "revision": 1, "definition": "HDBSCAN clustering groups memories by semantic similarity for downstream adaptive learning.", "created_at": "2026-03-10T11:00:00Z" },
+      { "revision": 2, "definition": "HDBSCAN clustering in rein builds a dendrogram from mutual reachability distances and extracts flat clusters via EOMBST. Output feeds M2 alpha optimization and M3 Kaplan-Meier survival decay.", "created_at": "2026-03-20T11:00:00Z" },
+      { "revision": 3, "definition": "HDBSCAN semantic clustering in rein extracts flat clusters from a stability-scored condensed tree. The pipeline samples when n>3000 to bound cost. Output feeds M2 per-cluster alpha optimization, M3 decay, and A1 per-cluster dedup thresholds. Lives in store/hdbscan.rs.", "created_at": "2026-04-01T11:00:00Z" }
+    ],
+    "evidence_keywords": ["dendrogram", "EOMBST", "Kaplan-Meier", "reachability", "clusters"]
+  }
+]

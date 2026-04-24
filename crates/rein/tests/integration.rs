@@ -507,6 +507,9 @@ fn test_dot_export_cjk() {
         last_episode_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        living_summary: None,
+        living_summary_updated_at: None,
+        living_summary_source_revision: None,
     };
     store.add_concept(c1).unwrap();
 
@@ -522,6 +525,9 @@ fn test_dot_export_cjk() {
         last_episode_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        living_summary: None,
+        living_summary_updated_at: None,
+        living_summary_source_revision: None,
     };
     store.add_concept(c2).unwrap();
 

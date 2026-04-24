@@ -88,6 +88,19 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
 
     let last_episode_id: Option<String> = row.get("last_episode_id").unwrap_or(None);
 
+    // v0.24 ARS fields — nullable columns on `concepts`. Absent on
+    // pre-v0.24 rows until the refresh trigger fires for the first time.
+    let living_summary: Option<String> = row.get("living_summary").unwrap_or(None);
+    let living_summary_updated_at: Option<DateTime<Utc>> = row
+        .get::<_, Option<String>>("living_summary_updated_at")
+        .unwrap_or(None)
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let living_summary_source_revision: Option<u32> = row
+        .get::<_, Option<i64>>("living_summary_source_revision")
+        .unwrap_or(None)
+        .map(|v| v.max(0) as u32);
+
     Ok(Concept {
         id,
         memoir_id,
@@ -100,7 +113,43 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
         last_episode_id,
         created_at,
         updated_at,
+        living_summary,
+        living_summary_updated_at,
+        living_summary_source_revision,
     })
+}
+
+/// v0.24 ARS: decide whether a concept's `living_summary` needs an LLM
+/// refresh. Both gates must pass — the revision-density gate catches
+/// fast-moving concepts (many edits in a short span), and the age gate
+/// prevents churn on recently-refreshed summaries.
+///
+/// Gates:
+/// - `revisions_since_last_summary >= adaptive.concept_refresh_revision_threshold()`
+/// - `age_since_last_summary >= adaptive.concept_refresh_age_threshold_secs()`
+///
+/// A concept that has never been summarized
+/// (`living_summary_updated_at == None`) counts as having infinite age,
+/// so it triggers as soon as the revision gate passes.
+///
+/// Thresholds come from [`AdaptiveState`] with fallback to bootstrap
+/// constants, matching the M-pattern used by `resummerize_target_bytes`.
+pub fn should_refresh_living_summary(
+    concept: &Concept,
+    adaptive: &crate::store::adaptive::AdaptiveState,
+    now: DateTime<Utc>,
+) -> bool {
+    let last_summary_revision = concept.living_summary_source_revision.unwrap_or(0);
+    let revisions_since_last = concept.revision.saturating_sub(last_summary_revision);
+    if revisions_since_last < adaptive.concept_refresh_revision_threshold() {
+        return false;
+    }
+
+    let age_secs = match concept.living_summary_updated_at {
+        Some(ts) => now.signed_duration_since(ts).num_seconds(),
+        None => i64::MAX,
+    };
+    age_secs >= adaptive.concept_refresh_age_threshold_secs()
 }
 
 /// Map a rusqlite Row to a ConceptLink struct.
@@ -1500,6 +1549,9 @@ mod tests {
             last_episode_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            living_summary: None,
+            living_summary_updated_at: None,
+            living_summary_source_revision: None,
         }
     }
 
@@ -2084,5 +2136,108 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(canonical.definition, "The engine v2 longer def");
+    }
+
+    // ── v0.24 ARS — Concept Living Summary refresh trigger tests ──────────────
+
+    #[test]
+    fn refresh_fresh_concept_triggers_once_revision_threshold_crossed() {
+        // A concept with no prior summary → age = infinity, so only the
+        // revision gate decides. Bootstrap threshold is active on a fresh
+        // AdaptiveState (no learned stats).
+        let adaptive = crate::store::adaptive::AdaptiveState::default();
+        let threshold = adaptive.concept_refresh_revision_threshold();
+        assert_eq!(
+            threshold,
+            crate::store::adaptive::CONCEPT_REFRESH_BOOTSTRAP_REVISION
+        );
+
+        let mut c = make_concept("m", "concept", "def");
+        let now = Utc::now();
+
+        c.revision = threshold.saturating_sub(1);
+        assert!(!should_refresh_living_summary(&c, &adaptive, now));
+
+        c.revision = threshold;
+        assert!(should_refresh_living_summary(&c, &adaptive, now));
+
+        c.revision = threshold * 10;
+        assert!(should_refresh_living_summary(&c, &adaptive, now));
+    }
+
+    #[test]
+    fn refresh_recent_summary_blocks_until_age_threshold_crosses() {
+        // A recent summary → age gate blocks even when revision gate passes.
+        let adaptive = crate::store::adaptive::AdaptiveState::default();
+        let rev_threshold = adaptive.concept_refresh_revision_threshold();
+        let age_threshold = adaptive.concept_refresh_age_threshold_secs();
+        assert_eq!(
+            age_threshold,
+            crate::store::adaptive::CONCEPT_REFRESH_BOOTSTRAP_AGE_SECS
+        );
+
+        let now = Utc::now();
+        let mut c = make_concept("m", "concept", "def");
+        c.revision = rev_threshold * 2; // well above the revision gate
+        c.living_summary = Some("prior summary".to_string());
+        c.living_summary_source_revision = Some(0); // revs_since = revision
+
+        c.living_summary_updated_at = Some(now - chrono::Duration::seconds(1));
+        assert!(!should_refresh_living_summary(&c, &adaptive, now));
+
+        c.living_summary_updated_at = Some(now - chrono::Duration::seconds(age_threshold + 1));
+        assert!(should_refresh_living_summary(&c, &adaptive, now));
+    }
+
+    #[test]
+    fn refresh_blocks_when_few_revisions_since_last_summary() {
+        // Revision gate uses `revision - source_revision`. A concept whose
+        // summary already tracks the latest state still blocks until new
+        // revisions accumulate.
+        let adaptive = crate::store::adaptive::AdaptiveState::default();
+        let rev_threshold = adaptive.concept_refresh_revision_threshold();
+        let age_threshold = adaptive.concept_refresh_age_threshold_secs();
+        let now = Utc::now();
+
+        let mut c = make_concept("m", "concept", "def");
+        c.revision = 100;
+        c.living_summary_source_revision = Some(100 - (rev_threshold.saturating_sub(1)));
+        // Make summary OLD so the age gate is out of the way.
+        c.living_summary_updated_at = Some(now - chrono::Duration::seconds(age_threshold * 2));
+
+        // revs_since_last = rev_threshold - 1 → blocks.
+        assert!(!should_refresh_living_summary(&c, &adaptive, now));
+
+        // One more revision → revs_since_last = rev_threshold → refreshes.
+        c.revision = 101;
+        assert!(should_refresh_living_summary(&c, &adaptive, now));
+    }
+
+    #[test]
+    fn adaptive_state_falls_back_to_bootstrap_when_stats_below_min_samples() {
+        // Learned stats present but under min-sample gate → ignored.
+        let mut adaptive = crate::store::adaptive::AdaptiveState::default();
+        adaptive.concept_refresh_stats = Some(crate::store::adaptive::ConceptRefreshStats {
+            count: crate::store::adaptive::CONCEPT_REFRESH_MIN_SAMPLES - 1,
+            revision_p75: 42,
+            age_p50_secs: 12345,
+        });
+        assert_eq!(
+            adaptive.concept_refresh_revision_threshold(),
+            crate::store::adaptive::CONCEPT_REFRESH_BOOTSTRAP_REVISION
+        );
+        assert_eq!(
+            adaptive.concept_refresh_age_threshold_secs(),
+            crate::store::adaptive::CONCEPT_REFRESH_BOOTSTRAP_AGE_SECS
+        );
+
+        // With enough samples, learned values take over.
+        adaptive.concept_refresh_stats = Some(crate::store::adaptive::ConceptRefreshStats {
+            count: crate::store::adaptive::CONCEPT_REFRESH_MIN_SAMPLES,
+            revision_p75: 42,
+            age_p50_secs: 12345,
+        });
+        assert_eq!(adaptive.concept_refresh_revision_threshold(), 42);
+        assert_eq!(adaptive.concept_refresh_age_threshold_secs(), 12345);
     }
 }

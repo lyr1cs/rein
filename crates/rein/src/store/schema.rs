@@ -326,6 +326,27 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
             .ok();
     }
 
+    // Migrate: add v0.24 ARS Concept Living Summary fields (three nullable
+    // columns). Backfill is lazy — rows without a `living_summary` just
+    // hold NULLs until their revision count crosses the refresh trigger
+    // in `should_refresh_living_summary`.
+    let has_living_summary: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='living_summary'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_living_summary {
+        conn.execute_batch(
+            "ALTER TABLE concepts ADD COLUMN living_summary TEXT;
+             ALTER TABLE concepts ADD COLUMN living_summary_updated_at TEXT;
+             ALTER TABLE concepts ADD COLUMN living_summary_source_revision INTEGER;",
+        )
+        .ok();
+    }
+
     // Create concept_revisions table (revision history)
     conn.execute_batch(
         "
