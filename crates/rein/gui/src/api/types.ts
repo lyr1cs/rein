@@ -33,6 +33,15 @@ export interface RecallResult extends Memory {
   sources_hit: number;
   evidence_count: number;
   evidence_preview: string[];
+  /**
+   * v0.26 Cap C — archival summary surfaced when the memory is in Cold tier
+   * AND `[ars].cold_archive_enabled = true` AND the row has a non-NULL
+   * `archival_summary` at the current `ARCHIVAL_SUMMARY_VERSION`. `undefined`
+   * for Hot/Warm or when the feature is off — UI/MCP must continue to render
+   * `memory.content` in that case. Server omits the field via
+   * `skip_serializing_if`, so the wire JSON stays compact for older clients.
+   */
+  archival_summary?: string;
 }
 
 export interface RecallPageResponse {
@@ -84,7 +93,24 @@ export interface RecallSynthesisOutcome {
   skipped_disabled?: boolean;
   skipped_no_llm?: boolean;
   skipped_too_few_results?: boolean;
+  /**
+   * v0.26 D direction — set when the per-query adaptive decision (driven by
+   * the synthesis_feedback consumer's `useful_rate` + cold-start fallback)
+   * voted to skip synthesis for this cluster/query_type pair, *distinct from*
+   * the operator-level `skipped_disabled` (which means `[ars]` config is
+   * off entirely). Server may temporarily reuse `skipped_disabled` per
+   * v0.26 contract §3.3 — UI tolerates either branch.
+   */
+  skipped_adaptive_decision?: boolean;
   citations?: Citation[];
+  /**
+   * v0.26 D direction — ULID stamped on each successful synthesis output
+   * (only set when prose is non-empty, never on skipped paths). Clients
+   * echo this in `SynthesisInteraction` feedback events posted to
+   * `/api/feedback`. When `synthesis_id` is `undefined`, callers MUST NOT
+   * post interaction events (per §8 invariant 9).
+   */
+  synthesis_id?: string;
 }
 
 /**
@@ -141,6 +167,40 @@ export interface StoreStats {
   cold_count: number;
 }
 
+/**
+ * v0.26 D direction — synthesis interaction projection embedded inside
+ * `AdaptiveStatus.synthesis`. The shape mirrors the JSON the server emits
+ * from `synthesis_feedback_stats` (per `compute_useful_rate` +
+ * `recompute_synthesis_feedback_stats`).
+ *
+ * `by_cluster` is a flat list keyed by `(cluster_id, query_type)` — the
+ * server projects the HashMap into a deterministic-order array. `global`
+ * is the rolled-up across-all-clusters scalar; `null` while the consumer
+ * has yet to absorb any events (cold-start state — UI shows the "awaiting
+ * traffic" hint when this branch hits).
+ */
+export interface AdaptiveStatusSynthesisCluster {
+  cluster_id: number;
+  query_type: string;
+  useful_rate: number;
+  viewed_count: number;
+  viewed_dwell_p50_ms: number | null;
+  clicked_source_rate: number;
+  immediate_requery_rate: number;
+  explicit_thumb_up_rate: number;
+}
+
+export interface AdaptiveStatusSynthesisGlobal {
+  useful_rate: number;
+  total_events: number;
+  last_consumed_event_id: number;
+}
+
+export interface AdaptiveStatusSynthesis {
+  by_cluster: AdaptiveStatusSynthesisCluster[];
+  global: AdaptiveStatusSynthesisGlobal | null;
+}
+
 export interface AdaptiveStatus {
   learned_alphas: Record<string, { value: number; sample_count: number; last_updated: string }>;
   reranker_weights: Record<string, number>;
@@ -158,7 +218,70 @@ export interface AdaptiveStatus {
     promotion_threshold: number;
     median_survival: number | null;
   }>;
+  /**
+   * v0.26 D direction — synthesis-quality observability projection. `undefined`
+   * on legacy backends that haven't shipped Cap C yet so callers can
+   * type-check against either; the Adaptive page renders the awaiting-traffic
+   * banner when this is undefined OR when `by_cluster` is empty AND `global`
+   * is null.
+   */
+  synthesis?: AdaptiveStatusSynthesis;
 }
+
+/* ── Feedback payloads (v0.26 D direction) ──────────────────────────── */
+
+/**
+ * v0.26 D direction — typed body for `synthesis_interaction` POST. The
+ * `kind` discriminator is serialized lower-case (`viewed`, `clicked_source`,
+ * `immediate_requery`, `explicit_thumb`) to match the Rust
+ * `SynthesisInteractionKind` `#[serde(rename_all = "snake_case", tag = "kind")]`.
+ *
+ * `source_index` is **1-based** to match the `[#k]` UI marker convention
+ * (extract_citations rank, recall_synthesis.rs:60). Out-of-range indices are
+ * accepted by the consumer and silently dropped.
+ */
+export type SynthesisInteractionKind =
+  | { kind: 'viewed'; dwell_ms: number }
+  | { kind: 'clicked_source'; source_index: number }
+  | { kind: 'immediate_requery'; gap_ms: number }
+  | { kind: 'explicit_thumb'; up: boolean };
+
+/**
+ * Optional per-event diagnostics. Server stores verbatim; consumer keys
+ * stats by `(cluster_id, query_type)`. Fields C_RECALL/B_REST_MCP haven't
+ * surfaced in v0.26.0 stay `undefined` on the wire and the consumer routes
+ * them to the global bucket — keep this best-effort, do not invent
+ * client-side guesses.
+ */
+export interface SynthesisMetadata {
+  query_type?: string;
+  cluster_id?: number;
+  source_count?: number;
+  synthesis_chars?: number;
+}
+
+/**
+ * Discriminated union — `kind: 'access'` mirrors the legacy
+ * `{memory_ids, request_id, query, helpful}` body so existing call sites
+ * keep working through the back-compat shim on the server. The server
+ * accepts both old (no `kind`) and new shapes; this typed view always
+ * carries the discriminator so future TypeScript callers stay explicit.
+ */
+export type FeedbackPayload =
+  | {
+      kind: 'access';
+      memory_ids: string[];
+      request_id?: string;
+      query?: string;
+      helpful?: boolean;
+    }
+  | {
+      kind: 'synthesis_interaction';
+      synthesis_id: string;
+      recall_id: string;
+      interaction: SynthesisInteractionKind;
+      metadata?: SynthesisMetadata;
+    };
 
 export interface DoctorCheck {
   name: string;

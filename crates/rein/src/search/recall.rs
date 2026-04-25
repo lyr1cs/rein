@@ -17,6 +17,50 @@ pub struct RecallResult {
     pub sources_hit: usize,
     pub evidence_count: usize,
     pub evidence_preview: Vec<String>,
+    /// v0.26 Cap C: condensed LLM summary surfaced when the underlying
+    /// memory is in the `Cold` tier AND `[ars].cold_archive_enabled = true`
+    /// AND the row carries a non-NULL `archival_summary` at the current
+    /// `ARCHIVAL_SUMMARY_VERSION`. `None` for Hot/Warm tiers, when the
+    /// feature flag is off, or when the stored summary is at a stale
+    /// version (the worker will regenerate it on the next pass).
+    ///
+    /// Clients (MCP / REST / GUI) MUST continue to render `memory.content`
+    /// when this is `None` — the summary is an enhancement, never a
+    /// substitute. Non-cold memories deliberately surface `None` even when
+    /// the column has data; only the cold tier benefits from the condensed
+    /// view (per contract §2.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archival_summary: Option<String>,
+}
+
+/// v0.26 Cap C: populate `RecallResult.archival_summary` when the gate
+/// permits — separated as a pure helper so tests can drive it without a
+/// full `SqliteStore` dance. Mirror of the gate condition in contract §2.6.
+///
+/// Returns `Some(summary)` iff:
+/// - `cold_archive_enabled = true`
+/// - `memory.tier == MemoryTier::Cold`
+/// - `memory.archival_summary.is_some()`
+/// - `memory.archival_summary_version == Some(ARCHIVAL_SUMMARY_VERSION)`
+///
+/// All other inputs (warm/hot tiers, feature off, stale version, missing
+/// summary) → `None`. Pure function.
+pub(crate) fn maybe_archival_summary_for_recall(
+    cold_archive_enabled: bool,
+    memory: &Memory,
+) -> Option<String> {
+    if !cold_archive_enabled {
+        return None;
+    }
+    if memory.tier != crate::types::MemoryTier::Cold {
+        return None;
+    }
+    let summary = memory.archival_summary.as_ref()?;
+    let version = memory.archival_summary_version?;
+    if version != crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION {
+        return None;
+    }
+    Some(summary.clone())
 }
 
 fn sort_recall_results(results: &mut [RecallResult]) {
@@ -89,6 +133,7 @@ fn collapse_results_to_canonicals(
                     sources_hit,
                     evidence_count: 0,
                     evidence_preview: vec![],
+                    archival_summary: None,
                 });
             }
         }
@@ -1425,6 +1470,7 @@ pub fn recall_temporal_with_request_id(
             sources_hit: v.sources_hit,
             evidence_count: 0,
             evidence_preview: vec![],
+            archival_summary: None,
         })
         .collect();
     results = collapse_results_to_canonicals(store, results)?;
@@ -1566,6 +1612,19 @@ pub fn recall_temporal_with_request_id(
         results.truncate(limit);
     }
     enrich_results_with_evidence(store, &mut results, 2);
+
+    // v0.26 Cap C: surface `archival_summary` for cold-tier memories when
+    // the operator has flipped `[ars].cold_archive_enabled = true`. Gating
+    // is centralised in `maybe_archival_summary_for_recall` so the
+    // tier/version invariants live next to the field definition. Pure /
+    // memory-local — no DB IO.
+    let cold_archive_enabled = config.ars.cold_archive_enabled;
+    for result in &mut results {
+        if let Some(summary) = maybe_archival_summary_for_recall(cold_archive_enabled, &result.memory)
+        {
+            result.archival_summary = Some(summary);
+        }
+    }
 
     // Record recall hit (NOT access — access should only be counted when
     // the agent/user actually uses the memory, not just when it's returned).
@@ -2009,6 +2068,9 @@ mod tests {
             embedding: None,
             tier: MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
@@ -2025,6 +2087,7 @@ mod tests {
                 sources_hit: 1,
                 evidence_count: 0,
                 evidence_preview: vec![],
+                archival_summary: None,
             },
             RecallResult {
                 memory: test_memory("high", 4, 2.0),
@@ -2033,6 +2096,7 @@ mod tests {
                 sources_hit: 1,
                 evidence_count: 0,
                 evidence_preview: vec![],
+                archival_summary: None,
             },
         ];
 
@@ -2107,6 +2171,7 @@ mod tests {
                 sources_hit: 1,
                 evidence_count: 0,
                 evidence_preview: vec![],
+                archival_summary: None,
             },
             RecallResult {
                 memory: store.get(&unsupported_id).unwrap(),
@@ -2115,11 +2180,142 @@ mod tests {
                 sources_hit: 1,
                 evidence_count: 0,
                 evidence_preview: vec![],
+                archival_summary: None,
             },
         ];
 
         apply_evidence_rerank(&store, "connection pool", &mut results, 3);
         sort_recall_results(&mut results);
         assert_eq!(results[0].memory.id, supported_id);
+    }
+
+    // ── v0.26 Cap C: archival_summary surfacing ─────────────────────────
+
+    /// Helper: build a memory with the desired tier + archival fields.
+    /// All other fields use the same defaults as `test_memory` so the
+    /// gate-only behavior stays the focus.
+    fn cold_archive_memory(
+        id: &str,
+        tier: MemoryTier,
+        summary: Option<&str>,
+        version: Option<u32>,
+    ) -> Memory {
+        let mut m = test_memory(id, 1, 1.0);
+        m.tier = tier;
+        m.archival_summary = summary.map(|s| s.to_string());
+        m.archival_summary_at = if summary.is_some() { Some(0) } else { None };
+        m.archival_summary_version = version;
+        m
+    }
+
+    /// Gate path 1 (canonical happy path): `cold_archive_enabled = true` +
+    /// tier=Cold + summary present + version current → surface the summary.
+    #[test]
+    fn maybe_archival_summary_returns_summary_for_enabled_cold_current_version() {
+        let memory = cold_archive_memory(
+            "cold-1",
+            MemoryTier::Cold,
+            Some("condensed view"),
+            Some(crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION),
+        );
+        let summary = maybe_archival_summary_for_recall(true, &memory);
+        assert_eq!(summary.as_deref(), Some("condensed view"));
+    }
+
+    /// Gate path 2: feature off → always None even when the row has data.
+    #[test]
+    fn maybe_archival_summary_returns_none_when_feature_disabled() {
+        let memory = cold_archive_memory(
+            "cold-2",
+            MemoryTier::Cold,
+            Some("condensed view"),
+            Some(crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION),
+        );
+        assert!(maybe_archival_summary_for_recall(false, &memory).is_none());
+    }
+
+    /// Gate path 3: tier != Cold → None even when the column has a current
+    /// summary (Hot/Warm memories deliberately do NOT surface the
+    /// condensed view per contract §2.6).
+    #[test]
+    fn maybe_archival_summary_returns_none_for_non_cold_tier() {
+        for tier in [MemoryTier::Hot, MemoryTier::Warm] {
+            let memory = cold_archive_memory(
+                "warm-3",
+                tier,
+                Some("condensed view"),
+                Some(crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION),
+            );
+            assert!(
+                maybe_archival_summary_for_recall(true, &memory).is_none(),
+                "tier {tier:?} must not surface archival_summary"
+            );
+        }
+    }
+
+    /// Gate path 4: stale version → None (worker will regenerate). Without
+    /// this we'd serve a summary written under an old prompt / contract.
+    #[test]
+    fn maybe_archival_summary_returns_none_for_stale_version() {
+        let stale_version =
+            crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION.saturating_sub(1);
+        let memory = cold_archive_memory(
+            "cold-stale",
+            MemoryTier::Cold,
+            Some("old prompt output"),
+            Some(stale_version),
+        );
+        assert!(maybe_archival_summary_for_recall(true, &memory).is_none());
+    }
+
+    /// Gate path 5: column null → None.
+    #[test]
+    fn maybe_archival_summary_returns_none_when_column_null() {
+        let memory = cold_archive_memory("cold-null", MemoryTier::Cold, None, None);
+        assert!(maybe_archival_summary_for_recall(true, &memory).is_none());
+    }
+
+    /// `RecallResult` JSON roundtrip with `archival_summary = Some`.
+    /// Mirrors the GUI consumer contract.
+    #[test]
+    fn recall_result_serde_roundtrip_with_archival_summary() {
+        let memory = test_memory("rr-1", 1, 1.0);
+        let r = RecallResult {
+            memory,
+            score: 0.7,
+            confidence: 0.9,
+            sources_hit: 2,
+            evidence_count: 1,
+            evidence_preview: vec!["[ev] preview".to_string()],
+            archival_summary: Some("compact view".to_string()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains("archival_summary"),
+            "field MUST appear in wire format when populated; got {json}"
+        );
+        assert!(json.contains("compact view"));
+    }
+
+    /// `archival_summary = None` is omitted from the wire format
+    /// (`skip_serializing_if = "Option::is_none"`) so old GUI builds that
+    /// don't know the field stay bit-identical.
+    #[test]
+    fn recall_result_serde_omits_archival_summary_when_none() {
+        let memory = test_memory("rr-2", 1, 1.0);
+        let r = RecallResult {
+            memory,
+            score: 0.7,
+            confidence: 0.9,
+            sources_hit: 2,
+            evidence_count: 0,
+            evidence_preview: vec![],
+            archival_summary: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("archival_summary"),
+            "None field MUST be elided; got {json}"
+        );
     }
 }

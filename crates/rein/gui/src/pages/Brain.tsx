@@ -4,7 +4,12 @@ import type { ForceGraphMethods, LinkObject, NodeObject } from 'react-force-grap
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { apiGet } from '../api/client';
 import { useMemoryDetail, useRecent, useMemoirs } from '../hooks/useApi';
-import { mergeForceGraphData } from '../utils/forceGraph';
+import {
+  endpointId as endpointIdGeneric,
+  endpointNode as endpointNodeGeneric,
+  mergeForceGraphData,
+  type LinkEndpoint as LinkEndpointGeneric,
+} from '../utils/forceGraph';
 import { getPollingIntervalMs } from '../utils/polling';
 import { TIER_COLORS } from '../utils/theme';
 import type { Memory, MemoirExport } from '../api/types';
@@ -42,19 +47,13 @@ interface GraphData {
 type BrainNode = NodeObject<GraphNode>;
 type BrainLink = LinkObject<GraphNode, GraphLink>;
 type GraphHandle = ForceGraphMethods<GraphNode, GraphLink> & { refresh?: () => void };
-type LinkEndpoint = string | number | BrainNode | undefined;
-
-function endpointId(endpoint: LinkEndpoint): string | null {
-  if (endpoint == null) return null;
-  if (typeof endpoint === 'object') {
-    return endpoint.id == null ? null : String(endpoint.id);
-  }
-  return String(endpoint);
-}
-
-function endpointNode(endpoint: LinkEndpoint): BrainNode | null {
-  return typeof endpoint === 'object' && endpoint !== null ? endpoint : null;
-}
+// M4 (v0.26 cleanup): the LinkEndpoint type alias + endpointId/endpointNode
+// helpers used to live inline here AND in Graph.tsx. Hoisted to
+// `utils/forceGraph.ts` as generics; the typed local aliases below keep
+// the call-sites unchanged while pinning the generic to BrainNode.
+type LinkEndpoint = LinkEndpointGeneric<BrainNode>;
+const endpointId = (e: LinkEndpoint) => endpointIdGeneric<BrainNode>(e);
+const endpointNode = (e: LinkEndpoint) => endpointNodeGeneric<BrainNode>(e);
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load data';
@@ -321,15 +320,30 @@ export default function Brain() {
   );
 
   /* ---- Animation loop for hot node pulse (paused when tab is hidden,
-   *      and skipped entirely when no hot nodes are visible) ---- */
+   *      and skipped entirely when no hot nodes are visible) ----
+   *
+   * M1 (v0.26 cleanup): the pulse is a slow visual cue (~1.5s breathing
+   * cycle baked into `paintNode`'s sin(t)), so we don't need a 60fps
+   * refresh — that was burning a frame's worth of canvas redraws every
+   * 16ms with no perceptible quality change above ~20fps. We throttle to
+   * ~30fps via a 33ms gate inside the rAF tick. Still backed by rAF so
+   * the browser handles vsync alignment + tab-throttling, but the actual
+   * canvas redraw fires at most 1 in every 2 frames on a 60Hz display
+   * (and proportionally less on 120Hz+). */
   useEffect(() => {
     if (!hasHotNodes) return;
+    const FRAME_BUDGET_MS = 33; // ~30fps; pulse cycle is 1.5s so a 33ms cadence is invisible
     let raf: number;
     let running = true;
-    const tick = () => {
+    let lastDrawAt = 0;
+    const tick = (timestamp: number) => {
       if (!running) return;
-      if (document.visibilityState === 'visible') {
+      if (
+        document.visibilityState === 'visible' &&
+        timestamp - lastDrawAt >= FRAME_BUDGET_MS
+      ) {
         fgRef.current?.refresh?.();
+        lastDrawAt = timestamp;
       }
       raf = requestAnimationFrame(tick);
     };
@@ -621,11 +635,15 @@ export default function Brain() {
         />
       </div>
 
-      {/* Background gradient overlay (behind everything but the canvas handles its own bg) */}
+      {/* Background gradient overlay (behind everything but the canvas
+          handles its own bg). L6 (v0.26 cleanup): both stops promoted to
+          CSS tokens — see `--bg-canvas-mid` / `--bg-canvas-deep` in
+          `index.css`. */}
       <div
         className="absolute inset-0 pointer-events-none"
         style={{
-          background: 'radial-gradient(ellipse at 50% 50%, #0f172a 0%, #020617 70%)',
+          background:
+            'radial-gradient(ellipse at 50% 50%, var(--bg-canvas-mid) 0%, var(--bg-canvas-deep) 70%)',
           zIndex: -1,
         }}
       />
@@ -713,7 +731,8 @@ export default function Brain() {
       </div>
 
       {/* Time slider (bottom, full width) */}
-      <div className="absolute bottom-0 left-0 right-0 z-10 px-4 pb-3 pt-1 bg-gradient-to-t from-[#020617]/90 to-transparent">
+      {/* L6 (v0.26 cleanup): bottom fade uses the deep canvas token. */}
+      <div className="absolute bottom-0 left-0 right-0 z-10 px-4 pb-3 pt-1 bg-gradient-to-t from-[var(--bg-canvas-deep)]/90 to-transparent">
         <div className="flex items-center gap-3">
           <span className="text-[10px] text-[var(--text-muted)] font-mono whitespace-nowrap">
             {new Date(timeMin).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' })}
@@ -722,7 +741,15 @@ export default function Brain() {
             type="range"
             min={timeMin}
             max={timeMax}
-            value={timeSlider}
+            // M2 (v0.26 cleanup): clamp the displayed value into
+            // [timeMin, timeMax] so the slider thumb never sits one frame
+            // outside its range during the brief window between graph data
+            // arrival and the merge-effect's `setTimeSlider(now)` bump. The
+            // input element silently snaps out-of-range values, but a
+            // visibly stuck thumb at the left edge looks like a bug to a
+            // user who's parked-and-watching. Clamp keeps the rendered
+            // position honest while leaving the underlying state untouched.
+            value={Math.min(Math.max(timeSlider, timeMin), timeMax)}
             onChange={(e) => setTimeSlider(Number(e.target.value))}
             className="flex-1 h-1 accent-[var(--accent)] cursor-pointer"
           />

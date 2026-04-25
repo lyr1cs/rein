@@ -205,6 +205,9 @@ mod tests {
                 embedding: None,
                 tier: MemoryTier::Warm,
                 cluster_id: Some(7),
+                archival_summary: None,
+                archival_summary_at: None,
+                archival_summary_version: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 last_accessed: Utc::now(),
@@ -218,6 +221,7 @@ mod tests {
                 "evidence preview two that is deliberately verbose to exercise the cap".to_string(),
                 "extra preview omitted".to_string(),
             ],
+            archival_summary: None,
         }
     }
 

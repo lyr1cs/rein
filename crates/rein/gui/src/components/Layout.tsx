@@ -7,8 +7,8 @@ const NAV_ITEMS = [
   { path: '/brain', icon: '\u{1F9E0}', label: 'Brain View' },
   { path: '/memories', icon: '\u{1F50D}', label: 'Memories' },
   { path: '/adaptive', icon: '\u{1F4CA}', label: 'Adaptive' },
-  { path: '/graph', icon: '\u{1F578}\uFE0F', label: 'Graph' },
-  { path: '/timeline', icon: '\u23F1\uFE0F', label: 'Timeline' },
+  { path: '/graph', icon: '\u{1F578}️', label: 'Graph' },
+  { path: '/timeline', icon: '⏱️', label: 'Timeline' },
   { path: '/artifacts', icon: '\u{1F4C4}', label: 'Artifacts' },
   { path: '/provenance', icon: '\u{1F50F}', label: 'Provenance' },
   { path: '/synthesis-lab', icon: '\u{1F9EA}', label: 'Synthesis Lab' },
@@ -52,13 +52,23 @@ export default function Layout() {
               <Link
                 key={item.path}
                 to={item.path}
+                aria-label={item.label}
+                title={item.label}
+                aria-current={active ? 'page' : undefined}
                 className={`flex items-center gap-3 rounded-lg transition-colors w-full px-2 py-2 ${
                   active
                     ? 'bg-[var(--accent)]/20 shadow-[0_0_12px_var(--accent)/30]'
                     : 'hover:bg-[var(--bg-secondary)]'
                 }`}
               >
-                <span className="text-base w-8 h-8 flex items-center justify-center flex-shrink-0">
+                {/* L3 (v0.26 cleanup): the emoji icon is decorative — `aria-hidden`
+                    keeps screen readers from announcing it twice (once via the
+                    aria-label on the parent Link, once via emoji-as-text). The
+                    visible label slides in on hover for sighted users. */}
+                <span
+                  aria-hidden="true"
+                  className="text-base w-8 h-8 flex items-center justify-center flex-shrink-0"
+                >
                   {item.icon}
                 </span>
                 {expanded && (
@@ -73,9 +83,12 @@ export default function Layout() {
         <div className="mt-auto pb-3 px-2 w-full">
           <Link
             to="/settings"
+            aria-label="Settings"
+            title="Settings"
+            aria-current={location.pathname === '/settings' ? 'page' : undefined}
             className="flex items-center gap-3 rounded-lg hover:bg-[var(--bg-secondary)] px-2 py-2 w-full"
           >
-            <span className="text-base w-8 h-8 flex items-center justify-center flex-shrink-0">{'\u2699\uFE0F'}</span>
+            <span aria-hidden="true" className="text-base w-8 h-8 flex items-center justify-center flex-shrink-0">{'⚙️'}</span>
             {expanded && <span className="text-sm text-[var(--text-muted)]">Settings</span>}
           </Link>
         </div>

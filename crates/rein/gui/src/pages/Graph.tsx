@@ -4,7 +4,12 @@ import type { LinkObject, NodeObject } from 'react-force-graph-2d';
 import { useQueryClient } from '@tanstack/react-query';
 import { getConceptState } from '../api/client';
 import { useMemoirs, useMemoirExport } from '../hooks/useApi';
-import { mergeForceGraphData } from '../utils/forceGraph';
+import {
+  endpointId as endpointIdGeneric,
+  endpointNode as endpointNodeGeneric,
+  mergeForceGraphData,
+  type LinkEndpoint as LinkEndpointGeneric,
+} from '../utils/forceGraph';
 import { timeAgo } from '../utils/time';
 import type { ConceptState } from '../api/types';
 
@@ -45,19 +50,12 @@ interface GraphData {
 
 type ConceptNode = NodeObject<GraphNode>;
 type ConceptLinkObject = LinkObject<GraphNode, GraphLink>;
-type LinkEndpoint = string | number | ConceptNode | undefined;
-
-function endpointId(endpoint: LinkEndpoint): string | null {
-  if (endpoint == null) return null;
-  if (typeof endpoint === 'object') {
-    return endpoint.id == null ? null : String(endpoint.id);
-  }
-  return String(endpoint);
-}
-
-function endpointNode(endpoint: LinkEndpoint): ConceptNode | null {
-  return typeof endpoint === 'object' && endpoint !== null ? endpoint : null;
-}
+// M4 (v0.26 cleanup): see Brain.tsx for the rationale — generics hoisted to
+// `utils/forceGraph.ts`; the type alias + thin wrappers below keep
+// call-sites readable.
+type LinkEndpoint = LinkEndpointGeneric<ConceptNode>;
+const endpointId = (e: LinkEndpoint) => endpointIdGeneric<ConceptNode>(e);
+const endpointNode = (e: LinkEndpoint) => endpointNodeGeneric<ConceptNode>(e);
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load graph data';

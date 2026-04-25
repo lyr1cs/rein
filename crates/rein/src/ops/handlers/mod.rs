@@ -4,6 +4,7 @@
 //! in that category.
 
 pub mod adaptive;
+pub mod cold_archive;
 pub mod diagnostics;
 pub mod knowledge;
 pub mod maintenance;

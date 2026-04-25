@@ -674,12 +674,19 @@ impl OpsRuntime {
         let route_name = route.query_type.to_string();
         let req_id_clone = request_id.clone();
 
-        // Phase 1: pull results out of `with_store`. Synthesis is called
-        // outside the store closure because it (a) needs no DB access and
-        // (b) wraps a `block_in_place` call to drive the LLM that should
-        // not be nested inside any store transaction guard.
-        let results = self.with_store(|store| {
-            crate::search::recall::recall_temporal_with_request_id(
+        // Phase 1: pull results AND a snapshot of the adaptive state out of
+        // `with_store`. The adaptive snapshot is what `run_recall_synthesis`
+        // needs for the v0.26 D-direction per-query gate (see
+        // `decide_synthesize`); loading it inside the store closure keeps
+        // every recall call observing a single consistent state across the
+        // search and the synthesis decision.
+        //
+        // Synthesis itself is called OUTSIDE the store closure because it
+        // (a) needs no DB access and (b) wraps a `block_in_place` call to
+        // drive the LLM that should not be nested inside any store
+        // transaction guard.
+        let (results, adaptive_state) = self.with_store(|store| {
+            let results = crate::search::recall::recall_temporal_with_request_id(
                 store,
                 &self.config,
                 &query,
@@ -692,17 +699,32 @@ impl OpsRuntime {
                 false,
                 Some(req_id_clone.clone()),
             )
-            .map_err(|e| crate::types::ReinError::Config(format!("{e}")))
+            .map_err(|e| crate::types::ReinError::Config(format!("{e}")))?;
+            // v0.26 D direction: load the adaptive snapshot once per
+            // recall (matches the established pattern in
+            // `ops/resummerize.rs:150`, `ops/concept_summary.rs:95`,
+            // `ops/dedup.rs:992`). `unwrap_or_default` mirrors fresh-install
+            // behavior; the gate's cold-start branches handle the empty
+            // case gracefully.
+            let adaptive_state =
+                crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+                    .unwrap_or_default();
+            Ok((results, adaptive_state))
         })?;
 
-        // Phase 2: optional synthesis (Cap B). Returns `None` when caller
-        // did not request synthesis; returns `Some(outcome)` otherwise — the
-        // outcome's `skipped_*` flags explain what happened.
+        // Phase 2: optional synthesis (Cap B / v0.26 D direction). Returns
+        // `None` when caller did not request synthesis; returns
+        // `Some(outcome)` otherwise — the outcome's `skipped_*` flags
+        // explain what happened. The fresh `adaptive_state` snapshot drives
+        // `decide_synthesize`'s per-cluster gate; passing `None` would
+        // force every recall through the global flag and erase the
+        // per-cluster signal entirely.
         let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
             &results,
             &query,
             &self.config,
             synthesize,
+            Some(&adaptive_state),
             None,
         );
 

@@ -4,8 +4,26 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import Layout from './components/Layout';
 
-// Class component intentional — React has no hook equivalent for
-// componentDidCatch / getDerivedStateFromError.
+/**
+ * Top-level ErrorBoundary — catches render-time exceptions from any lazy
+ * page so a single-page crash doesn't blank the whole app.
+ *
+ * Class-component intentional: React 19 still has no hook equivalent for
+ * `componentDidCatch` / `getDerivedStateFromError` (the official ESLint
+ * rule allows this exact pattern). When a render throws,
+ * `getDerivedStateFromError` updates state to the captured error, which
+ * `render` reads to swap in the fallback UI.
+ *
+ * "Go Home" performs a full document reload (`window.location.href = '/'`)
+ * rather than `navigate('/')` so the QueryClient + lazy-loaded chunks
+ * re-initialize from a clean slate — recoverable from caches that
+ * captured the bad data are the most common cause of repeat-crashes.
+ *
+ * L7 (v0.26 cleanup): expanded the previous one-liner into a proper
+ * docstring covering both the "why class component" and the "why full
+ * reload on Go Home" decisions, since both have come up in subsequent
+ * GUI audits.
+ */
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
   static getDerivedStateFromError(error: Error) { return { error }; }

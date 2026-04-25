@@ -1,9 +1,11 @@
+import { useMemo } from 'react';
 import { useAdaptive, useStats } from '../hooks/useApi';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, LineChart, Line,
+  PieChart, Pie, Cell, LineChart, Line, LabelList,
 } from 'recharts';
 import { ACCENT_PALETTE, TIER_COLORS } from '../utils/theme';
+import type { AdaptiveStatusSynthesis } from '../api/types';
 
 /* ── colour palettes ──────────────────────────────────────────── */
 
@@ -146,6 +148,9 @@ export default function Adaptive() {
   const clusterProfiles = [...(adaptive.cluster_profiles ?? [])]
     .sort((a, b) => b.memory_count - a.memory_count)
     .slice(0, 8);
+
+  /* Panel 7-9: Synthesis quality (v0.26 D direction) */
+  const synthesisProjection = adaptive.synthesis;
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -356,10 +361,295 @@ export default function Adaptive() {
             </div>
           )}
         </Panel>
+
+        {/* ── Synthesis Quality (v0.26 D direction) ──────────────────
+            Observability surface for the `synthesis_feedback` consumer.
+            Reads `adaptive.synthesis` (added in v0.26.0 by B_REST_MCP) and
+            renders three small charts + a global summary. The whole
+            block stays empty + shows a cold-start hint when no events
+            have been recorded yet — which is the expected v0.26.0 state
+            since the feature ships record-only and `[ars].recall_synthesis_enabled`
+            stays `false` by default. */}
+        <SynthesisQualitySection projection={synthesisProjection} />
       </div>
     </div>
   );
 }
+
+/* ── Synthesis Quality Panel (v0.26 D direction) ──────────────────── */
+
+/**
+ * Per-query-type chip color. Mirrors the autonomous-router taxonomy from
+ * `search/classify.rs` (Episodic/Temporal/Preference/ExactKeyword/Semantic/
+ * Exploratory). Unknown query_types fall back to the muted slate so the
+ * chart legend never breaks on a backend that adds a new variant before
+ * this table is updated.
+ */
+const QUERY_TYPE_COLORS: Record<string, string> = {
+  Episodic: '#7c3aed',
+  Temporal: '#7dd3fc',
+  Preference: '#4ade80',
+  ExactKeyword: '#fbbf24',
+  Semantic: '#22d3ee',
+  Exploratory: '#a78bfa',
+  _global: '#64748b',
+};
+
+/**
+ * Bin a list of dwell p50s into a discrete histogram so the chart axis
+ * stays interpretable when clusters span 100ms → 30s. Buckets are
+ * coarse-log so a glance shows "most synthesis dwells are sub-2s vs
+ * mostly past-5s" without needing y-axis math.
+ */
+const DWELL_BUCKETS: Array<{ label: string; max: number }> = [
+  { label: '<1s', max: 1000 },
+  { label: '1-2s', max: 2000 },
+  { label: '2-5s', max: 5000 },
+  { label: '5-10s', max: 10000 },
+  { label: '10s+', max: Number.POSITIVE_INFINITY },
+];
+
+function SynthesisQualitySection({
+  projection,
+}: {
+  projection?: AdaptiveStatusSynthesis;
+}) {
+  // Normalize the per-cluster array — when the projection is undefined OR
+  // both the bucket array AND the global rollup are empty we render a
+  // dedicated cold-start state instead of empty charts.
+  //
+  // Memoized: a `??` fallback to a fresh `[]` on every render would
+  // change identity and re-fire every downstream useMemo (queryTypes,
+  // usefulBars, clickBars, dwellHistogram), so we pin the empty array
+  // to one reference per polling tick.
+  const byCluster = useMemo(
+    () => projection?.by_cluster ?? [],
+    [projection?.by_cluster],
+  );
+  const global = projection?.global ?? null;
+  const hasData = byCluster.length > 0 || global !== null;
+
+  // Distinct query types in the data — used for both the bar fill and the
+  // legend chips. Stable order = first-seen (matches server projection).
+  const queryTypes = useMemo(() => {
+    const seen: string[] = [];
+    for (const row of byCluster) {
+      if (!seen.includes(row.query_type)) seen.push(row.query_type);
+    }
+    return seen;
+  }, [byCluster]);
+
+  const usefulBars = useMemo(
+    () =>
+      byCluster.map((row) => ({
+        bucket: `C${row.cluster_id}/${row.query_type === '_global' ? 'global' : row.query_type}`,
+        cluster_id: row.cluster_id,
+        query_type: row.query_type,
+        useful_rate: row.useful_rate,
+        viewed_count: row.viewed_count,
+      })),
+    [byCluster],
+  );
+
+  const clickBars = useMemo(
+    () =>
+      byCluster.map((row) => ({
+        bucket: `C${row.cluster_id}/${row.query_type === '_global' ? 'global' : row.query_type}`,
+        clicked_source_rate: row.clicked_source_rate,
+        query_type: row.query_type,
+      })),
+    [byCluster],
+  );
+
+  const dwellHistogram = useMemo(() => {
+    const buckets = DWELL_BUCKETS.map((b) => ({ label: b.label, count: 0 }));
+    for (const row of byCluster) {
+      if (row.viewed_dwell_p50_ms === null) continue;
+      const idx = DWELL_BUCKETS.findIndex(
+        (b) => (row.viewed_dwell_p50_ms ?? 0) <= b.max,
+      );
+      if (idx >= 0) buckets[idx].count += 1;
+    }
+    return buckets;
+  }, [byCluster]);
+
+  if (!hasData) {
+    return (
+      <Panel title="Synthesis Quality" className="md:col-span-3">
+        <div className="rounded-lg border border-dashed border-[#1e293b] bg-[#0b1220] p-6 text-center">
+          <div className="text-sm text-[var(--text-secondary)] mb-1.5">
+            Awaiting traffic
+          </div>
+          <div className="text-xs text-[var(--text-muted)] max-w-prose mx-auto leading-relaxed">
+            Cap B (recall-time synthesis) may not be enabled yet, or no
+            <code className="mx-1 px-1 py-0.5 rounded bg-[var(--bg-secondary)] text-[var(--text-secondary)] font-mono text-[10px]">
+              SynthesisInteraction
+            </code>
+            events have been recorded. Toggle{' '}
+            <code className="mx-1 px-1 py-0.5 rounded bg-[var(--bg-secondary)] text-[var(--text-secondary)] font-mono text-[10px]">
+              [ars].recall_synthesis_enabled = true
+            </code>{' '}
+            and use the Synthesis Lab page to start producing feedback
+            signals.
+          </div>
+        </div>
+      </Panel>
+    );
+  }
+
+  return (
+    <>
+      {/* Global summary — single big number + last consumed event watermark.
+          When `global` is null but per-cluster data exists (degenerate
+          backend), we show "—" rather than panicking. */}
+      <Panel title="Synthesis Quality (Global)" className="md:col-span-1">
+        <div className="flex flex-col items-start gap-1.5">
+          <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">
+            Useful Rate
+          </div>
+          <div className="text-3xl font-mono text-[var(--text-primary)]">
+            {global !== null ? (global.useful_rate * 100).toFixed(0) + '%' : '—'}
+          </div>
+          {global !== null && (
+            <>
+              <div className="mt-2 text-[10px] text-[var(--text-muted)]">
+                Total events
+              </div>
+              <div className="font-mono text-sm text-[var(--text-secondary)]">
+                {global.total_events.toLocaleString()}
+              </div>
+              <div className="mt-2 text-[10px] text-[var(--text-muted)]">
+                Last event id
+              </div>
+              <div className="font-mono text-xs text-[var(--text-muted)]">
+                #{global.last_consumed_event_id.toLocaleString()}
+              </div>
+            </>
+          )}
+        </div>
+      </Panel>
+
+      {/* Per-cluster useful_rate bars. Color-coded by query_type so the
+          eye can scan "Episodic clusters are doing well, Temporal less
+          so" in one glance. Threshold of 0.5 is the bootstrap decision
+          boundary — bars above the line vote-in synthesis for that
+          cluster, bars below vote-out. */}
+      <Panel title="Useful Rate (per cluster)" className="md:col-span-2">
+        <div className="flex gap-3 mb-2 flex-wrap">
+          {queryTypes.map((qt) => (
+            <div key={qt} className="flex items-center gap-1.5 text-[10px]">
+              <span
+                className="w-2.5 h-2.5 rounded-sm"
+                style={{
+                  background: QUERY_TYPE_COLORS[qt] ?? QUERY_TYPE_COLORS._global,
+                }}
+              />
+              <span className="text-[var(--text-secondary)]">
+                {qt === '_global' ? 'global' : qt}
+              </span>
+            </div>
+          ))}
+        </div>
+        <ResponsiveContainer width="100%" height={Math.max(180, byCluster.length * 22)}>
+          <BarChart data={usefulBars} layout="vertical" margin={{ top: 0, right: 30, left: 60, bottom: 0 }}>
+            <XAxis
+              type="number"
+              domain={[0, 1]}
+              tick={{ fill: '#64748b', fontSize: 10 }}
+              axisLine={false}
+              tickLine={false}
+            />
+            <YAxis
+              type="category"
+              dataKey="bucket"
+              tick={{ fill: '#94a3b8', fontSize: 10 }}
+              axisLine={false}
+              tickLine={false}
+              width={55}
+            />
+            <Tooltip content={<ChartTooltip />} />
+            <Bar dataKey="useful_rate" radius={[0, 4, 4, 0]} barSize={14}>
+              <LabelList
+                dataKey="viewed_count"
+                position="right"
+                formatter={(value: unknown) =>
+                  typeof value === 'number' ? `n=${value}` : ''
+                }
+                fill="#64748b"
+                fontSize={10}
+              />
+              {usefulBars.map((entry, i) => (
+                <Cell
+                  key={i}
+                  fill={
+                    QUERY_TYPE_COLORS[entry.query_type] ?? QUERY_TYPE_COLORS._global
+                  }
+                />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+        <div className="text-[10px] text-[var(--text-muted)] mt-1 text-center">
+          Bootstrap threshold: 0.5 — clusters below this line route to the
+          global synthesis flag in `decide_synthesize`
+        </div>
+      </Panel>
+
+      {/* Dwell histogram — coarse log buckets (sub-1s → 10s+). Shape
+          tells operator whether users are skimming or actually reading
+          the synthesis. */}
+      <Panel title="Dwell p50 distribution" className="md:col-span-1">
+        <ResponsiveContainer width="100%" height={180}>
+          <BarChart data={dwellHistogram} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+            <XAxis
+              dataKey="label"
+              tick={{ fill: '#94a3b8', fontSize: 10 }}
+              axisLine={false}
+              tickLine={false}
+            />
+            <YAxis tick={{ fill: '#64748b', fontSize: 10 }} axisLine={false} tickLine={false} allowDecimals={false} />
+            <Tooltip content={<ChartTooltip />} />
+            <Bar dataKey="count" radius={[4, 4, 0, 0]} fill={ACCENT_PALETTE[0]} />
+          </BarChart>
+        </ResponsiveContainer>
+        <div className="text-[10px] text-[var(--text-muted)] mt-1 text-center">
+          Cluster count by dwell-p50 bucket
+        </div>
+      </Panel>
+
+      {/* Click-through rate per cluster. Different colour palette so it
+          reads as a separate signal from useful_rate even when both
+          panels stack. */}
+      <Panel title="Click-through rate (per cluster)" className="md:col-span-2">
+        <ResponsiveContainer width="100%" height={Math.max(180, byCluster.length * 22)}>
+          <BarChart data={clickBars} layout="vertical" margin={{ top: 0, right: 20, left: 60, bottom: 0 }}>
+            <XAxis
+              type="number"
+              domain={[0, 1]}
+              tick={{ fill: '#64748b', fontSize: 10 }}
+              axisLine={false}
+              tickLine={false}
+            />
+            <YAxis
+              type="category"
+              dataKey="bucket"
+              tick={{ fill: '#94a3b8', fontSize: 10 }}
+              axisLine={false}
+              tickLine={false}
+              width={55}
+            />
+            <Tooltip content={<ChartTooltip />} />
+            <Bar dataKey="clicked_source_rate" radius={[0, 4, 4, 0]} barSize={14} fill={ACCENT_PALETTE[2]} />
+          </BarChart>
+        </ResponsiveContainer>
+        <div className="text-[10px] text-[var(--text-muted)] mt-1 text-center">
+          Source citations clicked per viewed synthesis
+        </div>
+      </Panel>
+    </>
+  );
+}
+
 
 /* ── small helpers ────────────────────────────────────────────── */
 

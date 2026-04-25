@@ -55,7 +55,9 @@ pub(crate) const MEMORY_SELECT_COLUMNS: &str = "m.id, m.layer, m.topic, m.summar
     COALESCE(cs.dedup_confidence, 1.0) AS dedup_confidence, \
     COALESCE(cs.source_diversity, 1.0) AS source_diversity, \
     COALESCE(cs.contradiction_score, 0.0) AS contradiction_score, \
-    m.related_ids, m.concept_ids, m.status, m.tier, m.cluster_id, m.created_at, m.updated_at, m.last_accessed";
+    m.related_ids, m.concept_ids, m.status, m.tier, m.cluster_id, \
+    m.archival_summary, m.archival_summary_at, m.archival_summary_version, \
+    m.created_at, m.updated_at, m.last_accessed";
 
 pub(crate) fn memory_select_base() -> String {
     format!(
@@ -714,6 +716,14 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
     let status_str: String = row
         .get::<_, String>("status")
         .unwrap_or_else(|_| "active".to_string());
+    // v0.26 Cap C: archival summary fields are optional and may be absent from
+    // SELECTs that don't project them (e.g. `SELECT * FROM memories WHERE topic`
+    // on a pre-migration DB). `unwrap_or(None)` mirrors `canonical_id` above —
+    // a missing column reads as `None`, never as an error.
+    let archival_summary: Option<String> = row.get("archival_summary").unwrap_or(None);
+    let archival_summary_at: Option<i64> = row.get("archival_summary_at").unwrap_or(None);
+    let archival_summary_version: Option<u32> =
+        row.get("archival_summary_version").unwrap_or(None);
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
     let updated_at_str: String = row.get("updated_at").map_err(ReinError::Database)?;
     let last_accessed_str: String = row.get("last_accessed").map_err(ReinError::Database)?;
@@ -766,6 +776,9 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
             .parse()
             .unwrap_or_default(),
         cluster_id: row.get::<_, Option<u32>>("cluster_id").unwrap_or(None),
+        archival_summary,
+        archival_summary_at,
+        archival_summary_version,
         created_at,
         updated_at,
         last_accessed,
@@ -2659,6 +2672,9 @@ mod tests {
             embedding: None,
             tier: MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
@@ -2959,6 +2975,9 @@ mod tests {
             embedding: None,
             tier: MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
@@ -3320,6 +3339,9 @@ enabled = true
             embedding: None,
             tier: MemoryTier::Hot,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
