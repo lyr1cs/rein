@@ -1,0 +1,16 @@
+[
+  {
+    "case_id": "ca_mt_001",
+    "category": "multi_topic",
+    "topic": "v0.26 D direction event flow",
+    "summary": "D direction adds SynthesisInteraction events through M1 consumer to a per-query adaptive gate.",
+    "original_content": "The v0.26 D direction wires a complete feedback loop for synthesis quality. Step 1: client surfaces SynthesisInteraction events via the GUI (viewed, dwell_ms, clicked_source, immediate_requery, explicit_up, explicit_down) which POST through /api/feedback to the rein backend. Step 2: events land in the feedback_events table tagged event_type = synthesis_interaction with the synthesis_id, request_id, cluster_id, and query_type metadata fields populated. Step 3: the synthesis_feedback M1 consumer drains events on each adaptive pipeline pass, folding them into a rolling SynthesisFeedbackState aggregate keyed by synthesis_bucket_key(cluster_id, query_type). Step 4: useful_rate is recomputed across viewed_count / clicked_source_count / dwell_p50_ms / explicit_up / explicit_down via compute_useful_rate. Step 5: at recall time the per-query gate decide_synthesize reads the bucket and either returns Yes (above SYNTHESIS_USEFUL_RATE_THRESHOLD or cold-start fallback) or Skip(AdaptiveDecision). The gate respects the operator override flag recall_synthesis_enabled.",
+    "evidence_keywords": [
+      "SynthesisInteraction",
+      "synthesis_bucket_key",
+      "compute_useful_rate",
+      "decide_synthesize",
+      "SYNTHESIS_USEFUL_RATE_THRESHOLD"
+    ]
+  }
+]

@@ -835,11 +835,23 @@ fn api_recall(
             )
             .ok()
             .and_then(|s| crate::store::adaptive::AdaptiveState::restore_snapshot(s.conn()));
+            // v0.26.1: classify the original query so the synthesis gate
+            // reads the matching per-cluster bucket (parity with the
+            // MCP/CLI path in `ops/handlers/memory.rs:673` which already
+            // classifies for routing). The classifier is rule-based and
+            // pure — no LLM cost — so calling it twice across the recall
+            // pipeline is fine.
+            let route = crate::search::classify::classify(
+                &synthesize_query.original_query,
+                false,
+                false,
+            );
             let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
                 &results,
                 &synthesize_query.original_query,
                 config,
                 synthesize_query.synthesize,
+                route.query_type.synthesis_bucket_label(),
                 adaptive_state.as_ref(),
                 None,
             );
