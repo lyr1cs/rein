@@ -736,6 +736,34 @@ fn attempt_one(
         return Ok(AttemptOutcome::SkippedShort);
     }
 
+    // v0.26.0 patch (Option C — `cold_archive` fallback): if M5 strip has
+    // already moved this row's original content into the `cold_archive`
+    // table (and replaced `memory.content` with `memory.summary`), prefer
+    // the original from `cold_archive` so the LLM summarizes real content
+    // rather than the truncated summary. M5's strip code always INSERTs
+    // into `cold_archive` BEFORE updating `memories.content` (see
+    // `ops/adaptive.rs::run_tiering`), so any row visible in
+    // `cold_archive` carries the authoritative original. This makes Cap C
+    // resilient to M5 strip running before the worker — the v0.26.0 ship
+    // had this race; fixing here in the worker so pipeline-step ordering
+    // is no longer load-bearing.
+    let mut memory = memory;
+    if let Ok(original) = store.conn().query_row(
+        "SELECT content FROM cold_archive WHERE memory_id = ?1",
+        rusqlite::params![&claim.memory_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        if original != memory.content {
+            tracing::debug!(
+                memory_id = %claim.memory_id,
+                stripped_chars = memory.content.chars().count(),
+                original_chars = original.chars().count(),
+                "Cap C: row already stripped by M5; reading original content from cold_archive"
+            );
+            memory.content = original;
+        }
+    }
+
     let outcome = match generator.generate(&memory) {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -1798,6 +1826,80 @@ mod tests {
                 "short-content path must NOT persist a summary"
             );
             assert_eq!(flag, 0, "flag must clear so row doesn't loop");
+        }
+
+        /// v0.26.0 patch (Option C — `cold_archive` fallback): when M5 strip
+        /// has already moved this row's original content into `cold_archive`
+        /// AND replaced `memory.content` with the (much shorter) summary,
+        /// Cap C MUST read the original from `cold_archive` instead of
+        /// short-circuiting on the stripped `memory.content`. Without the
+        /// fallback the v0.26.0 ship had this bug: the worker called
+        /// `generate(&memory)` whose first check
+        /// `memory.content.chars().count() <= target_chars` returned
+        /// `Ok(None)` → `skipped_short` → flag cleared, no archival summary
+        /// ever generated for the most archive-worthy rows.
+        #[test]
+        fn worker_reads_cold_archive_fallback_when_already_stripped() {
+            let (config, _tmp) = fresh_store();
+            let store = config.open_store().expect("open store");
+
+            // The seed_cold_flagged helper writes content as the row's
+            // memory.content. Pass a SHORT string here to simulate the
+            // post-M5-strip state where memory.content has been replaced
+            // with memory.summary.
+            let stripped = "short summary placeholder (post-M5-strip)";
+            seed_cold_flagged(&store, "stripped1", stripped, "2026-04-01T00:00:00Z");
+
+            // Insert the original (long) content into cold_archive — this
+            // is what M5's strip pass writes BEFORE replacing memory.content.
+            let original = "Anthropic released Claude 4.6 in 2026 with a 200K context window. \
+                The model targets long-document synthesis and tool use across multi-turn \
+                dialogs. Released alongside an upgrade to the Sonnet tier and improved \
+                citation grounding. The release also brought structured-output mode \
+                and improved tool calling latency."
+                .repeat(2);
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO cold_archive (memory_id, content, archived_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params!["stripped1", &original, "2026-04-01T00:00:00Z"],
+                )
+                .expect("seed cold_archive original");
+
+            let cold_config = ColdArchiveConfig::from_ars(&config.ars);
+            let summary = "Anthropic Claude 4.6 (2026) — 200K context, long-document \
+                synthesis, multi-turn tool use, Sonnet upgrade, structured output.";
+            let extractor =
+                ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
+            let report = run_cold_archive_summary_with_extractor(
+                &store,
+                &config,
+                &cold_config,
+                extractor,
+            )
+            .expect("worker must succeed");
+
+            // Without the cold_archive fallback the worker would see
+            // memory.content = "short summary placeholder..." (≤ target_chars
+            // 200), trip generate()'s first early-return, and report
+            // skipped_short = 1 / generated = 0. With the fallback it sees
+            // the original (~700 chars), runs the LLM, and persists a
+            // summary.
+            assert_eq!(report.considered, 1);
+            assert_eq!(
+                report.generated, 1,
+                "Option C fallback MUST read original from cold_archive instead of \
+                 short-circuiting on the stripped memory.content"
+            );
+            assert_eq!(report.skipped_short, 0);
+            assert_eq!(report.errors, 0);
+            assert_eq!(report.strikes, 0);
+
+            let (saved, _, version, flag) = read_archival_state(&store, "stripped1");
+            assert!(saved.is_some(), "summary persisted post-fallback");
+            assert_eq!(version, Some(ARCHIVAL_SUMMARY_VERSION as i64));
+            assert_eq!(flag, 0, "needs_archival_summary cleared on success");
         }
     }
 }
