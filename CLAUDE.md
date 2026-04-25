@@ -18,7 +18,7 @@ cargo install --path crates/rein     # install to ~/.cargo/bin/rein
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (**34 MCP tools** as of v0.24.0; v0.25.0 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) without adding a new tool; v0.25.1 ships the Cap B eval harness (`rein-eval synthesis {baseline,run,compare}`) + Synthesis Lab GUI page + GUI HIGH-finding fixes + Brain/Graph polling refactor — all opt-in defaults unchanged; evidence-aware canonical-first memory flow). Key modules:
+rein is a multi-source cross-validated memory MCP server (**36 MCP tools** as of v0.26.0; v0.26.0 adds `rein_archive_summary_refresh` for ARS Capability C cold-tier archival summary, plus a D-direction event variant `SynthesisInteraction` flowing into a `synthesis_feedback` M1 consumer and a per-query adaptive synthesis-decision gate; v0.25.1 ships the Cap B eval harness (`rein-eval synthesis {baseline,run,compare}`) + Synthesis Lab GUI page + GUI HIGH-finding fixes + Brain/Graph polling refactor; v0.25.0 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) without adding a new tool; v0.24.0 introduced ARS Cap A concept living-summary; all ARS feature flags default off. Evidence-aware canonical-first memory flow). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based; `MockExtractor` under `test-support` feature
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop); admission and memory surfaces are cluster/canonical-aware
