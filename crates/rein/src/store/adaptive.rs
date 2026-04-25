@@ -42,6 +42,14 @@ pub enum EventType {
     SessionEnd,       // hook_stop fired
     ParamUpdate,      // slow-channel parameter update (audit trail)
     ConceptSummaryRefreshed, // v0.24 ARS L3: concept living-summary refreshed
+    /// v0.26 D direction: user interacted with a Cap B synthesis prose surface.
+    /// Payload is a JSON-serialized [`SynthesisInteractionPayload`] in
+    /// `feedback_events.payload` (no DDL change — column already TEXT).
+    /// Backward compat: `feedback_events.event_type` is a `String` column,
+    /// existing consumers filter by string equality and silently skip
+    /// unknown values; no exhaustive `match` over `EventType` exists outside
+    /// `EventType::as_str` itself.
+    SynthesisInteraction,
 }
 
 impl EventType {
@@ -58,6 +66,7 @@ impl EventType {
             Self::SessionEnd => "session_end",
             Self::ParamUpdate => "param_update",
             Self::ConceptSummaryRefreshed => "concept_summary_refreshed",
+            Self::SynthesisInteraction => "synthesis_interaction",
         }
     }
 }
@@ -481,6 +490,13 @@ pub struct AdaptiveState {
     #[serde(default)]
     pub alpha_optimizer_access_last_id: i64,
 
+    /// v0.26 D direction: synthesis interaction aggregates from the
+    /// `synthesis_feedback` consumer. `None` on fresh install; helpers
+    /// fall back to the global enabled flag until per-(cluster,query_type)
+    /// `viewed_count >= SYNTHESIS_COLD_START_N`.
+    #[serde(default)]
+    pub synthesis_feedback_stats: Option<SynthesisFeedbackState>,
+
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
 }
@@ -811,6 +827,31 @@ impl AdaptiveState {
                         }
                         (Some(_), None) => {
                             current.concept_refresh_stats = self.concept_refresh_stats.clone();
+                        }
+                        (None, _) => { /* keep current */ }
+                    }
+                    // v0.26 D direction: synthesis_feedback_stats — same
+                    // arbitration shape as concept_refresh_stats above. The
+                    // event-id MAX rule preserves the more advanced
+                    // reservoir; if writer has None we keep current's
+                    // existing learned state (Codex round-3 HIGH from
+                    // v0.24 generalised). Both `by_cluster` aggregates and
+                    // `by_synthesis` LRU are wholesale-replaced because
+                    // they're both derived caches over the same monotonic
+                    // event log — partial merging would create double-counted
+                    // counters.
+                    match (
+                        &self.synthesis_feedback_stats,
+                        &current.synthesis_feedback_stats,
+                    ) {
+                        (Some(mine), Some(theirs)) => {
+                            if mine.last_consumed_event_id > theirs.last_consumed_event_id {
+                                current.synthesis_feedback_stats = Some(mine.clone());
+                            }
+                        }
+                        (Some(_), None) => {
+                            current.synthesis_feedback_stats =
+                                self.synthesis_feedback_stats.clone();
                         }
                         (None, _) => { /* keep current */ }
                     }
@@ -1320,6 +1361,503 @@ impl AdaptiveState {
             .filter(|s| s.count_steady_state >= CONCEPT_REFRESH_MIN_SAMPLES)
             .map(|s| s.age_p50_secs)
             .unwrap_or(CONCEPT_REFRESH_BOOTSTRAP_AGE_SECS)
+    }
+}
+
+// ── v0.26 D direction — Synthesis feedback (ARS Cap B closure loop) ─────────
+
+/// v0.26 D direction: typed payload serialised into
+/// `feedback_events.payload` for [`EventType::SynthesisInteraction`].
+///
+/// Shape locked by the Wave 2 contract (§3.1). The
+/// `feedback_events.payload` column is already TEXT, so no DDL change is
+/// required — emit the JSON via `serde_json::to_value` and round-trip via
+/// `serde_json::from_str` inside [`recompute_synthesis_feedback_stats`].
+///
+/// Backward-compat invariant: any old (pre-v0.26) payload that doesn't
+/// match this shape is simply ignored — the consumer filters by
+/// `event_type == "synthesis_interaction"` so foreign payloads never
+/// reach the deserializer in the first place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct SynthesisInteractionPayload {
+    /// ULID stamped in `run_recall_synthesis` after a synthesis succeeds.
+    pub synthesis_id: String,
+    /// ULID echoing `RecallMemoryOutput.request_id` so back-end can join
+    /// downstream recall traces with synthesis interactions.
+    pub recall_id: String,
+    pub interaction: SynthesisInteractionKind,
+    /// Optional hints about the synthesis context — `None` for older
+    /// callers; `metadata.query_type` and `metadata.cluster_id` route the
+    /// event into the per-`(cluster_id, query_type)` bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SynthesisMetadata>,
+}
+
+/// v0.26 D direction: discriminated interaction kinds posted from the
+/// SynthesisCard surface (and other synthesis consumers).
+///
+/// Variant rationale (per contract §3.1):
+/// - `Viewed { dwell_ms }`: time the synthesis was visible to the user;
+///   feeds the dwell reservoir → `useful_rate` dwell term.
+/// - `ClickedSource { source_index }`: 1-based to match the `[#k]` UI
+///   marker convention. Out-of-range indices are accepted (silently
+///   counted) — front-end is responsible for not emitting them.
+/// - `ImmediateRequery { gap_ms }`: time gap since the prior synthesis_id's
+///   last interaction to a new recall. Sliding threshold lives in the
+///   consumer; do NOT hardcode "immediate" in the event itself.
+/// - `ExplicitThumb { up }`: explicit user signal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SynthesisInteractionKind {
+    Viewed { dwell_ms: u64 },
+    ClickedSource { source_index: u32 },
+    ImmediateRequery { gap_ms: u64 },
+    ExplicitThumb { up: bool },
+}
+
+/// v0.26 D direction: optional context emitted alongside an interaction.
+/// `Default` is empty (all `None`) so callers can construct it without
+/// committing to every field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct SynthesisMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_chars: Option<u32>,
+}
+
+// Bootstrap weights for `compute_useful_rate`. Marked `bootstrap` per
+// `feedback_no_subjective_params` — every literal is data-driven in the
+// fullness of time. v0.26.1 will derive these from a SemDeDup-style
+// ablation across observed `(ClusterSynthesisStats, downstream-recall)`
+// pairs. Until then they reflect "view-with-dwell + thumb are positive,
+// requery is the strongest negative".
+pub const SYNTHESIS_W_VIEW: f64 = 1.0; // bootstrap; v0.26.1 → ablation
+pub const SYNTHESIS_W_CLICK: f64 = 0.5; // bootstrap; v0.26.1 → ablation
+pub const SYNTHESIS_W_THUMB: f64 = 2.0; // bootstrap; v0.26.1 → ablation
+pub const SYNTHESIS_W_REQUERY: f64 = 2.0; // bootstrap; v0.26.1 → ablation (subtracted)
+/// Bootstrap dwell threshold. v0.26.1 → per-cluster p50 of dwell_samples.
+pub const SYNTHESIS_DWELL_THRESHOLD_MS: u64 = 3_000; // bootstrap
+
+/// FIFO reservoir cap for `dwell_samples` per `ClusterSynthesisStats`.
+/// 500 keeps the `useful_rate` dwell term responsive to recent steady-state
+/// without unbounded memory growth.
+pub const SYNTHESIS_DWELL_RESERVOIR_CAP: usize = 500;
+
+/// LRU cap for `by_synthesis` per-id stats. Implemented as a `HashMap` +
+/// side `Vec<String>` for FIFO order because `lru::LruCache` is not
+/// `Serialize` (cross-agent invariant 11).
+pub const SYNTHESIS_PER_ID_CAP: usize = 1024;
+
+/// Hard cap on the number of distinct `(cluster_id, query_type)` buckets
+/// in `SynthesisFeedbackState.by_cluster`. Defends against a malicious
+/// or buggy client flooding `/api/feedback` with fabricated `cluster_id`
+/// or `query_type` values that would otherwise grow the persisted
+/// adaptive-state snapshot without limit (Codex round 2 F-11). Once the
+/// cap is reached new buckets are dropped (the events still increment
+/// `total_events`), so legitimate buckets don't compete for capacity
+/// once the system has converged on real cluster ids.
+pub const SYNTHESIS_BY_CLUSTER_CAP: usize = 4096;
+
+/// Whitelist of `query_type` values rein can legitimately emit (mirrors
+/// `search/classify.rs::QueryType` plus the `_global` sentinel used by
+/// REST projection). Any client-supplied value outside this list is
+/// normalized to `"unknown"` before being folded into `by_cluster`, so
+/// adversarial query_type strings can't multiplicatively explode the
+/// bucket cardinality (Codex round 2 F-11).
+pub const SYNTHESIS_ALLOWED_QUERY_TYPES: &[&str] = &[
+    "Episodic",
+    "Temporal",
+    "Preference",
+    "ExactKeyword",
+    "Semantic",
+    "Exploratory",
+    "_global",
+];
+
+/// Min events per `(cluster_id, query_type)` bucket before per-cluster
+/// `useful_rate` is trusted. Below this, `decide_synthesize` falls back
+/// to the global enabled flag.
+pub const SYNTHESIS_COLD_START_N: u64 = 10;
+
+/// Bootstrap `useful_rate` cutoff used by `decide_synthesize` (per-query
+/// gate). Hoisted into a constant so handler code never inlines the
+/// literal (cross-agent invariant 12); v0.26.1 → adaptive once
+/// `useful_rate` ablation lands.
+pub const SYNTHESIS_USEFUL_RATE_THRESHOLD: f64 = 0.5; // bootstrap; v0.26.1 → adaptive
+
+/// Per-bucket key used by [`SynthesisFeedbackState::by_cluster`]. Bucket
+/// is `(cluster_id, query_type)` — both can be unknown, in which case
+/// the consumer routes events to the global bucket key
+/// `synthesis_bucket_key(None, "")` → `"-1|"`. Keyed via
+/// `serde`-friendly `String` because `HashMap<(_, String), _>` round-trips
+/// awkwardly through JSON (`serde_json` requires string keys).
+pub fn synthesis_bucket_key(cluster_id: Option<i64>, query_type: &str) -> String {
+    let cid = cluster_id.unwrap_or(-1);
+    format!("{cid}|{query_type}")
+}
+
+/// v0.26 D direction: per-`(cluster_id, query_type)` synthesis interaction
+/// aggregate. `useful_rate` is recomputed on every consumer pass via
+/// [`compute_useful_rate`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ClusterSynthesisStats {
+    pub viewed_count: u64,
+    pub viewed_dwell_total_ms: u64,
+    /// FIFO reservoir of `Viewed.dwell_ms` samples capped at
+    /// [`SYNTHESIS_DWELL_RESERVOIR_CAP`]. Used to compute
+    /// `viewed_dwell_p50_ms` and the dwell term in [`compute_useful_rate`].
+    #[serde(default)]
+    pub dwell_samples: Vec<u64>,
+    /// Cached p50 of `dwell_samples`. `None` when reservoir is empty.
+    #[serde(default)]
+    pub viewed_dwell_p50_ms: Option<u64>,
+    pub clicked_source_count: u64,
+    pub immediate_requery_count: u64,
+    pub explicit_up: u64,
+    pub explicit_down: u64,
+    /// Derived metric, recomputed on every consumer pass.
+    pub useful_rate: f64,
+}
+
+/// v0.26 D direction: per-synthesis_id stats with bounded LRU semantics.
+/// Used by future per-synthesis decay/heatmap views; recompute_consumer
+/// caps total entries at [`SYNTHESIS_PER_ID_CAP`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerSynthesisStats {
+    pub viewed_count: u32,
+    pub clicked_source_count: u32,
+    pub explicit_up: u32,
+    pub explicit_down: u32,
+    pub last_interaction_ts: i64,
+}
+
+/// v0.26 D direction: state container for the `synthesis_feedback`
+/// consumer. Persisted as part of [`AdaptiveState`] (CAS-arbitrated by
+/// `last_consumed_event_id`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SynthesisFeedbackState {
+    /// Bucket: `synthesis_bucket_key(cluster_id, query_type)`.
+    /// `cluster_id = -1` (None) means "no cluster"; empty `query_type`
+    /// means unknown classification. HashMap so serde round-trips
+    /// cleanly into the JSON snapshot.
+    pub by_cluster: HashMap<String, ClusterSynthesisStats>,
+    /// Bounded per-synthesis_id stats (LRU-capped at
+    /// [`SYNTHESIS_PER_ID_CAP`]). Implemented as `HashMap` + side
+    /// `by_synthesis_order` Vec — `lru::LruCache` is not `Serialize`
+    /// and would break `AdaptiveState` snapshotting (cross-agent
+    /// invariant 11).
+    #[serde(default)]
+    pub by_synthesis: HashMap<String, PerSynthesisStats>,
+    /// FIFO order key list mirroring `by_synthesis` insertion order.
+    /// Eviction pops from the front and removes the matching HashMap
+    /// entry — both updates MUST happen together, otherwise the cache
+    /// leaks.
+    #[serde(default)]
+    pub by_synthesis_order: Vec<String>,
+    /// Highest event id incorporated into this state. Watermark for
+    /// replay-safety (mirrors
+    /// [`ConceptRefreshStats::last_consumed_event_id`]). The CAS merge
+    /// in `save_snapshot` arbitrates between concurrent writers by the
+    /// MAX of this id (Codex round-4 HIGH from v0.24 generalised).
+    #[serde(default)]
+    pub last_consumed_event_id: i64,
+    /// Total events the consumer has *processed* (including replays
+    /// counted only once). Useful for `/api/adaptive` exposure of
+    /// "how much signal has accumulated".
+    #[serde(default)]
+    pub total_events: u64,
+}
+
+/// Pure function — testable in isolation. Computes a `[0.0, 1.0]`
+/// usefulness rate from a single bucket's aggregate counters.
+///
+/// The formula combines:
+/// - dwell pct: fraction of `dwell_samples` exceeding
+///   [`SYNTHESIS_DWELL_THRESHOLD_MS`] (a "skim vs read" proxy).
+/// - click rate: clicks / views (engagement with cited evidence).
+/// - thumb rate: explicit positive ratio
+///   (`explicit_up / (explicit_up + explicit_down + 1)`); `+1` Laplace
+///   smoothing keeps the term well-defined when no thumbs have ever
+///   landed.
+/// - requery rate: requeries / views (subtracted — a strong negative
+///   signal that the synthesis didn't satisfy the question).
+///
+/// Output is `.clamp(0.0, 1.0)` so the requery penalty cannot push the
+/// score below zero (and rounding never floats above one). Bootstrap
+/// weights are documented above; v0.26.1 will derive them from a
+/// SemDeDup-style ablation.
+pub fn compute_useful_rate(stats: &ClusterSynthesisStats) -> f64 {
+    let total_views = stats.viewed_count.max(1) as f64;
+    let dwell_pct = if stats.dwell_samples.is_empty() {
+        0.0
+    } else {
+        stats
+            .dwell_samples
+            .iter()
+            .filter(|&&d| d > SYNTHESIS_DWELL_THRESHOLD_MS)
+            .count() as f64
+            / stats.dwell_samples.len() as f64
+    };
+    let click_rate = stats.clicked_source_count as f64 / total_views;
+    let thumb_rate =
+        stats.explicit_up as f64 / (stats.explicit_up + stats.explicit_down + 1) as f64;
+    let requery_rate = stats.immediate_requery_count as f64 / total_views;
+
+    let numerator = SYNTHESIS_W_VIEW * dwell_pct
+        + SYNTHESIS_W_CLICK * click_rate
+        + SYNTHESIS_W_THUMB * thumb_rate
+        - SYNTHESIS_W_REQUERY * requery_rate;
+    let denom = SYNTHESIS_W_VIEW + SYNTHESIS_W_CLICK + SYNTHESIS_W_THUMB + SYNTHESIS_W_REQUERY;
+    (numerator / denom).clamp(0.0, 1.0)
+}
+
+/// Compute the p50 of a non-empty slice of dwell samples (linear
+/// interpolation matching `percentile_*`). Returns `None` for empty input.
+fn dwell_p50_ms(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<u64> = samples.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let rank = 0.50 * (n.saturating_sub(1)) as f64;
+    let lo = rank.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = rank - lo as f64;
+    let lo_v = sorted[lo] as f64;
+    let hi_v = sorted[hi] as f64;
+    Some((lo_v + frac * (hi_v - lo_v)).round() as u64)
+}
+
+/// v0.26 D direction: peek new `SynthesisInteraction` feedback events,
+/// fold them into the rolling [`SynthesisFeedbackState`], recompute the
+/// derived `useful_rate` per bucket, and return the highest event id
+/// incorporated so the caller can commit the consumer offset *after*
+/// the derived state is durable (module-level peek+commit invariant).
+///
+/// Returns `(updated_state, Option<max_event_id>)`. `Option::None` means
+/// no new events were observed → caller skips `commit_offset`.
+///
+/// **5 invariants enforced** (per
+/// [[feedback_event_sourced_state_invariant]]):
+///
+///   1. **Watermark filter** — events with
+///      `id <= state.last_consumed_event_id` are skipped via
+///      `prior_high_water`. Counter increments are NOT idempotent, so
+///      this guard is the entire point.
+///   2. **Applied-prefix bump** — `state.last_consumed_event_id` is
+///      bumped to `max(state.last_consumed_event_id, max_id_this_pass)`
+///      *before* any new events are folded; the caller is responsible
+///      for committing the consumer offset only AFTER `save_snapshot`
+///      returns Ok.
+///   3. **Replay-drain** — `peek_events` reads from the consumer offset;
+///      replay-safety after a `commit_offset` failure is guarded by
+///      invariant (1).
+///   4. **CAS merge** — `AdaptiveState::save_snapshot` arbitrates by
+///      `last_consumed_event_id` MAX, mirroring the existing
+///      `concept_refresh_stats` arm at adaptive.rs:806-816.
+///   5. **Peek + commit** — uses `peek_events("synthesis_feedback", …)`
+///      then *the caller* runs `commit_offset(&[("synthesis_feedback",
+///      max_id)])` AFTER `save_snapshot` succeeds. Never `consume_events`
+///      (the v0.24 round-2/3/4 HIGH that this contract retires).
+///
+/// Malformed payloads are logged via `tracing::warn!` and skipped
+/// (mirrors `recompute_concept_refresh_stats` Codex round 1 finding #2 fix).
+pub fn recompute_synthesis_feedback_stats(
+    conn: &Connection,
+    prior: Option<SynthesisFeedbackState>,
+) -> ReinResult<(SynthesisFeedbackState, Option<i64>)> {
+    let mut state = prior.unwrap_or_default();
+
+    // Single peek covers the common case (most pipelines drain in one
+    // shot). 50 000 cap matches the prior implementation's pathological
+    // hard stop and is far above realistic per-pass volume; if you ever
+    // exceed this, the caller can re-enter the consumer in the next
+    // slow-channel pass.
+    let events = peek_events(
+        conn,
+        "synthesis_feedback",
+        &[EventType::SynthesisInteraction.as_str()],
+        50_000,
+    )?;
+    if events.is_empty() {
+        return Ok((state, None));
+    }
+    let max_id_this_pass = events.last().map(|e| e.id);
+
+    // Invariants 1 + 2: the prior_high_water guard skips already-applied
+    // events on a replay; the bump records the durable watermark in the
+    // returned state so the next `save_snapshot` advances it. The caller
+    // commits the consumer offset only AFTER save_snapshot succeeds.
+    let prior_high_water = state.last_consumed_event_id;
+    if let Some(max_id) = max_id_this_pass {
+        state.last_consumed_event_id = state.last_consumed_event_id.max(max_id);
+    }
+
+    // Track buckets that received new events so we recompute their
+    // `useful_rate` cache exactly once per pass.
+    let mut touched_buckets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for ev in events {
+        if ev.id <= prior_high_water {
+            continue;
+        }
+        let payload_str = match ev.payload.as_deref() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    event_id = ev.id,
+                    "synthesis_feedback: event missing payload, skipping"
+                );
+                continue;
+            }
+        };
+        let payload: SynthesisInteractionPayload = match serde_json::from_str(payload_str) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = ev.id,
+                    error = %e,
+                    "synthesis_feedback: malformed SynthesisInteractionPayload, skipping"
+                );
+                continue;
+            }
+        };
+
+        let metadata = payload.metadata.clone().unwrap_or_default();
+        let cluster_id = metadata.cluster_id;
+        let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
+        // F-11 normalize: clamp non-whitelisted query_types to "unknown" so
+        // malicious clients can't multiplicatively grow the bucket space.
+        let query_type = if SYNTHESIS_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+            raw_qtype.to_string()
+        } else {
+            "unknown".to_string()
+        };
+        let bucket_key = synthesis_bucket_key(cluster_id, &query_type);
+
+        // F-11 hard cap: drop event if creating a new bucket would push
+        // by_cluster past the cap. Existing buckets continue to receive
+        // updates so legitimate signal isn't lost.
+        if !state.by_cluster.contains_key(&bucket_key)
+            && state.by_cluster.len() >= SYNTHESIS_BY_CLUSTER_CAP
+        {
+            tracing::warn!(
+                cluster_id = ?cluster_id,
+                query_type = %query_type,
+                cap = SYNTHESIS_BY_CLUSTER_CAP,
+                "synthesis_feedback: by_cluster cap reached; dropping new bucket event"
+            );
+            // Still bump total_events so the consumer offset advances and
+            // we don't replay this event forever.
+            state.total_events = state.total_events.saturating_add(1);
+            continue;
+        }
+
+        // Per-bucket fold.
+        let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+        match &payload.interaction {
+            SynthesisInteractionKind::Viewed { dwell_ms } => {
+                bucket.viewed_count = bucket.viewed_count.saturating_add(1);
+                bucket.viewed_dwell_total_ms =
+                    bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
+                bucket.dwell_samples.push(*dwell_ms);
+                if bucket.dwell_samples.len() > SYNTHESIS_DWELL_RESERVOIR_CAP {
+                    let overflow = bucket.dwell_samples.len() - SYNTHESIS_DWELL_RESERVOIR_CAP;
+                    bucket.dwell_samples.drain(0..overflow);
+                }
+            }
+            SynthesisInteractionKind::ClickedSource { source_index: _ } => {
+                bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
+            }
+            SynthesisInteractionKind::ImmediateRequery { gap_ms: _ } => {
+                bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
+            }
+            SynthesisInteractionKind::ExplicitThumb { up } => {
+                if *up {
+                    bucket.explicit_up = bucket.explicit_up.saturating_add(1);
+                } else {
+                    bucket.explicit_down = bucket.explicit_down.saturating_add(1);
+                }
+            }
+        }
+        touched_buckets.insert(bucket_key);
+
+        // Per-synthesis_id LRU fold. HashMap update + side-vec FIFO must
+        // happen together; failure to dual-update leaks orphan keys.
+        let sid = payload.synthesis_id.clone();
+        let existed = state.by_synthesis.contains_key(&sid);
+        {
+            let per = state.by_synthesis.entry(sid.clone()).or_default();
+            match &payload.interaction {
+                SynthesisInteractionKind::Viewed { .. } => {
+                    per.viewed_count = per.viewed_count.saturating_add(1);
+                }
+                SynthesisInteractionKind::ClickedSource { .. } => {
+                    per.clicked_source_count = per.clicked_source_count.saturating_add(1);
+                }
+                SynthesisInteractionKind::ExplicitThumb { up } => {
+                    if *up {
+                        per.explicit_up = per.explicit_up.saturating_add(1);
+                    } else {
+                        per.explicit_down = per.explicit_down.saturating_add(1);
+                    }
+                }
+                SynthesisInteractionKind::ImmediateRequery { .. } => {
+                    // Tracked at bucket level only — per-synthesis attribution
+                    // for requery is ambiguous (the requery happens against
+                    // the *next* search, not this synthesis).
+                }
+            }
+            per.last_interaction_ts = chrono::Utc::now().timestamp();
+        }
+        if !existed {
+            // New entry — push to FIFO order.
+            state.by_synthesis_order.push(sid.clone());
+            // Cap evict: pop from the FRONT of the order vec AND remove
+            // from the HashMap. Dual update is mandatory — failure to keep
+            // both stores in sync leaks orphan HashMap entries.
+            while state.by_synthesis_order.len() > SYNTHESIS_PER_ID_CAP {
+                let evict = state.by_synthesis_order.remove(0);
+                state.by_synthesis.remove(&evict);
+            }
+        }
+
+        state.total_events = state.total_events.saturating_add(1);
+    }
+
+    // Recompute derived metrics for buckets touched this pass.
+    for key in touched_buckets {
+        if let Some(bucket) = state.by_cluster.get_mut(&key) {
+            bucket.viewed_dwell_p50_ms = dwell_p50_ms(&bucket.dwell_samples);
+            bucket.useful_rate = compute_useful_rate(bucket);
+        }
+    }
+
+    Ok((state, max_id_this_pass))
+}
+
+impl AdaptiveState {
+    /// v0.26 D direction: per-`(cluster_id, query_type)` synthesis bucket,
+    /// returned only when the bucket has accumulated at least
+    /// [`SYNTHESIS_COLD_START_N`] viewed samples (cold-start fallback
+    /// otherwise — caller falls back to the global `synthesize` flag).
+    pub fn synthesis_bucket(
+        &self,
+        cluster_id: Option<i64>,
+        query_type: &str,
+    ) -> Option<&ClusterSynthesisStats> {
+        let state = self.synthesis_feedback_stats.as_ref()?;
+        let key = synthesis_bucket_key(cluster_id, query_type);
+        state
+            .by_cluster
+            .get(&key)
+            .filter(|s| s.viewed_count >= SYNTHESIS_COLD_START_N)
     }
 }
 
@@ -2046,5 +2584,618 @@ mod tests {
         assert_eq!(stats.count, 2);
         assert_eq!(stats.samples[0].revisions_since_last, 3);
         assert_eq!(stats.samples[1].revisions_since_last, 5);
+    }
+
+    // ── v0.26 D direction: synthesis_feedback consumer + payload serde ──
+
+    fn emit_synthesis_event(conn: &Connection, payload: SynthesisInteractionPayload) {
+        emit_event(
+            conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisInteraction,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: payload
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.query_type.clone()),
+                topic: None,
+                payload: Some(serde_json::to_value(payload).unwrap()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn mk_payload(
+        synthesis_id: &str,
+        kind: SynthesisInteractionKind,
+        cluster_id: Option<i64>,
+        query_type: Option<&str>,
+    ) -> SynthesisInteractionPayload {
+        SynthesisInteractionPayload {
+            synthesis_id: synthesis_id.to_string(),
+            recall_id: format!("recall-{synthesis_id}"),
+            interaction: kind,
+            metadata: Some(SynthesisMetadata {
+                query_type: query_type.map(|s| s.to_string()),
+                cluster_id,
+                source_count: None,
+                synthesis_chars: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn synthesis_interaction_kind_round_trip_serde() {
+        // Round-trip each of the 4 SynthesisInteractionKind variants
+        // through JSON. Catches any future serde rename / tag drift.
+        let cases = vec![
+            SynthesisInteractionKind::Viewed { dwell_ms: 4200 },
+            SynthesisInteractionKind::ClickedSource { source_index: 3 },
+            SynthesisInteractionKind::ImmediateRequery { gap_ms: 1500 },
+            SynthesisInteractionKind::ExplicitThumb { up: true },
+        ];
+        for k in cases {
+            let json = serde_json::to_string(&k).unwrap();
+            let back: SynthesisInteractionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, back, "round-trip failed for {k:?} (json={json})");
+        }
+    }
+
+    #[test]
+    fn synthesis_interaction_payload_round_trip_with_metadata() {
+        let p = SynthesisInteractionPayload {
+            synthesis_id: "syn-1".into(),
+            recall_id: "rec-1".into(),
+            interaction: SynthesisInteractionKind::Viewed { dwell_ms: 5000 },
+            metadata: Some(SynthesisMetadata {
+                query_type: Some("Semantic".into()),
+                cluster_id: Some(42),
+                source_count: Some(5),
+                synthesis_chars: Some(800),
+            }),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: SynthesisInteractionPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn synthesis_interaction_payload_back_compat_missing_metadata() {
+        // Backward serde: legacy payloads without `metadata` deserialize
+        // to `None`, not a panic. Cross-agent invariant 5.
+        let json = r#"{
+            "synthesis_id":"syn-x",
+            "recall_id":"rec-x",
+            "interaction":{"kind":"viewed","dwell_ms":1000}
+        }"#;
+        let p: SynthesisInteractionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(p.synthesis_id, "syn-x");
+        assert_eq!(p.recall_id, "rec-x");
+        assert!(matches!(
+            p.interaction,
+            SynthesisInteractionKind::Viewed { dwell_ms: 1000 }
+        ));
+        assert!(p.metadata.is_none(), "missing metadata → None, not panic");
+    }
+
+    #[test]
+    fn compute_useful_rate_table() {
+        // Cold start (zeros) → 0.0 by clamp lower bound.
+        let cold = ClusterSynthesisStats::default();
+        assert_eq!(compute_useful_rate(&cold), 0.0);
+
+        // High-engagement: 10 views all over the dwell threshold,
+        // 5 clicks, 8 thumbs up, 0 requeries.
+        // dwell_pct = 1.0; click = 0.5; thumb = 8/9 ≈ 0.889;
+        // requery = 0.0
+        // numerator = 1*1 + 0.5*0.5 + 2*0.889 - 2*0 = 3.028
+        // denom = 1 + 0.5 + 2 + 2 = 5.5 → 0.55-ish, well above 0.5
+        let happy = ClusterSynthesisStats {
+            viewed_count: 10,
+            viewed_dwell_total_ms: 10 * 5000,
+            dwell_samples: vec![5000; 10],
+            viewed_dwell_p50_ms: Some(5000),
+            clicked_source_count: 5,
+            immediate_requery_count: 0,
+            explicit_up: 8,
+            explicit_down: 0,
+            useful_rate: 0.0,
+        };
+        let happy_rate = compute_useful_rate(&happy);
+        assert!(
+            happy_rate > 0.5,
+            "happy path useful_rate={happy_rate} should exceed 0.5"
+        );
+        assert!(happy_rate <= 1.0, "useful_rate must stay <= 1.0");
+
+        // Bad: 10 views all under dwell threshold, 0 clicks, 0 thumbs,
+        // 8 requeries. Strong negative signal → clamped to 0.0.
+        let bad = ClusterSynthesisStats {
+            viewed_count: 10,
+            viewed_dwell_total_ms: 10 * 100,
+            dwell_samples: vec![100; 10],
+            viewed_dwell_p50_ms: Some(100),
+            clicked_source_count: 0,
+            immediate_requery_count: 8,
+            explicit_up: 0,
+            explicit_down: 5,
+            useful_rate: 0.0,
+        };
+        let bad_rate = compute_useful_rate(&bad);
+        assert!(bad_rate >= 0.0, "useful_rate must clamp at 0.0");
+        assert!(
+            bad_rate < 0.5,
+            "bad path useful_rate={bad_rate} should fall below 0.5"
+        );
+    }
+
+    #[test]
+    fn recompute_synthesis_feedback_empty() {
+        let conn = setup_db();
+        let (state, max_id) = recompute_synthesis_feedback_stats(&conn, None).unwrap();
+        assert!(state.by_cluster.is_empty());
+        assert!(state.by_synthesis.is_empty());
+        assert!(state.by_synthesis_order.is_empty());
+        assert_eq!(state.total_events, 0);
+        assert_eq!(state.last_consumed_event_id, 0);
+        assert_eq!(max_id, None, "no events → no offset to commit");
+    }
+
+    #[test]
+    fn recompute_synthesis_feedback_aggregates_per_bucket() {
+        let conn = setup_db();
+        // 5 viewed events for (cluster=1, qtype=Semantic), 1 thumb-up.
+        for i in 0..5 {
+            emit_synthesis_event(
+                &conn,
+                mk_payload(
+                    &format!("syn-A{i}"),
+                    SynthesisInteractionKind::Viewed { dwell_ms: 4500 },
+                    Some(1),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-A0",
+                SynthesisInteractionKind::ExplicitThumb { up: true },
+                Some(1),
+                Some("Semantic"),
+            ),
+        );
+
+        let (state, max_id) = recompute_synthesis_feedback_stats(&conn, None).unwrap();
+        let key = synthesis_bucket_key(Some(1), "Semantic");
+        let bucket = state.by_cluster.get(&key).expect("bucket should exist");
+        assert_eq!(bucket.viewed_count, 5);
+        assert_eq!(bucket.viewed_dwell_total_ms, 5 * 4500);
+        assert_eq!(bucket.dwell_samples.len(), 5);
+        assert_eq!(bucket.viewed_dwell_p50_ms, Some(4500));
+        assert_eq!(bucket.explicit_up, 1);
+        assert_eq!(bucket.explicit_down, 0);
+        assert!(
+            (bucket.useful_rate - compute_useful_rate(bucket)).abs() < 1e-9,
+            "stored useful_rate must match the pure fn"
+        );
+        assert_eq!(state.total_events, 6);
+        assert_eq!(max_id, Some(6));
+        assert_eq!(state.last_consumed_event_id, 6);
+    }
+
+    #[test]
+    fn recompute_synthesis_feedback_peek_replay_is_idempotent() {
+        // Mirrors `recompute_concept_refresh_stats_peek_replay_is_idempotent`
+        // (line 1724): the v0.24 5-invariant Codex round-1 HIGH guard.
+        let conn = setup_db();
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-1",
+                SynthesisInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-2",
+                SynthesisInteractionKind::ClickedSource { source_index: 1 },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+
+        // First call: peeks both, bumps last_consumed_event_id to 2.
+        let (state, max_id) = recompute_synthesis_feedback_stats(&conn, None).unwrap();
+        assert_eq!(state.total_events, 2);
+        assert_eq!(state.last_consumed_event_id, 2);
+        assert_eq!(max_id, Some(2));
+
+        // Simulate prior pass's commit_offset FAILED — replay must be
+        // a no-op for counter increments. Without the watermark guard
+        // viewed_count would double.
+        let (state2, max_id2) =
+            recompute_synthesis_feedback_stats(&conn, Some(state.clone())).unwrap();
+        assert_eq!(
+            state2.total_events, 2,
+            "replay-safety: events with id <= last_consumed_event_id are skipped"
+        );
+        let key = synthesis_bucket_key(Some(7), "Semantic");
+        let bucket = state2.by_cluster.get(&key).expect("bucket exists");
+        assert_eq!(
+            bucket.viewed_count, 1,
+            "no double-count on replay (1 viewed event total)"
+        );
+        assert_eq!(bucket.clicked_source_count, 1);
+        assert_eq!(max_id2, Some(2), "max_id reported so caller can re-attempt");
+
+        // Caller successfully commits this pass; subsequent peek finds
+        // nothing.
+        commit_offset(&conn, &[("synthesis_feedback", max_id2.unwrap())]).unwrap();
+        let (state3, max_id3) = recompute_synthesis_feedback_stats(&conn, Some(state2)).unwrap();
+        assert_eq!(state3.total_events, 2);
+        assert_eq!(max_id3, None);
+
+        // New event arrives after commit: state grows by exactly one.
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-3",
+                SynthesisInteractionKind::ExplicitThumb { up: true },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+        let (state4, max_id4) = recompute_synthesis_feedback_stats(&conn, Some(state3)).unwrap();
+        assert_eq!(state4.total_events, 3);
+        assert_eq!(max_id4, Some(3));
+        let bucket4 = state4.by_cluster.get(&key).unwrap();
+        assert_eq!(bucket4.explicit_up, 1);
+    }
+
+    #[test]
+    fn recompute_synthesis_feedback_skips_malformed_payloads() {
+        let conn = setup_db();
+        // Two valid + one missing-payload + one malformed JSON.
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-good-1",
+                SynthesisInteractionKind::Viewed { dwell_ms: 3500 },
+                Some(2),
+                Some("Episodic"),
+            ),
+        );
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisInteraction,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None, // missing payload
+            },
+        )
+        .unwrap();
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisInteraction,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::json!({"unexpected": "shape"})),
+            },
+        )
+        .unwrap();
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-good-2",
+                SynthesisInteractionKind::ExplicitThumb { up: false },
+                Some(2),
+                Some("Episodic"),
+            ),
+        );
+
+        let (state, _) = recompute_synthesis_feedback_stats(&conn, None).unwrap();
+        // Only 2 valid events survived; total_events counts only those.
+        assert_eq!(state.total_events, 2);
+        let key = synthesis_bucket_key(Some(2), "Episodic");
+        let bucket = state.by_cluster.get(&key).expect("bucket should exist");
+        assert_eq!(bucket.viewed_count, 1);
+        assert_eq!(bucket.explicit_down, 1);
+    }
+
+    #[test]
+    fn recompute_synthesis_feedback_caps_dwell_reservoir_fifo() {
+        // Reservoir is per-bucket; emit > cap viewed events and assert
+        // FIFO eviction keeps the cap and drops oldest.
+        let conn = setup_db();
+        let overflow = 25;
+        for i in 0..(SYNTHESIS_DWELL_RESERVOIR_CAP + overflow) {
+            emit_synthesis_event(
+                &conn,
+                mk_payload(
+                    &format!("syn-fifo-{i}"),
+                    SynthesisInteractionKind::Viewed { dwell_ms: (i + 1) as u64 },
+                    Some(3),
+                    Some("Exploratory"),
+                ),
+            );
+        }
+        let (state, _) = recompute_synthesis_feedback_stats(&conn, None).unwrap();
+        let key = synthesis_bucket_key(Some(3), "Exploratory");
+        let bucket = state.by_cluster.get(&key).unwrap();
+        assert_eq!(bucket.dwell_samples.len(), SYNTHESIS_DWELL_RESERVOIR_CAP);
+        // Oldest `overflow` samples evicted → smallest surviving dwell
+        // is `overflow + 1`.
+        assert_eq!(*bucket.dwell_samples.first().unwrap(), (overflow + 1) as u64);
+    }
+
+    #[test]
+    fn recompute_synthesis_feedback_per_synthesis_lru_caps_with_dual_update() {
+        // Insert > SYNTHESIS_PER_ID_CAP unique synthesis_ids; verify that
+        // both `by_synthesis` HashMap and `by_synthesis_order` Vec stay
+        // in sync with the cap (no orphan keys / no oversized vec).
+        let conn = setup_db();
+        let overflow = 5;
+        let total = SYNTHESIS_PER_ID_CAP + overflow;
+        for i in 0..total {
+            emit_synthesis_event(
+                &conn,
+                mk_payload(
+                    &format!("syn-lru-{i}"),
+                    SynthesisInteractionKind::Viewed { dwell_ms: 1000 },
+                    Some(4),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        let (state, _) = recompute_synthesis_feedback_stats(&conn, None).unwrap();
+        assert_eq!(state.by_synthesis.len(), SYNTHESIS_PER_ID_CAP);
+        assert_eq!(state.by_synthesis_order.len(), SYNTHESIS_PER_ID_CAP);
+        // First `overflow` ids should have been evicted from BOTH stores.
+        for i in 0..overflow {
+            let evicted = format!("syn-lru-{i}");
+            assert!(
+                !state.by_synthesis.contains_key(&evicted),
+                "evicted key {evicted} must be gone from HashMap"
+            );
+            assert!(
+                !state.by_synthesis_order.contains(&evicted),
+                "evicted key {evicted} must be gone from order vec"
+            );
+        }
+    }
+
+    #[test]
+    fn synthesis_feedback_cas_merge_keeps_more_advanced_state() {
+        // CAS arbitration: the writer with higher `last_consumed_event_id`
+        // wins. Mirrors `cas_retry_keeps_more_advanced_reservoir_by_event_id`
+        // (line 1841) for the new synthesis_feedback_stats arm.
+        let conn = setup_db();
+
+        let mut winner_by_cluster = HashMap::new();
+        winner_by_cluster.insert(
+            synthesis_bucket_key(Some(11), "Semantic"),
+            ClusterSynthesisStats {
+                viewed_count: 50,
+                viewed_dwell_total_ms: 50 * 4000,
+                dwell_samples: vec![4000; 50],
+                viewed_dwell_p50_ms: Some(4000),
+                clicked_source_count: 20,
+                immediate_requery_count: 1,
+                explicit_up: 12,
+                explicit_down: 2,
+                useful_rate: 0.7,
+            },
+        );
+        let winner_synth = SynthesisFeedbackState {
+            by_cluster: winner_by_cluster.clone(),
+            by_synthesis: HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 500,
+            total_events: 50,
+        };
+        let winner = AdaptiveState {
+            version: 5,
+            synthesis_feedback_stats: Some(winner_synth.clone()),
+            ..AdaptiveState::default()
+        };
+        // Seed DB at v=5.
+        let winner_json = serde_json::to_string(&winner).unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![&winner_json],
+        )
+        .unwrap();
+
+        // Stale writer (last_consumed_event_id=100 < 500) tries to save.
+        let stale_synth = SynthesisFeedbackState {
+            by_cluster: HashMap::new(),
+            by_synthesis: HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 100,
+            total_events: 5,
+        };
+        let stale = AdaptiveState {
+            version: 2,
+            synthesis_feedback_stats: Some(stale_synth),
+            ..AdaptiveState::default()
+        };
+        stale.save_snapshot(&conn).unwrap();
+
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        let restored_synth = restored.synthesis_feedback_stats.unwrap();
+        assert_eq!(
+            restored_synth.last_consumed_event_id, 500,
+            "CAS winner with higher last_consumed_event_id must survive"
+        );
+        assert_eq!(restored_synth.by_cluster, winner_by_cluster);
+    }
+
+    #[test]
+    fn synthesis_feedback_cas_merge_takes_writer_when_more_advanced() {
+        // Counterpart: writer with HIGHER last_consumed_event_id replaces
+        // the older snapshot. Mirrors `cas_retry_takes_writer_when_more_advanced`
+        // (line 1900).
+        let conn = setup_db();
+        let older_synth = SynthesisFeedbackState {
+            by_cluster: HashMap::new(),
+            by_synthesis: HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 30,
+            total_events: 5,
+        };
+        let older = AdaptiveState {
+            version: 5,
+            synthesis_feedback_stats: Some(older_synth),
+            ..AdaptiveState::default()
+        };
+        let older_json = serde_json::to_string(&older).unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![&older_json],
+        )
+        .unwrap();
+
+        let mut fresher_buckets = HashMap::new();
+        fresher_buckets.insert(
+            synthesis_bucket_key(Some(99), "Semantic"),
+            ClusterSynthesisStats {
+                viewed_count: 100,
+                ..ClusterSynthesisStats::default()
+            },
+        );
+        let fresher_synth = SynthesisFeedbackState {
+            by_cluster: fresher_buckets.clone(),
+            by_synthesis: HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 999,
+            total_events: 100,
+        };
+        let writer = AdaptiveState {
+            version: 2,
+            synthesis_feedback_stats: Some(fresher_synth.clone()),
+            ..AdaptiveState::default()
+        };
+        writer.save_snapshot(&conn).unwrap();
+
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        let restored_synth = restored.synthesis_feedback_stats.unwrap();
+        assert_eq!(restored_synth.last_consumed_event_id, 999);
+        assert_eq!(restored_synth.by_cluster, fresher_buckets);
+    }
+
+    #[test]
+    fn synthesis_feedback_cas_preserves_existing_when_writer_has_none() {
+        // Mirrors `cas_retry_preserves_existing_stats_when_writer_has_none`
+        // (line 1953). Writer with `synthesis_feedback_stats = None` MUST
+        // NOT overwrite existing learned state.
+        let conn = setup_db();
+        let learned = SynthesisFeedbackState {
+            by_cluster: HashMap::new(),
+            by_synthesis: HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 1234,
+            total_events: 42,
+        };
+        let prior = AdaptiveState {
+            version: 5,
+            synthesis_feedback_stats: Some(learned.clone()),
+            ..AdaptiveState::default()
+        };
+        let prior_json = serde_json::to_string(&prior).unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![&prior_json],
+        )
+        .unwrap();
+
+        let our = AdaptiveState {
+            version: 2,
+            synthesis_feedback_stats: None,
+            ..AdaptiveState::default()
+        };
+        our.save_snapshot(&conn).unwrap();
+
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(
+            restored.synthesis_feedback_stats,
+            Some(learned),
+            "CAS merge must preserve existing stats when writer has None"
+        );
+    }
+
+    #[test]
+    fn synthesis_bucket_helper_gates_on_cold_start_n() {
+        // Helper returns Some only when viewed_count >= SYNTHESIS_COLD_START_N.
+        let key = synthesis_bucket_key(Some(8), "Semantic");
+        let mut by_cluster = HashMap::new();
+        // Below cold-start threshold.
+        by_cluster.insert(
+            key.clone(),
+            ClusterSynthesisStats {
+                viewed_count: SYNTHESIS_COLD_START_N - 1,
+                ..ClusterSynthesisStats::default()
+            },
+        );
+        let mut state = AdaptiveState {
+            synthesis_feedback_stats: Some(SynthesisFeedbackState {
+                by_cluster,
+                ..SynthesisFeedbackState::default()
+            }),
+            ..AdaptiveState::default()
+        };
+        assert!(state.synthesis_bucket(Some(8), "Semantic").is_none(),
+            "cold-start: bucket below SYNTHESIS_COLD_START_N must return None");
+
+        // At cold-start threshold → Some.
+        let s = state.synthesis_feedback_stats.as_mut().unwrap();
+        s.by_cluster
+            .get_mut(&key)
+            .unwrap()
+            .viewed_count = SYNTHESIS_COLD_START_N;
+        assert!(state.synthesis_bucket(Some(8), "Semantic").is_some());
+    }
+
+    #[test]
+    fn synthesis_feedback_event_type_str() {
+        // Guards against accidental rename of the SynthesisInteraction
+        // event_type string (which would silently de-route every existing
+        // emitted event from the consumer).
+        assert_eq!(
+            EventType::SynthesisInteraction.as_str(),
+            "synthesis_interaction"
+        );
+    }
+
+    #[test]
+    fn synthesis_feedback_state_default_is_empty() {
+        // Cold-start invariant: a fresh, empty state never panics on
+        // useful_rate evaluation, never reports any bucket, and serializes
+        // round-trip cleanly.
+        let s = SynthesisFeedbackState::default();
+        assert!(s.by_cluster.is_empty());
+        assert!(s.by_synthesis.is_empty());
+        assert!(s.by_synthesis_order.is_empty());
+        assert_eq!(s.last_consumed_event_id, 0);
+        assert_eq!(s.total_events, 0);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SynthesisFeedbackState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
     }
 }

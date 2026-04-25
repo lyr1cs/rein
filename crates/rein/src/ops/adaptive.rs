@@ -89,6 +89,26 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         Err(e) => tracing::warn!("failed to recompute concept_refresh_stats: {e}"),
     }
 
+    // Step 1e: v0.26 D direction — synthesis interaction feedback. Drains any
+    // new `SynthesisInteraction` events into per-cluster ClusterSynthesisStats
+    // so `decide_synthesize` can route adaptive synthesis decisions. Until
+    // `SYNTHESIS_COLD_START_N` events accumulate per (cluster_id, query_type)
+    // bucket, the gate falls back to the global flag — see
+    // `ops/recall_synthesis::decide_synthesize`. Same peek+commit + CAS-merge
+    // pattern as concept_refresh_stats above (5-invariant pattern).
+    match crate::store::adaptive::recompute_synthesis_feedback_stats(
+        store.conn(),
+        state.synthesis_feedback_stats.clone(),
+    ) {
+        Ok((stats, max_id)) => {
+            state.synthesis_feedback_stats = Some(stats);
+            if let Some(id) = max_id {
+                pending_offset_batches.push(vec![("synthesis_feedback", id)]);
+            }
+        }
+        Err(e) => tracing::warn!("failed to recompute synthesis_feedback_stats: {e}"),
+    }
+
     // Step 2: M3 — Build per-cluster survival curves from access data
     if !state.memory_clusters.is_empty() {
         build_survival_curves(store, &state);
@@ -97,6 +117,31 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // Step 3: M5 — Tier boundaries + cold_archive migration
     if mem_count >= config.adaptive.tier_cold_start as u64 {
         run_tiering(store, &mut state, config);
+    }
+
+    // Step 3a: v0.26 Cap C — bulk cold-tier archival summary worker. Walks
+    // rows flagged by `run_tiering` (`needs_archival_summary = 1`), claims +
+    // generates summaries via the LLM, applies the 3-invariant lossless
+    // contract, persists with 5-way CAS. Skipped cleanly when
+    // `ars.cold_archive_enabled = false`. No-op when nothing was flagged.
+    {
+        let cold_config = crate::ops::cold_archive_summary::ColdArchiveConfig::from_ars(&config.ars);
+        match crate::ops::cold_archive_summary::run_cold_archive_summary(store, config, &cold_config) {
+            Ok(report) => {
+                if report.considered > 0 {
+                    tracing::info!(
+                        considered = report.considered,
+                        generated = report.generated,
+                        skipped_short = report.skipped_short,
+                        strikes = report.strikes,
+                        errors = report.errors,
+                        exhausted = report.exhausted,
+                        "Cap C: cold-archive pass complete"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("Cap C: cold-archive worker failed: {e}"),
+        }
     }
 
     // Step 4: M2 — Counterfactual alpha optimization (peek events, learn alphas)
@@ -630,6 +675,27 @@ fn run_tiering(
                  (julianday('now') - julianday(created_at)) AS REAL)) > ?2)
              )",
             rusqlite::params![state.hot_threshold, state.cold_threshold],
+        );
+
+        // Cap C (v0.26): flag freshly-demoted cold memories for archival-summary
+        // generation by the slow-channel worker (`ops/cold_archive_summary.rs`).
+        // Re-flag covers both cases: (a) row never summarized yet (NULL summary),
+        // OR (b) summary present but written under a previous
+        // `ARCHIVAL_SUMMARY_VERSION` (recall suppresses stale-version summaries
+        // anyway, so they need regeneration). `needs_archival_summary = 0` skip
+        // avoids redundant worker wake-ups; on exhaustion the flag is set to 2
+        // (terminal) and stays invisible until the next cold transition rebumps it.
+        let _ = store.conn().execute(
+            "UPDATE memories SET needs_archival_summary = 1
+             WHERE status = 'active'
+               AND tier = 'cold'
+               AND needs_archival_summary = 0
+               AND (
+                   archival_summary IS NULL
+                   OR archival_summary_version IS NULL
+                   OR archival_summary_version != ?1
+               )",
+            rusqlite::params![crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION as i64],
         );
     }
 
@@ -2157,6 +2223,9 @@ mod tests {
             embedding: None,
             tier: MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now() - chrono::Duration::days(30),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),

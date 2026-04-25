@@ -477,6 +477,9 @@ impl SynthesisFixture {
                     embedding: None,
                     tier: MemoryTier::Warm,
                     cluster_id: None,
+                    archival_summary: None,
+                    archival_summary_at: None,
+                    archival_summary_version: None,
                     created_at: now,
                     updated_at: now,
                     last_accessed: now,
@@ -488,6 +491,10 @@ impl SynthesisFixture {
                     sources_hit: r.sources_hit,
                     evidence_count: r.evidence_count,
                     evidence_preview: r.evidence_preview.clone(),
+                    // v0.26 Cap C: synthetic eval rows synthesise from
+                    // `treatment_response`, not the live recall pipeline,
+                    // so they never carry an archival summary.
+                    archival_summary: None,
                 }
             })
             .collect()
