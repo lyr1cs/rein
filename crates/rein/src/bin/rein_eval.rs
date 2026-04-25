@@ -93,6 +93,21 @@ enum Commands {
         #[command(subcommand)]
         action: SynthesisAction,
     },
+    /// Evaluation routines for the v0.26 ARS Capability C cold-tier archival
+    /// summary feature (v0.26.1 harness). Baseline scores the post-M5-strip
+    /// surface (`topic + summary` — `memory.content` is replaced by
+    /// `memory.summary` during cold-tier migration in `ops/adaptive.rs:750`,
+    /// so that pair is what an operator sees from a cold memory WITHOUT
+    /// Cap C). `run` invokes `ColdArchiveSummaryGenerator::generate` over
+    /// fixture content and scores `topic + summary + archival_summary`
+    /// against `evidence_keywords`. `compare` runs paired McNemar +
+    /// ship/bail-out under `DecideShipKind::Synthesis` (Cap C is
+    /// additive — `archival_summary` is appended on top of the stripped
+    /// surface, never replaces it).
+    ColdArchive {
+        #[command(subcommand)]
+        action: ColdArchiveAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,6 +207,58 @@ enum ConceptSummaryAction {
         /// non-inferiority. Tighter than resummerize's 0.03 default because
         /// ARS Capability A is expected to materially improve keyword
         /// recall rather than hold hit-rate flat.
+        #[arg(long, default_value_t = 0.02)]
+        noise_floor: f64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ColdArchiveAction {
+    /// Score the post-M5-strip surface (`topic + summary`) against each
+    /// fixture's `evidence_keywords`. No LLM required — the fixture's
+    /// `topic` + `summary` IS the cold-tier baseline state (M5 replaces
+    /// `memory.content` with `memory.summary` per `ops/adaptive.rs:750`,
+    /// so both fields end up identical post-strip).
+    Baseline {
+        /// Directory containing cold-archive fixture JSON files.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Output path for the scorecard JSON.
+        #[arg(long, default_value = "cold_archive_baseline_scorecard.json")]
+        output: PathBuf,
+    },
+    /// Run the Cap C archival-summary treatment: synthesize a cold-tier
+    /// `Memory` from each fixture (`topic + original_content`), feed it
+    /// through `ColdArchiveSummaryGenerator::generate` (production LLM
+    /// path with the 3-invariant lossless gate), and score
+    /// `topic + summary + archival_summary` against `evidence_keywords`.
+    /// Errors cleanly if no LLM provider is configured.
+    Run {
+        /// Directory containing cold-archive fixture JSON files.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Output path for the scorecard JSON.
+        #[arg(long, default_value = "cold_archive_treatment_scorecard.json")]
+        output: PathBuf,
+        /// Print per-case LLM/contract diagnostics on failure or empty
+        /// output. Off by default; useful when debugging a low hit rate
+        /// without re-running expensive LLM calls.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+    /// Compare a baseline and a treatment scorecard via paired McNemar +
+    /// `DecideShipKind::Synthesis`. Cap C is additive — the archival
+    /// summary is appended on top of the stripped recall surface, so the
+    /// length-shorter ship gate is irrelevant; only hit-rate
+    /// non-inferiority matters.
+    Compare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        treatment: PathBuf,
+        /// Hit-rate difference tolerated as noise when calling
+        /// non-inferiority. Default 0.02 (matches concept-summary +
+        /// synthesis; Cap C is also expected additive, not regressive).
         #[arg(long, default_value_t = 0.02)]
         noise_floor: f64,
     },
@@ -543,6 +610,110 @@ impl SynthesisFixture {
     }
 }
 
+/// Fixture schema for the v0.26 Cap C cold-tier archival summary eval
+/// (v0.26.1 harness). Each fixture captures one cold-tier candidate:
+///
+/// - `topic` + `summary` are what M5 leaves visible after the cold-tier
+///   strip (`memory.content` is replaced by `memory.summary` in
+///   `ops/adaptive.rs:750`, so the post-strip surface is `topic +
+///   summary`). Baseline scoring concatenates these against
+///   `evidence_keywords`.
+/// - `original_content` is the long form M5 archives away. The harness
+///   builds a synthetic `Memory` with this as `content`, feeds it to
+///   `ColdArchiveSummaryGenerator::generate`, and scores
+///   `topic + " " + summary + " " + archival_summary` against
+///   `evidence_keywords`. Must exceed `target_chars`; the generator
+///   skips short content as a degenerate-success.
+/// - `target_chars` defaults to `ARCHIVAL_SUMMARY_TARGET_CHARS` (600)
+///   when absent — same value `ColdArchiveConfig::default()` uses so
+///   eval and production agree on the budget.
+#[derive(Debug, Deserialize, Serialize)]
+struct ColdArchiveFixture {
+    case_id: String,
+    #[serde(default)]
+    category: Option<String>,
+    topic: String,
+    summary: String,
+    original_content: String,
+    evidence_keywords: Vec<String>,
+    #[serde(default)]
+    target_chars: Option<usize>,
+}
+
+impl ColdArchiveFixture {
+    /// Build a synthetic cold-tier `Memory` for the generator. Only the
+    /// fields the prompt builder reads (`topic` + `content`) carry
+    /// fixture data; the rest take safe defaults that match a real
+    /// post-tiering row (`tier = Cold`, `layer = LTM`, no archival
+    /// summary present yet — that's what `generate` produces). Mirrors
+    /// `SynthesisFixture::to_recall_results` so a new `Memory` field
+    /// added later doesn't invalidate the fixture corpus.
+    fn to_memory(&self) -> Memory {
+        let now = Utc::now();
+        Memory {
+            id: format!("fixture:{}", self.case_id),
+            layer: MemoryLayer::LTM,
+            topic: self.topic.clone(),
+            summary: self.summary.clone(),
+            content: self.original_content.clone(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 0.2, // < 0.3 threshold per ops/adaptive.rs:720
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::default(),
+            embedding: None,
+            tier: MemoryTier::Cold,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        }
+    }
+
+    /// Post-M5-strip baseline text: `topic + " " + summary`. This is
+    /// the recall surface for a cold memory WITHOUT Cap C — the strip
+    /// has already replaced `memory.content` with `memory.summary`
+    /// (`ops/adaptive.rs:750`), so adding `content` to this string
+    /// would double-count `summary` and bias baseline upward.
+    fn baseline_text(&self) -> String {
+        let mut buf = String::with_capacity(self.topic.len() + self.summary.len() + 1);
+        buf.push_str(&self.topic);
+        buf.push(' ');
+        buf.push_str(&self.summary);
+        buf
+    }
+
+    /// Treatment text: baseline_text + archival_summary. Mirrors what an
+    /// operator sees from a Cap-C-enabled cold memory at recall time
+    /// (`memory.archival_summary` is appended to the existing topic +
+    /// summary — never replaces them). Asymmetry intentional: matches
+    /// `score_concept_case`'s `definition + Some(living_summary)` shape
+    /// so `treatment_length > baseline_length` is the expected steady
+    /// state, not a regression.
+    fn treatment_text_with(&self, archival_summary: &str) -> String {
+        let base = self.baseline_text();
+        let mut buf = String::with_capacity(base.len() + 1 + archival_summary.len());
+        buf.push_str(&base);
+        buf.push(' ');
+        buf.push_str(archival_summary);
+        buf
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -599,6 +770,26 @@ fn main() -> Result<()> {
                 verbose,
             } => cmd_synthesis_run(&fixtures, &output, verbose),
             SynthesisAction::Compare {
+                baseline,
+                treatment,
+                noise_floor,
+            } => cmd_compare(
+                &baseline,
+                &treatment,
+                noise_floor,
+                DecideShipKind::Synthesis,
+            ),
+        },
+        Commands::ColdArchive { action } => match action {
+            ColdArchiveAction::Baseline { fixtures, output } => {
+                cmd_cold_archive_baseline(&fixtures, &output)
+            }
+            ColdArchiveAction::Run {
+                fixtures,
+                output,
+                verbose,
+            } => cmd_cold_archive_run(&fixtures, &output, verbose),
+            ColdArchiveAction::Compare {
                 baseline,
                 treatment,
                 noise_floor,
@@ -1253,6 +1444,18 @@ fn print_summary(
     // concept-summary subcommands, so the banner must not claim either one.
     println!("=== rein-eval: compare ===");
     println!("paired cases : {}", paired.len());
+    if paired.len() < 12 {
+        // McNemar's chi-squared switches to exact-binomial for small
+        // discordant counts; even with maximal lift, n < 12 cannot reach
+        // p < 0.05. Surface this once at the top so a BAIL on a small
+        // corpus reads as "underpowered, not regressed". Same wording as
+        // the v0.25.1 (n=6) and v0.25.2 (n=24, hit-rate ceiling) evals.
+        println!(
+            "n={}: power-limited — McNemar may BAIL even on a strong win until the \
+             corpus grows; treat BailOut as 'inconclusive', not 'regressed'.",
+            paired.len()
+        );
+    }
     println!(
         "avg length   : baseline={mean_base_len:.1}  treatment={mean_treat_len:.1}  \
          ratio={ratio:.3}"
@@ -1969,6 +2172,263 @@ fn run_synthesis_treatment_with_extractor(
     Ok(())
 }
 
+// --- cold-archive subcommand ----------------------------------------------
+
+/// Score the post-M5-strip surface (`topic + summary`) against each
+/// fixture's `evidence_keywords`. The fixture's `topic + summary` IS
+/// the cold-tier baseline state — `ops/adaptive.rs:750` overwrites
+/// `memory.content` with `memory.summary` during the cold-tier strip,
+/// so the recall surface for a Cap-C-disabled cold memory is exactly
+/// `topic + summary`.
+fn cmd_cold_archive_baseline(fixtures: &Path, output: &Path) -> Result<()> {
+    let fixtures_list = load_cold_archive_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!("no cold-archive fixtures found in {}", fixtures.display());
+    }
+
+    let config =
+        ReinConfig::load().context("loading rein config for cold-archive baseline")?;
+    let checker = build_hybrid_checker(&config);
+    let mut outcomes = Vec::with_capacity(fixtures_list.len());
+    let mut skipped = 0usize;
+
+    for fx in &fixtures_list {
+        if fx.evidence_keywords.is_empty() {
+            eprintln!(
+                "[rein-eval] cold-archive baseline: skipping {} (no evidence_keywords)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+        let baseline_text = fx.baseline_text();
+        // Reuse `score_concept_case` with `Some(_)` set to `None` —
+        // baseline measures the topic+summary recall surface alone.
+        let hit = score_concept_case(&baseline_text, None, &fx.evidence_keywords, &checker);
+        outcomes.push(PairedOutcome {
+            case_id: fx.case_id.clone(),
+            baseline_hit: hit,
+            treatment_hit: false,
+            baseline_length: baseline_text.len(),
+            treatment_length: 0,
+            treatment_summary: None,
+        });
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} had evidence_keywords — baseline scoring requires keywords",
+            fixtures.display()
+        );
+    }
+
+    let category_map = build_cold_archive_category_map(&fixtures_list);
+    let sc = Scorecard {
+        fixtures_dir: fixtures.display().to_string(),
+        iterations: 1,
+        timestamp: Utc::now(),
+        outcomes,
+        per_category: HashMap::new(),
+        category_map,
+        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+    };
+    write_scorecard(output, &sc)?;
+
+    eprintln!(
+        "[rein-eval] cold-archive baseline: wrote {} scored cases ({} skipped) to {}",
+        sc.outcomes.len(),
+        skipped,
+        output.display()
+    );
+    Ok(())
+}
+
+/// Drive the Cap C archival-summary treatment: build a synthetic cold
+/// `Memory` from each fixture, feed it through
+/// `ColdArchiveSummaryGenerator::generate` (production LLM bridge +
+/// 3-invariant lossless gate), and score `topic + summary +
+/// archival_summary` against `evidence_keywords`. Errors cleanly if no
+/// LLM provider is configured.
+fn cmd_cold_archive_run(fixtures: &Path, output: &Path, verbose: bool) -> Result<()> {
+    let config = ReinConfig::load().context("loading rein config for cold-archive run")?;
+    let extractor = rein::ops::cold_archive_summary::create_cold_archive_extractor(&config)
+        .ok_or_else(|| {
+            anyhow!(
+                "no LLM extractor available for cold-archive — `[ars].llm_backend` resolved \
+                 to None or the configured provider is missing its API key. Set \
+                 `[ars].llm_backend = \"inherit\"` to follow `[extract].provider`, or \
+                 explicitly set `[ars].llm_backend = \"google\"` with GEMINI_API_KEY, or \
+                 `\"omlx\"` with a configured `[extract.omlx]` block."
+            )
+        })?;
+
+    let fixtures_list = load_cold_archive_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!("no cold-archive fixtures found in {}", fixtures.display());
+    }
+    run_cold_archive_treatment_with_extractor(
+        &fixtures_list,
+        std::sync::Arc::new(extractor),
+        &config,
+        output,
+        fixtures,
+        verbose,
+    )
+}
+
+/// Treatment loop split out of `cmd_cold_archive_run` so unit tests can
+/// drive it with a `MockExtractor` without hitting a live LLM provider.
+/// Production callers go through `cmd_cold_archive_run` (which loads
+/// config + builds the extractor once).
+fn run_cold_archive_treatment_with_extractor(
+    fixtures_list: &[ColdArchiveFixture],
+    extractor: std::sync::Arc<rein::extract::llm::ExtractorKind>,
+    config: &ReinConfig,
+    output: &Path,
+    fixtures_dir_for_meta: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let extractor_tag = match extractor.as_ref() {
+        rein::extract::llm::ExtractorKind::Gemini(_) => "gemini",
+        rein::extract::llm::ExtractorKind::Omlx(_) => "omlx",
+        #[cfg(feature = "test-support")]
+        rein::extract::llm::ExtractorKind::Mock(_) => "mock",
+    };
+    eprintln!(
+        "[rein-eval] cold-archive run: {} fixtures, extractor={}",
+        fixtures_list.len(),
+        extractor_tag,
+    );
+
+    let checker = build_hybrid_checker(config);
+    let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
+    let mut skipped = 0usize;
+    let mut llm_failed = 0usize;
+    let mut empty_output = 0usize;
+    let mut contract_failed = 0usize;
+
+    for fx in fixtures_list {
+        if fx.evidence_keywords.is_empty() {
+            eprintln!(
+                "[rein-eval] cold-archive run: skipping {} (no evidence_keywords)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+        let target_chars = fx
+            .target_chars
+            .unwrap_or(rein::ops::cold_archive_summary::ARCHIVAL_SUMMARY_TARGET_CHARS);
+        let baseline_len = fx.baseline_text().len();
+        let memory = fx.to_memory();
+        let cold_config = rein::ops::cold_archive_summary::ColdArchiveConfig {
+            enabled: true, // eval bypasses the operator opt-in flag
+            target_chars,
+            batch_size: 1,
+            max_strikes: rein::ops::cold_archive_summary::ARCHIVAL_SUMMARY_MAX_STRIKES,
+        };
+        let generator = rein::ops::cold_archive_summary::ColdArchiveSummaryGenerator::new(
+            extractor.clone(),
+            cold_config,
+        );
+        match generator.generate(&memory) {
+            Ok(Some(outcome)) => {
+                let archival = outcome.summary.clone();
+                let treatment_text = fx.treatment_text_with(&archival);
+                let hit = score_concept_case(
+                    &fx.baseline_text(),
+                    Some(&archival),
+                    &fx.evidence_keywords,
+                    &checker,
+                );
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: hit,
+                    baseline_length: baseline_len,
+                    treatment_length: treatment_text.len(),
+                    treatment_summary: Some(archival),
+                });
+            }
+            Ok(None) => {
+                if verbose {
+                    eprintln!(
+                        "[rein-eval] cold-archive run: {} generator returned None \
+                         (content already short or empty after strip)",
+                        fx.case_id
+                    );
+                }
+                empty_output += 1;
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: false,
+                    baseline_length: baseline_len,
+                    // Empty treatment → operator effectively sees only
+                    // the stripped surface; mirror that with baseline len.
+                    treatment_length: baseline_len,
+                    treatment_summary: None,
+                });
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("contract") || msg.contains("invariant") {
+                    contract_failed += 1;
+                } else {
+                    llm_failed += 1;
+                }
+                if verbose {
+                    let snippet: String = msg.chars().take(200).collect();
+                    eprintln!(
+                        "[rein-eval] cold-archive run: {} generator error: {}",
+                        fx.case_id, snippet
+                    );
+                }
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: false,
+                    baseline_length: baseline_len,
+                    treatment_length: baseline_len,
+                    treatment_summary: None,
+                });
+            }
+        }
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} produced a scorable cold-archive treatment outcome (skipped={})",
+            fixtures_dir_for_meta.display(),
+            skipped,
+        );
+    }
+
+    let category_map = build_cold_archive_category_map(fixtures_list);
+    let sc = Scorecard {
+        fixtures_dir: fixtures_dir_for_meta.display().to_string(),
+        iterations: 1,
+        timestamp: Utc::now(),
+        outcomes,
+        per_category: HashMap::new(),
+        category_map,
+        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+    };
+    write_scorecard(output, &sc)?;
+
+    eprintln!(
+        "[rein-eval] cold-archive run: wrote {} scored cases ({} skipped, \
+         {} llm_failed, {} contract_failed, {} empty_output) to {}",
+        sc.outcomes.len(),
+        skipped,
+        llm_failed,
+        contract_failed,
+        empty_output,
+        output.display()
+    );
+    Ok(())
+}
+
 fn build_synthesis_category_map(fixtures_list: &[SynthesisFixture]) -> HashMap<String, String> {
     fixtures_list
         .iter()
@@ -2048,6 +2508,54 @@ fn load_concept_fixtures(dir: &Path) -> Result<Vec<ConceptFixture>> {
     }
     out.sort_by(|a, b| a.case_id.cmp(&b.case_id));
     Ok(out)
+}
+
+fn load_cold_archive_fixtures(dir: &Path) -> Result<Vec<ColdArchiveFixture>> {
+    if !dir.exists() {
+        bail!("fixtures directory does not exist: {}", dir.display());
+    }
+    if !dir.is_dir() {
+        bail!("fixtures path is not a directory: {}", dir.display());
+    }
+    let mut out = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("reading fixtures dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading fixture {}", path.display()))?;
+        let cases: Vec<ColdArchiveFixture> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing fixture {}", path.display()))?;
+        out.extend(cases);
+    }
+    if out.is_empty() {
+        return Err(anyhow!(
+            "no .json cold-archive fixtures found in {}",
+            dir.display()
+        ));
+    }
+    out.sort_by(|a, b| a.case_id.cmp(&b.case_id));
+    Ok(out)
+}
+
+fn build_cold_archive_category_map(
+    fixtures_list: &[ColdArchiveFixture],
+) -> HashMap<String, String> {
+    fixtures_list
+        .iter()
+        .filter_map(|fx| {
+            fx.category
+                .as_ref()
+                .map(|c| (fx.case_id.clone(), c.clone()))
+        })
+        .collect()
 }
 
 // --- I/O helpers -----------------------------------------------------------
@@ -2754,5 +3262,270 @@ mod tests {
         assert!(text.contains("summary one"));
         assert!(text.contains("preview one"));
         assert!(text.contains("preview two"));
+    }
+
+    /// Build an ASCII cold-archive fixture whose `original_content` is
+    /// vocabulary-restricted enough that a paraphrased mock summary can
+    /// pass the 3-invariant lossless gate (INV-1 trigram coverage ≥ 0.65,
+    /// INV-3 length ≤ target_chars * 1.5, INV-5 same script). Used by the
+    /// `cold_archive_run_*` tests below.
+    fn mini_cold_archive_fixture(case_id: &str, category: &str) -> ColdArchiveFixture {
+        // Original content is intentionally repetitive so any short prose
+        // summary built from the same vocabulary reaches the trigram
+        // coverage floor. Topic + summary together leave the
+        // `decide_synthesize` keywords lookup short enough that the
+        // baseline misses the majority threshold (3/5).
+        let original = "The slow channel worker validates output via the lossless gate. \
+                        The slow channel worker enforces 3 invariants on every cold tier \
+                        archival summary. The lossless gate covers bounded length, script \
+                        preservation, and trigram coverage. The slow channel worker \
+                        commits via a 5 way CAS lease that mirrors apply resummerize. The \
+                        worker uses raw text with prompt for prose mode output, never \
+                        JSON mode. The cold tier archival summary version starts at one \
+                        hundred so it cannot collide with the keyword overlap version \
+                        space. The slow channel worker batches up to sixteen rows per \
+                        pass and bounds wall time to one hundred eighty seconds."
+            .to_string();
+        ColdArchiveFixture {
+            case_id: case_id.to_string(),
+            category: Some(category.to_string()),
+            topic: "lossless gate worker".to_string(),
+            // Summary mentions 1 of the 5 evidence_keywords ("worker"),
+            // ensuring baseline scores below the strict-majority threshold.
+            summary: "A slow channel worker drains pending rows.".to_string(),
+            original_content: original,
+            evidence_keywords: vec![
+                "lossless gate".to_string(),
+                "5 way CAS".to_string(),
+                "raw text".to_string(),
+                "trigram coverage".to_string(),
+                "script preservation".to_string(),
+            ],
+            target_chars: Some(600),
+        }
+    }
+
+    #[test]
+    fn cold_archive_baseline_records_topic_summary_outcome() {
+        let fx = mini_cold_archive_fixture("ca_test_001", "lossless");
+        let baseline_text = fx.baseline_text();
+        // Sanity: baseline carries topic + summary, NOT the long form.
+        assert!(baseline_text.contains("lossless gate worker"));
+        assert!(baseline_text.contains("slow channel worker"));
+        assert!(!baseline_text.contains("apply resummerize"));
+
+        let dir = tmp_path("ca_baseline_dir");
+        // Use a per-case scratch directory so concurrent test runs don't
+        // step on each other (mirrors the fixture-loader contract — input
+        // is a directory of JSON files, not a single file).
+        let _ = fs::create_dir_all(&dir);
+        let fixture_path = dir.join("mini.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec_pretty(&vec![fx]).unwrap(),
+        )
+        .unwrap();
+
+        let out_path = tmp_path("ca_baseline");
+        let res = cmd_cold_archive_baseline(&dir, &out_path);
+        assert!(res.is_ok(), "cold_archive baseline failed: {res:?}");
+
+        let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(sc.outcomes.len(), 1);
+        assert_eq!(
+            sc.outcomes[0].baseline_length,
+            baseline_text.len(),
+            "baseline_length must match topic + summary length, NOT the long original_content"
+        );
+        assert_eq!(sc.outcomes[0].treatment_length, 0, "baseline-only");
+        assert!(
+            sc.outcomes[0].treatment_summary.is_none(),
+            "baseline scoring writes no treatment text"
+        );
+        assert_eq!(
+            sc.category_map.get("ca_test_001").map(String::as_str),
+            Some("lossless")
+        );
+        let _ = fs::remove_file(&out_path);
+        let _ = fs::remove_file(&fixture_path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn cold_archive_run_with_mock_contract_pass_records_treatment_hit() {
+        let fx = mini_cold_archive_fixture("ca_test_002", "lossless");
+        // Mock summary built from the original-content vocabulary so the
+        // 3-invariant gate (length ≤ 900, ASCII script, trigram_coverage
+        // ≥ 0.65) all pass. Mentions every evidence keyword so treatment
+        // scores ≥3/5 (strict majority).
+        let mock_summary = "The slow channel worker validates lossless gate output via the \
+                            5 way CAS lease. The lossless gate enforces bounded length, \
+                            script preservation, and trigram coverage on every cold tier \
+                            archival summary. The worker uses raw text with prompt for \
+                            prose mode output. The slow channel worker mirrors apply \
+                            resummerize on commit and batches rows per pass with a wall \
+                            time bound."
+            .to_string();
+        let extractor = std::sync::Arc::new(ExtractorKind::Mock(MockExtractor::with_responses(
+            vec![Ok(mock_summary.clone())],
+        )));
+        let config = ReinConfig::default();
+        let out_path = tmp_path("ca_run_pass");
+        let res = run_cold_archive_treatment_with_extractor(
+            &[fx],
+            extractor,
+            &config,
+            &out_path,
+            Path::new("dummy"),
+            /* verbose */ false,
+        );
+        assert!(res.is_ok(), "cold_archive run failed: {res:?}");
+
+        let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(sc.outcomes.len(), 1);
+        let o = &sc.outcomes[0];
+        assert!(
+            o.treatment_hit,
+            "mock summary covering every evidence_keyword must score as treatment_hit; \
+             summary={mock_summary}"
+        );
+        // Treatment length = topic + " " + summary + " " + archival
+        // (matches `treatment_text_with`). MUST exceed baseline_length
+        // because Cap C is additive.
+        assert!(
+            o.treatment_length > o.baseline_length,
+            "additive Cap C → treatment_length must exceed baseline_length; \
+             got treatment={}, baseline={}",
+            o.treatment_length,
+            o.baseline_length
+        );
+        assert_eq!(
+            o.treatment_summary.as_deref(),
+            Some(mock_summary.as_str()),
+            "scorecard MUST persist the archival summary text for offline review"
+        );
+        let _ = fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn cold_archive_run_with_mock_llm_error_keeps_baseline_length() {
+        // Mirrors `synthesis_run_llm_error_does_not_score_as_hit` — LLM
+        // failures must fall back to baseline-equivalent length so
+        // `avg_length_ratio` doesn't falsely credit the failure.
+        let fx = mini_cold_archive_fixture("ca_test_003", "lossless");
+        let baseline_len = fx.baseline_text().len();
+        let extractor = std::sync::Arc::new(ExtractorKind::Mock(
+            MockExtractor::with_persistent_error("simulated cold-archive LLM outage"),
+        ));
+        let config = ReinConfig::default();
+        let out_path = tmp_path("ca_run_err");
+        let res = run_cold_archive_treatment_with_extractor(
+            &[fx],
+            extractor,
+            &config,
+            &out_path,
+            Path::new("dummy"),
+            /* verbose */ false,
+        );
+        assert!(res.is_ok(), "cold_archive run with LLM error must still write a scorecard");
+
+        let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(sc.outcomes.len(), 1);
+        let o = &sc.outcomes[0];
+        assert!(
+            !o.treatment_hit,
+            "LLM error MUST NOT produce a treatment hit"
+        );
+        assert_eq!(
+            o.treatment_length, baseline_len,
+            "LLM error → treatment_length collapses to baseline so length ratio is honest"
+        );
+        assert_eq!(o.baseline_length, baseline_len);
+        assert!(o.treatment_summary.is_none());
+        let _ = fs::remove_file(&out_path);
+    }
+
+    /// Sanity-check the bundled fixture corpus parses + has the expected
+    /// shape (every fixture has evidence_keywords and original_content
+    /// long enough to clear the generator's "already short" skip).
+    #[test]
+    fn cold_archive_corpus_loads_and_has_well_formed_cases() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cold_archive");
+        let cases =
+            load_cold_archive_fixtures(&dir).expect("cold_archive fixtures should parse");
+        assert!(
+            cases.len() >= 5,
+            "corpus should have ≥5 fixtures (power-limited acknowledged); got {}",
+            cases.len()
+        );
+        for fx in &cases {
+            assert!(
+                !fx.evidence_keywords.is_empty(),
+                "fixture {} has no evidence_keywords",
+                fx.case_id
+            );
+            let target = fx
+                .target_chars
+                .unwrap_or(rein::ops::cold_archive_summary::ARCHIVAL_SUMMARY_TARGET_CHARS);
+            assert!(
+                fx.original_content.chars().count() > target,
+                "fixture {} original_content shorter than target_chars={target} — generator \
+                 would skip it as a degenerate-success",
+                fx.case_id
+            );
+        }
+    }
+
+    /// End-to-end: run `cmd_cold_archive_baseline` against the bundled
+    /// corpus and verify the harness produces a scorecard with one
+    /// outcome per fixture and non-zero baseline lengths. Catches:
+    ///   - schema field renames that pass the parse check but break
+    ///     `baseline_text` (e.g. dropping `topic` or `summary`)
+    ///   - hybrid-checker symbol drift that crashes scoring on real text
+    ///   - keyword authoring mistakes that produce uniform all-hit /
+    ///     all-miss outcomes (every fixture having the same
+    ///     `baseline_hit` value would suggest the keywords don't
+    ///     discriminate against the topic+summary surface)
+    #[test]
+    fn cold_archive_baseline_runs_against_bundled_corpus() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cold_archive");
+        let expected = load_cold_archive_fixtures(&dir).expect("corpus parses");
+        let out_path = tmp_path("ca_corpus_baseline");
+        let res = cmd_cold_archive_baseline(&dir, &out_path);
+        assert!(
+            res.is_ok(),
+            "cmd_cold_archive_baseline must succeed against the bundled corpus: {res:?}"
+        );
+        let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(
+            sc.outcomes.len(),
+            expected.len(),
+            "every parsed fixture must yield a scored outcome"
+        );
+        for o in &sc.outcomes {
+            assert!(
+                o.baseline_length > 0,
+                "fixture {} produced an empty baseline_text",
+                o.case_id
+            );
+            // Baseline path leaves treatment fields zeroed.
+            assert_eq!(o.treatment_length, 0);
+            assert!(o.treatment_summary.is_none());
+        }
+        // Surface a soft signal if every keyword set produces the same
+        // verdict — that's authoring drift, not a hard failure.
+        let unanimous = sc
+            .outcomes
+            .windows(2)
+            .all(|w| w[0].baseline_hit == w[1].baseline_hit);
+        assert!(
+            !unanimous,
+            "baseline_hit is uniform across {} fixtures — keywords likely don't \
+             discriminate against the topic+summary surface (authoring drift)",
+            sc.outcomes.len()
+        );
+        let _ = fs::remove_file(&out_path);
     }
 }

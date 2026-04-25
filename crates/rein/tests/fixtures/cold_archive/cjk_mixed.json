@@ -1,0 +1,16 @@
+[
+  {
+    "case_id": "ca_cjk_001",
+    "category": "cjk_mixed",
+    "topic": "v0.22 D5 性能基准结论",
+    "summary": "v0.22 D5 性能基准实测推翻 spec §F1 前提:p99=54µs, 选方案 D。",
+    "original_content": "v0.22 D5 阶段对 KG 池化的性能基准测试结果显著推翻了 spec §F1 的前提假设。原 spec 估计单次 BFS 调用需要毫秒级延迟,因此提议引入 lock-free 链表加上 epoch-based reclamation 作为方案 A,预估实施时间五到七天。但实测数据显示:在一百个并发 BFS 调用的 stress test 下,p99 latency 等于 54µs, max latency 等于 4.57ms; p50 等于 2.3µs, p99.9 等于 1.2ms。这个数字压倒性地证明:现有的 std::sync::Mutex 加 Vec<Option<Arc<...>>> 池化结构的 contention overhead 已经远低于 BFS 主体计算时间。方案 A 的复杂度收益小于零。最终选用方案 D:零 LoC 改动,继续用 try_get 加 Mutex 池化。v0.22 timeline 因此从五到七天缩到三到四天。这个结论具有更广泛的含义:在做并发优化决策之前,必须先做实测基准测试,而不是仅依赖 spec 推断。后续 D6 阶段的服务连接池设计也照此原则:先 try_get,看实测数据,再决定是否引入 lock-free 结构。同样的方法应用于 D7, D8, D9 阶段:每个潜在的 contention 点都有对应的 stress test 基准数据,所有数据都集中在 docs/devlog/2026-04-22 文档中。",
+    "evidence_keywords": [
+      "v0.22 D5",
+      "p99 latency",
+      "lock-free",
+      "方案 D",
+      "Mutex 池化"
+    ]
+  }
+]

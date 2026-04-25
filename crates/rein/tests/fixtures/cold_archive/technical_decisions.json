@@ -1,0 +1,44 @@
+[
+  {
+    "case_id": "ca_td_001",
+    "category": "technical_decision",
+    "topic": "v0.23 resummerize architecture",
+    "summary": "v0.23 introduced LLM-driven canonical recompression replacing v0.21 keep-tail truncation.",
+    "original_content": "v0.23 resummerize replaces v0.21's keep-tail truncation at the 10KB MergeInto cap with LLM-driven canonical recompression, gated by a 7-invariant Lossless Compression Contract. Atomic apply_resummerize uses BEGIN IMMEDIATE plus a 5-way CAS over claim_token, snapshot updated_at, and status-live, with a pre-rewrite evidence snapshot, a 3-strike exhaustion fuse, and a 5-minute stale-claim timeout. Side-index discipline covers Tantivy refresh, sqlite-vec delete in-transaction, and HNSW re-insertion through the run_vec_dedup re-embed path. Audit table resummarize_runs records per-run status (Success, LlmError, ContractViolation, LengthExceeded, Exhausted, ClaimLost). The companion rein-eval binary runs paired McNemar non-inferiority tests with CI-driven ship-or-bail decisions. Operators must opt in via [resummerize].enabled = true; default is false.",
+    "evidence_keywords": [
+      "MergeInto cap",
+      "Lossless Compression Contract",
+      "5-way CAS",
+      "claim_token",
+      "stale-claim timeout"
+    ]
+  },
+  {
+    "case_id": "ca_td_002",
+    "category": "technical_decision",
+    "topic": "Cap C cold-tier archival summary",
+    "summary": "Cap C generates dense prose summaries for cold-tier memories with a 3-invariant local lossless gate.",
+    "original_content": "Capability C generates dense archival summaries for cold-tier memories that have been stripped by M5. The slow-channel worker drains needs_archival_summary flags, generates a compressed prose summary via the configured LLM (raw_text_with_prompt prose mode, NOT JSON mode), validates against a 3-invariant local lossless gate (INV-3 bounded_length cap at target_chars * 1.5, INV-5 script_preservation within plus or minus 0.10 CJK ratio drift, INV-1 trigram_coverage at least 0.65 of source trigrams present), and persists with a 5-way CAS lease that mirrors apply_resummerize. ARCHIVAL_SUMMARY_VERSION starts at 100 to avoid colliding with HIT_CHECKER_VERSION 1-3 and LLM_JUDGE_VERSION 100 namespacing. ARCHIVAL_SUMMARY_BATCH_BUDGET_SECS caps a single pass at 180 seconds, leaving headroom for roughly four Gemini Flash calls. The strike fuse counts ContractViolation and LengthExceeded only; LlmError and ClaimLost are non-counting.",
+    "evidence_keywords": [
+      "3-invariant",
+      "trigram_coverage",
+      "script_preservation",
+      "ARCHIVAL_SUMMARY_BATCH_BUDGET_SECS",
+      "5-way CAS lease"
+    ]
+  },
+  {
+    "case_id": "ca_td_003",
+    "category": "technical_decision",
+    "topic": "M3 Kaplan-Meier per-cluster decay",
+    "summary": "M3 replaces fixed Ebbinghaus half-life with per-cluster Kaplan-Meier survival curves once data is sufficient.",
+    "original_content": "Adaptive Capability M3 replaces the v0.4 fixed Ebbinghaus half-life model with non-parametric Kaplan-Meier survival curves estimated per semantic cluster. Activation is gated by a cold_start_min observation floor; below that count the engine falls back to pure Ebbinghaus. Between cold_start_min and cold_start_max the engine performs a linear blend so the transition is smooth. Above cold_start_max the engine trusts the survival curve fully. Survival curves consume the access-event log via the M1 feedback consumer with offset arbitration; the consumer's last_consumed_event_id watermarks each pass and the AdaptiveState CAS merge takes the maximum across concurrent writers. Cluster identity comes from M4 HDBSCAN: dendrogram from mutual reachability distances, condensed tree with stability scoring, and EOMBST flat-cluster extraction with sampling when n exceeds 3000 to bound cost.",
+    "evidence_keywords": [
+      "Kaplan-Meier",
+      "cold_start_min",
+      "AdaptiveState CAS merge",
+      "EOMBST",
+      "mutual reachability"
+    ]
+  }
+]
