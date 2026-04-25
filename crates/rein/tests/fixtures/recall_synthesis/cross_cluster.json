@@ -1,0 +1,375 @@
+[
+  {
+    "case_id": "cc_001",
+    "category": "cross_cluster",
+    "query": "How are the storage layer and search layer kept in sync after writes?",
+    "recall_results": [
+      {
+        "id": "mem-cc-1-1",
+        "summary": "store/sqlite.rs writes go through a per-request connection model with WAL mode and FULL_MUTEX; commit happens before any side-index work begins.",
+        "evidence_preview": [
+          "per-request connection model",
+          "WAL mode plus FULL_MUTEX",
+          "commit precedes side-index work"
+        ],
+        "score": 0.91,
+        "confidence": 0.89,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-1-2",
+        "summary": "Tantivy index refresh runs fire-and-forget after commit; writer-lock failure degrades gracefully into a skip and the next write retries the refresh.",
+        "evidence_preview": [
+          "Tantivy refresh fire-and-forget",
+          "writer-lock failure tolerated",
+          "next write retries the refresh"
+        ],
+        "score": 0.87,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-1-3",
+        "summary": "usearch HNSW insertion happens in-process after commit; the dirty marker is only cleared on a full rebuild, not per-write, so partial-write races never leave a stale clean flag.",
+        "evidence_preview": [
+          "HNSW insertion after commit",
+          "dirty marker cleared only on full rebuild",
+          "partial-write races handled"
+        ],
+        "score": 0.84,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-1-4",
+        "summary": "The recall waterfall reads from all three sources without coordinating refresh timing: stale-by-a-few-ms reads are tolerated by canonical-first collapse and dedup at fusion time.",
+        "evidence_preview": [
+          "no refresh-timing coordination at recall",
+          "stale-by-ms reads tolerated",
+          "canonical-first collapse handles dedup"
+        ],
+        "score": 0.79,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["eventual", "convergence", "asynchronous", "tolerated", "loose"]
+  },
+  {
+    "case_id": "cc_002",
+    "category": "cross_cluster",
+    "query": "What runtime safety mechanisms guard the v0.23 resummerize path?",
+    "recall_results": [
+      {
+        "id": "mem-cc-2-1",
+        "summary": "BEGIN IMMEDIATE plus 5-way CAS (claim token, snapshot updated_at, status-live) prevents a concurrent MergeInto from racing the rewrite write.",
+        "evidence_preview": [
+          "BEGIN IMMEDIATE for atomic apply",
+          "5-way CAS protects against concurrent MergeInto",
+          "claim token plus snapshot updated_at"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-2-2",
+        "summary": "The 7-invariant Lossless Compression Contract validates every LLM rewrite before apply; a failure routes to the audit table without touching the canonical.",
+        "evidence_preview": [
+          "7-invariant Compression Contract",
+          "validation before apply",
+          "failure logged to audit table"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-2-3",
+        "summary": "A 3-strike exhaustion fuse breaks the loop after repeated ContractViolation outcomes; ClaimLost and LlmError do not count toward the strike total.",
+        "evidence_preview": [
+          "3-strike exhaustion fuse",
+          "ClaimLost not counted",
+          "LlmError not counted"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-2-4",
+        "summary": "Stale claim tokens older than 5 minutes are reaped so a worker crash mid-rewrite does not leave a permanently-stuck row.",
+        "evidence_preview": [
+          "5-minute stale claim timeout",
+          "worker crash recovery",
+          "no permanently-stuck rows"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["layered", "defense", "multiple", "interlocking", "complementary"]
+  },
+  {
+    "case_id": "cc_003",
+    "category": "cross_cluster",
+    "query": "How are LLM extraction, query expansion, reranking, and dedup verdicts kept from overloading the upstream provider?",
+    "recall_results": [
+      {
+        "id": "mem-cc-3-1",
+        "summary": "extract/llm.rs hooks run on PostToolUse and feed an async queue so the editor never blocks on Gemini latency.",
+        "evidence_preview": [
+          "PostToolUse hook async queue",
+          "editor never blocks",
+          "Gemini latency absorbed"
+        ],
+        "score": 0.93,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-3-2",
+        "summary": "search/expand.rs query expansion fires its LLM calls in parallel with the original recall via tokio::join, so the user-perceived latency is bounded by the slowest leg.",
+        "evidence_preview": [
+          "query expansion uses tokio::join",
+          "parallel with original recall",
+          "latency bounded by slowest leg"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-3-3",
+        "summary": "search/rerank_llm.rs gates LLM rerank by a strong-signal bypass: if BM25 top-1 already exceeds the learned threshold, no LLM call is issued.",
+        "evidence_preview": [
+          "strong-signal bypass for rerank",
+          "BM25 top-1 threshold gate",
+          "no LLM call on strong-signal hits"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-3-4",
+        "summary": "extract/dedup.rs LLM verdict is only issued when lexical similarity falls in the ambiguous band; clear-merge and clear-distinct cases avoid the LLM entirely.",
+        "evidence_preview": [
+          "LLM dedup verdict only in ambiguous band",
+          "clear-merge bypasses LLM",
+          "clear-distinct bypasses LLM"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-3-5",
+        "summary": "v0.23.1 added a global LLM semaphore acquire_llm_permit() that bounds concurrent calls across all four code paths; default 8 permits.",
+        "evidence_preview": [
+          "acquire_llm_permit global semaphore",
+          "bounds concurrent LLM calls",
+          "default 8 permits configurable"
+        ],
+        "score": 0.78,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["semaphore", "extract", "expansion", "rerank", "dedup"]
+  },
+  {
+    "case_id": "cc_004",
+    "category": "cross_cluster",
+    "query": "How do M2 alpha learning, M3 survival decay, and M5 tiering all benefit from M4 HDBSCAN clusters?",
+    "recall_results": [
+      {
+        "id": "mem-cc-4-1",
+        "summary": "M4 HDBSCAN runs nightly, materializing cluster IDs into the memories table; downstream subsystems read those cluster IDs as a stable per-memory tag.",
+        "evidence_preview": [
+          "HDBSCAN runs nightly",
+          "cluster IDs materialized in memories table",
+          "stable per-memory tag for downstream"
+        ],
+        "score": 0.94,
+        "confidence": 0.92,
+        "sources_hit": 3,
+        "evidence_count": 4
+      },
+      {
+        "id": "mem-cc-4-2",
+        "summary": "M2 alpha optimizer groups candidate-replay events by cluster ID and learns a separate CC alpha per cluster, so dense semantic regions can have different fusion weights from sparse ones.",
+        "evidence_preview": [
+          "alpha groups events by cluster ID",
+          "separate CC alpha per cluster",
+          "dense and sparse regions diverge"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-4-3",
+        "summary": "M3 Kaplan-Meier estimator builds a separate survival curve per cluster; the per-cluster decay constant replaces fixed Ebbinghaus once enough events have accrued in that cluster.",
+        "evidence_preview": [
+          "per-cluster Kaplan-Meier curve",
+          "per-cluster decay constant",
+          "replaces fixed Ebbinghaus when warm"
+        ],
+        "score": 0.86,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-4-4",
+        "summary": "M5 tier boundaries are computed per cluster: the t-digest streaming quantile estimator runs once per cluster ID so dense and sparse clusters get tier cutoffs appropriate to their distribution.",
+        "evidence_preview": [
+          "tier boundaries computed per cluster",
+          "t-digest per cluster ID",
+          "cutoffs match cluster distribution"
+        ],
+        "score": 0.82,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["HDBSCAN", "alpha", "Kaplan-Meier", "tier", "cluster"]
+  },
+  {
+    "case_id": "cc_005",
+    "category": "cross_cluster",
+    "query": "What rein subsystems use SQLite transactions and how do they avoid stepping on each other?",
+    "recall_results": [
+      {
+        "id": "mem-cc-5-1",
+        "summary": "store_with_dedup wraps the lookup-then-insert flow in BEGIN IMMEDIATE so two concurrent stores of similar text cannot both create a new canonical.",
+        "evidence_preview": [
+          "store_with_dedup uses BEGIN IMMEDIATE",
+          "lookup-then-insert atomic",
+          "no double canonical creation"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-5-2",
+        "summary": "ops/resummerize.rs uses BEGIN DEFERRED for the snapshot read and BEGIN IMMEDIATE for the apply write; the two phases bracket the LLM call cleanly.",
+        "evidence_preview": [
+          "BEGIN DEFERRED for snapshot read",
+          "BEGIN IMMEDIATE for apply write",
+          "LLM call between phases"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-5-3",
+        "summary": "ops/dedup.rs run_vec_dedup re-embeds and writes inside a single BEGIN IMMEDIATE so a concurrent reader never sees a half-applied vector update.",
+        "evidence_preview": [
+          "run_vec_dedup wraps re-embed and write",
+          "single BEGIN IMMEDIATE",
+          "no half-applied vector visible"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-5-4",
+        "summary": "ARS Capability A concept-summary refresh wraps its read-then-CAS-write in BEGIN IMMEDIATE; the CAS detects a concurrent peer refresh and bails without writing.",
+        "evidence_preview": [
+          "ARS Cap A wraps read-then-CAS in BEGIN IMMEDIATE",
+          "CAS detects concurrent peer",
+          "bails without writing on conflict"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["pattern", "uniformly", "applied", "throughout", "discipline"]
+  },
+  {
+    "case_id": "cc_006",
+    "category": "cross_cluster",
+    "query": "Where does the Neural Wiki GUI fit relative to the MCP server, REST API, and CLI surfaces?",
+    "recall_results": [
+      {
+        "id": "mem-cc-6-1",
+        "summary": "Neural Wiki GUI lives under crates/rein/gui as a React 18 + TypeScript + Tailwind app, built into static assets that rust-embed bundles into the binary under --features gui.",
+        "evidence_preview": [
+          "React 18 + TypeScript + Tailwind",
+          "rust-embed bundles assets",
+          "--features gui enables embed"
+        ],
+        "score": 0.93,
+        "confidence": 0.91,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-6-2",
+        "summary": "GUI talks to the rein server through 21 REST endpoints in mcp/rest.rs; auth is enforced by AuthPolicy middleware registered through the same A1 inventory mechanism as MCP tools.",
+        "evidence_preview": [
+          "21 REST endpoints in mcp/rest.rs",
+          "AuthPolicy middleware",
+          "A1 inventory registration"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-6-3",
+        "summary": "MCP server in mcp/server.rs reuses the same OpsRuntime methods that REST endpoints call: every operation is authored once via #[op] and dispatched by all three adapters.",
+        "evidence_preview": [
+          "MCP server uses OpsRuntime methods",
+          "REST endpoints call the same methods",
+          "single #[op] author site"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cc-6-4",
+        "summary": "CLI subcommands also adapt OpsRuntime methods through cli/, completing the trio of dispatch surfaces over the shared inventory.",
+        "evidence_preview": [
+          "CLI adapts OpsRuntime via cli/",
+          "completes three adapter trio",
+          "shared inventory under all three"
+        ],
+        "score": 0.82,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["GUI", "REST", "MCP", "CLI", "OpsRuntime"]
+  }
+]

@@ -1479,9 +1479,18 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         .collect::<serde_json::Map<String, serde_json::Value>>()
         .into();
 
-    // Reranker weights (all 17)
+    // Reranker weights (all 17). Codex R3 G6: strip the v0.25.2
+    // replay-safety watermark fields (`last_*_event_id`) before
+    // returning to the GUI — the Adaptive page treats every numeric
+    // entry in `reranker_weights` as a feature weight, so leaking
+    // event-id integers (which can grow into the millions) would
+    // dwarf the real 0.x weights and break the chart's sort/scale.
     let weights = crate::search::rerank::load_weights(conn);
-    let reranker_weights = serde_json::to_value(&weights).unwrap_or_default();
+    let mut reranker_weights = serde_json::to_value(&weights).unwrap_or_default();
+    if let Some(obj) = reranker_weights.as_object_mut() {
+        obj.remove("last_access_event_id");
+        obj.remove("last_recall_event_id");
+    }
 
     // Cluster info
     let unique_clusters: std::collections::HashSet<u32> =

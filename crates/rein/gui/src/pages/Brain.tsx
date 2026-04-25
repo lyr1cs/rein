@@ -6,6 +6,7 @@ import { apiGet } from '../api/client';
 import { useMemoryDetail, useRecent, useMemoirs } from '../hooks/useApi';
 import { mergeForceGraphData } from '../utils/forceGraph';
 import { getPollingIntervalMs } from '../utils/polling';
+import { TIER_COLORS } from '../utils/theme';
 import type { Memory, MemoirExport } from '../api/types';
 
 /* ------------------------------------------------------------------ */
@@ -60,17 +61,6 @@ function errorMessage(error: unknown): string {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Tier colors                                                        */
-/* ------------------------------------------------------------------ */
-
-const TIER_COLORS: Record<string, string> = {
-  hot: '#f97316',
-  warm: '#fbbf24',
-  cold: '#3b82f6',
-  concept: '#e2e8f0',
-};
-
-/* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -101,7 +91,10 @@ export default function Brain() {
    * value we wrote last poll" without listing `timeMax` in its dep array
    * (which would self-loop because each poll writes a fresh `Date.now()`). */
   const timeMaxRef = useRef(0);
-  const [dimensions, setDimensions] = useState({ width: window.innerWidth - 48, height: window.innerHeight - 40 });
+  const [dimensions, setDimensions] = useState(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth - 48 : 800,
+    height: typeof window !== 'undefined' ? window.innerHeight - 40 : 600,
+  }));
 
   /* ---- Data fetching via react-query (H3 + M7) ----
    *
@@ -272,9 +265,10 @@ export default function Brain() {
   /* ---- Fit view on first render ---- */
   useEffect(() => {
     if (!loading && graphData.nodes.length > 0 && fgRef.current) {
-      setTimeout(() => {
+      const id = setTimeout(() => {
         fgRef.current?.zoomToFit?.(400, 60);
       }, 500);
+      return () => clearTimeout(id);
     }
   }, [loading, graphData.nodes.length]);
 
@@ -297,24 +291,6 @@ export default function Brain() {
     return () => ro.disconnect();
   }, []);
 
-  /* ---- Animation loop for hot node pulse (paused when tab is hidden) ---- */
-  useEffect(() => {
-    let raf: number;
-    let running = true;
-    const tick = () => {
-      if (!running) return;
-      if (document.visibilityState === 'visible') {
-        fgRef.current?.refresh?.();
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => {
-      running = false;
-      cancelAnimationFrame(raf);
-    };
-  }, []);
-
   /* ---- Time-filtered data ---- */
   const filteredData = useMemo(() => {
     const cutoff = timeSlider || Number.POSITIVE_INFINITY;
@@ -334,6 +310,35 @@ export default function Brain() {
     });
     return { nodes, links };
   }, [graphData, timeSlider]);
+
+  /* The pulse animation is the only reason we drive a 60fps RAF refresh —
+   * gate the loop on whether any hot-tier node is currently visible so the
+   * graph view is genuinely idle when the user has hot memories filtered
+   * out (e.g. tier filter, time slider before any hot mem existed). */
+  const hasHotNodes = useMemo(
+    () => filteredData.nodes.some((n) => n.tier === 'hot'),
+    [filteredData.nodes],
+  );
+
+  /* ---- Animation loop for hot node pulse (paused when tab is hidden,
+   *      and skipped entirely when no hot nodes are visible) ---- */
+  useEffect(() => {
+    if (!hasHotNodes) return;
+    let raf: number;
+    let running = true;
+    const tick = () => {
+      if (!running) return;
+      if (document.visibilityState === 'visible') {
+        fgRef.current?.refresh?.();
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      running = false;
+      cancelAnimationFrame(raf);
+    };
+  }, [hasHotNodes]);
 
   /* ---- Search matching ---- */
   const searchLower = search.toLowerCase();
@@ -361,10 +366,15 @@ export default function Brain() {
   }, [hoveredNode, filteredData.links]);
 
   /* ---- Time range ---- */
+  /* Walk both memory and concept nodes — `useRecent(200)` only seeds the
+   * memory side with the 200 most-recent rows, so a concept created from a
+   * historical session would otherwise fall outside the slider's `min`
+   * boundary and become unreachable from the live edge. */
   const timeMin = useMemo(() => {
     if (graphData.nodes.length === 0) return timeMax;
     let oldest = Number.POSITIVE_INFINITY;
     for (const n of graphData.nodes) {
+      if (n.type !== 'memory' && n.type !== 'concept') continue;
       const t = new Date(n.created_at).getTime();
       if (t < oldest) oldest = t;
     }
@@ -649,18 +659,21 @@ export default function Brain() {
       <div className="absolute bottom-20 right-4 z-10 flex flex-col gap-1">
         <button
           onClick={handleZoomIn}
+          aria-label="Zoom in"
           className="w-8 h-8 bg-[#0f172a]/80 backdrop-blur border border-[var(--border)] rounded-lg text-[var(--text-primary)] hover:border-[var(--accent)] text-sm font-mono flex items-center justify-center"
         >
           +
         </button>
         <button
           onClick={handleZoomOut}
+          aria-label="Zoom out"
           className="w-8 h-8 bg-[#0f172a]/80 backdrop-blur border border-[var(--border)] rounded-lg text-[var(--text-primary)] hover:border-[var(--accent)] text-sm font-mono flex items-center justify-center"
         >
           -
         </button>
         <button
           onClick={handleReset}
+          aria-label="Reset view"
           className="w-8 h-8 bg-[#0f172a]/80 backdrop-blur border border-[var(--border)] rounded-lg text-[var(--text-primary)] hover:border-[var(--accent)] text-xs flex items-center justify-center"
           title="Reset view"
         >
@@ -729,6 +742,7 @@ export default function Brain() {
             </h3>
             <button
               onClick={() => setSelectedNode(null)}
+              aria-label="Close detail"
               className="text-[var(--text-muted)] hover:text-[var(--text-primary)] ml-1 shrink-0 text-sm"
             >
               x
