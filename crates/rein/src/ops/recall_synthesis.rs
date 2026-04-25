@@ -14,7 +14,7 @@ use crate::extract::llm::{strip_code_fences, ExtractorKind};
 use crate::ops::concept_summary::create_concept_summary_extractor;
 use crate::search::recall::RecallResult;
 use crate::store::adaptive::{
-    synthesis_bucket_key, AdaptiveState, SYNTHESIS_COLD_START_N, SYNTHESIS_USEFUL_RATE_THRESHOLD,
+    synthesis_bucket_key, AdaptiveState, SYNTHESIS_USEFUL_RATE_THRESHOLD,
 };
 use crate::types::ReinResult;
 use serde::Serialize;
@@ -250,6 +250,14 @@ pub fn decide_synthesize(
 /// from inside the recall handler so synthesis sees the same adaptive
 /// snapshot used elsewhere in the request.
 ///
+/// v0.26.1: `query_type` is the capitalised
+/// [`crate::search::classify::QueryType::synthesis_bucket_label`] of the
+/// classified recall query. It MUST match the strings written into
+/// `SynthesisInteractionPayload.metadata.query_type` (see
+/// `synthesis_bucket_key` docs); using `Display` (lowercase route name)
+/// would silently miss every per-cluster bucket. Tests that don't care
+/// about per-cluster routing can pass `"Semantic"` literal.
+///
 /// `extractor_override` is only used by tests (feature `test-support`); pass
 /// `None` in production.
 pub fn run_recall_synthesis(
@@ -257,6 +265,7 @@ pub fn run_recall_synthesis(
     query: &str,
     config: &ReinConfig,
     synthesize: Option<bool>,
+    query_type: &str,
     adaptive_state: Option<&AdaptiveState>,
     extractor_override: Option<ExtractorKind>,
 ) -> Option<RecallSynthesisOutcome> {
@@ -287,34 +296,28 @@ pub fn run_recall_synthesis(
     // synthesis-quality signals are most relevant where the strongest
     // candidate sits.
     //
-    // query_type: hardcoded to `"Semantic"` for v0.26.0. This matches the
-    // capitalisation B_FEEDBACK_EVENT writes into the
-    // `SynthesisInteractionPayload.metadata.query_type` field (verified in
-    // `store/adaptive.rs` test fixtures; see e.g.
-    // `recompute_synthesis_feedback_*` tests using `synthesis_bucket_key(_,
-    // "Semantic")`). The bucket key is built by both sides via
-    // `synthesis_bucket_key`, so the strings MUST match exactly — using
-    // lowercase here would silently miss every per-cluster bucket and turn
-    // the gate into dead code. Note this is DIFFERENT from
-    // `QueryType::Semantic.to_string()` (search/classify.rs:412), which
-    // produces lowercase `"semantic"` for the route name — that surface
-    // is unrelated to the synthesis bucket key.
+    // query_type: caller-supplied capitalised label
+    // (`QueryType::synthesis_bucket_label()` — v0.26.1). MUST match the
+    // strings written into `SynthesisInteractionPayload.metadata.query_type`
+    // — drift would silently miss every per-cluster bucket and turn the
+    // gate into dead code. v0.26.0 hardcoded `"Semantic"` here, which
+    // meant any non-Semantic query routed events into one bucket while
+    // the gate read from another.
     //
-    // TODO v0.26.1: wire query classifier output through RecallResult /
-    // recall handler so the bucket key reflects the real query type. The
-    // canonical mapping is `QueryType -> "Semantic"|"Episodic"|...` (each
-    // variant capitalised to match the v0.26.0 payload convention).
+    // cold_start_n: pulled from `[ars].synthesis_cold_start_n` so an
+    // operator on a fresh canary can lower the threshold (3-5) and let
+    // the per-cluster gate fire against the partial event stream a soak
+    // collects without waiting for the bootstrap default of 10.
     let cluster_id = results
         .first()
         .and_then(|r| r.memory.cluster_id)
         .map(|c| c as i64);
-    let query_type = "Semantic"; // TODO v0.26.1: wire query classifier output
     match decide_synthesize(
         config.ars.recall_synthesis_enabled,
         cluster_id,
         query_type,
         adaptive_state,
-        SYNTHESIS_COLD_START_N,
+        config.ars.synthesis_cold_start_n,
     ) {
         SynthesizeDecision::Yes => { /* fall through to synthesis path */ }
         SynthesizeDecision::Skip(SkipReason::OperatorDisabled) => {
@@ -734,11 +737,21 @@ mod tests {
         let config = ReinConfig::default();
         let results = make_results(5);
         assert!(
-            run_recall_synthesis(&results, "test query", &config, None, None, None).is_none(),
+            run_recall_synthesis(&results, "test query", &config, None, "Semantic", None, None)
+                .is_none(),
             "None synthesize param → None outcome"
         );
         assert!(
-            run_recall_synthesis(&results, "test query", &config, Some(false), None, None).is_none(),
+            run_recall_synthesis(
+                &results,
+                "test query",
+                &config,
+                Some(false),
+                "Semantic",
+                None,
+                None
+            )
+            .is_none(),
             "Some(false) synthesize param → None outcome"
         );
     }
@@ -748,7 +761,8 @@ mod tests {
         let config = ReinConfig::default(); // recall_synthesis_enabled = false
         let results = make_results(5);
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None, None).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), "Semantic", None, None)
+                .unwrap();
         assert!(outcome.skipped_disabled, "feature off → skipped_disabled");
         assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_no_llm);
@@ -769,7 +783,8 @@ mod tests {
         config.ars.recall_synthesis_min_results = 3;
         let results = make_results(2); // < 3
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None, None).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), "Semantic", None, None)
+                .unwrap();
         assert!(
             outcome.skipped_too_few_results,
             "2 results < min 3 → skipped_too_few_results"
@@ -790,7 +805,8 @@ mod tests {
         config.extract.provider = "none".to_string();
         let results = make_results(5); // >= 3
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None, None).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), "Semantic", None, None)
+                .unwrap();
         assert!(outcome.skipped_no_llm, "no provider → skipped_no_llm");
         assert!(!outcome.skipped_disabled);
         assert!(!outcome.skipped_adaptive_decision);
@@ -809,9 +825,16 @@ mod tests {
         let results = make_results(5);
         let mock =
             ExtractorKind::Mock(MockExtractor::with_fixed_response("Synthesized narrative."));
-        let outcome =
-            run_recall_synthesis(&results, "test query", &config, Some(true), None, Some(mock))
-                .unwrap();
+        let outcome = run_recall_synthesis(
+            &results,
+            "test query",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            Some(mock),
+        )
+        .unwrap();
         assert!(!outcome.skipped_disabled);
         assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_no_llm);
@@ -1116,8 +1139,16 @@ mod tests {
         let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response(
             "The auth middleware was rewritten[#1][#3]. The new design uses session storage[#2].",
         ));
-        let outcome =
-            run_recall_synthesis(&results, "auth", &config, Some(true), None, Some(mock)).unwrap();
+        let outcome = run_recall_synthesis(
+            &results,
+            "auth",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            Some(mock),
+        )
+        .unwrap();
         assert_eq!(
             outcome.synthesis.as_deref(),
             Some("The auth middleware was rewritten. The new design uses session storage."),
@@ -1158,8 +1189,16 @@ mod tests {
         let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response(
             "Sourced claim[#1] and a hallucinated claim[#9].",
         ));
-        let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None, Some(mock)).unwrap();
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            Some(mock),
+        )
+        .unwrap();
         assert_eq!(
             outcome.synthesis.as_deref(),
             Some("Sourced claim and a hallucinated claim."),
@@ -1567,9 +1606,16 @@ mod tests {
         config.ars.recall_synthesis_enabled = true;
         config.ars.recall_synthesis_min_results = 3;
 
-        let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), Some(&state), None)
-                .expect("synthesis was requested → Some(outcome)");
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Semantic",
+            Some(&state),
+            None,
+        )
+        .expect("synthesis was requested → Some(outcome)");
 
         assert!(
             outcome.skipped_adaptive_decision,
@@ -1586,6 +1632,103 @@ mod tests {
         assert!(
             outcome.synthesis_id.is_none(),
             "skipped paths MUST leave synthesis_id = None (contract §8 invariant 9)"
+        );
+    }
+
+    /// v0.26.1 wiring: a Skip-quality bucket under `"Semantic"` MUST NOT
+    /// affect a recall whose classifier returned `Episodic`. v0.26.0
+    /// hardcoded `query_type = "Semantic"` inside `run_recall_synthesis`,
+    /// so any Episodic query would have hit the Semantic bucket and been
+    /// skipped despite carrying no Episodic-bucket data. After threading
+    /// the param, the gate must read the matching bucket — for an
+    /// Episodic query that's `"0|Episodic"`, which is empty here, so the
+    /// gate falls back to Yes and the LLM path is reached (no provider
+    /// here → `skipped_no_llm`, NOT `skipped_adaptive_decision`).
+    #[test]
+    fn run_recall_synthesis_query_type_threads_to_bucket_lookup() {
+        let mut results = make_results(5);
+        for r in &mut results {
+            r.memory.cluster_id = Some(0);
+        }
+
+        // Same Semantic-bucket-skip state as the test above.
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(0), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+        );
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        config.extract.provider = "none".to_string();
+
+        let outcome = run_recall_synthesis(
+            &results,
+            "what happened in our last meeting",
+            &config,
+            Some(true),
+            "Episodic",
+            Some(&state),
+            None,
+        )
+        .expect("synthesis was requested → Some(outcome)");
+
+        assert!(
+            !outcome.skipped_adaptive_decision,
+            "Episodic query MUST NOT consult the Semantic bucket — that was the v0.26.0 bug. \
+             Got: {outcome:?}"
+        );
+        // The path should have advanced to the LLM call site; with no
+        // provider configured that lands in `skipped_no_llm`, which
+        // confirms the gate let the request through.
+        assert!(
+            outcome.skipped_no_llm,
+            "expected gate→LLM path then no-provider stop, got: {outcome:?}"
+        );
+    }
+
+    /// v0.26.1 cold_start_n config knob: when `[ars].synthesis_cold_start_n`
+    /// is lowered to a value the bucket already exceeds, the gate trusts
+    /// the per-cluster `useful_rate` instead of falling back to Yes. This
+    /// gives operators on a fresh canary a way to activate the per-cluster
+    /// signal earlier than the default 10-event bootstrap.
+    #[test]
+    fn run_recall_synthesis_honours_configured_cold_start_n() {
+        let mut results = make_results(5);
+        for r in &mut results {
+            r.memory.cluster_id = Some(0);
+        }
+
+        // Bucket has fewer events than the default cold_start_n (10) but
+        // more than the canary-tightened value of 3 we set on config below.
+        // Without the config knob the gate would fall back to Yes; with it,
+        // the below-threshold useful_rate routes to Skip(AdaptiveDecision).
+        let viewed = 5u64;
+        assert!(viewed < SYNTHESIS_COLD_START_N, "test premise: under default");
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(0), "Semantic"),
+            cluster_stats(viewed, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+        );
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        config.ars.synthesis_cold_start_n = 3; // canary lowers it
+
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Semantic",
+            Some(&state),
+            None,
+        )
+        .expect("synthesis was requested → Some(outcome)");
+
+        assert!(
+            outcome.skipped_adaptive_decision,
+            "lowered cold_start_n MUST let the per-cluster useful_rate gate fire; got {outcome:?}"
         );
     }
 }

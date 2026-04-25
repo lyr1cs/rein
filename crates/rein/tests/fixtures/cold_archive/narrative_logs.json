@@ -1,0 +1,30 @@
+[
+  {
+    "case_id": "ca_nl_001",
+    "category": "narrative_log",
+    "topic": "v0.25.3 LLM-judge rollout",
+    "summary": "v0.25.3 added LLM-judged scoring path C with version namespace 100+ for incomparable methodology.",
+    "original_content": "On 2026-04-25 the v0.25.3 release shipped the LLM-judged hit checker as an opt-in scoring methodology. The judge lives in eval/llm_judge.rs as LlmJudgeHitChecker with two rubrics: SynthesisSourceCoverage for recall-time synthesis evaluation and ConceptSummaryFactCoverage for concept living-summary evaluation. Both rubrics share a strict 60% coverage floor with single-shot prompting, no chain-of-thought, no multi-shot voting; determinism comes from JSON-mode and rubric tightness rather than sampling tricks. Scorecards under LLM_JUDGE_VERSION = 100 are NOT comparable to v3 keyword-overlap regimes (HIT_CHECKER_VERSION 1-99) — the rubrics measure different things. The compare subcommand bails on any version mismatch. Activation is via REIN_EVAL_JUDGE=llm env var. Codex round 1 hardened prompt-injection defense via XML wrapper and zero-width-space close-tag escape.",
+    "evidence_keywords": [
+      "LlmJudgeHitChecker",
+      "ConceptSummaryFactCoverage",
+      "60% coverage floor",
+      "LLM_JUDGE_VERSION",
+      "REIN_EVAL_JUDGE"
+    ]
+  },
+  {
+    "case_id": "ca_nl_002",
+    "category": "narrative_log",
+    "topic": "v0.21 A1 operation registry rollout",
+    "summary": "A1 unified CLI/MCP/REST dispatch via the #[op] proc-macro and inventory crate.",
+    "original_content": "The v0.21 A1 operation registry shipped on 2026-04-20 after three phases of code migration. Phase 1 introduced the #[op] proc-macro in the rein-macros crate which expands OpsRuntime methods into inventory-registered entries. Phase 2 added the AuthPolicy middleware framework, the OpsErrorKind to HTTP status mapping through the ReinError adapter, the H5 body-JSON framework, single-seg path templates supporting GET /api/memories/{id} routing, and the IntoJson::to_raw_response hook letting ops emit non-JSON content-types. Phase 3 deleted the old ops/registry.rs middleman; drift checks now compare source-scan against inventory::iter directly. The migration touched 38 ops, increased crate count from 1 to 2 (rein and rein-macros), and was cleared by a Codex audit that found no auth or TOCTOU regressions.",
+    "evidence_keywords": [
+      "#[op] proc-macro",
+      "AuthPolicy middleware",
+      "ReinError adapter",
+      "single-seg path templates",
+      "drift checks"
+    ]
+  }
+]

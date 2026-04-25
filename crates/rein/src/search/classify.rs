@@ -415,9 +415,58 @@ impl std::fmt::Display for QueryType {
     }
 }
 
+impl QueryType {
+    /// Capitalised label used as the `query_type` token in
+    /// `crate::store::adaptive::synthesis_bucket_key(cluster_id, query_type)`.
+    /// MUST match the strings written into
+    /// `SynthesisInteractionPayload.metadata.query_type` (see
+    /// `store::adaptive::CANONICAL_SYNTHESIS_QUERY_TYPES` — both sides
+    /// share the bucket key, drift here would silently miss every
+    /// per-cluster bucket and turn the v0.26 D-direction per-query gate
+    /// into dead code). Intentionally distinct from [`Display`] which
+    /// emits the lowercase route name surfaced via `RecallMemoryOutput.route`.
+    pub fn synthesis_bucket_label(&self) -> &'static str {
+        match self {
+            Self::Episodic => "Episodic",
+            Self::Temporal => "Temporal",
+            Self::Preference => "Preference",
+            Self::ExactKeyword => "ExactKeyword",
+            Self::Semantic => "Semantic",
+            Self::Exploratory => "Exploratory",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.26.1: bucket label MUST exactly equal the strings the M1
+    /// consumer accepts in `synthesis_bucket_key(_, query_type)`. Drift
+    /// here would silently miss every per-cluster bucket and turn the
+    /// per-query gate into dead code (the v0.26.0 bug this method fixes).
+    #[test]
+    fn synthesis_bucket_label_matches_canonical_strings() {
+        assert_eq!(QueryType::Semantic.synthesis_bucket_label(), "Semantic");
+        assert_eq!(QueryType::Episodic.synthesis_bucket_label(), "Episodic");
+        assert_eq!(QueryType::Temporal.synthesis_bucket_label(), "Temporal");
+        assert_eq!(QueryType::Preference.synthesis_bucket_label(), "Preference");
+        assert_eq!(
+            QueryType::ExactKeyword.synthesis_bucket_label(),
+            "ExactKeyword"
+        );
+        assert_eq!(
+            QueryType::Exploratory.synthesis_bucket_label(),
+            "Exploratory"
+        );
+        // Sanity: bucket label MUST be capitalised — the lowercase
+        // `Display` variant is for the `RecallMemoryOutput.route` field
+        // and would silently miss the M1 consumer's bucket.
+        assert_ne!(
+            QueryType::Semantic.synthesis_bucket_label(),
+            QueryType::Semantic.to_string()
+        );
+    }
 
     #[test]
     fn test_temporal_queries() {

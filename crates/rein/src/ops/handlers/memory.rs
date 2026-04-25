@@ -719,11 +719,18 @@ impl OpsRuntime {
         // `decide_synthesize`'s per-cluster gate; passing `None` would
         // force every recall through the global flag and erase the
         // per-cluster signal entirely.
+        //
+        // v0.26.1: pass the classified `query_type.synthesis_bucket_label()`
+        // (capitalised "Semantic"|"Episodic"|...) so the gate reads from
+        // the same per-cluster bucket the M1 consumer writes into. v0.26.0
+        // hardcoded "Semantic" inside `run_recall_synthesis`, which silently
+        // misrouted every non-Semantic query.
         let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
             &results,
             &query,
             &self.config,
             synthesize,
+            route.query_type.synthesis_bucket_label(),
             Some(&adaptive_state),
             None,
         );
