@@ -28,9 +28,9 @@ use rein::compression::contract::{self, ContractInput, EvidenceEntry};
 use rein::config::ReinConfig;
 use rein::eval::concept_summary::score_concept_case;
 use rein::eval::{
-    decide_ship, mcnemar, CategoryStats, DecideShipKind, HitChecker, KeywordOverlapHitChecker,
-    McNemarResult, PairedOutcome, Scorecard, ShipDecision, ShipReason,
-    DEFAULT_SEMANTIC_THRESHOLD,
+    decide_ship, mcnemar, CategoryStats, DecideShipKind, HitChecker, JudgeMode,
+    KeywordOverlapHitChecker, LlmJudgeHitChecker, McNemarResult, PairedOutcome, Scorecard,
+    ShipDecision, ShipReason, DEFAULT_SEMANTIC_THRESHOLD, LLM_JUDGE_VERSION,
 };
 use rein::extract::llm::{strip_code_fences, ExtractorKind};
 // NOTE: `call_llm_sync` in ops::resummerize uses SYSTEM_PROMPT internally —
@@ -512,6 +512,28 @@ impl SynthesisFixture {
         }
         buf
     }
+
+    /// Per-result enriched source material for the LLM judge: each source's
+    /// `summary` enriched with its `evidence_preview` items so the judge
+    /// sees the same ground truth the baseline_text exposes and the
+    /// synthesis LLM was given. Without this enrichment the judge can flag
+    /// a perfectly-faithful candidate as "hallucinated" when the candidate
+    /// (correctly) draws from evidence_preview but the source list passed
+    /// to the judge contained only `summary` — mismatch caught on amb_002
+    /// when judge said "no LLM call" was unsupported by source [#3] even
+    /// though that string lived in [#3]'s evidence_preview.
+    fn judge_source_summaries(&self) -> Vec<String> {
+        self.recall_results
+            .iter()
+            .map(|r| {
+                if r.evidence_preview.is_empty() {
+                    r.summary.clone()
+                } else {
+                    format!("{} ({})", r.summary, r.evidence_preview.join("; "))
+                }
+            })
+            .collect()
+    }
 }
 
 fn main() -> Result<()> {
@@ -622,6 +644,41 @@ fn build_hybrid_checker(config: &ReinConfig) -> KeywordOverlapHitChecker {
         threshold
     );
     KeywordOverlapHitChecker::with_semantic(std::sync::Arc::new(embedder), threshold)
+}
+
+/// Build an LLM judge if `REIN_EVAL_JUDGE=llm` AND the configured
+/// extractor is available. Returns None to fall back to keyword-overlap
+/// path. Mode parameter selects synthesis vs concept-summary judging
+/// shape (the prompts differ).
+///
+/// Symmetry invariant: same `mode` value must be used for the baseline +
+/// treatment of one paired comparison so judgment shape stays consistent.
+fn build_judge(config: &ReinConfig, mode: JudgeMode) -> Option<LlmJudgeHitChecker> {
+    let enabled = std::env::var("REIN_EVAL_JUDGE")
+        .map(|v| v.eq_ignore_ascii_case("llm"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    // Mode picks the LLM backend the same way the production scoring
+    // path picks it: synthesis judging shares Cap B's `[ars].llm_backend`,
+    // concept-summary judging shares Cap A's `create_concept_summary_extractor`.
+    let extractor = match mode {
+        JudgeMode::SynthesisSourceCoverage => {
+            rein::ops::concept_summary::create_concept_summary_extractor(config)
+        }
+        JudgeMode::ConceptSummaryFactCoverage => {
+            rein::ops::concept_summary::create_concept_summary_extractor(config)
+        }
+    }?;
+    eprintln!(
+        "[rein-eval] LLM judge enabled (mode={:?}, version={})",
+        mode, LLM_JUDGE_VERSION
+    );
+    Some(LlmJudgeHitChecker::new(
+        std::sync::Arc::new(extractor),
+        mode,
+    ))
 }
 
 fn cmd_baseline(fixtures: &Path, iterations: u32, output: &Path) -> Result<()> {
@@ -1281,6 +1338,7 @@ fn cmd_concept_summary_baseline(fixtures: &Path, output: &Path) -> Result<()> {
     // stem-only and the symmetry still holds.
     let config = ReinConfig::load()
         .context("loading rein config for concept-summary baseline (hybrid checker)")?;
+    let judge = build_judge(&config, JudgeMode::ConceptSummaryFactCoverage);
     let checker = build_hybrid_checker(&config);
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
@@ -1297,7 +1355,28 @@ fn cmd_concept_summary_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         // Baseline: score definition alone — no living summary. Mirrors
         // the asymmetry documented on `score_concept_case`:
         // baseline_length = definition.len().
-        let hit = score_concept_case(&fx.definition, None, &fx.evidence_keywords, &checker);
+        let hit = if let Some(j) = judge.as_ref() {
+            match j.judge_concept_summary(&fx.definition, None, &fx.evidence_keywords) {
+                Ok(outcome) => {
+                    if !outcome.hit {
+                        eprintln!(
+                            "[rein-eval] concept-summary baseline {}: judge MISS — {}",
+                            fx.case_id, outcome.reason
+                        );
+                    }
+                    outcome.hit
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rein-eval] concept-summary baseline {}: judge error — treating as miss: {}",
+                        fx.case_id, e
+                    );
+                    false
+                }
+            }
+        } else {
+            score_concept_case(&fx.definition, None, &fx.evidence_keywords, &checker)
+        };
         outcomes.push(PairedOutcome {
             case_id: fx.case_id.clone(),
             baseline_hit: hit,
@@ -1323,7 +1402,11 @@ fn cmd_concept_summary_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         outcomes,
         per_category: HashMap::new(),
         category_map,
-        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+        hit_checker_version: if judge.is_some() {
+            LLM_JUDGE_VERSION
+        } else {
+            rein::eval::HIT_CHECKER_VERSION
+        },
     };
     write_scorecard(output, &sc)?;
 
@@ -1373,6 +1456,7 @@ fn cmd_concept_summary_run(fixtures: &Path, output: &Path, verbose: bool) -> Res
     // Hybrid checker mirrors `cmd_concept_summary_baseline`'s configuration
     // so the McNemar comparison stays methodology-symmetric. The same
     // `config` already loaded above feeds the embedder.
+    let judge = build_judge(&config, JudgeMode::ConceptSummaryFactCoverage);
     let checker = build_hybrid_checker(&config);
     let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
     let mut llm_failed = 0usize;
@@ -1429,12 +1513,40 @@ fn cmd_concept_summary_run(fixtures: &Path, output: &Path, verbose: bool) -> Res
                     });
                     continue;
                 }
-                let hit = score_concept_case(
-                    &fx.definition,
-                    Some(&living),
-                    &fx.evidence_keywords,
-                    &checker,
-                );
+                let hit = if let Some(j) = judge.as_ref() {
+                    match j.judge_concept_summary(
+                        &fx.definition,
+                        Some(&living),
+                        &fx.evidence_keywords,
+                    ) {
+                        Ok(outcome) => {
+                            // Always log judge MISS reasons — see Codex R1 P2
+                            // for the symmetric-logging rationale (paired
+                            // baseline/treatment must use the same policy).
+                            if !outcome.hit {
+                                eprintln!(
+                                    "[rein-eval] concept-summary run {}: judge MISS — {}",
+                                    fx.case_id, outcome.reason
+                                );
+                            }
+                            outcome.hit
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[rein-eval] concept-summary run {}: judge error — treating as miss: {}",
+                                fx.case_id, e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    score_concept_case(
+                        &fx.definition,
+                        Some(&living),
+                        &fx.evidence_keywords,
+                        &checker,
+                    )
+                };
                 // Treatment length: definition + " " + living_summary —
                 // the exact text that was scored (see
                 // `score_concept_case` docs on the asymmetry).
@@ -1487,7 +1599,11 @@ fn cmd_concept_summary_run(fixtures: &Path, output: &Path, verbose: bool) -> Res
         outcomes,
         per_category: HashMap::new(),
         category_map,
-        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+        hit_checker_version: if judge.is_some() {
+            LLM_JUDGE_VERSION
+        } else {
+            rein::eval::HIT_CHECKER_VERSION
+        },
     };
     write_scorecard(output, &sc)?;
 
@@ -1532,6 +1648,7 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
     // semantic fallback when one is configured.
     let config = ReinConfig::load()
         .context("loading rein config for synthesis baseline (hybrid checker)")?;
+    let judge = build_judge(&config, JudgeMode::SynthesisSourceCoverage);
     let checker = build_hybrid_checker(&config);
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
@@ -1558,7 +1675,30 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         // Reuse `score_concept_case` with `living_summary = None` — the
         // helper's "definition + (optional) summary" abstraction maps
         // cleanly onto baseline (raw text) vs treatment (LLM prose) here.
-        let hit = score_concept_case(&baseline_text, None, &fx.evidence_keywords, &checker);
+        let hit = if let Some(j) = judge.as_ref() {
+            let summaries_owned = fx.judge_source_summaries();
+            let summaries: Vec<&str> = summaries_owned.iter().map(|s| s.as_str()).collect();
+            match j.judge_synthesis(&fx.query, &summaries, &baseline_text) {
+                Ok(outcome) => {
+                    if !outcome.hit {
+                        eprintln!(
+                            "[rein-eval] synthesis baseline {}: judge MISS — {}",
+                            fx.case_id, outcome.reason
+                        );
+                    }
+                    outcome.hit
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rein-eval] synthesis baseline {}: judge error — treating as miss: {}",
+                        fx.case_id, e
+                    );
+                    false
+                }
+            }
+        } else {
+            score_concept_case(&baseline_text, None, &fx.evidence_keywords, &checker)
+        };
         outcomes.push(PairedOutcome {
             case_id: fx.case_id.clone(),
             baseline_hit: hit,
@@ -1585,7 +1725,11 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         outcomes,
         per_category: HashMap::new(),
         category_map,
-        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+        hit_checker_version: if judge.is_some() {
+            LLM_JUDGE_VERSION
+        } else {
+            rein::eval::HIT_CHECKER_VERSION
+        },
     };
     write_scorecard(output, &sc)?;
 
@@ -1651,6 +1795,7 @@ fn run_synthesis_treatment_with_extractor(
 ) -> Result<()> {
     // Hybrid checker — must match `cmd_synthesis_baseline`'s configuration
     // so the McNemar table reflects a consistent scoring methodology.
+    let judge = build_judge(config, JudgeMode::SynthesisSourceCoverage);
     let checker = build_hybrid_checker(config);
     let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
     let mut llm_failed = 0usize;
@@ -1720,8 +1865,35 @@ fn run_synthesis_treatment_with_extractor(
                     });
                     continue;
                 }
-                let hit =
-                    score_concept_case(&synthesis, None, &fx.evidence_keywords, &checker);
+                let hit = if let Some(j) = judge.as_ref() {
+                    let summaries_owned = fx.judge_source_summaries();
+                    let summaries: Vec<&str> = summaries_owned.iter().map(|s| s.as_str()).collect();
+                    match j.judge_synthesis(&fx.query, &summaries, &synthesis) {
+                        Ok(outcome) => {
+                            // Always log judge MISS reasons — they are
+                            // ship-decision-relevant and must mirror
+                            // `cmd_synthesis_baseline`'s policy. Codex R1
+                            // P2: dropping the verbose gate restores
+                            // symmetric logging across paired runs.
+                            if !outcome.hit {
+                                eprintln!(
+                                    "[rein-eval] synthesis run {}: judge MISS — {}",
+                                    fx.case_id, outcome.reason
+                                );
+                            }
+                            outcome.hit
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[rein-eval] synthesis run {}: judge error — treating as miss: {}",
+                                fx.case_id, e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    score_concept_case(&synthesis, None, &fx.evidence_keywords, &checker)
+                };
                 outcomes.push(PairedOutcome {
                     case_id: fx.case_id.clone(),
                     baseline_hit: false,
@@ -1770,7 +1942,11 @@ fn run_synthesis_treatment_with_extractor(
         outcomes,
         per_category: HashMap::new(),
         category_map,
-        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+        hit_checker_version: if judge.is_some() {
+            LLM_JUDGE_VERSION
+        } else {
+            rein::eval::HIT_CHECKER_VERSION
+        },
     };
     write_scorecard(output, &sc)?;
 
