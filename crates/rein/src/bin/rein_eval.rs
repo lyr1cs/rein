@@ -42,10 +42,14 @@ use rein::ops::concept_summary::{
     build_concept_summary_prompt, call_llm_sync as call_concept_summary_llm_sync,
     create_concept_summary_extractor,
 };
+use rein::ops::recall_synthesis::{build_synthesis_prompt, call_synthesis_llm_sync};
 use rein::ops::resummerize::{
     build_prompt, call_llm_sync as call_resummerize_llm_sync, create_resummerize_extractor,
 };
-use rein::types::{Concept, ConceptRevision};
+use rein::search::recall::RecallResult;
+use rein::types::{
+    Concept, ConceptRevision, Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -74,6 +78,17 @@ enum Commands {
     ConceptSummary {
         #[command(subcommand)]
         action: ConceptSummaryAction,
+    },
+    /// Evaluation routines for the v0.25 ARS Capability B recall-time synthesis
+    /// feature (A3 harness, v0.25.1). Parallel to `concept-summary`: baseline
+    /// scores the raw concatenated recall summary text (what the operator
+    /// would see without synthesis); `run` invokes the production synthesis
+    /// LLM bridge over fixture recall results and scores its prose output;
+    /// `compare` runs paired McNemar + ship/bail-out under the additive
+    /// `DecideShipKind::Synthesis` rule.
+    Synthesis {
+        #[command(subcommand)]
+        action: SynthesisAction,
     },
 }
 
@@ -174,6 +189,58 @@ enum ConceptSummaryAction {
         /// non-inferiority. Tighter than resummerize's 0.03 default because
         /// ARS Capability A is expected to materially improve keyword
         /// recall rather than hold hit-rate flat.
+        #[arg(long, default_value_t = 0.02)]
+        noise_floor: f64,
+    },
+}
+
+#[derive(Subcommand)]
+enum SynthesisAction {
+    /// Score the raw concatenated recall text (what the operator would see
+    /// without synthesis) against each fixture's `evidence_keywords`. No
+    /// LLM required — the fixture's `recall_results` IS the baseline state.
+    /// Concatenated text is `summary + " " + evidence_preview.join(" ")` per
+    /// result, joined across results — mirrors the `RecallResult` surface
+    /// the GUI / MCP client renders pre-synthesis.
+    Baseline {
+        /// Directory containing recall-synthesis fixture JSON files.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Output path for the scorecard JSON.
+        #[arg(long, default_value = "synthesis_baseline_scorecard.json")]
+        output: PathBuf,
+    },
+    /// Run the recall-synthesis treatment: synthesize `Vec<RecallResult>` from
+    /// each fixture, build the production prompt via `build_synthesis_prompt`,
+    /// call the configured LLM via `call_synthesis_llm_sync` (the same
+    /// `[ars].llm_backend` resolution path production uses through
+    /// `create_concept_summary_extractor`), and score the LLM prose output
+    /// against `evidence_keywords`. Errors cleanly if no LLM provider is
+    /// configured.
+    Run {
+        /// Directory containing recall-synthesis fixture JSON files.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Output path for the scorecard JSON.
+        #[arg(long, default_value = "synthesis_treatment_scorecard.json")]
+        output: PathBuf,
+        /// Print per-case LLM output previews (200-char snippet) on failure
+        /// or empty response. Off by default.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+    /// Compare a baseline and a treatment scorecard via paired McNemar and
+    /// apply the additive synthesis ship-or-bail policy
+    /// (`DecideShipKind::Synthesis` — non-inferior CI lower bound, length
+    /// ignored because synthesis is by design longer than raw recall text).
+    Compare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        treatment: PathBuf,
+        /// Hit-rate difference tolerated as noise when calling
+        /// non-inferiority. Default 0.02 (matches concept-summary; ARS
+        /// Capability B is also expected to be additive, not regressive).
         #[arg(long, default_value_t = 0.02)]
         noise_floor: f64,
     },
@@ -323,6 +390,127 @@ impl ConceptFixture {
     }
 }
 
+/// Fixture schema for the v0.25 ARS Capability B recall-time synthesis eval
+/// (A3 harness, v0.25.1).
+///
+/// Each fixture captures a recall scenario: the user `query`, the
+/// `recall_results` that were surfaced (synthetic `Memory`-shaped rows the
+/// production prompt would receive), and the `evidence_keywords` whose
+/// presence in the synthesized prose determines a hit. Baseline scoring
+/// concatenates `summary + " " + evidence_preview.join(" ")` across all
+/// results — this is the "what the operator would learn from raw recall
+/// without synthesis" surface. Treatment scoring runs the LLM through the
+/// production `build_synthesis_prompt` + `call_synthesis_llm_sync` path
+/// and scores the prose output against the same keyword set.
+///
+/// The schema is deliberately decoupled from `Memory` field churn: the
+/// harness builds a synthetic `Memory` from `id` + `summary` (used as
+/// `Memory.content`) so future field additions don't break old fixtures.
+#[derive(Debug, Deserialize, Serialize)]
+struct SynthesisFixture {
+    case_id: String,
+    #[serde(default)]
+    category: Option<String>,
+    query: String,
+    recall_results: Vec<SyntheticRecallResult>,
+    evidence_keywords: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SyntheticRecallResult {
+    id: String,
+    summary: String,
+    #[serde(default)]
+    evidence_preview: Vec<String>,
+    score: f32,
+    confidence: f32,
+    sources_hit: usize,
+    evidence_count: usize,
+}
+
+impl SynthesisFixture {
+    /// Build a `Vec<RecallResult>` mirroring what production would feed to
+    /// `build_synthesis_prompt`. The synthetic `Memory` only needs the
+    /// fields the prompt builder actually reads (`topic` + `content`); all
+    /// other fields take safe defaults that match the prompt's null
+    /// expectations. This keeps the fixture schema minimal — a new `Memory`
+    /// field added later doesn't invalidate the corpus.
+    fn to_recall_results(&self) -> Vec<RecallResult> {
+        let now = Utc::now();
+        self.recall_results
+            .iter()
+            .map(|r| {
+                let memory = Memory {
+                    id: r.id.clone(),
+                    layer: MemoryLayer::LTM,
+                    // Use the result id as the topic — `build_synthesis_prompt`
+                    // emits `[N] Topic: {topic}` headers, so the id surfaces
+                    // in the prompt and any LLM hallucination tracing back
+                    // to a non-fixture id is detectable.
+                    topic: r.id.clone(),
+                    summary: r.summary.clone(),
+                    // The prompt body uses `memory.content` — the fixture's
+                    // `summary` field IS the content the LLM sees. We do
+                    // NOT splice `evidence_preview` here: production never
+                    // includes evidence_preview in the synthesis prompt
+                    // (it's a UI-only surface), so the eval must match.
+                    content: r.summary.clone(),
+                    keywords: vec![],
+                    importance: Importance::Medium,
+                    source: Source::Manual,
+                    strength: 1.0,
+                    decay_lambda: 0.06,
+                    access_count: 0,
+                    superseded_by: None,
+                    canonical_id: None,
+                    support_count: 1,
+                    merge_count: 0,
+                    dedup_confidence: 1.0,
+                    source_diversity: 1.0,
+                    contradiction_score: 0.0,
+                    related_ids: vec![],
+                    concept_ids: vec![],
+                    status: MemoryStatus::default(),
+                    embedding: None,
+                    tier: MemoryTier::Warm,
+                    cluster_id: None,
+                    created_at: now,
+                    updated_at: now,
+                    last_accessed: now,
+                };
+                RecallResult {
+                    memory,
+                    score: r.score,
+                    confidence: r.confidence,
+                    sources_hit: r.sources_hit,
+                    evidence_count: r.evidence_count,
+                    evidence_preview: r.evidence_preview.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Concatenate the user-visible recall surface for baseline scoring:
+    /// per-result `summary` + `evidence_preview` joined. This is what an
+    /// operator skimming a `rein_recall` response sees today (pre-Cap B);
+    /// scoring it against `evidence_keywords` measures the "do the raw
+    /// results already mention the answer?" floor. Treatment scoring then
+    /// asks "does the synthesized prose preserve that?".
+    fn baseline_text(&self) -> String {
+        let mut buf =
+            String::with_capacity(self.recall_results.iter().map(|r| r.summary.len() + 64).sum());
+        for r in &self.recall_results {
+            buf.push_str(&r.summary);
+            buf.push(' ');
+            for ev in &r.evidence_preview {
+                buf.push_str(ev);
+                buf.push(' ');
+            }
+        }
+        buf
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -359,6 +547,26 @@ fn main() -> Result<()> {
                 verbose,
             } => cmd_concept_summary_run(&fixtures, &output, verbose),
             ConceptSummaryAction::Compare {
+                baseline,
+                treatment,
+                noise_floor,
+            } => cmd_compare(
+                &baseline,
+                &treatment,
+                noise_floor,
+                DecideShipKind::Synthesis,
+            ),
+        },
+        Commands::Synthesis { action } => match action {
+            SynthesisAction::Baseline { fixtures, output } => {
+                cmd_synthesis_baseline(&fixtures, &output)
+            }
+            SynthesisAction::Run {
+                fixtures,
+                output,
+                verbose,
+            } => cmd_synthesis_run(&fixtures, &output, verbose),
+            SynthesisAction::Compare {
                 baseline,
                 treatment,
                 noise_floor,
@@ -1249,6 +1457,305 @@ fn build_concept_category_map(fixtures_list: &[ConceptFixture]) -> HashMap<Strin
         .collect()
 }
 
+// --- recall-synthesis subcommand (v0.25.1 A3) ------------------------------
+
+/// Score the raw concatenated recall text (per-result `summary` +
+/// `evidence_preview`) against each fixture's `evidence_keywords`. This is
+/// the "what the operator sees pre-synthesis" floor — Cap B treatment must
+/// at least match it (the additive non-inferiority bar).
+fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
+    let fixtures_list = load_synthesis_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!("no recall-synthesis fixtures found in {}", fixtures.display());
+    }
+
+    let checker = KeywordOverlapHitChecker;
+    let mut outcomes = Vec::with_capacity(fixtures_list.len());
+    let mut skipped = 0usize;
+
+    for fx in &fixtures_list {
+        if fx.evidence_keywords.is_empty() {
+            eprintln!(
+                "[rein-eval] synthesis baseline: skipping {} (no evidence_keywords)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+        if fx.recall_results.is_empty() {
+            eprintln!(
+                "[rein-eval] synthesis baseline: skipping {} (no recall_results)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let baseline_text = fx.baseline_text();
+        // Reuse `score_concept_case` with `living_summary = None` — the
+        // helper's "definition + (optional) summary" abstraction maps
+        // cleanly onto baseline (raw text) vs treatment (LLM prose) here.
+        let hit = score_concept_case(&baseline_text, None, &fx.evidence_keywords, &checker);
+        outcomes.push(PairedOutcome {
+            case_id: fx.case_id.clone(),
+            baseline_hit: hit,
+            treatment_hit: false,
+            baseline_length: baseline_text.len(),
+            treatment_length: 0,
+            treatment_summary: None,
+        });
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} had both `evidence_keywords` and `recall_results` — \
+             baseline scoring requires both",
+            fixtures.display()
+        );
+    }
+
+    let category_map = build_synthesis_category_map(&fixtures_list);
+    let sc = Scorecard {
+        fixtures_dir: fixtures.display().to_string(),
+        iterations: 1,
+        timestamp: Utc::now(),
+        outcomes,
+        per_category: HashMap::new(),
+        category_map,
+        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+    };
+    write_scorecard(output, &sc)?;
+
+    eprintln!(
+        "[rein-eval] synthesis baseline: wrote {} scored cases ({} skipped) to {}",
+        sc.outcomes.len(),
+        skipped,
+        output.display()
+    );
+    Ok(())
+}
+
+/// Drive the recall-synthesis treatment: build the production prompt via
+/// `build_synthesis_prompt`, call the same LLM bridge production uses
+/// (`call_synthesis_llm_sync` + `create_concept_summary_extractor`), and
+/// score the prose output against `evidence_keywords`.
+fn cmd_synthesis_run(fixtures: &Path, output: &Path, verbose: bool) -> Result<()> {
+    let config = ReinConfig::load().context("loading rein config for synthesis run")?;
+    // Use the production extractor-selection path so eval honors
+    // `[ars].llm_backend` (inherit / google / omlx) the same way
+    // `run_recall_synthesis` does. Without this, an operator who
+    // configured a different ARS backend would see `compare` verdicts
+    // that don't reflect production behavior.
+    let extractor = create_concept_summary_extractor(&config).ok_or_else(|| {
+        anyhow!(
+            "no LLM extractor available for recall synthesis — configure \
+             `[extract].provider` (or `[ars].llm_backend = \"google\"`) with \
+             a valid API key (GEMINI_API_KEY) or `[ars].llm_backend = \"omlx\"` \
+             with a configured `[extract.omlx]` block."
+        )
+    })?;
+
+    let fixtures_list = load_synthesis_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!("no recall-synthesis fixtures found in {}", fixtures.display());
+    }
+
+    let extractor_tag = match &extractor {
+        ExtractorKind::Gemini(_) => "gemini",
+        ExtractorKind::Omlx(_) => "omlx",
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => "mock",
+    };
+    eprintln!(
+        "[rein-eval] synthesis run: {} fixtures, extractor={}",
+        fixtures_list.len(),
+        extractor_tag,
+    );
+
+    run_synthesis_treatment_with_extractor(&fixtures_list, &extractor, &config, output, fixtures, verbose)
+}
+
+/// Treatment loop extracted so unit tests can drive it with a `MockExtractor`
+/// without hitting a live provider. Production callers go through
+/// `cmd_synthesis_run`, which loads config + builds the extractor once.
+fn run_synthesis_treatment_with_extractor(
+    fixtures_list: &[SynthesisFixture],
+    extractor: &ExtractorKind,
+    config: &ReinConfig,
+    output: &Path,
+    fixtures_dir_for_meta: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let checker = KeywordOverlapHitChecker;
+    let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
+    let mut llm_failed = 0usize;
+    let mut empty_output = 0usize;
+    let mut skipped = 0usize;
+
+    // Mirror the production `max_input_chars` resolution so the eval
+    // truncates the prompt the same way `run_recall_synthesis` would.
+    // Drift here would silently change which evidence the LLM sees and
+    // invalidate the McNemar comparison.
+    let max_chars = rein::extract::llm::resolve_max_input_for_kind(config, extractor);
+
+    for fx in fixtures_list {
+        if fx.evidence_keywords.is_empty() {
+            eprintln!(
+                "[rein-eval] synthesis run: skipping {} (no evidence_keywords)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+        if fx.recall_results.is_empty() {
+            eprintln!(
+                "[rein-eval] synthesis run: skipping {} (no recall_results)",
+                fx.case_id
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let results = fx.to_recall_results();
+        let prompt = build_synthesis_prompt(&results, &fx.query, max_chars);
+        let baseline_len = fx.baseline_text().len();
+
+        match call_synthesis_llm_sync(extractor, &prompt) {
+            Ok(raw) => {
+                let synthesis = strip_code_fences(&raw).trim().to_string();
+                if synthesis.is_empty() {
+                    if verbose {
+                        eprintln!(
+                            "[rein-eval] synthesis run: {} empty LLM output",
+                            fx.case_id
+                        );
+                    }
+                    empty_output += 1;
+                    outcomes.push(PairedOutcome {
+                        case_id: fx.case_id.clone(),
+                        baseline_hit: false,
+                        treatment_hit: false,
+                        baseline_length: baseline_len,
+                        // Empty synthesis → operator effectively sees only
+                        // the raw recall list; mirror that by reporting
+                        // the baseline length.
+                        treatment_length: baseline_len,
+                        treatment_summary: None,
+                    });
+                    continue;
+                }
+                let hit =
+                    score_concept_case(&synthesis, None, &fx.evidence_keywords, &checker);
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: hit,
+                    baseline_length: baseline_len,
+                    treatment_length: synthesis.len(),
+                    treatment_summary: Some(synthesis),
+                });
+            }
+            Err(e) => {
+                if verbose {
+                    let snippet: String = format!("{e}").chars().take(200).collect();
+                    eprintln!(
+                        "[rein-eval] synthesis run: {} LLM error: {}",
+                        fx.case_id, snippet
+                    );
+                }
+                llm_failed += 1;
+                outcomes.push(PairedOutcome {
+                    case_id: fx.case_id.clone(),
+                    baseline_hit: false,
+                    treatment_hit: false,
+                    baseline_length: baseline_len,
+                    // Match concept-summary's LLM-error convention: treatment
+                    // falls back to baseline-equivalent length.
+                    treatment_length: baseline_len,
+                    treatment_summary: None,
+                });
+            }
+        }
+    }
+
+    if outcomes.is_empty() {
+        bail!(
+            "no fixtures in {} produced a scorable synthesis treatment outcome (skipped={})",
+            fixtures_dir_for_meta.display(),
+            skipped,
+        );
+    }
+
+    let category_map = build_synthesis_category_map(fixtures_list);
+    let sc = Scorecard {
+        fixtures_dir: fixtures_dir_for_meta.display().to_string(),
+        iterations: 1,
+        timestamp: Utc::now(),
+        outcomes,
+        per_category: HashMap::new(),
+        category_map,
+        hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+    };
+    write_scorecard(output, &sc)?;
+
+    eprintln!(
+        "[rein-eval] synthesis run: wrote {} scored cases ({} skipped, \
+         {} llm_failed, {} empty_output) to {}",
+        sc.outcomes.len(),
+        skipped,
+        llm_failed,
+        empty_output,
+        output.display()
+    );
+    Ok(())
+}
+
+fn build_synthesis_category_map(fixtures_list: &[SynthesisFixture]) -> HashMap<String, String> {
+    fixtures_list
+        .iter()
+        .filter_map(|fx| {
+            fx.category
+                .as_ref()
+                .map(|c| (fx.case_id.clone(), c.clone()))
+        })
+        .collect()
+}
+
+fn load_synthesis_fixtures(dir: &Path) -> Result<Vec<SynthesisFixture>> {
+    if !dir.exists() {
+        bail!("fixtures directory does not exist: {}", dir.display());
+    }
+    if !dir.is_dir() {
+        bail!("fixtures path is not a directory: {}", dir.display());
+    }
+    let mut out = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("reading fixtures dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading fixture {}", path.display()))?;
+        let cases: Vec<SynthesisFixture> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing fixture {}", path.display()))?;
+        out.extend(cases);
+    }
+    if out.is_empty() {
+        return Err(anyhow!(
+            "no .json recall-synthesis fixtures found in {}",
+            dir.display()
+        ));
+    }
+    out.sort_by(|a, b| a.case_id.cmp(&b.case_id));
+    Ok(out)
+}
+
 fn load_concept_fixtures(dir: &Path) -> Result<Vec<ConceptFixture>> {
     if !dir.exists() {
         bail!("fixtures directory does not exist: {}", dir.display());
@@ -1681,5 +2188,287 @@ mod tests {
             fixtures.iter().all(|f| !f.evidence_keywords.is_empty()),
             "concept-summary fixtures must include evidence keywords"
         );
+    }
+
+    // --- v0.25.1 A3 recall-synthesis harness tests --------------------------
+
+    /// Verify all three shipped synthesis fixture files load + each fixture
+    /// has the minimum schema needed by the harness.
+    #[test]
+    fn recall_synthesis_fixtures_parse() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recall_synthesis");
+        let fixtures =
+            load_synthesis_fixtures(&dir).expect("recall-synthesis fixtures should parse");
+
+        // 3 fixture files × 2 cases each = 6 cases at A3 ship time.
+        assert_eq!(fixtures.len(), 6);
+        assert!(
+            fixtures.iter().all(|f| !f.recall_results.is_empty()),
+            "recall-synthesis fixtures must include at least one recall result"
+        );
+        assert!(
+            fixtures.iter().all(|f| !f.evidence_keywords.is_empty()),
+            "recall-synthesis fixtures must include evidence keywords"
+        );
+        // Strict-majority threshold for `score_concept_case` is
+        // `hits * 2 > n`. With 5 keywords this means ≥3 hits, matching the
+        // task spec. Anything other than 5 changes the bar; lock it down.
+        assert!(
+            fixtures.iter().all(|f| f.evidence_keywords.len() == 5),
+            "recall-synthesis fixtures must have exactly 5 evidence_keywords \
+             so the strict-majority threshold equals the spec's 'at least 3 of 5'"
+        );
+    }
+
+    /// Baseline scoring is deterministic and produces a paired-outcome row
+    /// per fixture with `baseline_length` matching the concatenated text.
+    #[test]
+    fn synthesis_baseline_is_deterministic() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recall_synthesis");
+        let out_path = tmp_path("synth_baseline_det");
+
+        cmd_synthesis_baseline(&dir, &out_path)
+            .expect("baseline command should succeed against the shipped fixtures");
+        let sc1: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+
+        // Run a second time and compare hit columns + lengths — output must
+        // be deterministic (same fixtures + same hit checker version).
+        cmd_synthesis_baseline(&dir, &out_path)
+            .expect("baseline command should succeed on the second run");
+        let sc2: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+
+        assert_eq!(sc1.outcomes.len(), sc2.outcomes.len());
+        assert_eq!(sc1.outcomes.len(), 6);
+        for (a, b) in sc1.outcomes.iter().zip(sc2.outcomes.iter()) {
+            assert_eq!(a.case_id, b.case_id);
+            assert_eq!(a.baseline_hit, b.baseline_hit);
+            assert_eq!(a.baseline_length, b.baseline_length);
+        }
+        assert_eq!(sc1.hit_checker_version, rein::eval::HIT_CHECKER_VERSION);
+        let _ = fs::remove_file(&out_path);
+    }
+
+    /// Run scoring with a `MockExtractor` produces the expected scorecard:
+    /// the mock returns prose containing every evidence keyword, so all
+    /// cases score as treatment hits. `treatment_length` reflects the LLM
+    /// output length, not the baseline.
+    #[test]
+    fn synthesis_run_with_mock_records_treatment_hits() {
+        // Mock prose includes ALL evidence_keywords across all 6 fixtures
+        // so the strict-majority threshold is trivially satisfied for each.
+        // (Listing every keyword in a single response is the cheapest way
+        // to make the score deterministic without per-fixture mocking.)
+        let mock_response = "The system uses proc-macro generated OpsRuntime methods registered \
+             via inventory; CLI/MCP/REST adapters share dispatch with AuthPolicy middleware. \
+             HDBSCAN builds a dendrogram from mutual reachability and extracts EOMBST clusters \
+             which feed M3 Kaplan-Meier survival decay and AdaptiveState event-sourced tiering. \
+             v0.23 introduced resummerize gated by a 7-invariant Compression contract; v0.24 \
+             added concept living-summary; v0.25 added recall-time synthesis as Capability B. \
+             STM/LTM use Ebbinghaus decay with provenance-preserving merge over a tiering \
+             quantile estimator. Search is a Tantivy + HNSW + KG waterfall with rule-based \
+             routing and parallel query expansion via Gemini fusion.";
+
+        // 6 fixtures × 1 mock response each → queue 6 copies.
+        let extractor = ExtractorKind::Mock(MockExtractor::with_responses(
+            (0..6).map(|_| Ok(mock_response.to_string())).collect(),
+        ));
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recall_synthesis");
+        let fixtures =
+            load_synthesis_fixtures(&dir).expect("recall-synthesis fixtures should parse");
+        // Use a config with `recall_synthesis_enabled = true` so
+        // `resolve_max_input_for_kind` resolves predictably; mock has no
+        // real input cap so the value mostly matters for the prompt-shape
+        // path, not the call.
+        let config = ReinConfig::default();
+
+        let out_path = tmp_path("synth_run_mock");
+        run_synthesis_treatment_with_extractor(
+            &fixtures,
+            &extractor,
+            &config,
+            &out_path,
+            &dir,
+            /* verbose */ false,
+        )
+        .expect("treatment loop should succeed under mock");
+
+        let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(sc.outcomes.len(), 6);
+        for o in &sc.outcomes {
+            assert!(
+                o.treatment_hit,
+                "expected treatment hit for {} given keyword-rich mock response",
+                o.case_id
+            );
+            assert_eq!(
+                o.treatment_length,
+                mock_response.len(),
+                "treatment_length must reflect the LLM output, not the baseline"
+            );
+            assert_eq!(o.treatment_summary.as_deref(), Some(mock_response));
+        }
+        assert_eq!(sc.category_map.len(), 6, "category_map populated per fixture");
+        let _ = fs::remove_file(&out_path);
+    }
+
+    /// LLM error must NOT score as a treatment hit AND must report
+    /// `treatment_length == baseline_length` so `avg_length_ratio` doesn't
+    /// falsely credit the failure.
+    #[test]
+    fn synthesis_run_llm_error_does_not_score_as_hit() {
+        let extractor =
+            ExtractorKind::Mock(MockExtractor::with_persistent_error("simulated outage"));
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recall_synthesis");
+        let fixtures =
+            load_synthesis_fixtures(&dir).expect("recall-synthesis fixtures should parse");
+        let config = ReinConfig::default();
+
+        let out_path = tmp_path("synth_run_err");
+        run_synthesis_treatment_with_extractor(
+            &fixtures,
+            &extractor,
+            &config,
+            &out_path,
+            &dir,
+            /* verbose */ false,
+        )
+        .expect("treatment loop should still write a scorecard on LLM error");
+
+        let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+        for o in &sc.outcomes {
+            assert!(
+                !o.treatment_hit,
+                "LLM error must not produce a treatment hit for {}",
+                o.case_id
+            );
+            assert_eq!(
+                o.treatment_length, o.baseline_length,
+                "LLM error → treatment_length collapses to baseline_length"
+            );
+            assert!(o.treatment_summary.is_none());
+        }
+        let _ = fs::remove_file(&out_path);
+    }
+
+    /// `cmd_compare` joins two synthesized scorecards and reaches a
+    /// deterministic verdict under `DecideShipKind::Synthesis`. We
+    /// construct two scorecards in-memory rather than going through
+    /// `cmd_synthesis_run` to avoid coupling this test to a live LLM.
+    #[test]
+    fn synthesis_compare_with_synthetic_scorecards_ships_when_treatment_wins() {
+        // Baseline: all misses; Treatment: all hits → strong superiority.
+        let make_outcome =
+            |case_id: &str, baseline_hit: bool, treatment_hit: bool| PairedOutcome {
+                case_id: case_id.into(),
+                baseline_hit,
+                treatment_hit,
+                baseline_length: 1000,
+                treatment_length: 1500,
+                treatment_summary: None,
+            };
+
+        let baseline_outcomes = (0..30)
+            .map(|i| make_outcome(&format!("case_{i:03}"), false, false))
+            .collect::<Vec<_>>();
+        let treatment_outcomes = (0..30)
+            .map(|i| make_outcome(&format!("case_{i:03}"), false, true))
+            .collect::<Vec<_>>();
+
+        let base = Scorecard {
+            fixtures_dir: "test".into(),
+            iterations: 1,
+            timestamp: Utc::now(),
+            outcomes: baseline_outcomes,
+            per_category: HashMap::new(),
+            category_map: HashMap::new(),
+            hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+        };
+        let treat = Scorecard {
+            fixtures_dir: "test".into(),
+            iterations: 1,
+            timestamp: Utc::now(),
+            outcomes: treatment_outcomes,
+            per_category: HashMap::new(),
+            category_map: HashMap::new(),
+            hit_checker_version: rein::eval::HIT_CHECKER_VERSION,
+        };
+
+        let baseline_path = tmp_path("synth_cmp_base");
+        let treat_path = tmp_path("synth_cmp_treat");
+        write_scorecard(&baseline_path, &base).unwrap();
+        write_scorecard(&treat_path, &treat).unwrap();
+
+        // Run the compare path through the production code, then load the
+        // McNemar via direct calls to confirm the decision the user would
+        // see. (cmd_compare prints to stdout; we re-derive the verdict.)
+        let res = cmd_compare(
+            &baseline_path,
+            &treat_path,
+            0.02,
+            DecideShipKind::Synthesis,
+        );
+        assert!(res.is_ok(), "compare must succeed: {res:?}");
+
+        // Independent re-derivation: McNemar over (baseline=0, treatment=1)
+        // for 30 cases gives c=30 b=0 → exact binomial p ≈ 0 → Superior ship.
+        let paired: Vec<PairedOutcome> = base
+            .outcomes
+            .iter()
+            .zip(treat.outcomes.iter())
+            .map(|(b, t)| PairedOutcome {
+                case_id: b.case_id.clone(),
+                baseline_hit: b.baseline_hit,
+                treatment_hit: t.treatment_hit,
+                baseline_length: b.baseline_length,
+                treatment_length: t.treatment_length,
+                treatment_summary: None,
+            })
+            .collect();
+        let overall = mcnemar(&paired);
+        let decision = decide_ship(
+            &overall,
+            &HashMap::new(),
+            0.02,
+            1.5,
+            DecideShipKind::Synthesis,
+        );
+        match decision {
+            ShipDecision::Ship {
+                reason: ShipReason::Superior { .. },
+                ..
+            } => {}
+            other => panic!(
+                "expected Superior ship verdict for clean treatment win, got {other:?}"
+            ),
+        }
+
+        let _ = fs::remove_file(&baseline_path);
+        let _ = fs::remove_file(&treat_path);
+    }
+
+    /// `SynthesisFixture::baseline_text` concatenates summary +
+    /// evidence_preview per result; verify the exact shape so future
+    /// schema changes are explicit.
+    #[test]
+    fn synthesis_baseline_text_concatenates_summary_and_evidence_preview() {
+        let fx = SynthesisFixture {
+            case_id: "sample".into(),
+            category: None,
+            query: "q".into(),
+            recall_results: vec![SyntheticRecallResult {
+                id: "m1".into(),
+                summary: "summary one".into(),
+                evidence_preview: vec!["preview one".into(), "preview two".into()],
+                score: 0.9,
+                confidence: 0.9,
+                sources_hit: 2,
+                evidence_count: 2,
+            }],
+            evidence_keywords: vec!["one".into(), "two".into(), "three".into()],
+        };
+        let text = fx.baseline_text();
+        assert!(text.contains("summary one"));
+        assert!(text.contains("preview one"));
+        assert!(text.contains("preview two"));
     }
 }

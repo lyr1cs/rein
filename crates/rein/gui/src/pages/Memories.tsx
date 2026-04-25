@@ -2,11 +2,11 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useMemoryDetail, useRecent, useRecall, useTopics } from '../hooks/useApi';
 import { apiDelete } from '../api/client';
+import SynthesisCard from '../components/SynthesisCard';
 import type {
   Memory,
   MemoryDetailResponse,
   RecallResult,
-  RecallSynthesisOutcome,
 } from '../api/types';
 
 /* ── helpers ─────────────────────────────────────────────────────── */
@@ -150,6 +150,11 @@ function DetailPanel({
   const badge = tierBadge(display.tier);
   const recallMeta = 'score' in memory ? memory as RecallResult : null;
   const evidence = detail?.evidence ?? [];
+  // `evidence_total` is the un-truncated row count from the server;
+  // `evidence` itself is preview-capped at 200. Falling back to the
+  // preview length when the server didn't report a total keeps older
+  // backends honest (the number we show always matches what we render).
+  const evidenceTotal = detail?.evidence_total ?? evidence.length;
   const visibleEvidence = showAllEvidence ? evidence : evidence.slice(0, 3);
 
   return (
@@ -288,12 +293,24 @@ function DetailPanel({
                 </div>
               ))}
               {evidence.length > 3 && (
-                <button
-                  onClick={() => setShowAllEvidence((v) => !v)}
-                  className="text-xs text-[var(--accent)] hover:text-[var(--accent)]/80 transition-colors"
-                >
-                  {showAllEvidence ? 'Show fewer evidence items' : `Show all ${evidence.length} evidence items`}
-                </button>
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <span className="text-[10px] text-[var(--text-muted)]">
+                    {/* Honest count: report what's actually rendered
+                     * (`visibleEvidence.length`), not the preview cap.
+                     * Otherwise a collapsed view of a 543-row canonical
+                     * would say "Showing 200 of 543" while only 3 cards
+                     * are visible. */}
+                    {visibleEvidence.length === evidenceTotal
+                      ? `${evidenceTotal} evidence items`
+                      : `Showing ${visibleEvidence.length} of ${evidenceTotal} evidence items`}
+                  </span>
+                  <button
+                    onClick={() => setShowAllEvidence((v) => !v)}
+                    className="text-xs text-[var(--accent)] hover:text-[var(--accent)]/80 transition-colors"
+                  >
+                    {showAllEvidence ? 'Show fewer' : 'Show all'}
+                  </button>
+                </div>
               )}
             </div>
           ) : (

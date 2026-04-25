@@ -614,8 +614,15 @@ impl OpsRuntime {
             let m = store.get(&id)?;
             let canonical_id = m.canonical_id.clone().unwrap_or_else(|| m.id.clone());
             let mut body = crate::mcp::rest::memory_to_json(&m);
+            // `evidence` is preview-capped at 200 rows; `evidence_total` is
+            // the un-truncated row count so the UI can label honestly
+            // (e.g. "Showing 200 of 543") instead of claiming the preview
+            // size IS the total. Cap chosen well above the typical evidence
+            // count while still bounded for absurd canonicals.
+            const EVIDENCE_PREVIEW_CAP: usize = 200;
+            let evidence_total = store.count_memory_evidence(&canonical_id).unwrap_or(0);
             let evidence = store
-                .list_memory_evidence(&canonical_id, 12)
+                .list_memory_evidence(&canonical_id, EVIDENCE_PREVIEW_CAP)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|item| item.memory_id.as_deref() != Some(canonical_id.as_str()))
@@ -637,6 +644,7 @@ impl OpsRuntime {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("memory".to_string(), crate::mcp::rest::memory_to_json(&m));
                 obj.insert("evidence".to_string(), json!(evidence));
+                obj.insert("evidence_total".to_string(), json!(evidence_total));
             }
             Ok(GetMemoryOutput(body))
         })

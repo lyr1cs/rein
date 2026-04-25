@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { path: '/timeline', icon: '\u23F1\uFE0F', label: 'Timeline' },
   { path: '/artifacts', icon: '\u{1F4C4}', label: 'Artifacts' },
   { path: '/provenance', icon: '\u{1F50F}', label: 'Provenance' },
+  { path: '/synthesis-lab', icon: '\u{1F9EA}', label: 'Synthesis Lab' },
 ];
 
 export default function Layout() {

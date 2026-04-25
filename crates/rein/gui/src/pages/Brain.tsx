@@ -1,25 +1,16 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { ForceGraphMethods, LinkObject, NodeObject } from 'react-force-graph-2d';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { apiGet } from '../api/client';
-import { useMemoryDetail } from '../hooks/useApi';
-import type { Memory, Concept, ConceptLink } from '../api/types';
+import { useMemoryDetail, useRecent, useMemoirs } from '../hooks/useApi';
+import { mergeForceGraphData } from '../utils/forceGraph';
+import { getPollingIntervalMs } from '../utils/polling';
+import type { Memory, MemoirExport } from '../api/types';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
-
-interface Memoir {
-  id: string;
-  name: string;
-  description: string;
-}
-
-interface MemoirExport {
-  memoir: Memoir;
-  concepts: Concept[];
-  links: ConceptLink[];
-}
 
 interface GraphNode {
   id: string;
@@ -68,12 +59,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load data';
 }
 
-function getPollingIntervalMs(): number {
-  const saved = localStorage.getItem('rein_polling_interval');
-  const seconds = saved ? parseInt(saved, 10) : 5;
-  return Number.isFinite(seconds) ? seconds * 1000 : 5000;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Tier colors                                                        */
 /* ------------------------------------------------------------------ */
@@ -92,8 +77,6 @@ const TIER_COLORS: Record<string, string> = {
 export default function Brain() {
   /* Data state */
   const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
 
   /* Interaction state */
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -101,7 +84,6 @@ export default function Brain() {
   const [search, setSearch] = useState('');
   const [timeMax, setTimeMax] = useState(0);
   const [timeSlider, setTimeSlider] = useState(0);
-  const [reloadVersion, setReloadVersion] = useState(0);
   const { data: selectedMemoryDetail, isLoading: selectedMemoryLoading } = useMemoryDetail(
     selectedNode?.type === 'memory' ? selectedNode.id : null,
   );
@@ -109,156 +91,183 @@ export default function Brain() {
   /* Refs */
   const fgRef = useRef<GraphHandle | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement>(null);
-  const hasLoadedGraphRef = useRef(false);
+  /* `hasLoadedGraph` participates in rendering (used to compute the loading
+   * spinner gate), so it must be state, not a ref — the new
+   * `react-hooks/refs` lint rule (eslint-plugin-react-hooks v7) flags any
+   * `.current` read from the render body. */
+  const [hasLoadedGraph, setHasLoadedGraph] = useState(false);
+  /* `timeMax` mirror used inside the merge effect. The state version is what
+   * the time-slider input reads from; the ref is how the effect reads "the
+   * value we wrote last poll" without listing `timeMax` in its dep array
+   * (which would self-loop because each poll writes a fresh `Date.now()`). */
+  const timeMaxRef = useRef(0);
   const [dimensions, setDimensions] = useState({ width: window.innerWidth - 48, height: window.innerHeight - 40 });
 
+  /* ---- Data fetching via react-query (H3 + M7) ----
+   *
+   * Three coordinated queries:
+   *   1. `useRecent(200)`     — recent memories (BM25 layer)
+   *   2. `useMemoirs()`       — memoir directory
+   *   3. `useQueries(...)`    — fan-out one query per memoir for its export
+   *
+   * All three poll on the shared cadence from `getPollingIntervalMs()` and
+   * gate on tab visibility automatically (`refetchIntervalInBackground` is
+   * react-query's default `false`). Manual refresh calls `qc.invalidateQueries`
+   * on the relevant keys instead of bumping a `reloadVersion` state. */
+  const queryClient = useQueryClient();
+  const recentQuery = useRecent(200);
+  const memoirsQuery = useMemoirs();
+  const memoirNames = useMemo(
+    () => (memoirsQuery.data?.memoirs ?? []).map((m) => m.name),
+    [memoirsQuery.data],
+  );
+  const exportQueries = useQueries({
+    queries: memoirNames.map((name) => ({
+      queryKey: ['memoir-export', name],
+      queryFn: () =>
+        apiGet<MemoirExport>(`/api/memoirs/${encodeURIComponent(name)}/export?format=json`),
+      refetchInterval: () => getPollingIntervalMs(),
+    })),
+  });
+
+  /* Only `/api/recent` is critical — memoir/KG export failures degrade
+   * gracefully to an empty memoir list (memoirNames default = []), so the
+   * memory-only graph still renders. The pre-react-query loader caught
+   * memoir errors explicitly; preserving that behavior here so a transient
+   * KG outage or pre-v0.4 backend doesn't fail the whole page. */
+  const error = recentQuery.error ? errorMessage(recentQuery.error) : '';
+
   const refreshGraph = useCallback(() => {
-    setReloadVersion((version) => version + 1);
-  }, []);
+    queryClient.invalidateQueries({ queryKey: ['recent'] });
+    queryClient.invalidateQueries({ queryKey: ['memoirs'] });
+    queryClient.invalidateQueries({ queryKey: ['memoir-export'] });
+  }, [queryClient]);
 
-  useEffect(() => {
-    let cancelled = false;
-    let timeoutId: number | null = null;
+  /* Compose the next graph snapshot from query data. Pure derivation: when
+   * react-query's `structuralSharing: true` (default) returns a referentially
+   * stable response — i.e. the poll surfaced no changes — `nextGraph` keeps
+   * its prior identity and the merge effect below skips entirely.
+   *
+   * `exportQueries` itself is a fresh array on every render, so we derive a
+   * stable signature from each query's `dataUpdatedAt` + `status` — this only
+   * changes when a fan-out query actually receives new data. Without this,
+   * the useMemo would recompute on every render and the merge effect would
+   * run far more often than poll frequency. */
+  const exportsKey = exportQueries
+    .map((q) => `${q.dataUpdatedAt ?? 0}:${q.status}`)
+    .join('|');
+  const exportsData: MemoirExport[] = useMemo(
+    () =>
+      exportQueries
+        .map((q) => q.data)
+        .filter((d): d is MemoirExport => d !== undefined),
+    // exportQueries is rebuilt every render but each `.data` slot is
+    // structurally shared by react-query — we depend on the signature
+    // string instead of the array identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [exportsKey],
+  );
 
-    // Read localStorage each cycle so Settings changes apply to the next poll.
-    const scheduleNextPoll = () => {
-      timeoutId = window.setTimeout(() => {
-        refreshGraph();
-        if (!cancelled) {
-          scheduleNextPoll();
-        }
-      }, getPollingIntervalMs());
-    };
+  const nextGraph = useMemo<GraphData>(() => {
+    const memories: Memory[] = recentQuery.data?.memories ?? [];
+    const nodeMap = new Map<string, GraphNode>();
 
-    scheduleNextPoll();
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
-    };
-  }, [refreshGraph]);
+    for (const mem of memories) {
+      nodeMap.set(mem.id, {
+        id: mem.id,
+        type: 'memory',
+        label: mem.summary || mem.topic || mem.id.slice(0, 8),
+        tier: mem.tier,
+        strength: mem.strength,
+        importance: mem.importance,
+        cluster_id: mem.cluster_id,
+        created_at: mem.created_at,
+      });
+    }
 
-  /* ---- Fetch all data on mount ---- */
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      if (!cancelled) {
-        if (!hasLoadedGraphRef.current) {
-          setLoading(true);
-        }
-        setError('');
-      }
-      try {
-        /* Fetch memories and memoirs in parallel */
-        const [recentRes, memoirsRes] = await Promise.all([
-          apiGet<{ memories: Memory[] }>('/api/recent?limit=200'),
-          apiGet<{ memoirs: Memoir[] }>('/api/memoirs').catch(() => ({ memoirs: [] as Memoir[] })),
-        ]);
-
-        /* Fetch all memoir exports IN PARALLEL. The previous sequential
-         * `await` loop turned every poll into an N+1 trip on large vaults;
-         * Promise.all lets the browser fire every request together and still
-         * collect the successes. Failed memoirs still degrade gracefully via
-         * the per-request `.catch`. */
-        const exports: MemoirExport[] = (
-          await Promise.all(
-            memoirsRes.memoirs.map((m) =>
-              apiGet<MemoirExport>(
-                `/api/memoirs/${encodeURIComponent(m.name)}/export?format=json`,
-              ).catch(() => null),
-            ),
-          )
-        ).filter((exp): exp is MemoirExport => exp !== null);
-
-        if (cancelled) return;
-
-        /* Build nodes */
-        const nodeMap = new Map<string, GraphNode>();
-        const memories = recentRes.memories;
-
-        for (const mem of memories) {
-          nodeMap.set(mem.id, {
-            id: mem.id,
-            type: 'memory',
-            label: mem.summary || mem.topic || mem.id.slice(0, 8),
-            tier: mem.tier,
-            strength: mem.strength,
-            importance: mem.importance,
-            cluster_id: mem.cluster_id,
-            created_at: mem.created_at,
+    for (const exp of exportsData) {
+      for (const c of exp.concepts) {
+        if (!nodeMap.has(c.id)) {
+          nodeMap.set(c.id, {
+            id: c.id,
+            type: 'concept',
+            label: c.name,
+            confidence: c.confidence,
+            created_at: c.created_at || c.updated_at || new Date().toISOString(),
           });
-        }
-
-        for (const exp of exports) {
-          for (const c of exp.concepts) {
-            if (!nodeMap.has(c.id)) {
-              nodeMap.set(c.id, {
-                id: c.id,
-                type: 'concept',
-                label: c.name,
-                confidence: c.confidence,
-                created_at: c.created_at || c.updated_at || new Date().toISOString(),
-              });
-            }
-          }
-        }
-
-        /* Build links */
-        const linkSet = new Set<string>();
-        const links: GraphLink[] = [];
-
-        function addLink(src: string, tgt: string, type: GraphLink['type']) {
-          if (!nodeMap.has(src) || !nodeMap.has(tgt)) return;
-          if (src === tgt) return;
-          const key = `${src}|${tgt}|${type}`;
-          if (linkSet.has(key)) return;
-          linkSet.add(key);
-          links.push({ source: src, target: tgt, type });
-        }
-
-        /* Memory related_ids */
-        for (const mem of memories) {
-          for (const rid of mem.related_ids) {
-            addLink(mem.id, rid, 'related');
-          }
-          for (const cid of mem.concept_ids) {
-            addLink(mem.id, cid, 'memory_concept');
-          }
-        }
-
-        /* ConceptLink entries */
-        for (const exp of exports) {
-          for (const cl of exp.links) {
-            addLink(cl.source_id, cl.target_id, 'concept_link');
-          }
-        }
-
-        const nodes = Array.from(nodeMap.values());
-
-        const now = Date.now();
-
-        setGraphData({ nodes, links });
-        setSelectedNode((current) => {
-          if (!current) return null;
-          return nodeMap.get(current.id) ?? null;
-        });
-        setTimeMax(now);
-        setTimeSlider(now);
-        setLoading(false);
-        hasLoadedGraphRef.current = true;
-      } catch (err: unknown) {
-        if (!cancelled) {
-          setError(errorMessage(err));
-          setLoading(false);
         }
       }
     }
 
-    load();
-    return () => { cancelled = true; };
-  }, [reloadVersion]);
+    const linkSet = new Set<string>();
+    const links: GraphLink[] = [];
+    const addLink = (src: string, tgt: string, type: GraphLink['type']) => {
+      if (!nodeMap.has(src) || !nodeMap.has(tgt)) return;
+      if (src === tgt) return;
+      const key = `${src}|${tgt}|${type}`;
+      if (linkSet.has(key)) return;
+      linkSet.add(key);
+      links.push({ source: src, target: tgt, type });
+    };
+
+    for (const mem of memories) {
+      for (const rid of mem.related_ids) addLink(mem.id, rid, 'related');
+      for (const cid of mem.concept_ids) addLink(mem.id, cid, 'memory_concept');
+    }
+    for (const exp of exportsData) {
+      for (const cl of exp.links) addLink(cl.source_id, cl.target_id, 'concept_link');
+    }
+
+    return { nodes: Array.from(nodeMap.values()), links };
+  }, [recentQuery.data, exportsData]);
+
+  /* Diff-merge into committed graphData so unchanged nodes/links keep object
+   * identity (otherwise react-force-graph-2d reheats the d3-force simulation
+   * alpha=1 every poll → "fireworks" 5s loop). The effect only fires when
+   * `nextGraph` actually changes — react-query's structural sharing keeps
+   * `data` referentially stable on byte-equal responses, so identical polls
+   * are no-ops at this layer.
+   *
+   * The setState calls below are intentional: this effect synchronizes an
+   * external store (react-query cache) into local state with an in-place
+   * mutation (Object.assign for d3-force x/y/vx/vy preservation) that is
+   * impossible to express via useMemo. */
+  useEffect(() => {
+    if (!recentQuery.data) return;
+    setGraphData((prev) =>
+      mergeForceGraphData(prev, nextGraph, (l) => {
+        const src = endpointId(l.source as LinkEndpoint) ?? '';
+        const tgt = endpointId(l.target as LinkEndpoint) ?? '';
+        return `${src}|${tgt}|${l.type}`;
+      }),
+    );
+    /* Re-anchor the selected node onto the merged dataset (so the detail panel
+     * still resolves it after a poll dropped/restored its row). */
+    setSelectedNode((current) => {
+      if (!current) return null;
+      const found = nextGraph.nodes.find((n) => n.id === current.id);
+      return found ?? null;
+    });
+    /* Only auto-advance the slider when the user has it parked at the live
+     * edge (i.e. previous timeMax). If the user has scrubbed back to inspect
+     * history, leave their position alone.
+     *
+     * `timeMax` is mirrored into a ref so the merge effect can compare against
+     * the prior boundary without listing `timeMax` in its dep array — that
+     * would self-loop because the body also writes `setTimeMax(Date.now())`
+     * with a fresh value each cycle. */
+    const now = Date.now();
+    const prevTimeMax = timeMaxRef.current;
+    setTimeSlider((prevSlider) => {
+      if (prevSlider === 0) return now; // first load
+      return prevSlider >= prevTimeMax ? now : prevSlider;
+    });
+    setTimeMax(now);
+    timeMaxRef.current = now;
+    setHasLoadedGraph(true);
+  }, [nextGraph, recentQuery.data]);
+
+  const loading = !hasLoadedGraph && (recentQuery.isLoading || memoirsQuery.isLoading);
 
   /* ---- Fit view on first render ---- */
   useEffect(() => {

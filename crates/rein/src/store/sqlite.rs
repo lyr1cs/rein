@@ -457,6 +457,25 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Un-truncated row count for a canonical's evidence. Used by
+    /// `get_memory` so the GUI can display an honest total ("Showing N of
+    /// M") even when the inline preview is capped. Uses the
+    /// `idx_memory_evidence_canonical` index, so cost is O(log n).
+    ///
+    /// Excludes the canonical's own row (`memory_id = canonical_id`),
+    /// matching the filter `get_memory` applies to `list_memory_evidence`
+    /// before returning to the UI. Without this exclusion `evidence_total`
+    /// would always be off-by-one against the rendered list.
+    pub fn count_memory_evidence(&self, canonical_id: &str) -> ReinResult<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_evidence \
+             WHERE canonical_id = ?1 AND (memory_id IS NULL OR memory_id <> ?1)",
+            rusqlite::params![canonical_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
     /// Full evidence history for a canonical, ordered oldest-first. No
     /// LIMIT — the caller (e.g. `ops/resummerize.rs`) needs every row so the
     /// Lossless Compression Contract's `no_new_facts` check sees the entire

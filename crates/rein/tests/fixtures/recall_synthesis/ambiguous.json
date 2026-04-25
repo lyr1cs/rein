@@ -1,0 +1,110 @@
+[
+  {
+    "case_id": "amb_001",
+    "category": "ambiguous",
+    "query": "memory stuff",
+    "recall_results": [
+      {
+        "id": "mem-amb-1",
+        "summary": "M5 Hot/Warm/Cold tiering uses a streaming t-digest quantile estimator over per-cluster strength to choose adaptive tier boundaries; cold memories are excluded from non-Exploratory queries.",
+        "evidence_preview": [
+          "Hot/Warm/Cold tiering",
+          "t-digest streaming quantile estimator",
+          "cold tier excluded from non-Exploratory queries"
+        ],
+        "score": 0.71,
+        "confidence": 0.74,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-amb-2",
+        "summary": "Provenance-preserving merge keeps every merged memory's evidence row attached to the canonical so dedup never destroys source data.",
+        "evidence_preview": [
+          "provenance-preserving merge",
+          "evidence rows attached to canonical",
+          "dedup never destroys source data"
+        ],
+        "score": 0.68,
+        "confidence": 0.72,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-amb-3",
+        "summary": "STM has a half-life of 5 days and LTM 11 days under the fixed Ebbinghaus fallback; critical memories never decay.",
+        "evidence_preview": [
+          "STM half-life 5 days",
+          "LTM half-life 11 days",
+          "critical memories exempt from decay"
+        ],
+        "score": 0.65,
+        "confidence": 0.70,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-amb-4",
+        "summary": "STM promotes to LTM at access_count > 5 by default; cluster-aware promotion uses survival-curve-derived thresholds when curves are populated.",
+        "evidence_preview": [
+          "STM->LTM access_count > 5 default",
+          "cluster-aware promotion path",
+          "survival-curve thresholds when available"
+        ],
+        "score": 0.62,
+        "confidence": 0.68,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["tiering", "Ebbinghaus", "decay", "STM", "provenance"]
+  },
+  {
+    "case_id": "amb_002",
+    "category": "ambiguous",
+    "query": "how does it search",
+    "recall_results": [
+      {
+        "id": "mem-amb-5",
+        "summary": "Search is a 3-channel waterfall: Tantivy BM25 full-text plus usearch HNSW vector plus knowledge-graph BFS; results are fused with RRF or learned CC alpha.",
+        "evidence_preview": [
+          "Tantivy BM25 channel",
+          "usearch HNSW vector channel",
+          "knowledge-graph BFS channel",
+          "RRF and learned CC alpha fusion"
+        ],
+        "score": 0.74,
+        "confidence": 0.76,
+        "sources_hit": 3,
+        "evidence_count": 4
+      },
+      {
+        "id": "mem-amb-6",
+        "summary": "Query expansion rewrites the user query into 2-3 variants via Gemini Flash Lite or OMLX; expanded variants run in parallel with the original query.",
+        "evidence_preview": [
+          "query expansion to 2-3 variants",
+          "Gemini Flash Lite or OMLX backend",
+          "parallel execution with original query"
+        ],
+        "score": 0.69,
+        "confidence": 0.73,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-amb-7",
+        "summary": "Autonomous retrieval routing classifies queries into Episodic, Temporal, Preference, ExactKeyword, Semantic, or Exploratory and picks per-strategy fusion alpha and result limit.",
+        "evidence_preview": [
+          "6 retrieval strategies",
+          "rule-based classifier with no LLM call",
+          "per-strategy alpha and limit"
+        ],
+        "score": 0.66,
+        "confidence": 0.70,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["Tantivy", "HNSW", "expansion", "routing", "fusion"]
+  }
+]

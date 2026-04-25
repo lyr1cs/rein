@@ -1,0 +1,135 @@
+[
+  {
+    "case_id": "mt_001",
+    "category": "multi_topic",
+    "query": "How do the adaptive engine and survival decay interact with HDBSCAN clusters?",
+    "recall_results": [
+      {
+        "id": "mem-mt-1",
+        "summary": "M3 per-cluster Kaplan-Meier survival decay replaces fixed Ebbinghaus when sufficient data exists per cluster; the cluster IDs come from M4 HDBSCAN output.",
+        "evidence_preview": [
+          "Kaplan-Meier survival per cluster",
+          "fallback to fixed Ebbinghaus on cold start",
+          "cluster IDs sourced from HDBSCAN"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-2",
+        "summary": "M2 counterfactual alpha optimization learns CC fusion weights per cluster from candidate replay; alpha values are stored in AdaptiveState and updated event-sourced.",
+        "evidence_preview": [
+          "counterfactual replay for alpha",
+          "per-cluster CC fusion weights",
+          "AdaptiveState event-sourced cache"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-3",
+        "summary": "HDBSCAN extracts flat clusters from a stability-scored condensed tree using EOMBST; output feeds both the M2 alpha learner and the M3 survival estimator.",
+        "evidence_preview": [
+          "EOMBST stability extraction",
+          "feeds M2 and M3 jointly",
+          "store/hdbscan.rs is the implementation"
+        ],
+        "score": 0.87,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-4",
+        "summary": "STM to LTM promotion thresholds are derived from cluster-level survival curves when available; otherwise a global access_count > 5 fallback is used.",
+        "evidence_preview": [
+          "STM->LTM uses survival-curve thresholds",
+          "global access_count fallback",
+          "cluster-aware admission control"
+        ],
+        "score": 0.81,
+        "confidence": 0.83,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-5",
+        "summary": "M5 Hot/Warm/Cold tiering uses a streaming t-digest quantile estimator over the HDBSCAN cluster of each memory to pick adaptive tier boundaries.",
+        "evidence_preview": [
+          "t-digest quantile estimator",
+          "Hot/Warm/Cold tier boundaries",
+          "tiering keyed by HDBSCAN cluster"
+        ],
+        "score": 0.76,
+        "confidence": 0.80,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["Kaplan-Meier", "HDBSCAN", "AdaptiveState", "EOMBST", "tiering"]
+  },
+  {
+    "case_id": "mt_002",
+    "category": "multi_topic",
+    "query": "What landed in v0.23 and v0.24 around resummerize and ARS?",
+    "recall_results": [
+      {
+        "id": "mem-mt-6",
+        "summary": "v0.23.0-rc1 introduced LLM-driven resummerize with the 7-invariant Lossless Compression Contract gating every rewrite; feature-flagged off by default via [resummerize].enabled.",
+        "evidence_preview": [
+          "LLM-driven canonical rewrite",
+          "Lossless Compression Contract with 7 invariants",
+          "[resummerize].enabled = false default"
+        ],
+        "score": 0.94,
+        "confidence": 0.92,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-7",
+        "summary": "Atomic apply_resummerize uses BEGIN IMMEDIATE plus a 5-way CAS (claim token, snapshot updated_at, status-live) to apply the LLM rewrite safely.",
+        "evidence_preview": [
+          "BEGIN IMMEDIATE for atomic apply",
+          "5-way CAS guards rewrite",
+          "claim token plus snapshot updated_at"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-8",
+        "summary": "v0.24 ARS Capability A added concept living-summary refresh with L3 adaptive wiring and L4 concurrent CAS; opt-in via [ars].concept_summary_enabled.",
+        "evidence_preview": [
+          "ARS Capability A concept living-summary",
+          "L4 concurrent refresh CAS",
+          "opt-in via [ars].concept_summary_enabled"
+        ],
+        "score": 0.86,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-mt-9",
+        "summary": "v0.25 ARS Capability B added recall-time synthesis: optional synthesize=true on rein_recall produces a narrative over top-N results without a new MCP tool.",
+        "evidence_preview": [
+          "ARS Capability B recall synthesis",
+          "synthesize=true opt-in on rein_recall",
+          "no new MCP tool added"
+        ],
+        "score": 0.83,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["resummerize", "Compression", "synthesis", "concept", "Capability"]
+  }
+]
