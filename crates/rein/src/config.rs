@@ -204,6 +204,23 @@ pub struct ArsConfig {
     /// Default: 3.
     #[serde(default = "default_recall_synthesis_min_results")]
     pub recall_synthesis_min_results: usize,
+    // ── Cap C v0.26 ──────────────────────────────────────────────────────────
+    /// Enable cold-tier archival summary (Cap C). Default `false` (opt-in,
+    /// per spec §8 invariant 3 — flipping to true is a separate v0.26.x
+    /// canary, NOT v0.26.0). When enabled, a slow-channel worker generates
+    /// archival summaries for cold-tier memories and exposes them via
+    /// recall when present. See `ops/cold_archive_summary.rs`.
+    #[serde(default)]
+    pub cold_archive_enabled: bool,
+    /// Target chars for archival summary. Default 600. Bootstrap; v0.27+
+    /// may make this adaptive on cold-tier length distribution.
+    /// TODO: ablation.
+    #[serde(default = "default_cold_archive_target_chars")]
+    pub cold_archive_target_chars: usize,
+    /// Batch size per slow-channel pass. Default 16. Bootstrap; v0.27+ may
+    /// make this adaptive on cold-tier backlog depth.
+    #[serde(default = "default_cold_archive_batch_size")]
+    pub cold_archive_batch_size: usize,
 }
 
 fn default_ars_backend() -> String {
@@ -218,6 +235,18 @@ fn default_recall_synthesis_min_results() -> usize {
     3
 }
 
+// Cap C v0.26 defaults — see `ops/cold_archive_summary.rs::ARCHIVAL_SUMMARY_*`
+// for the constants these mirror. We duplicate the literal here rather than
+// import from the ops module so `config.rs` stays free of `ops` imports
+// (config is a foundation crate; ops depends on it, not vice-versa).
+fn default_cold_archive_target_chars() -> usize {
+    600 // bootstrap; v0.27+ → adaptive
+}
+
+fn default_cold_archive_batch_size() -> usize {
+    16 // bootstrap; v0.27+ → adaptive on backlog depth
+}
+
 impl Default for ArsConfig {
     fn default() -> Self {
         Self {
@@ -226,6 +255,10 @@ impl Default for ArsConfig {
             batch_size: default_ars_batch_size(),
             recall_synthesis_enabled: false,
             recall_synthesis_min_results: default_recall_synthesis_min_results(),
+            // Cap C v0.26 — opt-in (spec §8 invariant 3)
+            cold_archive_enabled: false,
+            cold_archive_target_chars: default_cold_archive_target_chars(),
+            cold_archive_batch_size: default_cold_archive_batch_size(),
         }
     }
 }

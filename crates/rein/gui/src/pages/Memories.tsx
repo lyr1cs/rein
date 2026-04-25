@@ -452,6 +452,12 @@ export default function Memories() {
           queryClient.invalidateQueries({ queryKey: ['recent'] }),
           queryClient.invalidateQueries({ queryKey: ['recall'] }),
           queryClient.invalidateQueries({ queryKey: ['memory-detail'] }),
+          // M3 (v0.26 cleanup): the topic dropdown is fed by `useTopics`,
+          // which polls but doesn't react to mutations. Deleting the last
+          // memory under a topic would silently leave that topic in the
+          // dropdown until the next poll tick. Invalidate so the dropdown
+          // re-syncs immediately.
+          queryClient.invalidateQueries({ queryKey: ['topics'] }),
         ]);
       } catch (err) {
         // B6 — surface the failure instead of only logging to console so the
@@ -571,9 +577,23 @@ export default function Memories() {
               state" card pattern (rounded border, bg-primary/60 panel, muted
               uppercase header, leading-relaxed body, footer meta). Renders
               only when the user has the toggle on AND we have something to
-              say — otherwise the recall flow looks identical to v0.24. */}
+              say — otherwise the recall flow looks identical to v0.24.
+              v0.26: `recallId` is plumbed through so the dwell timer +
+              click + thumb hooks can correlate feedback events with the
+              originating recall request. */}
           {isSearching && synthesize && !recallLoading && (
-            <SynthesisCard outcome={recallData?.synthesis} />
+            // `key` on `synthesis_id` forces a fresh component instance
+            // per synthesis output: the dwell timer + thumb-vote state +
+            // citation-feedback latch all reset cleanly when a new
+            // synthesis arrives. Falling back to 'none' for the
+            // legacy/skipped branches keeps the same instance across
+            // re-renders that don't carry a new synthesis (so the skip
+            // notice doesn't flicker).
+            <SynthesisCard
+              key={recallData?.synthesis?.synthesis_id ?? 'none'}
+              outcome={recallData?.synthesis}
+              recallId={recallData?.request_id}
+            />
           )}
 
           {isLoading ? (

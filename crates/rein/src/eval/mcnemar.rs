@@ -50,6 +50,25 @@ pub struct PairedOutcome {
 /// `a` = both hit, `b` = baseline hit / treatment missed,
 /// `c` = treatment hit / baseline missed, `d` = both missed.
 ///
+/// # Label convention (Wikipedia / Agresti)
+///
+/// - `b` = baseline hit / treatment missed   (cases where treatment is WORSE)
+/// - `c` = treatment hit / baseline missed   (cases where treatment is BETTER)
+/// - `diff_point = (c - b) / n`              (positive value = treatment improvement)
+///
+/// This matches Wikipedia's "McNemar's test" page and Agresti, *Categorical
+/// Data Analysis* (3rd ed., Table 10.5). The `agresti_textbook_example` test
+/// below verifies the chi-squared statistic against Agresti's published value.
+///
+/// Note: an older internal devlog briefly described these labels as "flipped
+/// vs. standard McNemar" — that was a documentation error, not a code bug.
+/// The code has always followed the textbook convention.
+///
+/// `decide_ship` reads only `diff_point` and `ci_lower`. Both are sign-stable
+/// under either labeling (flipping `b ↔ c` would flip the sign of `(c - b)/n`
+/// and the symmetric CI bounds together), so any future relabeling would
+/// leave ship gates valid.
+///
 /// `Deserialize` is included so scorecards round-trip cleanly through JSON
 /// (they embed `McNemarResult` via `CategoryStats`).
 #[derive(Debug, Clone, Serialize, Deserialize)]

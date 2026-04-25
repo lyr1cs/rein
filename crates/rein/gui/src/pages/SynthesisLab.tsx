@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRecall } from '../hooks/useApi';
 import SynthesisCard from '../components/SynthesisCard';
 import type { RecallResult } from '../api/types';
+import { postSynthesisInteraction } from '../api/feedback';
+import { timeAgo } from '../utils/time';
 import {
   PRESET_QUERIES,
   clearRecentQueries,
@@ -12,19 +14,6 @@ import {
 /* ── helpers ─────────────────────────────────────────────────────── */
 
 type TierFilter = 'all' | 'hot' | 'warm' | 'cold';
-
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  return `${months}mo ago`;
-}
 
 function tierBadge(tier: 'hot' | 'warm' | 'cold') {
   switch (tier) {
@@ -185,8 +174,7 @@ export default function SynthesisLab() {
   // the badge when the request identity changes (Codex R3 G10). The
   // setElapsedMs(null) call is a sync from external request-lifecycle
   // signal into React state — legitimate effect use per the react-hooks
-  // guidance, but the heuristic doesn't recognize this branch shape.
-  /* eslint-disable react-hooks/set-state-in-effect */
+  // guidance.
   useEffect(() => {
     if (debouncedQuery.length > 0) {
       startedAtRef.current = Date.now();
@@ -213,7 +201,6 @@ export default function SynthesisLab() {
     }
     prevLoadingRef.current = isLoading;
   }, [isLoading]);
-  /* eslint-enable react-hooks/set-state-in-effect */
 
   const filteredResults = useMemo(() => {
     const results = data?.results;
@@ -224,6 +211,86 @@ export default function SynthesisLab() {
 
   const isInitialState = debouncedQuery.length === 0;
   const requestId = data?.request_id;
+  const synthesisId = data?.synthesis?.synthesis_id;
+  const sourceCount = data?.synthesis?.source_count;
+  const synthesisChars = data?.synthesis?.synthesis?.length;
+
+  // ── ImmediateRequery detection ──────────────────────────────────
+  // When the user submits a fresh query while a previous synthesis is
+  // still in scope, emit a single `immediate_requery` event with the
+  // gap_ms from when the previous synthesis arrived to when the new
+  // query was committed. The consumer applies a sliding threshold
+  // server-side; we emit the raw gap, not a thresholded boolean.
+  //
+  // We track:
+  //   - `lastSynthesisIdRef`: which synthesis_id is currently "in scope"
+  //   - `lastSynthesisAtRef`: when its prose first arrived
+  //   - `lastRecallIdRef`: paired correlation id for the POST
+  //
+  // The effect fires when `debouncedQuery` changes AND a previous
+  // synthesis_id was tracked — see §5.2 of the v0.26 contract.
+  const lastSynthesisIdRef = useRef<string | undefined>(undefined);
+  const lastSynthesisAtRef = useRef<number | null>(null);
+  const lastRecallIdRef = useRef<string | undefined>(undefined);
+  const lastDebouncedQueryRef = useRef<string>('');
+
+  // External-state sync: when a fresh synthesis lands, latch the new id +
+  // arrival timestamp. We stamp arrival time once per synthesis_id so the
+  // gap measures user reading time, not API round-trip jitter.
+  useEffect(() => {
+    if (
+      synthesisId !== undefined &&
+      synthesisId !== lastSynthesisIdRef.current
+    ) {
+      lastSynthesisIdRef.current = synthesisId;
+      lastSynthesisAtRef.current = Date.now();
+      lastRecallIdRef.current = requestId;
+    }
+  }, [synthesisId, requestId]);
+
+  // External-state sync: detect query commit and emit ImmediateRequery
+  // BEFORE the new synthesis arrives. We compare against the previous
+  // committed query so initial-mount + rapid-typing pause both behave.
+  useEffect(() => {
+    const prevQuery = lastDebouncedQueryRef.current;
+    if (
+      debouncedQuery.length > 0 &&
+      debouncedQuery !== prevQuery &&
+      lastSynthesisIdRef.current !== undefined &&
+      lastSynthesisAtRef.current !== null
+    ) {
+      const gap_ms = Date.now() - lastSynthesisAtRef.current;
+      // Fire-and-forget — postSynthesisInteraction guards both ids.
+      void postSynthesisInteraction(
+        lastSynthesisIdRef.current,
+        lastRecallIdRef.current,
+        { kind: 'immediate_requery', gap_ms },
+        typeof sourceCount === 'number' ||
+        typeof synthesisChars === 'number'
+          ? {
+              ...(typeof sourceCount === 'number'
+                ? { source_count: sourceCount }
+                : {}),
+              ...(typeof synthesisChars === 'number'
+                ? { synthesis_chars: synthesisChars }
+                : {}),
+            }
+          : undefined,
+      );
+      // Clear the latch so we only emit once per (prior synthesis,
+      // new query) pair. The new synthesis will re-arm the refs on
+      // arrival via the effect above.
+      lastSynthesisIdRef.current = undefined;
+      lastSynthesisAtRef.current = null;
+      lastRecallIdRef.current = undefined;
+    }
+    lastDebouncedQueryRef.current = debouncedQuery;
+    // synthesisId/sourceCount/synthesisChars omitted from deps: the
+    // requery emission must NOT re-fire when a new synthesis lands,
+    // only when the user commits a NEW query. They're read at the
+    // moment of the requery for metadata fidelity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery]);
   const showBadge = !isInitialState && elapsedMs !== null;
   const latencyColor = error
     ? 'var(--hot)'
@@ -509,8 +576,13 @@ export default function SynthesisLab() {
             </div>
           ) : (
             <>
+              {/* See Memories.tsx for rationale: `key` on synthesis_id
+                  drives a fresh instance per synthesis output so dwell +
+                  thumb + click-feedback state can't leak across queries. */}
               <SynthesisCard
+                key={data?.synthesis?.synthesis_id ?? 'none'}
                 outcome={data?.synthesis}
+                recallId={requestId}
                 onCitationClick={handleCitationClick}
               />
 

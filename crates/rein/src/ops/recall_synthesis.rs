@@ -13,6 +13,9 @@ use crate::config::ReinConfig;
 use crate::extract::llm::{strip_code_fences, ExtractorKind};
 use crate::ops::concept_summary::create_concept_summary_extractor;
 use crate::search::recall::RecallResult;
+use crate::store::adaptive::{
+    synthesis_bucket_key, AdaptiveState, SYNTHESIS_COLD_START_N, SYNTHESIS_USEFUL_RATE_THRESHOLD,
+};
 use crate::types::ReinResult;
 use serde::Serialize;
 
@@ -71,9 +74,11 @@ pub struct Citation {
 ///   source_count: number;
 ///   model_used?: string;
 ///   skipped_disabled?: boolean;
+///   skipped_adaptive_decision?: boolean;
 ///   skipped_no_llm?: boolean;
 ///   skipped_too_few_results?: boolean;
 ///   citations?: Citation[];
+///   synthesis_id?: string;
 /// }
 /// export interface Citation {
 ///   rank: number;     // 1-based
@@ -92,9 +97,19 @@ pub struct RecallSynthesisOutcome {
     /// Model identifier, if determinable at call time. Reserved for future use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_used: Option<String>,
-    /// `true` when `[ars].recall_synthesis_enabled = false` (operator opted out).
+    /// `true` when `[ars].recall_synthesis_enabled = false` (operator opted
+    /// out globally). Mutually exclusive with `skipped_adaptive_decision`.
     #[serde(skip_serializing_if = "is_false")]
     pub skipped_disabled: bool,
+    /// v0.26 D direction: `true` when the per-query adaptive decision
+    /// (`decide_synthesize`) returned `Skip(AdaptiveDecision)` — i.e. the
+    /// global flag was on, but the cluster's `useful_rate` is below
+    /// `SYNTHESIS_USEFUL_RATE_THRESHOLD`. Distinct from `skipped_disabled`
+    /// (operator-off) so the GUI can surface "adaptive declined" as a
+    /// separate state from "operator off". Mutually exclusive with
+    /// `skipped_disabled` in practice.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_adaptive_decision: bool,
     /// `true` when no LLM provider is configured or the API key is absent.
     #[serde(skip_serializing_if = "is_false")]
     pub skipped_no_llm: bool,
@@ -107,6 +122,118 @@ pub struct RecallSynthesisOutcome {
     /// `synthesis` field — markers are removed before this is computed.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub citations: Vec<Citation>,
+    /// v0.26 D direction: ULID identifying this synthesis output.
+    /// Populated **only** when synthesis succeeded (i.e. `synthesis.is_some()`
+    /// after a successful LLM call); `None` on every skipped path
+    /// (`skipped_disabled`, `skipped_adaptive_decision`, `skipped_no_llm`,
+    /// `skipped_too_few_results`) AND when the LLM call returned an empty
+    /// or error response. Clients pass this back via `rein_feedback`
+    /// `SynthesisInteraction` events to close the M1 feedback loop.
+    /// Clients that receive a synthesis with `synthesis_id = None` MUST
+    /// NOT post interaction events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_id: Option<String>,
+}
+
+/// Reason a per-query synthesize gate skipped. Used inside
+/// [`SynthesizeDecision::Skip`].
+///
+/// The two reasons are reported through different `RecallSynthesisOutcome`
+/// flags so the GUI / observability surfaces can distinguish "operator off"
+/// from "the adaptive engine has learned this cluster doesn't benefit from
+/// synthesis". Without the split they collapse to "skipped" and the
+/// drift-detection signal is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// `[ars].recall_synthesis_enabled = false` — operator opted out
+    /// globally. Maps to `outcome.skipped_disabled = true`.
+    OperatorDisabled,
+    /// Per-query adaptive decision: cluster's `useful_rate` below
+    /// `SYNTHESIS_USEFUL_RATE_THRESHOLD`. Maps to
+    /// `outcome.skipped_adaptive_decision = true`.
+    AdaptiveDecision,
+}
+
+/// Per-query adaptive synthesize decision returned by [`decide_synthesize`].
+///
+/// `Yes` flows into the existing synthesis path; `Skip(reason)` short-circuits
+/// with the matching `outcome.skipped_*` flag set per [`SkipReason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynthesizeDecision {
+    Yes,
+    Skip(SkipReason),
+}
+
+/// Per-query synthesize decision used by `run_recall_synthesis`.
+///
+/// Cold-start fallback policy: when `global_enabled` is `true` but the
+/// adaptive state cannot disambiguate (no `cluster_id`, no adaptive state
+/// snapshot, no per-cluster bucket yet, or per-cluster events <
+/// `cold_start_n`), the function returns [`SynthesizeDecision::Yes`] — i.e.
+/// "behave like v0.25.x and let synthesis run". This is mandatory per
+/// contract §8 invariant 4: the per-query gate must NEVER silently skip
+/// synthesis just because adaptive data is missing.
+///
+/// When `global_enabled` is `false`, the function ALWAYS returns
+/// `Skip(OperatorDisabled)` — operator override wins over any adaptive
+/// signal.
+///
+/// Bucket key for `by_cluster.get(...)` is built via the canonical
+/// `synthesis_bucket_key` helper from `store::adaptive`, matching the
+/// `"{cid}|{qtype}"` format documented on
+/// `SynthesisFeedbackState.by_cluster`. Both sides reuse the same helper
+/// so they cannot drift; mismatch would produce a silent dead-code path.
+///
+/// Pure function — no IO, no allocation beyond the cluster-key string.
+pub fn decide_synthesize(
+    global_enabled: bool,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    adaptive_state: Option<&AdaptiveState>,
+    cold_start_n: u64,
+) -> SynthesizeDecision {
+    // Operator override wins. Even with rich adaptive data, if the operator
+    // disabled the global flag, the synthesis path is off.
+    if !global_enabled {
+        return SynthesizeDecision::Skip(SkipReason::OperatorDisabled);
+    }
+
+    // Cold-start ladder: each missing piece falls back to "Yes" (matches
+    // pre-adaptive v0.25.x behavior). Per contract §8 invariant 4 the gate
+    // must NEVER skip silently just because the per-query data is missing.
+    //
+    // `cluster_id = None` short-circuits to Yes — the synthesis bucket
+    // helper supports a `-1` "no cluster" key, but we deliberately do NOT
+    // route the gate through it: the global `-1` bucket aggregates events
+    // across ALL queries that lacked a cluster (different queries, different
+    // characteristics), so its `useful_rate` is too noisy to gate
+    // individual recalls on. The global bucket is preserved for the
+    // consumer-side `/api/adaptive` rollup, not for runtime gating.
+    let Some(cid) = cluster_id else {
+        return SynthesizeDecision::Yes;
+    };
+    let Some(state) = adaptive_state else {
+        return SynthesizeDecision::Yes;
+    };
+    let Some(synth_state) = state.synthesis_feedback_stats.as_ref() else {
+        return SynthesizeDecision::Yes;
+    };
+    let key = synthesis_bucket_key(Some(cid), query_type);
+    let Some(cluster) = synth_state.by_cluster.get(&key) else {
+        return SynthesizeDecision::Yes;
+    };
+    if cluster.viewed_count < cold_start_n {
+        return SynthesizeDecision::Yes;
+    }
+
+    // Per-cluster gate: skip if learned useful_rate is below the bootstrap
+    // threshold (cluster has acquired enough events to disagree with the
+    // global default).
+    if cluster.useful_rate >= SYNTHESIS_USEFUL_RATE_THRESHOLD {
+        SynthesizeDecision::Yes
+    } else {
+        SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)
+    }
 }
 
 /// Run recall-time synthesis over `results` for `query`.
@@ -115,6 +242,14 @@ pub struct RecallSynthesisOutcome {
 /// `Some(false)`). Returns `Some(RecallSynthesisOutcome)` when requested — the
 /// outcome's `skipped_*` flags explain why synthesis was not produced (if any).
 ///
+/// v0.26 D direction: `adaptive_state` carries the per-cluster
+/// `SynthesisFeedbackState` consumed by [`decide_synthesize`]. Pass `None`
+/// for cold-start callers (e.g. CLI, tests) — the gate degrades gracefully
+/// to v0.25.x behavior. Production should pass
+/// `AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default()`
+/// from inside the recall handler so synthesis sees the same adaptive
+/// snapshot used elsewhere in the request.
+///
 /// `extractor_override` is only used by tests (feature `test-support`); pass
 /// `None` in production.
 pub fn run_recall_synthesis(
@@ -122,6 +257,7 @@ pub fn run_recall_synthesis(
     query: &str,
     config: &ReinConfig,
     synthesize: Option<bool>,
+    adaptive_state: Option<&AdaptiveState>,
     extractor_override: Option<ExtractorKind>,
 ) -> Option<RecallSynthesisOutcome> {
     if synthesize != Some(true) {
@@ -135,14 +271,60 @@ pub fn run_recall_synthesis(
         source_count,
         model_used: None,
         skipped_disabled: false,
+        skipped_adaptive_decision: false,
         skipped_no_llm: false,
         skipped_too_few_results: false,
         citations: Vec::new(),
+        synthesis_id: None,
     };
 
-    if !config.ars.recall_synthesis_enabled {
-        outcome.skipped_disabled = true;
-        return Some(outcome);
+    // v0.26 D direction: per-query adaptive gate. Replaces the standalone
+    // `if !config.ars.recall_synthesis_enabled { … }` check so operator-off
+    // and per-cluster-decline route through the same decision surface.
+    //
+    // Cluster id source: first result's `cluster_id`. Top-1 is a reasonable
+    // proxy because results are already ranked by score, and per-cluster
+    // synthesis-quality signals are most relevant where the strongest
+    // candidate sits.
+    //
+    // query_type: hardcoded to `"Semantic"` for v0.26.0. This matches the
+    // capitalisation B_FEEDBACK_EVENT writes into the
+    // `SynthesisInteractionPayload.metadata.query_type` field (verified in
+    // `store/adaptive.rs` test fixtures; see e.g.
+    // `recompute_synthesis_feedback_*` tests using `synthesis_bucket_key(_,
+    // "Semantic")`). The bucket key is built by both sides via
+    // `synthesis_bucket_key`, so the strings MUST match exactly — using
+    // lowercase here would silently miss every per-cluster bucket and turn
+    // the gate into dead code. Note this is DIFFERENT from
+    // `QueryType::Semantic.to_string()` (search/classify.rs:412), which
+    // produces lowercase `"semantic"` for the route name — that surface
+    // is unrelated to the synthesis bucket key.
+    //
+    // TODO v0.26.1: wire query classifier output through RecallResult /
+    // recall handler so the bucket key reflects the real query type. The
+    // canonical mapping is `QueryType -> "Semantic"|"Episodic"|...` (each
+    // variant capitalised to match the v0.26.0 payload convention).
+    let cluster_id = results
+        .first()
+        .and_then(|r| r.memory.cluster_id)
+        .map(|c| c as i64);
+    let query_type = "Semantic"; // TODO v0.26.1: wire query classifier output
+    match decide_synthesize(
+        config.ars.recall_synthesis_enabled,
+        cluster_id,
+        query_type,
+        adaptive_state,
+        SYNTHESIS_COLD_START_N,
+    ) {
+        SynthesizeDecision::Yes => { /* fall through to synthesis path */ }
+        SynthesizeDecision::Skip(SkipReason::OperatorDisabled) => {
+            outcome.skipped_disabled = true;
+            return Some(outcome);
+        }
+        SynthesizeDecision::Skip(SkipReason::AdaptiveDecision) => {
+            outcome.skipped_adaptive_decision = true;
+            return Some(outcome);
+        }
     }
 
     let min_results = config.ars.recall_synthesis_min_results;
@@ -189,6 +371,12 @@ pub fn run_recall_synthesis(
                 let (clean, citations) = extract_citations(&text, included_count);
                 outcome.synthesis = Some(clean);
                 outcome.citations = citations;
+                // v0.26 D direction: stamp a fresh ULID **only** on a
+                // successful synthesis. Empty LLM output (text was empty
+                // post-strip) leaves `synthesis_id = None` so clients
+                // know not to emit interaction feedback. Per contract
+                // §8 invariant 9.
+                outcome.synthesis_id = Some(ulid::Ulid::new().to_string());
             }
         }
         Err(e) => {
@@ -518,6 +706,9 @@ mod tests {
             embedding: None,
             tier: crate::types::MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
@@ -533,6 +724,7 @@ mod tests {
                 sources_hit: 2,
                 evidence_count: 0,
                 evidence_preview: vec![],
+                archival_summary: None,
             })
             .collect()
     }
@@ -542,11 +734,11 @@ mod tests {
         let config = ReinConfig::default();
         let results = make_results(5);
         assert!(
-            run_recall_synthesis(&results, "test query", &config, None, None).is_none(),
+            run_recall_synthesis(&results, "test query", &config, None, None, None).is_none(),
             "None synthesize param → None outcome"
         );
         assert!(
-            run_recall_synthesis(&results, "test query", &config, Some(false), None).is_none(),
+            run_recall_synthesis(&results, "test query", &config, Some(false), None, None).is_none(),
             "Some(false) synthesize param → None outcome"
         );
     }
@@ -556,11 +748,16 @@ mod tests {
         let config = ReinConfig::default(); // recall_synthesis_enabled = false
         let results = make_results(5);
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), None, None).unwrap();
         assert!(outcome.skipped_disabled, "feature off → skipped_disabled");
+        assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_no_llm);
         assert!(!outcome.skipped_too_few_results);
         assert!(outcome.synthesis.is_none());
+        assert!(
+            outcome.synthesis_id.is_none(),
+            "skipped paths leave synthesis_id = None"
+        );
         assert_eq!(outcome.query, "test");
         assert_eq!(outcome.source_count, 5);
     }
@@ -572,13 +769,15 @@ mod tests {
         config.ars.recall_synthesis_min_results = 3;
         let results = make_results(2); // < 3
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), None, None).unwrap();
         assert!(
             outcome.skipped_too_few_results,
             "2 results < min 3 → skipped_too_few_results"
         );
         assert!(!outcome.skipped_disabled);
+        assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_no_llm);
+        assert!(outcome.synthesis_id.is_none());
     }
 
     #[test]
@@ -591,10 +790,12 @@ mod tests {
         config.extract.provider = "none".to_string();
         let results = make_results(5); // >= 3
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), None).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), None, None).unwrap();
         assert!(outcome.skipped_no_llm, "no provider → skipped_no_llm");
         assert!(!outcome.skipped_disabled);
+        assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_too_few_results);
+        assert!(outcome.synthesis_id.is_none());
     }
 
     #[cfg(feature = "test-support")]
@@ -609,9 +810,10 @@ mod tests {
         let mock =
             ExtractorKind::Mock(MockExtractor::with_fixed_response("Synthesized narrative."));
         let outcome =
-            run_recall_synthesis(&results, "test query", &config, Some(true), Some(mock))
+            run_recall_synthesis(&results, "test query", &config, Some(true), None, Some(mock))
                 .unwrap();
         assert!(!outcome.skipped_disabled);
+        assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_no_llm);
         assert!(!outcome.skipped_too_few_results);
         assert_eq!(
@@ -621,6 +823,16 @@ mod tests {
         );
         assert_eq!(outcome.source_count, 5);
         assert_eq!(outcome.query, "test query");
+        // v0.26 D direction: successful synthesis stamps a ULID.
+        let synth_id = outcome
+            .synthesis_id
+            .as_deref()
+            .expect("successful synthesis must populate synthesis_id");
+        assert_eq!(
+            synth_id.len(),
+            26,
+            "synthesis_id is a ULID (Crockford base32, 26 chars); got {synth_id:?}"
+        );
     }
 
     // ── prompt cap (Round 2 P2 regression coverage) ──────────────────────────
@@ -670,6 +882,7 @@ mod tests {
                     sources_hit: 2,
                     evidence_count: 0,
                     evidence_preview: vec![],
+                    archival_summary: None,
                 }
             })
             .collect();
@@ -904,7 +1117,7 @@ mod tests {
             "The auth middleware was rewritten[#1][#3]. The new design uses session storage[#2].",
         ));
         let outcome =
-            run_recall_synthesis(&results, "auth", &config, Some(true), Some(mock)).unwrap();
+            run_recall_synthesis(&results, "auth", &config, Some(true), None, Some(mock)).unwrap();
         assert_eq!(
             outcome.synthesis.as_deref(),
             Some("The auth middleware was rewritten. The new design uses session storage."),
@@ -946,7 +1159,7 @@ mod tests {
             "Sourced claim[#1] and a hallucinated claim[#9].",
         ));
         let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), Some(mock)).unwrap();
+            run_recall_synthesis(&results, "test", &config, Some(true), None, Some(mock)).unwrap();
         assert_eq!(
             outcome.synthesis.as_deref(),
             Some("Sourced claim and a hallucinated claim."),
@@ -959,6 +1172,420 @@ mod tests {
                 span_end: "Sourced claim".chars().count(),
             }],
             "out-of-range [#9] dropped, [#1] preserved"
+        );
+    }
+
+    // ── v0.26 D direction: decide_synthesize gate (cold-start, threshold,
+    // operator-disabled, mutually-exclusive flags) ──────────────────────────
+
+    use crate::store::adaptive::{
+        ClusterSynthesisStats, SynthesisFeedbackState, SYNTHESIS_COLD_START_N,
+        SYNTHESIS_USEFUL_RATE_THRESHOLD,
+    };
+
+    /// Build a `ClusterSynthesisStats` with a target `useful_rate` and
+    /// `viewed_count` — the only fields `decide_synthesize` reads.
+    fn cluster_stats(viewed: u64, rate: f64) -> ClusterSynthesisStats {
+        ClusterSynthesisStats {
+            viewed_count: viewed,
+            useful_rate: rate,
+            ..Default::default()
+        }
+    }
+
+    /// Helper: build an `AdaptiveState` with one bucket pre-populated.
+    fn state_with_bucket(key: &str, stats: ClusterSynthesisStats) -> AdaptiveState {
+        let mut sfs = SynthesisFeedbackState::default();
+        sfs.by_cluster.insert(key.to_string(), stats);
+        AdaptiveState {
+            synthesis_feedback_stats: Some(sfs),
+            ..Default::default()
+        }
+    }
+
+    /// Cold-start path 1: empty `Option<&AdaptiveState>` → return Yes
+    /// (matches v0.25.x behavior). Per contract §8 invariant 4.
+    #[test]
+    fn decide_synthesize_cold_start_no_state_returns_yes() {
+        let decision = decide_synthesize(true, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N);
+        assert_eq!(decision, SynthesizeDecision::Yes);
+    }
+
+    /// Cold-start path 2: state present but `synthesis_feedback_stats =
+    /// None` (fresh install) → return Yes.
+    #[test]
+    fn decide_synthesize_cold_start_no_synthesis_state_returns_yes() {
+        let state = AdaptiveState::default(); // synthesis_feedback_stats: None
+        let decision = decide_synthesize(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+        );
+        assert_eq!(decision, SynthesizeDecision::Yes);
+    }
+
+    /// Cold-start path 3: cluster_id is None — runtime gate must NOT route
+    /// through the global `-1` bucket (too noisy for individual recalls).
+    #[test]
+    fn decide_synthesize_cold_start_no_cluster_id_returns_yes() {
+        // Even with a populated state, no cluster_id → cold-start fallback.
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(100, 0.1), // would skip if it were looked up
+        );
+        let decision =
+            decide_synthesize(true, None, "Semantic", Some(&state), SYNTHESIS_COLD_START_N);
+        assert_eq!(decision, SynthesizeDecision::Yes);
+    }
+
+    /// Cold-start path 4: cluster has data but `viewed_count <
+    /// COLD_START_N` → return Yes (insufficient samples to trust).
+    #[test]
+    fn decide_synthesize_cold_start_insufficient_samples_returns_yes() {
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N - 1, 0.0), // 1 short of threshold, useful_rate awful
+        );
+        let decision = decide_synthesize(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+        );
+        assert_eq!(decision, SynthesizeDecision::Yes);
+    }
+
+    /// Warm cluster, useful_rate ABOVE threshold → return Yes (adaptive
+    /// signal agrees with global default).
+    #[test]
+    fn decide_synthesize_warm_cluster_above_threshold_returns_yes() {
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD + 0.1),
+        );
+        let decision = decide_synthesize(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+        );
+        assert_eq!(decision, SynthesizeDecision::Yes);
+    }
+
+    /// Warm cluster, useful_rate BELOW threshold → return
+    /// `Skip(AdaptiveDecision)`. The adaptive signal disagrees with the
+    /// global default, so we trust it.
+    #[test]
+    fn decide_synthesize_warm_cluster_below_threshold_returns_skip_adaptive() {
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+        );
+        let decision = decide_synthesize(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+        );
+        assert_eq!(decision, SynthesizeDecision::Skip(SkipReason::AdaptiveDecision));
+    }
+
+    /// Operator-off ALWAYS short-circuits — even with rich adaptive data
+    /// suggesting synthesis would help, the operator override wins.
+    #[test]
+    fn decide_synthesize_operator_disabled_overrides_adaptive() {
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 10, 1.0), // perfect useful_rate
+        );
+        let decision = decide_synthesize(
+            false, // operator off
+            Some(42),
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+        );
+        assert_eq!(
+            decision,
+            SynthesizeDecision::Skip(SkipReason::OperatorDisabled)
+        );
+    }
+
+    /// Operator-off + cold-start (no adaptive state at all) — still
+    /// `OperatorDisabled`, NOT `AdaptiveDecision`. The two reasons are
+    /// distinct surfaces for the GUI.
+    #[test]
+    fn decide_synthesize_operator_disabled_with_no_state() {
+        let decision =
+            decide_synthesize(false, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N);
+        assert_eq!(
+            decision,
+            SynthesizeDecision::Skip(SkipReason::OperatorDisabled)
+        );
+    }
+
+    /// Bucket-key mismatch (different query_type, same cluster) → cold-start
+    /// fallback — gate looks at the wrong bucket and finds nothing.
+    /// Proves the function honors the query_type partition; v0.26.1 will
+    /// pull the real query_type from the classifier so different intents
+    /// don't bleed into one another.
+    #[test]
+    fn decide_synthesize_query_type_partition_isolates_buckets() {
+        // Cluster 42 has plenty of "Episodic" data saying "skip" — but
+        // we're asking about "Semantic", which has no bucket → Yes.
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Episodic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 50, 0.0), // would Skip if it matched
+        );
+        let decision = decide_synthesize(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+        );
+        assert_eq!(
+            decision,
+            SynthesizeDecision::Yes,
+            "different query_type → different bucket → cold-start fallback"
+        );
+    }
+
+    /// Custom `cold_start_n` plumbing: pass a smaller value to flip from
+    /// cold-start to per-cluster behavior.
+    #[test]
+    fn decide_synthesize_custom_cold_start_n() {
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(3, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+        );
+        // viewed=3 < default cold_start_n=10 → Yes
+        assert_eq!(
+            decide_synthesize(true, Some(42), "Semantic", Some(&state), 10),
+            SynthesizeDecision::Yes
+        );
+        // viewed=3 >= custom cold_start_n=2 → consults useful_rate (below
+        // threshold) → Skip
+        assert_eq!(
+            decide_synthesize(true, Some(42), "Semantic", Some(&state), 2),
+            SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)
+        );
+    }
+
+    // ── RecallSynthesisOutcome serde — synthesis_id + skipped_adaptive_decision ──
+
+    /// Round-trip: a populated `synthesis_id` survives JSON serialization
+    /// and is visible to clients.
+    #[test]
+    fn outcome_serde_roundtrip_synthesis_id() {
+        let outcome = RecallSynthesisOutcome {
+            synthesis: Some("test prose".to_string()),
+            query: "q".to_string(),
+            source_count: 3,
+            model_used: None,
+            skipped_disabled: false,
+            skipped_adaptive_decision: false,
+            skipped_no_llm: false,
+            skipped_too_few_results: false,
+            citations: Vec::new(),
+            synthesis_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        // Field MUST be present in the wire format when populated.
+        assert!(
+            json.contains("synthesis_id"),
+            "synthesis_id absent from JSON: {json}"
+        );
+        assert!(json.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    /// `synthesis_id = None` MUST be omitted from the wire format
+    /// (`skip_serializing_if = "Option::is_none"`) — old clients that
+    /// don't know the field stay bit-identical to their previous experience.
+    #[test]
+    fn outcome_serde_synthesis_id_omitted_when_none() {
+        let outcome = RecallSynthesisOutcome {
+            synthesis: None,
+            query: "q".to_string(),
+            source_count: 0,
+            model_used: None,
+            skipped_disabled: true,
+            skipped_adaptive_decision: false,
+            skipped_no_llm: false,
+            skipped_too_few_results: false,
+            citations: Vec::new(),
+            synthesis_id: None,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !json.contains("synthesis_id"),
+            "synthesis_id SHOULD be elided when None; got JSON: {json}"
+        );
+    }
+
+    /// `skipped_adaptive_decision = true` is visible in the wire format
+    /// (skip_serializing_if = false collapses the field, but true stays).
+    #[test]
+    fn outcome_serde_skipped_adaptive_decision_visible_when_true() {
+        let outcome = RecallSynthesisOutcome {
+            synthesis: None,
+            query: "q".to_string(),
+            source_count: 5,
+            model_used: None,
+            skipped_disabled: false,
+            skipped_adaptive_decision: true,
+            skipped_no_llm: false,
+            skipped_too_few_results: false,
+            citations: Vec::new(),
+            synthesis_id: None,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            json.contains("skipped_adaptive_decision"),
+            "true value MUST appear in wire format: {json}"
+        );
+    }
+
+    /// Mutual-exclusivity sanity: no `decide_synthesize` outcome can set
+    /// both `skipped_disabled` AND `skipped_adaptive_decision`. Verified at
+    /// the gate-result level — `OperatorDisabled` short-circuits before
+    /// the per-cluster check can fire.
+    #[test]
+    fn skipped_flags_are_mutually_exclusive() {
+        // Build a config that passes the per-cluster check (operator on,
+        // useful_rate above threshold) AND a config that fails (operator
+        // off). Run both through the gate and assert the resulting
+        // outcome has at most ONE skipped flag set.
+        let warm_state = state_with_bucket(
+            &synthesis_bucket_key(Some(42), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+        );
+        let scenarios = [
+            // (global, expected_decision)
+            (true, SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)),
+            (false, SynthesizeDecision::Skip(SkipReason::OperatorDisabled)),
+        ];
+        for (global, expected) in scenarios {
+            let decision = decide_synthesize(
+                global,
+                Some(42),
+                "Semantic",
+                Some(&warm_state),
+                SYNTHESIS_COLD_START_N,
+            );
+            assert_eq!(decision, expected);
+            // Reduce to the (skipped_disabled, skipped_adaptive_decision)
+            // pair the run_recall_synthesis gate would set:
+            let (sd, sa) = match decision {
+                SynthesizeDecision::Yes => (false, false),
+                SynthesizeDecision::Skip(SkipReason::OperatorDisabled) => (true, false),
+                SynthesizeDecision::Skip(SkipReason::AdaptiveDecision) => (false, true),
+            };
+            // Only one (or zero) flag may be true at a time.
+            assert!(
+                !(sd && sa),
+                "flags must be mutually exclusive (got skipped_disabled={sd}, skipped_adaptive_decision={sa})"
+            );
+        }
+    }
+
+    /// Backward serde: deserialize a v0.25.x payload (no `synthesis_id`,
+    /// no `skipped_adaptive_decision` keys) — both new fields default
+    /// gracefully.
+    ///
+    /// `RecallSynthesisOutcome` is `Serialize` only in production code,
+    /// so this test uses a structurally-equivalent local `Deserialize`
+    /// shadow type to verify the wire shape parses cleanly. If a future
+    /// edit accidentally drops `#[serde(default)]` from the new fields,
+    /// this test will fail with a "missing field" error.
+    #[test]
+    fn outcome_serde_backward_compat_old_payload_parses() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OutcomeReadback {
+            #[serde(default)]
+            synthesis: Option<String>,
+            query: String,
+            source_count: usize,
+            #[serde(default)]
+            skipped_disabled: bool,
+            // The new v0.26.0 fields MUST default cleanly when missing
+            // from the wire payload.
+            #[serde(default)]
+            skipped_adaptive_decision: bool,
+            #[serde(default)]
+            synthesis_id: Option<String>,
+        }
+
+        // v0.25.x-era payload: no synthesis_id / skipped_adaptive_decision.
+        let old_json = r#"{
+            "synthesis": "old prose",
+            "query": "q",
+            "source_count": 3,
+            "skipped_disabled": false
+        }"#;
+        let parsed: OutcomeReadback = serde_json::from_str(old_json)
+            .expect("v0.25.x payload must still parse on v0.26.0 readback");
+        assert_eq!(parsed.synthesis.as_deref(), Some("old prose"));
+        assert!(!parsed.skipped_adaptive_decision);
+        assert!(parsed.synthesis_id.is_none());
+    }
+
+    /// End-to-end: when the per-query gate returns
+    /// `Skip(AdaptiveDecision)`, `run_recall_synthesis` MUST set
+    /// `outcome.skipped_adaptive_decision = true` AND leave
+    /// `synthesis_id = None` AND skip the LLM call entirely (so the test
+    /// can run without a real provider). Wires together
+    /// `decide_synthesize` + `run_recall_synthesis` + the new outcome
+    /// flag so a future regression that breaks the gate→outcome plumbing
+    /// surfaces here, not 6 layers deep in production.
+    #[test]
+    fn run_recall_synthesis_routes_adaptive_skip_into_outcome_flag() {
+        // Build results with cluster_id=0 so the gate's cluster_id branch
+        // engages instead of cold-start fallback. (`make_memory` defaults
+        // cluster_id=None which would short-circuit to Yes.)
+        let mut results = make_results(5);
+        for r in &mut results {
+            r.memory.cluster_id = Some(0);
+        }
+
+        // Adaptive state: bucket exists, has plenty of samples, but
+        // `useful_rate` below threshold → Skip(AdaptiveDecision).
+        let state = state_with_bucket(
+            &synthesis_bucket_key(Some(0), "Semantic"),
+            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+        );
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+
+        let outcome =
+            run_recall_synthesis(&results, "test", &config, Some(true), Some(&state), None)
+                .expect("synthesis was requested → Some(outcome)");
+
+        assert!(
+            outcome.skipped_adaptive_decision,
+            "per-query gate skip MUST set skipped_adaptive_decision; got {outcome:?}"
+        );
+        assert!(
+            !outcome.skipped_disabled,
+            "operator was on; skipped_disabled MUST stay false to keep the two flags distinguishable"
+        );
+        assert!(
+            outcome.synthesis.is_none(),
+            "skipped paths MUST NOT carry a synthesis prose"
+        );
+        assert!(
+            outcome.synthesis_id.is_none(),
+            "skipped paths MUST leave synthesis_id = None (contract §8 invariant 9)"
         );
     }
 }

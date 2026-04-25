@@ -818,15 +818,29 @@ fn api_recall(
     match run_recall_query(config, query, None) {
         Ok((results, request_id, synthesize_query)) => {
             // Cap B (v0.25): when ?synthesize=true is set on /api/memories,
-            // run recall-time synthesis. The LLM call sits OUTSIDE the store
-            // open block above (results already collected) so block_in_place
-            // never nests inside any store transaction guard. Returns None
-            // when the param is not Some(true).
+            // run recall-time synthesis. The LLM call sits OUTSIDE any store
+            // open block (results already collected) so block_in_place never
+            // nests inside any store transaction guard.
+            //
+            // v0.26 D direction: load `AdaptiveState` so per-query gate has
+            // parity with the MCP/CLI path (`ops/handlers/memory.rs:710`).
+            // Without this, REST callers always fall to the global flag and
+            // the per-cluster `useful_rate` signal is invisible to REST
+            // recalls — the very deployments most likely to feed back
+            // `synthesis_interaction` events via the GUI. Codex round 1 F-6.
+            let adaptive_state = crate::store::SqliteStore::new(
+                std::path::Path::new(&config.database.path),
+                &config.embedding_model(),
+                config.embedding.dimensions,
+            )
+            .ok()
+            .and_then(|s| crate::store::adaptive::AdaptiveState::restore_snapshot(s.conn()));
             let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
                 &results,
                 &synthesize_query.original_query,
                 config,
                 synthesize_query.synthesize,
+                adaptive_state.as_ref(),
                 None,
             );
             recall_results_response(results, 0, None, &request_id, synthesis)
@@ -1646,6 +1660,9 @@ mod tests {
             embedding: None,
             tier: MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
@@ -1727,6 +1744,63 @@ mod tests {
         assert_eq!(json["count"].as_u64(), Some(2));
         assert!(json.get("next_offset").is_none());
         assert_eq!(json["results"].as_array().unwrap().len(), 2);
+    }
+
+    /// v0.26 D direction (B_REST_MCP): `/api/adaptive` JSON response MUST
+    /// include the `synthesis` key on a fresh DB (cold-start state). The GUI
+    /// Adaptive page conditions its empty-state branch on the presence of
+    /// this key — a regression here would silently break the synthesis
+    /// observability surface even though the rest of `/api/adaptive` looks
+    /// healthy.
+    ///
+    /// Cold-start contract per implementation-contract §4.3:
+    ///     synthesis = { "by_cluster": [], "global": null }
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn api_adaptive_response_includes_synthesis_cold_start_shape() {
+        let _guard = env_lock().lock().await;
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("adaptive.db");
+        let config = test_config(&db_path);
+        // Touch the store so the schema migrations run before /api/adaptive
+        // queries it. Without this, the inventory dispatcher would still
+        // succeed (adaptive_status uses unwrap_or_default on missing rows)
+        // but the test would also exercise the lazy-init path — keeping it
+        // explicit makes the cold-start contract unambiguous.
+        let _store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/adaptive")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&req, &config).await.unwrap();
+        let json = read_json(response).await;
+
+        // Existing keys preserved (smoke-check that we didn't accidentally
+        // restructure the response body) — at least one well-known field
+        // from the pre-v0.26 shape MUST still be present.
+        assert!(
+            json.get("learned_alphas").is_some(),
+            "/api/adaptive must keep its pre-v0.26 keys (learned_alphas)"
+        );
+        assert!(
+            json.get("cluster_info").is_some(),
+            "/api/adaptive must keep its pre-v0.26 keys (cluster_info)"
+        );
+
+        // v0.26 surface: `synthesis` key with cold-start contract shape.
+        let synthesis = json
+            .get("synthesis")
+            .expect("/api/adaptive response must include `synthesis` key");
+        assert_eq!(
+            synthesis,
+            &serde_json::json!({
+                "by_cluster": [],
+                "global": null,
+            }),
+            "cold-start synthesis projection must match contract §4.3 exactly"
+        );
     }
 
     #[tokio::test]

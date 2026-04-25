@@ -8,6 +8,7 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 pub mod adaptive;
+pub mod cold_archive_summary;
 pub mod concept_summary;
 pub mod consolidation;
 pub mod dedup;
@@ -85,6 +86,9 @@ pub fn build_memory(
         embedding: None,
         tier: MemoryTier::Warm,
         cluster_id: None,
+        archival_summary: None,
+        archival_summary_at: None,
+        archival_summary_version: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed: chrono::Utc::now(),
@@ -1629,6 +1633,13 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         })
         .collect();
 
+    // v0.26 D direction: project the synthesis interaction aggregates from
+    // AdaptiveState. Cold-start (no events yet, or `synthesis_feedback_stats`
+    // absent on the snapshot — older AdaptiveState rows pre-v0.26 have no
+    // such field and `Option::None` after restore) returns the empty/null
+    // shape per implementation-contract §4.3.
+    let synthesis = project_synthesis_status(state.synthesis_feedback_stats.as_ref());
+
     serde_json::json!({
         "learned_alphas": learned_alphas,
         "reranker_weights": reranker_weights,
@@ -1638,6 +1649,103 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         "survival_curves": survival_curves,
         "dedup_thresholds": dedup_thresholds,
         "cluster_profiles": cluster_profiles,
+        "synthesis": synthesis,
+    })
+}
+
+/// v0.26 D direction: project `SynthesisFeedbackState` to the GUI-facing
+/// adaptive shape.
+///
+/// Bucket key in the source state is `"{cluster_id}|{query_type}"` per
+/// `store/adaptive.rs::SynthesisFeedbackState`. The `(-1, "_global")` bucket
+/// is the documented "no cluster / unknown" sink — we lift it into the
+/// `global` object's `useful_rate` and exclude it from `by_cluster` so the
+/// GUI's per-cluster table stays free of synthetic rows.
+///
+/// Cold-start (state is `None`): returns
+/// `{ "by_cluster": [], "global": null }` exactly as the contract specifies.
+///
+/// Pure function — testable without a real store. Tests live in `mod tests`
+/// at the bottom of this file.
+pub(crate) fn project_synthesis_status(
+    state: Option<&crate::store::adaptive::SynthesisFeedbackState>,
+) -> serde_json::Value {
+    let Some(s) = state else {
+        return serde_json::json!({
+            "by_cluster": [],
+            "global": null,
+        });
+    };
+
+    let mut by_cluster: Vec<serde_json::Value> = Vec::new();
+    let mut global_useful_rate: Option<f64> = None;
+    for (key, stats) in s.by_cluster.iter() {
+        // Key shape: "{cid}|{qtype}". cid is i64 and may be -1 for the
+        // global sink. qtype is the ASCII query-type name (Semantic /
+        // Temporal / etc) or "_global" for the sink. `split_once` on the
+        // first '|' is safe: cid is decimal-only and never contains '|',
+        // and the documented qtype values are ASCII identifiers without '|'.
+        let (cid_str, qtype) = match key.split_once('|') {
+            Some(parts) => parts,
+            None => continue, // malformed bucket key — skip rather than panic
+        };
+        let cid: i64 = match cid_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // The global sink (cid == -1) feeds `global.useful_rate` — exclude
+        // from the per-cluster array.
+        if cid == -1 {
+            global_useful_rate = Some(stats.useful_rate);
+            continue;
+        }
+
+        let clicked_source_rate = if stats.viewed_count > 0 {
+            stats.clicked_source_count as f64 / stats.viewed_count as f64
+        } else {
+            0.0
+        };
+        let immediate_requery_rate = if stats.viewed_count > 0 {
+            stats.immediate_requery_count as f64 / stats.viewed_count as f64
+        } else {
+            0.0
+        };
+        let thumb_denom = stats.explicit_up + stats.explicit_down;
+        let explicit_thumb_up_rate = if thumb_denom > 0 {
+            stats.explicit_up as f64 / thumb_denom as f64
+        } else {
+            0.0
+        };
+        by_cluster.push(serde_json::json!({
+            "cluster_id": cid,
+            "query_type": qtype,
+            "useful_rate": stats.useful_rate,
+            "viewed_count": stats.viewed_count,
+            "viewed_dwell_p50_ms": stats.viewed_dwell_p50_ms,
+            "clicked_source_rate": clicked_source_rate,
+            "immediate_requery_rate": immediate_requery_rate,
+            "explicit_thumb_up_rate": explicit_thumb_up_rate,
+        }));
+    }
+    // Stable order for the GUI table — by cluster_id ascending, then
+    // query_type. Without this, HashMap iteration order would shuffle
+    // between calls and the chart would re-sort visibly.
+    by_cluster.sort_by(|a, b| {
+        let ac = a.get("cluster_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let bc = b.get("cluster_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let aq = a.get("query_type").and_then(|v| v.as_str()).unwrap_or("");
+        let bq = b.get("query_type").and_then(|v| v.as_str()).unwrap_or("");
+        ac.cmp(&bc).then_with(|| aq.cmp(bq))
+    });
+
+    serde_json::json!({
+        "by_cluster": by_cluster,
+        "global": {
+            "useful_rate": global_useful_rate,
+            "total_events": s.total_events,
+            "last_consumed_event_id": s.last_consumed_event_id,
+        },
     })
 }
 
@@ -1891,6 +1999,9 @@ mod tests {
             embedding: None,
             tier: MemoryTier::Warm,
             cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
@@ -2181,5 +2292,176 @@ mod tests {
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].memory_count, 2);
         assert!(report.groups[0].created_id.is_none());
+    }
+
+    // ── v0.26 D direction: synthesis projection (B_REST_MCP) ──────────────
+
+    /// Test #6: cold-start state (no AdaptiveState.synthesis_feedback_stats)
+    /// renders the exact contract-specified empty shape:
+    ///   `{ "by_cluster": [], "global": null }`
+    /// This is the shape /api/adaptive returns on a fresh install (no
+    /// synthesis events have been emitted) and the GUI's empty-state branch
+    /// keys off it.
+    #[test]
+    fn project_synthesis_status_cold_start_returns_empty_by_cluster_and_null_global() {
+        let projected = project_synthesis_status(None);
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "by_cluster": [],
+                "global": null,
+            }),
+            "cold-start projection MUST be {{by_cluster: [], global: null}} per contract §4.3"
+        );
+    }
+
+    /// Per-cluster projection rendering: a populated SynthesisFeedbackState
+    /// with two real clusters + the global sink (cid=-1) MUST render
+    /// `by_cluster` with only the real clusters (sorted by cluster_id), and
+    /// MUST lift the sink's `useful_rate` into `global.useful_rate`.
+    #[test]
+    fn project_synthesis_status_separates_global_sink_from_real_clusters() {
+        let mut by_cluster = std::collections::HashMap::new();
+        by_cluster.insert(
+            "42|Semantic".to_string(),
+            crate::store::adaptive::ClusterSynthesisStats {
+                viewed_count: 100,
+                viewed_dwell_total_ms: 0,
+                dwell_samples: vec![],
+                viewed_dwell_p50_ms: Some(4200),
+                clicked_source_count: 18,
+                immediate_requery_count: 5,
+                explicit_up: 30,
+                explicit_down: 5,
+                useful_rate: 0.73,
+            },
+        );
+        by_cluster.insert(
+            "7|Temporal".to_string(),
+            crate::store::adaptive::ClusterSynthesisStats {
+                viewed_count: 50,
+                viewed_dwell_total_ms: 0,
+                dwell_samples: vec![],
+                viewed_dwell_p50_ms: Some(2100),
+                clicked_source_count: 5,
+                immediate_requery_count: 1,
+                explicit_up: 10,
+                explicit_down: 0,
+                useful_rate: 0.55,
+            },
+        );
+        // The global sink — cid=-1, qtype=_global. Must NOT appear in
+        // by_cluster, but MUST surface as global.useful_rate.
+        by_cluster.insert(
+            "-1|_global".to_string(),
+            crate::store::adaptive::ClusterSynthesisStats {
+                viewed_count: 200,
+                viewed_dwell_total_ms: 0,
+                dwell_samples: vec![],
+                viewed_dwell_p50_ms: None,
+                clicked_source_count: 0,
+                immediate_requery_count: 0,
+                explicit_up: 0,
+                explicit_down: 0,
+                useful_rate: 0.68,
+            },
+        );
+
+        let state = crate::store::adaptive::SynthesisFeedbackState {
+            by_cluster,
+            by_synthesis: std::collections::HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 9876,
+            total_events: 8421,
+        };
+
+        let projected = project_synthesis_status(Some(&state));
+
+        // Top-level shape
+        let by_cluster_arr = projected
+            .get("by_cluster")
+            .and_then(|v| v.as_array())
+            .expect("by_cluster must be an array");
+        // Global sink (-1) must be excluded from the per-cluster table.
+        assert_eq!(
+            by_cluster_arr.len(),
+            2,
+            "by_cluster must exclude the cid=-1 global sink"
+        );
+        // Sorted ascending by cluster_id: 7 first, then 42.
+        assert_eq!(
+            by_cluster_arr[0]["cluster_id"].as_i64(),
+            Some(7),
+            "by_cluster must be sorted by cluster_id ascending"
+        );
+        assert_eq!(by_cluster_arr[0]["query_type"].as_str(), Some("Temporal"));
+        assert_eq!(by_cluster_arr[1]["cluster_id"].as_i64(), Some(42));
+        assert_eq!(by_cluster_arr[1]["query_type"].as_str(), Some("Semantic"));
+        // Per-cluster derived fields
+        assert!(
+            (by_cluster_arr[1]["clicked_source_rate"].as_f64().unwrap() - 0.18).abs() < 1e-9,
+            "clicked_source_rate = clicked_source_count / viewed_count"
+        );
+
+        // Global sink lifted into global.useful_rate; cluster-level total
+        // event count + watermark surface from the top-level state fields.
+        let global = projected.get("global").expect("global must be an object");
+        assert!(
+            (global["useful_rate"].as_f64().unwrap() - 0.68).abs() < 1e-9,
+            "global.useful_rate must equal the cid=-1 sink's useful_rate"
+        );
+        assert_eq!(global["total_events"].as_u64(), Some(8421));
+        assert_eq!(global["last_consumed_event_id"].as_i64(), Some(9876));
+    }
+
+    /// State with no `(-1, _global)` sink (e.g. only per-cluster events have
+    /// been recorded) → `global.useful_rate` is `null`, but `total_events` /
+    /// `last_consumed_event_id` still surface.
+    #[test]
+    fn project_synthesis_status_global_useful_rate_null_when_no_sink_bucket() {
+        let mut by_cluster = std::collections::HashMap::new();
+        by_cluster.insert(
+            "1|Semantic".to_string(),
+            crate::store::adaptive::ClusterSynthesisStats::default(),
+        );
+        let state = crate::store::adaptive::SynthesisFeedbackState {
+            by_cluster,
+            by_synthesis: std::collections::HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id: 1,
+            total_events: 1,
+        };
+        let projected = project_synthesis_status(Some(&state));
+        let global = projected.get("global").unwrap();
+        assert!(
+            global["useful_rate"].is_null(),
+            "global.useful_rate is null when no (-1, _global) sink bucket exists"
+        );
+        assert_eq!(global["total_events"].as_u64(), Some(1));
+    }
+
+    /// Adaptive_status output (the pub serde_json::Value) MUST include the
+    /// `synthesis` key in cold-start. This is the contract surface
+    /// `/api/adaptive` exposes via the inventory dispatcher — the GUI
+    /// branches on `body.synthesis` so a missing key would be a regression.
+    #[test]
+    fn adaptive_status_includes_synthesis_key_on_cold_start() {
+        let store = SqliteStore::in_memory().unwrap();
+        let value = adaptive_status(&store);
+        // Presence check (object form): the `synthesis` key must be there.
+        assert!(
+            value.get("synthesis").is_some(),
+            "adaptive_status() output must include `synthesis` key"
+        );
+        let synthesis = value.get("synthesis").unwrap();
+        // Cold-start shape: by_cluster=[], global=null.
+        assert_eq!(
+            synthesis,
+            &serde_json::json!({
+                "by_cluster": [],
+                "global": null,
+            }),
+            "cold-start synthesis projection mismatch"
+        );
     }
 }

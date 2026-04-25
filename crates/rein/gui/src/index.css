@@ -16,6 +16,12 @@
   --success: #4ade80;
   --error: #ef4444;
   --bg-tertiary: #1e2535;
+  /* L6 (v0.26 cleanup): Brain.tsx background gradient stops were hardcoded
+     hex literals (#0f172a / #020617 — the dark "magnetic tape" backdrop).
+     Promoted to tokens so the Brain View can be re-themed (or contrast-
+     adjusted for accessibility) from one place. */
+  --bg-canvas-mid: #0f172a;
+  --bg-canvas-deep: #020617;
 }
 
 body {
