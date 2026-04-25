@@ -3,12 +3,14 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, LineChart, Line,
 } from 'recharts';
+import { ACCENT_PALETTE, TIER_COLORS } from '../utils/theme';
 
 /* ── colour palettes ──────────────────────────────────────────── */
 
-const ALPHA_COLORS = ['#7c3aed', '#3b82f6', '#f97316', '#22d3ee', '#4ade80'];
-const TIER_COLORS = { hot: 'var(--hot)', warm: 'var(--warm)', cold: 'var(--cold)' };
-const EVENT_COLORS = ['#7c3aed', '#3b82f6', '#f97316', '#22d3ee', '#4ade80', '#f43f5e', '#fbbf24', '#64748b'];
+// `ALPHA_COLORS` is the shared 5-stop accent palette; `EVENT_COLORS` is
+// page-local because it adds three more chart-specific stops on top.
+const ALPHA_COLORS = ACCENT_PALETTE;
+const EVENT_COLORS = [...ACCENT_PALETTE, '#f43f5e', '#fbbf24', '#64748b'];
 
 const WEIGHT_CATEGORIES: Record<string, { color: string; label: string }> = {
   fts: { color: '#a78bfa', label: 'Retrieval' },

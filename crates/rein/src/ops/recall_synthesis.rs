@@ -25,10 +25,39 @@ the provided memories. If the memories are contradictory, note the \
 contradiction explicitly. Output plain prose only — no preamble, no bullet \
 points, no code fences, no headings.\n\n\
 CRITICAL — synthesize from the provided memories only; do not invent facts \
-not present in the memory list below.";
+not present in the memory list below.\n\n\
+After each sentence or clause that draws from a specific memory, insert the \
+source marker [#k] where k is the 1-based rank of the source memory in the \
+input list. If a sentence draws from multiple memories, list all markers, \
+e.g. [#1][#3]. Place markers at the end of the relevant sentence or clause, \
+before the period or comma. If a sentence is purely connective and doesn't \
+make a sourced claim (e.g. \"However,\" or \"Overall,\"), omit the marker.";
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// A single inline citation extracted from the synthesized prose.
+///
+/// Citations point a UI badge at the **char offset** in the cleaned prose
+/// (after `[#k]` markers were stripped) where the cited claim ends. The
+/// offset is in `chars()`, NOT bytes — JS strings are UTF-16, Rust strings
+/// are UTF-8, and the only common ground is character count. CJK content
+/// (where 1 char = 3 bytes UTF-8 = 1 UTF-16 code unit) is the canonical
+/// case where byte offsets would silently desync the two stacks.
+///
+/// Multiple citations sharing the same `span_end` (e.g. the LLM emitted
+/// `[#1][#3]` together) keep their distinct ranks — the UI groups them
+/// visually but tracks them as separate badges so each is clickable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Citation {
+    /// 1-based rank of the source memory (e.g. 3 means the 3rd result in
+    /// the input list, matching `RecallCard rank={idx + 1}` in the GUI).
+    pub rank: usize,
+    /// Char offset in the **clean** prose (after marker removal) where the
+    /// cited claim ends. The UI inserts the badge at this offset using
+    /// char-aware string slicing — never byte indexing.
+    pub span_end: usize,
 }
 
 /// Outcome of a recall-time synthesis attempt.
@@ -44,6 +73,11 @@ fn is_false(b: &bool) -> bool {
 ///   skipped_disabled?: boolean;
 ///   skipped_no_llm?: boolean;
 ///   skipped_too_few_results?: boolean;
+///   citations?: Citation[];
+/// }
+/// export interface Citation {
+///   rank: number;     // 1-based
+///   span_end: number; // char offset in clean prose
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +101,12 @@ pub struct RecallSynthesisOutcome {
     /// `true` when `results.len() < [ars].recall_synthesis_min_results`.
     #[serde(skip_serializing_if = "is_false")]
     pub skipped_too_few_results: bool,
+    /// Inline citations parsed out of the LLM's `[#k]` markers. Empty when
+    /// the LLM emitted no markers (older models / non-compliance) or when
+    /// synthesis was skipped. Char offsets are aligned with the cleaned
+    /// `synthesis` field — markers are removed before this is computed.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub citations: Vec<Citation>,
 }
 
 /// Run recall-time synthesis over `results` for `query`.
@@ -97,6 +137,7 @@ pub fn run_recall_synthesis(
         skipped_disabled: false,
         skipped_no_llm: false,
         skipped_too_few_results: false,
+        citations: Vec::new(),
     };
 
     if !config.ars.recall_synthesis_enabled {
@@ -128,12 +169,26 @@ pub fn run_recall_synthesis(
     // multi-megabyte payload to the LLM provider — costly, slow, and
     // possibly over the model's context window. Codex audit Round 2 P2.
     let max_chars = crate::extract::llm::resolve_max_input_for_kind(config, &extractor);
-    let prompt = build_synthesis_prompt(results, query, max_chars);
+    // Codex R2 G4: use `included_count` (the actual number of memory
+    // blocks the LLM sees in the prompt after truncation) — not the
+    // pre-truncation `source_count` — as the citation max-rank. Without
+    // this, a marker like `[#10]` is accepted even when truncation only
+    // included the first 5 memories, so the UI would render an inline
+    // reference to a source the LLM never saw.
+    let (prompt, included_count) =
+        build_synthesis_prompt_with_count(results, query, max_chars);
     match call_synthesis_llm_sync(&extractor, &prompt) {
         Ok(raw) => {
             let text = strip_code_fences(&raw).trim().to_string();
             if !text.is_empty() {
-                outcome.synthesis = Some(text);
+                // Strip [#k] markers and extract citations. Any marker
+                // pointing past `included_count` is dropped silently
+                // (defensive — the LLM should never emit out-of-range
+                // markers under the system prompt, but compliance is not
+                // guaranteed).
+                let (clean, citations) = extract_citations(&text, included_count);
+                outcome.synthesis = Some(clean);
+                outcome.citations = citations;
             }
         }
         Err(e) => {
@@ -153,6 +208,82 @@ const TRUNCATION_NOTICE: &str =
 const FOOTER: &str =
     "\nNow produce the concise narrative synthesis based solely on the memories above.";
 
+/// Strip `[#k]` source markers from synthesized prose and return the
+/// citation list keyed by char offset into the cleaned output.
+///
+/// Marker grammar (deliberately strict — any deviation drops the marker
+/// silently rather than corrupting the clean prose):
+///   `[` `#` <one or more ASCII digits> `]`
+///
+/// The offset returned for each citation is the **char** count of the
+/// cleaned prose at the position the marker appeared. Consecutive markers
+/// like `[#1][#3]` collapse to two citations both at the same `span_end`.
+/// Invalid markers — non-numeric body, rank `0`, rank > `max_rank`, or a
+/// missing `]` — are passed through unchanged into the cleaned output so
+/// the LLM's prose isn't silently mutilated by edge cases. This is a
+/// pure function (no allocations beyond the output buffers, no IO).
+///
+/// Example: `"Foo[#1]."` → `("Foo.", [Citation { rank: 1, span_end: 3 }])`
+/// CJK example: `"中文[#1]。"` → `("中文。", [Citation { rank: 1, span_end: 2 }])`
+/// — note `span_end` is **char** count, not bytes.
+/// `pub` so the v0.25.2 A3 `rein-eval synthesis` binary can mirror
+/// production by stripping markers from the raw LLM output before
+/// scoring (Codex R2 G5 — without this, `treatment_summary` /
+/// `treatment_length` carry literal `[#k]` text that the production UI
+/// would never render, inflating length and risking spurious keyword
+/// hits on numeric tokens inside markers).
+pub fn extract_citations(prose: &str, max_rank: usize) -> (String, Vec<Citation>) {
+    let mut clean = String::with_capacity(prose.len());
+    let mut citations: Vec<Citation> = Vec::new();
+    // Char count of `clean` so far. Tracked separately from `clean.len()`
+    // because the latter is a byte length and we need a **char** offset
+    // for the JS frontend to slice without UTF-16 conversion gymnastics.
+    let mut clean_chars: usize = 0;
+
+    let chars: Vec<char> = prose.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        let c = chars[i];
+        // Try to parse a marker starting at i: `[` `#` <digits> `]`.
+        if c == '[' && i + 3 < n && chars[i + 1] == '#' {
+            // Walk digits from i+2.
+            let digit_start = i + 2;
+            let mut j = digit_start;
+            while j < n && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            // Need at least one digit + a closing ']'.
+            if j > digit_start && j < n && chars[j] == ']' {
+                let digits: String = chars[digit_start..j].iter().collect();
+                // `digits` is non-empty ASCII digits → parse cannot fail
+                // for reasonable lengths. Use saturating fallback to
+                // 0 (which is dropped by the rank filter) for paranoid
+                // multi-MB digit strings rather than panicking.
+                let rank = digits.parse::<usize>().unwrap_or(0);
+                if rank >= 1 && rank <= max_rank {
+                    citations.push(Citation {
+                        rank,
+                        span_end: clean_chars,
+                    });
+                }
+                // Whether the rank was valid or not, swallow the marker
+                // so the user-visible prose stays clean. Out-of-range
+                // markers are quality issues the user should not see.
+                i = j + 1;
+                continue;
+            }
+            // Fall through: malformed marker, treat `[` as literal.
+        }
+        clean.push(c);
+        clean_chars += 1;
+        i += 1;
+    }
+
+    (clean, citations)
+}
+
 /// Build the synthesis prompt with priority-aware truncation.
 ///
 /// `max_chars = 0` means "no cap" (used by Mock in tests). Otherwise the
@@ -171,7 +302,26 @@ const FOOTER: &str =
 /// `pub` so the v0.25.1 A3 `rein-eval synthesis` binary can construct the
 /// exact same prompt that production uses — eval-vs-production drift here
 /// would invalidate the McNemar comparison.
+///
+/// Backward-compat shim: returns just the prompt string. New callers that
+/// need to validate citations against the actually-included memory blocks
+/// (Codex R2 G4 — `[#k]` markers past the truncation point can be silently
+/// dropped) should call [`build_synthesis_prompt_with_count`] directly.
 pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: usize) -> String {
+    build_synthesis_prompt_with_count(results, query, max_chars).0
+}
+
+/// Same as [`build_synthesis_prompt`] but also returns `included_count` —
+/// the number of memory blocks (1-based ranks 1..=N) that the LLM
+/// actually sees in the prompt. When prompt truncation drops trailing
+/// memories, `included_count < results.len()`. Citation parsing should
+/// pass `included_count` (not `results.len()`) as `max_rank` so the LLM
+/// can't legitimately cite a source it never saw.
+pub fn build_synthesis_prompt_with_count(
+    results: &[RecallResult],
+    query: &str,
+    max_chars: usize,
+) -> (String, usize) {
     // Query budget: cap query so it cannot consume the whole prompt
     // budget. Floor of QUERY_BUDGET_FLOOR comfortably fits typical
     // natural-language queries (~50-200 chars) without truncation.
@@ -217,7 +367,7 @@ pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: 
             push_memory_block(&mut buf, i + 1, r);
         }
         buf.push_str(FOOTER);
-        return buf;
+        return (buf, results.len());
     }
 
     // Reserve headroom for header + footer + the truncation notice (only
@@ -233,6 +383,12 @@ pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: 
 
     let mut used: usize = 0;
     let mut truncated = false;
+    // Codex R2 G4: `included_count` tracks how many memory blocks the
+    // LLM actually sees in the prompt. Updated AFTER the header is
+    // pushed (because that's the marker the LLM keys citations on); a
+    // memory whose header didn't fit is NOT included even though its
+    // index existed in `results`.
+    let mut included_count: usize = 0;
 
     for (i, r) in results.iter().enumerate() {
         let block_header = format!("\n[{}] Topic: {}\n", i + 1, r.memory.topic);
@@ -244,6 +400,7 @@ pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: 
         }
         buf.push_str(&block_header);
         used += header_chars;
+        included_count = i + 1;
 
         let content_chars = r.memory.content.chars().count();
         let trailing_newline = if r.memory.content.ends_with('\n') { 0 } else { 1 };
@@ -259,7 +416,9 @@ pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: 
         } else {
             // Truncate this memory's content and stop adding more memories.
             // `remaining` may be 0 here, in which case we still want to mark
-            // truncation so the LLM knows facts were dropped.
+            // truncation so the LLM knows facts were dropped. The block
+            // header was already pushed, so this memory IS counted in
+            // `included_count` — the LLM sees its rank and partial content.
             let take = remaining.saturating_sub(trailing_newline);
             if take > 0 {
                 let partial: String = r.memory.content.chars().take(take).collect();
@@ -287,7 +446,7 @@ pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: 
     if buf.chars().count() > max_chars {
         buf = buf.chars().take(max_chars).collect();
     }
-    buf
+    (buf, included_count)
 }
 
 fn push_memory_block(buf: &mut String, index: usize, r: &RecallResult) {
@@ -603,6 +762,203 @@ mod tests {
         assert!(
             !prompt.contains("query truncated"),
             "short query → no query-truncation notice"
+        );
+    }
+
+    // ── citation parser (v0.25.2 ARS Cap B inline citations) ──────────────
+
+    /// Basic sanity: a single `[#1]` marker is stripped from the prose
+    /// and surfaced as a citation pointing at the char position the
+    /// marker occupied (which is also the char count of the prose
+    /// preceding the marker).
+    #[test]
+    fn extract_citations_strips_markers() {
+        let (clean, cites) = extract_citations("Foo[#1].", 5);
+        assert_eq!(clean, "Foo.");
+        assert_eq!(
+            cites,
+            vec![Citation {
+                rank: 1,
+                span_end: 3,
+            }]
+        );
+    }
+
+    /// Consecutive markers `[#1][#3]` collapse to two distinct citations
+    /// at the same `span_end`. The frontend will group them visually but
+    /// each rank stays clickable independently.
+    #[test]
+    fn extract_citations_handles_consecutive() {
+        let (clean, cites) = extract_citations("Foo[#1][#3].", 5);
+        assert_eq!(clean, "Foo.");
+        assert_eq!(
+            cites,
+            vec![
+                Citation { rank: 1, span_end: 3 },
+                Citation { rank: 3, span_end: 3 },
+            ]
+        );
+    }
+
+    /// Invalid ranks (`[#0]`, `[#99]` when only 5 results, `[#abc]`)
+    /// must be dropped silently. Well-formed but out-of-range markers
+    /// (`[#0]`, `[#99]`) get their marker text removed from the clean
+    /// prose; truly malformed markers (`[#abc]`) pass through as literal
+    /// text since the LLM may legitimately have meant `[#abc]` in prose
+    /// (e.g. a code snippet).
+    #[test]
+    fn extract_citations_drops_invalid_rank() {
+        // rank=0 → swallow marker, no citation
+        let (clean, cites) = extract_citations("Foo [#0].", 5);
+        assert_eq!(clean, "Foo .");
+        assert!(cites.is_empty());
+
+        // rank > max_rank → swallow marker, no citation
+        let (clean, cites) = extract_citations("Foo [#99].", 5);
+        assert_eq!(clean, "Foo .");
+        assert!(cites.is_empty());
+
+        // malformed body → pass through as literal text
+        let (clean, cites) = extract_citations("Foo [#abc].", 5);
+        assert_eq!(clean, "Foo [#abc].");
+        assert!(cites.is_empty());
+
+        // unterminated marker → pass through
+        let (clean, cites) = extract_citations("Foo [#1.", 5);
+        assert_eq!(clean, "Foo [#1.");
+        assert!(cites.is_empty());
+    }
+
+    /// Empty / no-marker input → empty citation vec, prose returned unchanged.
+    #[test]
+    fn extract_citations_empty_input() {
+        let (clean, cites) = extract_citations("", 5);
+        assert_eq!(clean, "");
+        assert!(cites.is_empty());
+
+        let (clean, cites) = extract_citations("Plain prose with no markers.", 5);
+        assert_eq!(clean, "Plain prose with no markers.");
+        assert!(cites.is_empty());
+    }
+
+    /// CJK-safe: `span_end` must be a CHAR offset, not a byte offset.
+    /// "中文" is 6 bytes UTF-8 but 2 chars; a marker after it must
+    /// produce `span_end: 2`. This is the canonical case where a
+    /// byte-offset bug would silently desync Rust + JS.
+    #[test]
+    fn extract_citations_unicode_safe() {
+        let (clean, cites) = extract_citations("中文[#1]。", 5);
+        assert_eq!(clean, "中文。");
+        assert_eq!(
+            cites,
+            vec![Citation { rank: 1, span_end: 2 }],
+            "span_end must be 2 (char count of 中文), not 6 (byte length)"
+        );
+
+        // Marker between two CJK runs.
+        let (clean, cites) = extract_citations("缓存策略[#2]需要复审[#3]。", 5);
+        assert_eq!(clean, "缓存策略需要复审。");
+        assert_eq!(
+            cites,
+            vec![
+                Citation { rank: 2, span_end: 4 },
+                Citation { rank: 3, span_end: 8 },
+            ]
+        );
+    }
+
+    /// Citation at the very start of the prose lands at `span_end: 0`.
+    /// (Spec example: `"[#1]Foo." -> ("Foo.", [{1,0}])`)
+    #[test]
+    fn extract_citations_at_start() {
+        let (clean, cites) = extract_citations("[#1]Foo.", 5);
+        assert_eq!(clean, "Foo.");
+        assert_eq!(cites, vec![Citation { rank: 1, span_end: 0 }]);
+    }
+
+    /// Multi-claim spec example: `"Foo[#1][#2]bar[#3]." → ("Foobar.", …)`.
+    #[test]
+    fn extract_citations_multi_claim_inline() {
+        let (clean, cites) = extract_citations("Foo[#1][#2]bar[#3].", 5);
+        assert_eq!(clean, "Foobar.");
+        assert_eq!(
+            cites,
+            vec![
+                Citation { rank: 1, span_end: 3 },
+                Citation { rank: 2, span_end: 3 },
+                Citation { rank: 3, span_end: 6 },
+            ]
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn run_recall_synthesis_extracts_citations_from_mock() {
+        use crate::extract::llm::MockExtractor;
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        let results = make_results(5);
+        let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+            "The auth middleware was rewritten[#1][#3]. The new design uses session storage[#2].",
+        ));
+        let outcome =
+            run_recall_synthesis(&results, "auth", &config, Some(true), Some(mock)).unwrap();
+        assert_eq!(
+            outcome.synthesis.as_deref(),
+            Some("The auth middleware was rewritten. The new design uses session storage."),
+            "markers must be stripped from the synthesis text"
+        );
+        assert_eq!(
+            outcome.citations,
+            vec![
+                Citation {
+                    rank: 1,
+                    span_end: "The auth middleware was rewritten".chars().count(),
+                },
+                Citation {
+                    rank: 3,
+                    span_end: "The auth middleware was rewritten".chars().count(),
+                },
+                Citation {
+                    rank: 2,
+                    span_end: "The auth middleware was rewritten. The new design uses session storage"
+                        .chars()
+                        .count(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn run_recall_synthesis_drops_out_of_range_citations() {
+        use crate::extract::llm::MockExtractor;
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        // 3 results → max_rank=3. Marker [#9] points past the last
+        // result and must be dropped without affecting the [#1] citation.
+        let results = make_results(3);
+        let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+            "Sourced claim[#1] and a hallucinated claim[#9].",
+        ));
+        let outcome =
+            run_recall_synthesis(&results, "test", &config, Some(true), Some(mock)).unwrap();
+        assert_eq!(
+            outcome.synthesis.as_deref(),
+            Some("Sourced claim and a hallucinated claim."),
+            "out-of-range marker swallowed alongside the in-range one"
+        );
+        assert_eq!(
+            outcome.citations,
+            vec![Citation {
+                rank: 1,
+                span_end: "Sourced claim".chars().count(),
+            }],
+            "out-of-range [#9] dropped, [#1] preserved"
         );
     }
 }

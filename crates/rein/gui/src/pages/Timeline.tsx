@@ -1,27 +1,7 @@
 import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { apiGet } from '../api/client';
-
-/* ── types ──────────────────────────────────────────────────────── */
-
-interface TimelineEvent {
-  type: 'episode' | 'memory';
-  created_at: string;
-  // Episode fields (when type=episode)
-  id?: string;
-  title?: string;
-  outcome?: string;
-  decisions?: string[];
-  // Memory fields (when type=memory)
-  summary?: string;
-  topic?: string;
-  tier?: 'hot' | 'warm' | 'cold';
-  strength?: number;
-}
-
-interface TimelineResponse {
-  events: TimelineEvent[];
-}
+import type { TimelineResponse } from '../api/types';
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 

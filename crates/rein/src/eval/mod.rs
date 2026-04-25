@@ -165,10 +165,38 @@ const CJK_STOP_WORDS: &[&str] = &[
 /// character was treated as alphanumeric, so a whole sentence tokenized as
 /// a single token — making the eval's `cjk` category numbers noise).
 /// v2 routes CJK content through `extract::dedup::tokenize_for_search`
-/// (jieba + bigrams), making the scorer fair to CJK fixtures. Scorecards
-/// produced under different versions must NOT be compared via `compare`
-/// without acknowledging the methodology change.
-pub const HIT_CHECKER_VERSION: u32 = 2;
+/// (jieba + bigrams), making the scorer fair to CJK fixtures. v3 (v0.25.2)
+/// stems Latin tokens via Snowball Porter2 so morphological variants
+/// (extract / extracting / extraction) collapse to the same form, AND adds
+/// an optional semantic fallback ([`SemanticFallback`]) where keywords
+/// that miss the stemmed token-set are checked against an embedding-cosine
+/// similarity threshold. Scorecards produced under different versions
+/// must NOT be compared via `compare` without acknowledging the
+/// methodology change.
+pub const HIT_CHECKER_VERSION: u32 = 3;
+
+/// Stem an ASCII alphabetic token via Snowball Porter2.
+///
+/// Returns the input unchanged for any token that contains a non-ASCII
+/// character (CJK), a digit, or punctuation — preserving the existing
+/// CJK pathway via jieba and avoiding accidental morphological collapse
+/// on numeric or mixed-script tokens like "v0.25" or "ARS".
+///
+/// `feedback_rust_cjk_alphanumeric_trap`: the all-ASCII-alpha guard is the
+/// reason CJK tokens never reach the stemmer — Rust's `char::is_alphabetic`
+/// returns `true` for CJK, so the right gate is `is_ascii_alphabetic`.
+pub(crate) fn stem_if_latin(token: &str) -> String {
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphabetic()) {
+        // Stemmer construction is cheap (it only borrows static rule
+        // tables); the per-call allocation cost is dominated by the
+        // returned String.
+        rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
+            .stem(token)
+            .into_owned()
+    } else {
+        token.to_string()
+    }
+}
 
 /// Tokenize text for keyword overlap. Routes CJK-containing input through
 /// `jieba` segmentation so the eval scorer doesn't collapse CJK sentences
@@ -198,25 +226,93 @@ pub(crate) fn tokenize(s: &str) -> Vec<String> {
                     && !CJK_STOP_WORDS.contains(&t.as_str())
                     && t.chars().any(|c| c.is_alphanumeric())
             })
+            // v3: stem ASCII subtokens emitted by jieba (e.g. "extract"
+            // alongside "用户"). CJK tokens go through unchanged because
+            // `stem_if_latin` only fires when every char is ASCII alpha.
+            .map(|t| stem_if_latin(&t))
             .collect();
     }
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty() && w.len() > 2 && !STOP_WORDS.contains(w))
-        .map(|w| w.to_string())
+        // v3: stem to collapse morphological variants. Tokens with digits
+        // (e.g. "v0", "0252") survive untouched because `stem_if_latin`
+        // gates on ascii-alphabetic-only.
+        .map(stem_if_latin)
         .collect()
 }
 
-/// Phase 1 [`HitChecker`] stub: extract top-5 keywords from the evidence
-/// entry by raw frequency, then return `true` iff at least 3 of those keywords
-/// appear in the canonical text.
+/// Default cosine threshold for the v3 semantic fallback. Calibrated for
+/// the Google `text-embedding-*` model family — empirically, semantically
+/// related sentence-level pairs cluster ≥0.55 in this embedding space
+/// while unrelated pairs sit below it. Operators can override via the
+/// `REIN_EVAL_SEMANTIC_THRESHOLD` env var read in `bin/rein_eval.rs`.
+pub const DEFAULT_SEMANTIC_THRESHOLD: f32 = 0.55;
+
+/// Optional semantic fallback for [`KeywordOverlapHitChecker`].
 ///
-/// This is intentionally simple and expected to be replaced by a better
-/// (LLM-backed / semantic) oracle in later phases. v2 of `tokenize` makes
-/// the scorer CJK-aware (see [`HIT_CHECKER_VERSION`]); the top-5/≥3
-/// predicate is unchanged from v1.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KeywordOverlapHitChecker;
+/// When attached, keywords that miss the stemmed token-set get a second
+/// chance via embedding cosine similarity: if `embedder.embed(keyword)`
+/// has cosine ≥ `similarity_threshold` against `embedder.embed(text)`,
+/// the keyword counts as a hit. This catches synonymy that stemming
+/// can't bridge (e.g. "Ebbinghaus" ≈ "decay").
+///
+/// The embedder is `Arc`'d so the same handle can be cheaply cloned into
+/// every checker instance the eval pipeline constructs (one per command
+/// invocation; the embedder's HTTP client is reused under the hood).
+#[derive(Clone)]
+pub struct SemanticFallback {
+    pub embedder: std::sync::Arc<crate::embed::EmbedderKind>,
+    pub similarity_threshold: f32,
+}
+
+impl std::fmt::Debug for SemanticFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::types::traits::Embedder;
+        f.debug_struct("SemanticFallback")
+            .field("model", &self.embedder.model_name())
+            .field("similarity_threshold", &self.similarity_threshold)
+            .finish()
+    }
+}
+
+/// Hybrid [`HitChecker`]: stem-tokenized fast path + optional semantic
+/// fallback (see [`SemanticFallback`]).
+///
+/// `Default` returns the stem-only configuration so existing call sites
+/// (and unit tests) compile unchanged. Production rein-eval commands wrap
+/// the configured embedder via [`Self::with_semantic`] when one is
+/// available, so the same checker covers both regimes.
+///
+/// The legacy `check_hit(evidence, canonical)` predicate (top-5 frequency
+/// from evidence, ≥3 overlap with canonical) is preserved for the v0.23
+/// resummerize baseline path. The richer per-keyword scoring used by
+/// concept-summary + recall-synthesis lives in [`crate::eval::concept_summary::score_concept_case`].
+#[derive(Debug, Default, Clone)]
+pub struct KeywordOverlapHitChecker {
+    pub semantic: Option<SemanticFallback>,
+}
+
+impl KeywordOverlapHitChecker {
+    /// Stem-only checker — no embedder calls, fully sync, deterministic.
+    pub fn stem_only() -> Self {
+        Self { semantic: None }
+    }
+
+    /// Stem fast path + semantic fallback. Use the configured embedder
+    /// for any keyword that misses the stem-tokenized text token-set.
+    pub fn with_semantic(
+        embedder: std::sync::Arc<crate::embed::EmbedderKind>,
+        similarity_threshold: f32,
+    ) -> Self {
+        Self {
+            semantic: Some(SemanticFallback {
+                embedder,
+                similarity_threshold,
+            }),
+        }
+    }
+}
 
 impl HitChecker for KeywordOverlapHitChecker {
     fn check_hit(&self, evidence_entry_content: &str, canonical: &str) -> bool {
@@ -252,6 +348,49 @@ impl HitChecker for KeywordOverlapHitChecker {
     }
 }
 
+/// Cosine similarity between two equally-sized embeddings.
+/// Returns 0.0 if either vector is empty or zero-norm — degenerate inputs
+/// can never match, so 0 is the safe sentinel under the threshold check.
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Run a `Future` to completion from a sync caller, mirroring
+/// `ops::recall_synthesis::call_synthesis_llm_sync`'s pattern: prefer the
+/// surrounding tokio runtime via `Handle::try_current`, otherwise spin up
+/// a current-thread runtime. Centralized here so semantic-fallback
+/// embedding calls and any future async eval helpers share one
+/// implementation rather than re-deriving the bridge.
+pub(crate) fn block_on_future<F, T>(fut: F) -> Result<T, crate::types::ReinError>
+where
+    F: std::future::Future<Output = Result<T, crate::types::ReinError>>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return tokio::task::block_in_place(|| handle.block_on(fut));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            crate::types::ReinError::Config(format!("failed to build tokio runtime: {e}"))
+        })?;
+    rt.block_on(fut)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +403,7 @@ mod tests {
         // consistently across both strings.
         let evidence = "Neural wiki renders concepts with concepts wiki links and concepts links.";
         let canonical = "Neural wiki renders concepts with links between concepts.";
-        let checker = KeywordOverlapHitChecker;
+        let checker = KeywordOverlapHitChecker::stem_only();
         assert!(checker.check_hit(evidence, canonical));
     }
 
@@ -272,14 +411,68 @@ mod tests {
     fn keyword_checker_miss_case() {
         let evidence = "Rust borrow checker ownership lifetimes compile errors";
         let canonical = "Python garbage collector reference counting";
-        let checker = KeywordOverlapHitChecker;
+        let checker = KeywordOverlapHitChecker::stem_only();
         assert!(!checker.check_hit(evidence, canonical));
     }
 
     #[test]
     fn keyword_checker_empty_evidence_misses() {
-        let checker = KeywordOverlapHitChecker;
+        let checker = KeywordOverlapHitChecker::stem_only();
         assert!(!checker.check_hit("", "anything here"));
+    }
+
+    #[test]
+    fn keyword_checker_stem_collapses_morphology() {
+        // v3 (HIT_CHECKER_VERSION = 3): Snowball Porter2 stemming collapses
+        // morphological variants so "extracting"/"extraction"/"extracts"
+        // share one stem. Three distinct stems in the evidence
+        // (extract*, recall*, summar*) all appear in the canonical →
+        // ≥3 overlap → hit. Under v2's bare tokenizer those variants would
+        // have been three different surface forms apiece (frequency 1 each),
+        // letting unrelated singletons displace them from the top-5.
+        let evidence = "extract extraction extracts extracting recall recalled recalling \
+                        summary summarize summarized";
+        let canonical = "extract recall summary pipeline inventory";
+        let checker = KeywordOverlapHitChecker::stem_only();
+        assert!(
+            checker.check_hit(evidence, canonical),
+            "v3 stemming must collapse morphological families so the top-5 \
+             slots are dominated by extract*, recall*, summar* — all of \
+             which the canonical also stems to."
+        );
+    }
+
+    #[test]
+    fn stem_if_latin_preserves_cjk_and_digits() {
+        // CJK input → unchanged (Rust's `is_alphabetic` returns true for
+        // CJK; the gate is `is_ascii_alphabetic` to keep them out of the
+        // English stemmer per `feedback_rust_cjk_alphanumeric_trap`).
+        assert_eq!(stem_if_latin("用户"), "用户");
+        // Digits → unchanged (would otherwise corrupt version tokens).
+        assert_eq!(stem_if_latin("v0252"), "v0252");
+        // Pure ASCII alpha → stemmed.
+        assert_eq!(stem_if_latin("extracting"), "extract");
+        assert_eq!(stem_if_latin("recalled"), "recal");
+    }
+
+    #[test]
+    fn cosine_similarity_basics() {
+        // Identical vectors → 1.0
+        let a = vec![1.0_f32, 0.0, 0.0];
+        let b = vec![1.0_f32, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+        // Orthogonal → 0.0
+        let c = vec![0.0_f32, 1.0, 0.0];
+        assert!(cosine_similarity(&a, &c).abs() < 1e-6);
+        // Opposite → -1.0
+        let d = vec![-1.0_f32, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &d) + 1.0).abs() < 1e-6);
+        // Empty / mismatched length → 0.0 (safe sentinel under threshold).
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0_f32], &[1.0, 1.0]), 0.0);
+        // Zero vector → 0.0 (no division-by-zero).
+        let z = vec![0.0_f32, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &z), 0.0);
     }
 
     #[test]
@@ -293,7 +486,7 @@ mod tests {
         // actually score.
         let evidence = "用户偏好简洁输出 用户偏好中文回复 用户偏好周末减少通知 用户偏好简洁输出";
         let canonical = "用户偏好简洁输出和中文回复，周末减少通知";
-        let checker = KeywordOverlapHitChecker;
+        let checker = KeywordOverlapHitChecker::stem_only();
         assert!(
             checker.check_hit(evidence, canonical),
             "CJK content with shared `用户`/`偏好`/`简洁`/`输出` tokens between \
@@ -310,7 +503,7 @@ mod tests {
         // separates words and finds no overlap.
         let evidence = "리뷰어가 커밋 메시지 형식에 대해 피드백을 남겼습니다";
         let canonical = "用户偏好简洁输出和中文回复";
-        let checker = KeywordOverlapHitChecker;
+        let checker = KeywordOverlapHitChecker::stem_only();
         assert!(
             !checker.check_hit(evidence, canonical),
             "evidence and canonical share no meaningful tokens; checker \

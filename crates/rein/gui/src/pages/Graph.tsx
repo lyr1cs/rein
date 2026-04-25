@@ -5,6 +5,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { getConceptState } from '../api/client';
 import { useMemoirs, useMemoirExport } from '../hooks/useApi';
 import { mergeForceGraphData } from '../utils/forceGraph';
+import { timeAgo } from '../utils/time';
 import type { ConceptState } from '../api/types';
 
 /* ------------------------------------------------------------------ */
@@ -60,25 +61,6 @@ function endpointNode(endpoint: LinkEndpoint): ConceptNode | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load graph data';
-}
-
-/**
- * Relative-time formatter for the "Auto-refreshed {X ago}" meta line of the
- * living_summary card. Mirrors the `timeAgo` helper in `Memories.tsx` so the
- * whole app reads dates consistently (shy of pulling in date-fns).
- */
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  if (!Number.isFinite(diff) || diff < 0) return 'just now';
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  return `${months}mo ago`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -562,6 +544,7 @@ export default function Graph() {
               <h3 className="text-sm font-semibold text-[var(--text-primary)] break-words leading-snug">{selectedNode.name}</h3>
               <button
                 onClick={() => setSelectedNode(null)}
+                aria-label="Close detail"
                 className="text-[var(--text-muted)] hover:text-[var(--text-primary)] ml-2 shrink-0"
               >
                 x

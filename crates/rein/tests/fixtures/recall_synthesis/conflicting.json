@@ -1,0 +1,362 @@
+[
+  {
+    "case_id": "cf_001",
+    "category": "conflicting",
+    "query": "What is the default policy for resummerize and concept-summary refresh in v0.25?",
+    "recall_results": [
+      {
+        "id": "mem-cf-1-1",
+        "summary": "v0.23.0 release notes state [resummerize].enabled = false by default; operator must opt in before any LLM rewrite is attempted.",
+        "evidence_preview": [
+          "[resummerize].enabled = false default",
+          "operator must opt in",
+          "no LLM rewrite without opt-in"
+        ],
+        "score": 0.91,
+        "confidence": 0.89,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-1-2",
+        "summary": "v0.24.0 release notes describe ARS Capability A as opt-in via [ars].concept_summary_enabled, mirroring the v0.23 resummerize default-off pattern.",
+        "evidence_preview": [
+          "[ars].concept_summary_enabled opt-in",
+          "mirrors resummerize default-off pattern",
+          "v0.24 keeps default-off discipline"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-1-3",
+        "summary": "v0.25.0 release notes explicitly preserve all v0.23 and v0.24 default-off settings; the recall_synthesis_enabled flag also defaults to false.",
+        "evidence_preview": [
+          "v0.25 preserves default-off settings",
+          "recall_synthesis_enabled defaults false",
+          "no behavior change without opt-in"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-1-4",
+        "summary": "An older v0.23 brainstorm doc proposed making resummerize default-on once eval cleared; the proposal never landed and the production default stayed off through v0.24 and v0.25.",
+        "evidence_preview": [
+          "v0.23 brainstorm proposed default-on",
+          "proposal never landed",
+          "production stayed off through v0.25"
+        ],
+        "score": 0.79,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["agreement", "consistent", "uniformly", "rejected", "stance"]
+  },
+  {
+    "case_id": "cf_002",
+    "category": "conflicting",
+    "query": "Should LongMemEval be the primary signal for whether v0.25 ships?",
+    "recall_results": [
+      {
+        "id": "mem-cf-2-1",
+        "summary": "An early devlog argued LongMemEval should remain the north-star metric for any new search-pipeline work because v0.9.0 used it.",
+        "evidence_preview": [
+          "LongMemEval as north-star metric",
+          "v0.9.0 used LongMemEval",
+          "early devlog argued for continuity"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-2-2",
+        "summary": "The v0.23 eval design doc replaced LongMemEval with a paired McNemar test on production-fixture corpora because LongMemEval mixes too many subsystems to attribute a single change.",
+        "evidence_preview": [
+          "v0.23 replaced LongMemEval with McNemar",
+          "LongMemEval mixes subsystems",
+          "single-change attribution unclear"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-2-3",
+        "summary": "v0.24 ship notes confirm the McNemar paired test is now the gating signal for the resummerize and concept-summary features; LongMemEval is reduced to a quarterly regression check.",
+        "evidence_preview": [
+          "McNemar paired test gates v0.24",
+          "LongMemEval is quarterly regression",
+          "no longer the primary gate"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-2-4",
+        "summary": "v0.25 ship notes follow the v0.23/v0.24 pattern: paired McNemar on the synthesis fixture corpus is the ship gate, not LongMemEval.",
+        "evidence_preview": [
+          "McNemar on synthesis corpus is ship gate",
+          "follows v0.23/v0.24 pattern",
+          "LongMemEval not the v0.25 gate"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["superseded", "shifted", "replaced", "evolution", "retired"]
+  },
+  {
+    "case_id": "cf_003",
+    "category": "conflicting",
+    "query": "What is the right strike count for the resummerize exhaustion fuse?",
+    "recall_results": [
+      {
+        "id": "mem-cf-3-1",
+        "summary": "v0.23.0-rc1 spec proposed a 5-strike exhaustion fuse counting any non-success outcome including LlmError and ClaimLost.",
+        "evidence_preview": [
+          "rc1 spec proposed 5-strike fuse",
+          "any non-success counted",
+          "LlmError and ClaimLost included"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-3-2",
+        "summary": "v0.23.0 ship pulled the strike count down to 3 after a Codex audit pointed out that 5 was too forgiving for genuine LLM-quality regressions.",
+        "evidence_preview": [
+          "v0.23.0 ships 3-strike",
+          "Codex audit advocated tightening",
+          "5 was too forgiving"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-3-3",
+        "summary": "v0.23.1 candidate kept the strike total at 3 but reclassified LlmError and ClaimLost as non-counting because they reflect transient or contention failure, not LLM quality.",
+        "evidence_preview": [
+          "v0.23.1 keeps 3-strike total",
+          "LlmError reclassified non-counting",
+          "ClaimLost reclassified non-counting"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-3-4",
+        "summary": "Operator feedback after v0.23.1 candidate suggested 2 strikes would catch quality regressions faster; no decision logged yet.",
+        "evidence_preview": [
+          "operator feedback proposed 2 strikes",
+          "no decision logged",
+          "tighter fuse for faster regression catch"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["disagreement", "evolved", "narrowed", "unresolved", "tension"]
+  },
+  {
+    "case_id": "cf_004",
+    "category": "conflicting",
+    "query": "Should A1 operation registry use the proc-macro plus inventory pattern or static dispatch tables?",
+    "recall_results": [
+      {
+        "id": "mem-cf-4-1",
+        "summary": "Original A1 spec compared a static dispatch table approach against the proc-macro plus inventory pattern; the spec chose the proc-macro path for single-author surface.",
+        "evidence_preview": [
+          "A1 spec compared two approaches",
+          "static dispatch table vs proc-macro",
+          "proc-macro chosen for single-author surface"
+        ],
+        "score": 0.93,
+        "confidence": 0.91,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-4-2",
+        "summary": "Phase 2 of A1 confirmed the proc-macro plus inventory pattern after benching the dispatch overhead at sub-microsecond per operation, well under the static-table alternative's compile-time cost.",
+        "evidence_preview": [
+          "Phase 2 confirmed proc-macro inventory",
+          "sub-microsecond dispatch overhead",
+          "static-table alternative more compile-cost"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-4-3",
+        "summary": "Phase 3 deleted the old ops/registry.rs middleman entirely; the inventory iterator is now the single source of truth, removing any case for a parallel static table.",
+        "evidence_preview": [
+          "Phase 3 deleted ops/registry.rs",
+          "inventory iterator is single source of truth",
+          "no parallel static table"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-4-4",
+        "summary": "v0.22 D5 brainstorm revisited the question and re-affirmed the proc-macro path; bench showed p99 dispatch latency at 54 microseconds, far below any static-dispatch concern.",
+        "evidence_preview": [
+          "v0.22 D5 re-affirmed proc-macro path",
+          "p99 dispatch 54 microseconds",
+          "static-dispatch concern unfounded"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["proc-macro", "inventory", "dispatch", "static", "chosen"]
+  },
+  {
+    "case_id": "cf_005",
+    "category": "conflicting",
+    "query": "Are HDBSCAN clusters stable enough to be the load-bearing key for adaptive learning?",
+    "recall_results": [
+      {
+        "id": "mem-cf-5-1",
+        "summary": "M4 spec asserts HDBSCAN clusters are stable enough across nightly reruns to serve as a per-memory tag for downstream learning.",
+        "evidence_preview": [
+          "M4 spec asserts cluster stability",
+          "nightly reruns acceptable",
+          "per-memory tag downstream"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-5-2",
+        "summary": "An adaptive-engine devlog noted that HDBSCAN reassigns roughly 8 percent of memories per nightly run, which is borderline for downstream consumers that cache per-cluster statistics.",
+        "evidence_preview": [
+          "8 percent reassignment per nightly run",
+          "borderline for cached per-cluster stats",
+          "devlog flagged the concern"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-5-3",
+        "summary": "v0.7.1 closed the loop by making M2 alpha optimization and M3 survival decay tolerant to cluster reassignment via a smoothed exponential moving average per cluster.",
+        "evidence_preview": [
+          "v0.7.1 added per-cluster EMA smoothing",
+          "M2 and M3 tolerant to reassignment",
+          "loop closed by smoothing"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-5-4",
+        "summary": "Recent A1 dedup audit suggested per-cluster thresholds may need a coarser grouping than HDBSCAN provides; the matter is open.",
+        "evidence_preview": [
+          "per-cluster dedup may need coarser grouping",
+          "A1 audit raised the issue",
+          "matter remains open"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["HDBSCAN", "stability", "reassignment", "smoothing", "cluster"]
+  },
+  {
+    "case_id": "cf_006",
+    "category": "conflicting",
+    "query": "What is the right keyword count for the synthesis fixture hit checker?",
+    "recall_results": [
+      {
+        "id": "mem-cf-6-1",
+        "summary": "The original v0.23 resummerize fixture spec used 5 evidence_keywords with a top-5 frequency selection and 3-of-5 hit threshold for KeywordOverlapHitChecker.",
+        "evidence_preview": [
+          "5 evidence_keywords original spec",
+          "top-5 frequency selection",
+          "3-of-5 hit threshold"
+        ],
+        "score": 0.93,
+        "confidence": 0.91,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-6-2",
+        "summary": "v0.24 concept-summary fixtures inherited the 5-keyword convention; the score_concept_case helper enforces strict majority via hits*2 > n.",
+        "evidence_preview": [
+          "5-keyword convention inherited",
+          "score_concept_case helper enforces",
+          "strict majority hits*2 > n"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-6-3",
+        "summary": "v0.25 synthesis fixtures locked the 5-keyword schema in a parse test that asserts every fixture has exactly 5 evidence_keywords.",
+        "evidence_preview": [
+          "v0.25 synthesis schema locks 5",
+          "parse test asserts exactly 5",
+          "no fixture may deviate"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-cf-6-4",
+        "summary": "An eval-team brainstorm proposed dropping to 3 keywords for tighter signal; the proposal was rejected because 3-of-3 leaves no buffer for keyword choice noise.",
+        "evidence_preview": [
+          "brainstorm proposed 3 keywords",
+          "rejected for no noise buffer",
+          "3-of-3 too brittle"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["five", "keywords", "majority", "threshold", "spec"]
+  }
+]
