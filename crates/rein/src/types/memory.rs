@@ -46,6 +46,22 @@ pub struct Memory {
     /// Cluster assignment from HDBSCAN (M4)
     #[serde(default)]
     pub cluster_id: Option<u32>,
+    /// v0.26 Cap C: LLM-generated condensed summary written by the
+    /// cold-tier archival worker. `None` until the worker fires for this
+    /// memory at least once (see `run_cold_archive_summary`). Worker-only
+    /// write surface; recall reads it through the standard SELECT path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archival_summary: Option<String>,
+    /// v0.26 Cap C: Unix epoch seconds when `archival_summary` was last
+    /// regenerated. `None` iff `archival_summary` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archival_summary_at: Option<i64>,
+    /// v0.26 Cap C: snapshot of `ARCHIVAL_SUMMARY_VERSION` at the time
+    /// `archival_summary` was generated. Used to invalidate stale summaries
+    /// when the prompt or contract bumps. `None` iff `archival_summary` is
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archival_summary_version: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,

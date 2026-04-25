@@ -571,6 +571,11 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     // first-vs-second-boot drift in the schema.
     migrate_resummerize(conn)?;
 
+    // v0.26 Cap C: cold-tier archival summary fields. Same ordering rationale
+    // as `migrate_resummerize` — must run AFTER `migrate_source_check` so the
+    // table-recreate path doesn't silently drop the new columns.
+    migrate_cold_archive_summary(conn)?;
+
     Ok(())
 }
 
@@ -665,6 +670,59 @@ fn migrate_resummerize(conn: &Connection) -> ReinResult<()> {
     ",
     )?;
 
+    Ok(())
+}
+
+/// v0.26 Cap C migration: adds cold-tier archival-summary fields to
+/// `memories`. Idempotent — re-running on a DB that already has the columns
+/// is a no-op. No backfill: existing cold rows stay NULL until the next
+/// `run_tiering` pass re-flags them via `needs_archival_summary = 1`.
+///
+/// Columns:
+/// * `archival_summary` — LLM-generated condensed summary (NULL until worker
+///   runs)
+/// * `archival_summary_at` — Unix epoch seconds when the summary was last
+///   generated (NULL iff `archival_summary` is NULL)
+/// * `archival_summary_version` — `ARCHIVAL_SUMMARY_VERSION` snapshot at
+///   generation time; bumps invalidate prior summaries (NULL iff
+///   `archival_summary` is NULL)
+/// * `needs_archival_summary` — worker-internal flag set by `run_tiering`
+///   on cold transition, cleared by `run_cold_archive_summary` after
+///   successful contract-gated persist
+fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
+    let has_archival_summary: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='archival_summary'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_archival_summary {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN archival_summary TEXT;
+             ALTER TABLE memories ADD COLUMN archival_summary_at INTEGER;
+             ALTER TABLE memories ADD COLUMN archival_summary_version INTEGER;
+             ALTER TABLE memories ADD COLUMN needs_archival_summary INTEGER NOT NULL DEFAULT 0;",
+        )
+        .ok();
+    }
+    let has_in_progress: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='in_progress_archival_summary_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_in_progress {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN in_progress_archival_summary_at TEXT;
+             ALTER TABLE memories ADD COLUMN archival_claim_token TEXT;",
+        )
+        .ok();
+    }
+    // No backfill: existing cold rows stay NULL until run_tiering re-flags them.
     Ok(())
 }
 
