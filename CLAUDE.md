@@ -18,7 +18,7 @@ cargo install --path crates/rein     # install to ~/.cargo/bin/rein
 
 ## Architecture
 
-rein is a multi-source cross-validated memory MCP server (**34 MCP tools** as of v0.24.0; v0.25.0 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) without adding a new tool; evidence-aware canonical-first memory flow). Key modules:
+rein is a multi-source cross-validated memory MCP server (**34 MCP tools** as of v0.24.0; v0.25.0 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) without adding a new tool; v0.25.1 ships the Cap B eval harness (`rein-eval synthesis {baseline,run,compare}`) + Synthesis Lab GUI page + GUI HIGH-finding fixes + Brain/Graph polling refactor — all opt-in defaults unchanged; evidence-aware canonical-first memory flow). Key modules:
 
 - `extract/llm.rs` — LLM extraction (Gemini 3.1 Flash Lite), fallback to rule-based; `MockExtractor` under `test-support` feature
 - `extract/hooks/` — 4 hooks: post (PostToolUse), compact (PreCompact), prompt (UserPromptSubmit compatibility no-op), stop (Stop); admission and memory surfaces are cluster/canonical-aware
@@ -77,7 +77,7 @@ Post-fusion multi-feature reranking (canonical support/diversity included in lea
 Extraction postprocess: algorithmic date/preference/knowledge-update detection + LLM prompt rules.
 Automatic prompt injection is disabled. `hook_prompt` remains as a compatibility no-op while memory production flows through record-only proxy + async worker + layered memory surfaces.
 
-## Resummerize (v0.23.0 shipped, v0.23.1-candidate in working tree)
+## Resummerize (v0.23.0 shipped, v0.23.1 hardening shipped)
 
 LLM-driven canonical recompression replacing v0.21's keep-tail truncation at the 10KB `MergeInto` cap, gated by the 7-invariant Lossless Compression Contract.
 

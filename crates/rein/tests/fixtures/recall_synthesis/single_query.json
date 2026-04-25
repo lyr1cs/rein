@@ -1,0 +1,110 @@
+[
+  {
+    "case_id": "sq_001",
+    "category": "single_query",
+    "query": "How does the A1 operation registry dispatch operations?",
+    "recall_results": [
+      {
+        "id": "mem-a1-1",
+        "summary": "A1 operation registry: the #[op] proc-macro in rein-macros expands OpsRuntime methods into inventory-registered entries dispatched by CLI, MCP, and REST adapters.",
+        "evidence_preview": [
+          "OpsRuntime methods authored once via #[op] macro",
+          "CLI/MCP/REST adapters share dispatch path",
+          "inventory crate registers handlers at link time"
+        ],
+        "score": 0.93,
+        "confidence": 0.91,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-a1-2",
+        "summary": "AuthPolicy middleware was added in v0.21 A1 and registered through inventory; OpsErrorKind maps to HTTP status codes via the ReinError adapter.",
+        "evidence_preview": [
+          "AuthPolicy registered via inventory submit",
+          "OpsErrorKind to HTTP status mapping",
+          "ReinError adapter consolidates error surfaces"
+        ],
+        "score": 0.87,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-a1-3",
+        "summary": "Phase 3 of A1 deleted the old ops/registry.rs middleman; drift checks now compare source-scan against inventory::iter directly.",
+        "evidence_preview": [
+          "Phase 3 deleted ops/registry.rs middleman",
+          "drift check uses inventory::iter directly",
+          "single source of truth: the proc-macro"
+        ],
+        "score": 0.82,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-a1-4",
+        "summary": "Single-seg path templates introduced in A1 enable GET /api/memories/{id} style routing through the inventory dispatch layer.",
+        "evidence_preview": [
+          "single-seg path template framework",
+          "GET /api/memories/{id} style routes",
+          "REST inventory dispatch reuses CLI handlers"
+        ],
+        "score": 0.78,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["proc-macro", "OpsRuntime", "inventory", "adapters", "AuthPolicy"]
+  },
+  {
+    "case_id": "sq_002",
+    "category": "single_query",
+    "query": "What does HDBSCAN clustering do for the adaptive engine?",
+    "recall_results": [
+      {
+        "id": "mem-hdb-1",
+        "summary": "HDBSCAN semantic clustering in rein extracts flat clusters from a stability-scored condensed tree; output feeds M2 alpha optimization, M3 decay, and A1 per-cluster dedup thresholds.",
+        "evidence_preview": [
+          "stability-scored condensed tree extraction",
+          "feeds M2 alpha optimization",
+          "feeds M3 Kaplan-Meier decay",
+          "feeds A1 per-cluster dedup thresholds"
+        ],
+        "score": 0.94,
+        "confidence": 0.92,
+        "sources_hit": 3,
+        "evidence_count": 4
+      },
+      {
+        "id": "mem-hdb-2",
+        "summary": "The HDBSCAN pipeline samples when n>3000 to bound clustering cost; the dendrogram is built from mutual reachability distances and reduced via EOMBST.",
+        "evidence_preview": [
+          "samples when n>3000 to bound cost",
+          "dendrogram from mutual reachability",
+          "EOMBST flat-cluster extraction"
+        ],
+        "score": 0.88,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-hdb-3",
+        "summary": "Clusters from store/hdbscan.rs are consumed by store/adaptive.rs and ops/adaptive.rs to learn per-cluster fusion weights and survival curves.",
+        "evidence_preview": [
+          "store/hdbscan.rs is the implementation",
+          "consumed by store/adaptive.rs",
+          "per-cluster learning enabled"
+        ],
+        "score": 0.83,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["dendrogram", "EOMBST", "Kaplan-Meier", "reachability", "clusters"]
+  }
+]

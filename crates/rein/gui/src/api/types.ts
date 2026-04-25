@@ -92,7 +92,14 @@ export interface MemoryEvidence {
 
 export interface MemoryDetailResponse {
   memory: Memory;
+  // Preview-capped at 200 rows by the server so we don't ship megabyte
+  // payloads for canonicals with huge evidence histories. Use
+  // `evidence_total` for honest count labels — `evidence.length` is the
+  // preview size, not the true total. `evidence_total` is optional so the
+  // legacy servers (pre-v0.25.1) that only return `evidence` still type-check;
+  // call sites should fall back to `evidence.length`.
   evidence: MemoryEvidence[];
+  evidence_total?: number;
 }
 
 export interface StoreStats {
@@ -195,6 +202,28 @@ export interface ConceptLink {
   created_at: string;
   valid_from: string | null;
   valid_until: string | null;
+}
+
+/**
+ * Memoir summary returned from `GET /api/memoirs`. Mirrors the server
+ * `MemoirSummary` row shape — kept in `types.ts` (not inline in Brain.tsx /
+ * Graph.tsx) so the new react-query hooks can share a single declaration.
+ */
+export interface Memoir {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/**
+ * Full export of a memoir's concepts + concept-links via
+ * `GET /api/memoirs/{name}/export?format=json`. Used by Brain.tsx (fanned out
+ * over every memoir via `useQueries`) and Graph.tsx (single-memoir view).
+ */
+export interface MemoirExport {
+  memoir: Memoir;
+  concepts: Concept[];
+  links: ConceptLink[];
 }
 
 /**

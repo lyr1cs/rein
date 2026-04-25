@@ -14,6 +14,8 @@
   --concept: #e2e8f0;
   --new: #22d3ee;
   --success: #4ade80;
+  --error: #ef4444;
+  --bg-tertiary: #1e2535;
 }
 
 body {
