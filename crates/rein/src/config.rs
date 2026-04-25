@@ -204,6 +204,15 @@ pub struct ArsConfig {
     /// Default: 3.
     #[serde(default = "default_recall_synthesis_min_results")]
     pub recall_synthesis_min_results: usize,
+    /// v0.26.1: Min events per `(cluster_id, query_type)` bucket before
+    /// per-cluster `useful_rate` is trusted by the per-query synthesis gate.
+    /// Below this, `decide_synthesize` falls back to the global
+    /// `recall_synthesis_enabled` flag. Default 10 (matches
+    /// `store::adaptive::SYNTHESIS_COLD_START_N`); operators on a fresh
+    /// canary may lower this to 3-5 to let the per-cluster gate fire
+    /// sooner against the partial event stream a soak collects.
+    #[serde(default = "default_synthesis_cold_start_n")]
+    pub synthesis_cold_start_n: u64,
     // ── Cap C v0.26 ──────────────────────────────────────────────────────────
     /// Enable cold-tier archival summary (Cap C). Default `false` (opt-in,
     /// per spec §8 invariant 3 — flipping to true is a separate v0.26.x
@@ -235,6 +244,10 @@ fn default_recall_synthesis_min_results() -> usize {
     3
 }
 
+fn default_synthesis_cold_start_n() -> u64 {
+    10
+}
+
 // Cap C v0.26 defaults — see `ops/cold_archive_summary.rs::ARCHIVAL_SUMMARY_*`
 // for the constants these mirror. We duplicate the literal here rather than
 // import from the ops module so `config.rs` stays free of `ops` imports
@@ -255,6 +268,7 @@ impl Default for ArsConfig {
             batch_size: default_ars_batch_size(),
             recall_synthesis_enabled: false,
             recall_synthesis_min_results: default_recall_synthesis_min_results(),
+            synthesis_cold_start_n: default_synthesis_cold_start_n(),
             // Cap C v0.26 — opt-in (spec §8 invariant 3)
             cold_archive_enabled: false,
             cold_archive_target_chars: default_cold_archive_target_chars(),
