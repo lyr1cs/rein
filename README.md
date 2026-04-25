@@ -16,7 +16,7 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 | Feature | Description |
 |---------|-------------|
-| **34 MCP tools** | 8 core memory + 9 maintenance + 10 knowledge graph + 2 temporal + 2 adaptive + 1 session ingest + 2 ARS concept-summary (v0.24). v0.25 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B) — no new tool added. |
+| **36 MCP tools** | 8 core memory + 9 maintenance + 10 knowledge graph + 2 temporal + 2 adaptive + 1 session ingest + 2 ARS concept-summary (v0.24) + 1 Cap C archival summary refresh (v0.26) + 1 GUI/MCP synthesis interaction feedback (v0.26). v0.25 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B); v0.26 adds Cap C cold-tier archival summaries + D direction synthesis-feedback events flowing into M1. |
 | **Unified operation registry** | One `#[op]` declaration drives CLI / MCP / REST surfaces (v0.21, A1). Inventory-based dispatch; zero hand-maintained lists. |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
