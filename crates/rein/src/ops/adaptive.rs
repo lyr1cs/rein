@@ -124,6 +124,14 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // generates summaries via the LLM, applies the 3-invariant lossless
     // contract, persists with 5-way CAS. Skipped cleanly when
     // `ars.cold_archive_enabled = false`. No-op when nothing was flagged.
+    //
+    // Pipeline ordering note: `run_tiering` above also runs the M5 strip
+    // pass which replaces `memory.content` with `memory.summary` for
+    // archived rows. Cap C's `attempt_one` reads `cold_archive.content` as
+    // a fallback when the row is in the archive table, so the worker
+    // always sees the original content even when strip ran first
+    // (v0.26.0 patch: Option C — defended inside the worker rather than
+    // by reordering pipeline steps).
     {
         let cold_config = crate::ops::cold_archive_summary::ColdArchiveConfig::from_ars(&config.ars);
         match crate::ops::cold_archive_summary::run_cold_archive_summary(store, config, &cold_config) {
@@ -699,7 +707,12 @@ fn run_tiering(
         );
     }
 
-    // Migrate cold memories to cold_archive (content → summary, original in archive)
+    // Migrate cold memories to cold_archive (content → summary, original in archive).
+    // The strip happens here regardless of Cap C state. Cap C's generator reads
+    // `cold_archive.content` as a fallback when the row is in the archive table,
+    // so the order of strip vs Cap C does NOT affect what content the LLM sees
+    // (v0.26.0 patch: Option C — Cap C self-defends via cold_archive fallback
+    // in `attempt_one`, instead of relying on pipeline step ordering).
     let migrated: u64 = match store.conn().execute(
         "INSERT OR IGNORE INTO cold_archive (memory_id, content, archived_at)
          SELECT id, content, strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -3483,4 +3496,5 @@ mod tests {
              A `max(correlated_id)` strategy would fail this assertion."
         );
     }
+
 }
