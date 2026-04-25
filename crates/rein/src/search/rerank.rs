@@ -55,6 +55,29 @@ pub struct RerankFeatures {
 }
 
 /// Learned weights for the linear scoring model (19 features).
+///
+/// ## Replay-safety watermarks (v0.25.2)
+///
+/// `last_access_event_id` and `last_recall_event_id` are the highest
+/// `feedback_events.id` from the `recall_access` and `recall_complete`
+/// streams whose gradient effect is **already durable in this row**.
+/// They are persisted atomically with the weights via the same
+/// `UPDATE metadata SET value = ?` statement.
+///
+/// The reranker consumer loop uses these watermarks to filter peeked
+/// events strictly by `id > last_*_event_id`. If the per-consumer
+/// `commit_offset` call fails after `save_weights` succeeds, the next
+/// peek re-surfaces the same events, and the watermark filter drops
+/// them — preserving "exactly-once gradient application" without
+/// folding the consumer into a single transaction.
+///
+/// The weights table effectively owns the source-of-truth watermark;
+/// `consumer_offsets` is a redundant best-effort cache (kept for
+/// compatibility / observability). Replay-drain on startup is
+/// implicit: `peek_events` already filters by `consumer_offsets`, then
+/// the watermark filter further drops any event with `id <=
+/// last_*_event_id`. Composition gives the effective watermark
+/// `id > max(consumer_offsets, weights)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankWeights {
     pub w_fts: f32,
@@ -90,6 +113,21 @@ pub struct RerankWeights {
     /// M3 cluster survival weight. Defaults to 0.02.
     #[serde(default = "default_w_small")]
     pub w_cluster_survival: f32,
+
+    /// v0.25.2 replay-safety watermark for the `reranker_weights`
+    /// consumer (`recall_access` event stream). Highest event id whose
+    /// gradient effect is durable in this row. `0` on fresh install /
+    /// pre-v0.25.2 snapshots.
+    #[serde(default)]
+    pub last_access_event_id: i64,
+
+    /// v0.25.2 replay-safety watermark for the
+    /// `reranker_weights_recall` consumer (`recall_complete` event
+    /// stream). Highest event id whose candidate-feature contribution
+    /// is durable in this row. `0` on fresh install / pre-v0.25.2
+    /// snapshots.
+    #[serde(default)]
+    pub last_recall_event_id: i64,
 }
 
 fn default_w_topic_match() -> f32 {
@@ -134,6 +172,8 @@ pub fn default_weights() -> RerankWeights {
         w_tier_score: 0.03,
         w_is_current: 0.03,
         w_cluster_survival: 0.02,
+        last_access_event_id: 0,
+        last_recall_event_id: 0,
     }
 }
 
@@ -259,15 +299,157 @@ pub fn load_weights(conn: &rusqlite::Connection) -> RerankWeights {
 }
 
 /// Persist rerank weights to the metadata table.
+///
+/// Convenience shim that delegates to [`save_weights_cas`] with the
+/// `expected_*` watermarks taken from `weights` itself — i.e. it
+/// trusts the caller to have set the new watermark fields to the
+/// values it just observed under load. New code feeding the consumer
+/// loop should prefer [`save_weights_cas`] directly so the
+/// observed-vs-write watermark transition is explicit AND so the
+/// boolean return value can gate downstream `commit_offset` calls.
+///
+/// The bool result is intentionally discarded here; legacy callers
+/// (`adaptive_status` snapshot serialization, default-only test code)
+/// don't have a downstream offset to gate.
 pub fn save_weights(conn: &rusqlite::Connection, weights: &RerankWeights) {
+    let _ = save_weights_cas(
+        conn,
+        weights,
+        weights.last_access_event_id,
+        weights.last_recall_event_id,
+    );
+}
+
+/// v0.25.2: Persist rerank weights with CAS protection over both
+/// per-stream watermarks (`recall_access` + `recall_complete`).
+///
+/// `expected_access_id` / `expected_recall_id` are the watermarks the
+/// caller observed when it [`load_weights`]'d. The UPDATE only succeeds
+/// when the row's current watermarks still match — otherwise a
+/// concurrent worker has already incorporated newer events and our
+/// gradient step is stale. On a CAS miss we log + skip (no panic);
+/// the next pipeline tick will re-load and re-attempt.
+///
+/// On first run the row is absent → `INSERT` (the legacy
+/// `ON CONFLICT(key) DO UPDATE` path is gone deliberately so the CAS
+/// invariant can't be silently bypassed by concurrent inserts; if two
+/// fresh-install workers race the loser's INSERT errors with UNIQUE
+/// and we log + skip the same way).
+///
+/// `COALESCE(json_extract(...), -1)` handles two migration cases:
+/// (a) pre-v0.25.2 rows whose JSON lacks the watermark fields — the
+/// caller's observed `0` matches `-1` → predicate fails on first hit,
+/// then succeeds after the next load surfaces the newly-written `0`.
+/// To unblock that boot transition the first save after upgrade
+/// always passes `expected_*=0` (consumer loads via [`load_weights`]
+/// which `#[serde(default)]`s the absent fields to `0`).
+/// Returns `true` when the weights row was durably written (CAS hit
+/// or first-time insert), `false` when the CAS predicate missed (a
+/// concurrent worker raced us) or any underlying SQL error occurred.
+///
+/// **Callers MUST gate their `commit_offset` on the return value** —
+/// advancing the consumer offset after a CAS miss permanently drops
+/// events whose gradient never made it into the weights row. Codex
+/// R1 (v0.25.2) caught this regression in `run_reranker_weight_learning`.
+#[must_use = "the caller must gate commit_offset on the CAS result; \
+              advancing the consumer offset after a CAS miss permanently \
+              drops the events that were peeked but not persisted"]
+pub fn save_weights_cas(
+    conn: &rusqlite::Connection,
+    weights: &RerankWeights,
+    expected_access_id: i64,
+    expected_recall_id: i64,
+) -> bool {
     let json = serde_json::to_string(weights).expect("RerankWeights serialization cannot fail");
-    if let Err(e) = conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('rerank_weights', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![json],
+
+    // CAS UPDATE: only succeeds when both stored watermarks equal what
+    // we observed at load time. Atomic with the weights write because
+    // it's a single statement on a single row.
+    let updated = match conn.execute(
+        "UPDATE metadata
+            SET value = ?1
+          WHERE key = 'rerank_weights'
+            AND COALESCE(json_extract(value, '$.last_access_event_id'), 0) = ?2
+            AND COALESCE(json_extract(value, '$.last_recall_event_id'), 0) = ?3",
+        rusqlite::params![json, expected_access_id, expected_recall_id],
     ) {
-        tracing::warn!("save_weights failed: {}", e);
+        Ok(rows) => rows,
+        Err(e) => {
+            // Codex R3 G7: when the stored row holds malformed JSON,
+            // SQLite's `json_extract` raises an error and our CAS write
+            // can never succeed — the row stays stuck forever and
+            // reranker learning livelocks even though `load_weights`
+            // already silently falls back to defaults on read. Detect
+            // the malformed-JSON failure mode and recover by deleting
+            // the corrupt row, then fall through to the first-install
+            // INSERT path below (treat-as-fresh contract is consistent
+            // with what `load_weights` already returns to consumers).
+            let err_str = e.to_string();
+            let is_malformed_json = err_str.contains("malformed JSON")
+                || err_str.contains("malformed json");
+            if is_malformed_json {
+                tracing::warn!(
+                    error = %e,
+                    "save_weights CAS hit malformed JSON in stored row; \
+                     deleting corrupt row + retrying as first-install INSERT"
+                );
+                if let Err(del_err) = conn.execute(
+                    "DELETE FROM metadata WHERE key = 'rerank_weights'",
+                    [],
+                ) {
+                    tracing::warn!(
+                        error = %del_err,
+                        "save_weights recovery DELETE failed; row stays corrupt"
+                    );
+                    return false;
+                }
+                0 // fall through to !exists → INSERT branch
+            } else {
+                tracing::warn!("save_weights CAS update failed: {}", e);
+                return false;
+            }
+        }
+    };
+
+    if updated > 0 {
+        return true; // happy path
     }
+
+    // No row updated. Either the row doesn't exist yet (first save) or
+    // a concurrent worker bumped the watermark.
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM metadata WHERE key = 'rerank_weights'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if !exists {
+        // First-time insert. Use INSERT (not ON CONFLICT) so a race
+        // with another fresh-install worker fails loudly via UNIQUE
+        // constraint rather than silently last-writes-wins.
+        return match conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('rerank_weights', ?1)",
+            rusqlite::params![&serde_json::to_string(weights)
+                .expect("RerankWeights serialization cannot fail")],
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("save_weights initial insert failed: {}", e);
+                false
+            }
+        };
+    }
+
+    // Row exists but our CAS predicate missed → another worker won the
+    // race. Log + skip; next pipeline tick will re-load and re-try.
+    tracing::warn!(
+        expected_access_id,
+        expected_recall_id,
+        "save_weights CAS predicate missed (concurrent writer); skipping cycle"
+    );
+    false
 }
 
 #[cfg(test)]
@@ -564,6 +746,175 @@ mod tests {
         assert!(
             (final_w.w_is_current - initial.w_is_current).abs() < tolerance,
             "w_is_current drifted"
+        );
+    }
+
+    // ── v0.25.2 watermark + CAS tests ────────────────────────────────
+
+    /// Helper: create an in-memory connection with the metadata table.
+    fn ws_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn
+    }
+
+    /// Read the persisted watermarks from the row using `json_extract`,
+    /// matching the same predicate the CAS UPDATE uses. This exercises
+    /// the "atomic with weights" guarantee — the test does not parse
+    /// the row through `RerankWeights` to avoid hiding any
+    /// serialization-vs-storage gap.
+    fn read_persisted_watermarks(conn: &rusqlite::Connection) -> (Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT json_extract(value, '$.last_access_event_id'),
+                    json_extract(value, '$.last_recall_event_id')
+               FROM metadata WHERE key = 'rerank_weights'",
+            [],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap_or((None, None))
+    }
+
+    #[test]
+    fn reranker_save_weights_writes_event_id_atomically() {
+        // v0.25.2: `save_weights_cas` writes the weights and BOTH
+        // watermarks in the same single-row UPDATE. After the save
+        // returns, the persisted JSON row must contain the new
+        // `last_access_event_id` AND `last_recall_event_id` AND the
+        // new weight values — there is no observable in-between state.
+        let conn = ws_conn();
+        let mut w = default_weights();
+        w.w_fts = 0.99;
+        w.last_access_event_id = 42;
+        w.last_recall_event_id = 17;
+
+        // First save (row absent → INSERT path).
+        assert!(save_weights_cas(&conn, &w, 0, 0), "first install should succeed");
+
+        let (acc, rec) = read_persisted_watermarks(&conn);
+        assert_eq!(acc, Some(42), "last_access_event_id missing from row");
+        assert_eq!(rec, Some(17), "last_recall_event_id missing from row");
+
+        let loaded = load_weights(&conn);
+        // Sanity: weights and watermarks survive the roundtrip.
+        // (`load_weights` falls back to defaults if `sum > 5.0` — the
+        // bumped `w_fts = 0.99` keeps the sum well within range.)
+        assert!((loaded.w_fts - 0.99).abs() < 1e-6);
+        assert_eq!(loaded.last_access_event_id, 42);
+        assert_eq!(loaded.last_recall_event_id, 17);
+    }
+
+    #[test]
+    fn reranker_cas_rejects_stale_observed_watermark() {
+        // v0.25.2: complementary to the consumer-loop replay-safety
+        // test in `ops/adaptive::test_reranker_replay_safe_when_commit_offset_lost`.
+        // Here we exercise the row-level invariant directly: once the
+        // watermark in the row has been bumped to N, any caller that
+        // observed an older watermark and tries to write must be
+        // rejected by the CAS predicate. This is the storage-side
+        // half of the protection; the peek-side filter is the
+        // higher-level half.
+        let conn = ws_conn();
+        let mut w = default_weights();
+        assert!(save_weights_cas(&conn, &w, 0, 0), "first install should succeed"); // watermarks = 0
+
+        // Pretend cycle 1 absorbed events through id=5 on both streams.
+        w.w_fts = 0.20;
+        w.last_access_event_id = 5;
+        w.last_recall_event_id = 5;
+        assert!(save_weights_cas(&conn, &w, 0, 0), "cycle 1 CAS should hit (expected=0,0 matches)");
+        let after_cycle1 = read_persisted_watermarks(&conn);
+        assert_eq!(after_cycle1, (Some(5), Some(5)));
+
+        // Cycle 2 starts with a stale view (commit_offset failed last
+        // cycle, peek re-surfaces events 1..=5). A naive caller that
+        // observed watermark=0 from a stale `consumer_offsets` and
+        // tried to re-apply with `expected=(0,0)` MUST be rejected by
+        // the CAS predicate → row unchanged.
+        let stale_attempt_ftsf = 0.55_f32;
+        let mut stale = w.clone();
+        stale.w_fts = stale_attempt_ftsf;
+        // Note: the stale caller does NOT bump the watermark (it
+        // thinks it's the first-ever apply), so it passes
+        // `expected=(0, 0)`.
+        assert!(
+            !save_weights_cas(&conn, &stale, 0, 0),
+            "stale CAS should report miss so the caller can refrain from advancing offset"
+        );
+
+        // The CAS predicate misses → row still has cycle-1 weights.
+        let row_value: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'rerank_weights'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&row_value).unwrap();
+        let w_fts = parsed.get("w_fts").and_then(|v| v.as_f64()).unwrap();
+        assert!(
+            (w_fts - 0.20).abs() < 1e-6,
+            "stale CAS write must be rejected; w_fts in row = {w_fts} (expected 0.20)"
+        );
+    }
+
+    #[test]
+    fn reranker_concurrent_save_cas_protects() {
+        // v0.25.2: simulate two workers who both load weights at the
+        // same time (both observe watermark=(0, 0)), each compute a
+        // gradient step, then both attempt to save with their own
+        // bumped watermark. Worker A writes first (CAS hits); Worker
+        // B's CAS predicate misses (the row's watermark is no longer
+        // 0). Worker B's write is dropped silently — the spec says
+        // "log + skip the cycle (do not panic)".
+        let conn = ws_conn();
+        let initial = default_weights();
+        assert!(save_weights_cas(&conn, &initial, 0, 0), "first install should succeed");
+
+        // Worker A: observed (0, 0), bumps to (10, 20), updates w_fts.
+        let mut worker_a = initial.clone();
+        worker_a.w_fts = 0.30;
+        worker_a.last_access_event_id = 10;
+        worker_a.last_recall_event_id = 20;
+        assert!(save_weights_cas(&conn, &worker_a, 0, 0), "worker A CAS should hit");
+
+        let after_a = read_persisted_watermarks(&conn);
+        assert_eq!(after_a, (Some(10), Some(20)), "worker A must commit first");
+
+        // Worker B: observed (0, 0) at the same time as A, computed
+        // its own gradient step, attempts to commit. CAS predicate
+        // checks against the row's CURRENT watermarks (10, 20) ≠ B's
+        // expected (0, 0) → rejection.
+        let mut worker_b = initial.clone();
+        worker_b.w_fts = 0.99;
+        worker_b.last_access_event_id = 7;
+        worker_b.last_recall_event_id = 11;
+        assert!(
+            !save_weights_cas(&conn, &worker_b, 0, 0),
+            "worker B CAS should miss so it knows not to advance its consumer offsets"
+        );
+
+        // Row must still reflect Worker A's write — Worker B silently
+        // skipped its cycle.
+        let row_value: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'rerank_weights'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&row_value).unwrap();
+        let w_fts = parsed.get("w_fts").and_then(|v| v.as_f64()).unwrap();
+        assert!(
+            (w_fts - 0.30).abs() < 1e-6,
+            "worker B's stale CAS must be rejected; w_fts = {w_fts} (expected 0.30)"
+        );
+
+        let after_b = read_persisted_watermarks(&conn);
+        assert_eq!(
+            after_b,
+            (Some(10), Some(20)),
+            "Worker B must not have bumped the watermark"
         );
     }
 }

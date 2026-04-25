@@ -1,14 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useArtifacts } from '../hooks/useApi';
 import { apiGet } from '../api/client';
-import type { Artifact } from '../api/types';
-
-/* ── types ──────────────────────────────────────────────────────── */
-
-interface ArtifactDetail extends Artifact {
-  transcript_text: string | null;
-  transcript_available?: boolean;
-}
+import type { Artifact, ArtifactDetail, Turn } from '../api/types';
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -20,11 +13,6 @@ function formatDate(iso: string): string {
     hour: '2-digit',
     minute: '2-digit',
   });
-}
-
-interface Turn {
-  role: string;
-  text: string;
 }
 
 function parseTranscript(text: string): Turn[] {

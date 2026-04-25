@@ -1,0 +1,388 @@
+[
+  {
+    "case_id": "lt_001",
+    "category": "longtail",
+    "query": "What are the various consumer offsets used by AdaptiveState event sourcing?",
+    "recall_results": [
+      {
+        "id": "mem-lt-1-1",
+        "summary": "M2 alpha optimizer reads from feedback_events with its own per-consumer offset; replays past recall sessions to learn CC fusion weights.",
+        "evidence_preview": [
+          "M2 alpha optimizer offset advances after replay",
+          "feedback_events table is append-only",
+          "alpha values cached in AdaptiveState"
+        ],
+        "score": 0.91,
+        "confidence": 0.89,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-1-2",
+        "summary": "M3 Kaplan-Meier survival estimator tracks its own watermark over the same feedback_events log to update per-cluster decay curves.",
+        "evidence_preview": [
+          "M3 survival watermark distinct from M2",
+          "decay curves recomputed on advance",
+          "stored in AdaptiveState cache"
+        ],
+        "score": 0.88,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-1-3",
+        "summary": "M5 tiering recompute uses its own watermark over feedback_events to track which events have already informed the t-digest streaming quantile estimator.",
+        "evidence_preview": [
+          "M5 tiering watermark on feedback_events",
+          "t-digest updated incrementally",
+          "Hot/Warm/Cold boundaries recomputed on advance"
+        ],
+        "score": 0.84,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-1-4",
+        "summary": "ARS Capability A concept summary refresh holds its own watermark; v0.24 cross-cutting refactor unified the peek+commit pattern across every reader.",
+        "evidence_preview": [
+          "ARS Cap A refresh watermark",
+          "peek+commit pattern from v0.24 refactor",
+          "uniform across every reader"
+        ],
+        "score": 0.79,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-1-5",
+        "summary": "Resummerize audit recheck advances its own watermark to drive the 3-strike exhaustion fuse off the resummarize_runs status stream.",
+        "evidence_preview": [
+          "resummerize fuse watermark",
+          "3-strike exhaustion counted from watermark position",
+          "audit table is the source of truth"
+        ],
+        "score": 0.74,
+        "confidence": 0.79,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["five", "consumers", "different", "spanning", "list"]
+  },
+  {
+    "case_id": "lt_002",
+    "category": "longtail",
+    "query": "How do the lossless compression contract invariants gate canonical rewrites?",
+    "recall_results": [
+      {
+        "id": "mem-lt-2-1",
+        "summary": "Invariant 1 of the contract checks no_new_facts: the rewritten canonical may not introduce trigrams absent from the source evidence corpus.",
+        "evidence_preview": [
+          "no_new_facts trigram check",
+          "trigrams from evidence rows form the allowlist",
+          "rewrite rejected if novel trigrams appear"
+        ],
+        "score": 0.93,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-2-2",
+        "summary": "Invariant 2 enforces length_bounded: rewritten output must be at least 30 percent shorter than the keep-tail input but not below a minimum canonical floor.",
+        "evidence_preview": [
+          "length_bounded ratio check",
+          "minimum canonical floor enforced",
+          "30 percent shorter than input"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-2-3",
+        "summary": "Invariants 3 and 4 enforce keyword_preservation and entity_preservation: high-frequency keywords and named entities from evidence must survive the rewrite.",
+        "evidence_preview": [
+          "keyword_preservation rule",
+          "entity_preservation rule",
+          "high-frequency tokens must survive"
+        ],
+        "score": 0.86,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-2-4",
+        "summary": "Invariant 5 (numeric_preservation) guards numbers; invariant 6 (date_preservation) guards ISO dates and relative time markers.",
+        "evidence_preview": [
+          "numeric_preservation invariant",
+          "date_preservation invariant",
+          "ISO and relative dates protected"
+        ],
+        "score": 0.81,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-2-5",
+        "summary": "Invariant 7 is shape_consistency: the rewrite must keep the structural shape of the canonical (bullet lists stay bullet lists, prose stays prose).",
+        "evidence_preview": [
+          "shape_consistency invariant",
+          "structural shape preserved",
+          "bullet lists vs prose distinction"
+        ],
+        "score": 0.78,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["seven", "together", "guardrail", "complete", "validation"]
+  },
+  {
+    "case_id": "lt_003",
+    "category": "longtail",
+    "query": "What MCP tools were added in v0.23 / v0.24 / v0.25 and how do they fit together?",
+    "recall_results": [
+      {
+        "id": "mem-lt-3-1",
+        "summary": "v0.23.0 shipped rein_resummerize as a new MCP tool — operator-driven LLM canonical rewrite gated by the lossless contract; opt-in via [resummerize].enabled.",
+        "evidence_preview": [
+          "rein_resummerize is the new MCP tool",
+          "opt-in via [resummerize].enabled",
+          "operator-driven slow-channel rewrite"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-3-2",
+        "summary": "v0.24.0 introduced rein_concept_summary_refresh and rein_concept_state to expose the ARS Capability A living-summary refresh path; both opt-in via [ars].concept_summary_enabled.",
+        "evidence_preview": [
+          "rein_concept_summary_refresh added",
+          "rein_concept_state added",
+          "opt-in via [ars].concept_summary_enabled"
+        ],
+        "score": 0.88,
+        "confidence": 0.87,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-3-3",
+        "summary": "rein_dedup_concepts arrived in v0.24 to drive the SemDeDup P90 per-cluster threshold loop on the concepts side.",
+        "evidence_preview": [
+          "rein_dedup_concepts new in v0.24",
+          "SemDeDup P90 per-cluster threshold",
+          "drives concepts dedup loop"
+        ],
+        "score": 0.84,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-3-4",
+        "summary": "v0.25.0 extended rein_recall with synthesize=true rather than introducing a new tool, keeping the surface stable.",
+        "evidence_preview": [
+          "rein_recall extended with synthesize=true",
+          "no new tool added in v0.25.0",
+          "surface stability priority"
+        ],
+        "score": 0.81,
+        "confidence": 0.83,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["four", "across", "additions", "incremental", "lineage"]
+  },
+  {
+    "case_id": "lt_004",
+    "category": "longtail",
+    "query": "Where do the test-support mock implementations live and what do they cover?",
+    "recall_results": [
+      {
+        "id": "mem-lt-4-1",
+        "summary": "embed/mock.rs defines MockEmbedder behind the test-support feature; integration tests use it to script vector responses for run_vec_dedup_with_embedder.",
+        "evidence_preview": [
+          "embed/mock.rs MockEmbedder",
+          "behind test-support feature flag",
+          "scripts vector responses for run_vec_dedup"
+        ],
+        "score": 0.93,
+        "confidence": 0.91,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-4-2",
+        "summary": "extract/llm.rs::MockExtractor sits behind the same test-support feature; uses a FIFO response queue with explicit exhausted error so under-provisioned tests fail loudly.",
+        "evidence_preview": [
+          "MockExtractor in extract/llm.rs",
+          "FIFO queue of responses",
+          "exhausted error on drain"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-4-3",
+        "summary": "MockExtractorProbe complements MockExtractor with a call-count probe so tests can assert how many LLM calls a code path issued.",
+        "evidence_preview": [
+          "MockExtractorProbe records call count",
+          "asserts code path call shape",
+          "shipped alongside MockExtractor"
+        ],
+        "score": 0.84,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-4-4",
+        "summary": "test-support mocks are absent from the release binary: they are gated by a Cargo feature so production builds never link them in.",
+        "evidence_preview": [
+          "release binary excludes test-support",
+          "Cargo feature gates the mocks",
+          "production link safety"
+        ],
+        "score": 0.80,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["MockEmbedder", "MockExtractor", "test-support", "FIFO", "feature"]
+  },
+  {
+    "case_id": "lt_005",
+    "category": "longtail",
+    "query": "What does evidence-aware recall mean and which channels feed it?",
+    "recall_results": [
+      {
+        "id": "mem-lt-5-1",
+        "summary": "Evidence-aware recall means each candidate carries both its canonical summary and a preview of the evidence rows that support it; the rerank uses both signals.",
+        "evidence_preview": [
+          "candidate carries canonical plus evidence preview",
+          "rerank uses both signals",
+          "evidence_count surfaced in payload"
+        ],
+        "score": 0.92,
+        "confidence": 0.90,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-5-2",
+        "summary": "Tantivy BM25 returns canonicals; the recall layer fans out to fetch a small evidence preview per canonical so the operator sees sources without N+1 round-trips.",
+        "evidence_preview": [
+          "Tantivy BM25 returns canonicals only",
+          "evidence preview fetched in batch",
+          "no N+1 round-trips"
+        ],
+        "score": 0.87,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-5-3",
+        "summary": "usearch HNSW vector channel returns canonical IDs; the same evidence-preview batch fetch path applies, keyed by canonical.",
+        "evidence_preview": [
+          "HNSW returns canonical IDs",
+          "shared batch fetch path for evidence preview",
+          "keyed by canonical"
+        ],
+        "score": 0.83,
+        "confidence": 0.84,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-5-4",
+        "summary": "Knowledge-graph BFS surfaces concept-linked memories; canonical-first collapse merges duplicates before evidence preview is computed.",
+        "evidence_preview": [
+          "KG BFS surfaces concept-linked memories",
+          "canonical-first collapse before preview",
+          "duplicate merge before fetch"
+        ],
+        "score": 0.79,
+        "confidence": 0.82,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["Tantivy", "HNSW", "BFS", "canonical", "preview"]
+  },
+  {
+    "case_id": "lt_006",
+    "category": "longtail",
+    "query": "How does the v0.23 resummerize side-index discipline work?",
+    "recall_results": [
+      {
+        "id": "mem-lt-6-1",
+        "summary": "After a successful apply_resummerize, refresh_indexes_after_canonical_rewrite triggers Tantivy refresh inside the same write transaction.",
+        "evidence_preview": [
+          "Tantivy refresh inline with rewrite",
+          "refresh_indexes_after_canonical_rewrite helper",
+          "in-transaction trigger"
+        ],
+        "score": 0.93,
+        "confidence": 0.91,
+        "sources_hit": 3,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-6-2",
+        "summary": "The same path issues a sqlite-vec delete for the old vector row in-transaction so the vector table never carries stale embeddings tied to the rewritten canonical.",
+        "evidence_preview": [
+          "sqlite-vec delete in-transaction",
+          "old vector row removed",
+          "no stale embedding lingers"
+        ],
+        "score": 0.89,
+        "confidence": 0.88,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-6-3",
+        "summary": "needs_vec_dedup is set to 1 after rewrite to enqueue an adaptive-pipeline re-embed pass that re-inserts the new canonical into HNSW.",
+        "evidence_preview": [
+          "needs_vec_dedup flag set to 1",
+          "adaptive pipeline re-embeds",
+          "HNSW re-insertion via run_vec_dedup"
+        ],
+        "score": 0.85,
+        "confidence": 0.86,
+        "sources_hit": 2,
+        "evidence_count": 3
+      },
+      {
+        "id": "mem-lt-6-4",
+        "summary": "Audit row in resummarize_runs records the side-index outcome so a doctor pass can detect drift between Tantivy / sqlite-vec / HNSW for any rewritten canonical.",
+        "evidence_preview": [
+          "resummarize_runs audit row",
+          "doctor detects side-index drift",
+          "Tantivy / sqlite-vec / HNSW state"
+        ],
+        "score": 0.82,
+        "confidence": 0.85,
+        "sources_hit": 2,
+        "evidence_count": 3
+      }
+    ],
+    "evidence_keywords": ["Tantivy", "sqlite-vec", "HNSW", "needs_vec_dedup", "audit"]
+  }
+]

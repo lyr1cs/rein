@@ -37,6 +37,11 @@ export function useTopics() {
   return useQuery({
     queryKey: ['topics'],
     queryFn: () => apiGet<{ topics: string[] }>('/api/topics'),
+    refetchInterval: () => getPollingIntervalMs(),
+    // Explicit even though `false` is the react-query default — pairs the
+    // background-gating decision with the polling cadence at the call site
+    // so a future flip is a one-line change.
+    refetchIntervalInBackground: false,
   });
 }
 
