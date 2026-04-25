@@ -1217,32 +1217,54 @@ fn peek_access_events(
 // ===========================================================================
 
 fn run_reranker_weight_learning(store: &SqliteStore) {
-    // **Known limitation (v0.24.x backlog)**: `save_weights` and
-    // `commit_offset` here are NOT in one transaction. If `save_weights`
-    // succeeds and the immediately-following `commit_offset` fails (DB
-    // I/O race / lock failure), the same gradient window will replay
-    // and apply a second step (lr=0.005, single epoch). Per-step deltas
-    // are bounded by renormalization to sum=1.0; cumulative
-    // over-application is bounded only by eventual successful commit
-    // (Codex Tier-B+C round-3 LOW). A proper fix requires either:
-    //   (a) a `weights_last_id` column on the `weights` table
-    //       persisted in the same transaction as `save_weights`, or
-    //   (b) folding the reranker's writes into the M1 `feedback_events`
-    //       → `AdaptiveState` pipeline so it benefits from the existing
-    //       watermark + CAS-merge protections.
-    // Both approaches are out of scope for v0.24.0 (Codex Tier-B+C
-    // round-2 MEDIUM, deferred).
+    // v0.25.2 (lifted v0.24.x backlog item): `save_weights` and
+    // `commit_offset` are still two separate writes — but the
+    // weights row now carries `last_access_event_id` +
+    // `last_recall_event_id` watermarks persisted atomically with the
+    // weights themselves. If `commit_offset` fails after `save_weights`
+    // succeeds, the next pass re-peeks the same events and the
+    // watermark filter (`id > weights.last_*_event_id`) drops them →
+    // no double-application. The weights row is now the source-of-
+    // truth watermark; `consumer_offsets` is a redundant best-effort
+    // cache (kept for compatibility / observability).
+    //
+    // Five invariants for event-sourced state (see
+    // `feedback_event_sourced_state_invariant` memory):
+    //   1. watermark filter — `events.into_iter().filter(|e| e.id >
+    //      prior_*_water)` below.
+    //   2. applied-prefix bump — `weights.last_*_event_id =
+    //      max(prior, peek_max)` is set *only when `updates > 0`*. Zero-
+    //      update passes do NOT bump the weights watermark; `commit_offset`
+    //      still bumps the redundant offset cache to drain the FIFO so the
+    //      next peek doesn't re-surface the same window forever.
+    //   3. replay-drain on startup — implicit. `peek_events` already
+    //      filters by `consumer_offsets`; the additional
+    //      `id > prior_*_water` filter composes to `id > max(offsets,
+    //      weights)`, exactly the spec.
+    //   4. CAS merge — `save_weights_cas` predicates the UPDATE on
+    //      `(observed_access_id, observed_recall_id)` matching the row's
+    //      current values. Concurrent writer wins → we log + skip.
+    //   5. per-consumer offset record — kept as best-effort cache via
+    //      the existing `commit_offset` calls; weights row dominates.
     let conn = store.conn();
 
+    // Load weights up front so we can capture the prior watermarks
+    // BEFORE peeking (invariant #1 + CAS-prep). The weights serve as
+    // the source-of-truth replay watermark.
+    let mut weights = crate::search::rerank::load_weights(conn);
+    let prior_access_water = weights.last_access_event_id;
+    let prior_recall_water = weights.last_recall_event_id;
+
     // Peek feedback events (RecallAccess with source=agent_feedback). Self-
-    // contained peek+commit: this helper writes to the `weights` table
-    // (NOT `adaptive_state`), so it commits its own consumer offsets.
+    // contained peek+commit: this helper writes to the `metadata`
+    // `rerank_weights` row (NOT `adaptive_state`), so it commits its
+    // own consumer offsets.
     // Codex Tier-B+C round-1 MEDIUM: commit each peek's offset *after
     // evaluation* (not gated on `updates > 0`). Filtered-out events have
     // been evaluated → safe to mark consumed; otherwise they stuck
     // behind the 200-row peek limit forever when no agent-feedback rows
     // arrived.
-    let events = match crate::store::adaptive::peek_events(
+    let raw_access_events = match crate::store::adaptive::peek_events(
         conn,
         "reranker_weights",
         &["recall_access"],
@@ -1254,6 +1276,53 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             return;
         }
     };
+    // Codex R3 G9 fix: peek BOTH streams up front so the early-return
+    // paths below (no agent-feedback rows / no used_ids) can also
+    // replay-drain the recall consumer offset, not just access. Without
+    // this, a prior successful weights-save with a failed recall
+    // commit_offset would leave the recall consumer cursor stale
+    // forever; eventually new recall_complete events fall behind the
+    // peek window and future feedback can't find their candidate
+    // features. `unwrap_or_default()` is best-effort — peek errors
+    // simply leave the recall queue undrained until next cycle.
+    let raw_recall_events = crate::store::adaptive::peek_events(
+        conn,
+        "reranker_weights_recall",
+        &["recall_complete"],
+        100,
+    )
+    .unwrap_or_default();
+
+    // Capture the RAW peek max BEFORE the watermark filter (Codex R1
+    // G1 fix). When `commit_offset` was lost last cycle but the weights
+    // row's watermark was already saved, the next peek surfaces those
+    // already-applied events. The watermark filter drops them all, so
+    // the post-filter `weights_max_id` is None — but we still must
+    // advance the consumer offset past them, otherwise the same 200
+    // events pin the cursor forever and starve later feedback events
+    // behind the peek-window limit.
+    let raw_access_max = raw_access_events.last().map(|e| e.id);
+    let raw_recall_max = raw_recall_events.last().map(|e| e.id);
+    // Replay-only drain target for the recall stream: the highest event
+    // id that's STRICTLY ≤ the durable watermark in the weights row
+    // (i.e., already applied to a prior cycle's gradient). Early-return
+    // paths advance to this id only — they MUST NOT drop post-water
+    // events that future feedback events may legitimately need.
+    let recall_replay_drain_id = raw_recall_events
+        .iter()
+        .filter(|e| e.id <= prior_recall_water)
+        .map(|e| e.id)
+        .max();
+    let recall_replay_pair: Option<(&str, i64)> =
+        recall_replay_drain_id.map(|id| ("reranker_weights_recall", id));
+
+    // Replay-safety filter (invariant #1): drop events whose gradient
+    // effect is already durable in the weights row (commit_offset
+    // failed last cycle, those events re-surface on this peek).
+    let events: Vec<_> = raw_access_events
+        .into_iter()
+        .filter(|e| e.id > prior_access_water)
+        .collect();
     let weights_max_id = events.last().map(|e| e.id);
 
     // Filter to agent_feedback source only
@@ -1272,13 +1341,38 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         })
         .collect();
 
-    let weights_pair: Option<(&str, i64)> = weights_max_id.map(|id| ("reranker_weights", id));
+    // `access_offset_id` falls back to the raw peek max so already-applied
+    // events drained by the watermark filter still advance the consumer
+    // offset (replay-drain invariant — Codex R1 G1).
+    let access_offset_id = weights_max_id.or(raw_access_max);
+    let access_offset_pair: Option<(&str, i64)> =
+        access_offset_id.map(|id| ("reranker_weights", id));
+
+    // Helper for the early-return paths: commit access advance plus the
+    // recall replay-drain in a single atomic call (Codex R3 G9). The
+    // recall portion only includes pure replays — post-water recall
+    // events stay in queue for future feedback processing.
+    let early_return_commit = |conn: &rusqlite::Connection| {
+        let mut pairs: Vec<(&str, i64)> = Vec::with_capacity(2);
+        if let Some(pair) = access_offset_pair {
+            pairs.push(pair);
+        }
+        if let Some(pair) = recall_replay_pair {
+            pairs.push(pair);
+        }
+        if !pairs.is_empty() {
+            let _ = crate::store::adaptive::commit_offset(conn, &pairs);
+        }
+    };
+
     if feedback_events.is_empty() {
         // Evaluated this batch (no agent-feedback rows applied) →
         // commit the offset so the same window isn't re-peeked forever.
-        if let Some(pair) = weights_pair {
-            let _ = crate::store::adaptive::commit_offset(conn, &[pair]);
-        }
+        // Weights row is unchanged so no watermark bump is needed.
+        // (If `commit_offset` fails here, the next pass re-peeks the
+        // same empty-filter window and re-evaluates to the same
+        // empty-applied outcome → wasted work, no double-apply.)
+        early_return_commit(conn);
         return;
     }
     if feedback_events.len() < 10 {
@@ -1295,31 +1389,25 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         .collect();
 
     if used_ids.is_empty() {
-        if let Some(pair) = weights_pair {
-            let _ = crate::store::adaptive::commit_offset(conn, &[pair]);
-        }
+        early_return_commit(conn);
         return;
     }
 
-    // Peek recent recall_complete events to get candidate features.
-    let recall_events = match crate::store::adaptive::peek_events(
-        conn,
-        "reranker_weights_recall",
-        &["recall_complete"],
-        100,
-    ) {
-        Ok(evts) => evts,
-        Err(_) => {
-            if let Some(pair) = weights_pair {
-                let _ = crate::store::adaptive::commit_offset(conn, &[pair]);
-            }
-            return;
-        }
-    };
+    // Same raw-vs-filtered split as the access stream — `recall_max_id`
+    // drives the watermark bump (only events whose gradient was applied
+    // count); `recall_offset_id` drives the consumer offset (must
+    // advance past already-applied replays too). Recall events were
+    // peeked up front for the early-return drain logic above; here we
+    // consume them for the actual gradient computation.
+    let recall_events: Vec<_> = raw_recall_events
+        .into_iter()
+        .filter(|e| e.id > prior_recall_water)
+        .collect();
     let recall_max_id = recall_events.last().map(|e| e.id);
+    let recall_offset_id = recall_max_id.or(raw_recall_max);
 
     // Build training pairs: for each recall, which candidates were used (positive) vs not (negative)
-    let mut weights = crate::search::rerank::load_weights(conn);
+    // (`weights` already loaded above to capture prior watermarks)
     let lr: f32 = 0.005;
     let mut updates = 0;
 
@@ -1421,6 +1509,11 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         }
     }
 
+    // Default to "true" so the no-save path (updates == 0) advances the
+    // consumer offset normally. Only flipped to false when the CAS
+    // write inside `if updates > 0` is rejected by a concurrent writer.
+    let mut cas_succeeded = true;
+
     if updates > 0 {
         // Now normalize ALL weights to sum to 1.0
         let sum = weights.w_fts
@@ -1464,21 +1557,68 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             weights.w_episode /= sum;
         }
 
-        crate::search::rerank::save_weights(conn, &weights);
-        tracing::info!(updates, "reranker weights updated from agent feedback");
+        // v0.25.2 invariant #2 — applied-prefix bump. Update the
+        // weights row's watermarks to the highest event id whose
+        // gradient effect is in the (about-to-be-saved) weights blob.
+        // peek-max == applied-prefix here because every event that
+        // survived the agent_feedback / used_ids filtering and produced
+        // a non-zero gradient is unconditionally absorbed.
+        if let Some(id) = weights_max_id {
+            weights.last_access_event_id = weights.last_access_event_id.max(id);
+        }
+        if let Some(id) = recall_max_id {
+            weights.last_recall_event_id = weights.last_recall_event_id.max(id);
+        }
+
+        // CAS write: predicate on the watermarks observed at load
+        // time. If a concurrent worker bumped them already, the UPDATE
+        // misses → returns false. Codex R1 G2: we MUST gate the
+        // post-evaluation commit on this result, otherwise we'd advance
+        // the consumer offsets past events whose gradient never made
+        // it into the weights row, permanently dropping them.
+        cas_succeeded = crate::search::rerank::save_weights_cas(
+            conn,
+            &weights,
+            prior_access_water,
+            prior_recall_water,
+        );
+        if cas_succeeded {
+            tracing::info!(updates, "reranker weights updated from agent feedback");
+        } else {
+            tracing::warn!(
+                updates,
+                "reranker weights CAS missed (concurrent worker won the race); \
+                 leaving consumer offsets in place so next cycle can replay"
+            );
+        }
     }
 
-    // Post-evaluation commit (Codex Tier-B+C MEDIUM): always commit
-    // both consumer offsets after we've evaluated the batch — even if
-    // no `updates` happened (e.g. no candidate-vs-used-id overlap).
-    // Skipping the commit here was the bug that pinned events behind
-    // the peek limit. Both offsets advance atomically.
+    // Post-evaluation commit. The weights row's watermarks
+    // (`last_access_event_id` / `last_recall_event_id`) are the durable
+    // source of truth; `consumer_offsets` is a best-effort cache that
+    // accelerates future peeks by skipping already-processed events.
+    //
+    // Three cases:
+    //   1. updates == 0 (no gradient applied): `cas_succeeded` stays
+    //      `true` (default) → safe to advance, those events won't
+    //      contribute on retry either.
+    //   2. updates > 0 AND CAS hit: gradient durable → safe to advance.
+    //   3. updates > 0 AND CAS missed: gradient NOT durable → must NOT
+    //      advance, so next cycle re-peeks the same events and retries
+    //      with fresh watermarks (Codex R1 G2 fix).
+    //
+    // Both offsets are gated together: even though the recall stream
+    // doesn't have its own CAS predicate, retrying needs the same
+    // recall events available to re-derive the candidate features that
+    // drove the gradient.
     let mut pairs: Vec<(&str, i64)> = Vec::with_capacity(2);
-    if let Some(pair) = weights_pair {
-        pairs.push(pair);
-    }
-    if let Some(id) = recall_max_id {
-        pairs.push(("reranker_weights_recall", id));
+    if cas_succeeded {
+        if let Some(pair) = access_offset_pair {
+            pairs.push(pair);
+        }
+        if let Some(id) = recall_offset_id {
+            pairs.push(("reranker_weights_recall", id));
+        }
     }
     if !pairs.is_empty() {
         if let Err(e) = crate::store::adaptive::commit_offset(conn, &pairs) {
@@ -1506,28 +1646,45 @@ fn run_m6_threshold_learning(
     // which is only durable after `state.save_snapshot()` in
     // `run_adaptive_pipeline`. Caller commits the returned offsets only
     // on save success.
-    let events =
-        crate::store::adaptive::peek_events(conn, "m6_threshold", &["param_update"], 200)
-            .unwrap_or_default();
-    let max_threshold_id = events.last().map(|e| e.id);
-    if let Some(id) = max_threshold_id {
-        pending.push(("m6_threshold", id));
-    }
-    // Replay-safety (Codex Tier-B+C round-1 HIGH): if a prior pass's
-    // commit_offset failed after save_snapshot succeeded, those events
-    // are re-peeked. Skip ones whose threshold nudge is already in the
-    // durable snapshot (id <= state.m6_threshold_last_id).
+    //
+    // v0.25.2 — gate-and-stay (M6 latent watermark-on-peek, flagged in
+    // v0.24.0 ship notes). The previous implementation pushed the offset
+    // and bumped `m6_threshold_last_id` UNCONDITIONALLY after peek, which
+    // silently dropped events 1..N-1 whenever the cycle woke up below the
+    // gate threshold (>=10 explore_events). Now both side effects are
+    // gated on the same condition as the state mutation: events stay in
+    // the queue until the gate fires, matching the v0.24 peek+commit
+    // pattern used by `recompute_concept_refresh_stats` and
+    // `run_alpha_learning`. Pre-existing watermark filter (`id >
+    // prior_threshold_water`) and CAS merge in `save_snapshot` are kept
+    // unchanged.
+    const M6_THRESHOLD_PEEK_LIMIT: usize = 200;
+    let raw_events = crate::store::adaptive::peek_events(
+        conn,
+        "m6_threshold",
+        &["param_update"],
+        M6_THRESHOLD_PEEK_LIMIT,
+    )
+    .unwrap_or_default();
+    // Codex R3 G8: capture the saturated-window flag BEFORE the move.
+    // Used by the below-gate fallback to break the
+    // "explore-contiguous-with-watermark + window full of noise"
+    // deadlock that the simple `min_explore_id - 1` rule can't reach.
+    let raw_window_saturated = raw_events.len() >= M6_THRESHOLD_PEEK_LIMIT;
+    let max_threshold_id = raw_events.last().map(|e| e.id);
     let prior_threshold_water = state.m6_threshold_last_id;
-    if let Some(id) = max_threshold_id {
-        state.m6_threshold_last_id = state.m6_threshold_last_id.max(id);
-    }
-    let events: Vec<_> = events
+    let post_water_events: Vec<_> = raw_events
         .into_iter()
         .filter(|e| e.id > prior_threshold_water)
         .collect();
 
-    // Filter to threshold_exploration events only
-    let explore_events: Vec<_> = events
+    // Filter to threshold_exploration events only. Other consumers also
+    // emit `param_update` (vec-dedup cleanup in ops/dedup.rs writes
+    // `param_update` rows with no query_type), so the dedicated
+    // `m6_threshold` cursor would starve on a steady stream of noise if
+    // we waited for the explore-gate to fire. Below we advance past
+    // noise-only batches even when the explore gate doesn't fire.
+    let explore_events: Vec<_> = post_water_events
         .iter()
         .filter(|e| e.query_type.as_deref() == Some("threshold_exploration"))
         .collect();
@@ -1605,24 +1762,127 @@ fn run_m6_threshold_learning(
                 );
             }
         }
+
+        // Gate fired → explore events have been *consumed* (the inner
+        // raised/lowered branch may or may not have nudged the threshold;
+        // either way, re-applying the same batch on the next cycle would
+        // compound the count and re-nudge). Bump the watermark to the
+        // peeked-max and ask the orchestrator to commit the cursor on
+        // save success. Without this paired bump, a `commit_offset`
+        // failure after `save_snapshot` would let the same batch nudge
+        // the threshold again on the next pass — exactly the issue
+        // round-1 HIGH closed for the always-bumped variant.
+        if let Some(id) = max_threshold_id {
+            state.m6_threshold_last_id = state.m6_threshold_last_id.max(id);
+            pending.push(("m6_threshold", id));
+        }
+    } else if explore_events.is_empty() && max_threshold_id.is_some() {
+        // Three sub-cases collapse here, all advancing the cursor with
+        // no state effect:
+        //
+        //  1. Noise-only: this consumer is dedicated to
+        //     `threshold_exploration`, so non-exploration `param_update`
+        //     rows (e.g. `ops/dedup.rs` cleanup events) have nothing to
+        //     do for it. Without this advance, a steady cleanup stream
+        //     would push future explore events past the 200-event peek
+        //     window forever.
+        //
+        //  2. Replay-drain (Codex round-1 HIGH analog): a prior pass's
+        //     `save_snapshot` succeeded but `commit_offset` failed. The
+        //     in-memory `m6_threshold_last_id` was bumped (to W); the
+        //     durable cursor is still at 0. This pass re-peeks events
+        //     1..W. The `id > prior_threshold_water` filter drops all of
+        //     them, so `post_water_events` AND `explore_events` are both
+        //     empty — but the durable cursor MUST still advance to W,
+        //     otherwise the next pass repeats the same drain and the
+        //     events sit behind the cursor forever (until retention
+        //     sweeps them). Mirrors `recompute_concept_refresh_stats`,
+        //     which always returns `max_id_this_pass` once raw peek is
+        //     non-empty.
+        //
+        //  3. Pure noise + replay-drain mix: same outcome.
+        //
+        // The watermark bump is a no-op in case 2 (`m6_threshold_last_id`
+        // already at W or higher); in cases 1/3 it does real work. The
+        // `max_threshold_id.is_some()` guard means we only push when the
+        // raw peek returned at least one event — empty raw peeks don't
+        // need a commit.
+        if let Some(id) = max_threshold_id {
+            state.m6_threshold_last_id = state.m6_threshold_last_id.max(id);
+            pending.push(("m6_threshold", id));
+        }
+    } else if !explore_events.is_empty() {
+        // Codex R2 G3 (mixed-batch livelock fix): explore_events is
+        // non-empty but below the >=10 gate. The 200-row peek window
+        // may have filled mostly with noise (cleanup `param_update`
+        // rows from `ops/dedup.rs`) plus a small explore tail.
+        //
+        // Without this branch, the cursor stays put → next peek returns
+        // the same 200 rows → gate never fires (livelock under noise
+        // dominance). Codex R2 caught the path that Agent 5's self-audit
+        // had flagged as out-of-scope.
+        //
+        // Safe drain rule: advance cursor to `min(explore.id) - 1`. All
+        // events strictly BEFORE the first explore in this peek are
+        // noise we can permanently drop (this consumer doesn't care
+        // about non-exploration `param_update`). The explore events
+        // themselves stay in the queue to accumulate with future
+        // arrivals on the next cycle. Noise interleaved BETWEEN explores
+        // stays for now (the next cycle re-filters and re-drops it,
+        // cheap).
+        let min_explore_id = explore_events
+            .iter()
+            .map(|e| e.id)
+            .min()
+            .expect("explore_events non-empty by branch guard");
+        let safe_advance = min_explore_id.saturating_sub(1);
+        if safe_advance > prior_threshold_water {
+            state.m6_threshold_last_id = state.m6_threshold_last_id.max(safe_advance);
+            pending.push(("m6_threshold", safe_advance));
+        } else if raw_window_saturated {
+            // Codex R3 G8 break-glass: first explore is contiguous with
+            // the watermark (`min_explore_id - 1 == prior_threshold_water`)
+            // AND the peek window is saturated → noise behind the
+            // explore can never accumulate to the >=10 gate, so the
+            // standard min-1 rule deadlocks. Break the deadlock by
+            // advancing past the whole window, sacrificing up to 9
+            // explore signals. The next cycle gets a clean window with
+            // new arrivals only. Logged at WARN so the loss is visible
+            // in observability — if this fires often, the right fix is
+            // a separate consumer key for noise sources, not a wider
+            // peek window.
+            if let Some(raw_max) = max_threshold_id {
+                tracing::warn!(
+                    explore_count = explore_events.len(),
+                    noise_count = post_water_events.len() - explore_events.len(),
+                    advanced_to = raw_max,
+                    "M6 below-gate deadlock break: explore signals dropped to advance past saturated window"
+                );
+                state.m6_threshold_last_id = state.m6_threshold_last_id.max(raw_max);
+                pending.push(("m6_threshold", raw_max));
+            }
+        }
     }
+    // else: gate didn't fire AND we have a partial batch of explore
+    // events queued (1..=9). Leave the cursor + watermark untouched so
+    // the next pass peeks them again alongside future arrivals and
+    // (eventually) crosses the threshold.
 
     // --- Part 2: Co-recall frequency signal ---
     // If two memories always appear together in recall results, they might be duplicates
     // that slipped through dedup (threshold was too high).
-    let recall_events =
+    //
+    // v0.25.2 — same gate-and-stay fix as Part 1. The outer `>= 5` gate
+    // is the one that matters here: when it fires, real side effects
+    // happen (UPDATE memories SET needs_vec_dedup = 1, plus
+    // global/per-cluster threshold tweaks). Below the gate, leave events
+    // queued for the next cycle.
+    let raw_recall_events =
         crate::store::adaptive::peek_events(conn, "m6_corecall", &["recall_complete"], 100)
             .unwrap_or_default();
-    let max_corecall_id = recall_events.last().map(|e| e.id);
-    if let Some(id) = max_corecall_id {
-        pending.push(("m6_corecall", id));
-    }
-    // Replay-safety (Codex Tier-B+C round-1 HIGH): same dedup as Part 1.
+    let max_corecall_id = raw_recall_events.last().map(|e| e.id);
     let prior_corecall_water = state.m6_corecall_last_id;
-    if let Some(id) = max_corecall_id {
-        state.m6_corecall_last_id = state.m6_corecall_last_id.max(id);
-    }
-    let recall_events: Vec<_> = recall_events
+    let recall_events: Vec<_> = raw_recall_events
         .into_iter()
         .filter(|e| e.id > prior_corecall_water)
         .collect();
@@ -1743,7 +2003,36 @@ fn run_m6_threshold_learning(
                 );
             }
         }
+
+        // Outer gate fired → DB writes (`needs_vec_dedup = 1`) plus
+        // global / per-cluster threshold tweaks have happened. Bump the
+        // watermark to peeked-max and ask the orchestrator to commit
+        // the cursor on save success. Without this paired bump,
+        // re-applying the same batch would double-count pair occurrences
+        // and re-flag the same memories on the next pass.
+        if let Some(id) = max_corecall_id {
+            state.m6_corecall_last_id = state.m6_corecall_last_id.max(id);
+            pending.push(("m6_corecall", id));
+        }
+    } else if recall_events.is_empty() && max_corecall_id.is_some() {
+        // Replay-drain (Codex round-1 HIGH analog, mirrors Part 1):
+        // a prior pass's `save_snapshot` succeeded but `commit_offset`
+        // failed. The in-memory `m6_corecall_last_id` was bumped (to W);
+        // the durable cursor is still at 0. This pass re-peeks events
+        // 1..W, the `id > prior_corecall_water` filter drops them all,
+        // so `recall_events` is empty BUT raw peek was non-empty. The
+        // durable cursor MUST still advance to W, or the events sit
+        // behind the cursor forever. The watermark bump is a no-op
+        // (state already at W or higher); only the cursor advance has
+        // an effect.
+        if let Some(id) = max_corecall_id {
+            state.m6_corecall_last_id = state.m6_corecall_last_id.max(id);
+            pending.push(("m6_corecall", id));
+        }
     }
+    // else: outer gate didn't fire (1..=4 post-watermark events). Leave
+    // cursor + watermark untouched so the next pass picks up the same
+    // events alongside fresh arrivals.
 
     if pending.is_empty() {
         None
@@ -2206,6 +2495,127 @@ mod tests {
         assert!(after.w_source_diversity > before.w_source_diversity);
     }
 
+    /// v0.25.2 — replay-safety: even if `commit_offset` fails after
+    /// `save_weights`, a second invocation of the consumer loop must
+    /// NOT apply the same gradient step twice. The watermark fields
+    /// on the weights row drop the re-peeked events on the second
+    /// call.
+    #[test]
+    fn test_reranker_replay_safe_when_commit_offset_lost() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Generate the same training corpus the canonical-features
+        // test uses (12 RecallComplete + 12 matching RecallAccess).
+        for i in 0..12 {
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("req-replay-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("docker".into()),
+                    query_type: Some("semantic".into()),
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "candidates": [
+                            {
+                                "id": format!("used-{i}"),
+                                "bm25_norm": 0.4,
+                                "vec_norm": 0.4,
+                                "kg_norm": 0.1,
+                                "episode_norm": 0.1,
+                                "support_count": 5,
+                                "source_diversity": 3.0
+                            },
+                            {
+                                "id": format!("unused-{i}"),
+                                "bm25_norm": 0.4,
+                                "vec_norm": 0.4,
+                                "kg_norm": 0.1,
+                                "episode_norm": 0.1,
+                                "support_count": 1,
+                                "source_diversity": 1.0
+                            }
+                        ]
+                    })),
+                },
+            );
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallAccess,
+                    request_id: Some(format!("req-replay-{i}")),
+                    memory_id: Some(format!("used-{i}")),
+                    concept_id: None,
+                    query: None,
+                    query_type: None,
+                    topic: None,
+                    payload: Some(serde_json::json!({ "source": "agent_feedback" })),
+                },
+            );
+        }
+
+        // First run: gradient applies, weights row's watermarks bump.
+        run_reranker_weight_learning(&store);
+        let after_first = crate::search::rerank::load_weights(store.conn());
+        assert!(after_first.last_access_event_id > 0);
+        assert!(after_first.last_recall_event_id > 0);
+
+        // Simulate `commit_offset` failure: roll the consumer offsets
+        // back to 0 so the next peek re-surfaces every event. Without
+        // the watermark filter on the weights row this would cause
+        // double-application; the watermark filter must drop them.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM consumer_offsets
+                  WHERE consumer IN ('reranker_weights', 'reranker_weights_recall')",
+                [],
+            )
+            .unwrap();
+
+        // Second run: with consumer offsets reset, peek_events
+        // returns ALL events again. Watermark filter on weights row
+        // must drop them — weights MUST stay byte-identical.
+        run_reranker_weight_learning(&store);
+        let after_second = crate::search::rerank::load_weights(store.conn());
+
+        let tol = 1e-9_f32;
+        assert!(
+            (after_second.w_fts - after_first.w_fts).abs() < tol,
+            "w_fts double-applied: first={}, second={}",
+            after_first.w_fts,
+            after_second.w_fts
+        );
+        assert!(
+            (after_second.w_vec - after_first.w_vec).abs() < tol,
+            "w_vec double-applied: first={}, second={}",
+            after_first.w_vec,
+            after_second.w_vec
+        );
+        assert!(
+            (after_second.w_canonical_support - after_first.w_canonical_support).abs() < tol,
+            "w_canonical_support double-applied: first={}, second={}",
+            after_first.w_canonical_support,
+            after_second.w_canonical_support
+        );
+        assert!(
+            (after_second.w_source_diversity - after_first.w_source_diversity).abs() < tol,
+            "w_source_diversity double-applied: first={}, second={}",
+            after_first.w_source_diversity,
+            after_second.w_source_diversity
+        );
+        assert_eq!(
+            after_second.last_access_event_id, after_first.last_access_event_id,
+            "access watermark must not regress on replay"
+        );
+        assert_eq!(
+            after_second.last_recall_event_id, after_first.last_recall_event_id,
+            "recall watermark must not regress on replay"
+        );
+    }
+
     // ── Test 5: peek_recall_events ───────────────────────────────────────────
 
     #[test]
@@ -2418,6 +2828,423 @@ mod tests {
             "global_dedup_threshold should be in [0.40, 0.90], got {}",
             state.global_dedup_threshold
         );
+    }
+
+    // ── v0.25.2 M6 gate-and-stay regression suite ───────────────────────────
+    // The pre-v0.25.2 implementation pushed both `m6_threshold` /
+    // `m6_corecall` offsets and bumped both watermarks UNCONDITIONALLY
+    // after `peek_events`. When the gate (`>=10` for explore, `>=5` for
+    // co-recall) didn't fire, the cursor still advanced after
+    // `save_snapshot`, silently dropping events that should have stayed
+    // queued for the next cycle. These tests pin the new behavior:
+    //  - below the gate → no offset returned, no watermark bump, events
+    //    stay re-peekable on the next call;
+    //  - above the gate → offset returned, watermark bumped to peeked-max;
+    //  - noise-only batch → offset advanced past the noise (so the
+    //    dedicated `m6_threshold` cursor isn't starved by `param_update`
+    //    rows from `ops/dedup.rs` cleanup events).
+
+    /// Helper: read the cursor stored in `consumer_offsets` for a consumer.
+    /// Returns 0 when the consumer has never been written.
+    fn read_offset(store: &SqliteStore, consumer: &str) -> i64 {
+        store
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = ?1",
+                rusqlite::params![consumer],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// Helper: emit N threshold-exploration events and return the last
+    /// inserted row id.
+    fn emit_explore_events(store: &SqliteStore, count: u32) -> i64 {
+        let mut last_id = 0;
+        for i in 0..count {
+            let offset = if i % 2 == 0 { 0.05 } else { -0.05 };
+            last_id = emit(
+                store,
+                FeedbackEvent {
+                    event_type: EventType::ParamUpdate,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: None,
+                    query: None,
+                    query_type: Some("threshold_exploration".into()),
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "offset": offset,
+                        "was_dedup": i % 3 == 0,
+                    })),
+                },
+            );
+        }
+        last_id
+    }
+
+    #[test]
+    fn m6_below_threshold_does_not_commit() {
+        let store = SqliteStore::in_memory().unwrap();
+        emit_explore_events(&store, 5); // < 10 → gate must NOT fire
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        // Watermark must remain at the default (0).
+        assert_eq!(
+            state.m6_threshold_last_id, 0,
+            "watermark must not bump when explore gate didn't fire"
+        );
+        // No `m6_threshold` consumer pair returned for the orchestrator
+        // to commit.
+        let has_threshold_pair = result
+            .as_deref()
+            .map(|p| p.iter().any(|(c, _)| *c == "m6_threshold"))
+            .unwrap_or(false);
+        assert!(
+            !has_threshold_pair,
+            "m6_threshold cursor must not be in the pending batch when gate didn't fire"
+        );
+
+        // Belt-and-braces: simulate the orchestrator committing whatever
+        // we returned. The cursor row must still be absent / at 0,
+        // proving the events stay re-peekable.
+        if let Some(batch) = result {
+            let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+            crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+        }
+        assert_eq!(
+            read_offset(&store, "m6_threshold"),
+            0,
+            "consumer cursor must stay at 0 — events remain re-peekable next pass"
+        );
+    }
+
+    #[test]
+    fn m6_above_threshold_commits_after_save() {
+        let store = SqliteStore::in_memory().unwrap();
+        let last_id = emit_explore_events(&store, 12); // >= 10 → gate fires
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        // Watermark bumped to peeked-max.
+        assert_eq!(
+            state.m6_threshold_last_id, last_id,
+            "watermark must bump to peeked-max when gate fires"
+        );
+
+        // Pending batch carries the m6_threshold cursor at peeked-max.
+        let batch = result.expect("gate fired → pending batch must be Some");
+        let pair = batch
+            .iter()
+            .find(|(c, _)| *c == "m6_threshold")
+            .expect("m6_threshold cursor must be in the pending batch");
+        assert_eq!(pair.1, last_id, "pending offset must be the peeked-max id");
+
+        // Simulate the orchestrator committing on save success →
+        // cursor advances and a re-peek returns no new events.
+        let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+        crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+        assert_eq!(read_offset(&store, "m6_threshold"), last_id);
+        let re_peek = crate::store::adaptive::peek_events(
+            store.conn(),
+            "m6_threshold",
+            &["param_update"],
+            200,
+        )
+        .unwrap();
+        assert!(re_peek.is_empty(), "no events should remain after commit");
+    }
+
+    #[test]
+    fn m6_save_failure_leaves_offset_alone() {
+        // Simulates the orchestrator path where `save_snapshot` fails
+        // after `run_m6_threshold_learning` returns: the orchestrator
+        // discards the pending batch (no `commit_offset` call), so the
+        // cursor stays put and the next pass re-peeks the same events
+        // and re-applies the watermark filter. This must not advance
+        // the durable `consumer_offsets` row even if the in-memory
+        // `state.m6_threshold_last_id` was bumped.
+        let store = SqliteStore::in_memory().unwrap();
+        let last_id = emit_explore_events(&store, 12);
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        // Run the helper but do NOT propagate the pending batch to
+        // `commit_offset` (the orchestrator's save-failure branch).
+        let _result = run_m6_threshold_learning(&store, &mut state);
+
+        // Durable cursor is untouched — the event log and the cursor
+        // row are the source of truth, the in-memory watermark bump is
+        // only durable once `save_snapshot` succeeds.
+        assert_eq!(
+            read_offset(&store, "m6_threshold"),
+            0,
+            "consumer cursor must stay at 0 when save_snapshot would have failed"
+        );
+
+        // Re-peek (as the next pipeline pass would): events are still
+        // returned, and the prior in-memory watermark of 0 means they
+        // pass the `id > prior_threshold_water` filter. The next pass
+        // can re-apply the gate cleanly.
+        let re_peek = crate::store::adaptive::peek_events(
+            store.conn(),
+            "m6_threshold",
+            &["param_update"],
+            200,
+        )
+        .unwrap();
+        assert_eq!(re_peek.len(), 12);
+        assert_eq!(re_peek.last().unwrap().id, last_id);
+    }
+
+    #[test]
+    fn m6_noise_only_advances_past_cleanup_events() {
+        // ops/dedup.rs emits `param_update` rows with no query_type as
+        // part of vec-dedup cleanup. M6's dedicated `m6_threshold`
+        // cursor must advance past those even when the explore gate
+        // doesn't fire, otherwise a steady cleanup-event stream pushes
+        // future explore events past the 200-event peek window forever.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut last_noise_id = 0;
+        for i in 0..15 {
+            last_noise_id = emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::ParamUpdate,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: None,
+                    query: None,
+                    query_type: None, // ← NOT "threshold_exploration"
+                    topic: None,
+                    payload: Some(serde_json::json!({"source": "dedup", "duplicates_merged": i})),
+                },
+            );
+        }
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        assert_eq!(
+            state.m6_threshold_last_id, last_noise_id,
+            "watermark must advance past noise-only batch"
+        );
+        let batch = result.expect("noise-only batch must still return a pending offset");
+        let pair = batch
+            .iter()
+            .find(|(c, _)| *c == "m6_threshold")
+            .expect("m6_threshold cursor must be in the pending batch (noise advance)");
+        assert_eq!(pair.1, last_noise_id);
+        // global_dedup_threshold stays at the seed value — no explore
+        // events means no nudge.
+        assert!((state.global_dedup_threshold - 0.70).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn m6_corecall_below_gate_does_not_commit() {
+        let store = SqliteStore::in_memory().unwrap();
+        // Emit 3 recall_complete events — below the outer `>= 5` gate.
+        for i in 0..3 {
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("rid-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("q".into()),
+                    query_type: None,
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "candidates": [
+                            {"id": "a"}, {"id": "b"},
+                        ]
+                    })),
+                },
+            );
+        }
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        assert_eq!(
+            state.m6_corecall_last_id, 0,
+            "corecall watermark must not bump below the >=5 gate"
+        );
+        let has_corecall_pair = result
+            .as_deref()
+            .map(|p| p.iter().any(|(c, _)| *c == "m6_corecall"))
+            .unwrap_or(false);
+        assert!(
+            !has_corecall_pair,
+            "m6_corecall cursor must not be in the pending batch below the >=5 gate"
+        );
+
+        // Simulate the orchestrator committing whatever we returned.
+        if let Some(batch) = result {
+            let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+            crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+        }
+        assert_eq!(read_offset(&store, "m6_corecall"), 0);
+    }
+
+    #[test]
+    fn m6_replay_empty_drains_cursor() {
+        // Simulates the Codex round-1 HIGH scenario for M6: a prior
+        // pass's `save_snapshot` succeeded (in-memory watermark bumped)
+        // but `commit_offset` failed (durable cursor still at 0). The
+        // next pass re-peeks the same events, the watermark filter
+        // drops them all, and a naive "events.is_empty() → return
+        // None" branch would livelock the cursor at 0 forever (until
+        // event retention sweeps the rows). The helper must still
+        // surface the peeked-max id in `pending` so the orchestrator
+        // advances the durable cursor on save success.
+        let store = SqliteStore::in_memory().unwrap();
+        let last_id = emit_explore_events(&store, 12);
+        // Pre-load both M6 watermarks as if a prior pass had bumped them
+        // and the orchestrator's commit_offset had crashed before
+        // landing the cursor write.
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            m6_threshold_last_id: last_id,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        // Watermark unchanged (already at last_id; max is a no-op).
+        assert_eq!(state.m6_threshold_last_id, last_id);
+        // Pending batch carries the peeked-max id so the orchestrator
+        // can drain the stale cursor.
+        let batch = result.expect("replay-drain → pending must be Some");
+        let pair = batch
+            .iter()
+            .find(|(c, _)| *c == "m6_threshold")
+            .expect("m6_threshold cursor must be in the pending batch (replay-drain)");
+        assert_eq!(pair.1, last_id);
+
+        // Simulate the orchestrator committing → durable cursor now
+        // matches the in-memory watermark and a re-peek returns 0.
+        let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+        crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+        let re_peek = crate::store::adaptive::peek_events(
+            store.conn(),
+            "m6_threshold",
+            &["param_update"],
+            200,
+        )
+        .unwrap();
+        assert!(re_peek.is_empty());
+    }
+
+    #[test]
+    fn m6_corecall_replay_empty_drains_cursor() {
+        // Same Codex round-1 HIGH analog for the corecall consumer.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut last_id = 0;
+        for i in 0..6 {
+            last_id = emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("rid-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("q".into()),
+                    query_type: None,
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "candidates": [{"id": "a"}, {"id": "b"}]
+                    })),
+                },
+            );
+        }
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            m6_corecall_last_id: last_id,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        assert_eq!(state.m6_corecall_last_id, last_id);
+        let batch = result.expect("replay-drain → pending must be Some");
+        let pair = batch
+            .iter()
+            .find(|(c, _)| *c == "m6_corecall")
+            .expect("m6_corecall cursor must be in the pending batch (replay-drain)");
+        assert_eq!(pair.1, last_id);
+
+        let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+        crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+        let re_peek = crate::store::adaptive::peek_events(
+            store.conn(),
+            "m6_corecall",
+            &["recall_complete"],
+            100,
+        )
+        .unwrap();
+        assert!(re_peek.is_empty());
+    }
+
+    #[test]
+    fn m6_corecall_above_gate_commits_after_save() {
+        let store = SqliteStore::in_memory().unwrap();
+        // Emit 6 recall_complete events — fires the outer `>= 5` gate
+        // (real DB writes for `needs_vec_dedup` may or may not happen
+        // depending on co-recall ratios; we only assert on the cursor
+        // bookkeeping here).
+        let mut last_id = 0;
+        for i in 0..6 {
+            last_id = emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("rid-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("q".into()),
+                    query_type: None,
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "candidates": [
+                            {"id": "a"}, {"id": "b"},
+                        ]
+                    })),
+                },
+            );
+        }
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        let result = run_m6_threshold_learning(&store, &mut state);
+        assert_eq!(
+            state.m6_corecall_last_id, last_id,
+            "corecall watermark must bump to peeked-max when outer gate fires"
+        );
+        let batch = result.expect("outer gate fired → pending batch must be Some");
+        let pair = batch
+            .iter()
+            .find(|(c, _)| *c == "m6_corecall")
+            .expect("m6_corecall cursor must be in the pending batch");
+        assert_eq!(pair.1, last_id);
+
+        let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+        crate::store::adaptive::commit_offset(store.conn(), &pairs).unwrap();
+        assert_eq!(read_offset(&store, "m6_corecall"), last_id);
     }
 
     /// Regression: M2 alpha learning must (a) advance both offsets in one

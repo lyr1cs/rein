@@ -45,6 +45,22 @@ export interface RecallPageResponse {
 }
 
 /**
+ * A single inline citation extracted from synthesized prose (v0.25.2).
+ *
+ * The Rust backend emits **char offsets** (not byte offsets) so the JS
+ * frontend can slice the prose with `Array.from(s)` / spread-then-join
+ * without round-tripping through TextEncoder or worrying about UTF-16
+ * surrogate pairs. CJK content is the canonical case where byte vs char
+ * would silently desync the two stacks.
+ */
+export interface Citation {
+  /** 1-based rank of the source memory in the results list. */
+  rank: number;
+  /** Char offset in the cleaned prose where this cited claim ends. */
+  span_end: number;
+}
+
+/**
  * Outcome of an opt-in recall-time synthesis pass (v0.25 ARS Capability B).
  *
  * The server attaches this on `RecallMemoryOutput` whenever the request
@@ -52,6 +68,13 @@ export interface RecallPageResponse {
  * no narrative was produced — the synthesis pipeline emits exactly one
  * branch (synthesis text OR a single skipped flag) so the GUI can decide
  * between rendering the prose, a muted reason note, or a generic fallback.
+ *
+ * `citations` (v0.25.2 ARS Cap B inline-citation feature) is a list of
+ * `[#k]` markers parsed out of the LLM's output; markers are stripped
+ * from `synthesis` and surfaced here as structured spans the UI can
+ * render as click-to-scroll badges. Empty when the LLM emitted no
+ * markers (older models / non-compliant outputs) or synthesis was
+ * skipped — older backends without the feature simply omit the field.
  */
 export interface RecallSynthesisOutcome {
   synthesis?: string;
@@ -61,18 +84,20 @@ export interface RecallSynthesisOutcome {
   skipped_disabled?: boolean;
   skipped_no_llm?: boolean;
   skipped_too_few_results?: boolean;
+  citations?: Citation[];
 }
 
 /**
  * Shape of `GET /api/memories?...` once Cap B lands. The legacy 24.x
  * response (`{ results, count }`) is a structural subset — the new
- * `synthesis` / `route` / `request_id` fields are optional so older
- * backends still type-check.
+ * `synthesis` / `request_id` fields are optional so older backends still
+ * type-check. (`route` was documented but never emitted by the legacy REST
+ * handler at `mcp/rest.rs:965-1029`; only the inventory `recall` op
+ * populates it on CLI/MCP — kept off the type to avoid doc drift.)
  */
 export interface RecallMemoryOutput {
   results: RecallResult[];
   count?: number;
-  route?: string;
   request_id?: string;
   synthesis?: RecallSynthesisOutcome;
 }
@@ -189,6 +214,13 @@ export interface Concept {
   confidence: number;
   revision: number;
   last_episode_id: string | null;
+  // v0.24 ARS Capability A. Mirrored from the Rust `Concept` for completeness
+  // — Graph.tsx fetches the live snapshot via `getConceptState` separately,
+  // but external clients hitting `/api/memoirs/{name}/export` get these
+  // fields and may want to consume them without a second round trip.
+  living_summary?: string | null;
+  living_summary_updated_at?: string | null;
+  living_summary_source_revision?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -247,4 +279,85 @@ export interface ConceptState {
   living_summary_source_revision: number | null;
   created_at: string;
   updated_at: string;
+}
+
+/* ── Page-local response shapes (relocated from individual pages) ───── */
+
+/**
+ * Detail row returned by `GET /api/artifacts/{id}?include_transcript=true`.
+ * Extends the base `Artifact` summary with the full transcript text.
+ */
+export interface ArtifactDetail extends Artifact {
+  transcript_text: string | null;
+  transcript_available?: boolean;
+}
+
+/**
+ * Single dedup verdict row returned by `GET /api/dedup_decisions`.
+ */
+export interface DedupDecision {
+  id: string;
+  winner_id: string | null;
+  loser_id: string | null;
+  canonical_id: string | null;
+  lexical_score: number | null;
+  embedding_score: number | null;
+  relation: string;
+  confidence: number;
+  reason: string;
+  operator: string;
+  reversible: boolean;
+  merged_summary: string | null;
+  novel_facts: string;
+  conflict_detected: boolean;
+  created_at: string;
+}
+
+export interface DedupResponse {
+  decisions: DedupDecision[];
+}
+
+/**
+ * Counters from `GET /api/intelligent_merge_metrics` summarising recent
+ * intelligent-merge attempts.
+ */
+export interface MergeMetrics {
+  attempted: number;
+  success: number;
+  parse_errors: number;
+  http_errors: number;
+  stale_races: number;
+}
+
+/**
+ * One row of the unified episode/memory feed returned by
+ * `GET /api/timeline?from=...&to=...`.
+ */
+export interface TimelineEvent {
+  type: 'episode' | 'memory';
+  created_at: string;
+  // Episode fields (when type=episode)
+  id?: string;
+  title?: string;
+  outcome?: string;
+  decisions?: string[];
+  // Memory fields (when type=memory)
+  summary?: string;
+  topic?: string;
+  tier?: 'hot' | 'warm' | 'cold';
+  strength?: number;
+}
+
+export interface TimelineResponse {
+  events: TimelineEvent[];
+}
+
+/**
+ * One parsed conversational turn from an artifact transcript. Roles are
+ * normalised to `user` / `assistant` / `transcript` (the catch-all when the
+ * transcript text contains no role prefixes).
+ */
+export interface Turn {
+  role: string;
+  text: string;
 }

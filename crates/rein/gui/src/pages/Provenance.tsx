@@ -1,36 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { apiGet } from '../api/client';
-
-interface DedupDecision {
-  id: string;
-  winner_id: string | null;
-  loser_id: string | null;
-  canonical_id: string | null;
-  lexical_score: number | null;
-  embedding_score: number | null;
-  relation: string;
-  confidence: number;
-  reason: string;
-  operator: string;
-  reversible: boolean;
-  merged_summary: string | null;
-  novel_facts: string;
-  conflict_detected: boolean;
-  created_at: string;
-}
-
-interface DedupResponse {
-  decisions: DedupDecision[];
-}
-
-interface MergeMetrics {
-  attempted: number;
-  success: number;
-  parse_errors: number;
-  http_errors: number;
-  stale_races: number;
-}
+import type { DedupResponse, MergeMetrics } from '../api/types';
 
 function relationClasses(relation: string): string {
   switch (relation) {

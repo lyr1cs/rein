@@ -30,6 +30,7 @@ use rein::eval::concept_summary::score_concept_case;
 use rein::eval::{
     decide_ship, mcnemar, CategoryStats, DecideShipKind, HitChecker, KeywordOverlapHitChecker,
     McNemarResult, PairedOutcome, Scorecard, ShipDecision, ShipReason,
+    DEFAULT_SEMANTIC_THRESHOLD,
 };
 use rein::extract::llm::{strip_code_fences, ExtractorKind};
 // NOTE: `call_llm_sync` in ops::resummerize uses SYSTEM_PROMPT internally —
@@ -42,7 +43,9 @@ use rein::ops::concept_summary::{
     build_concept_summary_prompt, call_llm_sync as call_concept_summary_llm_sync,
     create_concept_summary_extractor,
 };
-use rein::ops::recall_synthesis::{build_synthesis_prompt, call_synthesis_llm_sync};
+use rein::ops::recall_synthesis::{
+    build_synthesis_prompt_with_count, call_synthesis_llm_sync, extract_citations,
+};
 use rein::ops::resummerize::{
     build_prompt, call_llm_sync as call_resummerize_llm_sync, create_resummerize_extractor,
 };
@@ -582,13 +585,55 @@ fn main() -> Result<()> {
 
 // --- baseline / run -------------------------------------------------------
 
+/// Build a [`KeywordOverlapHitChecker`]. When config exposes an embedder
+/// (`[embedding].provider` resolved + API key present), attach it as the
+/// v3 semantic fallback so morphologically-distant synonyms (e.g.
+/// "Ebbinghaus" ≈ "decay") still score as hits. Threshold defaults to
+/// [`DEFAULT_SEMANTIC_THRESHOLD`] but can be overridden via the
+/// `REIN_EVAL_SEMANTIC_THRESHOLD` env var (clamped to `[0.0, 1.0]`;
+/// out-of-range values fall back to the default with a warning).
+///
+/// Set `REIN_EVAL_DISABLE_SEMANTIC=1` (or any non-empty value) to force
+/// stem-only mode even when an embedder is configured — used for the A/B
+/// "did semantic actually help" comparison without having to unset
+/// `GEMINI_API_KEY` (which the synthesis LLM still needs).
+///
+/// **Symmetry invariant**: the same call must be used for baseline AND
+/// treatment of the same paired comparison so McNemar's per-case outcomes
+/// are computed under one methodology — drift here would bias the test.
+fn build_hybrid_checker(config: &ReinConfig) -> KeywordOverlapHitChecker {
+    if std::env::var("REIN_EVAL_DISABLE_SEMANTIC")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        eprintln!("[rein-eval] REIN_EVAL_DISABLE_SEMANTIC set — using stem-only checker");
+        return KeywordOverlapHitChecker::stem_only();
+    }
+    let Some(embedder) = rein::embed::create_embedder(config) else {
+        return KeywordOverlapHitChecker::stem_only();
+    };
+    let threshold = std::env::var("REIN_EVAL_SEMANTIC_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|t| (0.0..=1.0).contains(t))
+        .unwrap_or(DEFAULT_SEMANTIC_THRESHOLD);
+    eprintln!(
+        "[rein-eval] hybrid hit checker enabled — semantic fallback threshold={:.3}",
+        threshold
+    );
+    KeywordOverlapHitChecker::with_semantic(std::sync::Arc::new(embedder), threshold)
+}
+
 fn cmd_baseline(fixtures: &Path, iterations: u32, output: &Path) -> Result<()> {
     let fixtures_list = load_fixtures(fixtures)?;
     if fixtures_list.is_empty() {
         bail!("no fixtures found in {}", fixtures.display());
     }
 
-    let checker = KeywordOverlapHitChecker;
+    // Resummerize baseline uses `check_hit` (top-5 frequency overlap),
+    // which doesn't dispatch the semantic fallback. Stem-only is the
+    // honest configuration here — adding an embedder would be no-op cost.
+    let checker = KeywordOverlapHitChecker::stem_only();
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
 
@@ -722,7 +767,10 @@ fn run_treatment_with_extractor(
     fixtures_dir_for_meta: &Path,
     verbose: bool,
 ) -> Result<()> {
-    let checker = KeywordOverlapHitChecker;
+    // Resummerize treatment scoring also uses `check_hit` (no per-keyword
+    // semantic dispatch), so stem-only matches the baseline path's
+    // configuration.
+    let checker = KeywordOverlapHitChecker::stem_only();
     let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
     let mut llm_failed = 0usize;
@@ -1227,7 +1275,13 @@ fn cmd_concept_summary_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         );
     }
 
-    let checker = KeywordOverlapHitChecker;
+    // Hybrid checker keeps baseline + treatment scored under one
+    // methodology so McNemar's per-case outcome remains an apples-to-apples
+    // comparison. If config has no embedder, the helper degrades to
+    // stem-only and the symmetry still holds.
+    let config = ReinConfig::load()
+        .context("loading rein config for concept-summary baseline (hybrid checker)")?;
+    let checker = build_hybrid_checker(&config);
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
 
@@ -1316,7 +1370,10 @@ fn cmd_concept_summary_run(fixtures: &Path, output: &Path, verbose: bool) -> Res
         extractor_tag,
     );
 
-    let checker = KeywordOverlapHitChecker;
+    // Hybrid checker mirrors `cmd_concept_summary_baseline`'s configuration
+    // so the McNemar comparison stays methodology-symmetric. The same
+    // `config` already loaded above feeds the embedder.
+    let checker = build_hybrid_checker(&config);
     let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
     let mut llm_failed = 0usize;
     let mut empty_output = 0usize;
@@ -1469,7 +1526,13 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         bail!("no recall-synthesis fixtures found in {}", fixtures.display());
     }
 
-    let checker = KeywordOverlapHitChecker;
+    // Symmetric scoring with `run_synthesis_treatment_with_extractor` —
+    // both must use the same checker for McNemar to be honest. Loading
+    // config here is cheap and lets baseline opt into the embedding-based
+    // semantic fallback when one is configured.
+    let config = ReinConfig::load()
+        .context("loading rein config for synthesis baseline (hybrid checker)")?;
+    let checker = build_hybrid_checker(&config);
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
 
@@ -1586,7 +1649,9 @@ fn run_synthesis_treatment_with_extractor(
     fixtures_dir_for_meta: &Path,
     verbose: bool,
 ) -> Result<()> {
-    let checker = KeywordOverlapHitChecker;
+    // Hybrid checker — must match `cmd_synthesis_baseline`'s configuration
+    // so the McNemar table reflects a consistent scoring methodology.
+    let checker = build_hybrid_checker(config);
     let mut outcomes: Vec<PairedOutcome> = Vec::with_capacity(fixtures_list.len());
     let mut llm_failed = 0usize;
     let mut empty_output = 0usize;
@@ -1617,12 +1682,23 @@ fn run_synthesis_treatment_with_extractor(
         }
 
         let results = fx.to_recall_results();
-        let prompt = build_synthesis_prompt(&results, &fx.query, max_chars);
+        // Codex R2 G4+G5: track `included_count` (memories the LLM
+        // actually sees after truncation) and strip `[#k]` markers from
+        // the LLM output the same way production does, so the eval's
+        // `treatment_summary` / `treatment_length` / keyword scoring
+        // reflect what users see — not the raw LLM response.
+        let (prompt, included_count) =
+            build_synthesis_prompt_with_count(&results, &fx.query, max_chars);
         let baseline_len = fx.baseline_text().len();
 
         match call_synthesis_llm_sync(extractor, &prompt) {
             Ok(raw) => {
-                let synthesis = strip_code_fences(&raw).trim().to_string();
+                let raw_text = strip_code_fences(&raw).trim().to_string();
+                // Mirror production: strip markers, keep clean prose for
+                // scoring + recording. `included_count` matches the prod
+                // contract; out-of-range markers are silently dropped.
+                let (synthesis, _citations) =
+                    extract_citations(&raw_text, included_count);
                 if synthesis.is_empty() {
                     if verbose {
                         eprintln!(
@@ -2192,7 +2268,7 @@ mod tests {
 
     // --- v0.25.1 A3 recall-synthesis harness tests --------------------------
 
-    /// Verify all three shipped synthesis fixture files load + each fixture
+    /// Verify all shipped synthesis fixture files load + each fixture
     /// has the minimum schema needed by the harness.
     #[test]
     fn recall_synthesis_fixtures_parse() {
@@ -2200,8 +2276,10 @@ mod tests {
         let fixtures =
             load_synthesis_fixtures(&dir).expect("recall-synthesis fixtures should parse");
 
-        // 3 fixture files × 2 cases each = 6 cases at A3 ship time.
-        assert_eq!(fixtures.len(), 6);
+        // 6 fixture files × {2 (sq/mt/amb) or 6 (lt/cc/cf)} cases = 24 cases
+        // total at v0.25.2 corpus expansion (3 original files + 3 hard-case
+        // files: longtail / cross_cluster / conflicting).
+        assert_eq!(fixtures.len(), 24);
         assert!(
             fixtures.iter().all(|f| !f.recall_results.is_empty()),
             "recall-synthesis fixtures must include at least one recall result"
@@ -2238,7 +2316,7 @@ mod tests {
         let sc2: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
 
         assert_eq!(sc1.outcomes.len(), sc2.outcomes.len());
-        assert_eq!(sc1.outcomes.len(), 6);
+        assert_eq!(sc1.outcomes.len(), 24);
         for (a, b) in sc1.outcomes.iter().zip(sc2.outcomes.iter()) {
             assert_eq!(a.case_id, b.case_id);
             assert_eq!(a.baseline_hit, b.baseline_hit);
@@ -2254,10 +2332,13 @@ mod tests {
     /// output length, not the baseline.
     #[test]
     fn synthesis_run_with_mock_records_treatment_hits() {
-        // Mock prose includes ALL evidence_keywords across all 6 fixtures
-        // so the strict-majority threshold is trivially satisfied for each.
-        // (Listing every keyword in a single response is the cheapest way
-        // to make the score deterministic without per-fixture mocking.)
+        // Mock prose includes ≥3-of-5 evidence_keywords for every fixture in
+        // the v0.25.2 expanded corpus (24 cases across 6 files) so the
+        // strict-majority threshold is trivially satisfied for each. The
+        // prose layers in synthesis-emergent meta-language (five, seven,
+        // four, consensus, agreement, defense, semaphore, etc.) so the new
+        // baseline-miss fixtures still treatment-hit under the mock without
+        // per-fixture scripted responses.
         let mock_response = "The system uses proc-macro generated OpsRuntime methods registered \
              via inventory; CLI/MCP/REST adapters share dispatch with AuthPolicy middleware. \
              HDBSCAN builds a dendrogram from mutual reachability and extracts EOMBST clusters \
@@ -2266,11 +2347,31 @@ mod tests {
              added concept living-summary; v0.25 added recall-time synthesis as Capability B. \
              STM/LTM use Ebbinghaus decay with provenance-preserving merge over a tiering \
              quantile estimator. Search is a Tantivy + HNSW + KG waterfall with rule-based \
-             routing and parallel query expansion via Gemini fusion.";
+             routing and parallel query expansion via Gemini fusion. \
+             Five distinct consumers maintain different watermarks spanning the event log; \
+             the list of consumer offsets is enumerated incrementally across four MCP-tool \
+             additions in the v0.23-v0.25 lineage. Seven invariants together act as a complete \
+             guardrail validation gate. MockEmbedder and MockExtractor sit behind the \
+             test-support feature flag with a FIFO queue. The waterfall returns canonical \
+             previews via Tantivy BM25, HNSW vector channel, KG BFS, sqlite-vec storage, and \
+             a needs_vec_dedup audit marker. Eventual convergence is reached asynchronously; \
+             loose consistency is tolerated. A layered defense uses multiple interlocking \
+             complementary fuses. The semaphore bounds extract, expansion, rerank, and dedup \
+             LLM calls; the alpha learner per cluster picks a tier per cluster ID. The \
+             pattern is uniformly applied throughout the codebase with the same discipline. \
+             The GUI surfaces 21 REST endpoints alongside MCP and CLI through OpsRuntime. \
+             There is broad agreement consistent across versions that the proposal was \
+             uniformly rejected; the stance held. Older designs were superseded and shifted \
+             out, replaced through evolution and retired. A standing disagreement evolved \
+             as the spec narrowed; some matters remain unresolved with tension. The \
+             proc-macro plus inventory dispatch pattern is the chosen static-or-not \
+             decision. HDBSCAN cluster stability is good despite reassignment, with \
+             smoothing in M2 and M3. Five evidence_keywords with majority threshold \
+             matches the spec.";
 
-        // 6 fixtures × 1 mock response each → queue 6 copies.
+        // 24 fixtures × 1 mock response each → queue 24 copies.
         let extractor = ExtractorKind::Mock(MockExtractor::with_responses(
-            (0..6).map(|_| Ok(mock_response.to_string())).collect(),
+            (0..24).map(|_| Ok(mock_response.to_string())).collect(),
         ));
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recall_synthesis");
         let fixtures =
@@ -2293,7 +2394,7 @@ mod tests {
         .expect("treatment loop should succeed under mock");
 
         let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
-        assert_eq!(sc.outcomes.len(), 6);
+        assert_eq!(sc.outcomes.len(), 24);
         for o in &sc.outcomes {
             assert!(
                 o.treatment_hit,
@@ -2307,7 +2408,7 @@ mod tests {
             );
             assert_eq!(o.treatment_summary.as_deref(), Some(mock_response));
         }
-        assert_eq!(sc.category_map.len(), 6, "category_map populated per fixture");
+        assert_eq!(sc.category_map.len(), 24, "category_map populated per fixture");
         let _ = fs::remove_file(&out_path);
     }
 

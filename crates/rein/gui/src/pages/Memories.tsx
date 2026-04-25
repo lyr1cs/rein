@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useMemoryDetail, useRecent, useRecall, useTopics } from '../hooks/useApi';
 import { apiDelete } from '../api/client';
 import SynthesisCard from '../components/SynthesisCard';
+import { timeAgo } from '../utils/time';
 import type {
   Memory,
   MemoryDetailResponse,
@@ -10,19 +11,6 @@ import type {
 } from '../api/types';
 
 /* ── helpers ─────────────────────────────────────────────────────── */
-
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  return `${months}mo ago`;
-}
 
 function tierBadge(tier: 'hot' | 'warm' | 'cold') {
   switch (tier) {
@@ -166,6 +154,7 @@ function DetailPanel({
         </span>
         <button
           onClick={onClose}
+          aria-label="Close detail"
           className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--border)] text-[var(--text-muted)] transition-colors"
         >
           {'\u2715'}
