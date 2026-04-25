@@ -1252,7 +1252,15 @@ fn prepare_with_context_for_kind(
     }
 }
 
-pub(crate) fn resolve_max_input_for_kind(
+/// Resolve the per-call `max_input_chars` cap for an `ExtractorKind`.
+///
+/// `pub` (not `pub(crate)`) so the v0.25.1 A3 `rein-eval synthesis` binary,
+/// which is a separate `bin/` target, can build the synthesis prompt with
+/// the same cap production uses (`run_recall_synthesis` calls this through
+/// `crate::extract::llm::resolve_max_input_for_kind`). Drift here would
+/// silently change which evidence the LLM sees and invalidate the McNemar
+/// comparison.
+pub fn resolve_max_input_for_kind(
     config: &ReinConfig,
     extractor: &ExtractorKind,
 ) -> usize {

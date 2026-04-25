@@ -34,6 +34,7 @@ const Graph = lazy(() => import('./pages/Graph'));
 const Timeline = lazy(() => import('./pages/Timeline'));
 const Artifacts = lazy(() => import('./pages/Artifacts'));
 const Provenance = lazy(() => import('./pages/Provenance'));
+const SynthesisLab = lazy(() => import('./pages/SynthesisLab'));
 const Settings = lazy(() => import('./pages/Settings'));
 
 const queryClient = new QueryClient({
@@ -67,6 +68,7 @@ export default function App() {
                 <Route path="/timeline" element={<Timeline />} />
                 <Route path="/artifacts" element={<Artifacts />} />
                 <Route path="/provenance" element={<Provenance />} />
+                <Route path="/synthesis-lab" element={<SynthesisLab />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>

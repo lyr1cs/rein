@@ -167,7 +167,11 @@ const FOOTER: &str =
 /// defensive `take(max_chars)` is applied as a safety net guaranteeing
 /// the total prompt never exceeds the budget regardless of edge cases in
 /// the reservation arithmetic.
-fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: usize) -> String {
+///
+/// `pub` so the v0.25.1 A3 `rein-eval synthesis` binary can construct the
+/// exact same prompt that production uses — eval-vs-production drift here
+/// would invalidate the McNemar comparison.
+pub fn build_synthesis_prompt(results: &[RecallResult], query: &str, max_chars: usize) -> String {
     // Query budget: cap query so it cannot consume the whole prompt
     // budget. Floor of QUERY_BUDGET_FLOOR comfortably fits typical
     // natural-language queries (~50-200 chars) without truncation.
@@ -294,7 +298,12 @@ fn push_memory_block(buf: &mut String, index: usize, r: &RecallResult) {
     }
 }
 
-fn call_synthesis_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<String> {
+/// Call the configured LLM extractor to produce the synthesis narrative.
+///
+/// `pub` so the v0.25.1 A3 `rein-eval synthesis` binary can drive the same
+/// LLM bridge production uses (system prompt + prose-mode `raw_text_with_prompt`
+/// path), keeping eval and production exercising identical request shapes.
+pub fn call_synthesis_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<String> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
             handle.block_on(async {

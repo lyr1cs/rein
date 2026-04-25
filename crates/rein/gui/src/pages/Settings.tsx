@@ -131,7 +131,7 @@ export default function Settings() {
     setFixRunning(true);
     setFixError(null);
     try {
-      await apiPost<DoctorReport>('/api/doctor', {});
+      await apiPost<DoctorReport>('/api/doctor', { fix: true });
       await refetch();
     } catch (error) {
       setFixError(error instanceof Error ? error.message : 'Failed to run doctor fix');

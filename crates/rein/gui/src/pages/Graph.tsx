@@ -1,24 +1,15 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { LinkObject, NodeObject } from 'react-force-graph-2d';
-import { apiGet, getConceptState } from '../api/client';
-import type { Concept, ConceptLink, ConceptState } from '../api/types';
+import { useQueryClient } from '@tanstack/react-query';
+import { getConceptState } from '../api/client';
+import { useMemoirs, useMemoirExport } from '../hooks/useApi';
+import { mergeForceGraphData } from '../utils/forceGraph';
+import type { ConceptState } from '../api/types';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
-
-interface Memoir {
-  id: string;
-  name: string;
-  description: string;
-}
-
-interface MemoirExport {
-  memoir: Memoir;
-  concepts: Concept[];
-  links: ConceptLink[];
-}
 
 interface GraphNode {
   id: string;
@@ -69,12 +60,6 @@ function endpointNode(endpoint: LinkEndpoint): ConceptNode | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load graph data';
-}
-
-function getPollingIntervalMs(): number {
-  const saved = localStorage.getItem('rein_polling_interval');
-  const seconds = saved ? parseInt(saved, 10) : 5;
-  return Number.isFinite(seconds) ? seconds * 1000 : 5000;
 }
 
 /**
@@ -128,20 +113,16 @@ function relationColor(rel: string): string {
 
 export default function Graph() {
   /* Memoir selector state */
-  const [memoirs, setMemoirs] = useState<Memoir[]>([]);
   const [selectedMemoir, setSelectedMemoir] = useState<string>('');
-  const [memoirLoading, setMemoirLoading] = useState(true);
-  const [memoirError, setMemoirError] = useState('');
 
-  /* Graph data */
+  /* Graph data — committed to state via the diff-merge effect below so
+   * unchanged nodes/links keep object identity across react-query polls. */
   const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
-  const [graphLoading, setGraphLoading] = useState(false);
 
   /* Interaction state */
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [search, setSearch] = useState('');
-  const [reloadVersion, setReloadVersion] = useState(0);
 
   /* Concept state (v0.24 ARS Capability A): living_summary snapshot for the
    * currently-selected concept. Null when no node selected, the fetch is
@@ -155,117 +136,138 @@ export default function Graph() {
     height: typeof window !== 'undefined' ? window.innerHeight - 120 : 600,
   }));
 
-  const refreshGraph = useCallback(() => {
-    setGraphLoading(true);
-    setReloadVersion((version) => version + 1);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    let timeoutId: number | null = null;
-
-    // Read localStorage each cycle so Settings changes apply to the next poll.
-    const scheduleNextPoll = () => {
-      timeoutId = window.setTimeout(() => {
-        refreshGraph();
-        if (!cancelled) {
-          scheduleNextPoll();
-        }
-      }, getPollingIntervalMs());
-    };
-
-    scheduleNextPoll();
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
-    };
-  }, [refreshGraph]);
-
-  /* ---- Fetch memoirs on mount and on each refresh (polling / manual Refresh) ----
+  /* ---- Data fetching via react-query (H3 + M7) ----
    *
-   * Keyed on reloadVersion so creating/renaming/deleting a memoir elsewhere is
-   * reflected next poll tick. On subsequent fetches we preserve the current
-   * selection instead of auto-selecting the first memoir.
-   */
+   * `useMemoirs()` polls the directory; `useMemoirExport(selectedMemoir)`
+   * polls the active memoir's concepts + links. Both gate on tab visibility
+   * (refetchIntervalInBackground=false default) and dedup with any other
+   * consumer of the same query key. Manual Refresh invalidates both keys. */
+  const queryClient = useQueryClient();
+  const memoirsQuery = useMemoirs();
+  const memoirs = useMemo(() => memoirsQuery.data?.memoirs ?? [], [memoirsQuery.data]);
+  const exportQuery = useMemoirExport(selectedMemoir || null);
+
+  const memoirLoading = memoirsQuery.isLoading;
+  const memoirError = memoirsQuery.error ? errorMessage(memoirsQuery.error) : '';
+  /* Show the loading overlay while the export is in-flight OR when the
+   * underlying selected-memoir id is set but no data has arrived yet. */
+  const graphLoading = exportQuery.isFetching && !exportQuery.data;
+
+  /* Auto-select the first memoir on the first successful directory fetch.
+   * Side-effect — must be in an effect, not inline derivation, so subsequent
+   * polls don't override the user's manual selection. The setState calls
+   * legitimately sync external (react-query) data into local UI state. */
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    let cancelled = false;
-    apiGet<{ memoirs: Memoir[] }>('/api/memoirs')
-      .then((res) => {
-        if (cancelled) return;
-        setMemoirs(res.memoirs);
-        if (res.memoirs.length > 0 && !selectedMemoir) {
-          setGraphLoading(true);
-          setSelectedNode(null);
-          setSelectedMemoir(res.memoirs[0].name);
-        }
-        setMemoirError('');
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setMemoirError(errorMessage(err));
-      })
-      .finally(() => {
-        if (!cancelled) setMemoirLoading(false);
-      });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadVersion]);
+    if (!selectedMemoir && memoirs.length > 0) {
+      setSelectedNode(null);
+      setSelectedMemoir(memoirs[0].name);
+    }
+  }, [memoirs, selectedMemoir]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
-  /* ---- Fetch graph data when memoir changes ---- */
+  const refreshGraph = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['memoirs'] });
+    queryClient.invalidateQueries({ queryKey: ['memoir-export'] });
+  }, [queryClient]);
+
+  /* Derive the "next" graph snapshot purely from the latest export response.
+   * react-query's structural sharing keeps `exportQuery.data` referentially
+   * stable when the poll surfaced no changes, so this useMemo is identity-
+   * preserving for byte-equal polls and the diff-merge effect below skips. */
+  const nextGraph = useMemo<GraphData>(() => {
+    const data = exportQuery.data;
+    if (!data) return { nodes: [], links: [] };
+    const nodes: GraphNode[] = data.concepts.map((c) => ({
+      id: c.id,
+      name: c.name,
+      definition: c.definition,
+      labels: c.labels,
+      confidence: c.confidence,
+      revision: c.revision,
+      source_memory_ids: c.source_memory_ids,
+      last_episode_id: c.last_episode_id,
+      val: Math.max(1, c.confidence * 4),
+      created_at: c.created_at,
+      updated_at: c.updated_at,
+    }));
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const links: GraphLink[] = data.links
+      .filter((l) => nodeIds.has(l.source_id) && nodeIds.has(l.target_id))
+      .map((l) => ({
+        source: l.source_id,
+        target: l.target_id,
+        relation: l.relation,
+        weight: l.weight,
+        valid_from: l.valid_from,
+        valid_until: l.valid_until,
+      }));
+    return { nodes, links };
+  }, [exportQuery.data]);
+
+  /* Diff-merge so unchanged nodes/links keep object identity (otherwise
+   * react-force-graph-2d reheats the d3-force simulation alpha=1 every poll
+   * → "fireworks" 3s loop because cooldownTime (3000ms) is shorter than the
+   * default poll interval (5000ms)). The effect only fires when `nextGraph`
+   * actually changes — react-query's structural sharing makes identical poll
+   * responses no-ops at this layer.
+   *
+   * The setState calls below intentionally sync external (react-query) data
+   * into a locally-merged `graphData` whose object identities must persist
+   * (Object.assign in `mergeForceGraphData` mutates d3-force's x/y/vx/vy
+   * stamps), so `react-hooks/set-state-in-effect` is silenced for this and
+   * the memoir-change reset effect that follows. */
+  /* Track the memoir whose graph is currently in `graphData` so the merge
+   * effect knows when to replace-from-empty (memoir change) vs preserve
+   * identity (poll refetch on the same memoir). Replaces the earlier
+   * separate "reset on selectedMemoir change" effect, which raced the
+   * merge effect on cache-hit memoir switches and could leave the page
+   * showing an empty graph for a memoir that actually had concepts. */
+  const lastMemoirRef = useRef<string>('');
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    if (!selectedMemoir) return;
-    let cancelled = false;
+    const memoirChanged = lastMemoirRef.current !== selectedMemoir;
+    lastMemoirRef.current = selectedMemoir;
 
-    apiGet<MemoirExport>(`/api/memoirs/${encodeURIComponent(selectedMemoir)}/export?format=json`)
-      .then((res) => {
-        if (cancelled) return;
-        const nodes: GraphNode[] = res.concepts.map((c) => ({
-          id: c.id,
-          name: c.name,
-          definition: c.definition,
-          labels: c.labels,
-          confidence: c.confidence,
-          revision: c.revision,
-          source_memory_ids: c.source_memory_ids,
-          last_episode_id: c.last_episode_id,
-          val: Math.max(1, c.confidence * 4),
-          created_at: c.created_at,
-          updated_at: c.updated_at,
-        }));
-        const nodeIds = new Set(nodes.map((n) => n.id));
-        const links: GraphLink[] = res.links
-          .filter((l) => nodeIds.has(l.source_id) && nodeIds.has(l.target_id))
-          .map((l) => ({
-            source: l.source_id,
-            target: l.target_id,
-            relation: l.relation,
-            weight: l.weight,
-            valid_from: l.valid_from,
-              valid_until: l.valid_until,
-          }));
-        setGraphData({ nodes, links });
-        setSelectedNode((current) => {
-          if (!current) return null;
-          return nodes.find((node) => node.id === current.id) ?? null;
-        });
-      })
-      .catch(() => {
-        if (!cancelled) setGraphData({ nodes: [], links: [] });
-      })
-      .finally(() => {
-        if (!cancelled) setGraphLoading(false);
-      });
+    if (!exportQuery.data) {
+      // Fetch in flight, errored, or memoir cleared. Drop the previous
+      // memoir's graph if the user just switched (so the wrong nodes don't
+      // linger while B's fetch is in flight) or if the fetch errored.
+      if (memoirChanged || exportQuery.isError) {
+        setGraphData({ nodes: [], links: [] });
+        setSelectedNode(null);
+      }
+      return;
+    }
 
-    return () => { cancelled = true; };
-  }, [selectedMemoir, reloadVersion]);
+    setGraphData((prev) =>
+      mergeForceGraphData(
+        memoirChanged ? { nodes: [], links: [] } : prev,
+        nextGraph,
+        (l) => {
+          const src = endpointId(l.source as LinkEndpoint) ?? '';
+          const tgt = endpointId(l.target as LinkEndpoint) ?? '';
+          return `${src}|${tgt}|${l.relation}`;
+        },
+      ),
+    );
+    setSelectedNode((current) => {
+      if (memoirChanged) return null;
+      if (!current) return null;
+      return nextGraph.nodes.find((n) => n.id === current.id) ?? null;
+    });
+  }, [nextGraph, exportQuery.data, exportQuery.isError, selectedMemoir]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   /* ---- Fetch concept state when a node is selected ----
    *
    * v0.24 ARS Capability A: surface `living_summary` alongside the concept
    * detail. Any fetch failure silently collapses the section (no toast, no
    * placeholder) so the rest of the panel remains functional if the REST
-   * endpoint is missing (e.g. pre-v0.24 backend). */
+   * endpoint is missing (e.g. pre-v0.24 backend). The setState calls clear
+   * stale state before a new fetch and on selection clear — both are
+   * external-store synchronization, not derived state. */
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (!selectedNode) {
       setConceptState(null);
@@ -282,6 +284,7 @@ export default function Graph() {
       });
     return () => { cancelled = true; };
   }, [selectedNode]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   /* ---- Resize observer ---- */
   useEffect(() => {
@@ -475,7 +478,8 @@ export default function Graph() {
         <select
           value={selectedMemoir}
           onChange={(e) => {
-            setGraphLoading(true);
+            // graphLoading is now driven by `exportQuery.isFetching && !data`,
+            // so it auto-flips true when the new memoir's export starts loading.
             setSelectedNode(null);
             setSelectedMemoir(e.target.value);
           }}

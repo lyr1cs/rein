@@ -5,27 +5,25 @@ import type {
   AdaptiveStatus,
   DoctorReport,
   Memory,
+  Memoir,
+  MemoirExport,
   RecallMemoryOutput,
   RecallPageResponse,
   Episode,
   Artifact,
   MemoryDetailResponse,
 } from '../api/types';
-
-const DEFAULT_INTERVAL = 5000;
+import { getPollingIntervalMs } from '../utils/polling';
 
 /**
- * Read the user's polling cadence from localStorage.
- *
- * Passed as a function to React Query's `refetchInterval` so it is evaluated
- * after each fetch — letting a Settings-page change take effect on the next
- * poll without a full page reload. Before B6 #29 this was called once at
- * module init and the interval stayed frozen until reload.
+ * Re-export under the legacy module-private name so the existing
+ * `refetchInterval: () => getPollingInterval()` call sites in this file keep
+ * working. The implementation now lives in `utils/polling.ts` so Brain.tsx
+ * and Graph.tsx can share a single source of truth (Settings-page changes
+ * take effect on the next poll without a reload because react-query
+ * re-evaluates the function after every fetch).
  */
-function getPollingInterval(): number {
-  const saved = localStorage.getItem('rein_polling_interval');
-  return saved ? parseInt(saved, 10) * 1000 : DEFAULT_INTERVAL;
-}
+const getPollingInterval = getPollingIntervalMs;
 
 export function useStats() {
   return useQuery({
@@ -147,5 +145,38 @@ export function useServerVersion() {
     queryFn: () => apiGet<{ version: string }>(`/api/version`),
     staleTime: 60 * 60 * 1000, // 1 hour — version is pinned per build
     refetchInterval: false,
+  });
+}
+
+/**
+ * Memoir directory used by Brain (fan-out) and Graph (selector). Polled on the
+ * shared cadence; `refetchIntervalInBackground: false` (the react-query
+ * default) gates polling on tab visibility — fixes audit M7 in one line.
+ */
+export function useMemoirs() {
+  return useQuery({
+    queryKey: ['memoirs'],
+    queryFn: () => apiGet<{ memoirs: Memoir[] }>('/api/memoirs'),
+    refetchInterval: () => getPollingInterval(),
+  });
+}
+
+/**
+ * Single memoir export — concepts + concept-links — keyed by memoir name so
+ * each memoir has its own cache slot. Used directly by Graph.tsx and via
+ * `useQueries` in Brain.tsx to fan out across every memoir.
+ *
+ * Disabled when `name` is null so the hook composes cleanly with Graph.tsx's
+ * "wait until selectedMemoir is set" flow.
+ */
+export function useMemoirExport(name: string | null) {
+  return useQuery({
+    queryKey: ['memoir-export', name],
+    queryFn: () =>
+      apiGet<MemoirExport>(
+        `/api/memoirs/${encodeURIComponent(name as string)}/export?format=json`,
+      ),
+    enabled: name !== null && name !== '',
+    refetchInterval: () => getPollingInterval(),
   });
 }
