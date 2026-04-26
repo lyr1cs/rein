@@ -1,0 +1,184 @@
+//! v0.27 ARS Cap A feedback loop: `rein_feedback_concept_summary` op.
+//!
+//! Mirrors the v0.26 D direction `rein_feedback` synthesis-interaction branch
+//! (in `ops/handlers/adaptive.rs::feedback_synthesis_interaction`) for the
+//! Cap A surface. Records a single
+//! [`crate::store::adaptive::EventType::ConceptSummaryInteraction`] event,
+//! which is later drained by the `concept_summary_feedback` consumer
+//! (`store::adaptive::recompute_concept_summary_feedback_stats`) and folded
+//! into [`crate::store::adaptive::ConceptSummaryFeedbackState`].
+//!
+//! Distinct MCP tool from `rein_feedback` (operator-defined boundary in the
+//! Track 1 brief: do NOT extend the existing tagged-union dispatch). The
+//! Cap A and Cap B feedback streams are deliberately separate at the API
+//! surface so they can be enabled / observed independently.
+
+use rein_macros::op;
+use serde::{Deserialize, Serialize};
+
+use crate::ops::handlers::adaptive::FeedbackOutput;
+use crate::ops::OpsRuntime;
+use crate::types::{OpsErrorKind, ReinError, ReinResult};
+
+/// Parameters for the `rein_feedback_concept_summary` /
+/// `POST /api/feedback/concept_summary` op.
+///
+/// Emitted by GUI hooks (dwell timer / source clicks / explicit thumb /
+/// immediate requery) on the concept living-summary surface.
+#[derive(Deserialize, Serialize, schemars::JsonSchema, Debug, Clone)]
+pub struct ConceptSummaryFeedbackParams {
+    /// Concept's persistent id (NOT a per-call ULID — concepts span sessions).
+    pub concept_id: String,
+    /// ULID echoing `RecallMemoryOutput.request_id` so the back-end can join
+    /// downstream recall traces with concept-summary interactions when the
+    /// surface was reached via recall.
+    pub recall_id: String,
+    /// Discriminated kind tagged via `interaction.kind`. See
+    /// `crate::store::adaptive::ConceptSummaryInteractionKind` for the
+    /// variant set.
+    pub interaction: crate::store::adaptive::ConceptSummaryInteractionKind,
+    /// Optional metadata used for cluster bucketing in the consumer
+    /// (query_type / cluster_id / concept_chars / revision_version).
+    #[serde(default)]
+    pub metadata: Option<crate::store::adaptive::ConceptSummaryMetadata>,
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "feedback_concept_summary",
+        category = "adaptive",
+        description = "Record a user interaction on a Cap A concept living-summary surface (dwell / click / thumb / immediate-requery). Drains into the `concept_summary_feedback` consumer that powers the v0.27 per-query Cap-A gate.",
+        mutating = true,
+        mcp(name = "rein_feedback_concept_summary"),
+        rest(method = "POST", path = "/api/feedback/concept_summary"),
+        auth = "mutation_marker"
+    )]
+    pub fn feedback_concept_summary(
+        &self,
+        params: ConceptSummaryFeedbackParams,
+    ) -> ReinResult<FeedbackOutput> {
+        // Mirror the synthesis-interaction handler shape: lift query_type onto
+        // the FeedbackEvent column so consumers can filter via the indexed
+        // column without parsing the payload JSON for every event.
+        let query_type = params
+            .metadata
+            .as_ref()
+            .and_then(|m| m.query_type.clone());
+
+        let payload = crate::store::adaptive::ConceptSummaryInteractionPayload {
+            concept_id: params.concept_id.clone(),
+            recall_id: params.recall_id.clone(),
+            interaction: params.interaction.clone(),
+            metadata: params.metadata.clone(),
+        };
+        let payload_value = serde_json::to_value(&payload).map_err(|e| {
+            ReinError::Config(format!("concept_summary interaction payload serialize: {e}"))
+                .with_kind(OpsErrorKind::Internal)
+        })?;
+
+        self.with_store(|store| {
+            let conn = store.conn();
+            // BEGIN IMMEDIATE for symmetry with the access + synthesis-interaction
+            // paths. The single emit_event INSERT does not strictly need a
+            // transaction, but the wrap keeps failure semantics identical
+            // (rollback on err) and prevents a partial offset advance if a
+            // future change adds a second statement to this branch.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            // `concept_id` is hoisted onto the FeedbackEvent column (mirrors
+            // how `concept_summary_refreshed` does) so future per-concept
+            // queries can index the column directly. `request_id`,
+            // `memory_id`, `query`, `topic` left None per contract — the
+            // recall_id and concept_id are carried via the payload only.
+            let result = crate::store::adaptive::emit_event(
+                conn,
+                crate::store::adaptive::FeedbackEvent {
+                    event_type: crate::store::adaptive::EventType::ConceptSummaryInteraction,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: Some(params.concept_id.clone()),
+                    query: None,
+                    query_type,
+                    topic: None,
+                    payload: Some(payload_value),
+                },
+            );
+            match result {
+                Ok(_) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(FeedbackOutput { emitted: 1 })
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip the canonical params shape through JSON. Catches any future
+    /// serde rename / tag drift on the params struct itself (the underlying
+    /// kind enum is round-tripped in `store/adaptive.rs` tests).
+    #[test]
+    fn concept_summary_feedback_params_round_trip_serde() {
+        let p = ConceptSummaryFeedbackParams {
+            concept_id: "con-1".into(),
+            recall_id: "rec-1".into(),
+            interaction: crate::store::adaptive::ConceptSummaryInteractionKind::Viewed {
+                dwell_ms: 4200,
+            },
+            metadata: Some(crate::store::adaptive::ConceptSummaryMetadata {
+                query_type: Some("Semantic".into()),
+                cluster_id: Some(42),
+                concept_chars: Some(800),
+                revision_version: Some(3),
+            }),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ConceptSummaryFeedbackParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.concept_id, p.concept_id);
+        assert_eq!(back.recall_id, p.recall_id);
+        assert_eq!(back.metadata.unwrap().cluster_id, Some(42));
+    }
+
+    /// JsonSchema derive sanity check: the schema must not panic to render.
+    #[test]
+    fn concept_summary_feedback_params_jsonschema_renders() {
+        let schema = schemars::schema_for!(ConceptSummaryFeedbackParams);
+        let value = serde_json::to_value(&schema).expect("schema serializes to JSON");
+        // Confirm the params object lists at minimum `concept_id`,
+        // `recall_id`, and `interaction` as required.
+        let required = value
+            .pointer("/required")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let names: std::collections::HashSet<&str> =
+            required.iter().filter_map(|v| v.as_str()).collect();
+        for must in &["concept_id", "recall_id", "interaction"] {
+            assert!(
+                names.contains(must),
+                "expected required field {must} in schema, got {names:?}"
+            );
+        }
+    }
+
+    /// Back-compat: `metadata` is optional, so a payload without it
+    /// deserializes to `None`.
+    #[test]
+    fn concept_summary_feedback_params_metadata_optional() {
+        let json = serde_json::json!({
+            "concept_id": "con-x",
+            "recall_id": "rec-x",
+            "interaction": {"kind": "viewed", "dwell_ms": 1000_u64}
+        });
+        let parsed: ConceptSummaryFeedbackParams =
+            serde_json::from_value(json).expect("missing metadata must parse to None");
+        assert_eq!(parsed.concept_id, "con-x");
+        assert!(parsed.metadata.is_none());
+    }
+}

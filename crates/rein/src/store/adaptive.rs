@@ -50,6 +50,13 @@ pub enum EventType {
     /// unknown values; no exhaustive `match` over `EventType` exists outside
     /// `EventType::as_str` itself.
     SynthesisInteraction,
+    /// v0.27 ARS Cap A feedback loop (Track 1, mirror of v0.26 D for Cap B):
+    /// user interacted with a concept living-summary surface (Cap A).
+    /// Payload is a JSON-serialized [`ConceptSummaryInteractionPayload`].
+    /// Same back-compat invariant as `SynthesisInteraction` — string-based
+    /// dispatch via `event_type`, no exhaustive match on `EventType` outside
+    /// `EventType::as_str`.
+    ConceptSummaryInteraction,
 }
 
 impl EventType {
@@ -67,6 +74,7 @@ impl EventType {
             Self::ParamUpdate => "param_update",
             Self::ConceptSummaryRefreshed => "concept_summary_refreshed",
             Self::SynthesisInteraction => "synthesis_interaction",
+            Self::ConceptSummaryInteraction => "concept_summary_interaction",
         }
     }
 }
@@ -497,6 +505,15 @@ pub struct AdaptiveState {
     #[serde(default)]
     pub synthesis_feedback_stats: Option<SynthesisFeedbackState>,
 
+    /// v0.27 ARS Cap A feedback loop (Track 1): concept living-summary
+    /// interaction aggregates from the `concept_summary_feedback` consumer.
+    /// `None` on fresh install; helpers fall back to the global Cap A
+    /// `[ars].concept_summary_enabled` flag until
+    /// `viewed_count >= CONCEPT_SUMMARY_COLD_START_N` per
+    /// `(cluster_id, query_type)` bucket.
+    #[serde(default)]
+    pub concept_summary_feedback_stats: Option<ConceptSummaryFeedbackState>,
+
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
 }
@@ -852,6 +869,26 @@ impl AdaptiveState {
                         (Some(_), None) => {
                             current.synthesis_feedback_stats =
                                 self.synthesis_feedback_stats.clone();
+                        }
+                        (None, _) => { /* keep current */ }
+                    }
+                    // v0.27 ARS Cap A feedback loop (Track 1): mirror the
+                    // synthesis_feedback_stats arm above. Same arbitration
+                    // shape — event-id MAX wins, writer's `None` does not
+                    // overwrite existing learned state. Round-3 HIGH from
+                    // v0.24 generalised; round-4 HIGH from v0.26 mirrored.
+                    match (
+                        &self.concept_summary_feedback_stats,
+                        &current.concept_summary_feedback_stats,
+                    ) {
+                        (Some(mine), Some(theirs)) => {
+                            if mine.last_consumed_event_id > theirs.last_consumed_event_id {
+                                current.concept_summary_feedback_stats = Some(mine.clone());
+                            }
+                        }
+                        (Some(_), None) => {
+                            current.concept_summary_feedback_stats =
+                                self.concept_summary_feedback_stats.clone();
                         }
                         (None, _) => { /* keep current */ }
                     }
@@ -1858,6 +1895,527 @@ impl AdaptiveState {
             .by_cluster
             .get(&key)
             .filter(|s| s.viewed_count >= SYNTHESIS_COLD_START_N)
+    }
+}
+
+// ── v0.27 ARS Cap A feedback loop (Track 1) — concept-summary feedback ──────
+//
+// Mirrors the v0.26 D direction synthesis-feedback infrastructure (above) for
+// Cap A (concept living-summary). Pattern is fully proven: lift-and-rename,
+// not redesigned. Bucket key remains `(cluster_id, query_type)` — the same
+// shape `decide_synthesize` uses — so the per-cluster gate can disambiguate
+// whether a given concept-summary surface is helping a given query class.
+// The persistent `concept_id` only feeds the per-id LRU (`by_concept`).
+
+/// v0.27 ARS Cap A: typed payload serialised into `feedback_events.payload`
+/// for [`EventType::ConceptSummaryInteraction`].
+///
+/// Shape mirrors [`SynthesisInteractionPayload`] — same 4 interaction kinds,
+/// same `(cluster_id, query_type)` bucketing — with two Cap-A-specific
+/// substitutions:
+/// - `concept_id: String` replaces `synthesis_id`. Concepts are persistent
+///   across sessions, so this is the concept's stable id, not a per-call ULID.
+/// - `metadata.revision_version` records which living-summary revision the
+///   user actually saw — Cap A summaries are versioned, so we can later
+///   slice `useful_rate` by revision freshness.
+///
+/// The `feedback_events.payload` column is already TEXT, so no DDL change is
+/// required — emit via `serde_json::to_value` and round-trip via
+/// `serde_json::from_str` inside [`recompute_concept_summary_feedback_stats`].
+///
+/// Backward-compat invariant: pre-v0.27 payloads never carry this shape, and
+/// the consumer filters by `event_type == "concept_summary_interaction"`, so
+/// foreign payloads cannot reach the deserializer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct ConceptSummaryInteractionPayload {
+    /// Concept's persistent id (NOT a per-call ULID — concepts span sessions).
+    pub concept_id: String,
+    /// Opaque correlation id. ULID echoing `RecallMemoryOutput.request_id`
+    /// when the concept-summary surface was reached via recall; otherwise
+    /// any non-empty client-minted id (UUID, etc.) — back-end treats as
+    /// opaque and joins downstream traces by string equality.
+    pub recall_id: String,
+    pub interaction: ConceptSummaryInteractionKind,
+    /// Optional context — `None` for older callers; `metadata.query_type` and
+    /// `metadata.cluster_id` route the event into the per-`(cluster_id,
+    /// query_type)` bucket (mirrors v0.26 D direction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ConceptSummaryMetadata>,
+}
+
+/// v0.27 ARS Cap A: discriminated interaction kinds posted from the concept
+/// living-summary surface.
+///
+/// Variant set is identical to [`SynthesisInteractionKind`] — proven shape
+/// for the dwell / click / requery / thumb signals. Re-stating rather than
+/// re-using the synthesis enum keeps the two feedback loops fully decoupled
+/// at the type level (they evolve independently per
+/// `feedback_no_subjective_params`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ConceptSummaryInteractionKind {
+    /// Time the concept-summary surface was visible. Feeds the dwell
+    /// reservoir → `useful_rate` dwell term.
+    Viewed { dwell_ms: u64 },
+    /// 1-based index into the concept-summary's evidence/source list.
+    /// Out-of-range indices are accepted (silently counted) — front-end
+    /// is responsible for not emitting them.
+    ClickedSource { source_index: u32 },
+    /// Time gap since the prior `concept_id`'s last interaction to a new
+    /// recall. Sliding threshold lives in the consumer; do NOT hardcode
+    /// "immediate" in the event itself.
+    ImmediateRequery { gap_ms: u64 },
+    /// Explicit user signal.
+    ExplicitThumb { up: bool },
+}
+
+/// v0.27 ARS Cap A: optional context emitted alongside an interaction.
+/// `Default` is empty (all `None`) so callers can construct it without
+/// committing to every field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ConceptSummaryMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<i64>,
+    /// Living-summary character count — diagnostic dimension for Cap A
+    /// ablation (analogous to `synthesis_chars`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_chars: Option<u32>,
+    /// Cap-A specific: which revision of the concept living-summary the
+    /// user actually saw. Surfaced so future ablations can slice
+    /// `useful_rate` by revision freshness — Cap A summaries are
+    /// versioned, unlike Cap B synthesis (which is per-call ephemeral).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_version: Option<u32>,
+}
+
+// Bootstrap weights for `compute_concept_summary_useful_rate`. Marked
+// `bootstrap` per `feedback_no_subjective_params` — every literal is
+// data-driven in the fullness of time. v0.27.1 → ablation across observed
+// `(ClusterConceptSummaryStats, downstream-recall)` pairs, mirroring the
+// v0.26.1 plan for synthesis. Until then: view-with-dwell + thumb are
+// positive, requery is the strongest negative.
+pub const CONCEPT_SUMMARY_W_VIEW: f64 = 1.0; // bootstrap; v0.27.1 → ablation
+pub const CONCEPT_SUMMARY_W_CLICK: f64 = 0.5; // bootstrap; v0.27.1 → ablation
+pub const CONCEPT_SUMMARY_W_THUMB: f64 = 2.0; // bootstrap; v0.27.1 → ablation
+pub const CONCEPT_SUMMARY_W_REQUERY: f64 = 2.0; // bootstrap; v0.27.1 → ablation (subtracted)
+/// Bootstrap dwell threshold. v0.27.1 → per-cluster p50 of dwell_samples.
+pub const CONCEPT_SUMMARY_DWELL_THRESHOLD_MS: u64 = 3_000; // bootstrap; v0.27.1 → ablation
+
+/// FIFO reservoir cap for `dwell_samples` per [`ClusterConceptSummaryStats`].
+/// 500 keeps the `useful_rate` dwell term responsive to recent steady state
+/// without unbounded memory growth (mirrors `SYNTHESIS_DWELL_RESERVOIR_CAP`).
+pub const CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP: usize = 500;
+
+/// LRU cap for `by_concept` per-id stats. Implemented as a `HashMap` + side
+/// `Vec<String>` for FIFO order because `lru::LruCache` is not `Serialize`
+/// (cross-agent invariant 11, mirrors `SYNTHESIS_PER_ID_CAP`).
+pub const CONCEPT_SUMMARY_PER_ID_CAP: usize = 1024;
+
+/// Hard cap on the number of distinct `(cluster_id, query_type)` buckets
+/// in [`ConceptSummaryFeedbackState::by_cluster`]. Defends against a
+/// malicious or buggy client flooding `/api/feedback` with fabricated
+/// `cluster_id` or `query_type` values that would otherwise grow the
+/// persisted adaptive-state snapshot without limit (mirrors v0.26 Codex
+/// round 2 F-11). Once the cap is reached new buckets are dropped (the
+/// events still increment `total_events`), so legitimate buckets don't
+/// compete for capacity once the system has converged on real cluster ids.
+pub const CONCEPT_SUMMARY_BY_CLUSTER_CAP: usize = 4096;
+
+/// Whitelist of `query_type` values rein can legitimately emit (mirrors
+/// `SYNTHESIS_ALLOWED_QUERY_TYPES`). Any client-supplied value outside
+/// this list is normalized to `"unknown"` before being folded into
+/// `by_cluster`, so adversarial query_type strings can't multiplicatively
+/// explode the bucket cardinality.
+pub const CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES: &[&str] = &[
+    "Episodic",
+    "Temporal",
+    "Preference",
+    "ExactKeyword",
+    "Semantic",
+    "Exploratory",
+    "_global",
+];
+
+/// Min events per `(cluster_id, query_type)` bucket before per-cluster
+/// `useful_rate` is trusted by the per-query Cap-A gate. Below this, the
+/// gate falls back to the global `[ars].concept_summary_enabled` flag
+/// (mirrors `SYNTHESIS_COLD_START_N`).
+pub const CONCEPT_SUMMARY_COLD_START_N: u64 = 10;
+
+/// Bootstrap `useful_rate` cutoff used by the Cap-A per-query gate. Hoisted
+/// into a constant so handler code never inlines the literal (cross-agent
+/// invariant 12); v0.27.1 → adaptive once `useful_rate` ablation lands
+/// (mirrors `SYNTHESIS_USEFUL_RATE_THRESHOLD`).
+pub const CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD: f64 = 0.5; // bootstrap; v0.27.1 → adaptive
+
+/// Per-bucket key used by [`ConceptSummaryFeedbackState::by_cluster`].
+/// Bucket is `(cluster_id, query_type)` — both can be unknown, in which
+/// case the consumer routes events to the global bucket key
+/// `concept_summary_bucket_key(None, "")` → `"-1|"`.
+///
+/// Keyed via `serde`-friendly `String` because `HashMap<(_, String), _>`
+/// round-trips awkwardly through JSON (`serde_json` requires string keys).
+/// Mirrors `synthesis_bucket_key`; the two helpers are deliberately
+/// kept separate so a future schema-only change to one doesn't silently
+/// drift the other.
+pub fn concept_summary_bucket_key(cluster_id: Option<i64>, query_type: &str) -> String {
+    let cid = cluster_id.unwrap_or(-1);
+    format!("{cid}|{query_type}")
+}
+
+/// v0.27 ARS Cap A: per-`(cluster_id, query_type)` concept-summary
+/// interaction aggregate. `useful_rate` is recomputed on every consumer
+/// pass via [`compute_concept_summary_useful_rate`]. Mirrors
+/// [`ClusterSynthesisStats`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ClusterConceptSummaryStats {
+    pub viewed_count: u64,
+    pub viewed_dwell_total_ms: u64,
+    /// FIFO reservoir of `Viewed.dwell_ms` samples capped at
+    /// [`CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP`]. Used to compute
+    /// `viewed_dwell_p50_ms` and the dwell term in
+    /// [`compute_concept_summary_useful_rate`].
+    #[serde(default)]
+    pub dwell_samples: Vec<u64>,
+    /// Cached p50 of `dwell_samples`. `None` when reservoir is empty.
+    #[serde(default)]
+    pub viewed_dwell_p50_ms: Option<u64>,
+    pub clicked_source_count: u64,
+    pub immediate_requery_count: u64,
+    pub explicit_up: u64,
+    pub explicit_down: u64,
+    /// Derived metric, recomputed on every consumer pass.
+    pub useful_rate: f64,
+}
+
+/// v0.27 ARS Cap A: per-concept_id stats with bounded LRU semantics.
+/// Used by future per-concept decay/heatmap views; the consumer caps total
+/// entries at [`CONCEPT_SUMMARY_PER_ID_CAP`]. Mirrors [`PerSynthesisStats`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerConceptSummaryStats {
+    pub viewed_count: u32,
+    pub clicked_source_count: u32,
+    pub explicit_up: u32,
+    pub explicit_down: u32,
+    pub last_interaction_ts: i64,
+}
+
+/// v0.27 ARS Cap A: state container for the `concept_summary_feedback`
+/// consumer. Persisted as part of [`AdaptiveState`] (CAS-arbitrated by
+/// `last_consumed_event_id`). Mirrors [`SynthesisFeedbackState`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConceptSummaryFeedbackState {
+    /// Bucket: `concept_summary_bucket_key(cluster_id, query_type)`.
+    /// `cluster_id = -1` (None) means "no cluster"; empty `query_type`
+    /// means unknown classification. HashMap so serde round-trips
+    /// cleanly into the JSON snapshot.
+    pub by_cluster: HashMap<String, ClusterConceptSummaryStats>,
+    /// Bounded per-concept_id stats (LRU-capped at
+    /// [`CONCEPT_SUMMARY_PER_ID_CAP`]). Implemented as `HashMap` + side
+    /// `by_concept_order` Vec — `lru::LruCache` is not `Serialize` and
+    /// would break `AdaptiveState` snapshotting (cross-agent invariant 11).
+    #[serde(default)]
+    pub by_concept: HashMap<String, PerConceptSummaryStats>,
+    /// FIFO order key list mirroring `by_concept` insertion order.
+    /// Eviction pops from the front and removes the matching HashMap
+    /// entry — both updates MUST happen together, otherwise the cache
+    /// leaks orphan keys.
+    #[serde(default)]
+    pub by_concept_order: Vec<String>,
+    /// Highest event id incorporated into this state. Watermark for
+    /// replay-safety (mirrors
+    /// [`SynthesisFeedbackState::last_consumed_event_id`]). The CAS merge
+    /// in `save_snapshot` arbitrates between concurrent writers by the
+    /// MAX of this id (Codex round-4 HIGH from v0.24 generalised to the
+    /// new arm).
+    #[serde(default)]
+    pub last_consumed_event_id: i64,
+    /// Total events the consumer has *processed* (including replays
+    /// counted only once). Useful for `/api/adaptive` exposure of
+    /// "how much signal has accumulated".
+    #[serde(default)]
+    pub total_events: u64,
+}
+
+/// Pure function — testable in isolation. Computes a `[0.0, 1.0]`
+/// usefulness rate from a single bucket's aggregate counters.
+/// Mirrors [`compute_useful_rate`] for the concept-summary surface.
+///
+/// The formula combines:
+/// - dwell pct: fraction of `dwell_samples` exceeding
+///   [`CONCEPT_SUMMARY_DWELL_THRESHOLD_MS`] (a "skim vs read" proxy).
+/// - click rate: clicks / views (engagement with cited evidence).
+/// - thumb rate: explicit positive ratio
+///   (`explicit_up / (explicit_up + explicit_down + 1)`); `+1` Laplace
+///   smoothing keeps the term well-defined when no thumbs have ever
+///   landed.
+/// - requery rate: requeries / views (subtracted — a strong negative
+///   signal that the concept summary didn't satisfy the question).
+///
+/// Output is `.clamp(0.0, 1.0)` so the requery penalty cannot push the
+/// score below zero (and rounding never floats above one). Bootstrap
+/// weights are documented above; v0.27.1 will derive them from a
+/// SemDeDup-style ablation.
+pub fn compute_concept_summary_useful_rate(stats: &ClusterConceptSummaryStats) -> f64 {
+    let total_views = stats.viewed_count.max(1) as f64;
+    let dwell_pct = if stats.dwell_samples.is_empty() {
+        0.0
+    } else {
+        stats
+            .dwell_samples
+            .iter()
+            .filter(|&&d| d > CONCEPT_SUMMARY_DWELL_THRESHOLD_MS)
+            .count() as f64
+            / stats.dwell_samples.len() as f64
+    };
+    let click_rate = stats.clicked_source_count as f64 / total_views;
+    let thumb_rate =
+        stats.explicit_up as f64 / (stats.explicit_up + stats.explicit_down + 1) as f64;
+    let requery_rate = stats.immediate_requery_count as f64 / total_views;
+
+    let numerator = CONCEPT_SUMMARY_W_VIEW * dwell_pct
+        + CONCEPT_SUMMARY_W_CLICK * click_rate
+        + CONCEPT_SUMMARY_W_THUMB * thumb_rate
+        - CONCEPT_SUMMARY_W_REQUERY * requery_rate;
+    let denom = CONCEPT_SUMMARY_W_VIEW
+        + CONCEPT_SUMMARY_W_CLICK
+        + CONCEPT_SUMMARY_W_THUMB
+        + CONCEPT_SUMMARY_W_REQUERY;
+    (numerator / denom).clamp(0.0, 1.0)
+}
+
+/// Compute the p50 of a non-empty slice of dwell samples. Mirrors the
+/// inner `dwell_p50_ms` helper above (private — we just route through it).
+fn concept_summary_dwell_p50_ms(samples: &[u64]) -> Option<u64> {
+    dwell_p50_ms(samples)
+}
+
+/// v0.27 ARS Cap A: peek new [`EventType::ConceptSummaryInteraction`]
+/// feedback events, fold them into the rolling
+/// [`ConceptSummaryFeedbackState`], recompute the derived `useful_rate`
+/// per bucket, and return the highest event id incorporated so the
+/// caller can commit the consumer offset *after* the derived state is
+/// durable (module-level peek+commit invariant).
+///
+/// Returns `(updated_state, Option<max_event_id>)`. `Option::None` means
+/// no new events were observed → caller skips `commit_offset`.
+///
+/// **5 invariants enforced** (per
+/// [[feedback_event_sourced_state_invariant]]):
+///
+///   1. **Watermark filter** — events with
+///      `id <= state.last_consumed_event_id` are skipped via
+///      `prior_high_water`. Counter increments are NOT idempotent, so
+///      this guard is the entire point.
+///   2. **Applied-prefix bump** — `state.last_consumed_event_id` is
+///      bumped to `max(state.last_consumed_event_id, max_id_this_pass)`
+///      *before* any new events are folded; the caller is responsible
+///      for committing the consumer offset only AFTER `save_snapshot`
+///      returns Ok.
+///   3. **Replay-drain** — `peek_events` reads from the consumer offset;
+///      replay-safety after a `commit_offset` failure is guarded by
+///      invariant (1).
+///   4. **CAS merge** — [`AdaptiveState::save_snapshot`] arbitrates by
+///      `last_consumed_event_id` MAX, mirroring the
+///      `synthesis_feedback_stats` arm.
+///   5. **Peek + commit** — uses `peek_events("concept_summary_feedback",
+///      …)` then *the caller* runs
+///      `commit_offset(&[("concept_summary_feedback", max_id)])` AFTER
+///      `save_snapshot` succeeds. Never `consume_events` (the v0.24
+///      round-2/3/4 HIGH that this contract retires).
+///
+/// Malformed payloads are logged via `tracing::warn!` and skipped
+/// (mirrors `recompute_synthesis_feedback_stats`).
+pub fn recompute_concept_summary_feedback_stats(
+    conn: &Connection,
+    prior: Option<ConceptSummaryFeedbackState>,
+) -> ReinResult<(ConceptSummaryFeedbackState, Option<i64>)> {
+    let mut state = prior.unwrap_or_default();
+
+    // Single peek covers the common case (most pipelines drain in one
+    // shot). 50 000 cap matches `recompute_synthesis_feedback_stats`.
+    let events = peek_events(
+        conn,
+        "concept_summary_feedback",
+        &[EventType::ConceptSummaryInteraction.as_str()],
+        50_000,
+    )?;
+    if events.is_empty() {
+        return Ok((state, None));
+    }
+    let max_id_this_pass = events.last().map(|e| e.id);
+
+    // Invariants 1 + 2: prior_high_water guard skips already-applied events
+    // on a replay; the bump records the durable watermark in the returned
+    // state so the next `save_snapshot` advances it. The caller commits the
+    // consumer offset only AFTER save_snapshot succeeds.
+    let prior_high_water = state.last_consumed_event_id;
+    if let Some(max_id) = max_id_this_pass {
+        state.last_consumed_event_id = state.last_consumed_event_id.max(max_id);
+    }
+
+    // Track buckets that received new events so we recompute their
+    // `useful_rate` cache exactly once per pass.
+    let mut touched_buckets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for ev in events {
+        if ev.id <= prior_high_water {
+            continue;
+        }
+        let payload_str = match ev.payload.as_deref() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    event_id = ev.id,
+                    "concept_summary_feedback: event missing payload, skipping"
+                );
+                continue;
+            }
+        };
+        let payload: ConceptSummaryInteractionPayload = match serde_json::from_str(payload_str) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = ev.id,
+                    error = %e,
+                    "concept_summary_feedback: malformed ConceptSummaryInteractionPayload, skipping"
+                );
+                continue;
+            }
+        };
+
+        let metadata = payload.metadata.clone().unwrap_or_default();
+        let cluster_id = metadata.cluster_id;
+        let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
+        // Whitelist normalize: clamp non-allowed query_types to "unknown" so
+        // malicious clients can't multiplicatively grow the bucket space.
+        let query_type = if CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+            raw_qtype.to_string()
+        } else {
+            "unknown".to_string()
+        };
+        let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
+
+        // Hard cap: drop event if creating a new bucket would push
+        // by_cluster past the cap. Existing buckets continue to receive
+        // updates so legitimate signal isn't lost.
+        if !state.by_cluster.contains_key(&bucket_key)
+            && state.by_cluster.len() >= CONCEPT_SUMMARY_BY_CLUSTER_CAP
+        {
+            tracing::warn!(
+                cluster_id = ?cluster_id,
+                query_type = %query_type,
+                cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+                "concept_summary_feedback: by_cluster cap reached; dropping new bucket event"
+            );
+            // Still bump total_events so the consumer offset advances and
+            // we don't replay this event forever.
+            state.total_events = state.total_events.saturating_add(1);
+            continue;
+        }
+
+        // Per-bucket fold.
+        let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+        match &payload.interaction {
+            ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
+                bucket.viewed_count = bucket.viewed_count.saturating_add(1);
+                bucket.viewed_dwell_total_ms =
+                    bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
+                bucket.dwell_samples.push(*dwell_ms);
+                if bucket.dwell_samples.len() > CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP {
+                    let overflow = bucket.dwell_samples.len() - CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP;
+                    bucket.dwell_samples.drain(0..overflow);
+                }
+            }
+            ConceptSummaryInteractionKind::ClickedSource { source_index: _ } => {
+                bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
+            }
+            ConceptSummaryInteractionKind::ImmediateRequery { gap_ms: _ } => {
+                bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
+            }
+            ConceptSummaryInteractionKind::ExplicitThumb { up } => {
+                if *up {
+                    bucket.explicit_up = bucket.explicit_up.saturating_add(1);
+                } else {
+                    bucket.explicit_down = bucket.explicit_down.saturating_add(1);
+                }
+            }
+        }
+        touched_buckets.insert(bucket_key);
+
+        // Per-concept_id LRU fold. HashMap update + side-vec FIFO must
+        // happen together; failure to dual-update leaks orphan keys.
+        let cid_str = payload.concept_id.clone();
+        let existed = state.by_concept.contains_key(&cid_str);
+        {
+            let per = state.by_concept.entry(cid_str.clone()).or_default();
+            match &payload.interaction {
+                ConceptSummaryInteractionKind::Viewed { .. } => {
+                    per.viewed_count = per.viewed_count.saturating_add(1);
+                }
+                ConceptSummaryInteractionKind::ClickedSource { .. } => {
+                    per.clicked_source_count = per.clicked_source_count.saturating_add(1);
+                }
+                ConceptSummaryInteractionKind::ExplicitThumb { up } => {
+                    if *up {
+                        per.explicit_up = per.explicit_up.saturating_add(1);
+                    } else {
+                        per.explicit_down = per.explicit_down.saturating_add(1);
+                    }
+                }
+                ConceptSummaryInteractionKind::ImmediateRequery { .. } => {
+                    // Tracked at bucket level only — per-concept attribution
+                    // for requery is ambiguous (the requery happens against
+                    // the *next* search, not this concept-summary view).
+                }
+            }
+            per.last_interaction_ts = chrono::Utc::now().timestamp();
+        }
+        if !existed {
+            // New entry — push to FIFO order.
+            state.by_concept_order.push(cid_str.clone());
+            // Cap evict: pop from the FRONT of the order vec AND remove
+            // from the HashMap. Dual update is mandatory — failure to keep
+            // both stores in sync leaks orphan HashMap entries.
+            while state.by_concept_order.len() > CONCEPT_SUMMARY_PER_ID_CAP {
+                let evict = state.by_concept_order.remove(0);
+                state.by_concept.remove(&evict);
+            }
+        }
+
+        state.total_events = state.total_events.saturating_add(1);
+    }
+
+    // Recompute derived metrics for buckets touched this pass.
+    for key in touched_buckets {
+        if let Some(bucket) = state.by_cluster.get_mut(&key) {
+            bucket.viewed_dwell_p50_ms = concept_summary_dwell_p50_ms(&bucket.dwell_samples);
+            bucket.useful_rate = compute_concept_summary_useful_rate(bucket);
+        }
+    }
+
+    Ok((state, max_id_this_pass))
+}
+
+impl AdaptiveState {
+    /// v0.27 ARS Cap A: per-`(cluster_id, query_type)` concept-summary
+    /// bucket, returned only when the bucket has accumulated at least
+    /// [`CONCEPT_SUMMARY_COLD_START_N`] viewed samples (cold-start
+    /// fallback otherwise — caller falls back to the global Cap A
+    /// `[ars].concept_summary_enabled` flag). Mirrors [`Self::synthesis_bucket`].
+    pub fn concept_summary_bucket(
+        &self,
+        cluster_id: Option<i64>,
+        query_type: &str,
+    ) -> Option<&ClusterConceptSummaryStats> {
+        let state = self.concept_summary_feedback_stats.as_ref()?;
+        let key = concept_summary_bucket_key(cluster_id, query_type);
+        state
+            .by_cluster
+            .get(&key)
+            .filter(|s| s.viewed_count >= CONCEPT_SUMMARY_COLD_START_N)
     }
 }
 
@@ -3196,6 +3754,759 @@ mod tests {
         assert_eq!(s.total_events, 0);
         let json = serde_json::to_string(&s).unwrap();
         let back: SynthesisFeedbackState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    // ── v0.27 ARS Cap A: concept_summary_feedback consumer tests ───────────
+
+    fn emit_concept_summary_event(
+        conn: &Connection,
+        payload: ConceptSummaryInteractionPayload,
+    ) {
+        emit_event(
+            conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryInteraction,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some(payload.concept_id.clone()),
+                query: None,
+                query_type: payload
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.query_type.clone()),
+                topic: None,
+                payload: Some(serde_json::to_value(payload).unwrap()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn mk_concept_summary_payload(
+        concept_id: &str,
+        kind: ConceptSummaryInteractionKind,
+        cluster_id: Option<i64>,
+        query_type: Option<&str>,
+    ) -> ConceptSummaryInteractionPayload {
+        ConceptSummaryInteractionPayload {
+            concept_id: concept_id.to_string(),
+            recall_id: format!("recall-{concept_id}"),
+            interaction: kind,
+            metadata: Some(ConceptSummaryMetadata {
+                query_type: query_type.map(|s| s.to_string()),
+                cluster_id,
+                concept_chars: None,
+                revision_version: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn concept_summary_feedback_event_type_str() {
+        // Guards against accidental rename of the
+        // ConceptSummaryInteraction event_type string (silent de-route).
+        assert_eq!(
+            EventType::ConceptSummaryInteraction.as_str(),
+            "concept_summary_interaction"
+        );
+    }
+
+    #[test]
+    fn concept_summary_interaction_kind_round_trip_serde() {
+        let cases = vec![
+            ConceptSummaryInteractionKind::Viewed { dwell_ms: 4200 },
+            ConceptSummaryInteractionKind::ClickedSource { source_index: 3 },
+            ConceptSummaryInteractionKind::ImmediateRequery { gap_ms: 1500 },
+            ConceptSummaryInteractionKind::ExplicitThumb { up: true },
+        ];
+        for k in cases {
+            let json = serde_json::to_string(&k).unwrap();
+            let back: ConceptSummaryInteractionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, back, "round-trip failed for {k:?} (json={json})");
+        }
+    }
+
+    #[test]
+    fn concept_summary_interaction_payload_back_compat_missing_metadata() {
+        // Pre-v0.27 payloads with no `metadata` field deserialize to None.
+        let json = r#"{
+            "concept_id":"con-x",
+            "recall_id":"rec-x",
+            "interaction":{"kind":"viewed","dwell_ms":1000}
+        }"#;
+        let p: ConceptSummaryInteractionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(p.concept_id, "con-x");
+        assert_eq!(p.recall_id, "rec-x");
+        assert!(matches!(
+            p.interaction,
+            ConceptSummaryInteractionKind::Viewed { dwell_ms: 1000 }
+        ));
+        assert!(p.metadata.is_none(), "missing metadata → None, not panic");
+    }
+
+    #[test]
+    fn compute_concept_summary_useful_rate_table() {
+        // Cold start (zeros) → 0.0 by clamp lower bound.
+        let cold = ClusterConceptSummaryStats::default();
+        assert_eq!(compute_concept_summary_useful_rate(&cold), 0.0);
+
+        // Happy path: 10 views all over dwell threshold, 5 clicks, 8 thumbs
+        // up, 0 requeries → useful_rate well above 0.5.
+        let happy = ClusterConceptSummaryStats {
+            viewed_count: 10,
+            viewed_dwell_total_ms: 10 * 5000,
+            dwell_samples: vec![5000; 10],
+            viewed_dwell_p50_ms: Some(5000),
+            clicked_source_count: 5,
+            immediate_requery_count: 0,
+            explicit_up: 8,
+            explicit_down: 0,
+            useful_rate: 0.0,
+        };
+        let happy_rate = compute_concept_summary_useful_rate(&happy);
+        assert!(happy_rate > 0.5, "happy path useful_rate={happy_rate}");
+        assert!(happy_rate <= 1.0);
+
+        // Bad path: 10 views all under dwell, 0 clicks, 0 thumbs, 8 requeries
+        // → strong negative signal → clamped near 0.0.
+        let bad = ClusterConceptSummaryStats {
+            viewed_count: 10,
+            viewed_dwell_total_ms: 10 * 100,
+            dwell_samples: vec![100; 10],
+            viewed_dwell_p50_ms: Some(100),
+            clicked_source_count: 0,
+            immediate_requery_count: 8,
+            explicit_up: 0,
+            explicit_down: 5,
+            useful_rate: 0.0,
+        };
+        let bad_rate = compute_concept_summary_useful_rate(&bad);
+        assert!(bad_rate >= 0.0);
+        assert!(bad_rate < 0.5);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_empty() {
+        let conn = setup_db();
+        let (state, max_id) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        assert!(state.by_cluster.is_empty());
+        assert!(state.by_concept.is_empty());
+        assert!(state.by_concept_order.is_empty());
+        assert_eq!(state.total_events, 0);
+        assert_eq!(state.last_consumed_event_id, 0);
+        assert_eq!(max_id, None);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_aggregates_per_bucket() {
+        let conn = setup_db();
+        // 5 viewed events for (cluster=1, qtype=Semantic), 1 thumb-up,
+        // 2 clicks, 1 requery (negative signal).
+        for i in 0..5 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    &format!("con-A{i}"),
+                    ConceptSummaryInteractionKind::Viewed { dwell_ms: 4500 },
+                    Some(1),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-A0",
+                ConceptSummaryInteractionKind::ExplicitThumb { up: true },
+                Some(1),
+                Some("Semantic"),
+            ),
+        );
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-A0",
+                ConceptSummaryInteractionKind::ClickedSource { source_index: 1 },
+                Some(1),
+                Some("Semantic"),
+            ),
+        );
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-A1",
+                ConceptSummaryInteractionKind::ClickedSource { source_index: 2 },
+                Some(1),
+                Some("Semantic"),
+            ),
+        );
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-A2",
+                ConceptSummaryInteractionKind::ImmediateRequery { gap_ms: 800 },
+                Some(1),
+                Some("Semantic"),
+            ),
+        );
+
+        let (state, max_id) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        let key = concept_summary_bucket_key(Some(1), "Semantic");
+        let bucket = state.by_cluster.get(&key).expect("bucket should exist");
+        assert_eq!(bucket.viewed_count, 5);
+        assert_eq!(bucket.clicked_source_count, 2);
+        assert_eq!(bucket.immediate_requery_count, 1);
+        assert_eq!(bucket.explicit_up, 1);
+        assert_eq!(bucket.explicit_down, 0);
+        // Positive contributions: 5 viewed-with-dwell-above-threshold + 1
+        // thumb up + 2 clicks; 1 requery as negative. The cached
+        // useful_rate must equal the pure-fn value computed against the
+        // same bucket — the explicit value is asserted in
+        // `compute_concept_summary_useful_rate_table` above.
+        assert!(
+            bucket.useful_rate > 0.0,
+            "useful_rate={} must be strictly positive after positive signal mix",
+            bucket.useful_rate
+        );
+        assert!(
+            (bucket.useful_rate - compute_concept_summary_useful_rate(bucket)).abs() < 1e-9,
+            "stored useful_rate must match the pure fn"
+        );
+        assert_eq!(state.total_events, 9);
+        assert_eq!(max_id, Some(9));
+        assert_eq!(state.last_consumed_event_id, 9);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_watermark_filter_skips_replay() {
+        // Required test #1: events with id <= prior_high_water are skipped.
+        let conn = setup_db();
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-1",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-2",
+                ConceptSummaryInteractionKind::ClickedSource { source_index: 1 },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+
+        // First call drains both events, bumps last_consumed_event_id to 2.
+        let (state, max_id) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        assert_eq!(state.total_events, 2);
+        assert_eq!(state.last_consumed_event_id, 2);
+        assert_eq!(max_id, Some(2));
+
+        // Replay (commit_offset failed): same events re-peeked. With the
+        // watermark filter, no double-counting.
+        let (state2, max_id2) =
+            recompute_concept_summary_feedback_stats(&conn, Some(state.clone())).unwrap();
+        assert_eq!(state2.total_events, 2, "replay-safety: events with id <= last_consumed_event_id are skipped");
+        let key = concept_summary_bucket_key(Some(7), "Semantic");
+        let bucket = state2.by_cluster.get(&key).unwrap();
+        assert_eq!(bucket.viewed_count, 1);
+        assert_eq!(bucket.clicked_source_count, 1);
+        assert_eq!(max_id2, Some(2));
+
+        // Caller commits this pass; subsequent peek finds nothing.
+        commit_offset(&conn, &[("concept_summary_feedback", max_id2.unwrap())]).unwrap();
+        let (state3, max_id3) =
+            recompute_concept_summary_feedback_stats(&conn, Some(state2)).unwrap();
+        assert_eq!(state3.total_events, 2);
+        assert_eq!(max_id3, None);
+
+        // New event after commit: state grows by exactly one.
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-3",
+                ConceptSummaryInteractionKind::ExplicitThumb { up: true },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+        let (state4, max_id4) =
+            recompute_concept_summary_feedback_stats(&conn, Some(state3)).unwrap();
+        assert_eq!(state4.total_events, 3);
+        assert_eq!(max_id4, Some(3));
+        assert_eq!(state4.by_cluster.get(&key).unwrap().explicit_up, 1);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_bucket_cap_drops_new_buckets() {
+        // Required test #2: bucket cap behavior.
+        // We can't realistically emit 4096 events in a unit test, so we
+        // pre-populate state past the cap and verify that a new bucket
+        // event drops with `total_events` still incrementing.
+        let conn = setup_db();
+        let mut by_cluster = HashMap::new();
+        for i in 0..CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+            by_cluster.insert(
+                concept_summary_bucket_key(Some(i as i64), "Semantic"),
+                ClusterConceptSummaryStats::default(),
+            );
+        }
+        let prior = ConceptSummaryFeedbackState {
+            by_cluster,
+            ..ConceptSummaryFeedbackState::default()
+        };
+        // Emit one event that would create a NEW (out-of-range) bucket.
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-overflow",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(99_999),
+                Some("Semantic"),
+            ),
+        );
+        let (state, max_id) =
+            recompute_concept_summary_feedback_stats(&conn, Some(prior)).unwrap();
+        assert_eq!(state.by_cluster.len(), CONCEPT_SUMMARY_BY_CLUSTER_CAP);
+        // New bucket NOT inserted, but total_events bumps so the offset
+        // advances and we don't replay this event forever.
+        let cap_key = concept_summary_bucket_key(Some(99_999), "Semantic");
+        assert!(!state.by_cluster.contains_key(&cap_key));
+        assert_eq!(state.total_events, 1);
+        assert_eq!(max_id, Some(1));
+        assert_eq!(state.last_consumed_event_id, 1);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_query_type_whitelist_normalizes() {
+        // Required test #3: non-allowed query_type → "unknown" bucket.
+        let conn = setup_db();
+        // Allowed value lands in its own bucket.
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-1",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(5),
+                Some("Semantic"),
+            ),
+        );
+        // Adversarial query_type → routed to "unknown".
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-2",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(5),
+                Some("'; DROP TABLE memories; --"),
+            ),
+        );
+        // Empty query_type also → "unknown".
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-3",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(5),
+                Some(""),
+            ),
+        );
+
+        let (state, _) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        let semantic_key = concept_summary_bucket_key(Some(5), "Semantic");
+        let unknown_key = concept_summary_bucket_key(Some(5), "unknown");
+        assert!(
+            state.by_cluster.contains_key(&semantic_key),
+            "allowed Semantic query_type lands in its own bucket"
+        );
+        assert!(
+            state.by_cluster.contains_key(&unknown_key),
+            "non-allowed and empty query_types both normalize to unknown"
+        );
+        assert_eq!(state.by_cluster.get(&unknown_key).unwrap().viewed_count, 2);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_useful_rate_signal_directions() {
+        // Required test #4: positive vs negative contributions to useful_rate.
+        // Signal mix calibrated to land the positive bucket above the
+        // bootstrap cutoff and the negative bucket below it.
+        //
+        // Positive bucket algebra (with the bootstrap weights):
+        //   10 viewed (dwell 5000ms above 3000ms threshold) → dwell_pct = 1.0
+        //   10 clicks → click_rate = 1.0
+        //   10 thumbs up → thumb_rate = 10/11 ≈ 0.909
+        //   0 requeries → requery_rate = 0
+        //   numerator = 1*1.0 + 0.5*1.0 + 2*0.909 - 2*0 = 3.318
+        //   denom = 1 + 0.5 + 2 + 2 = 5.5
+        //   useful_rate ≈ 0.603 (above 0.5)
+        let conn = setup_db();
+
+        for _ in 0..10 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    "con-pos",
+                    ConceptSummaryInteractionKind::Viewed { dwell_ms: 5000 },
+                    Some(11),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        for _ in 0..10 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    "con-pos",
+                    ConceptSummaryInteractionKind::ClickedSource { source_index: 1 },
+                    Some(11),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        for _ in 0..10 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    "con-pos",
+                    ConceptSummaryInteractionKind::ExplicitThumb { up: true },
+                    Some(11),
+                    Some("Semantic"),
+                ),
+            );
+        }
+
+        // Negative bucket algebra:
+        //   5 viewed (dwell 200ms — under threshold) → dwell_pct = 0
+        //   0 clicks
+        //   5 requeries → requery_rate = 1.0
+        //   3 thumbs down → thumb_rate = 0/4 = 0
+        //   numerator = 0 + 0 + 0 - 2*1.0 = -2.0 → clamped to 0.0
+        for _ in 0..5 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    "con-neg",
+                    ConceptSummaryInteractionKind::Viewed { dwell_ms: 200 },
+                    Some(22),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        for _ in 0..5 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    "con-neg",
+                    ConceptSummaryInteractionKind::ImmediateRequery { gap_ms: 300 },
+                    Some(22),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        for _ in 0..3 {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    "con-neg",
+                    ConceptSummaryInteractionKind::ExplicitThumb { up: false },
+                    Some(22),
+                    Some("Semantic"),
+                ),
+            );
+        }
+
+        let (state, _) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        let pos_key = concept_summary_bucket_key(Some(11), "Semantic");
+        let neg_key = concept_summary_bucket_key(Some(22), "Semantic");
+        let pos = state.by_cluster.get(&pos_key).unwrap();
+        let neg = state.by_cluster.get(&neg_key).unwrap();
+        assert!(
+            pos.useful_rate > neg.useful_rate,
+            "positive bucket useful_rate={} must exceed negative bucket useful_rate={}",
+            pos.useful_rate,
+            neg.useful_rate
+        );
+        assert!(
+            pos.useful_rate > 0.5,
+            "positive bucket useful_rate={} above bootstrap cutoff",
+            pos.useful_rate
+        );
+        assert!(
+            neg.useful_rate < 0.5,
+            "negative bucket useful_rate={} below bootstrap cutoff",
+            neg.useful_rate
+        );
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_skips_malformed_payloads() {
+        let conn = setup_db();
+        // 1 valid + 1 missing-payload + 1 malformed JSON + 1 valid.
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-good-1",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 3500 },
+                Some(2),
+                Some("Episodic"),
+            ),
+        );
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryInteraction,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("con-malformed-1".into()),
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryInteraction,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("con-malformed-2".into()),
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::json!({"unexpected": "shape"})),
+            },
+        )
+        .unwrap();
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "con-good-2",
+                ConceptSummaryInteractionKind::ExplicitThumb { up: false },
+                Some(2),
+                Some("Episodic"),
+            ),
+        );
+
+        let (state, _) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        // Only 2 valid events survived; total_events counts only those.
+        assert_eq!(state.total_events, 2);
+        let key = concept_summary_bucket_key(Some(2), "Episodic");
+        let bucket = state.by_cluster.get(&key).unwrap();
+        assert_eq!(bucket.viewed_count, 1);
+        assert_eq!(bucket.explicit_down, 1);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_caps_dwell_reservoir_fifo() {
+        let conn = setup_db();
+        let overflow = 25;
+        for i in 0..(CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP + overflow) {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    &format!("con-fifo-{i}"),
+                    ConceptSummaryInteractionKind::Viewed { dwell_ms: (i + 1) as u64 },
+                    Some(3),
+                    Some("Exploratory"),
+                ),
+            );
+        }
+        let (state, _) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        let key = concept_summary_bucket_key(Some(3), "Exploratory");
+        let bucket = state.by_cluster.get(&key).unwrap();
+        assert_eq!(
+            bucket.dwell_samples.len(),
+            CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP
+        );
+        // Oldest `overflow` samples evicted → smallest surviving dwell is
+        // `overflow + 1`.
+        assert_eq!(*bucket.dwell_samples.first().unwrap(), (overflow + 1) as u64);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_per_concept_lru_caps_with_dual_update() {
+        // Insert > CONCEPT_SUMMARY_PER_ID_CAP unique concept_ids; verify
+        // both `by_concept` HashMap and `by_concept_order` Vec stay in
+        // sync with the cap (no orphan keys / no oversized vec).
+        let conn = setup_db();
+        let overflow = 5;
+        let total = CONCEPT_SUMMARY_PER_ID_CAP + overflow;
+        for i in 0..total {
+            emit_concept_summary_event(
+                &conn,
+                mk_concept_summary_payload(
+                    &format!("con-lru-{i}"),
+                    ConceptSummaryInteractionKind::Viewed { dwell_ms: 1000 },
+                    Some(4),
+                    Some("Semantic"),
+                ),
+            );
+        }
+        let (state, _) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+        assert_eq!(state.by_concept.len(), CONCEPT_SUMMARY_PER_ID_CAP);
+        assert_eq!(state.by_concept_order.len(), CONCEPT_SUMMARY_PER_ID_CAP);
+        for i in 0..overflow {
+            let evicted = format!("con-lru-{i}");
+            assert!(
+                !state.by_concept.contains_key(&evicted),
+                "evicted key {evicted} must be gone from HashMap"
+            );
+            assert!(
+                !state.by_concept_order.contains(&evicted),
+                "evicted key {evicted} must be gone from order vec"
+            );
+        }
+    }
+
+    #[test]
+    fn concept_summary_feedback_cas_merge_keeps_more_advanced_state() {
+        // CAS arbitration: the writer with higher `last_consumed_event_id`
+        // wins. Mirrors `synthesis_feedback_cas_merge_keeps_more_advanced_state`.
+        let conn = setup_db();
+
+        let mut winner_by_cluster = HashMap::new();
+        winner_by_cluster.insert(
+            concept_summary_bucket_key(Some(11), "Semantic"),
+            ClusterConceptSummaryStats {
+                viewed_count: 50,
+                viewed_dwell_total_ms: 50 * 4000,
+                dwell_samples: vec![4000; 50],
+                viewed_dwell_p50_ms: Some(4000),
+                clicked_source_count: 20,
+                immediate_requery_count: 1,
+                explicit_up: 12,
+                explicit_down: 2,
+                useful_rate: 0.7,
+            },
+        );
+        let winner_csf = ConceptSummaryFeedbackState {
+            by_cluster: winner_by_cluster.clone(),
+            by_concept: HashMap::new(),
+            by_concept_order: vec![],
+            last_consumed_event_id: 500,
+            total_events: 50,
+        };
+        let winner = AdaptiveState {
+            version: 5,
+            concept_summary_feedback_stats: Some(winner_csf.clone()),
+            ..AdaptiveState::default()
+        };
+        let winner_json = serde_json::to_string(&winner).unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![&winner_json],
+        )
+        .unwrap();
+
+        let stale_csf = ConceptSummaryFeedbackState {
+            by_cluster: HashMap::new(),
+            by_concept: HashMap::new(),
+            by_concept_order: vec![],
+            last_consumed_event_id: 100,
+            total_events: 5,
+        };
+        let stale = AdaptiveState {
+            version: 2,
+            concept_summary_feedback_stats: Some(stale_csf),
+            ..AdaptiveState::default()
+        };
+        stale.save_snapshot(&conn).unwrap();
+
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        let restored_csf = restored.concept_summary_feedback_stats.unwrap();
+        assert_eq!(
+            restored_csf.last_consumed_event_id, 500,
+            "CAS winner with higher last_consumed_event_id must survive"
+        );
+        assert_eq!(restored_csf.by_cluster, winner_by_cluster);
+    }
+
+    #[test]
+    fn concept_summary_feedback_cas_preserves_existing_when_writer_has_none() {
+        // Mirrors `synthesis_feedback_cas_preserves_existing_when_writer_has_none`.
+        // Writer with `concept_summary_feedback_stats = None` MUST NOT
+        // overwrite existing learned state.
+        let conn = setup_db();
+        let learned = ConceptSummaryFeedbackState {
+            by_cluster: HashMap::new(),
+            by_concept: HashMap::new(),
+            by_concept_order: vec![],
+            last_consumed_event_id: 1234,
+            total_events: 42,
+        };
+        let prior = AdaptiveState {
+            version: 5,
+            concept_summary_feedback_stats: Some(learned.clone()),
+            ..AdaptiveState::default()
+        };
+        let prior_json = serde_json::to_string(&prior).unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![&prior_json],
+        )
+        .unwrap();
+
+        let our = AdaptiveState {
+            version: 2,
+            concept_summary_feedback_stats: None,
+            ..AdaptiveState::default()
+        };
+        our.save_snapshot(&conn).unwrap();
+
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(
+            restored.concept_summary_feedback_stats,
+            Some(learned),
+            "CAS merge must preserve existing concept_summary stats when writer has None"
+        );
+    }
+
+    #[test]
+    fn concept_summary_bucket_helper_gates_on_cold_start_n() {
+        // Helper returns Some only when viewed_count >= COLD_START_N.
+        let key = concept_summary_bucket_key(Some(8), "Semantic");
+        let mut by_cluster = HashMap::new();
+        by_cluster.insert(
+            key.clone(),
+            ClusterConceptSummaryStats {
+                viewed_count: CONCEPT_SUMMARY_COLD_START_N - 1,
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let mut state = AdaptiveState {
+            concept_summary_feedback_stats: Some(ConceptSummaryFeedbackState {
+                by_cluster,
+                ..ConceptSummaryFeedbackState::default()
+            }),
+            ..AdaptiveState::default()
+        };
+        assert!(
+            state.concept_summary_bucket(Some(8), "Semantic").is_none(),
+            "cold-start: bucket below COLD_START_N must return None"
+        );
+
+        let s = state.concept_summary_feedback_stats.as_mut().unwrap();
+        s.by_cluster.get_mut(&key).unwrap().viewed_count = CONCEPT_SUMMARY_COLD_START_N;
+        assert!(state.concept_summary_bucket(Some(8), "Semantic").is_some());
+    }
+
+    #[test]
+    fn concept_summary_feedback_state_default_is_empty() {
+        let s = ConceptSummaryFeedbackState::default();
+        assert!(s.by_cluster.is_empty());
+        assert!(s.by_concept.is_empty());
+        assert!(s.by_concept_order.is_empty());
+        assert_eq!(s.last_consumed_event_id, 0);
+        assert_eq!(s.total_events, 0);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ConceptSummaryFeedbackState = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
     }
 }
