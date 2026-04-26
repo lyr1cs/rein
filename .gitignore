@@ -11,3 +11,9 @@ __pycache__/
 .superpowers/
 gui/dist/
 gui/node_modules/
+
+# Stray SQLite test artifacts (e.g. tests writing to relative path "auto")
+auto
+auto-shm
+auto-wal
+auto-journal

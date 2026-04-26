@@ -588,6 +588,18 @@ impl IntoCliText for LinkOutput {
 pub struct ConceptStateParams {
     /// Concept ID to fetch.
     pub concept_id: String,
+    /// v0.27 R2 P2: optional query context for the Cap A adaptive gate.
+    /// When BOTH `query_type` and `cluster_id` are supplied, the response
+    /// consults `decide_concept_summary_quality`; if the gate returns
+    /// `Skip`, `living_summary` is null and `living_summary_suppressed` is
+    /// true. When either is None, the gate is bypassed (caller receives
+    /// the full summary — back-compat with v0.24/v0.25/v0.26 callers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[clap(skip)]
+    pub query_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[clap(skip)]
+    pub cluster_id: Option<i64>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -603,7 +615,20 @@ pub struct ConceptStateOutput {
     pub living_summary_source_revision: Option<u32>,
     pub created_at: String,
     pub updated_at: String,
+    /// v0.27 R2 P2: true when the Cap A adaptive gate suppressed
+    /// `living_summary`. Default false (gate bypassed when context absent).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub living_summary_suppressed: bool,
+    /// v0.27 R5 P2: representative cluster_id for this concept (the mode of
+    /// its source memories' cluster_ids). Surfaced so GUI feedback events
+    /// can route into the correct `(cluster_id, query_type)` bucket of the
+    /// Cap A adaptive gate. None when the concept has no clustered source
+    /// memories (the gate's cold-start fallback applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<i64>,
 }
+
+fn is_false(b: &bool) -> bool { !*b }
 
 impl IntoJson for ConceptStateOutput {
     fn to_json(&self) -> serde_json::Value {
@@ -984,10 +1009,87 @@ impl OpsRuntime {
     )]
     pub fn concept_state(&self, params: ConceptStateParams) -> ReinResult<ConceptStateOutput> {
         let concept_id = params.concept_id.clone();
+        let query_type = params.query_type.clone();
+        let cluster_id = params.cluster_id;
+        let global_enabled = self.config.ars.concept_summary_enabled;
+        let cold_start_n = self.config.ars.concept_summary_cold_start_n;
         self.with_store(|store| {
             let concept = store
                 .get_concept_by_id(&concept_id)?
                 .ok_or_else(|| ReinError::NotFound(format!("concept '{concept_id}' not found")))?;
+
+            // v0.27 R5 P2 fix: compute the concept's representative
+            // cluster_id (mode of source memories' cluster_ids) so GUI
+            // surfaces can echo it through feedback events into the right
+            // adaptive bucket. When source memories have no clusters or
+            // the concept has none, returns None (gate cold-start path).
+            let representative_cluster_id: Option<i64> = if concept.source_memory_ids.is_empty() {
+                None
+            } else {
+                let placeholders = (0..concept.source_memory_ids.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT cluster_id FROM memories \
+                     WHERE id IN ({placeholders}) AND cluster_id IS NOT NULL"
+                );
+                let mut counts: std::collections::HashMap<i64, usize> =
+                    std::collections::HashMap::new();
+                if let Ok(mut stmt) = store.conn().prepare(&sql) {
+                    let rows = stmt.query_map(
+                        rusqlite::params_from_iter(concept.source_memory_ids.iter()),
+                        |row| row.get::<_, Option<i64>>(0),
+                    );
+                    if let Ok(rows) = rows {
+                        for cid in rows.flatten().flatten() {
+                            *counts.entry(cid).or_insert(0) += 1;
+                        }
+                    }
+                }
+                counts.into_iter().max_by_key(|(_, n)| *n).map(|(cid, _)| cid)
+            };
+
+            // v0.27 R2 P2 fix: consult the Cap A adaptive gate when caller
+            // supplies query context. v0.27 R6 P2 fix: also use the
+            // computed `representative_cluster_id` as a fallback when the
+            // caller supplies query_type but not cluster_id (GUI callers
+            // can't know the representative cluster_id until this endpoint
+            // returns it — without the fallback the gate would never fire
+            // on first-fetch). Caller-supplied cluster_id still wins over
+            // the computed fallback.
+            //
+            // v0.27 R10 P2 fix: call the gate whenever `query_type` is
+            // present, even when `effective_cluster_id` is None. The
+            // gate's `OperatorDisabled` branch (global flag = false) MUST
+            // bind regardless of cluster context, otherwise unclustered
+            // concepts could render summaries that the operator turned
+            // off globally. None cluster_id falls into the gate's
+            // cold-start `Yes` branch when global is true.
+            let effective_cluster_id = cluster_id.or(representative_cluster_id);
+            let (living_summary, suppressed) = match &query_type {
+                Some(qtype) => {
+                    let adaptive_state =
+                        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+                            .unwrap_or_default();
+                    match crate::ops::concept_summary::decide_concept_summary_quality(
+                        global_enabled,
+                        effective_cluster_id,
+                        qtype,
+                        Some(&adaptive_state),
+                        cold_start_n,
+                    ) {
+                        crate::ops::concept_summary::ConceptSummaryDecision::Yes => {
+                            (concept.living_summary.clone(), false)
+                        }
+                        crate::ops::concept_summary::ConceptSummaryDecision::Skip(_) => {
+                            (None, concept.living_summary.is_some())
+                        }
+                    }
+                }
+                None => (concept.living_summary.clone(), false),
+            };
+
             Ok(ConceptStateOutput {
                 id: concept.id,
                 memoir_id: concept.memoir_id,
@@ -995,13 +1097,15 @@ impl OpsRuntime {
                 definition: concept.definition,
                 revision: concept.revision,
                 last_episode_id: concept.last_episode_id,
-                living_summary: concept.living_summary,
+                living_summary,
                 living_summary_updated_at: concept
                     .living_summary_updated_at
                     .map(|dt| dt.to_rfc3339()),
                 living_summary_source_revision: concept.living_summary_source_revision,
                 created_at: concept.created_at.to_rfc3339(),
                 updated_at: concept.updated_at.to_rfc3339(),
+                living_summary_suppressed: suppressed,
+                cluster_id: representative_cluster_id,
             })
         })
     }
@@ -1319,6 +1423,7 @@ mod tests {
         let out = runtime
             .concept_state(ConceptStateParams {
                 concept_id: concept_id.clone(),
+                ..Default::default()
             })
             .expect("concept_state");
         assert_eq!(out.id, concept_id);
@@ -1342,6 +1447,7 @@ mod tests {
         let out = runtime
             .concept_state(ConceptStateParams {
                 concept_id: concept_id.clone(),
+                ..Default::default()
             })
             .expect("concept_state");
         assert_eq!(out.id, concept_id);
@@ -1356,6 +1462,7 @@ mod tests {
         let err = runtime
             .concept_state(ConceptStateParams {
                 concept_id: "nonexistent".to_string(),
+                ..Default::default()
             })
             .expect_err("missing concept must error");
         // Assert the error surface carries the not-found signal (string match

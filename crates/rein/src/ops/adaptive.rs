@@ -109,6 +109,24 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         Err(e) => tracing::warn!("failed to recompute synthesis_feedback_stats: {e}"),
     }
 
+    // Step 1f: v0.27 Cap A mirror — concept-summary interaction feedback.
+    // Mirrors Step 1e for the Cap A surface; same peek+commit + CAS-merge
+    // pattern. `decide_concept_summary_quality` consults this state per
+    // (cluster_id, query_type) bucket; cold-start falls back to the global
+    // `[ars].concept_summary_enabled` flag.
+    match crate::store::adaptive::recompute_concept_summary_feedback_stats(
+        store.conn(),
+        state.concept_summary_feedback_stats.clone(),
+    ) {
+        Ok((stats, max_id)) => {
+            state.concept_summary_feedback_stats = Some(stats);
+            if let Some(id) = max_id {
+                pending_offset_batches.push(vec![("concept_summary_feedback", id)]);
+            }
+        }
+        Err(e) => tracing::warn!("failed to recompute concept_summary_feedback_stats: {e}"),
+    }
+
     // Step 2: M3 — Build per-cluster survival curves from access data
     if !state.memory_clusters.is_empty() {
         build_survival_curves(store, &state);
