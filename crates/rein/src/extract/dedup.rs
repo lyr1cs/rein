@@ -566,7 +566,7 @@ fn embedding_candidate_lookup(
     let emb = crate::embed::EmbedCache::get(store.conn(), &enriched, model)
         .ok()
         .flatten()?;
-    let results = crate::store::vec::search_vec(store.conn(), &emb, 5).ok()?;
+    let results = crate::store::vec::search_vec(store.conn(), &emb, None, 5).ok()?;
     // A1: use adaptive global threshold minus margin as pre-filter floor.
     // This ensures candidates below the fixed 0.70 are not silently dropped
     // when the per-cluster dedup threshold is lower.

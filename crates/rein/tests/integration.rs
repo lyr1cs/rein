@@ -472,7 +472,7 @@ fn test_vector_only_recall() {
 
     // Vector search directly should still find the memory
     let query_vec = vec![0.1_f32; 3072];
-    let vec_results = rein::store::vec::search_vec(store.conn(), &query_vec, 10).unwrap();
+    let vec_results = rein::store::vec::search_vec(store.conn(), &query_vec, None, 10).unwrap();
     assert!(
         !vec_results.is_empty(),
         "Vector search should return the stored memory"

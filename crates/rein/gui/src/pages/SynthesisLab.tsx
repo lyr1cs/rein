@@ -214,6 +214,13 @@ export default function SynthesisLab() {
   const synthesisId = data?.synthesis?.synthesis_id;
   const sourceCount = data?.synthesis?.source_count;
   const synthesisChars = data?.synthesis?.synthesis?.length;
+  // v0.26.2 R7 F2: also extract query_type + cluster_id so the
+  // ImmediateRequery POST below carries the same bucket key the per-query
+  // adaptive gate looks up. Without these the negative requery signal
+  // lands in `(-1, "unknown")` and `useful_rate` for the real bucket
+  // never sees the subtraction.
+  const queryType = data?.synthesis?.query_type;
+  const clusterId = data?.synthesis?.cluster_id;
 
   // ── ImmediateRequery detection ──────────────────────────────────
   // When the user submits a fresh query while a previous synthesis is
@@ -233,6 +240,12 @@ export default function SynthesisLab() {
   const lastSynthesisAtRef = useRef<number | null>(null);
   const lastRecallIdRef = useRef<string | undefined>(undefined);
   const lastDebouncedQueryRef = useRef<string>('');
+  // R7 F2: track the bucket key (query_type + cluster_id) of the synthesis
+  // currently in scope so the requery POST below attributes the negative
+  // signal to the right bucket — not whatever fresh synthesis is about to
+  // arrive.
+  const lastQueryTypeRef = useRef<string | undefined>(undefined);
+  const lastClusterIdRef = useRef<number | null | undefined>(undefined);
 
   // External-state sync: when a fresh synthesis lands, latch the new id +
   // arrival timestamp. We stamp arrival time once per synthesis_id so the
@@ -245,8 +258,10 @@ export default function SynthesisLab() {
       lastSynthesisIdRef.current = synthesisId;
       lastSynthesisAtRef.current = Date.now();
       lastRecallIdRef.current = requestId;
+      lastQueryTypeRef.current = queryType;
+      lastClusterIdRef.current = clusterId;
     }
-  }, [synthesisId, requestId]);
+  }, [synthesisId, requestId, queryType, clusterId]);
 
   // External-state sync: detect query commit and emit ImmediateRequery
   // BEFORE the new synthesis arrives. We compare against the previous
@@ -261,18 +276,30 @@ export default function SynthesisLab() {
     ) {
       const gap_ms = Date.now() - lastSynthesisAtRef.current;
       // Fire-and-forget — postSynthesisInteraction guards both ids.
+      // R7 F2: include query_type + cluster_id from the LATCHED refs so
+      // the bucket attribution matches the synthesis the user is leaving.
+      const lastQt = lastQueryTypeRef.current;
+      const lastCid = lastClusterIdRef.current;
       void postSynthesisInteraction(
         lastSynthesisIdRef.current,
         lastRecallIdRef.current,
         { kind: 'immediate_requery', gap_ms },
         typeof sourceCount === 'number' ||
-        typeof synthesisChars === 'number'
+        typeof synthesisChars === 'number' ||
+        typeof lastQt === 'string' ||
+        typeof lastCid === 'number'
           ? {
               ...(typeof sourceCount === 'number'
                 ? { source_count: sourceCount }
                 : {}),
               ...(typeof synthesisChars === 'number'
                 ? { synthesis_chars: synthesisChars }
+                : {}),
+              ...(typeof lastQt === 'string'
+                ? { query_type: lastQt }
+                : {}),
+              ...(typeof lastCid === 'number'
+                ? { cluster_id: lastCid }
                 : {}),
             }
           : undefined,

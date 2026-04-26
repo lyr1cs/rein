@@ -984,6 +984,17 @@ fn recall_result_to_json(r: &crate::search::recall::RecallResult) -> serde_json:
         obj.insert("sources_hit".to_string(), json!(r.sources_hit));
         obj.insert("evidence_count".to_string(), json!(r.evidence_count));
         obj.insert("evidence_preview".to_string(), json!(r.evidence_preview));
+        // v0.26.2 (Bug #O3) + R4 F2: hand-serialize `archival_summary`
+        // honoring the omit-when-None contract. `RecallResult` declares
+        // `#[serde(skip_serializing_if = "Option::is_none")]` and the TS
+        // type is `archival_summary?: string` — emitting literal `null`
+        // for every Hot/Warm response (or when Cap C is disabled) would
+        // change the wire shape for every recall and trip clients that
+        // branch on property presence vs `undefined`. Only insert the
+        // key when there's a real summary to surface.
+        if let Some(s) = &r.archival_summary {
+            obj.insert("archival_summary".to_string(), json!(s));
+        }
     }
     memory
 }
@@ -2630,6 +2641,59 @@ mod tests {
             json["request_id"].as_str().is_some(),
             "stream response must include request_id: {}",
             json
+        );
+    }
+
+    /// v0.26.2 fix (Bug #O3): `recall_result_to_json` previously dropped
+    /// `archival_summary` because the function hand-serializes sibling
+    /// fields, bypassing the struct's `#[serde(skip_serializing_if)]` for
+    /// the field. The REST recall path is the surface the Neural Wiki GUI
+    /// consumes; without this insert, cold-tier memories never surfaced
+    /// their condensed archival summary even when Cap C populated the
+    /// field upstream.
+    #[test]
+    fn recall_result_to_json_surfaces_archival_summary() {
+        let mut memory = test_memory("m1", "topic", "content");
+        memory.tier = MemoryTier::Cold;
+        memory.archival_summary = Some("condensed summary".to_string());
+        let result = crate::search::recall::RecallResult {
+            memory,
+            score: 0.42,
+            confidence: 0.7,
+            sources_hit: 1,
+            evidence_count: 0,
+            evidence_preview: vec![],
+            archival_summary: Some("condensed summary".to_string()),
+        };
+        let json = recall_result_to_json(&result);
+        assert_eq!(
+            json.get("archival_summary").and_then(|v| v.as_str()),
+            Some("condensed summary"),
+            "archival_summary MUST appear on the wire so GUI Cap C surfaces work; got {json}"
+        );
+    }
+
+    /// v0.26.2 R4 F2: `recall_result_to_json` OMITS the key when None,
+    /// matching the `RecallResult` struct's
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` and the TS
+    /// type `archival_summary?: string`. Earlier R1 fix emitted JSON
+    /// null which would break clients that branch on property presence.
+    #[test]
+    fn recall_result_to_json_omits_archival_summary_when_none() {
+        let result = crate::search::recall::RecallResult {
+            memory: test_memory("m1", "topic", "content"),
+            score: 0.42,
+            confidence: 0.7,
+            sources_hit: 1,
+            evidence_count: 0,
+            evidence_preview: vec![],
+            archival_summary: None,
+        };
+        let json = recall_result_to_json(&result);
+        assert!(
+            json.get("archival_summary").is_none(),
+            "archival_summary key MUST be omitted when None to match the \
+             optional TS type contract; got {json}"
         );
     }
 }

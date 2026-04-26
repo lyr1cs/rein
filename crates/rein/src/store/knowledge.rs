@@ -236,7 +236,27 @@ impl SqliteStore {
         let similar = self.search_fts(new_content, None, 5)?;
         let mut evolved = 0usize;
 
-        // Wrap in savepoint — multiple UPDATEs should be atomic
+        // Wrap in savepoint — multiple UPDATEs should be atomic.
+        // Side-index cleanup for the deprecation path follows the `delete()`
+        // contract (sqlite.rs): in-DB cleanup (sqlite-vec row) lives INSIDE the
+        // savepoint so a failure aborts the transaction and never leaves a
+        // ghost embedding. Tantivy + HNSW external indexes are removed AFTER
+        // the savepoint releases, mirroring `delete()`'s post-commit pattern.
+        let mut deprecated_ids: Vec<String> = Vec::new();
+        // v0.26.2 R3 Codex F2: collected refined records so post-RELEASE
+        // can refresh Tantivy/HNSW with the new content. The DB write +
+        // sqlite-vec delete happen inside the savepoint so a rollback
+        // also reverts them; only the external (non-transactional) index
+        // touches are deferred until we know the savepoint committed.
+        struct RefinedRecord {
+            id: String,
+            topic: String,
+            summary: String,
+            content: String,
+            keywords_json: String,
+        }
+        let mut refined_records: Vec<RefinedRecord> = Vec::new();
+
         self.conn
             .execute_batch("SAVEPOINT evolution")
             .map_err(crate::types::ReinError::Database)?;
@@ -268,22 +288,81 @@ impl SqliteStore {
 
                 if sim > 0.8 {
                     self.mark_superseded(&old.id, new_id)?;
+                    // Bump updated_at alongside status flip so consumers that
+                    // gate on freshness (recall, M5 tier recompute) see the
+                    // transition.
                     self.conn.execute(
-                        "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
-                        rusqlite::params![old.id],
+                        "UPDATE memories SET status = 'deprecated', updated_at = ?2 WHERE id = ?1",
+                        rusqlite::params![old.id, Utc::now().to_rfc3339()],
                     )?;
+                    // sqlite-vec row deletion stays inside the savepoint —
+                    // matches the `delete()` invariant: a vec0 ghost left
+                    // behind would keep surfacing the deprecated row from
+                    // the vector channel forever.
+                    crate::store::vec::delete_embedding(&self.conn, &old.id)?;
+                    deprecated_ids.push(old.id.clone());
                     evolved += 1;
                     tracing::debug!("superseded memory '{}' with '{}'", old.id, new_id);
                 } else if sim > 0.5 {
-                    let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
+                    // v0.26.2 R3 Codex F2: do DB-only update inside the
+                    // savepoint and queue Tantivy/HNSW refresh until AFTER
+                    // RELEASE. Calling `self.update()` here would touch the
+                    // external (non-transactional) indexes synchronously;
+                    // a later op in this savepoint that triggers ROLLBACK
+                    // would leave Tantivy/HNSW serving the refined text
+                    // for DB content that was reverted. Mirrors the
+                    // deprecation path's split.
+                    let refined_content =
+                        format!("{}\n\n[refined] {}", old.content, new_content);
                     let refined_summary: String = refined_content
                         .chars()
                         .take(crate::types::SUMMARY_MAX_CHARS)
                         .collect();
+                    let refined_updated_at = Utc::now().to_rfc3339();
+                    // DB write inside savepoint. Status flips Active →
+                    // Updated to mirror `update()`'s auto-promotion. Also
+                    // null the archival_summary cols (matches `update()`'s
+                    // R2 F2 fix) so cold-tier rows can't expose stale
+                    // summaries pointing at content that's just been
+                    // rewritten.
+                    // R5 F2: also flip `needs_vec_dedup = 1` so the
+                    // slow-channel `run_vec_dedup` worker re-embeds the
+                    // refined content. Without this flag the worker skips
+                    // the row (it scans `needs_vec_dedup = 1` only) and
+                    // the row stays invisible to the vector channel until
+                    // some other event re-flags it. Mirrors the
+                    // resummarize path (`ops/resummerize.rs::apply_resummerize`).
                     self.conn.execute(
-                        "UPDATE memories SET content = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
-                        rusqlite::params![refined_content, refined_summary, Utc::now().to_rfc3339(), old.id],
+                        "UPDATE memories SET content = ?1, summary = ?2, \
+                                              updated_at = ?3, status = 'updated', \
+                                              needs_vec_dedup = 1, \
+                                              archival_summary = NULL, \
+                                              archival_summary_at = NULL, \
+                                              archival_summary_version = NULL, \
+                                              needs_archival_summary = 1, \
+                                              in_progress_archival_summary_at = NULL, \
+                                              archival_claim_token = NULL \
+                         WHERE id = ?4",
+                        rusqlite::params![
+                            refined_content,
+                            refined_summary,
+                            refined_updated_at,
+                            old.id
+                        ],
                     )?;
+                    // sqlite-vec is a vec0 virtual table tied to the
+                    // SQLite txn — delete inside savepoint so a rollback
+                    // also reverts the embedding removal. Ghost embedding
+                    // would surface old content from the vector channel.
+                    crate::store::vec::delete_embedding(&self.conn, &old.id)?;
+                    refined_records.push(RefinedRecord {
+                        id: old.id.clone(),
+                        topic: old.topic.clone(),
+                        summary: refined_summary,
+                        content: refined_content,
+                        keywords_json: serde_json::to_string(&old.keywords)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    });
                     evolved += 1;
                     tracing::debug!("refined memory '{}' with new content", old.id);
                 }
@@ -296,6 +375,28 @@ impl SqliteStore {
                 self.conn
                     .execute_batch("RELEASE evolution")
                     .map_err(crate::types::ReinError::Database)?;
+                // External side indexes (Tantivy + HNSW) are fire-and-forget
+                // AFTER the savepoint releases, so their failure can't roll
+                // back the successful DB writes. Mirrors `delete()`.
+                for id in &deprecated_ids {
+                    self.remove_from_tantivy(id);
+                    self.remove_from_hnsw(id);
+                }
+                // R3 Codex F2: refresh refined rows' external indexes only
+                // after we know the savepoint committed. HNSW is dropped
+                // (no embedding to insert; the next dedup pass will re-embed
+                // via the `vec::delete_embedding` we did inside the
+                // savepoint, which sets the row up for re-embed).
+                for rec in &refined_records {
+                    self.update_tantivy(
+                        &rec.id,
+                        &rec.topic,
+                        &rec.summary,
+                        &rec.content,
+                        &rec.keywords_json,
+                    );
+                    self.remove_from_hnsw(&rec.id);
+                }
             }
             Err(_) => {
                 let _ = self.conn.execute_batch("ROLLBACK TO evolution");
@@ -964,5 +1065,152 @@ mod tests {
         let old = store.get(&old_id).unwrap();
         assert_eq!(old.superseded_by.as_deref(), Some(new_id.as_str()));
         assert_eq!(store.canonical_id_for(&old_id).unwrap(), new_id);
+    }
+
+    /// v0.26.2 Bug #3 (HIGH): the deprecation path of `apply_evolution`
+    /// must remove the deprecated row's sqlite-vec embedding so the vector
+    /// channel doesn't keep returning a ghost. Pre-fix the raw `UPDATE
+    /// status='deprecated'` left every side index untouched.
+    #[test]
+    fn apply_evolution_deprecation_removes_vec_row() {
+        let store = SqliteStore::in_memory().unwrap();
+        let old_id = store
+            .store(test_memory(
+                "old-id",
+                "topic-a",
+                "legacy summary",
+                "shared evolution content",
+            ))
+            .unwrap();
+        let new_id = store
+            .store(test_memory(
+                "new-id",
+                "topic-a",
+                "new summary",
+                "shared evolution content",
+            ))
+            .unwrap();
+
+        // Seed a vec_memories row for the soon-to-be-deprecated memory.
+        // sqlite-vec virtual table does not auto-cascade on `memories` deletes,
+        // so this is the exact ghost surface the bug exposes.
+        let mut embedding = vec![0.0f32; 3072];
+        embedding[0] = 1.0;
+        crate::store::vec::insert_embedding(store.conn(), &old_id, &embedding).unwrap();
+
+        let before: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_memories WHERE id = ?1",
+                rusqlite::params![old_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1, "seeded vec row must exist before evolution");
+
+        // sim == 1.0 → deprecation branch.
+        store
+            .apply_evolution(&new_id, "shared evolution content", None)
+            .unwrap();
+
+        // Deprecated row's vec embedding must be gone.
+        let after: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_memories WHERE id = ?1",
+                rusqlite::params![old_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "apply_evolution deprecation must delete the sqlite-vec row \
+             (was leaking ghost embeddings into the vector channel)"
+        );
+
+        // Sanity: the memory row itself still exists (status flipped, not deleted).
+        let old = store.get(&old_id).unwrap();
+        assert_eq!(old.status, MemoryStatus::Deprecated);
+        assert_eq!(old.superseded_by.as_deref(), Some(new_id.as_str()));
+    }
+
+    /// v0.26.2 Bug #3 (HIGH): the refine path (`0.5 < sim <= 0.8`) must route
+    /// through `update()` so vec / Tantivy / HNSW side indexes refresh.
+    /// Pre-fix the raw `UPDATE content/summary` left external indexes
+    /// serving the pre-refine text indefinitely. Easiest observable signal:
+    /// `update()` flips `status: Active -> Updated` automatically; the raw
+    /// SQL path did not.
+    ///
+    /// Hitting the refine band is structurally fiddly: `similarity()` =
+    /// max(jaccard, containment), and FTS5 default operator is implicit AND,
+    /// so the candidate row must contain every token of `new_content` for
+    /// FTS to surface it. We satisfy both with a 3-token query that lives
+    /// in the old summary (FTS finds the row) but only partially overlaps
+    /// the old content body (sim = containment = 2/3 ≈ 0.67, in the refine
+    /// band).
+    #[test]
+    fn apply_evolution_refine_writes_db_and_promotes_status() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Old summary contains every new_content token so FTS5's implicit-AND
+        // returns this row. Old content body shares only 2 of 3 new tokens
+        // (`shared`, `content`) → containment(new, old.content) =
+        // 2 / min(3, 5) = 0.67, jaccard ≈ 0.33 → sim = 0.67 → refine band.
+        let old_id = store
+            .store(test_memory(
+                "old-id",
+                "topic-a",
+                "very long summary mentioning shared evolution content here for fts",
+                "shared content alpha beta gamma",
+            ))
+            .unwrap();
+
+        // Confirm starting status is Active.
+        let pre = store.get(&old_id).unwrap();
+        assert_eq!(pre.status, MemoryStatus::Active);
+
+        let new_id = "new-evolution-id";
+        let new_content = "shared evolution content";
+
+        // Seed the new memory so FTS has it indexed; apply_evolution skips
+        // `old.id == new_id` internally so the new row doesn't self-match.
+        store
+            .store(test_memory(
+                new_id,
+                "topic-a",
+                "new summary",
+                new_content,
+            ))
+            .unwrap();
+
+        let evolved = store.apply_evolution(new_id, new_content, None).unwrap();
+        assert!(
+            evolved >= 1,
+            "old memory must be hit by the refine branch (got {evolved} evolutions)"
+        );
+
+        let refined = store.get(&old_id).unwrap();
+        // Status promotion via inline SQL `status = 'updated'` (mirrors the
+        // auto-promotion `update()` does for semantic_changed). v0.26.2 R3
+        // F2: the refine path no longer routes through `update()` — it does
+        // a DB-only update inside the savepoint and queues Tantivy/HNSW
+        // refresh until after RELEASE so a rollback can't leave external
+        // indexes diverged from rolled-back DB content.
+        assert_eq!(
+            refined.status,
+            MemoryStatus::Updated,
+            "refine must promote Active -> Updated to mirror update()'s contract"
+        );
+        // And the refined content actually landed.
+        assert!(
+            refined.content.contains("[refined]"),
+            "refine marker must be present in updated content (got: {:?})",
+            refined.content
+        );
+        assert!(
+            refined.content.contains("shared content alpha beta gamma"),
+            "original content must be preserved (got: {:?})",
+            refined.content
+        );
     }
 }

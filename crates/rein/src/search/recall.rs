@@ -973,11 +973,22 @@ pub fn recall_temporal_with_request_id(
     // Capture per-channel scores for reranking and M2 logging.
     // Clamp negatives (rank sentinels like -1,-2) to positive via 1/(1+|rank|),
     // then max-normalize positive scores to [0,1] so CC fusion channels are comparable.
+    //
+    // Bug #O1 fix: use `is_sign_negative()` instead of `*s < 0.0`. In IEEE 754
+    // `-0.0 < 0.0` is FALSE (negative-zero compares equal to positive-zero),
+    // so when the FTS channel emits `-0.0` for the top rank the sentinel
+    // conversion was being skipped — the score stayed at -0.0, then `fts_max`
+    // (folded with a 0.0 seed) kept a positive max, and the first-place row
+    // was never bumped to its proper rank-derived `1.0 / (1.0 + 0) = 1.0`.
     let fts_norm_log: std::collections::HashMap<String, f32> = fts_for_fusion
         .iter()
         .map(|(id, s)| {
             // Convert negative rank sentinels (-1,-2,...) to positive rank scores: 1/(1+|rank|)
-            let score = if *s < 0.0 { 1.0 / (1.0 + s.abs()) } else { *s };
+            let score = if s.is_sign_negative() {
+                1.0 / (1.0 + s.abs())
+            } else {
+                *s
+            };
             (id.clone(), score)
         })
         .collect();
@@ -994,7 +1005,12 @@ pub fn recall_temporal_with_request_id(
     let vec_norm_log: std::collections::HashMap<String, f32> = vec_for_fusion
         .iter()
         .map(|(id, s)| {
-            let score = if *s < 0.0 { 1.0 / (1.0 + s.abs()) } else { *s };
+            // Bug #O1 fix: see fts_norm_log above — `*s < 0.0` misses `-0.0`.
+            let score = if s.is_sign_negative() {
+                1.0 / (1.0 + s.abs())
+            } else {
+                *s
+            };
             (id.clone(), score)
         })
         .collect();
@@ -1166,6 +1182,52 @@ pub fn recall_temporal_with_request_id(
             memory_map.entry(m.id.clone()).or_insert(m);
         }
     }
+
+    // Bug #2 (HIGH, v0.26.2): centralized "deprecated" filter on the fully-
+    // assembled `memory_map`. Belt-and-suspenders behind the SQL filters in
+    // `store::fts::search_fts` and `store::vec::search_vec` — required because
+    // not every channel goes through SQL:
+    //   - The Tantivy BM25 path in `try_tantivy_then_fts5` queries an
+    //     external index that doesn't auto-prune when `apply_evolution`
+    //     raw-SQL flips `status='deprecated'` (Agent C's Bug #3 in v0.26.2);
+    //     until the next side-index refresh, the dead row's text still
+    //     matches and `store.get(id)` happily returns the deprecated row.
+    //   - The KG/episode channels resolve memory IDs through
+    //     `bfs_expand_memories_by_id` / `episode.memory_ids` and `store.get`
+    //     — neither of which filters by status.
+    //
+    // v0.26.2 R2 Codex F3: drop ONLY `Deprecated` (terminal dead rows). DO
+    // NOT drop superseded rows (`superseded_by IS NOT NULL` with status
+    // `Active`) — `collapse_results_to_canonicals` later maps them to the
+    // live canonical successor under the canonical-first read model. Pre-R2
+    // we filtered both, which silently lost queries that matched only the
+    // old/evidence text whose canonical is still live.
+    let live_filter_before = memory_map.len();
+    memory_map.retain(|_id, m| {
+        matches!(
+            m.status,
+            crate::types::MemoryStatus::Active | crate::types::MemoryStatus::Updated
+        )
+    });
+    let live_filter_dropped = live_filter_before - memory_map.len();
+    if live_filter_dropped > 0 {
+        tracing::debug!(
+            dropped = live_filter_dropped,
+            kept = memory_map.len(),
+            "recall: live-status filter excluded deprecated rows from memory_map"
+        );
+    }
+
+    // v0.26.2 R2 Codex finding F1 (recall side): also prune `fused` so
+    // dead-row IDs don't consume the `take(limit * 2)` budget below. Without
+    // this, when stale Tantivy/KG/episode hits put the top-2N fused IDs all
+    // on deprecated rows, the take() picks them all and `memory_map.remove`
+    // silently no-ops, leaving live lower-ranked candidates behind →
+    // recall returns empty despite valid matches existing further down.
+    let fused: Vec<(String, f32)> = fused
+        .into_iter()
+        .filter(|(id, _)| memory_map.contains_key(id))
+        .collect();
 
     // Apply strength weighting (Ebbinghaus or KM survival curve) + temporal filter
     // Load cached per-cluster survival curves from M3 (if available)
@@ -1897,7 +1959,13 @@ fn vec_search_direct(
             tracing::debug!("hnsw rebuild already in progress, using sqlite-vec for this request");
         }
         // Fall through to sqlite-vec fallback immediately — do not block.
-        return match crate::store::vec::search_vec(store.conn(), embedding, limit) {
+        // Bug #O2: pass `topic` into the SQL so the topic filter happens on the
+        // ANN scan (the in-SQL over-fetch lives in `search_vec` itself). The
+        // outer `rank_and_filter` is still load-bearing for rank-encoding to
+        // negative positions used by RRF; its topic post-filter is a redundant
+        // belt-and-suspenders pass after the SQL filter and a no-op when SQL
+        // already filtered correctly.
+        return match crate::store::vec::search_vec(store.conn(), embedding, topic, limit) {
             Ok(results) => rank_and_filter(results, store, topic, limit),
             Err(_) => vec![],
         };
@@ -1913,8 +1981,10 @@ fn vec_search_direct(
         }
     }
 
-    // Fall back to sqlite-vec (brute-force O(n))
-    match crate::store::vec::search_vec(store.conn(), embedding, limit) {
+    // Fall back to sqlite-vec (brute-force O(n)).
+    // Bug #O2: same fix as the early-return fallback above — push `topic` into
+    // the SQL so we don't lose every top-k ANN hit when none happen to match.
+    match crate::store::vec::search_vec(store.conn(), embedding, topic, limit) {
         Ok(results) => rank_and_filter(results, store, topic, limit),
         Err(_) => vec![],
     }
@@ -2295,6 +2365,109 @@ mod tests {
             "field MUST appear in wire format when populated; got {json}"
         );
         assert!(json.contains("compact view"));
+    }
+
+    /// Bug #2 (HIGH, v0.26.2) + R2 Codex F3: the centralized retain in
+    /// `recall_temporal_with_request_id` must drop `Deprecated` rows
+    /// (terminal dead from `apply_evolution`) but MUST keep superseded rows
+    /// (`superseded_by IS NOT NULL`, status still `Active`) so
+    /// `collapse_results_to_canonicals` can map them to the live canonical
+    /// successor under the canonical-first read model. Dropping superseded
+    /// here would silently lose queries that match only old/evidence text.
+    #[test]
+    fn recall_memory_map_live_filter_drops_deprecated_keeps_superseded() {
+        // Mirror of the production retain — keep these in sync.
+        let predicate = |m: &Memory| -> bool {
+            matches!(m.status, MemoryStatus::Active | MemoryStatus::Updated)
+        };
+
+        let mut active = test_memory("active", 1, 1.0);
+        active.status = MemoryStatus::Active;
+        active.superseded_by = None;
+
+        let mut updated = test_memory("updated", 1, 1.0);
+        updated.status = MemoryStatus::Updated;
+        updated.superseded_by = None;
+
+        let mut deprecated = test_memory("deprecated", 1, 1.0);
+        deprecated.status = MemoryStatus::Deprecated;
+        deprecated.superseded_by = None;
+
+        // The mark_superseded shape: superseded_by set, status still Active.
+        // R2 F3: this row MUST pass the retain so collapse can map it.
+        let mut superseded = test_memory("superseded", 1, 1.0);
+        superseded.status = MemoryStatus::Active;
+        superseded.superseded_by = Some("active".to_string());
+
+        assert!(predicate(&active), "Active + superseded_by=None must pass");
+        assert!(predicate(&updated), "Updated + superseded_by=None must pass");
+        assert!(!predicate(&deprecated), "Deprecated must be dropped");
+        assert!(
+            predicate(&superseded),
+            "superseded row MUST pass — collapse_results_to_canonicals \
+             maps it to the live canonical successor (R2 Codex F3)"
+        );
+    }
+
+    /// Bug #O1 (v0.26.2): the rank-sentinel-to-positive-score normalization
+    /// loop in `recall_temporal_with_request_id` (`fts_norm_log` /
+    /// `vec_norm_log`) used `*s < 0.0` to detect the sentinel. In IEEE 754
+    /// `-0.0 < 0.0` is **false**, so a `-0.0` sentinel (which the FTS path
+    /// CAN emit when the top hit's rank position is 0) was passed through
+    /// unchanged. `f32::max` then kept the positive max, max-normalization
+    /// did nothing, and the first-place row stayed at -0.0 instead of being
+    /// promoted to its proper rank score `1.0 / (1.0 + 0) = 1.0`.
+    ///
+    /// This test re-implements the production closure inline so we can
+    /// assert the post-fix behavior without reaching into the giant
+    /// `recall_temporal_with_request_id` body. The closure must stay in
+    /// sync with the production code — see fts_norm_log/vec_norm_log.
+    #[test]
+    fn rank_sentinel_normalization_handles_negative_zero() {
+        let normalize = |s: f32| -> f32 {
+            // Mirrors the production fix: `is_sign_negative()` catches both
+            // `-1.0` AND `-0.0` (the latter is what the original `< 0.0`
+            // missed).
+            if s.is_sign_negative() {
+                1.0 / (1.0 + s.abs())
+            } else {
+                s
+            }
+        };
+
+        // The bug case: -0.0 sentinel from rank position 0.
+        let neg_zero: f32 = -0.0;
+        assert!(
+            neg_zero.is_sign_negative(),
+            "fixture sanity: -0.0 must report as sign-negative"
+        );
+        // Spelled-out via partial_cmp to avoid clippy::neg_cmp_op_on_partial_ord;
+        // the underlying invariant is the IEEE 754 trap: -0.0 < 0.0 is FALSE
+        // (negative-zero compares Equal to positive-zero), which is exactly
+        // what the original `*s < 0.0` check fell into.
+        assert_eq!(
+            neg_zero.partial_cmp(&0.0_f32),
+            Some(std::cmp::Ordering::Equal),
+            "fixture sanity: -0.0 partial-compares Equal to 0.0 (the IEEE 754 trap)"
+        );
+        assert_eq!(
+            normalize(neg_zero),
+            1.0,
+            "post-fix: -0.0 sentinel must normalize to 1/(1+0) = 1.0"
+        );
+
+        // Other ranks still work: -1.0 → 0.5, -2.0 → 0.333...
+        assert_eq!(normalize(-1.0), 0.5);
+        assert!((normalize(-2.0) - (1.0 / 3.0)).abs() < 1e-6);
+
+        // Positive scores pass through unchanged.
+        assert_eq!(normalize(0.7), 0.7);
+        assert_eq!(normalize(2.5), 2.5);
+
+        // Positive zero passes through (not a sentinel — this is a real
+        // zero score from a regular channel).
+        let pos_zero: f32 = 0.0;
+        assert_eq!(normalize(pos_zero), 0.0);
     }
 
     /// `archival_summary = None` is omitted from the wire format
