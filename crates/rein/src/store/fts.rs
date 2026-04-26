@@ -3,6 +3,19 @@ use rusqlite::Connection;
 
 use super::sqlite::{memory_select_base, row_to_memory, MEMORY_SELECT_COLUMNS};
 
+/// Canonical "live memory" SQL predicate used by every FTS path.
+///
+/// "Live" excludes `Deprecated` (terminal dead rows from `apply_evolution`).
+/// Superseded rows (`superseded_by IS NOT NULL` with `status='active'`) are
+/// NOT excluded — `collapse_results_to_canonicals` in `recall.rs` maps them
+/// to their live canonical successor under the canonical-first read model.
+/// Filtering them here would silently lose queries that match only the
+/// old/evidence text. v0.26.2 R2 Codex F3 (corrects R1 over-broad guidance).
+///
+/// Mirrors `store::vec::search_vec` and `ops/adaptive.rs` — single source
+/// of truth for the predicate.
+const LIVE_MEMORY_FILTER: &str = "m.status IN ('active', 'updated')";
+
 /// Sanitize user input for FTS5 queries by quoting each token.
 ///
 /// NOTE: FTS5 uses the unicode61 tokenizer which does NOT segment CJK text.
@@ -50,6 +63,8 @@ pub fn search_fts(
 
     // Try FTS5 first
     let results = if let Some(topic) = topic {
+        // Bug #2: filter out deprecated / superseded rows so recall never
+        // returns lifecycle-dead memories.
         let mut stmt = conn.prepare(&format!(
             "SELECT {MEMORY_SELECT_COLUMNS}, bm25(memories_fts) as rank
              FROM memories_fts f
@@ -57,6 +72,7 @@ pub fn search_fts(
              LEFT JOIN memory_canonical_state cs ON cs.memory_id = m.id
              WHERE memories_fts MATCH ?1
              AND m.topic = ?2
+             AND {LIVE_MEMORY_FILTER}
              ORDER BY rank
              LIMIT ?3"
         ))?;
@@ -73,12 +89,14 @@ pub fn search_fts(
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     } else {
+        // Bug #2: same live-status filter as the topic-bound branch above.
         let mut stmt = conn.prepare(&format!(
             "SELECT {MEMORY_SELECT_COLUMNS}, bm25(memories_fts) as rank
              FROM memories_fts f
              JOIN memories m ON m.id = f.id
              LEFT JOIN memory_canonical_state cs ON cs.memory_id = m.id
              WHERE memories_fts MATCH ?1
+             AND {LIVE_MEMORY_FILTER}
              ORDER BY rank
              LIMIT ?2"
         ))?;
@@ -112,9 +130,11 @@ pub fn search_fts(
         .replace('_', "\\_");
     let like_pattern = format!("%{escaped}%");
     let fallback: Vec<(crate::types::Memory, f32)> = if let Some(topic) = topic {
+        // Bug #2: live-status filter applies to LIKE fallback too.
         let sql = format!(
             "{} WHERE (m.topic LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\') \
-             AND m.topic = ?2 ORDER BY m.strength DESC LIMIT ?3",
+             AND m.topic = ?2 AND {LIVE_MEMORY_FILTER} \
+             ORDER BY m.strength DESC LIMIT ?3",
             memory_select_base()
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -135,8 +155,11 @@ pub fn search_fts(
             .map(|m| (m, 0.0f32))
             .collect()
     } else {
+        // Bug #2: live-status filter — wrap the OR with parentheses so the
+        // AND binds to both LIKE branches, not just the summary one.
         let sql = format!(
-            "{} WHERE m.topic LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\' \
+            "{} WHERE (m.topic LIKE ?1 ESCAPE '\\' OR m.summary LIKE ?1 ESCAPE '\\') \
+             AND {LIVE_MEMORY_FILTER} \
              ORDER BY m.strength DESC LIMIT ?2",
             memory_select_base()
         );
@@ -190,8 +213,10 @@ pub fn search_fts(
     }
 
     let content_fallback = if let Some(topic) = topic {
+        // Bug #2: live-status filter on content fallback too.
         let sql = format!(
             "{} WHERE m.content LIKE ?1 ESCAPE '\\' AND m.topic = ?2 \
+             AND {LIVE_MEMORY_FILTER} \
              ORDER BY m.strength DESC LIMIT ?3",
             memory_select_base()
         );
@@ -213,8 +238,10 @@ pub fn search_fts(
             .map(|m| (m, 0.0f32))
             .collect::<Vec<_>>()
     } else {
+        // Bug #2: live-status filter on the no-topic content fallback.
         let sql = format!(
             "{} WHERE m.content LIKE ?1 ESCAPE '\\' \
+             AND {LIVE_MEMORY_FILTER} \
              ORDER BY m.strength DESC LIMIT ?2",
             memory_select_base()
         );
@@ -235,4 +262,129 @@ pub fn search_fts(
     };
 
     Ok(content_fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+    use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
+    use chrono::Utc;
+
+    /// Build a memory with an explicit status / superseded_by combo so the
+    /// test can assert the live-status filter (Bug #2) excludes the right
+    /// rows. All other fields are intentionally identical so the only
+    /// signal driving the filter is `status` / `superseded_by`.
+    fn fixture(
+        topic: &str,
+        content: &str,
+        status: MemoryStatus,
+        superseded_by: Option<&str>,
+    ) -> Memory {
+        Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: content.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 0.8,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: superseded_by.map(|s| s.to_string()),
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status,
+            embedding: None,
+            tier: crate::store::tiering::MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    /// Bug #2 (HIGH) + R2 Codex F3: the FTS5 + LIKE + content-fallback paths
+    /// must filter out `Deprecated` rows (set by `apply_evolution`) but MUST
+    /// surface `superseded_by IS NOT NULL` rows (set by `mark_superseded`,
+    /// which leaves `status='active'`) — `collapse_results_to_canonicals`
+    /// later maps them to the live canonical successor.
+    #[test]
+    fn search_fts_excludes_deprecated_keeps_superseded_for_canonical_collapse() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Insert four rows with the same FTS-matching content. Use direct SQL
+        // for `Updated` and `Deprecated` so we can place exact statuses
+        // without going through the `update()` path.
+        let active_id = store
+            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .unwrap();
+        let updated_id = store
+            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .unwrap();
+        let deprecated_id = store
+            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .unwrap();
+        let superseded_id = store
+            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .unwrap();
+        // Force the dead statuses post-insert so the FTS row exists.
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status = 'updated' WHERE id = ?1",
+                rusqlite::params![updated_id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                rusqlite::params![deprecated_id],
+            )
+            .unwrap();
+        // Mirror `mark_superseded`: set superseded_by but leave status='active'
+        // so this row tests the dual-predicate guard.
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET superseded_by = ?2 WHERE id = ?1",
+                rusqlite::params![superseded_id, active_id],
+            )
+            .unwrap();
+
+        // FTS5 path (no topic).
+        let results = search_fts(store.conn(), "alpha", None, 10).unwrap();
+        let ids: Vec<&str> = results.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert!(ids.contains(&active_id.as_str()), "Active must surface");
+        assert!(ids.contains(&updated_id.as_str()), "Updated must surface");
+        assert!(
+            !ids.contains(&deprecated_id.as_str()),
+            "Deprecated must be hidden"
+        );
+        // R2 F3: superseded rows surface so collapse can map them.
+        assert!(
+            ids.contains(&superseded_id.as_str()),
+            "superseded row must surface for canonical-collapse mapping"
+        );
+
+        // FTS5 path with topic — same invariant.
+        let results = search_fts(store.conn(), "alpha", Some("life"), 10).unwrap();
+        let ids: Vec<&str> = results.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert!(ids.contains(&active_id.as_str()));
+        assert!(ids.contains(&updated_id.as_str()));
+        assert!(!ids.contains(&deprecated_id.as_str()));
+        assert!(ids.contains(&superseded_id.as_str()));
+    }
 }

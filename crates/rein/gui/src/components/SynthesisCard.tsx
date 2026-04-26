@@ -189,16 +189,34 @@ export default function SynthesisCard({
   const synthesisId = outcome?.synthesis_id;
   const sourceCount = outcome?.source_count;
   const synthesisChars = outcome?.synthesis?.length;
+  const queryType = outcome?.query_type;
+  const clusterId = outcome?.cluster_id;
 
   // Build the metadata payload once per synthesis so dwell + click + thumb
-  // events all carry a consistent diagnostic envelope. We only include
-  // fields the server has actually surfaced — query_type and cluster_id
-  // would require backend exposure beyond v0.26.0 (see deliverables note).
+  // events all carry a consistent diagnostic envelope.
+  //
+  // v0.26.2 hotfix (Bug #4): also echo `query_type` and `cluster_id` from
+  // the outcome so the M1 consumer's bucket key matches the per-query
+  // gate's lookup. Pre-fix the GUI omitted both fields (the backend
+  // hadn't surfaced them) and every feedback event landed in the
+  // consumer's `(-1, "unknown")` bucket while `decide_synthesize` read
+  // from the real per-cluster bucket — making the per-query adaptive
+  // gate dead code on GUI traffic.
+  //
+  // `query_type` is included whenever it's a string (server normalize
+  // handles the empty-string case, and the backend always populates it
+  // for v0.26.2+ outcomes); `cluster_id` is omitted when undefined,
+  // matching the existing `source_count`/`synthesis_chars` omit-if-undefined
+  // idiom (the M1 consumer treats missing as `None` → routes to the
+  // global bucket, which is the correct semantic for cluster-less recalls).
   // Memoized so the three feedback callbacks below get stable deps and
   // don't tear-down/recreate every render.
   const metadata = useMemo(
     () =>
-      typeof sourceCount === 'number' || typeof synthesisChars === 'number'
+      typeof sourceCount === 'number' ||
+      typeof synthesisChars === 'number' ||
+      typeof queryType === 'string' ||
+      typeof clusterId === 'number'
         ? {
             ...(typeof sourceCount === 'number'
               ? { source_count: sourceCount }
@@ -206,9 +224,15 @@ export default function SynthesisCard({
             ...(typeof synthesisChars === 'number'
               ? { synthesis_chars: synthesisChars }
               : {}),
+            ...(typeof queryType === 'string'
+              ? { query_type: queryType }
+              : {}),
+            ...(typeof clusterId === 'number'
+              ? { cluster_id: clusterId }
+              : {}),
           }
         : undefined,
-    [sourceCount, synthesisChars],
+    [sourceCount, synthesisChars, queryType, clusterId],
   );
 
   const handleDwellComplete = useCallback(

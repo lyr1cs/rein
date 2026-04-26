@@ -95,7 +95,7 @@ impl SqliteStore {
         }
 
         // Fallback: nearest-neighbor heuristic (used before first full HDBSCAN run).
-        crate::store::vec::search_vec(self.conn(), &embedding, 8)
+        crate::store::vec::search_vec(self.conn(), &embedding, None, 8)
             .ok()?
             .into_iter()
             .find_map(|(id, _)| self.get(&id).ok().and_then(|m| m.cluster_id))
@@ -248,9 +248,15 @@ impl SqliteStore {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for memory in memories {
-            if memory.superseded_by.is_some()
-                || !matches!(memory.status, MemoryStatus::Active | MemoryStatus::Updated)
-            {
+            // v0.26.2 R6 F1: skip ONLY terminal-deprecated rows here.
+            // Superseded rows (`superseded_by IS NOT NULL`, status still
+            // Active) MUST flow to `canonical_id_for` so the supersede
+            // chain resolves to the live canonical successor — otherwise
+            // FTS-only evidence-text hits whose canonical is still live
+            // get silently dropped. The final live check below guards the
+            // canonical row so a stale chain (canonical itself dead) is
+            // still excluded.
+            if matches!(memory.status, MemoryStatus::Deprecated) {
                 continue;
             }
             let canonical_id = self
@@ -998,6 +1004,53 @@ impl MemoryStore for SqliteStore {
             )));
         }
 
+        // v0.26.2 hotfix: when a cold-tier memory's semantic fields (topic /
+        // summary / content) change, the previously generated `archival_summary`
+        // is now stale and would keep being surfaced by
+        // `recall.rs::maybe_archival_summary_for_recall` (its version still
+        // matches `ARCHIVAL_SUMMARY_VERSION`). Null the summary fields and
+        // re-flag for the cold-archive worker so it regenerates against the
+        // current text. Also clear any in-flight claim lease so a stale worker
+        // can't finish into the now-invalidated row.
+        //
+        // Hot/Warm rows with stale archival_summary data are harmless (the
+        // recall gate filters by tier first), and a follow-up M5 tier
+        // recompute will overwrite needs_archival_summary if the row is no
+        // longer cold.
+        if semantic_changed {
+            // v0.26.2 R2 Codex F2: also clear `archival_summary_at` so the
+            // model invariant "timestamp is None iff summary is None" holds.
+            // Otherwise the GUI surface and recall metadata would expose a
+            // stale generated-at timestamp pointing at content that no longer
+            // exists, until the worker regenerates the summary.
+            self.conn.execute(
+                "UPDATE memories
+                 SET archival_summary = NULL,
+                     archival_summary_at = NULL,
+                     archival_summary_version = NULL,
+                     needs_archival_summary = 1,
+                     in_progress_archival_summary_at = NULL,
+                     archival_claim_token = NULL
+                 WHERE id = ?1",
+                rusqlite::params![memory.id],
+            )?;
+        }
+        // v0.26.2 R7 F1 + R10 F1: drop the `cold_archive` fallback row
+        // ONLY when the body actually changed. `semantic_changed` includes
+        // topic + summary edits; deleting on those would wipe the only
+        // pre-strip full body for cold rows where `memory.content` is
+        // already the M5-stripped summary, leaving Cap C's worker with
+        // nothing better to compress than the truncated summary itself.
+        // Restrict the invalidation to real `content` rewrites — that's
+        // the case where the archived body is genuinely stale.
+        let content_changed = previous.content != memory.content;
+        if content_changed {
+            self.conn.execute(
+                "DELETE FROM cold_archive WHERE memory_id = ?1",
+                rusqlite::params![memory.id],
+            )?;
+        }
+
         let refreshed_embedding = if let Some(embedding) = memory.embedding.clone() {
             vec::insert_embedding(&self.conn, &memory.id, &embedding)?;
             Some(embedding)
@@ -1087,7 +1140,7 @@ impl MemoryStore for SqliteStore {
     ) -> ReinResult<Vec<Memory>> {
         // Fetch more than needed to compensate for topic filtering
         let fetch_limit = if topic.is_some() { limit * 3 } else { limit };
-        let results = vec::search_vec(&self.conn, embedding, fetch_limit)?;
+        let results = vec::search_vec(&self.conn, embedding, None, fetch_limit)?;
         let mut memories = Vec::new();
         for (id, _distance) in results {
             match self.get_canonical(&id) {
@@ -1432,6 +1485,20 @@ impl SqliteStore {
              AND importance NOT IN ('critical', 'high')",
             rusqlite::params![threshold],
         )?;
+
+        // sqlite-vec row deletion lives INSIDE the transaction. `vec_memories`
+        // is a vec0 virtual table with NO FK cascade — the same invariant the
+        // single-row `delete()` path enforces (sqlite.rs ~line 1048). Without
+        // this, every pruned STM row leaves a ghost embedding that the vector
+        // channel keeps returning forever, growing unboundedly with each prune
+        // sweep. On any failure we abort the transaction so DB + side index
+        // never diverge.
+        for id in &ids {
+            if let Err(e) = vec::delete_embedding(&self.conn, id) {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
 
         // Remove pruned memory IDs from concept.source_memory_ids in a single pass.
         // We load all concepts once, filter to those with any pruned ID, and update them.
@@ -2257,7 +2324,7 @@ impl SqliteStore {
     }
 
     /// Fire-and-forget: update Tantivy index after a write.
-    fn update_tantivy(&self, id: &str, topic: &str, summary: &str, content: &str, keywords: &str) {
+    pub(crate) fn update_tantivy(&self, id: &str, topic: &str, summary: &str, content: &str, keywords: &str) {
         self.with_tantivy(|t| {
             if let Err(error) = t.insert(id, topic, summary, content, keywords) {
                 tracing::warn!("tantivy insert failed for {id}: {error}");
@@ -2711,6 +2778,153 @@ mod tests {
         assert!(matches!(result.unwrap_err(), ReinError::NotFound(_)));
     }
 
+    /// v0.26.2 Bug #8 (HIGH): when `update()` mutates a cold-tier memory's
+    /// semantic fields (topic / summary / content), the previously generated
+    /// `archival_summary` is stale and `recall.rs::maybe_archival_summary_for_recall`
+    /// would keep surfacing it (its version still equals
+    /// `ARCHIVAL_SUMMARY_VERSION`). Fix: invalidate all 5 archival-summary
+    /// columns and re-flag for the worker on `semantic_changed`.
+    #[test]
+    fn test_update_invalidates_archival_summary_on_semantic_change() {
+        use crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION;
+
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = test_memory("topic-x", "old summary", Importance::High);
+        let id = store.store(mem).unwrap();
+
+        // Seed archival_summary state as if the cold-archive worker had run.
+        store
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET archival_summary = 'OLD ARCHIVAL TEXT',
+                     archival_summary_at = 1700000000,
+                     archival_summary_version = ?2,
+                     needs_archival_summary = 0,
+                     in_progress_archival_summary_at = '2026-04-25T00:00:00Z',
+                     archival_claim_token = 'stale-claim-abc'
+                 WHERE id = ?1",
+                rusqlite::params![id, ARCHIVAL_SUMMARY_VERSION as i64],
+            )
+            .unwrap();
+
+        // Mutate content (semantic_changed = true).
+        let mut updated = store.get(&id).unwrap();
+        updated.content = "totally rewritten content body".to_string();
+        store.update(&updated).unwrap();
+
+        // All 6 archival-summary columns must be invalidated (R2 Codex F2
+        // adds `archival_summary_at` to the original 5).
+        let (summary, summary_at, version, needs, in_progress, claim_token): (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = store
+            .conn
+            .query_row(
+                "SELECT archival_summary, archival_summary_at, archival_summary_version, \
+                        needs_archival_summary, in_progress_archival_summary_at, \
+                        archival_claim_token \
+                 FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(
+            summary.is_none(),
+            "semantic_changed must NULL archival_summary"
+        );
+        assert!(
+            summary_at.is_none(),
+            "semantic_changed must NULL archival_summary_at (R2 F2: keep \
+             timestamp/summary in lockstep)"
+        );
+        assert!(
+            version.is_none(),
+            "semantic_changed must NULL archival_summary_version"
+        );
+        assert_eq!(
+            needs, 1,
+            "semantic_changed must re-flag needs_archival_summary so the worker regenerates"
+        );
+        assert!(
+            in_progress.is_none(),
+            "semantic_changed must clear in_progress_archival_summary_at to kill any stale lease"
+        );
+        assert!(
+            claim_token.is_none(),
+            "semantic_changed must clear archival_claim_token to kill any stale lease"
+        );
+    }
+
+    /// v0.26.2 Bug #8 (HIGH) negative case: when only non-semantic fields
+    /// (e.g. `tier`, `strength`, `last_accessed`) change, archival-summary
+    /// state must be left untouched.
+    #[test]
+    fn test_update_preserves_archival_summary_when_no_semantic_change() {
+        use crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION;
+
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = test_memory("topic-x", "preserved summary", Importance::High);
+        let id = store.store(mem).unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET archival_summary = 'KEEP ME',
+                     archival_summary_at = 1700000000,
+                     archival_summary_version = ?2,
+                     needs_archival_summary = 0,
+                     in_progress_archival_summary_at = NULL,
+                     archival_claim_token = NULL
+                 WHERE id = ?1",
+                rusqlite::params![id, ARCHIVAL_SUMMARY_VERSION as i64],
+            )
+            .unwrap();
+
+        // Mutate ONLY tier — semantic_changed must compute false.
+        let mut updated = store.get(&id).unwrap();
+        updated.tier = MemoryTier::Cold;
+        store.update(&updated).unwrap();
+
+        let (summary, version, needs): (Option<String>, Option<i64>, i64) = store
+            .conn
+            .query_row(
+                "SELECT archival_summary, archival_summary_version, needs_archival_summary \
+                 FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            summary.as_deref(),
+            Some("KEEP ME"),
+            "non-semantic update must preserve archival_summary"
+        );
+        assert_eq!(
+            version,
+            Some(ARCHIVAL_SUMMARY_VERSION as i64),
+            "non-semantic update must preserve archival_summary_version"
+        );
+        assert_eq!(
+            needs, 0,
+            "non-semantic update must NOT re-flag needs_archival_summary"
+        );
+    }
+
     #[test]
     fn test_preflight_classify_returns_none_without_grayzone() {
         // With no stored memories there's no candidate for dedup, so preflight
@@ -2942,6 +3156,73 @@ mod tests {
         // Low and Medium should be gone
         assert!(store.get(&id_low).is_err());
         assert!(store.get(&id_med).is_err());
+    }
+
+    /// v0.26.2 Bug #7 (HIGH): `prune_memories_only` deleted rows from
+    /// `memories` but left ghost rows in the `vec_memories` virtual table —
+    /// vec0 has no FK cascade. Single-row `delete()` already enforces this
+    /// invariant (sqlite.rs ~line 1048); the bulk prune path was missing it.
+    /// Without the fix, every prune sweep grew the embedding ghost set
+    /// unboundedly and the vector channel kept returning pruned rows.
+    #[test]
+    fn test_prune_removes_vec_memories_rows() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Two STM + low-importance memories, both with seeded vec_memories rows.
+        let id_a = store
+            .store(test_memory("test", "ghost-a candidate", Importance::Low))
+            .unwrap();
+        let id_b = store
+            .store(test_memory("test", "ghost-b candidate", Importance::Low))
+            .unwrap();
+
+        let mut emb_a = vec![0.0f32; 3072];
+        emb_a[0] = 1.0;
+        let mut emb_b = vec![0.0f32; 3072];
+        emb_b[1] = 1.0;
+        crate::store::vec::insert_embedding(store.conn(), &id_a, &emb_a).unwrap();
+        crate::store::vec::insert_embedding(store.conn(), &id_b, &emb_b).unwrap();
+
+        // Drive both rows below the prune threshold.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET strength = 0.05 WHERE id IN (?1, ?2)",
+                rusqlite::params![id_a, id_b],
+            )
+            .unwrap();
+
+        let pre_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_memories WHERE id IN (?1, ?2)",
+                rusqlite::params![id_a, id_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre_count, 2, "two seeded vec rows must exist pre-prune");
+
+        let pruned = store.prune_memories_only(0.1, false).unwrap();
+        assert_eq!(pruned, 2, "both low-strength STM rows must prune");
+
+        // memories rows gone
+        assert!(store.get(&id_a).is_err());
+        assert!(store.get(&id_b).is_err());
+
+        // vec_memories rows must be gone too — this is the regression check.
+        let post_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_memories WHERE id IN (?1, ?2)",
+                rusqlite::params![id_a, id_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post_count, 0,
+            "prune must delete sqlite-vec rows alongside memories rows; \
+             pre-fix every prune sweep accumulated ghost embeddings unboundedly"
+        );
     }
 
     fn test_memory_with_content(
