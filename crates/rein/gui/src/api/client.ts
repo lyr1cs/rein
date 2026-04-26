@@ -34,5 +34,18 @@ export const apiDelete = <T>(path: string) =>
  * `living_summary` (v0.24 ARS Capability A). Backed by
  * `GET /api/concepts/{concept_id}/state`.
  */
-export const getConceptState = (conceptId: string): Promise<ConceptState> =>
-  apiGet<ConceptState>(`/api/concepts/${encodeURIComponent(conceptId)}/state`);
+export const getConceptState = (
+  conceptId: string,
+  opts?: { queryType?: string; clusterId?: number },
+): Promise<ConceptState> => {
+  // v0.27 R6 P2 fix: thread optional bucket context so the Cap A adaptive
+  // gate can suppress low-usefulness summaries on first-fetch. Backend
+  // uses the computed `representative_cluster_id` as a fallback when
+  // `clusterId` is omitted.
+  const params = new URLSearchParams();
+  if (opts?.queryType) params.set('query_type', opts.queryType);
+  if (typeof opts?.clusterId === 'number') params.set('cluster_id', String(opts.clusterId));
+  const qs = params.toString();
+  const path = `/api/concepts/${encodeURIComponent(conceptId)}/state${qs ? `?${qs}` : ''}`;
+  return apiGet<ConceptState>(path);
+};

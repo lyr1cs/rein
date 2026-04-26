@@ -283,6 +283,53 @@ export interface SynthesisMetadata {
   synthesis_chars?: number;
 }
 
+/* ── Concept summary feedback (v0.27 ARS Cap A mirror of D-direction) ── */
+
+/**
+ * v0.27 — interaction kinds emitted by `ConceptSummaryCard` (Cap A mirror of
+ * v0.26 D-direction synthesis instrumentation). Variant set + serde shape
+ * (`#[serde(rename_all = "snake_case", tag = "kind")]`) match the backend's
+ * `ConceptSummaryInteractionKind`.
+ *
+ * `source_index` is **1-based** to match any inline `[#k]` rendering convention
+ * the GUI may add later; out-of-range indices are accepted by the consumer
+ * and silently dropped (parity with `SynthesisInteractionKind`).
+ */
+export type ConceptSummaryInteractionKind =
+  | { kind: 'viewed'; dwell_ms: number }
+  | { kind: 'clicked_source'; source_index: number }
+  | { kind: 'immediate_requery'; gap_ms: number }
+  | { kind: 'explicit_thumb'; up: boolean };
+
+/**
+ * Optional per-event diagnostics carried verbatim to the consumer. Field
+ * names mirror the backend `ConceptSummaryMetadata` struct; missing fields
+ * route to fallback buckets server-side.
+ */
+export interface ConceptSummaryMetadata {
+  query_type?: string;
+  cluster_id?: number;
+  concept_chars?: number;
+  revision_version?: number;
+}
+
+/**
+ * Wire body for `POST /api/feedback/concept-summary`. Unlike the v0.26
+ * `/api/feedback` route which uses a `kind`-discriminated union, the
+ * concept-summary endpoint accepts the bare event shape.
+ *
+ * `recall_id` is a per-view correlation id minted by the GUI when a
+ * concept is selected — for Brain.tsx this is a `crypto.randomUUID()`
+ * generated on selection rather than echoed from a recall response (Cap A
+ * is not a recall surface). The backend treats it opaquely.
+ */
+export interface ConceptSummaryInteractionEvent {
+  concept_id: string;
+  recall_id: string;
+  interaction: ConceptSummaryInteractionKind;
+  metadata?: ConceptSummaryMetadata;
+}
+
 /**
  * Discriminated union — `kind: 'access'` mirrors the legacy
  * `{memory_ids, request_id, query, helpful}` body so existing call sites
@@ -425,6 +472,13 @@ export interface ConceptState {
   living_summary_source_revision: number | null;
   created_at: string;
   updated_at: string;
+  /** v0.27 R2 P2: true when the Cap A adaptive gate suppressed `living_summary`. */
+  living_summary_suppressed?: boolean;
+  /** v0.27 R5 P2: representative cluster_id (mode of source memories' cluster_ids).
+   * Used by the GUI to route concept-summary feedback events into the right
+   * adaptive bucket. May be null when the concept's source memories aren't
+   * clustered. */
+  cluster_id?: number | null;
 }
 
 /* ── Page-local response shapes (relocated from individual pages) ───── */

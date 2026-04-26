@@ -63,6 +63,59 @@ pub struct ReinConfig {
     pub resummerize: ResummerizeConfig,
     #[serde(default)]
     pub ars: ArsConfig,
+    #[serde(default)]
+    pub dedup: DedupConfig,
+}
+
+/// v0.27 Track 2 config — feature flags + thresholds for the new
+/// triple-overlap, N-merge, and temporal-supersede dedup paths.
+///
+/// Mirrors the `[ars]` shape: each knob is a bootstrap value to be
+/// replaced by feedback-driven adaptation in v0.27.1+.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedupConfig {
+    /// v0.27 Track 2 #5: triple-overlap threshold for upgrading text
+    /// gray-zone matches to `MergeInto`. When triple-set Jaccard
+    /// (Agent C `triple_overlap_score`) ≥ this value AND text similarity
+    /// is in the gray zone, the candidate is merged. Default `0.7`.
+    /// bootstrap; v0.27.1+ → ablation
+    #[serde(default = "default_triple_overlap_threshold")]
+    pub triple_overlap_threshold: f64,
+    /// v0.27 Track 2 #6: cap on N-merge fan-out. When ≥2 candidates exceed
+    /// the merge threshold, the highest-similarity candidate becomes the
+    /// canonical winner; up to `n_merge_max_candidates - 1` losers are
+    /// folded into evidence rows in a single savepoint. Default `5`.
+    /// bootstrap; v0.27.1+ → ablation
+    #[serde(default = "default_n_merge_max_candidates")]
+    pub n_merge_max_candidates: usize,
+    /// v0.27 Track 2 #8: feature flag for temporal supersede chains.
+    /// When `false` (default), text-similarity merges proceed even when
+    /// temporal anchors disagree — preserving v0.26.2 behavior.
+    /// When `true`, temporal conflict downgrades `MergeInto` to a
+    /// `TemporalSupersede` decision (which currently degrades to
+    /// `Supersede` for memories pending v0.28+ schema work).
+    /// bootstrap; v0.27.1+ → ablation
+    #[serde(default)]
+    pub temporal_supersede_enabled: bool,
+}
+
+fn default_triple_overlap_threshold() -> f64 {
+    0.7 // bootstrap; v0.27.1+ → ablation
+}
+
+fn default_n_merge_max_candidates() -> usize {
+    5 // bootstrap; v0.27.1+ → ablation
+}
+
+impl Default for DedupConfig {
+    fn default() -> Self {
+        Self {
+            triple_overlap_threshold: default_triple_overlap_threshold(),
+            n_merge_max_candidates: default_n_merge_max_candidates(),
+            temporal_supersede_enabled: false,
+        }
+    }
 }
 
 /// Config for the LLM-driven intelligent-merge classifier (opt-in).
@@ -213,6 +266,16 @@ pub struct ArsConfig {
     /// sooner against the partial event stream a soak collects.
     #[serde(default = "default_synthesis_cold_start_n")]
     pub synthesis_cold_start_n: u64,
+    /// v0.27 ARS Cap A feedback loop: Min events per `(cluster_id,
+    /// query_type)` bucket before per-cluster `useful_rate` is trusted by
+    /// the per-query Cap-A gate. Below this, the gate falls back to the
+    /// global `concept_summary_enabled` flag. Default 10 (matches
+    /// `store::adaptive::CONCEPT_SUMMARY_COLD_START_N`); operators on a
+    /// fresh canary may lower this to 3-5 to let the per-cluster gate
+    /// fire sooner against a partial event stream. Mirrors the v0.26.1
+    /// `synthesis_cold_start_n` knob.
+    #[serde(default = "default_concept_summary_cold_start_n")]
+    pub concept_summary_cold_start_n: u64,
     // ── Cap C v0.26 ──────────────────────────────────────────────────────────
     /// Enable cold-tier archival summary (Cap C). Default `false` (opt-in,
     /// per spec §8 invariant 3 — flipping to true is a separate v0.26.x
@@ -248,6 +311,10 @@ fn default_synthesis_cold_start_n() -> u64 {
     10
 }
 
+fn default_concept_summary_cold_start_n() -> u64 {
+    10 // bootstrap; v0.27.1 → ablation (mirrors default_synthesis_cold_start_n)
+}
+
 // Cap C v0.26 defaults — see `ops/cold_archive_summary.rs::ARCHIVAL_SUMMARY_*`
 // for the constants these mirror. We duplicate the literal here rather than
 // import from the ops module so `config.rs` stays free of `ops` imports
@@ -269,6 +336,7 @@ impl Default for ArsConfig {
             recall_synthesis_enabled: false,
             recall_synthesis_min_results: default_recall_synthesis_min_results(),
             synthesis_cold_start_n: default_synthesis_cold_start_n(),
+            concept_summary_cold_start_n: default_concept_summary_cold_start_n(),
             // Cap C v0.26 — opt-in (spec §8 invariant 3)
             cold_archive_enabled: false,
             cold_archive_target_chars: default_cold_archive_target_chars(),

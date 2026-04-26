@@ -18,6 +18,9 @@
  */
 import { apiPost } from './client';
 import type {
+  ConceptSummaryInteractionEvent,
+  ConceptSummaryInteractionKind,
+  ConceptSummaryMetadata,
   FeedbackPayload,
   SynthesisInteractionKind,
   SynthesisMetadata,
@@ -60,6 +63,49 @@ export async function postSynthesisInteraction(
     return true;
   } catch (err) {
     console.warn('[feedback] synthesis_interaction POST failed:', err);
+    return false;
+  }
+}
+
+/**
+ * v0.27 — post one concept-summary interaction event (Cap A mirror of Cap B's
+ * D-direction loop). Targets the dedicated `/api/feedback/concept-summary`
+ * route the v0.27 backend exposes via inventory dispatch.
+ *
+ * Failure policy mirrors `postSynthesisInteraction`: silent, `console.warn`,
+ * never bubbles to the user. Both correlation ids must be non-empty strings —
+ * the gate refuses partial events so the consumer's stats stay honest.
+ */
+export async function postConceptSummaryFeedback(
+  conceptId: string | undefined,
+  recallId: string | undefined,
+  interaction: ConceptSummaryInteractionKind,
+  metadata?: ConceptSummaryMetadata,
+): Promise<boolean> {
+  if (
+    typeof conceptId !== 'string' ||
+    conceptId.length === 0 ||
+    typeof recallId !== 'string' ||
+    recallId.length === 0
+  ) {
+    return false;
+  }
+
+  const body: ConceptSummaryInteractionEvent = {
+    concept_id: conceptId,
+    recall_id: recallId,
+    interaction,
+    ...(metadata ? { metadata } : {}),
+  };
+
+  try {
+    await apiPost<{ ok: true } | { error: string }>(
+      '/api/feedback/concept_summary',
+      body,
+    );
+    return true;
+  } catch (err) {
+    console.warn('[feedback] concept_summary POST failed:', err);
     return false;
   }
 }

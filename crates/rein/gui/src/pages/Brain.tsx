@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { ForceGraphMethods, LinkObject, NodeObject } from 'react-force-graph-2d';
-import { useQueries, useQueryClient } from '@tanstack/react-query';
-import { apiGet } from '../api/client';
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { apiGet, getConceptState } from '../api/client';
 import { useMemoryDetail, useRecent, useMemoirs } from '../hooks/useApi';
 import {
   endpointId as endpointIdGeneric,
@@ -12,7 +12,9 @@ import {
 } from '../utils/forceGraph';
 import { getPollingIntervalMs } from '../utils/polling';
 import { TIER_COLORS } from '../utils/theme';
-import type { Memory, MemoirExport } from '../api/types';
+import ConceptSummaryCard from '../components/ConceptSummaryCard';
+import { postConceptSummaryFeedback } from '../api/feedback';
+import type { Concept, Memory, MemoirExport } from '../api/types';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -546,6 +548,157 @@ export default function Brain() {
     return selectedNode;
   }, [selectedNode]);
 
+  /* ---- Concept living-summary surface (v0.27 ARS Cap A mirror) ----
+   *
+   * Index every concept emitted by the memoir exports so the detail panel can
+   * resolve `source_memory_ids` + `revision` for the selected node without a
+   * second API roundtrip. The map is rebuilt only when the underlying
+   * `exportsData` slot identity changes (react-query structural sharing keeps
+   * unchanged exports referentially stable). */
+  const conceptIndex = useMemo(() => {
+    const m = new Map<string, Concept>();
+    for (const exp of exportsData) {
+      for (const c of exp.concepts) m.set(c.id, c);
+    }
+    return m;
+  }, [exportsData]);
+  const selectedConceptDetail = useMemo(
+    () => (selectedConcept ? conceptIndex.get(selectedConcept.id) ?? null : null),
+    [selectedConcept, conceptIndex],
+  );
+
+  /* Live concept state (carries the auto-refreshed `living_summary`). Disabled
+   * unless a concept is selected — react-query treats `id=null` as a no-op so
+   * memory-node selections don't issue a request. Failure collapses to
+   * `data=undefined` which the card-render branch interprets as "no summary
+   * available", keeping the rest of the panel functional on pre-v0.24 backends.
+   */
+  const conceptStateQuery = useQuery({
+    queryKey: ['concept-state', selectedConcept?.id ?? null],
+    queryFn: () =>
+      getConceptState(selectedConcept!.id, { queryType: 'Exploratory' }),
+    enabled: !!selectedConcept,
+    staleTime: 30_000,
+  });
+
+  /* Per-view correlation id (v0.27 Cap A feedback): minted whenever the
+   * selected concept changes. Brain.tsx is not a recall surface so there's no
+   * server-issued recall_id to echo — `crypto.randomUUID()` gives the
+   * consumer a stable opaque id for de-duping interactions within a single
+   * concept-view session. Cleared on deselection so feedback emission gates
+   * off (see `ConceptSummaryCard` provenance check). */
+  const [conceptViewRecallId, setConceptViewRecallId] = useState<string | null>(null);
+
+  /* Immediate-requery latch — mirrors the SynthesisLab pattern but keyed on
+   * `selectedConcept?.id` (the page-level "query commit" signal for Cap A).
+   * Refs hold the (concept_id, recall_id, viewed_at, bucket_keys) tuple
+   * currently in scope; on selection change, post `immediate_requery` against
+   * the LATCHED prior values, then re-arm.
+   *
+   * `viewedAt` stamps when the new selection landed (effectively when the
+   * user committed to looking at this concept), and `gap_ms` measures the
+   * delta from that moment to the next selection switch — i.e. how long the
+   * user spent on the previous concept before re-querying. */
+  const lastConceptIdRef = useRef<string | undefined>(undefined);
+  const lastConceptRecallIdRef = useRef<string | undefined>(undefined);
+  const lastConceptViewedAtRef = useRef<number | null>(null);
+  const lastConceptCharsRef = useRef<number | undefined>(undefined);
+  const lastConceptRevisionRef = useRef<number | undefined>(undefined);
+  // v0.27 R6 P2 fix: latch the prior concept's cluster_id at view time so
+  // the immediate_requery emission below routes to the same adaptive
+  // bucket as the viewed/click/thumb events for that concept.
+  const lastConceptClusterIdRef = useRef<number | undefined>(undefined);
+
+  // External-state sync: respond to concept-selection changes by minting a
+  // fresh recall_id for the new view and emitting an immediate_requery for
+  // the prior view if one was in scope. Mirrors SynthesisLab §5.2.
+  useEffect(() => {
+    const newId = selectedConcept?.id;
+    const priorId = lastConceptIdRef.current;
+    // v0.27 R7 P2 fix: only emit immediate_requery when transitioning
+    // to ANOTHER concept. Closing the detail panel or selecting a memory
+    // node makes `newId === undefined`; counting that as negative
+    // Cap-A feedback would depress useful_rate from ordinary navigation.
+    if (
+      priorId !== undefined &&
+      newId !== undefined &&
+      priorId !== newId &&
+      lastConceptViewedAtRef.current !== null
+    ) {
+      const gap_ms = Date.now() - lastConceptViewedAtRef.current;
+      const priorChars = lastConceptCharsRef.current;
+      const priorRev = lastConceptRevisionRef.current;
+      const priorCluster = lastConceptClusterIdRef.current;
+      // v0.27 R6 P2 fix: include bucket metadata (query_type + cluster_id)
+      // so this negative-signal event routes into the same adaptive
+      // bucket as the prior concept's viewed/click/thumb events. Without
+      // this, requery signals land in the `-1|unknown` bucket and bias
+      // the learned useful_rate upward.
+      const meta: Record<string, number | string> = { query_type: 'Exploratory' };
+      if (typeof priorCluster === 'number') meta.cluster_id = priorCluster;
+      if (typeof priorChars === 'number') meta.concept_chars = priorChars;
+      if (typeof priorRev === 'number') meta.revision_version = priorRev;
+      void postConceptSummaryFeedback(
+        priorId,
+        lastConceptRecallIdRef.current,
+        { kind: 'immediate_requery', gap_ms },
+        meta as never,
+      );
+    }
+    if (newId) {
+      // v0.27 R5 P2 fix: mint the recall_id eagerly (the card needs it
+      // before it can emit a `viewed` event), but DON'T arm the requery
+      // refs yet. Arming has to wait until a living_summary actually
+      // lands and the card renders, otherwise we'd emit a negative
+      // `immediate_requery` for a card the user never saw.
+      const fresh =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `cv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      setConceptViewRecallId(fresh);
+    } else {
+      setConceptViewRecallId(null);
+    }
+    // Always reset on selection change — a new selection means the prior
+    // refs are no longer "the rendered card the user is leaving".
+    lastConceptIdRef.current = undefined;
+    lastConceptRecallIdRef.current = undefined;
+    lastConceptViewedAtRef.current = null;
+    lastConceptCharsRef.current = undefined;
+    lastConceptRevisionRef.current = undefined;
+    lastConceptClusterIdRef.current = undefined;
+  }, [selectedConcept?.id]);
+
+  // v0.27 R5 P2 fix: arm the requery refs only AFTER the living_summary
+  // has loaded for the current selection. This guarantees a one-to-one
+  // correspondence between rendered ConceptSummaryCard instances and the
+  // immediate_requery events emitted on selection change.
+  useEffect(() => {
+    const newId = selectedConcept?.id;
+    const summary = conceptStateQuery.data?.living_summary;
+    if (newId && conceptViewRecallId && typeof summary === 'string' && summary.length > 0) {
+      lastConceptIdRef.current = newId;
+      lastConceptRecallIdRef.current = conceptViewRecallId;
+      lastConceptViewedAtRef.current = Date.now();
+      lastConceptCharsRef.current = summary.length;
+      const rev = conceptStateQuery.data?.living_summary_source_revision;
+      if (typeof rev === 'number') {
+        lastConceptRevisionRef.current = rev;
+      }
+      // v0.27 R6 P2 fix: latch cluster_id alongside chars/revision so
+      // immediate_requery events on the next selection switch land in the
+      // same adaptive bucket as this card's viewed/click/thumb events.
+      const cid = conceptStateQuery.data?.cluster_id;
+      lastConceptClusterIdRef.current = typeof cid === 'number' ? cid : undefined;
+    }
+  }, [
+    selectedConcept?.id,
+    conceptViewRecallId,
+    conceptStateQuery.data?.living_summary,
+    conceptStateQuery.data?.living_summary_source_revision,
+    conceptStateQuery.data?.cluster_id,
+  ]);
+
   /* ---- Zoom controls ---- */
   const handleZoomIn = useCallback(() => {
     if (!fgRef.current) return;
@@ -882,6 +1035,32 @@ export default function Brain() {
                     {(selectedConcept.confidence * 100).toFixed(0)}%
                   </span>
                 </div>
+              )}
+
+              {/* v0.27 ARS Cap A — living summary card (mirrors SynthesisCard
+                  feedback hooks). Hidden when no summary has been generated
+                  yet OR the per-view recall id hasn't been minted (keeps
+                  feedback emission gated, see ConceptSummaryCard). The
+                  `key` ensures dwell + thumb state can't leak across concept
+                  switches. */}
+              {conceptStateQuery.data?.living_summary && conceptViewRecallId && (
+                <ConceptSummaryCard
+                  key={`${selectedConcept.id}::${conceptViewRecallId}`}
+                  conceptId={selectedConcept.id}
+                  recallId={conceptViewRecallId}
+                  summary={conceptStateQuery.data.living_summary}
+                  sources={selectedConceptDetail?.source_memory_ids}
+                  revisionVersion={
+                    conceptStateQuery.data.living_summary_source_revision ?? undefined
+                  }
+                  // v0.27 R5 P2 fix: route feedback into the right
+                  // (cluster_id, query_type) bucket. Brain page is
+                  // exploratory by intent (no query box), so query_type
+                  // defaults to "Exploratory"; cluster_id comes from the
+                  // backend's representative-cluster computation.
+                  queryType="Exploratory"
+                  clusterId={conceptStateQuery.data.cluster_id ?? undefined}
+                />
               )}
             </>
           )}

@@ -46,6 +46,12 @@ pub struct SqliteStore {
     /// `SqliteStore::new(db_path)` per thread — saves ~1-2ms per
     /// channel per recall (schema init + model check elided).
     pool: Option<std::sync::Arc<super::pool::ConnPool>>,
+    /// v0.27 R9 P2 fix: deferred non-transactional side-index scrub queue.
+    /// Loser ids accumulated by `apply_n_merge` are stashed here while
+    /// inside the outer `BEGIN IMMEDIATE`; `store_with_dedup` drains the
+    /// queue AFTER `COMMIT` succeeds (and clears it on `ROLLBACK`), so
+    /// Tantivy/HNSW removal is bounded to durable DB state.
+    pub(crate) pending_index_scrub: std::cell::RefCell<Vec<String>>,
 }
 
 pub(crate) const MEMORY_SELECT_COLUMNS: &str = "m.id, m.layer, m.topic, m.summary, m.content, \
@@ -130,6 +136,7 @@ impl SqliteStore {
             dims,
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
+            pending_index_scrub: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -145,6 +152,7 @@ impl SqliteStore {
             dims: 3072,
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
+            pending_index_scrub: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -166,6 +174,7 @@ impl SqliteStore {
             dims,
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
+            pending_index_scrub: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -207,6 +216,7 @@ impl SqliteStore {
             dims,
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
+            pending_index_scrub: std::cell::RefCell::new(Vec::new()),
         })
     }
     /// Access the underlying SQLite connection (for direct queries).
@@ -1592,7 +1602,16 @@ impl SqliteStore {
             let candidate_cluster = match &dedup_action {
                 DedupAction::MergeInto(id)
                 | DedupAction::Supersede(id)
-                | DedupAction::GrayZone(id, _) => self.get(id).ok().and_then(|m| m.cluster_id),
+                | DedupAction::GrayZone(id, _)
+                | DedupAction::TemporalSupersede(id, _) => {
+                    self.get(id).ok().and_then(|m| m.cluster_id)
+                }
+                // v0.27 Track 2 #6: winner drives cluster inference; losers
+                // fold into the same canonical so the cluster_id of the
+                // winner is the right anchor for adaptive-threshold lookup.
+                DedupAction::MergeIntoMany(winner, _) => {
+                    self.get(winner).ok().and_then(|m| m.cluster_id)
+                }
                 DedupAction::CreateNew => memory.cluster_id,
             };
 
@@ -1872,7 +1891,30 @@ impl SqliteStore {
 
         match decision {
             Ok(result) => {
-                self.conn.execute_batch("COMMIT")?;
+                // v0.27 R12 P2 fix: a COMMIT failure (disk-full, etc.)
+                // returns early via `?` and would leave queued loser ids
+                // in `pending_index_scrub` — the rollback arm wouldn't
+                // run, so a later successful commit on this same store
+                // could drain stale ids and remove Tantivy/HNSW entries
+                // for rows whose DB changes were never durable. Match
+                // explicitly so we can clear the queue on commit failure.
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    self.pending_index_scrub.borrow_mut().clear();
+                    return Err(e.into());
+                }
+                // v0.27 R9 P2 fix: drain the deferred index-scrub queue
+                // ONLY after the outer tx commit succeeds. apply_n_merge
+                // populates this queue from inside the savepoint; the
+                // non-transactional Tantivy/HNSW removal is bounded to
+                // durable DB state.
+                {
+                    let drained: Vec<String> =
+                        std::mem::take(&mut *self.pending_index_scrub.borrow_mut());
+                    for id in &drained {
+                        self.remove_from_tantivy(id);
+                        self.remove_from_hnsw(id);
+                    }
+                }
                 if let Some((pending_row_id, candidate_id, sim)) = pending_grayzone {
                     let config = crate::config::ReinConfig::load().unwrap_or_default();
                     match crate::extract::hooks::queue::queue_dedup_job(
@@ -1911,6 +1953,10 @@ impl SqliteStore {
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                // v0.27 R9 P2 fix: drop the deferred scrub queue on
+                // rollback — the loser deprecations have been reverted in
+                // the DB, so we must NOT remove them from Tantivy/HNSW.
+                self.pending_index_scrub.borrow_mut().clear();
                 Err(e)
             }
         }
@@ -2191,6 +2237,54 @@ impl SqliteStore {
                 // Treat as CreateNew as a safe fallback.
                 tracing::warn!("unexpected GrayZone in store_with_dedup_resolved, creating new");
                 self.store(memory)
+            }
+            // v0.27 Track 2 #6: N-merge — fold the new memory into the
+            // canonical winner via the existing MergeInto path, then mark
+            // every additional loser as superseded by the winner inside an
+            // atomic apply_evolution-style savepoint. Each loser gets an
+            // evidence row written before mark_superseded so provenance is
+            // preserved (INV-1/INV-3 of the Lossless Compression Contract).
+            //
+            // Atomicity: the MergeInto winner-merge writes via
+            // `update()` against `self.conn`, which is enrolled in the
+            // outer `store_with_dedup` `BEGIN IMMEDIATE` transaction.
+            // Propagating an apply_n_merge error with `?` therefore
+            // rolls BACK the winner's MergeInto via the outer txn —
+            // a partial N-merge can never be observed in committed state.
+            DedupAction::MergeIntoMany(winner_id, losers) => {
+                // v0.27 R7 P2 fix: do all fallible DB work BEFORE the
+                // recursive MergeInto, which fires non-transactional
+                // Tantivy/HNSW updates via `update()`. Earlier ordering
+                // ran MergeInto first; if `apply_n_merge` then errored,
+                // the outer BEGIN IMMEDIATE rolled back the DB but the
+                // winner's side-index updates had already landed,
+                // leaking uncommitted content into recall.
+                if !losers.is_empty() {
+                    self.apply_n_merge(&winner_id, &losers).map_err(|e| {
+                        tracing::warn!(
+                            winner = %winner_id,
+                            error = %e,
+                            "v0.27 #6: N-merge loser-fold failed; rolling back the entire decision via outer BEGIN IMMEDIATE"
+                        );
+                        e
+                    })?;
+                }
+                self.store_with_dedup_resolved(
+                    memory,
+                    DedupAction::MergeInto(winner_id.clone()),
+                )
+            }
+            // v0.27 Track 2 #8: temporal supersede — preserve the old
+            // memory as a historical version. Currently degrades to
+            // standard Supersede semantics; the full version-chain ledger
+            // is deferred to v0.28+ schema work (no DDL in v0.27).
+            DedupAction::TemporalSupersede(old_id, version) => {
+                tracing::info!(
+                    old = %old_id,
+                    version = version,
+                    "v0.27 #8: TemporalSupersede degrading to Supersede (memory_revisions schema pending v0.28+)"
+                );
+                self.store_with_dedup_resolved(memory, DedupAction::Supersede(old_id))
             }
         }
     }
