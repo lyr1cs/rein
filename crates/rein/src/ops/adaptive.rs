@@ -631,10 +631,27 @@ fn run_tiering(
     tracing::debug!("M5: computing tier boundaries");
     let mut boundaries = crate::store::tiering::TierBoundaries::new();
 
+    // v0.26.2 Bug #6: include `updated` rows. `store.update()` auto-flips
+    // `Active → Updated` (sqlite.rs::update line 960-964), so any edited
+    // memory has `status = 'updated'` and would be invisible to
+    // tier-recompute SQL filtered on `status = 'active'`. Both are live
+    // statuses for tiering. Kept in lockstep with the recall-time filter
+    // updates Agent B is making in `store/fts.rs` + `store/vec.rs`.
+    //
+    // v0.26.2 Bug #5: track whether any rates were observed (rather than
+    // gating on `cold_threshold > 0.0`). On a fresh deployment / canary /
+    // quiet workload the legitimate P25 of access rates is 0.0, which the
+    // old guard mistook for "boundaries not yet computed" and short-
+    // circuited both the tier UPDATEs and the Cap C reflag — paper-
+    // shipping cold-tier on quiet workloads.
+    let mut rates_present = false;
+
     // Compute access rates for all memories
     if let Ok(mut stmt) = store
         .conn()
-        .prepare("SELECT access_count, created_at FROM memories WHERE status = 'active'")
+        .prepare(
+            "SELECT access_count, created_at FROM memories WHERE status IN ('active', 'updated')",
+        )
     {
         let rates: Vec<f64> = stmt
             .query_map([], |row| {
@@ -650,6 +667,7 @@ fn run_tiering(
             .unwrap_or_default();
 
         if !rates.is_empty() {
+            rates_present = true;
             boundaries.update(&rates);
             state.hot_threshold = boundaries.hot_threshold;
             state.cold_threshold = boundaries.cold_threshold;
@@ -658,24 +676,24 @@ fn run_tiering(
 
     // Update tier labels on memories
     // NOTE: SQL formula must stay in sync with crate::store::tiering::compute_access_rate
-    if state.hot_threshold > 0.0 && state.cold_threshold > 0.0 {
+    if rates_present {
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'hot'
-             WHERE status = 'active' AND tier != 'hot'
+             WHERE status IN ('active', 'updated') AND tier != 'hot'
              AND CAST(access_count AS REAL) / MAX(1, CAST(
                (julianday('now') - julianday(created_at)) AS REAL)) >= ?1",
             rusqlite::params![state.hot_threshold],
         );
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'cold'
-             WHERE status = 'active' AND tier != 'cold'
+             WHERE status IN ('active', 'updated') AND tier != 'cold'
              AND CAST(access_count AS REAL) / MAX(1, CAST(
                (julianday('now') - julianday(created_at)) AS REAL)) <= ?1",
             rusqlite::params![state.cold_threshold],
         );
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'warm'
-             WHERE status = 'active' AND (
+             WHERE status IN ('active', 'updated') AND (
                tier NOT IN ('hot', 'cold')
                OR (tier = 'hot' AND CAST(access_count AS REAL) / MAX(1, CAST(
                  (julianday('now') - julianday(created_at)) AS REAL)) < ?1)
@@ -695,7 +713,7 @@ fn run_tiering(
         // (terminal) and stays invisible until the next cold transition rebumps it.
         let _ = store.conn().execute(
             "UPDATE memories SET needs_archival_summary = 1
-             WHERE status = 'active'
+             WHERE status IN ('active', 'updated')
                AND tier = 'cold'
                AND needs_archival_summary = 0
                AND (
@@ -725,9 +743,16 @@ fn run_tiering(
         Err(_) => 0,
     };
 
-    // Strip archived memories to summary-only via store.update() to keep Tantivy in sync
+    // Strip archived memories to summary-only — bypass `store.update()`
+    // here. v0.26.2 R8 F1: `update()` now deletes the `cold_archive` row
+    // on `semantic_changed` (R7 F1 — invalidates the fallback after a
+    // user edit). M5's strip ALSO triggers `semantic_changed=true`
+    // (content→summary), so going through `update()` would delete the
+    // cold_archive row that the INSERT above just populated → Cap C
+    // worker would lose its full-body fallback for every freshly-cold
+    // memory. We do the strip inline with raw SQL + a direct Tantivy
+    // refresh so the cold_archive row stays intact.
     if migrated > 0 {
-        // Fetch archived memory IDs and update through the proper API
         let archived_ids: Vec<String> = store
             .conn()
             .prepare(
@@ -743,12 +768,33 @@ fn run_tiering(
             })
             .unwrap_or_default();
 
-        // Batch cold archive stripping in a transaction
         let _ = store.conn().execute_batch("BEGIN");
         for aid in &archived_ids {
-            if let Ok(mut mem) = store.get(aid) {
-                mem.content = mem.summary.clone();
-                let _ = store.update(&mem); // Triggers Tantivy + FTS update
+            if let Ok(mem) = store.get(aid) {
+                let keywords_json =
+                    serde_json::to_string(&mem.keywords).unwrap_or_else(|_| "[]".to_string());
+                // Raw SQL: rewrite content := summary. We deliberately do
+                // NOT bump status (this is internal data-shape change,
+                // not a user-edit semantic change) and do NOT touch
+                // archival_summary fields (they're owned by Cap C's
+                // worker per the `needs_archival_summary` flag set above).
+                let _ = store.conn().execute(
+                    "UPDATE memories SET content = summary WHERE id = ?1",
+                    rusqlite::params![aid],
+                );
+                // Direct Tantivy refresh — the indexed content field now
+                // matches the summary, mirroring the SQL truncation.
+                store.update_tantivy(aid, &mem.topic, &mem.summary, &mem.summary, &keywords_json);
+                // R9 F1: also invalidate vec_memories + HNSW. The
+                // pre-strip embedding represented the full body; leaving
+                // it in place lets the vector channel rank this cold row
+                // by facts that are no longer in `memory.content`. Cold
+                // rows are filtered out of non-Exploratory recall anyway,
+                // so the entry is dead weight for everything except the
+                // exploratory channel — and for that channel we'd rather
+                // miss the row than mismatch its semantic surface.
+                let _ = crate::store::vec::delete_embedding(store.conn(), aid);
+                store.remove_from_hnsw(aid);
             }
         }
         let _ = store.conn().execute_batch("COMMIT");
@@ -849,19 +895,34 @@ fn parse_candidates_from_event(
 
     // Find which candidate memories were actually accessed (injected by hook_prompt).
     // Match by: (a) memory_id appears in this recall's candidate set, AND
-    // (b) access event timestamp is within 10 minutes of the recall event.
-    // The time window reduces false attribution when the same memory appears
-    // in multiple unrelated recalls.
+    // (b) the access event correlates back to *this* recall.
+    //
+    // v0.26.2 Bug #O5: prefer the strong `(memory_id, request_id)` join
+    // when both events carry a `request_id`; fall back to the legacy
+    // 10-minute time window only when one or both events lack a
+    // `request_id`. The time-window-only filter mis-attributed every
+    // co-recalled memory inside a 10-minute burst — two unrelated
+    // recalls of the same memory each got both access events, doubling
+    // the learning signal and silently corrupting per-cluster alphas.
+    let recall_request_id: Option<&str> = event.request_id.as_deref();
     let candidate_ids: std::collections::HashSet<&str> =
         candidates.iter().map(|c| c.memory_id.as_str()).collect();
     let accessed_ids: Vec<String> = access_events
         .iter()
         .filter(|a| {
-            let access_ts = chrono::DateTime::parse_from_rfc3339(&a.ts)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or(ts);
-            let diff = (access_ts - ts).num_seconds().abs();
-            diff < 600 // 10 minutes
+            match (a.request_id.as_deref(), recall_request_id) {
+                // Strong match: same originating request — attribute regardless
+                // of timestamp (handles delayed access logging within a single
+                // session).
+                (Some(a_rid), Some(r_rid)) => a_rid == r_rid,
+                // One side missing request_id — fall back to the time window.
+                _ => {
+                    let access_ts = chrono::DateTime::parse_from_rfc3339(&a.ts)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or(ts);
+                    (access_ts - ts).num_seconds().abs() < 600
+                }
+            }
         })
         .filter_map(|a| a.memory_id.as_deref())
         .filter(|mid| candidate_ids.contains(mid))
@@ -2329,6 +2390,346 @@ mod tests {
             tiers_used >= 2,
             "tiering should use at least 2 tiers (hot={hot_count}, warm={warm_count}, cold={cold_count})"
         );
+    }
+
+    // ── Test 1b (v0.26.2 Bug #5): tiering still runs when cold_threshold == 0 ─
+
+    /// Quiet workload: every memory has `access_count = 0`. The legitimate
+    /// P25 of access rates is 0.0 — the pre-fix guard
+    /// (`cold_threshold > 0.0 && hot_threshold > 0.0`) treated this as
+    /// "boundaries not yet computed" and skipped both the tier UPDATEs
+    /// AND the Cap C `needs_archival_summary = 1` reflag. Cap C therefore
+    /// never had work on quiet workloads. With Bug #5 fixed, the tier
+    /// UPDATE block is gated on whether *any* rates were observed
+    /// (regardless of their numeric value), and every row should land in
+    /// the cold tier (since 0 <= cold_threshold = 0).
+    #[test]
+    fn test_run_tiering_handles_zero_access_rate_population() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        // 5 memories, all with access_count = 0 → all rates exactly 0.0
+        for i in 0..5u32 {
+            let mut mem = test_memory("quiet", &format!("memory {i}"), 0);
+            mem.created_at = Utc::now() - chrono::Duration::days(7);
+            store.store(mem).unwrap();
+        }
+
+        let mut state = AdaptiveState::default();
+        run_tiering(&store, &mut state, &config);
+
+        // P25 == P75 == 0 → degenerate-distribution guard in TierBoundaries
+        // bumps hot_threshold to cold_threshold + 1.0; cold stays 0.0.
+        assert_eq!(
+            state.cold_threshold, 0.0,
+            "cold_threshold should be the legitimate P25 == 0.0, got {}",
+            state.cold_threshold
+        );
+
+        // The tier UPDATE block must have RUN despite cold_threshold == 0.
+        // Every row has rate == 0 == cold_threshold → all rows land in cold.
+        let cold_count: u32 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE tier = 'cold'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cold_count, 5,
+            "all 5 zero-access memories should be tiered cold (Bug #5: SQL block must run when rates_present even if cold_threshold == 0), got {cold_count}"
+        );
+
+        // Cap C reflag must also have run — every freshly-cold row whose
+        // archival_summary is still NULL should now carry
+        // `needs_archival_summary = 1`. Without the Bug #5 fix the
+        // reflag block was skipped and Cap C had nothing to chew on.
+        let needs_summary_count: u32 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE needs_archival_summary = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            needs_summary_count, 5,
+            "Cap C reflag must mark all cold rows missing archival_summary (Bug #5), got {needs_summary_count}"
+        );
+    }
+
+    // ── Test 1c (v0.26.2 Bug #6): tier SQL must include `status = 'updated'` ─
+
+    /// `store.update()` auto-flips Active → Updated on any edit
+    /// (sqlite.rs::update line 960-964). Pre-fix, the tier SQL
+    /// `WHERE status = 'active'` filter excluded edited memories from
+    /// every tier-recompute pass — they were stranded at whatever tier
+    /// they had at insertion time. Verifies both the access-rate SELECT
+    /// and the tier UPDATE statements include `status IN ('active',
+    /// 'updated')`.
+    #[test]
+    fn test_run_tiering_includes_updated_status_memories() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.tier_cold_start = 5;
+
+        // Build a population with non-zero access counts so the access-
+        // rate distribution is actually informative (so Bug #6 — not Bug
+        // #5 — is the only thing under test).
+        let mut all_ids: Vec<String> = Vec::new();
+        for i in 0..12u32 {
+            let (ac, days_ago) = match i {
+                0..=3 => (100 + i * 20, 5i64),
+                4..=7 => (5, 30),
+                _ => (1, 120),
+            };
+            let mut mem = test_memory("status_test", &format!("memory {i}"), ac);
+            mem.created_at = Utc::now() - chrono::Duration::days(days_ago);
+            let id = mem.id.clone();
+            store.store(mem).unwrap();
+            all_ids.push(id);
+        }
+
+        // Pick the highest-access memory (i=3 → rate 160/5 = 32, the
+        // top of the access-rate distribution) and the lowest-access
+        // memory (i=11 → rate 1/120 ≈ 0.008, well below P25), edit
+        // them — `store.update()` flips their status to `Updated`.
+        let high_id = all_ids[3].clone();
+        let low_id = all_ids[11].clone();
+        for id in [&high_id, &low_id] {
+            let mut mem = store.get(id).unwrap();
+            mem.summary = format!("{} (edited)", mem.summary);
+            store.update(&mem).unwrap();
+        }
+
+        // Confirm the test setup: both rows are now `status = 'updated'`.
+        let updated_status_count: u32 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE status = 'updated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            updated_status_count, 2,
+            "test setup: both edited memories should be status='updated', got {updated_status_count}"
+        );
+
+        let mut state = AdaptiveState::default();
+        run_tiering(&store, &mut state, &config);
+
+        // Bug #6 fix: tier UPDATEs now cover `status IN ('active',
+        // 'updated')`, so neither edited memory is stranded at the
+        // default Warm tier. The high-access row should now be Hot, the
+        // low-access row should now be Cold.
+        let high_tier: String = store
+            .conn()
+            .query_row(
+                "SELECT tier FROM memories WHERE id = ?1",
+                rusqlite::params![&high_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let low_tier: String = store
+            .conn()
+            .query_row(
+                "SELECT tier FROM memories WHERE id = ?1",
+                rusqlite::params![&low_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            high_tier, "hot",
+            "high-access edited memory (status=updated) must reach hot tier (Bug #6), got tier={high_tier}"
+        );
+        assert_eq!(
+            low_tier, "cold",
+            "low-access edited memory (status=updated) must reach cold tier (Bug #6), got tier={low_tier}"
+        );
+    }
+
+    // ── Test 1d (v0.26.2 Bug #O5): access attribution prefers request_id ─────
+
+    /// Two recalls touching the *same* memory inside the same 10-minute
+    /// window with *different* request_ids. Pre-fix, the time-window
+    /// filter alone matched every access event to every recall, so each
+    /// recall saw both access events — false attribution that doubled
+    /// the learning signal whenever two unrelated queries hit the same
+    /// memory in quick succession.
+    ///
+    /// With Bug #O5 fixed, when both events carry a `request_id`, the
+    /// strong `(memory_id, request_id)` join wins regardless of
+    /// timestamp; each recall sees only its own access event.
+    #[test]
+    fn test_parse_candidates_filters_by_request_id_when_present() {
+        use crate::store::adaptive::StoredEvent;
+
+        let candidates_payload = serde_json::json!({
+            "candidates": [
+                {"id": "mem-shared", "bm25_norm": 0.5, "vec_norm": 0.5},
+            ]
+        });
+
+        let now = chrono::Utc::now();
+        // Two recalls 30s apart — both well inside the 600s legacy window.
+        let ts_recall_a = (now - chrono::Duration::seconds(60)).to_rfc3339();
+        let ts_recall_b = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let ts_access_a = (now - chrono::Duration::seconds(50)).to_rfc3339();
+        let ts_access_b = (now - chrono::Duration::seconds(20)).to_rfc3339();
+
+        let recall_a = StoredEvent {
+            id: 1,
+            ts: ts_recall_a,
+            event_type: "recall_complete".into(),
+            request_id: Some("req-A".into()),
+            memory_id: None,
+            concept_id: None,
+            query: None,
+            query_type: Some("semantic".into()),
+            topic: None,
+            payload: Some(candidates_payload.to_string()),
+        };
+        let recall_b = StoredEvent {
+            id: 2,
+            ts: ts_recall_b,
+            event_type: "recall_complete".into(),
+            request_id: Some("req-B".into()),
+            memory_id: None,
+            concept_id: None,
+            query: None,
+            query_type: Some("semantic".into()),
+            topic: None,
+            payload: Some(candidates_payload.to_string()),
+        };
+
+        let access_a = StoredEvent {
+            id: 3,
+            ts: ts_access_a,
+            event_type: "recall_access".into(),
+            request_id: Some("req-A".into()),
+            memory_id: Some("mem-shared".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: None,
+        };
+        let access_b = StoredEvent {
+            id: 4,
+            ts: ts_access_b,
+            event_type: "recall_access".into(),
+            request_id: Some("req-B".into()),
+            memory_id: Some("mem-shared".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: None,
+        };
+
+        let access_events = vec![access_a, access_b];
+
+        let parsed_a = parse_candidates_from_event(&recall_a, &access_events)
+            .expect("recall A should parse");
+        let parsed_b = parse_candidates_from_event(&recall_b, &access_events)
+            .expect("recall B should parse");
+
+        // Each recall must see EXACTLY ONE accessed memory id (its own),
+        // not two. Pre-fix this assertion would trigger because both
+        // access events fall inside the 600s window.
+        assert_eq!(
+            parsed_a.accessed_ids.len(),
+            1,
+            "recall A should attribute only its own access event (Bug #O5), got {:?}",
+            parsed_a.accessed_ids
+        );
+        assert_eq!(
+            parsed_b.accessed_ids.len(),
+            1,
+            "recall B should attribute only its own access event (Bug #O5), got {:?}",
+            parsed_b.accessed_ids
+        );
+        assert_eq!(parsed_a.accessed_ids[0], "mem-shared");
+        assert_eq!(parsed_b.accessed_ids[0], "mem-shared");
+        assert_eq!(parsed_a.request_id, "req-A");
+        assert_eq!(parsed_b.request_id, "req-B");
+    }
+
+    /// When the access event lacks a `request_id` (e.g. legacy event row
+    /// emitted by an older binary, or partial-instrumentation), the
+    /// fallback 10-minute time-window predicate must still apply. The
+    /// recall always carries a `request_id` (`parse_candidates_from_event`
+    /// `?`-bails otherwise), so the asymmetric case is the realistic one.
+    #[test]
+    fn test_parse_candidates_falls_back_to_time_window_when_access_missing_request_id() {
+        use crate::store::adaptive::StoredEvent;
+
+        let candidates_payload = serde_json::json!({
+            "candidates": [
+                {"id": "mem-x", "bm25_norm": 0.5, "vec_norm": 0.5},
+            ]
+        });
+
+        let now = chrono::Utc::now();
+        let ts_recall = (now - chrono::Duration::seconds(60)).to_rfc3339();
+        let ts_access_close = (now - chrono::Duration::seconds(50)).to_rfc3339();
+        let ts_access_far = (now - chrono::Duration::hours(2)).to_rfc3339();
+
+        let recall = StoredEvent {
+            id: 1,
+            ts: ts_recall,
+            event_type: "recall_complete".into(),
+            request_id: Some("req-modern".into()),
+            memory_id: None,
+            concept_id: None,
+            query: None,
+            query_type: Some("semantic".into()),
+            topic: None,
+            payload: Some(candidates_payload.to_string()),
+        };
+
+        // Both access events lack request_id — must fall back to time
+        // window for each.
+        let access_close = StoredEvent {
+            id: 2,
+            ts: ts_access_close,
+            event_type: "recall_access".into(),
+            request_id: None, // legacy / partial instrumentation
+            memory_id: Some("mem-x".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: None,
+        };
+        let access_far = StoredEvent {
+            id: 3,
+            ts: ts_access_far,
+            event_type: "recall_access".into(),
+            request_id: None,
+            memory_id: Some("mem-x".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: None,
+        };
+
+        let access_events = vec![access_close, access_far];
+        let parsed = parse_candidates_from_event(&recall, &access_events)
+            .expect("recall should parse");
+
+        // The 2-hour-old access is outside the 600s window and must be
+        // dropped; the 50-second-old access must be attributed.
+        assert_eq!(
+            parsed.accessed_ids.len(),
+            1,
+            "fallback should drop time-window-stale access (Bug #O5 fallback path), got {:?}",
+            parsed.accessed_ids
+        );
+        assert_eq!(parsed.accessed_ids[0], "mem-x");
     }
 
     // ── Test 2: build_survival_curves with access data ───────────────────────

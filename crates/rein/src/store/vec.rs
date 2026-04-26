@@ -20,26 +20,86 @@ pub fn delete_embedding(conn: &Connection, id: &str) -> ReinResult<()> {
     Ok(())
 }
 
-/// Search for nearest neighbors by embedding vector.
+/// Over-fetch multiplier when filtering vec results by topic / live status.
+///
+/// `vec_memories` (sqlite-vec virtual table) requires `LIMIT` inside the
+/// `MATCH` query — there is no way to push a join predicate into the ANN
+/// scan itself. So we over-fetch the top `limit * VEC_OVERFETCH_MULTIPLIER`
+/// candidates and then filter by `status IN (...)` / `superseded_by IS NULL`
+/// (Bug #2) and optional `topic` (Bug #O2) in an outer join. The multiplier
+/// is bounded so a single recall can never scan the entire table even on
+/// stores where most rows are deprecated. 8 is large enough that even a
+/// pathological topic with 12% prevalence still yields enough live hits to
+/// fill the requested `limit` in expectation.
+const VEC_OVERFETCH_MULTIPLIER: usize = 8;
+/// Live-status SQL predicate. Excludes only `Deprecated` (terminal dead
+/// rows from `apply_evolution`). Superseded rows (`superseded_by IS NOT NULL`
+/// with `status='active'`) are NOT excluded — `collapse_results_to_canonicals`
+/// in `recall.rs` maps them to their live canonical successor under the
+/// canonical-first read model. Filtering them here would silently lose
+/// queries that match only the old/evidence text. v0.26.2 R2 Codex F3.
+const VEC_LIVE_STATUS_FILTER: &str = "m.status IN ('active', 'updated')";
+
+/// Search for nearest neighbors by embedding vector, filtered to live memories.
+///
+/// "Live" = `status IN ('active', 'updated') AND superseded_by IS NULL`.
+/// Deprecated rows (set by `apply_evolution`) and superseded rows (set by
+/// `mark_superseded`, which only flips `superseded_by` and leaves `status =
+/// 'active'`) are both excluded — see Bug #2 in the v0.26.2 audit.
+///
+/// `_topic` is accepted for caller-side documentation: callers express
+/// "I am topic-restricted" so future readers see the intent at the call
+/// site, but the SQL never filters on topic — the actual topic comparison
+/// happens in `recall.rs::rank_and_filter` via `crate::ops::normalize_topic_name`
+/// two-sided match. Pushing `m.topic = ?` into SQL would silently drop
+/// normalized equivalents (e.g. stored `rust-lang` vs caller `Rust Lang`).
+/// Bug #O2 + v0.26.2 R2 Codex F2 + R3 F1 (renamed `topic` → `_topic` to
+/// silence unused-variable lint without dropping the documented signature).
 pub fn search_vec(
     conn: &Connection,
     embedding: &[f32],
+    _topic: Option<&str>,
     limit: usize,
 ) -> ReinResult<Vec<(String, f32)>> {
     let bytes = embedding_to_bytes(embedding);
-    let mut stmt = conn.prepare(
-        "SELECT id, distance
-         FROM vec_memories
-         WHERE embedding MATCH ?1
-         ORDER BY distance
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![bytes, limit as i64], |row| {
+    // v0.26.2 R2 Codex F1: always over-fetch (regardless of topic) so
+    // live-status attrition (deprecated rows surfacing in the top-k ANN
+    // hits) doesn't drop us below `limit`. Without this, when the nearest
+    // `limit` embeddings happen to all be deprecated, the live filter
+    // discards them and live candidates just below the cutoff are never
+    // considered. Cost is bounded — vec0 ANN scan is cheap and the JOIN +
+    // filter happens on at most `overfetch` rows.
+    let overfetch = limit.saturating_mul(VEC_OVERFETCH_MULTIPLIER).max(limit);
+
+    // Inner LIMIT = overfetch caps the ANN scan; the outer JOIN filters
+    // dead rows but does NOT re-cap. The Rust-side take(limit) below
+    // restores the caller's contract for topic=None callers (dedup/GC
+    // path: `embedding_candidate_lookup`, `run_vec_dedup_inner`) which
+    // expect `limit` candidates exactly. Topic=Some callers (recall) skip
+    // the take so `rank_and_filter` has enough material to apply
+    // normalized topic comparison without false negatives. v0.26.2 R4 F1.
+    let sql = format!(
+        "SELECT v.id, v.distance \
+         FROM (SELECT id, distance FROM vec_memories \
+               WHERE embedding MATCH ?1 \
+               ORDER BY distance \
+               LIMIT ?2) v \
+         JOIN memories m ON m.id = v.id \
+         WHERE {VEC_LIVE_STATUS_FILTER} \
+         ORDER BY v.distance"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![bytes, overfetch as i64], |row| {
         let id: String = row.get(0)?;
         let distance: f64 = row.get(1)?;
         Ok((id, distance as f32))
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let all = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(if _topic.is_some() {
+        all
+    } else {
+        all.into_iter().take(limit).collect()
+    })
 }
 
 /// Fetch an embedding vector by memory id, if present.
@@ -65,4 +125,198 @@ fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+    use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, Source};
+    use chrono::Utc;
+
+    /// Same fixture shape as the FTS tests — explicit status / superseded_by
+    /// so the live filter is the only signal driving the test.
+    fn fixture(topic: &str) -> Memory {
+        Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: format!("vec test {topic}"),
+            content: format!("vec test {topic} content"),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 0.8,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: crate::store::tiering::MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed: Utc::now(),
+        }
+    }
+
+    /// Make a deterministic 3072d embedding with a single non-zero coordinate.
+    /// Cosine similarity between two such vectors is 0 unless the same axis
+    /// is set, so we can place known "near" / "far" candidates by axis index.
+    fn one_hot(axis: usize, magnitude: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; 3072];
+        v[axis] = magnitude;
+        v
+    }
+
+    /// Bug #2 (HIGH) + R2 Codex F3: `search_vec` must skip `Deprecated`
+    /// (terminal dead rows from `apply_evolution`) but MUST surface
+    /// superseded rows (`superseded_by IS NOT NULL` with `status='active'`)
+    /// — `collapse_results_to_canonicals` later maps them to the live
+    /// canonical successor. Pre-R2 the SQL filter dropped both, which
+    /// silently lost queries matching only the old/evidence text.
+    #[test]
+    fn search_vec_excludes_deprecated_keeps_superseded_for_canonical_collapse() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let live = store.store(fixture("topic-a")).unwrap();
+        let updated = store.store(fixture("topic-a")).unwrap();
+        let deprecated = store.store(fixture("topic-a")).unwrap();
+        let superseded = store.store(fixture("topic-a")).unwrap();
+
+        // Drive each row's status / superseded_by into the configuration the
+        // test wants to verify (raw SQL — sidesteps `update()` so we can place
+        // exact tombstone shapes including the mark_superseded variant where
+        // status stays Active).
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status = 'updated' WHERE id = ?1",
+                rusqlite::params![updated],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                rusqlite::params![deprecated],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET superseded_by = ?2 WHERE id = ?1",
+                rusqlite::params![superseded, live],
+            )
+            .unwrap();
+
+        // Place the dead rows at the closest cosine distance and the live ones
+        // farther out, so a faulty filter would let the dead ones win.
+        insert_embedding(store.conn(), &deprecated, &one_hot(0, 1.0)).unwrap();
+        insert_embedding(store.conn(), &superseded, &one_hot(0, 0.99)).unwrap();
+        insert_embedding(store.conn(), &updated, &one_hot(0, 0.5)).unwrap();
+        insert_embedding(store.conn(), &live, &one_hot(0, 0.4)).unwrap();
+
+        let results = search_vec(store.conn(), &one_hot(0, 1.0), None, 4).unwrap();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&live.as_str()), "live Active row must surface");
+        assert!(ids.contains(&updated.as_str()), "Updated row must surface");
+        assert!(
+            !ids.contains(&deprecated.as_str()),
+            "Deprecated row must be hidden by the live-status filter"
+        );
+        // R2 Codex F3: superseded rows MUST surface so the canonical-first
+        // collapse step downstream can map them to the live successor.
+        assert!(
+            ids.contains(&superseded.as_str()),
+            "superseded row must surface for canonical-collapse mapping"
+        );
+    }
+
+    /// Bug #O2 + v0.26.2 R2 Codex finding F2: when `topic` is `Some`,
+    /// `search_vec` must over-fetch enough candidates to give the
+    /// post-fetch normalized topic comparison in `recall.rs::rank_and_filter`
+    /// a fighting chance. The actual topic comparison stays in Rust because
+    /// pushing `m.topic = ?` into SQL silently drops normalized equivalents
+    /// (e.g. stored `rust-lang` vs caller `Rust Lang`).
+    #[test]
+    fn search_vec_with_topic_overfetches_for_post_filter() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Two memories on topic A (placed FAR from the query) and several on
+        // topic B (placed NEAR the query). With over-fetch, the topic-A
+        // rows must appear in `search_vec`'s output even though they are
+        // cosine-orthogonal to the query.
+        let a1 = store.store(fixture("topic-a")).unwrap();
+        let a2 = store.store(fixture("topic-a")).unwrap();
+        let b_ids: Vec<String> = (0..6)
+            .map(|_| store.store(fixture("topic-b")).unwrap())
+            .collect();
+
+        // topic-A vectors live on axis 0; topic-B vectors on axis 1. The
+        // query is axis 1 → topic-B is "near" (cosine 1), topic-A is
+        // orthogonal (cosine 0). Without over-fetch, `limit=3` would only
+        // return topic-B.
+        insert_embedding(store.conn(), &a1, &one_hot(0, 1.0)).unwrap();
+        insert_embedding(store.conn(), &a2, &one_hot(0, 0.5)).unwrap();
+        for (i, id) in b_ids.iter().enumerate() {
+            insert_embedding(store.conn(), id, &one_hot(1, 1.0 - i as f32 * 0.05)).unwrap();
+        }
+
+        let query = one_hot(1, 1.0);
+
+        // No topic filter → returned set is ordered by distance ascending.
+        // R2 F1: search_vec ALWAYS over-fetches now (regardless of topic),
+        // so the cap is `limit * over-fetch-multiplier`, not `limit`. The
+        // top-K cap is the caller's responsibility (rank_and_filter does
+        // it). What we pin here is the ORDERING: the first 3 entries must
+        // all be topic-B (closest-by-distance).
+        let unfiltered = search_vec(store.conn(), &query, None, 3).unwrap();
+        assert!(
+            unfiltered.len() >= 3,
+            "over-fetched set must contain at least `limit` rows; got {}",
+            unfiltered.len()
+        );
+        assert!(
+            unfiltered
+                .iter()
+                .take(3)
+                .all(|(id, _)| b_ids.contains(&id.to_string())),
+            "the top-3 closest must all come from topic-B \
+             (otherwise the test fixture is broken)"
+        );
+
+        // With topic="topic-a" → over-fetched superset MUST contain both
+        // topic-A rows so the post-filter in rank_and_filter can pick them
+        // out. The result is NOT topic-filtered here — that happens in
+        // `recall.rs::rank_and_filter` with normalize_topic_name.
+        let overfetched = search_vec(store.conn(), &query, Some("topic-a"), 3).unwrap();
+        let returned_ids: std::collections::HashSet<&str> =
+            overfetched.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            returned_ids.contains(a1.as_str()),
+            "over-fetch must include topic-A row a1; got {returned_ids:?}"
+        );
+        assert!(
+            returned_ids.contains(a2.as_str()),
+            "over-fetch must include topic-A row a2; got {returned_ids:?}"
+        );
+        assert!(
+            overfetched.len() > 3,
+            "topic-restricted call must over-fetch beyond `limit` so the \
+             post-filter has material; got {} rows",
+            overfetched.len()
+        );
+    }
 }

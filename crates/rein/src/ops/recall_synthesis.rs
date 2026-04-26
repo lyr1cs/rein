@@ -133,6 +133,27 @@ pub struct RecallSynthesisOutcome {
     /// NOT post interaction events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthesis_id: Option<String>,
+    /// v0.26.2 hotfix (Bug #4): query type classifier label emitted for
+    /// this recall — surfaced so the GUI can echo it back in
+    /// `SynthesisInteraction.metadata.query_type`, keeping the M1
+    /// consumer's bucket key in lockstep with the per-query gate's lookup.
+    /// Pre-v0.26.2 the GUI had no way to round-trip this and every
+    /// feedback event landed in the consumer's `(-1, "unknown")` bucket
+    /// while `decide_synthesize` read from the real per-cluster bucket —
+    /// making the per-query adaptive gate dead code on GUI traffic.
+    /// Always populated (matches the function arg); not `Option` because
+    /// "no classifier label" is not a meaningful state at this layer.
+    #[serde(default)]
+    pub query_type: String,
+    /// v0.26.2 hotfix (Bug #4): dominant / sampled cluster id for this
+    /// recall — surfaced for the same metadata round-trip rationale as
+    /// `query_type` above. Sourced from the top-ranked result's
+    /// `cluster_id` (matching what `decide_synthesize` reads), so the
+    /// GUI-echoed metadata routes to the same bucket the gate consults.
+    /// `None` when the result set is empty or the top result carries no
+    /// cluster assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<i64>,
 }
 
 /// Reason a per-query synthesize gate skipped. Used inside
@@ -274,18 +295,6 @@ pub fn run_recall_synthesis(
     }
 
     let source_count = results.len();
-    let mut outcome = RecallSynthesisOutcome {
-        synthesis: None,
-        query: query.to_string(),
-        source_count,
-        model_used: None,
-        skipped_disabled: false,
-        skipped_adaptive_decision: false,
-        skipped_no_llm: false,
-        skipped_too_few_results: false,
-        citations: Vec::new(),
-        synthesis_id: None,
-    };
 
     // v0.26 D direction: per-query adaptive gate. Replaces the standalone
     // `if !config.ars.recall_synthesis_enabled { … }` check so operator-off
@@ -295,6 +304,13 @@ pub fn run_recall_synthesis(
     // proxy because results are already ranked by score, and per-cluster
     // synthesis-quality signals are most relevant where the strongest
     // candidate sits.
+    //
+    // v0.26.2 (Bug #4): cluster_id is hoisted above the outcome literal so
+    // the SAME computed value flows into BOTH `decide_synthesize` (the
+    // gate) AND `outcome.cluster_id` (the GUI metadata round-trip). Drift
+    // here would re-introduce the very bug we're fixing — the GUI would
+    // echo a different cluster_id than the gate read, and the M1
+    // consumer's bucket key would diverge from the gate's lookup key.
     //
     // query_type: caller-supplied capitalised label
     // (`QueryType::synthesis_bucket_label()` — v0.26.1). MUST match the
@@ -312,6 +328,25 @@ pub fn run_recall_synthesis(
         .first()
         .and_then(|r| r.memory.cluster_id)
         .map(|c| c as i64);
+
+    let mut outcome = RecallSynthesisOutcome {
+        synthesis: None,
+        query: query.to_string(),
+        source_count,
+        model_used: None,
+        skipped_disabled: false,
+        skipped_adaptive_decision: false,
+        skipped_no_llm: false,
+        skipped_too_few_results: false,
+        citations: Vec::new(),
+        synthesis_id: None,
+        // v0.26.2 (Bug #4): always echo the classifier's query_type and
+        // the gate's cluster_id so the GUI can round-trip them through
+        // SynthesisInteraction metadata into the M1 consumer's bucket
+        // key.
+        query_type: query_type.to_string(),
+        cluster_id,
+    };
     match decide_synthesize(
         config.ars.recall_synthesis_enabled,
         cluster_id,
@@ -362,6 +397,15 @@ pub fn run_recall_synthesis(
     // reference to a source the LLM never saw.
     let (prompt, included_count) =
         build_synthesis_prompt_with_count(results, query, max_chars);
+    // v0.26.2 (Bug #O6): replace `outcome.source_count` (pre-truncation
+    // `results.len()`) with `included_count` — the count of memory blocks
+    // the LLM ACTUALLY saw after the prompt-budget truncation. The GUI
+    // label says "synthesized from N sources"; showing a higher N than
+    // the LLM saw is misleading. Update happens BEFORE the LLM call so
+    // both Ok and Err arms inherit the post-truncation value (an LLM
+    // error path that retains pre-truncation `source_count` would lie
+    // about how many memories were even attempted).
+    outcome.source_count = included_count;
     match call_synthesis_llm_sync(&extractor, &prompt) {
         Ok(raw) => {
             let text = strip_code_fences(&raw).trim().to_string();
@@ -372,14 +416,24 @@ pub fn run_recall_synthesis(
                 // markers under the system prompt, but compliance is not
                 // guaranteed).
                 let (clean, citations) = extract_citations(&text, included_count);
-                outcome.synthesis = Some(clean);
-                outcome.citations = citations;
-                // v0.26 D direction: stamp a fresh ULID **only** on a
-                // successful synthesis. Empty LLM output (text was empty
-                // post-strip) leaves `synthesis_id = None` so clients
-                // know not to emit interaction feedback. Per contract
-                // §8 invariant 9.
-                outcome.synthesis_id = Some(ulid::Ulid::new().to_string());
+                // v0.26.2 (Bug #O7): tighten the empty-output guard.
+                // Pre-fix the guard was `!text.is_empty()`, which let
+                // citation-only LLM outputs (e.g. `"[#1][#2]"`) past —
+                // `text` is non-empty but `extract_citations` strips the
+                // markers leaving `clean = ""`, and we'd stamp a
+                // `synthesis_id` against empty prose. Re-check `clean`
+                // post-strip so citation-only is treated as the empty
+                // output it effectively is (per contract §8 invariant 9).
+                if !clean.trim().is_empty() {
+                    outcome.synthesis = Some(clean);
+                    outcome.citations = citations;
+                    // v0.26 D direction: stamp a fresh ULID **only** on
+                    // a successful synthesis. Empty LLM output (text
+                    // was empty post-strip) leaves `synthesis_id =
+                    // None` so clients know not to emit interaction
+                    // feedback. Per contract §8 invariant 9.
+                    outcome.synthesis_id = Some(ulid::Ulid::new().to_string());
+                }
             }
         }
         Err(e) => {
@@ -1433,6 +1487,8 @@ mod tests {
             skipped_too_few_results: false,
             citations: Vec::new(),
             synthesis_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+            query_type: "Semantic".to_string(),
+            cluster_id: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         // Field MUST be present in the wire format when populated.
@@ -1459,6 +1515,8 @@ mod tests {
             skipped_too_few_results: false,
             citations: Vec::new(),
             synthesis_id: None,
+            query_type: "Semantic".to_string(),
+            cluster_id: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(
@@ -1482,6 +1540,8 @@ mod tests {
             skipped_too_few_results: false,
             citations: Vec::new(),
             synthesis_id: None,
+            query_type: "Semantic".to_string(),
+            cluster_id: Some(42),
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(
@@ -1729,6 +1789,309 @@ mod tests {
         assert!(
             outcome.skipped_adaptive_decision,
             "lowered cold_start_n MUST let the per-cluster useful_rate gate fire; got {outcome:?}"
+        );
+    }
+
+    // ── v0.26.2 hotfix: Bug #4 — outcome carries query_type + cluster_id ───
+
+    /// v0.26.2 (Bug #4): an outcome from a Skip path MUST still carry the
+    /// classifier's `query_type` and the gate's `cluster_id`. The GUI
+    /// echoes both back through SynthesisInteraction metadata so the M1
+    /// consumer's bucket key matches what `decide_synthesize` consulted.
+    /// Pre-fix the GUI had no way to round-trip these and every event
+    /// landed in the consumer's `(-1, "unknown")` bucket — making the
+    /// per-query adaptive gate dead code on GUI traffic.
+    #[test]
+    fn outcome_carries_query_type_and_cluster_id_from_top_result() {
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        config.extract.provider = "none".to_string();
+
+        let mut results = make_results(5);
+        // Top-ranked result carries cluster_id=7; the rest are heterogeneous
+        // so the test pins the "top-ranked" policy (NOT mode/most-frequent).
+        results[0].memory.cluster_id = Some(7);
+        results[1].memory.cluster_id = Some(99);
+        results[2].memory.cluster_id = Some(99);
+        results[3].memory.cluster_id = None;
+        results[4].memory.cluster_id = Some(99);
+
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Episodic",
+            None,
+            None,
+        )
+        .expect("synthesis was requested → Some(outcome)");
+
+        assert_eq!(
+            outcome.query_type, "Episodic",
+            "outcome.query_type must echo the function arg verbatim"
+        );
+        assert_eq!(
+            outcome.cluster_id,
+            Some(7),
+            "outcome.cluster_id must come from the top-ranked result \
+             (not mode/most-frequent — the gate uses the same source)"
+        );
+    }
+
+    /// v0.26.2 (Bug #4): empty results → `cluster_id = None`. The cold-start
+    /// gate path returns Yes for None cluster, so consistency between gate
+    /// input and outcome echo is preserved on the empty-result branch too.
+    #[test]
+    fn outcome_cluster_id_none_when_results_empty() {
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        // min_results = 0 lets us actually exercise the empty-results
+        // branch through the success path; default min_results = 3 would
+        // bail on `skipped_too_few_results` first which is also a valid
+        // observation but doesn't pin the cluster_id derivation.
+        config.ars.recall_synthesis_min_results = 0;
+        config.extract.provider = "none".to_string();
+
+        let outcome =
+            run_recall_synthesis(&[], "test", &config, Some(true), "Semantic", None, None)
+                .expect("synthesis was requested → Some(outcome)");
+
+        assert_eq!(
+            outcome.cluster_id, None,
+            "empty results → cluster_id = None (no top-ranked result to read)"
+        );
+        assert_eq!(outcome.query_type, "Semantic");
+    }
+
+    /// v0.26.2 (Bug #4): outcome JSON wire shape includes `query_type`
+    /// and `cluster_id`. `query_type` is always present (no
+    /// `skip_serializing_if`); `cluster_id` is omitted when None.
+    #[test]
+    fn outcome_serde_query_type_always_present_cluster_id_omitted_when_none() {
+        let outcome = RecallSynthesisOutcome {
+            synthesis: None,
+            query: "q".to_string(),
+            source_count: 0,
+            model_used: None,
+            skipped_disabled: true,
+            skipped_adaptive_decision: false,
+            skipped_no_llm: false,
+            skipped_too_few_results: false,
+            citations: Vec::new(),
+            synthesis_id: None,
+            query_type: "Semantic".to_string(),
+            cluster_id: None,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            json.contains("\"query_type\":\"Semantic\""),
+            "query_type MUST appear on the wire (no skip_serializing_if): {json}"
+        );
+        assert!(
+            !json.contains("cluster_id"),
+            "cluster_id MUST be elided when None: {json}"
+        );
+
+        // And present when populated.
+        let outcome2 = RecallSynthesisOutcome {
+            cluster_id: Some(42),
+            ..outcome
+        };
+        let json2 = serde_json::to_string(&outcome2).unwrap();
+        assert!(
+            json2.contains("\"cluster_id\":42"),
+            "cluster_id MUST appear when populated: {json2}"
+        );
+    }
+
+    // ── v0.26.2 hotfix: Bug #O6 — source_count uses post-truncation count ──
+
+    /// v0.26.2 (Bug #O6) helper-level: pre-truncation `results.len()` and
+    /// post-truncation `included_count` MUST diverge under a tight cap.
+    /// This pins the upstream signal that
+    /// `outcome_source_count_reports_post_truncation_included_count`
+    /// then asserts on. Verified at the `build_synthesis_prompt_with_count`
+    /// surface so the contract holds independently of which extractor
+    /// the runtime path picks.
+    #[test]
+    fn build_synthesis_prompt_with_count_reports_truncation() {
+        let results: Vec<RecallResult> = (0..10)
+            .map(|i| {
+                let mut m = make_memory(i);
+                m.content = "x".repeat(5_000);
+                RecallResult {
+                    memory: m,
+                    score: 0.9 - (i as f32 * 0.05),
+                    confidence: 0.8,
+                    sources_hit: 2,
+                    evidence_count: 0,
+                    evidence_preview: vec![],
+                    archival_summary: None,
+                }
+            })
+            .collect();
+        // Tight cap, forces dropping after the first memory.
+        let (_prompt, included) = build_synthesis_prompt_with_count(&results, "q", 8_000);
+        assert!(
+            included < results.len(),
+            "tight cap MUST report included_count < results.len(); got included={included}, results.len()={}",
+            results.len()
+        );
+        assert!(
+            included >= 1,
+            "top-ranked memory MUST always fit (else the gate has no source at all)"
+        );
+    }
+
+    /// v0.26.2 (Bug #O6): `outcome.source_count` reports the count of
+    /// memory blocks the LLM ACTUALLY saw after prompt-budget truncation,
+    /// NOT the pre-truncation `results.len()`. The GUI label says
+    /// "synthesized from N sources"; the pre-truncation number lies about
+    /// what contributed.
+    ///
+    /// Strategy: force truncation via the Gemini provider config
+    /// (`extract.google.max_input_chars = 2_000`). Mock would resolve
+    /// to `LARGE_CONTEXT_DEFAULT_CAP` (1M chars), which can't be reached
+    /// without enormous test fixtures. By passing extractor_override =
+    /// `Some(Mock)` we still avoid live LLM calls — but
+    /// `resolve_max_input_for_kind` reads the cap based on the
+    /// extractor variant, which is Mock here. So we instead drive the
+    /// Gemini code path: provider = "google" with no API key → real
+    /// Gemini extractor in `create_concept_summary_extractor`. But that
+    /// would attempt a live call.
+    ///
+    /// Resolved by extractor_override + Mock + EXPLICIT cap injection:
+    /// the test fixes `outcome.source_count == included_count` by also
+    /// inspecting `included_count` we computed against the same prompt
+    /// builder under a small explicit cap. The cap path used by
+    /// `run_recall_synthesis` for Mock is `LARGE_CONTEXT_DEFAULT_CAP`,
+    /// so under that cap with content sized below 1M, no truncation
+    /// happens and `included_count == results.len()`. That still
+    /// validates the propagation: outcome.source_count == included_count,
+    /// even when included_count happens to equal results.len() because
+    /// the Mock cap is generous. The truncation-divergence side is
+    /// covered by `build_synthesis_prompt_with_count_reports_truncation`
+    /// at the helper level above.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn outcome_source_count_equals_included_count_after_synthesis() {
+        use crate::extract::llm::MockExtractor;
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 1;
+
+        let results = make_results(5);
+        let mock =
+            ExtractorKind::Mock(MockExtractor::with_fixed_response("Synthesized narrative."));
+        let outcome = run_recall_synthesis(
+            &results,
+            "q",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            Some(mock),
+        )
+        .unwrap();
+
+        // Compute what included_count would be under the same Mock cap
+        // (LARGE_CONTEXT_DEFAULT_CAP). Reuse the public helper so the
+        // arithmetic is identical to what run_recall_synthesis used.
+        let max_chars = crate::extract::llm::resolve_max_input_for_kind(
+            &config,
+            &ExtractorKind::Mock(MockExtractor::with_fixed_response("")),
+        );
+        let (_, included) = build_synthesis_prompt_with_count(&results, "q", max_chars);
+
+        assert_eq!(
+            outcome.source_count, included,
+            "outcome.source_count MUST equal included_count from \
+             build_synthesis_prompt_with_count (Bug #O6 — pre-fix it \
+             was results.len() which overstates contribution under \
+             truncation)"
+        );
+    }
+
+    // ── v0.26.2 hotfix: Bug #O7 — citation-only LLM output guard ───────────
+
+    /// v0.26.2 (Bug #O7): citation-only LLM output (e.g. `"[#1][#2]"`)
+    /// must NOT stamp a `synthesis_id` against empty prose. Pre-fix the
+    /// guard was `!text.is_empty()` checked BEFORE marker stripping; the
+    /// markers passed the guard, then `extract_citations` stripped them
+    /// to `clean = ""`, and `synthesis_id` was stamped + `synthesis =
+    /// Some("")`. Post-fix: re-check `clean` post-strip.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn run_recall_synthesis_drops_citation_only_output() {
+        use crate::extract::llm::MockExtractor;
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        let results = make_results(5);
+        // LLM emits ONLY citation markers — no prose around them.
+        let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response("[#1][#2]"));
+        let outcome = run_recall_synthesis(
+            &results,
+            "q",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            Some(mock),
+        )
+        .unwrap();
+
+        assert!(
+            outcome.synthesis.is_none(),
+            "citation-only output → synthesis MUST stay None (post-strip prose is empty); got {outcome:?}"
+        );
+        assert!(
+            outcome.synthesis_id.is_none(),
+            "citation-only output → synthesis_id MUST stay None (no prose to attribute); got {outcome:?}"
+        );
+        assert!(
+            outcome.citations.is_empty(),
+            "citations MUST be cleared alongside the dropped prose so clients can't \
+             render dangling badges with no context: {outcome:?}"
+        );
+    }
+
+    /// v0.26.2 (Bug #O7): whitespace-only post-strip output is treated
+    /// the same as fully empty. Defensive: an LLM that emits
+    /// `"  [#1]  \n  [#2]  "` strips to `"     "` which `clean.trim()`
+    /// then sees as empty.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn run_recall_synthesis_drops_whitespace_only_post_strip() {
+        use crate::extract::llm::MockExtractor;
+
+        let mut config = ReinConfig::default();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.recall_synthesis_min_results = 3;
+        let results = make_results(5);
+        let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response("  [#1]  [#2]  "));
+        let outcome = run_recall_synthesis(
+            &results,
+            "q",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            Some(mock),
+        )
+        .unwrap();
+
+        assert!(
+            outcome.synthesis.is_none(),
+            "whitespace-only post-strip → synthesis MUST stay None; got {outcome:?}"
+        );
+        assert!(
+            outcome.synthesis_id.is_none(),
+            "whitespace-only post-strip → synthesis_id MUST stay None; got {outcome:?}"
         );
     }
 }

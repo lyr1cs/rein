@@ -553,6 +553,7 @@ fn build_none_bucket_ann_candidates(
         let Ok(results) = crate::store::vec::search_vec(
             store.conn(),
             embedding,
+            None,
             none_bucket_neighbor_limit(config) + 1,
         ) else {
             continue;
@@ -716,7 +717,7 @@ fn run_vec_dedup_inner(
         // wants to preserve the flag for retry.
         let mut flag_clear_ok = true;
 
-        let vec_results = match crate::store::vec::search_vec(conn, &embedding, 10) {
+        let vec_results = match crate::store::vec::search_vec(conn, &embedding, None, 10) {
             Ok(r) => r,
             Err(_) => {
                 // Codex round-5 H-2: keep the flag set so next sweep retries.

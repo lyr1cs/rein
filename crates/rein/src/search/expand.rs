@@ -400,7 +400,11 @@ fn parse_expansion_response(content: &str, max: usize) -> ReinResult<Vec<String>
     let expansions: Vec<String> = arr
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty() && s.len() <= 200)
+        // Bug #O8 fix: `s.len()` is byte length — three-byte CJK chars capped
+        // effective length at ~66 chars instead of 200, silently dropping
+        // valid Chinese expansion variants. Use char count and early-exit at
+        // 201 so very-long inputs don't pay an O(n) scan per item.
+        .filter(|s| !s.is_empty() && s.chars().take(201).count() <= 200)
         .take(max)
         .collect();
 
@@ -508,5 +512,55 @@ mod tests {
         assert_eq!(strip_code_fences("```json\n[\"a\"]\n```"), "[\"a\"]");
         assert_eq!(strip_code_fences("[\"a\"]"), "[\"a\"]");
         assert_eq!(strip_code_fences("```\n[\"a\"]\n```"), "[\"a\"]");
+    }
+
+    /// Bug #O8 (v0.26.2): the expansion-length filter used `s.len()` (byte
+    /// length). Three-byte CJK characters silently capped effective length
+    /// at ~66 chars instead of 200, dropping every long Chinese variant the
+    /// LLM produced. Fix uses `chars().take(201).count()` so the policy is
+    /// in characters and the comparison early-exits at the cap.
+    #[test]
+    fn parse_expansion_uses_char_count_not_byte_length() {
+        // 100 CJK chars = ~300 bytes — passes the char-count filter but
+        // would have been REJECTED by the old byte-length filter
+        // (300 > 200).
+        let cjk_100 = "中".repeat(100);
+        let input = format!("[\"{cjk_100}\"]");
+        let result = parse_expansion_response(&input, 5).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "100 CJK chars (~300 bytes) MUST pass; pre-fix byte filter dropped this"
+        );
+        assert_eq!(result[0].chars().count(), 100);
+
+        // 200 CJK chars = ~600 bytes — boundary case, must still pass.
+        let cjk_200 = "中".repeat(200);
+        let input = format!("[\"{cjk_200}\"]");
+        let result = parse_expansion_response(&input, 5).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "exactly 200 CJK chars MUST pass (the boundary)"
+        );
+
+        // 201 CJK chars — must be REJECTED (one char over the limit).
+        let cjk_201 = "中".repeat(201);
+        let input = format!("[\"{cjk_201}\"]");
+        let result = parse_expansion_response(&input, 5).unwrap();
+        assert!(
+            result.is_empty(),
+            "201 CJK chars must be rejected (char limit is 200)"
+        );
+
+        // 250 ASCII chars = 250 bytes — must be REJECTED (length policy is
+        // identical for both alphabets, just measured in chars now).
+        let ascii_250 = "a".repeat(250);
+        let input = format!("[\"{ascii_250}\"]");
+        let result = parse_expansion_response(&input, 5).unwrap();
+        assert!(
+            result.is_empty(),
+            "250 ASCII chars must be rejected (over the 200-char cap)"
+        );
     }
 }

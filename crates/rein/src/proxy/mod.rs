@@ -239,11 +239,16 @@ fn error_response(status: u16, msg: &str) -> hyper::Response<BoxBody> {
 /// the wire, which decouples the path used for local policy decisions from
 /// the path the upstream actually sees. Reject such requests at the edge
 /// so the two views are always identical.
+///
+/// v0.26.2: also detects percent-encoded dot-segments (`%2e%2e`, `%2e`,
+/// case-insensitive). The previous version only matched literal `..` /
+/// `.` segments, so `/foo/%2e%2e/bar` reached upstream as `/foo/../bar`
+/// while passing the local guard.
 fn has_traversal_segments(path: &str) -> bool {
     // Strip query string — path traversal only matters for the path portion.
     let path_only = path.split('?').next().unwrap_or(path);
     for segment in path_only.split('/') {
-        if segment == ".." || segment == "." {
+        if segment_resolves_to_dot_segment(segment) {
             return true;
         }
     }
@@ -255,6 +260,38 @@ fn has_traversal_segments(path: &str) -> bool {
         }
     }
     false
+}
+
+/// Decodes ONLY the `%2e` / `%2E` percent escape (the dot character) in
+/// `seg` and returns whether the result equals `..` or `.`. Other
+/// percent-encoded bytes are left untouched so we don't, e.g., decode
+/// `%2f` into `/` and create an opportunity to mis-split the path.
+///
+/// A length gate skips the decoder for any segment that obviously can't
+/// reduce to `.` or `..`: each literal dot is 1 byte and each `%2e`
+/// expands from 3 → 1 byte, so `..` ranges from 2 (literal) to 6 (`%2e%2e`)
+/// bytes and `.` from 1 to 3.
+fn segment_resolves_to_dot_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg.len() > 6 {
+        return false;
+    }
+    let mut decoded = String::with_capacity(seg.len());
+    let bytes = seg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if hex.eq_ignore_ascii_case("2e") {
+                    decoded.push('.');
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        decoded.push(bytes[i] as char);
+        i += 1;
+    }
+    decoded == ".." || decoded == "."
 }
 
 #[cfg(test)]
@@ -294,6 +331,46 @@ mod traversal_guard_tests {
         // "..foo" is not the ".." segment — must not trip.
         assert!(!has_traversal_segments("/a.b/c..d/e"));
         assert!(!has_traversal_segments("/config.yml"));
+    }
+
+    // v0.26.2: percent-encoded dot-segments must not bypass the local
+    // policy guard. `reqwest`/`url` decode `%2e%2e` → `..` on the wire.
+    #[test]
+    fn rejects_percent_encoded_dot_dot() {
+        assert!(has_traversal_segments("/foo/%2e%2e/bar"));
+        assert!(has_traversal_segments("/%2e%2e/etc/passwd"));
+        assert!(has_traversal_segments("/foo/%2e%2e"));
+    }
+
+    #[test]
+    fn rejects_percent_encoded_single_dot() {
+        assert!(has_traversal_segments("/foo/%2e/bar"));
+        assert!(has_traversal_segments("/%2e/"));
+    }
+
+    #[test]
+    fn rejects_mixed_case_percent_encoded_dots() {
+        assert!(has_traversal_segments("/foo/%2E%2E/bar"));
+        assert!(has_traversal_segments("/foo/%2e%2E/bar"));
+        assert!(has_traversal_segments("/foo/%2E/bar"));
+    }
+
+    #[test]
+    fn rejects_mixed_literal_and_encoded_dots() {
+        assert!(has_traversal_segments("/foo/.%2e/bar"));
+        assert!(has_traversal_segments("/foo/%2e./bar"));
+    }
+
+    #[test]
+    fn accepts_percent_encoded_non_dot_bytes() {
+        // %41 = 'A', %2f = '/', partial '%' must NOT trip the guard.
+        assert!(!has_traversal_segments("/foo/%41bc/bar"));
+        assert!(!has_traversal_segments("/foo/%2fbar"));
+        assert!(!has_traversal_segments("/foo/%/bar"));
+        assert!(!has_traversal_segments("/foo/%2/bar"));
+        // dot-adjacent-to-literal (still doesn't reduce to "."):
+        assert!(!has_traversal_segments("/foo/.x/bar"));
+        assert!(!has_traversal_segments("/foo/%2ex/bar"));
     }
 }
 
