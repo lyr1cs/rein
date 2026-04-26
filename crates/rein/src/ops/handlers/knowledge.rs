@@ -589,11 +589,18 @@ pub struct ConceptStateParams {
     /// Concept ID to fetch.
     pub concept_id: String,
     /// v0.27 R2 P2: optional query context for the Cap A adaptive gate.
-    /// When BOTH `query_type` and `cluster_id` are supplied, the response
-    /// consults `decide_concept_summary_quality`; if the gate returns
-    /// `Skip`, `living_summary` is null and `living_summary_suppressed` is
-    /// true. When either is None, the gate is bypassed (caller receives
-    /// the full summary — back-compat with v0.24/v0.25/v0.26 callers).
+    /// When `query_type` is supplied, the response consults
+    /// `decide_concept_summary_quality`; if the gate returns `Skip`
+    /// (operator-disabled OR per-cluster useful_rate below threshold),
+    /// `living_summary` is null and `living_summary_suppressed` is true.
+    /// `cluster_id` is optional — when omitted, the handler falls back to
+    /// the representative cluster of the concept's source memories. Per
+    /// the v0.27 R10 P2 fix, the `OperatorDisabled` branch must bind
+    /// regardless of cluster context, so the gate fires whenever
+    /// `query_type` is `Some` even if `cluster_id` and the representative
+    /// fallback both resolve to `None`. v0.24/v0.25/v0.26 callers (which
+    /// never sent `query_type`) hit the bypass arm and receive the full
+    /// summary unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[clap(skip)]
     pub query_type: Option<String>,
