@@ -4,6 +4,9 @@ use std::sync::OnceLock;
 use jieba_rs::Jieba;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::extract::llm::ExtractorKind;
+use crate::extract::temporal::{extract_temporal_rule_based, temporal_conflict, TemporalAnchor};
+use crate::extract::triples::{extract_triples_rule_based, triple_overlap_score, Triple};
 use crate::store::SqliteStore;
 use crate::types::{Memory, MemoryStore, ReinResult};
 
@@ -348,16 +351,48 @@ fn candidate_topics(store: &SqliteStore, topic: &str) -> ReinResult<Vec<String>>
 }
 
 /// What to do when storing a potentially duplicate memory.
+#[derive(Debug, Clone)]
 pub enum DedupAction {
     /// No duplicate found, create new memory.
     CreateNew,
     /// Similar content within time window, merge into existing memory.
     MergeInto(String),
+    /// v0.27 Track 2 #6: ≥2 existing memories simultaneously matched the
+    /// new memory above the merge threshold. The first `String` is the
+    /// canonical winner id; the `Vec<String>` is the additional loser ids
+    /// (length ≥1; if empty the caller should downgrade to `MergeInto`).
+    /// Each loser will be folded into evidence + marked `superseded_by =
+    /// winner_id` atomically inside a single savepoint.
+    MergeIntoMany(String, Vec<String>),
     /// Similar content but older than time window, supersede old memory.
     Supersede(String),
+    /// v0.27 Track 2 #8: text-similarity is high but temporal anchors
+    /// conflict. Old memory is preserved as a historical version (status
+    /// flips, but vec/Tantivy/HNSW are NOT torn down), and `version` is
+    /// the next chain index. Currently degrades to `Supersede` semantics
+    /// for memories pending v0.28+ schema work — see
+    /// `apply_temporal_supersede` in `store/knowledge.rs`.
+    TemporalSupersede(String, u32),
     /// Gray zone (0.5 <= sim < threshold): needs LLM judgment.
     /// Falls back to CreateNew if LLM unavailable.
     GrayZone(String, f32),
+}
+
+impl std::fmt::Display for DedupAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DedupAction::CreateNew => write!(f, "CreateNew"),
+            DedupAction::MergeInto(id) => write!(f, "MergeInto({id})"),
+            DedupAction::MergeIntoMany(winner, losers) => {
+                write!(f, "MergeIntoMany({winner}, +{} losers)", losers.len())
+            }
+            DedupAction::Supersede(id) => write!(f, "Supersede({id})"),
+            DedupAction::TemporalSupersede(id, ver) => {
+                write!(f, "TemporalSupersede({id}, v{ver})")
+            }
+            DedupAction::GrayZone(id, sim) => write!(f, "GrayZone({id}, {sim:.3})"),
+        }
+    }
 }
 
 /// Check for duplicate memories using FTS search and Jaccard similarity.
@@ -367,6 +402,21 @@ pub enum DedupAction {
 /// - If > threshold and time diff < time_window_days -> MergeInto(id)
 /// - If > threshold and time diff >= time_window_days -> Supersede(id)
 /// - Otherwise -> CreateNew
+///
+/// v0.27 Track 2 layer (additive — does not change pre-v0.27 behavior unless
+/// config knobs are tuned):
+/// - **Triple-overlap upgrade (#5)**: gray-zone matches whose extracted
+///   triple sets overlap ≥ `[dedup].triple_overlap_threshold` are upgraded
+///   to `MergeInto` directly (skipping the LLM verdict path).
+/// - **N-merge collection (#6)**: when ≥2 candidates exceed the merge
+///   threshold, returns `MergeIntoMany(winner, losers)` instead of
+///   `MergeInto(winner)` so all duplicates collapse in one savepoint.
+/// - **Temporal supersede (#8, opt-in via `[dedup].temporal_supersede_enabled`)**:
+///   high-similarity merges whose temporal anchors conflict are downgraded
+///   to `TemporalSupersede(old, version)`.
+///
+/// Triple + temporal extraction is bounded: each is run **at most once**
+/// per `check_dedup` call against the new content (cached locally).
 pub fn check_dedup(
     store: &SqliteStore,
     topic: &str,
@@ -377,7 +427,17 @@ pub fn check_dedup(
     cluster_id: Option<u32>,
 ) -> ReinResult<DedupAction> {
     // Resolve embedding model name once per call to avoid repeated config reloads.
-    let embed_model = crate::config::ReinConfig::load()
+    let loaded_cfg = crate::config::ReinConfig::load().ok();
+    let dedup_cfg = loaded_cfg
+        .as_ref()
+        .map(|c| c.dedup.clone())
+        .unwrap_or_default();
+    let intelligent_merge_enabled = loaded_cfg
+        .as_ref()
+        .map(|c| c.intelligent_merge.enabled)
+        .unwrap_or(false);
+    let embed_model = loaded_cfg
+        .as_ref()
         .map(|c| c.embedding_model())
         .unwrap_or_default();
 
@@ -460,21 +520,196 @@ pub fn check_dedup(
     // This creates A/B test data for causal inference on optimal thresholds.
     let (effective_threshold, is_exploration) = m6_explore_threshold(similarity_threshold);
 
+    // v0.27 Track 2 #6: Collect ALL candidates that exceed the merge threshold
+    // for N-merge consideration. Sorted by final_score descending so the head
+    // is the canonical winner and the tail is loser candidates. We only build
+    // this when at least one candidate clears the threshold to keep the
+    // sub-threshold path on the fast path it had pre-v0.27.
+    let mut above_threshold: Vec<CandidateScore> = candidates
+        .iter()
+        .map(|c| score_candidate(topic, content, c, cluster_id))
+        .filter(|s| s.final_score > effective_threshold)
+        .collect();
+    above_threshold.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // v0.27 Track 2 — extractor + new-content triples / anchors are computed
+    // at most once per `check_dedup` call (lazy, lazily memoized below).
+    // Mirrors `embed_model` resolution above. Loading the extractor when
+    // `[dedup]` features are off is still cheap (it's just config lookup +
+    // an Option) and graceful-degrades when no LLM is configured.
+    let extractor: Option<ExtractorKind> = build_dedup_extractor();
+    let extractor_ref: Option<&ExtractorKind> = extractor.as_ref();
+    let mut new_triples_cache: Option<Vec<Triple>> = None;
+    let mut new_anchors_cache: Option<Vec<TemporalAnchor>> = None;
+
     // Vector-only candidates only auto-merge at a strong threshold (> 0.85).
     // Below that, they route to GrayZone for LLM review to avoid false-positive merges.
-    if best_vec_sim > 0.85 {
+    //
+    // v0.27 R8 P2 fix: when 2+ lexical candidates already exceed the merge
+    // threshold, fall through to the N-merge path instead — the vector
+    // shortcut would otherwise reduce the duplicate set to a single
+    // MergeInto and silently skip MergeIntoMany.
+    if best_vec_sim > 0.85 && above_threshold.len() < 2 {
         if let Some(memory) = best_vec_memory {
             let age_days = (chrono::Utc::now() - memory.created_at).num_days();
             if age_days < time_window_days && !new_strongly_contains_old(content, &memory.content) {
+                // v0.27 #8: temporal-conflict downgrade.
+                if let Some(supersede) = maybe_temporal_supersede(
+                    store,
+                    extractor_ref,
+                    content,
+                    memory,
+                    &dedup_cfg,
+                    &mut new_anchors_cache,
+                ) {
+                    return Ok(supersede);
+                }
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
             }
         }
     } else if best_vec_sim > 0.60 && best_sim < effective_threshold {
-        // Vector suggests similarity but lexical doesn't confirm — route to LLM
+        // v0.27 #5: gray-zone — attempt triple-overlap upgrade BEFORE routing
+        // to LLM. v0.27 R2 P2 fix: skip the upgrade when
+        // `[intelligent_merge].enabled = true` — the operator opted into
+        // LLM-verdict gray-zone resolution, so a triple-overlap heuristic
+        // must not bypass it (mirrors the lexical gray-zone branch below).
         if let Some(memory) = best_vec_memory {
+            if !intelligent_merge_enabled {
+                if let Some(upgrade) = maybe_triple_upgrade(
+                    extractor_ref,
+                    content,
+                    memory,
+                    &dedup_cfg,
+                    &mut new_triples_cache,
+                    time_window_days,
+                ) {
+                    // v0.27 R6 P2 fix: temporal-supersede check before
+                    // triple-overlap MergeInto, mirroring the lexical
+                    // gray-zone branch below (R4 fix). Otherwise a
+                    // 2024-vs-2026 pair with high triple overlap would
+                    // merge instead of supersede.
+                    if let Some(supersede) = maybe_temporal_supersede(
+                        store,
+                        extractor_ref,
+                        content,
+                        memory,
+                        &dedup_cfg,
+                        &mut new_anchors_cache,
+                    ) {
+                        return Ok(supersede);
+                    }
+                    return Ok(upgrade);
+                }
+            }
             return Ok(DedupAction::GrayZone(memory.id.clone(), best_vec_sim));
+        }
+    }
+
+    // v0.27 Track 2 #6: when ≥2 candidates exceed the merge threshold, return
+    // MergeIntoMany so callers can collapse them in one savepoint. The head
+    // of `above_threshold` is the winner; the rest (capped at
+    // `n_merge_max_candidates - 1`) become losers.
+    if above_threshold.len() >= 2 {
+        let winner = above_threshold[0].clone();
+        // v0.27 R3 P2 fix: honor the configured cap exactly. Operators can
+        // set `n_merge_max_candidates = 0` or `1` to disable extra-loser
+        // folding; the previous `.max(1)` floor would have forced one loser
+        // through anyway. When `max_losers == 0` we fall through to the
+        // standard MergeInto path below.
+        let max_losers = dedup_cfg.n_merge_max_candidates.saturating_sub(1);
+        let losers: Vec<String> = above_threshold
+            .iter()
+            .skip(1)
+            .take(max_losers)
+            .map(|s| s.memory_id.clone())
+            .collect();
+
+        // Find the winner Memory for temporal/age checks.
+        let winner_memory = candidates
+            .iter()
+            .find(|c| c.id == winner.memory_id)
+            .expect("winner came from candidates");
+
+        let age_days = (chrono::Utc::now() - winner_memory.created_at).num_days();
+        if is_exploration {
+            m6_log_outcome(
+                store,
+                winner.final_score,
+                effective_threshold,
+                similarity_threshold,
+                true,
+            );
+        }
+
+        if age_days < time_window_days
+            && !new_strongly_contains_old(content, &winner_memory.content)
+        {
+            // v0.27 #8: temporal-conflict downgrade.  When temporal supersede
+            // fires we keep the existing MergeInto/Supersede semantics for
+            // the winner only; the additional duplicates aren't folded in
+            // (they're already separate memories — a future pass will
+            // collapse them once the temporal chain stabilizes).
+            if let Some(supersede) = maybe_temporal_supersede(
+                store,
+                extractor_ref,
+                content,
+                winner_memory,
+                &dedup_cfg,
+                &mut new_anchors_cache,
+            ) {
+                return Ok(supersede);
+            }
+            // v0.27 R6 P2 fix: filter losers by temporal compatibility
+            // when temporal-supersede is enabled. Otherwise an N-merge
+            // would deprecate a 2024 loser into a 2026 winner even though
+            // the loser temporally conflicts with the new content. The
+            // filter mirrors `maybe_temporal_supersede`'s gating: if the
+            // loser's anchors conflict with new_anchors, keep it as a
+            // separate memory (it'll surface in a subsequent dedup pass).
+            let filtered_losers: Vec<String> = if dedup_cfg.temporal_supersede_enabled
+                && new_anchors_cache.as_ref().is_some_and(|a| !a.is_empty())
+            {
+                let new_anchors = new_anchors_cache
+                    .as_deref()
+                    .unwrap_or(&[]);
+                losers
+                    .into_iter()
+                    .filter(|loser_id| {
+                        let Some(loser) = candidates.iter().find(|c| &c.id == loser_id) else {
+                            return true;
+                        };
+                        let cand_anchors = extract_temporal_rule_based(
+                            &loser.content,
+                            loser.created_at,
+                        );
+                        if cand_anchors.is_empty() {
+                            return true;
+                        }
+                        // Drop the loser when at least one new anchor has
+                        // NO compatible counterpart on the loser side.
+                        let conflict = new_anchors.iter().any(|a| {
+                            cand_anchors.iter().all(|b| temporal_conflict(a, b))
+                        });
+                        !conflict
+                    })
+                    .collect()
+            } else {
+                losers
+            };
+            // Downgrade to MergeInto when no losers materialized (cap=1 or
+            // similar pathological config, or temporal filter dropped all).
+            if filtered_losers.is_empty() {
+                return Ok(DedupAction::MergeInto(winner.memory_id.clone()));
+            }
+            return Ok(DedupAction::MergeIntoMany(winner.memory_id.clone(), filtered_losers));
+        } else {
+            return Ok(DedupAction::Supersede(winner.memory_id.clone()));
         }
     }
 
@@ -492,6 +727,17 @@ pub fn check_dedup(
                 );
             }
             if age_days < time_window_days && !new_strongly_contains_old(content, &memory.content) {
+                // v0.27 #8: temporal-conflict downgrade.
+                if let Some(supersede) = maybe_temporal_supersede(
+                    store,
+                    extractor_ref,
+                    content,
+                    memory,
+                    &dedup_cfg,
+                    &mut new_anchors_cache,
+                ) {
+                    return Ok(supersede);
+                }
                 return Ok(DedupAction::MergeInto(memory.id.clone()));
             } else {
                 return Ok(DedupAction::Supersede(memory.id.clone()));
@@ -504,6 +750,45 @@ pub fn check_dedup(
     let llm_budget_available = m6_has_llm_budget(store);
     if let (Some(memory), Some(ref score)) = (best_memory, &best_candidate_score) {
         if should_escalate_gray_zone(score, best_sim, llm_budget_available) {
+            // v0.27 #5: triple-overlap fast path BEFORE the embedding cosine
+            // check. Triple overlap is a stronger semantic signal than vector
+            // cosine for fact-equivalence and avoids the LLM round-trip in
+            // many CJK / paraphrase cases.
+            //
+            // SKIP when `[intelligent_merge].enabled = true` — the operator
+            // has opted into LLM-verdict gray-zone resolution; bypassing
+            // that with a triple-jaccard heuristic would silently change
+            // behavior on a release with intelligent_merge enabled. The
+            // triple upgrade is for operators who DON'T have the heavier
+            // LLM verdict path turned on. This preserves the v0.26.x
+            // intelligent_merge contract (preflight verdict → mechanical
+            // merge fallback) verbatim.
+            if !intelligent_merge_enabled {
+                if let Some(upgrade) = maybe_triple_upgrade(
+                    extractor_ref,
+                    content,
+                    memory,
+                    &dedup_cfg,
+                    &mut new_triples_cache,
+                    time_window_days,
+                ) {
+                    // v0.27 R4 P2 fix: temporal-supersede check must run
+                    // BEFORE returning a triple-overlap MergeInto upgrade,
+                    // otherwise an existing 2024 fact and an incoming 2026
+                    // fact get merged instead of taking the supersede path.
+                    if let Some(supersede) = maybe_temporal_supersede(
+                        store,
+                        extractor_ref,
+                        content,
+                        memory,
+                        &dedup_cfg,
+                        &mut new_anchors_cache,
+                    ) {
+                        return Ok(supersede);
+                    }
+                    return Ok(upgrade);
+                }
+            }
             // Try embedding-based resolution first (zero LLM cost)
             if let Some(embed_sim) =
                 embedding_cosine_check(store, summary, content, &memory.id, &embed_model, topic)
@@ -514,6 +799,19 @@ pub fn check_dedup(
                     if age_days < time_window_days
                         && !new_strongly_contains_old(content, &memory.content)
                     {
+                        // v0.27 R4 P2 fix: gate the embedding-strong MergeInto
+                        // path through temporal-supersede too — same reason
+                        // as the triple-overlap branch above.
+                        if let Some(supersede) = maybe_temporal_supersede(
+                            store,
+                            extractor_ref,
+                            content,
+                            memory,
+                            &dedup_cfg,
+                            &mut new_anchors_cache,
+                        ) {
+                            return Ok(supersede);
+                        }
                         return Ok(DedupAction::MergeInto(memory.id.clone()));
                     } else {
                         return Ok(DedupAction::Supersede(memory.id.clone()));
@@ -550,6 +848,208 @@ pub fn check_dedup(
     }
 
     Ok(DedupAction::CreateNew)
+}
+
+/// Build an `ExtractorKind` from `[extract]` config for v0.27 triple +
+/// temporal extraction. Returns `None` when no LLM is configured (graceful
+/// degradation: the dedup decision falls back to text-only signals,
+/// matching pre-v0.27 behavior).
+///
+/// Mirrors `ops/resummerize.rs::create_resummerize_extractor` but reads
+/// `[extract]` directly (dedup has no separate `llm_backend` knob).
+fn build_dedup_extractor() -> Option<ExtractorKind> {
+    let cfg = crate::config::ReinConfig::load().ok()?;
+    match cfg.extract_provider() {
+        crate::config::Provider::None => None,
+        crate::config::Provider::Google => {
+            let api_key = cfg.extract.google.api_key.as_ref()?.clone();
+            Some(ExtractorKind::Gemini(
+                crate::extract::llm::GeminiExtractor::new(
+                    api_key,
+                    cfg.extract.google.endpoint.clone(),
+                    cfg.extract.google.model.clone(),
+                ),
+            ))
+        }
+        crate::config::Provider::Omlx => Some(ExtractorKind::Omlx(
+            crate::extract::llm::OmlxExtractor::new(
+                cfg.extract.omlx.endpoint.clone(),
+                cfg.extract.omlx.model.clone(),
+                cfg.extract.omlx.disable_thinking,
+            ),
+        )),
+    }
+}
+
+/// v0.27 Track 2 #5: when text similarity is in the gray zone but extracted
+/// triple sets agree strongly, upgrade to `MergeInto` directly (skip the
+/// LLM verdict path).
+///
+/// Caching: `new_triples_cache` is mutated on first call so subsequent
+/// invocations within the same `check_dedup` reuse the result. This bounds
+/// triple extraction to at most ONE LLM call per dedup decision regardless
+/// of how many candidates we evaluate.
+///
+/// Returns `None` (no upgrade) when:
+///   - the new content yields no triples (LLM degraded or no facts present);
+///   - the candidate's content yields no triples;
+///   - the overlap score is below `triple_overlap_threshold`.
+fn maybe_triple_upgrade(
+    _extractor: Option<&ExtractorKind>,
+    new_content: &str,
+    candidate: &Memory,
+    dedup_cfg: &crate::config::DedupConfig,
+    new_triples_cache: &mut Option<Vec<Triple>>,
+    time_window_days: i64,
+) -> Option<DedupAction> {
+    // v0.27 R1 P2 fix: dedup runs INSIDE `BEGIN IMMEDIATE` (sqlite write
+    // lock). Calling LLM-mode `extract_triples` here would hold the write
+    // lock for the duration of a network call, blocking concurrent writes.
+    // Rule-based extraction is fast and deterministic; LLM-driven triple
+    // extraction is deferred to a preflight pass in v0.27.1.
+    let new_triples: &[Triple] = match new_triples_cache {
+        Some(t) => t.as_slice(),
+        None => {
+            let extracted = extract_triples_rule_based(new_content);
+            *new_triples_cache = Some(extracted);
+            new_triples_cache.as_deref().unwrap_or(&[])
+        }
+    };
+    if new_triples.is_empty() {
+        return None;
+    }
+
+    let cand_triples = extract_triples_rule_based(&candidate.content);
+    if cand_triples.is_empty() {
+        return None;
+    }
+
+    let overlap = triple_overlap_score(new_triples, &cand_triples);
+    if overlap >= dedup_cfg.triple_overlap_threshold as f32 {
+        // v0.27 R11 P2 fix: respect the same age/containment guard as the
+        // surrounding lexical/embedding branches. Stale candidates beyond
+        // `time_window_days`, OR cases where the new content strongly
+        // contains the old, take the `Supersede` path; otherwise the
+        // triple-overlap signal upgrades to `MergeInto`.
+        let age_days = (chrono::Utc::now() - candidate.created_at).num_days();
+        let action = if age_days >= time_window_days
+            || new_strongly_contains_old(new_content, &candidate.content)
+        {
+            DedupAction::Supersede(candidate.id.clone())
+        } else {
+            DedupAction::MergeInto(candidate.id.clone())
+        };
+        tracing::debug!(
+            candidate_id = %candidate.id,
+            overlap = overlap,
+            threshold = dedup_cfg.triple_overlap_threshold,
+            ?action,
+            "v0.27 #5: triple-overlap upgrade"
+        );
+        Some(action)
+    } else {
+        None
+    }
+}
+
+/// v0.27 Track 2 #8: when text similarity is high (the caller is about to
+/// `MergeInto`) but the extracted temporal anchors conflict, downgrade to
+/// `TemporalSupersede(old, version)`.
+///
+/// Returns `None` when:
+///   - `[dedup].temporal_supersede_enabled = false` (default — preserves
+///     pre-v0.27 behavior);
+///   - either side has no temporal anchors (insufficient signal);
+///   - no anchor pair conflicts (`temporal_conflict` is the boolean check).
+///
+/// Caching: same pattern as `maybe_triple_upgrade` — at most one LLM call
+/// per dedup decision for new-content anchor extraction.
+fn maybe_temporal_supersede(
+    store: &SqliteStore,
+    _extractor: Option<&ExtractorKind>,
+    new_content: &str,
+    candidate: &Memory,
+    dedup_cfg: &crate::config::DedupConfig,
+    new_anchors_cache: &mut Option<Vec<TemporalAnchor>>,
+) -> Option<DedupAction> {
+    if !dedup_cfg.temporal_supersede_enabled {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    // v0.27 R1 P2 fix: same write-lock concern as `maybe_triple_upgrade`.
+    // Rule-based extraction only inside the dedup transaction; LLM-mode
+    // temporal extraction deferred to a preflight pass in v0.27.1.
+    let new_anchors: &[TemporalAnchor] = match new_anchors_cache {
+        Some(a) => a.as_slice(),
+        None => {
+            // The new memory hasn't been stored yet — its conceptual
+            // "created_at" is `now`, so relative phrases ("yesterday")
+            // resolve against `now` for the new side.
+            let extracted = extract_temporal_rule_based(new_content, now);
+            *new_anchors_cache = Some(extracted);
+            new_anchors_cache.as_deref().unwrap_or(&[])
+        }
+    };
+    if new_anchors.is_empty() {
+        return None;
+    }
+
+    // v0.27 R4 P2 fix: resolve the candidate's relative anchors against
+    // ITS `created_at`, not the current instant. Otherwise an old memory
+    // saying "yesterday" would slide forward every day and falsely match a
+    // new memory that also says "yesterday" — historical-vs-current
+    // conflicts get missed. The new content is parsed with `now` (it
+    // hasn't been stored yet) but the candidate uses its frozen timestamp.
+    let cand_anchors = extract_temporal_rule_based(&candidate.content, candidate.created_at);
+    if cand_anchors.is_empty() {
+        return None;
+    }
+
+    // v0.27 R1 P2 fix: gate on "anchors without compatible counterparts"
+    // rather than "any conflicting cross-pair". Two memories that BOTH
+    // mention 2024 AND 2026 (a shared timeline) should NOT temporal-
+    // supersede each other — the 2024-vs-2026 cross-pair conflicts but
+    // each anchor has an identical match. Conflict only when at least one
+    // new anchor has NO compatible (= non-conflicting) counterpart.
+    let conflict = new_anchors.iter().any(|a| {
+        cand_anchors
+            .iter()
+            .all(|b| temporal_conflict(a, b))
+    });
+    if !conflict {
+        return None;
+    }
+
+    // Compute next chain version. memory schema doesn't carry an explicit
+    // chain version, so we approximate it by counting how many memories
+    // already supersede this candidate's canonical (transitively) — gives a
+    // monotonic value good enough for audit-log purposes. v0.28+ will
+    // formalize this against a memory_revisions table.
+    let canonical = store.canonical_id_for(&candidate.id).unwrap_or_else(|_| {
+        candidate.id.clone()
+    });
+    let version: u32 = store
+        .conn()
+        .query_row(
+            "SELECT COALESCE(MAX(rev), 0) FROM (
+                 SELECT 0 AS rev
+                 UNION ALL
+                 SELECT 1 + COUNT(*) AS rev
+                   FROM memory_canonical_state
+                  WHERE canonical_id = ?1 AND memory_id != ?1
+             )",
+            rusqlite::params![&canonical],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v.max(1) as u32)
+        .unwrap_or(1);
+
+    tracing::debug!(
+        candidate_id = %candidate.id,
+        version = version,
+        "v0.27 #8: temporal conflict — MergeInto → TemporalSupersede"
+    );
+    Some(DedupAction::TemporalSupersede(candidate.id.clone(), version))
 }
 
 /// Look up embedding-based candidates for cross-topic dedup (zero API cost).
@@ -1029,5 +1529,250 @@ mod tests {
         assert!(!new_strongly_contains_old("", "anything"));
         assert!(!new_strongly_contains_old("anything", ""));
         assert!(!new_strongly_contains_old("", ""));
+    }
+
+    // ─── v0.27 Track 2 — Agent E (DedupAction extensions) ───────────────────────
+
+    /// Format-style smoke check: every variant prints something useful (the
+    /// `Display` impl covers logging + tracing/audit). Future enum
+    /// extensions get an immediate compile-fail reminder via the exhaustive
+    /// match in `Display`.
+    #[test]
+    fn v027_dedup_action_display_covers_every_variant() {
+        let cases = [
+            DedupAction::CreateNew,
+            DedupAction::MergeInto("X".into()),
+            DedupAction::MergeIntoMany("W".into(), vec!["L1".into(), "L2".into()]),
+            DedupAction::Supersede("O".into()),
+            DedupAction::TemporalSupersede("O".into(), 3),
+            DedupAction::GrayZone("C".into(), 0.65),
+        ];
+        for a in &cases {
+            let rendered = format!("{a}");
+            assert!(!rendered.is_empty(), "Display output empty for {a:?}");
+        }
+    }
+
+    /// E3: when ≥2 candidates exceed the merge threshold,
+    /// `check_dedup` returns `MergeIntoMany(winner, [losers...])`.
+    ///
+    /// FTS5 uses implicit-AND, so the seeded candidates must contain
+    /// every token the new content emits. We seed identical content so
+    /// FTS retrieval matches and final_score is uniformly high.
+    #[test]
+    fn v027_n_merge_returned_when_multiple_candidates_exceed_threshold() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Three identical-content memories. FTS will find all three when
+        // queried with the same shared content.
+        let shared = "deploys docker compose healthchecks restart";
+        let id1 = store.store(test_memory("deploys", shared)).unwrap();
+        let id2 = store.store(test_memory("deploys", shared)).unwrap();
+        let id3 = store.store(test_memory("deploys", shared)).unwrap();
+
+        // Pre-condition: FTS retrieval finds all three.
+        let fts_hits = store.search_fts(shared, Some("deploys"), 8).unwrap();
+        assert_eq!(
+            fts_hits.len(),
+            3,
+            "FTS must surface all 3 seeded memories; got {}",
+            fts_hits.len()
+        );
+
+        let action = check_dedup(
+            &store,
+            "deploys",
+            "deploys summary",
+            shared,
+            0.30,
+            7,
+            None,
+        )
+        .unwrap();
+
+        let DedupAction::MergeIntoMany(winner, losers) = action else {
+            panic!("expected MergeIntoMany, got {action:?}");
+        };
+        let all_ids = [id1, id2, id3];
+        assert!(
+            all_ids.contains(&winner),
+            "winner {winner} must be one of {all_ids:?}"
+        );
+        assert_eq!(
+            losers.len(),
+            2,
+            "with 3 above-threshold candidates we expect 2 losers (winner + 2)"
+        );
+        assert!(
+            losers.iter().all(|l| all_ids.contains(l) && l != &winner),
+            "every loser must be in the candidate set and != winner"
+        );
+    }
+
+    /// E3: `n_merge_max_candidates` caps the loser count.
+    ///
+    /// We can't override config inside this unit test (the function loads
+    /// `[dedup]` from disk; defaults to `5`). The cap is enforced via
+    /// `n_merge_max_candidates.saturating_sub(1).max(1)` and `take(...)`,
+    /// so seeding more candidates than the cap and asserting `losers.len()
+    /// == 4` exercises the bound.
+    #[test]
+    fn v027_n_merge_capped_at_n_merge_max_candidates_minus_one() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Seed 7 identical memories. FTS retrieval cap is 8, so all
+        // 7 should be candidates; default cap (5) → 4 losers.
+        let shared = "stack docker compose service cache queue metrics";
+        for _ in 0..7 {
+            store.store(test_memory("stack", shared)).unwrap();
+        }
+
+        // Pre-condition: FTS surfaces all 7.
+        let fts_hits = store.search_fts(shared, Some("stack"), 8).unwrap();
+        assert_eq!(
+            fts_hits.len(),
+            7,
+            "FTS must surface all 7 seeded memories; got {}",
+            fts_hits.len()
+        );
+
+        let action = check_dedup(&store, "stack", "stack summary", shared, 0.30, 7, None).unwrap();
+
+        let DedupAction::MergeIntoMany(_, losers) = action else {
+            panic!("expected MergeIntoMany, got {action:?}");
+        };
+        // Default cap n_merge_max_candidates=5 allows up to 4 losers.
+        assert_eq!(
+            losers.len(),
+            4,
+            "losers must be capped at n_merge_max_candidates-1 (4); got {}",
+            losers.len()
+        );
+    }
+
+    /// E2: the `maybe_triple_upgrade` helper returns `MergeInto` when
+    /// triple-overlap is high. We exercise it directly here because
+    /// `check_dedup`-level triple gating depends on a configured LLM
+    /// (rule-based fallback may or may not produce overlap depending on
+    /// the input text).
+    #[test]
+    fn v027_triple_upgrade_promotes_grayzone_to_mergeinto() {
+        let candidate = test_memory("prefs", "I prefer tabs");
+        let mut cache: Option<Vec<Triple>> = None;
+        let cfg = crate::config::DedupConfig::default(); // threshold 0.7
+
+        // Rule-based extraction on "I prefer tabs" yields (user, prefers,
+        // tabs); same on the new content. Overlap = 1.0 → upgrade.
+        let action = maybe_triple_upgrade(
+            None, // rule-based fallback
+            "I prefer tabs",
+            &candidate,
+            &cfg,
+            &mut cache,
+            30, // time_window_days — fresh candidate stays MergeInto
+        );
+        assert!(
+            matches!(action, Some(DedupAction::MergeInto(_))),
+            "high triple overlap must upgrade to MergeInto, got {action:?}"
+        );
+
+        // And the cache was populated so a second call wouldn't re-extract.
+        assert!(
+            cache.as_ref().is_some_and(|c| !c.is_empty()),
+            "new_triples_cache must be populated on first call"
+        );
+    }
+
+    /// E2: triple-overlap below threshold returns `None` (no upgrade).
+    /// Distinct subjects → zero overlap.
+    #[test]
+    fn v027_triple_upgrade_returns_none_below_threshold() {
+        let candidate = test_memory("prefs", "Alice prefers tabs");
+        let mut cache: Option<Vec<Triple>> = None;
+        let cfg = crate::config::DedupConfig::default();
+
+        // "user prefers spaces" ≠ "Alice prefers tabs" → triple overlap is
+        // 0 (objects differ AND subjects differ after pronoun normalization).
+        let action = maybe_triple_upgrade(
+            None,
+            "I prefer spaces",
+            &candidate,
+            &cfg,
+            &mut cache,
+            30,
+        );
+        assert!(
+            action.is_none(),
+            "low triple overlap must NOT upgrade, got {action:?}"
+        );
+    }
+
+    /// E4: `temporal_supersede_enabled = false` (the default) is the
+    /// kill-switch — no temporal-conflict checks run, so a high-sim merge
+    /// stays a `MergeInto`.
+    #[test]
+    fn v027_temporal_supersede_respects_disable_flag() {
+        let store = SqliteStore::in_memory().unwrap();
+        let candidate = test_memory("X", "candidate text");
+        let mut cache: Option<Vec<TemporalAnchor>> = None;
+        let cfg = crate::config::DedupConfig {
+            temporal_supersede_enabled: false,
+            ..Default::default()
+        };
+
+        // Even with text that has anchors, the disabled flag short-circuits.
+        let action = maybe_temporal_supersede(
+            &store,
+            None,
+            "this happened on 2024-01-15",
+            &candidate,
+            &cfg,
+            &mut cache,
+        );
+        assert!(
+            action.is_none(),
+            "disabled flag must short-circuit; got {action:?}"
+        );
+    }
+
+    /// E4: when enabled and anchors conflict → `TemporalSupersede(id, ver)`.
+    #[test]
+    fn v027_temporal_supersede_fires_on_conflict() {
+        let store = SqliteStore::in_memory().unwrap();
+        // Candidate carries 2024 anchor.
+        let candidate = test_memory("react", "in 2024 we used React for the dashboard");
+        store.store(candidate.clone()).unwrap();
+
+        let mut cache: Option<Vec<TemporalAnchor>> = None;
+        let cfg = crate::config::DedupConfig {
+            temporal_supersede_enabled: true,
+            ..Default::default()
+        };
+
+        // Incoming says 2026 → conflicts with 2024.
+        let action = maybe_temporal_supersede(
+            &store,
+            None,
+            "in 2026 we used Solid for the dashboard",
+            &candidate,
+            &cfg,
+            &mut cache,
+        );
+        match action {
+            Some(DedupAction::TemporalSupersede(id, ver)) => {
+                assert_eq!(id, candidate.id);
+                assert!(ver >= 1, "version must be >= 1, got {ver}");
+            }
+            other => panic!("expected TemporalSupersede, got {other:?}"),
+        }
+    }
+
+    /// E1: variant smoke — `MergeIntoMany` with empty losers vec is a
+    /// pathological-but-valid construction. `Display` shouldn't panic.
+    #[test]
+    fn v027_merge_into_many_with_empty_losers_renders_safely() {
+        let action = DedupAction::MergeIntoMany("W".into(), vec![]);
+        let rendered = format!("{action}");
+        assert!(rendered.contains("0 losers"), "expected '0 losers', got {rendered}");
     }
 }

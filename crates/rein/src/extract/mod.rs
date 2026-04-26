@@ -4,6 +4,8 @@ pub mod intelligent_merge;
 pub mod llm;
 pub mod patterns;
 pub mod postprocess;
+pub mod temporal;
+pub mod triples;
 
 pub use dedup::{
     check_dedup, containment_similarity, extract_keywords_from_text, jaccard_similarity,

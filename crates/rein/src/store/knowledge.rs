@@ -223,6 +223,177 @@ impl SqliteStore {
         Ok(report)
     }
 
+    /// v0.27 Track 2 #6: atomic N-memory merge.
+    ///
+    /// Fold every `loser_ids[i]` into the canonical of `winner_id` by:
+    ///   1. Writing each loser's content as a `memory_evidence` row pointing
+    ///      at the winner's canonical id (so provenance survives — satisfies
+    ///      Lossless Compression Contract INV-1 / INV-3).
+    ///   2. Marking each loser `superseded_by = winner_id` + `status =
+    ///      'deprecated'` (matches the existing `apply_evolution`
+    ///      deprecation path; recall filters `status IN ('active', 'updated')`
+    ///      so deprecated rows fall out of the standard read paths but
+    ///      remain reachable via `canonical_id_for`).
+    ///   3. Deleting each loser's `sqlite-vec` embedding in the SAME
+    ///      savepoint (mirrors `apply_evolution` invariant — vec is the
+    ///      only side-index that's transactional).
+    ///
+    /// External (non-transactional) side-indexes — Tantivy + HNSW — are
+    /// scrubbed AFTER the savepoint releases. A failure mid-savepoint leaves
+    /// them untouched, matching the v0.26.2 R3 F2 invariant for
+    /// `apply_evolution`.
+    ///
+    /// Atomicity: a partial fail (e.g. 3 of 5 losers committed before a 4th
+    /// fails) rolls back ALL N losers via SAVEPOINT. The winner's MergeInto
+    /// is performed BEFORE this call by `store_with_dedup_resolved` and is
+    /// not subject to this savepoint.
+    pub fn apply_n_merge(&self, winner_id: &str, loser_ids: &[String]) -> ReinResult<usize> {
+        if loser_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let canonical_id = self.canonical_id_for(winner_id)?;
+
+        // Snapshot loser memories BEFORE the savepoint. We need their content
+        // for evidence rows; reading them inside the savepoint is fine but
+        // hoisting the loads keeps the write window short.
+        let mut losers: Vec<Memory> = Vec::with_capacity(loser_ids.len());
+        for id in loser_ids {
+            if id == winner_id || id == &canonical_id {
+                // Defensive: never let the winner sneak into the loser list.
+                continue;
+            }
+            match self.get(id) {
+                Ok(m) if m.superseded_by.is_none() => losers.push(m),
+                Ok(_) => {
+                    tracing::debug!(loser = %id, "v0.27 #6: skipping already-superseded loser");
+                }
+                Err(e) => {
+                    tracing::debug!(loser = %id, error = %e, "v0.27 #6: skipping unloadable loser");
+                }
+            }
+        }
+        if losers.is_empty() {
+            return Ok(0);
+        }
+
+        self.conn
+            .execute_batch("SAVEPOINT n_merge")
+            .map_err(crate::types::ReinError::Database)?;
+
+        let mut applied: Vec<String> = Vec::new();
+        let result = (|| -> ReinResult<usize> {
+            for loser in &losers {
+                // 1. Evidence row — provenance preservation. Same shape as
+                // `snapshot_memory_as_evidence` but inlined to keep the
+                // savepoint atomic across all losers (snapshot_memory_as_evidence
+                // calls refresh_canonical_state which we want to defer until
+                // after RELEASE).
+                self.add_memory_evidence(MemoryEvidence {
+                    id: String::new(),
+                    canonical_id: canonical_id.clone(),
+                    memory_id: Some(loser.id.clone()),
+                    source_topic: loser.topic.clone(),
+                    summary: loser.summary.clone(),
+                    content: loser.content.clone(),
+                    keywords: loser.keywords.clone(),
+                    source: loser.source,
+                    created_at: loser.created_at,
+                    imported_at: Utc::now(),
+                })?;
+
+                // 2. Mark superseded — pointer + status flip + canonical
+                // remapping. mark_superseded itself opens a nested savepoint
+                // which is fine (SQLite SAVEPOINTs nest).
+                self.mark_superseded(&loser.id, winner_id)?;
+                self.conn.execute(
+                    "UPDATE memories SET status = 'deprecated', updated_at = ?2 WHERE id = ?1",
+                    rusqlite::params![loser.id, Utc::now().to_rfc3339()],
+                )?;
+
+                // v0.27 R12 P2 fix: record a dedup_decisions ledger row so
+                // `/api/dedup_decisions` can explain why each loser was
+                // deprecated (mirrors the MergeInto/Supersede paths in
+                // store_with_dedup at sqlite.rs:2168/2199). Loser→winner
+                // duplicate, auto-decided by the N-merge orchestrator.
+                let _ = self.record_dedup_decision(crate::types::DedupDecision {
+                    id: String::new(),
+                    winner_id: Some(winner_id.to_string()),
+                    loser_id: Some(loser.id.clone()),
+                    canonical_id: Some(canonical_id.clone()),
+                    lexical_score: None,
+                    embedding_score: None,
+                    relation: crate::types::DedupRelation::Duplicate,
+                    confidence: 0.9,
+                    reason: "n_merge".to_string(),
+                    operator: "auto".to_string(),
+                    reversible: true,
+                    merged_summary: Some(loser.summary.clone()),
+                    novel_facts: Vec::new(),
+                    conflict_detected: false,
+                    payload: None,
+                    created_at: Utc::now(),
+                });
+
+                // 3. sqlite-vec delete inside savepoint — vec is
+                // transactional (vec0 virtual table), so a rollback also
+                // reverts the embedding removal.
+                crate::store::vec::delete_embedding(&self.conn, &loser.id)?;
+
+                applied.push(loser.id.clone());
+            }
+            // Refresh canonical state once at the end; the support_count /
+            // source_diversity recomputation reflects every new evidence row
+            // we just wrote.
+            self.refresh_canonical_state(&canonical_id)?;
+            Ok(applied.len())
+        })();
+
+        match &result {
+            Ok(_) => {
+                self.conn
+                    .execute_batch("RELEASE n_merge")
+                    .map_err(crate::types::ReinError::Database)?;
+                // v0.27 R9 P2 fix: enqueue Tantivy/HNSW scrub on the
+                // store's deferred queue instead of running it
+                // synchronously. `store_with_dedup` drains this queue
+                // AFTER its outer `BEGIN IMMEDIATE` commits (and clears it
+                // on rollback), so the non-transactional side-index work
+                // is bounded to durable DB state.
+                //
+                // v0.27 R10 P2 fix: when there is no outer transaction
+                // (direct callers — integration tests, future ops),
+                // RELEASE n_merge has just made our changes durable, so
+                // we drain synchronously instead of stranding loser ids
+                // in the queue forever (`store_with_dedup` is the only
+                // caller that drains, so a direct caller would otherwise
+                // leak the queue indefinitely). `Connection::is_autocommit`
+                // is true exactly when no explicit BEGIN is active.
+                if self.conn.is_autocommit() {
+                    for id in &applied {
+                        self.remove_from_tantivy(id);
+                        self.remove_from_hnsw(id);
+                    }
+                } else {
+                    let mut queue = self.pending_index_scrub.borrow_mut();
+                    for id in &applied {
+                        queue.push(id.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    winner = %winner_id,
+                    error = %e,
+                    "v0.27 #6: apply_n_merge rolling back; no losers committed"
+                );
+                let _ = self.conn.execute_batch("ROLLBACK TO n_merge");
+                let _ = self.conn.execute_batch("RELEASE n_merge");
+            }
+        }
+        result
+    }
+
     /// Memory Evolution: new memory can refine or supersede similar old memories.
     /// - sim > 0.8 → supersede (mark old as superseded_by new_id)
     /// - 0.5 < sim <= 0.8 → refine (append new content to old memory)

@@ -1,7 +1,8 @@
 use crate::config::{Provider, ReinConfig};
 use crate::extract::llm::{strip_code_fences, ExtractorKind};
 use crate::store::adaptive::{
-    emit_event, AdaptiveState, EventType, FeedbackEvent, RefreshSample,
+    concept_summary_bucket_key, emit_event, AdaptiveState, EventType, FeedbackEvent,
+    RefreshSample, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
 };
 use crate::store::memoir::{row_to_concept, should_refresh_living_summary};
 use crate::store::SqliteStore;
@@ -453,6 +454,107 @@ pub fn call_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinResult<Stri
     }
 }
 
+// ── v0.27 ARS Cap A feedback loop: per-query gate ───────────────────────────
+//
+// Mirrors `ops/recall_synthesis::decide_synthesize` for the Cap A surface.
+// Decision logic is identical (operator override > cluster gate > cold-start
+// fallback). Re-stated rather than parameterised because Cap A and Cap B are
+// independent feature flags that may diverge over time
+// (`feedback_no_subjective_params`).
+
+/// Reason a per-query Cap-A gate skipped. Used inside
+/// [`ConceptSummaryDecision::Skip`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConceptSummarySkipReason {
+    /// `[ars].concept_summary_enabled = false` — operator opted out
+    /// globally.
+    OperatorDisabled,
+    /// Per-query adaptive decision: cluster's `useful_rate` is below
+    /// [`CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD`].
+    AdaptiveDecision,
+}
+
+/// Per-query adaptive Cap-A decision. `Yes` flows into the existing
+/// concept-summary surface; `Skip(reason)` short-circuits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConceptSummaryDecision {
+    Yes,
+    Skip(ConceptSummarySkipReason),
+}
+
+/// Per-query Cap-A gate. Decides whether to surface a concept living-summary
+/// to the user based on the learned `(cluster_id, query_type)` `useful_rate`.
+///
+/// **Cold-start fallback**: when `global_enabled` is `true` but the adaptive
+/// state cannot disambiguate (no `cluster_id`, no adaptive state snapshot,
+/// no per-cluster bucket yet, or per-cluster events < `cold_start_n`), the
+/// function returns [`ConceptSummaryDecision::Yes`] — i.e. "behave like the
+/// pre-feedback v0.26.x default and let the surface render". The
+/// global flag is binding only when an operator explicitly disabled Cap A.
+///
+/// When `global_enabled` is `false`, the function ALWAYS returns
+/// `Skip(OperatorDisabled)` — operator override wins over any adaptive
+/// signal.
+///
+/// Bucket key for `by_cluster.get(...)` is built via the canonical
+/// [`concept_summary_bucket_key`] helper from `store::adaptive`, matching the
+/// `"{cid}|{qtype}"` format documented on
+/// [`crate::store::adaptive::ConceptSummaryFeedbackState::by_cluster`]. Both
+/// sides reuse the same helper so they cannot drift; mismatch would produce a
+/// silent dead-code path (the v0.26.0 D-direction bug v0.26.2 fixed for Cap B).
+///
+/// Pure function — no IO, no allocation beyond the cluster-key string.
+pub fn decide_concept_summary_quality(
+    global_enabled: bool,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    adaptive_state: Option<&AdaptiveState>,
+    cold_start_n: u64,
+) -> ConceptSummaryDecision {
+    // Operator override wins. Even with rich adaptive data, if the operator
+    // disabled the global flag, the Cap-A surface is off.
+    if !global_enabled {
+        return ConceptSummaryDecision::Skip(ConceptSummarySkipReason::OperatorDisabled);
+    }
+
+    // Cold-start ladder: each missing piece falls back to "Yes" (matches
+    // pre-feedback Cap A behaviour). The gate must NEVER skip silently just
+    // because the per-query data is missing.
+    //
+    // `cluster_id = None` short-circuits to Yes — the bucket helper supports
+    // a `-1` "no cluster" key, but we deliberately do NOT route the gate
+    // through it: the global `-1` bucket aggregates events across ALL queries
+    // that lacked a cluster (different queries, different characteristics),
+    // so its `useful_rate` is too noisy to gate individual recalls on. The
+    // global bucket is preserved for the consumer-side `/api/adaptive`
+    // rollup, not for runtime gating.
+    let Some(cid) = cluster_id else {
+        return ConceptSummaryDecision::Yes;
+    };
+    let Some(state) = adaptive_state else {
+        return ConceptSummaryDecision::Yes;
+    };
+    let Some(cs_state) = state.concept_summary_feedback_stats.as_ref() else {
+        return ConceptSummaryDecision::Yes;
+    };
+    let key = concept_summary_bucket_key(Some(cid), query_type);
+    let Some(cluster) = cs_state.by_cluster.get(&key) else {
+        return ConceptSummaryDecision::Yes;
+    };
+    if cluster.viewed_count < cold_start_n {
+        return ConceptSummaryDecision::Yes;
+    }
+
+    // Per-cluster gate: skip if learned useful_rate is below the bootstrap
+    // threshold (cluster has acquired enough events to disagree with the
+    // global default).
+    if cluster.useful_rate >= CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD {
+        ConceptSummaryDecision::Yes
+    } else {
+        ConceptSummaryDecision::Skip(ConceptSummarySkipReason::AdaptiveDecision)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +740,221 @@ mod tests {
             .expect("concept exists");
         assert_eq!(after.living_summary.as_deref(), Some("winner"));
         assert_eq!(after.living_summary_source_revision, Some(5));
+    }
+
+    // ── v0.27 Cap A feedback loop: decide_concept_summary_quality tests ──
+
+    use crate::store::adaptive::{
+        ClusterConceptSummaryStats, ConceptSummaryFeedbackState, CONCEPT_SUMMARY_COLD_START_N,
+    };
+    use std::collections::HashMap;
+
+    fn cs_state_with_bucket(
+        cluster_id: i64,
+        query_type: &str,
+        bucket: ClusterConceptSummaryStats,
+    ) -> AdaptiveState {
+        let mut by_cluster = HashMap::new();
+        by_cluster.insert(concept_summary_bucket_key(Some(cluster_id), query_type), bucket);
+        AdaptiveState {
+            concept_summary_feedback_stats: Some(ConceptSummaryFeedbackState {
+                by_cluster,
+                ..ConceptSummaryFeedbackState::default()
+            }),
+            ..AdaptiveState::default()
+        }
+    }
+
+    #[test]
+    fn decide_concept_summary_cold_start_no_state_returns_yes() {
+        let decision = decide_concept_summary_quality(
+            true,
+            Some(42),
+            "Semantic",
+            None,
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(decision, ConceptSummaryDecision::Yes);
+    }
+
+    #[test]
+    fn decide_concept_summary_cold_start_no_feedback_state_returns_yes() {
+        let state = AdaptiveState::default(); // concept_summary_feedback_stats: None
+        let decision = decide_concept_summary_quality(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(decision, ConceptSummaryDecision::Yes);
+    }
+
+    #[test]
+    fn decide_concept_summary_cold_start_no_cluster_id_returns_yes() {
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: 100,
+                useful_rate: 0.0, // would skip if it reached the gate
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision = decide_concept_summary_quality(
+            true,
+            None, // no cluster_id → cold-start fallback
+            "Semantic",
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(decision, ConceptSummaryDecision::Yes);
+    }
+
+    #[test]
+    fn decide_concept_summary_cold_start_insufficient_samples_returns_yes() {
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: CONCEPT_SUMMARY_COLD_START_N - 1,
+                useful_rate: 0.0, // would skip if it reached the gate
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision = decide_concept_summary_quality(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(decision, ConceptSummaryDecision::Yes);
+    }
+
+    #[test]
+    fn decide_concept_summary_warm_cluster_above_threshold_returns_yes() {
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: 100,
+                useful_rate: 0.7,
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision = decide_concept_summary_quality(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(decision, ConceptSummaryDecision::Yes);
+    }
+
+    #[test]
+    fn decide_concept_summary_warm_cluster_below_threshold_returns_skip_adaptive() {
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: 100,
+                useful_rate: 0.2,
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision = decide_concept_summary_quality(
+            true,
+            Some(42),
+            "Semantic",
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(
+            decision,
+            ConceptSummaryDecision::Skip(ConceptSummarySkipReason::AdaptiveDecision)
+        );
+    }
+
+    #[test]
+    fn decide_concept_summary_operator_disabled_overrides_adaptive() {
+        // Even with rich adaptive data, operator-off wins.
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: 100,
+                useful_rate: 0.99, // would say Yes if it reached the gate
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision = decide_concept_summary_quality(
+            false, // operator disabled
+            Some(42),
+            "Semantic",
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(
+            decision,
+            ConceptSummaryDecision::Skip(ConceptSummarySkipReason::OperatorDisabled)
+        );
+    }
+
+    #[test]
+    fn decide_concept_summary_query_type_partition_isolates_buckets() {
+        // Episodic bucket has bad rate, but query is Semantic — that bucket
+        // doesn't exist yet → cold-start Yes. Confirms the per-query partition.
+        let state = cs_state_with_bucket(
+            42,
+            "Episodic",
+            ClusterConceptSummaryStats {
+                viewed_count: 100,
+                useful_rate: 0.1,
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision = decide_concept_summary_quality(
+            true,
+            Some(42),
+            "Semantic", // different query_type
+            Some(&state),
+            CONCEPT_SUMMARY_COLD_START_N,
+        );
+        assert_eq!(
+            decision,
+            ConceptSummaryDecision::Yes,
+            "different query_type must route to its own bucket (cold-start Yes)"
+        );
+    }
+
+    #[test]
+    fn decide_concept_summary_custom_cold_start_n() {
+        // With cold_start_n = 2, viewed_count = 5 is past the threshold and
+        // useful_rate = 0.1 should trigger AdaptiveDecision skip.
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: 5,
+                useful_rate: 0.1,
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+        let decision_default =
+            decide_concept_summary_quality(true, Some(42), "Semantic", Some(&state), 10);
+        assert_eq!(
+            decision_default,
+            ConceptSummaryDecision::Yes,
+            "cold_start_n=10 not met (only 5 views) → Yes"
+        );
+        let decision_canary =
+            decide_concept_summary_quality(true, Some(42), "Semantic", Some(&state), 2);
+        assert_eq!(
+            decision_canary,
+            ConceptSummaryDecision::Skip(ConceptSummarySkipReason::AdaptiveDecision),
+            "cold_start_n=2 met and rate below threshold → Skip"
+        );
     }
 }
