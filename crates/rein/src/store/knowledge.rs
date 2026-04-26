@@ -244,9 +244,14 @@ impl SqliteStore {
     /// `apply_evolution`.
     ///
     /// Atomicity: a partial fail (e.g. 3 of 5 losers committed before a 4th
-    /// fails) rolls back ALL N losers via SAVEPOINT. The winner's MergeInto
-    /// is performed BEFORE this call by `store_with_dedup_resolved` and is
-    /// not subject to this savepoint.
+    /// fails) rolls back ALL N losers via SAVEPOINT. Per the v0.27 R7 P2
+    /// fix, the winner's recursive MergeInto runs AFTER this call by
+    /// `store_with_dedup_resolved` — all fallible DB work for losers must
+    /// complete first so the winner's non-transactional Tantivy/HNSW
+    /// updates only fire after the loser fold has succeeded. Reversing
+    /// the order would re-introduce the leak where an `apply_n_merge`
+    /// failure rolls back the outer `BEGIN IMMEDIATE` but the winner's
+    /// side-index writes have already landed.
     pub fn apply_n_merge(&self, winner_id: &str, loser_ids: &[String]) -> ReinResult<usize> {
         if loser_ids.is_empty() {
             return Ok(0);

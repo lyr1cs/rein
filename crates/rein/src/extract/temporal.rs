@@ -554,9 +554,17 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
     // boundary `\b` does NOT split between an ASCII digit and a Han
     // character, so the standard `\b...\b` regex misses `2026年` entirely.
     // Use an ASCII-digit-bounded match plus an optional `年` suffix.
+    //
+    // v0.27 R13 P1 fix: the trailing boundary was a *consuming* alternation
+    // (`(?:[^0-9]|$)`), so in `YYYY-YYYY-YYYY` (or `/`, `~`, ` `) sequences
+    // the dash was eaten by the prior match — leaving the engine pointing
+    // at a digit, where the leading boundary cannot match. Result:
+    // `2024-2025-2026` produced only `[2024, 2026]`, dropping the middle
+    // year. The `regex` crate has no lookaround, so we drop the trailing
+    // boundary from the regex and post-filter the next byte instead.
     // -----------------------------------------------------------------
     let year_re =
-        Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(年?)(?:[^0-9]|$)").expect("static regex compiles");
+        Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(年?)").expect("static regex compiles");
     for cap in year_re.captures_iter(content) {
         let year_match = cap.get(1).expect("group 1");
         let suffix_match = cap.get(2).expect("group 2");
@@ -566,6 +574,18 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
         } else {
             suffix_match.end()
         };
+        // Reject if the next byte is an ASCII digit — `2024X` where X is a
+        // digit means the year is part of a longer numeric run (e.g. 20245
+        // or a phone number) and should not be harvested as a year anchor.
+        // The 年 suffix already takes the place of a trailing boundary, so
+        // skip the check when the suffix matched.
+        if suffix_match.range().is_empty() {
+            if let Some(&next_byte) = content.as_bytes().get(end_byte) {
+                if next_byte.is_ascii_digit() {
+                    continue;
+                }
+            }
+        }
         if is_consumed(&consumed, start_byte, end_byte) {
             continue;
         }
@@ -1041,6 +1061,64 @@ mod tests {
         // Spec: confidence < 0.3 ("recent"/"old") → skip.
         assert!(extract_temporal_rule_based("recently I shipped", fixed_now()).is_empty());
         assert!(extract_temporal_rule_based("an old bug", fixed_now()).is_empty());
+    }
+
+    #[test]
+    fn consecutive_years_all_harvested() {
+        // v0.27 R13 P1 regression test: the trailing-boundary-consuming
+        // regex used to drop every other year in a YYYY-YYYY-YYYY sequence,
+        // because the dash separator was eaten by the prior match leaving
+        // the engine pointing at a digit. All three years must be captured.
+        let anchors = extract_temporal_rule_based("in 2024-2025-2026 era", fixed_now());
+        let mut starts: Vec<i32> =
+            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        starts.sort();
+        starts.dedup();
+        assert_eq!(starts, vec![2024, 2025, 2026]);
+    }
+
+    #[test]
+    fn consecutive_years_two_year_dash() {
+        let anchors = extract_temporal_rule_based("2024-2025", fixed_now());
+        let mut starts: Vec<i32> =
+            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        starts.sort();
+        starts.dedup();
+        assert_eq!(starts, vec![2024, 2025]);
+    }
+
+    #[test]
+    fn consecutive_years_slash_separated() {
+        let anchors = extract_temporal_rule_based("2024/2025/2026", fixed_now());
+        let mut starts: Vec<i32> =
+            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        starts.sort();
+        starts.dedup();
+        assert_eq!(starts, vec![2024, 2025, 2026]);
+    }
+
+    #[test]
+    fn consecutive_cjk_years_year_suffix() {
+        // 2024年-2025年 — both years must be harvested, including the 年
+        // suffix on each.
+        let anchors = extract_temporal_rule_based("shipped 2024年-2025年", fixed_now());
+        let mut starts: Vec<i32> =
+            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        starts.sort();
+        starts.dedup();
+        assert_eq!(starts, vec![2024, 2025]);
+    }
+
+    #[test]
+    fn five_digit_run_not_treated_as_year() {
+        // Post-filter rejects when the next byte is an ASCII digit:
+        // "20245" is not the year 2024, it's part of a longer numeric run.
+        let anchors = extract_temporal_rule_based("the value 20245 not a year", fixed_now());
+        assert!(
+            anchors.is_empty(),
+            "expected no year anchors for 5-digit run, got {:?}",
+            anchors
+        );
     }
 
     #[test]
