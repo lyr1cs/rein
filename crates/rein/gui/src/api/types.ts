@@ -111,6 +111,29 @@ export interface RecallSynthesisOutcome {
    * post interaction events (per §8 invariant 9).
    */
   synthesis_id?: string;
+  /**
+   * v0.26.2 hotfix — capitalised query-type label
+   * (`Episodic`/`Temporal`/`Preference`/`ExactKeyword`/`Semantic`/`Exploratory`)
+   * the gate used when consulting the per-cluster synthesis bucket.
+   * Surfaced so the GUI can echo it back through SynthesisInteraction
+   * `metadata.query_type` and keep the M1 consumer's bucket key in
+   * lockstep with the gate's lookup. Pre-v0.26.2 this round-trip was
+   * missing, so every GUI feedback event landed in the consumer's
+   * `(-1, "unknown")` bucket while the gate read from the real per-cluster
+   * bucket — making the per-query adaptive gate dead code on GUI traffic.
+   * Older backends omit the field; treat as missing (do NOT invent a
+   * client-side default).
+   */
+  query_type?: string;
+  /**
+   * v0.26.2 hotfix — dominant cluster id for this recall (top-ranked
+   * result's `cluster_id`, matching the source `decide_synthesize` reads).
+   * Surfaced for the same metadata round-trip rationale as `query_type`
+   * above. `undefined` when the result set is empty or the top result
+   * carries no cluster assignment, which matches the cold-start gate
+   * fallback. Older backends omit the field.
+   */
+  cluster_id?: number;
 }
 
 /**

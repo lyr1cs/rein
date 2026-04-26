@@ -317,22 +317,21 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     let _ = crate::service::write_pid("gui");
 
     let rest_config = config.clone();
+    let gui_enabled = config.server.gui_enabled;
     let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
         let svc = service.clone();
         let token = auth_token.clone();
         let cfg = rest_config.clone();
         async move {
-            // Check bearer token for API/MCP paths only (GUI static assets are public
-            // so the SPA can bootstrap and show a token input dialog).
-            //
-            // DELETE /api/session is exempted so a browser holding a stale/invalid
-            // cookie can clear it without being 401-blocked — otherwise the SPA
-            // would be stuck resending the bad cookie until manual browser-data wipe.
+            // v0.26.2 default-deny: any request requires bearer auth UNLESS
+            // it is the stale-cookie clear path OR a GUI surface served when
+            // the SPA is enabled. Earlier allowlist (`/api/` || `/mcp`) let
+            // unmatched paths fall through to the MCP service, so a request
+            // like `POST /not-mcp` ran MCP `initialize` with no token. The
+            // pure helper `http_request_needs_auth` is unit-tested below.
             let path = req.uri().path();
             let method = req.method();
-            let is_clear_session = method == hyper::Method::DELETE && path == "/api/session";
-            let needs_auth =
-                !is_clear_session && (path.starts_with("/api/") || path.starts_with("/mcp"));
+            let needs_auth = http_request_needs_auth(method, path, gui_enabled);
             if needs_auth {
                 if let Some(ref expected) = token {
                     if !request_has_valid_http_auth(req.headers(), expected) {
@@ -406,6 +405,31 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// v0.26.2 default-deny auth gate. Any HTTP request requires bearer-token
+/// auth unless one of two narrow exemptions applies:
+///
+/// 1. `DELETE /api/session` — lets the SPA clear a stale/invalid cookie
+///    even when the cookie no longer matches the live token. Without this
+///    exemption a browser holding a bad cookie would loop on 401.
+/// 2. Any non-`/api/`, non-`/mcp` path when `gui_enabled` is `true` — the
+///    SPA must reach `/`, `/index.html`, `/assets/...`, and SPA-fallback
+///    routes (e.g. `/synthesis-lab`) to bootstrap and show the
+///    token-input dialog.
+///
+/// All other paths require auth; the previous allowlist (`/api/` || `/mcp`)
+/// let `POST /not-mcp` fall through to the MCP service with no token.
+pub(crate) fn http_request_needs_auth(method: &hyper::Method, path: &str, gui_enabled: bool) -> bool {
+    if method == hyper::Method::DELETE && path == "/api/session" {
+        return false;
+    }
+    if path.starts_with("/api/") || path.starts_with("/mcp") {
+        return true;
+    }
+    // Unknown path: open to the GUI when it's serving (for SPA bootstrap +
+    // static assets); otherwise default-deny.
+    !gui_enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +479,65 @@ mod tests {
             hyper::header::HeaderValue::from_static("Bearer secret-token-longer"),
         );
         assert!(!request_has_valid_http_auth(&headers, "secret-token"));
+    }
+
+    // v0.26.2: auth-gate path predicate regression tests for the bypass
+    // bug where unmatched paths fell through to the MCP service.
+    use hyper::Method;
+
+    #[test]
+    fn auth_required_for_api_path() {
+        assert!(http_request_needs_auth(&Method::GET, "/api/foo", false));
+        assert!(http_request_needs_auth(&Method::GET, "/api/foo", true));
+    }
+
+    #[test]
+    fn auth_required_for_mcp_path() {
+        assert!(http_request_needs_auth(&Method::POST, "/mcp", false));
+        assert!(http_request_needs_auth(&Method::POST, "/mcp", true));
+        assert!(http_request_needs_auth(&Method::POST, "/mcp/init", false));
+    }
+
+    #[test]
+    fn auth_required_for_unknown_path_when_gui_disabled() {
+        // The bypass: previously `POST /not-mcp` skipped auth and dispatched
+        // to MCP svc.handle. Default-deny closes that hole.
+        assert!(http_request_needs_auth(&Method::POST, "/not-mcp", false));
+        assert!(http_request_needs_auth(&Method::GET, "/", false));
+        assert!(http_request_needs_auth(&Method::GET, "/index.html", false));
+    }
+
+    #[test]
+    fn auth_skipped_for_unknown_path_when_gui_enabled() {
+        // GUI mode: SPA boots from `/`, asset paths under `/assets/...`,
+        // SPA fallback to index.html for any client-side route.
+        assert!(!http_request_needs_auth(&Method::GET, "/", true));
+        assert!(!http_request_needs_auth(&Method::GET, "/index.html", true));
+        assert!(!http_request_needs_auth(&Method::GET, "/assets/app.js", true));
+        assert!(!http_request_needs_auth(&Method::GET, "/synthesis-lab", true));
+    }
+
+    #[test]
+    fn auth_skipped_for_delete_api_session() {
+        assert!(!http_request_needs_auth(
+            &Method::DELETE,
+            "/api/session",
+            false
+        ));
+        assert!(!http_request_needs_auth(
+            &Method::DELETE,
+            "/api/session",
+            true
+        ));
+    }
+
+    #[test]
+    fn auth_required_for_other_session_methods() {
+        assert!(http_request_needs_auth(
+            &Method::POST,
+            "/api/session",
+            false
+        ));
+        assert!(http_request_needs_auth(&Method::GET, "/api/session", true));
     }
 }
