@@ -246,8 +246,18 @@ pub fn dispatch_one(
         None => return Ok(DispatchResult::Dropped(DropReason::DailyCapReached)),
     };
 
+    // v0.27.2 R8-P3 fix — real per-call judge_model_override. When the
+    // manual MCP caller passed `judge_model_override = Some(model)`,
+    // build an alternate extractor with that model name + same
+    // provider/endpoint/api_key as the resolved `[ars.llm_judge]`.
+    // The override extractor lives only for this dispatch_one call.
+    // For Mock extractor (test-support), override is ignored — tests
+    // script the response queue directly.
+    let override_extractor = build_override_extractor(extractor, job.judge_model_override.as_deref());
+    let active_extractor: &ExtractorKind = override_extractor.as_ref().unwrap_or(extractor);
+
     // LLM call (J4 — failures never propagate).
-    let raw = match call_judge_sync(extractor, &job.prompt, &job.candidate) {
+    let raw = match call_judge_sync(active_extractor, &job.prompt, &job.candidate) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "judge worker: LLM call failed, ledger row → failed");
@@ -277,24 +287,11 @@ pub fn dispatch_one(
     // intent, otherwise use the coarse extractor family id. v0.27.2 will
     // honor the override by constructing an alternate extractor; tracked
     // in spec §15 as known issue.
-    // Codex R8 P2 fix — record the ACTUAL model used by the LLM call,
-    // never the override. Recording an unused override would corrupt
-    // calibration/audit joins (κ would treat events as if judged by
-    // a different model than they were). When the override is set,
-    // log a warn so operators know v0.27.1 doesn't yet honor per-call
-    // extractor swap; v0.27.2 may construct an alternate extractor.
-    if let Some(override_name) = job.judge_model_override.as_deref() {
-        if !override_name.is_empty() {
-            tracing::warn!(
-                requested = %override_name,
-                actual = %judge_model_id(extractor),
-                "judge worker: judge_model_override is accepted but ignored in \
-                 v0.27.1 — call used the configured judge model; v0.27.2 will \
-                 honor the override by constructing an alternate extractor"
-            );
-        }
-    }
-    let model_id = judge_model_id(extractor);
+    // v0.27.2 R8-P3 — record the ACTUAL model used. When override
+    // applied, that's the override-built extractor; otherwise the
+    // configured judge extractor. `active_extractor` already points
+    // at whichever was used for the LLM call above.
+    let model_id = judge_model_id(active_extractor);
     let metadata = JudgeMetadata {
         query_type: job.query_type.clone(),
         cluster_id: job.cluster_id,
@@ -370,6 +367,56 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max_chars).collect()
+}
+
+/// v0.27.2 R8-P3 — construct an alternate extractor with the same
+/// provider + endpoint + api_key as the configured judge but with a
+/// different model name. Returns `None` when override is absent /
+/// empty / equals the current extractor's model (no-op).
+///
+/// For Gemini and OMLX, the model is a per-instance String, so
+/// cloning the existing extractor's connection-shaped fields and
+/// swapping just the model gives a working alternate. For Mock
+/// (test-support), override is ignored — tests use scripted responses.
+fn build_override_extractor(
+    base: &ExtractorKind,
+    override_model: Option<&str>,
+) -> Option<ExtractorKind> {
+    let model = override_model.filter(|s| !s.is_empty())?;
+    match base {
+        ExtractorKind::Gemini(g) => {
+            if g.model == model {
+                return None;
+            }
+            Some(ExtractorKind::Gemini(
+                crate::extract::llm::GeminiExtractor::new(
+                    g.api_key.clone(),
+                    g.endpoint.clone(),
+                    model.to_string(),
+                ),
+            ))
+        }
+        ExtractorKind::Omlx(o) => {
+            if o.model == model {
+                return None;
+            }
+            // Codex v0.27.2 R1 P2 fix — preserve base's
+            // `disable_thinking`. v0 hardcoded `false` here, so an
+            // operator with `extract.omlx.disable_thinking = true` who
+            // used judge_model_override would see the override call
+            // emit a different protocol than the configured judge,
+            // changing output format / latency. Read base's value.
+            Some(ExtractorKind::Omlx(
+                crate::extract::llm::OmlxExtractor::new(
+                    o.endpoint.clone(),
+                    model.to_string(),
+                    o.disable_thinking,
+                ),
+            ))
+        }
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => None,
+    }
 }
 
 /// Identify the judge model on the emitted event using the SAME
@@ -487,7 +534,146 @@ pub struct DrainStats {
 /// Called on each `run_adaptive_pipeline` tick (slow channel) — same
 /// cadence as M2/M3/M4/M5/M6 + synthesis_feedback / concept_summary_feedback
 /// / judge_calibration consumers.
+/// v0.27.2 R5-K2 fix — reap expired entries from the synthesis +
+/// concept-summary judge rehydration caches. The append-only jsonl
+/// caches grow unbounded on long-running nodes; manual MCP lookup
+/// already enforces TTL via `cache_lookup_value_with_ttl`, but the
+/// disk file kept all old rows. This reaper rewrites each cache file
+/// in place, keeping only rows whose `stamped_at` is within the
+/// configured `[ars.llm_judge].cache_ttl_secs` window.
+///
+/// Default-off (`enabled = false` short-circuits before the reaper
+/// touches disk). Best-effort: any IO error is logged and ignored
+/// — the manual lookup TTL guard remains the correctness boundary.
+///
+/// Called from `drain_queue` so the reaper runs at the same slow-channel
+/// cadence as judge dispatch. No need for a dedicated thread.
+pub fn reap_expired_caches(config: &crate::config::ReinConfig) {
+    if !config.ars.llm_judge.enabled {
+        return;
+    }
+    let ttl_secs = config.ars.llm_judge.cache_ttl_secs;
+    if ttl_secs == 0 {
+        return; // 0 means "never expire" — skip reaper.
+    }
+    let synth_path =
+        crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
+    let concept_path =
+        crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
+    for path in [&synth_path, &concept_path] {
+        if let Err(e) = reap_one_cache_file(path, ttl_secs) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "judge cache reaper: failed to reap (non-fatal)"
+            );
+        }
+    }
+}
+
+fn reap_one_cache_file(
+    path: &std::path::Path,
+    ttl_secs: u64,
+) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    // v0.27.2 R1 P2 fix — take the rotation lock FIRST, then read.
+    // The v0 reaper read the snapshot OUTSIDE the lock, then renamed
+    // a stale snapshot back over the live path; a concurrent append
+    // landing between read and rename was silently lost.
+    use std::os::fd::AsRawFd as _;
+    let rotation_lock_path = path.with_extension("jsonl.rotation_lock");
+    let rotation_lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&rotation_lock_path)
+        .ok();
+    if let Some(ref f) = rotation_lock_file {
+        let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    }
+
+    // Inside lock: read → filter → rewrite atomically. Release lock
+    // only after rename. Concurrent appenders block on the lockfile
+    // and unblock seeing the post-reap fresh inode.
+    let result: std::io::Result<(usize, usize)> = (|| {
+        let text = std::fs::read_to_string(path)?;
+        let now = chrono::Utc::now();
+        let mut keep: Vec<&str> = Vec::new();
+        let mut total = 0usize;
+        let mut expired = 0usize;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total += 1;
+            let v: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => {
+                    expired += 1;
+                    continue;
+                }
+            };
+            let stamped_at = v.get("stamped_at").and_then(|x| x.as_str());
+            let live = stamped_at
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .map(|parsed| {
+                    let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+                    age.num_seconds() <= ttl_secs as i64
+                })
+                .unwrap_or(false);
+            if live {
+                keep.push(trimmed);
+            } else {
+                expired += 1;
+            }
+        }
+        if expired == 0 {
+            return Ok((total, 0));
+        }
+        let tmp_path = path.with_extension(format!(
+            "jsonl.reap-tmp-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            std::process::id()
+        ));
+        let body = if keep.is_empty() {
+            String::new()
+        } else {
+            let mut out = keep.join("\n");
+            out.push('\n');
+            out
+        };
+        std::fs::write(&tmp_path, &body)?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok((total, expired))
+    })();
+
+    // Always release the lock, even on error.
+    if let Some(ref f) = rotation_lock_file {
+        let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+    }
+    drop(rotation_lock_file);
+
+    let (total, expired) = result?;
+    if expired > 0 {
+        tracing::debug!(
+            path = %path.display(),
+            total,
+            expired,
+            kept = total - expired,
+            "judge cache reaper: pruned"
+        );
+    }
+    Ok(())
+}
+
 pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> DrainStats {
+    // v0.27.2 R5-K2 — opportunistic reap on each drain tick. Cheap
+    // when files are small/missing; bounded by daily-rotated cache
+    // size (~80MB worst case at full daily_call_cap).
+    reap_expired_caches(config);
     use std::io::BufRead;
 
     if !config.ars.llm_judge.enabled {
