@@ -1437,10 +1437,19 @@ pub fn recall_temporal_with_request_id(
     // Snapshot positional id list and candidates for background thread.
     // `candidate_ids` lets us rebuild an id→score map after the thread joins.
     // When `llm_reranker_timeout_ms = 0`, use legacy synchronous mode (blocks in-place).
+    // v0.27.1 B2: route through `resolve_llm_for("search.llm_reranker")`
+    // so `[llm]` inheritance applies to the reranker-gate decision.
+    // Fail-soft: an Err from the resolver (e.g. provider known but model
+    // missing) acts as `Provider::None` — disables the reranker rather
+    // than aborting the request.
+    let reranker_resolved_provider = config
+        .resolve_llm_for("search.llm_reranker")
+        .map(|r| r.provider)
+        .unwrap_or(crate::config::Provider::None);
     let llm_rerank_state: Option<(Vec<String>, std::sync::mpsc::Receiver<Vec<f32>>)> = if !fast
         && !strong_signal
         && !linear_clear
-        && config.reranker_provider() != crate::config::Provider::None
+        && reranker_resolved_provider != crate::config::Provider::None
         && local_results.len() > 1
     {
         let candidate_ids: Vec<String> = local_results.iter().map(|(m, _)| m.id.clone()).collect();

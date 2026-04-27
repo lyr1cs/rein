@@ -258,18 +258,22 @@ impl ExpanderKind {
 }
 
 fn create_expander(config: &ReinConfig) -> Option<ExpanderKind> {
-    match config.expand_provider() {
+    let r = config.resolve_llm_for("query_expansion").ok()?;
+    match r.provider {
         Provider::Google => {
-            let api_key = config.query_expansion.google.api_key.as_ref()?;
+            // Codex R2 P2 fix — honor resolver api_key_env.
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| config.query_expansion.google.api_key.clone())?;
             Some(ExpanderKind::Gemini(GeminiExpander::new(
-                api_key.clone(),
-                config.query_expansion.google.endpoint.clone(),
-                config.query_expansion.google.model.clone(),
+                api_key, r.endpoint, r.model,
             )))
         }
         Provider::Omlx => Some(ExpanderKind::Omlx(OmlxExpander::new(
-            config.query_expansion.omlx.endpoint.clone(),
-            config.query_expansion.omlx.model.clone(),
+            r.endpoint,
+            r.model,
             config.query_expansion.omlx.disable_thinking,
         ))),
         Provider::None => None,

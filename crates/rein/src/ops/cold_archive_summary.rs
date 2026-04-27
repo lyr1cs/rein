@@ -420,23 +420,28 @@ fn cjk_ratio(s: &str) -> f64 {
 /// than an error so a Cap-C-disabled deployment doesn't surface a
 /// spurious failure on every adaptive pass.
 pub fn create_cold_archive_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
-    let extract_provider = config.extract_provider();
-    match config.ars.resolved_provider(extract_provider) {
+    // v0.27.1 B2: route through `resolve_llm_for("ars.cold_archive")` so
+    // `[llm]` inheritance applies. The resolver replicates v0.26.x's
+    // `[ars].llm_backend` semantic. API key + disable_thinking still live
+    // on `[extract.{provider}]` per v0.26.x mapping.
+    let r = config.resolve_llm_for("ars.cold_archive").ok()?;
+    match r.provider {
         Provider::None => None,
         Provider::Google => {
-            let api_key = config.extract.google.api_key.as_ref()?.clone();
+            // Codex R3 P2 fix — honor resolver's api_key_env.
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(
-                crate::extract::llm::GeminiExtractor::new(
-                    api_key,
-                    config.extract.google.endpoint.clone(),
-                    config.extract.google.model.clone(),
-                ),
+                crate::extract::llm::GeminiExtractor::new(api_key, r.endpoint, r.model),
             ))
         }
         Provider::Omlx => Some(ExtractorKind::Omlx(
             crate::extract::llm::OmlxExtractor::new(
-                config.extract.omlx.endpoint.clone(),
-                config.extract.omlx.model.clone(),
+                r.endpoint,
+                r.model,
                 config.extract.omlx.disable_thinking,
             ),
         )),

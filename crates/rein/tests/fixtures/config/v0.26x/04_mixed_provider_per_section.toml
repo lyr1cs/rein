@@ -1,0 +1,88 @@
+# v0.26.x fixture #4: mixed-provider — different sections explicitly
+# pin different providers. Real-world hybrid setup: extraction routes
+# to Google (high-quality), query expansion + reranker stay on a fast
+# local OMLX, slow-channel ars.* sections inherit from extract.
+#
+# Critical for `resolve_llm_for` correctness: each section must resolve
+# independently to its OWN provider, not collapse into a single global
+# choice. Without §8.1's per-section walk this would be silently wrong.
+
+[database]
+path = "/tmp/rein-fixture-04.db"
+
+[embedding]
+provider = "google"
+dimensions = 3072
+
+[embedding.google]
+model = "gemini-embedding-001"
+
+[embedding.omlx]
+endpoint = "http://localhost:8000/v1"
+model = "default"
+
+[extract]
+provider = "google"
+
+[extract.google]
+model = "gemini-3.1-flash-lite-preview"
+max_input_chars = 0
+
+[extract.omlx]
+endpoint = "http://localhost:11434/v1"
+model = "qwen2.5:14b"
+max_input_chars = 32000
+
+[query_expansion]
+provider = "omlx"
+max_expansions = 3
+
+[query_expansion.google]
+model = "gemini-3.1-flash-lite-preview"
+
+[query_expansion.omlx]
+endpoint = "http://localhost:8000/v1"
+model = "qwen2.5:7b"
+
+[search]
+rrf_k = 60.0
+rrf_fts_weight = 0.3
+rrf_vec_weight = 0.7
+dedup_similarity = 0.70
+dedup_time_window_days = 7
+llm_reranker = "omlx"
+llm_reranker_top_n = 15
+
+[chunking]
+max_tokens = 512
+overlap_percent = 10
+metadata_prefix = true
+
+[sync]
+supermemory_enabled = false
+auto_memory_enabled = false
+auto_memory_glob = ""
+
+[decay]
+base_lambda = 0.06
+ltm_beta = 0.8
+stm_beta = 1.2
+interval_hours = 24
+prune_threshold = 0.05
+stm_to_ltm_access_count = 5
+
+[server]
+compact = false
+sse_enabled = false
+sse_port = 8680
+sse_bind = "127.0.0.1"
+
+[ars]
+llm_backend = "inherit"  # follow [extract] = google
+
+[resummerize]
+enabled = false
+llm_backend = "google"
+
+[async_memory]
+provider = "inherit"

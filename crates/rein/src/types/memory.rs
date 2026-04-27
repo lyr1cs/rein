@@ -381,6 +381,15 @@ pub struct Concept {
     /// the refresh-decision gate.
     #[serde(default)]
     pub living_summary_source_revision: Option<u32>,
+    /// v0.27.1 E direction (spec §3.2 R8 P1) — ULID identifying the
+    /// concept-summary instance currently in `living_summary`. Minted on
+    /// every `refresh_living_summary` call; the same id is persisted in
+    /// `concept_summary_instances` (R9-K3 retention) so the runtime LLM
+    /// judge can validate J5 (link-present) against an immutable
+    /// snapshot even after a subsequent refresh overwrites this row.
+    /// `None` on pre-v0.27.1 concepts and on never-refreshed concepts.
+    #[serde(default)]
+    pub living_summary_id: Option<String>,
 }
 
 /// A typed relation between two concepts, with optional temporal validity.

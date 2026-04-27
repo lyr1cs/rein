@@ -850,31 +850,35 @@ pub fn check_dedup(
     Ok(DedupAction::CreateNew)
 }
 
-/// Build an `ExtractorKind` from `[extract]` config for v0.27 triple +
-/// temporal extraction. Returns `None` when no LLM is configured (graceful
-/// degradation: the dedup decision falls back to text-only signals,
-/// matching pre-v0.27 behavior).
+/// Build an `ExtractorKind` from the `extract.dedup` resolved config for
+/// v0.27 triple + temporal extraction. Returns `None` when no LLM is
+/// configured (graceful degradation: the dedup decision falls back to
+/// text-only signals, matching pre-v0.27 behavior).
 ///
-/// Mirrors `ops/resummerize.rs::create_resummerize_extractor` but reads
-/// `[extract]` directly (dedup has no separate `llm_backend` knob).
+/// v0.27.1: routes through `resolve_llm_for("extract.dedup")` so `[llm]`
+/// inheritance applies. The resolver replicates the v0.26.x semantic of
+/// "extract.dedup falls back to [extract]" when no dedicated section is
+/// configured (see config.rs §8.1 fall-through chain).
 fn build_dedup_extractor() -> Option<ExtractorKind> {
     let cfg = crate::config::ReinConfig::load().ok()?;
-    match cfg.extract_provider() {
+    let r = cfg.resolve_llm_for("extract.dedup").ok()?;
+    match r.provider {
         crate::config::Provider::None => None,
         crate::config::Provider::Google => {
-            let api_key = cfg.extract.google.api_key.as_ref()?.clone();
+            // Codex R3 P2 fix — honor resolver's api_key_env.
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| cfg.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(
-                crate::extract::llm::GeminiExtractor::new(
-                    api_key,
-                    cfg.extract.google.endpoint.clone(),
-                    cfg.extract.google.model.clone(),
-                ),
+                crate::extract::llm::GeminiExtractor::new(api_key, r.endpoint, r.model),
             ))
         }
         crate::config::Provider::Omlx => Some(ExtractorKind::Omlx(
             crate::extract::llm::OmlxExtractor::new(
-                cfg.extract.omlx.endpoint.clone(),
-                cfg.extract.omlx.model.clone(),
+                r.endpoint,
+                r.model,
                 cfg.extract.omlx.disable_thinking,
             ),
         )),

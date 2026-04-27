@@ -409,6 +409,30 @@ const DWELL_BUCKETS: Array<{ label: string; max: number }> = [
   { label: '10s+', max: Number.POSITIVE_INFINITY },
 ];
 
+/**
+ * v0.27.1 E direction — render the per-bucket label that sits next to each
+ * useful_rate bar. Adds the runtime LLM judge column inline (the spec asks
+ * for "an LLM judge column" on the existing per-cluster table; the per-
+ * cluster view here is the bar list, so the column lives in the right-hand
+ * label).
+ *
+ * Format: `n=42` for cold-start (no judge events yet) → `n=42 · judge 7/12 (58%)`
+ * once the runtime judge has folded in events.
+ */
+function formatBucketAnnotation(
+  viewedCount: number,
+  judgeCount: number | undefined,
+  judgeHitCount: number | undefined,
+): string {
+  const base = `n=${viewedCount}`;
+  if (typeof judgeCount !== 'number' || judgeCount === 0) {
+    return base;
+  }
+  const hits = typeof judgeHitCount === 'number' ? judgeHitCount : 0;
+  const pct = Math.round((hits / judgeCount) * 100);
+  return `${base} · judge ${hits}/${judgeCount} (${pct}%)`;
+}
+
 function SynthesisQualitySection({
   projection,
 }: {
@@ -447,6 +471,16 @@ function SynthesisQualitySection({
         query_type: row.query_type,
         useful_rate: row.useful_rate,
         viewed_count: row.viewed_count,
+        // v0.27.1 E direction: extra annotation rendered next to the bar.
+        // `n=42 · judge 7/12` reads left-to-right as "42 human signals,
+        // 12 LLM judge calls of which 7 hit". Cold-start rows (no judge
+        // events yet) collapse to plain `n=42` so the column doesn't
+        // render misleading zeros.
+        annotation: formatBucketAnnotation(
+          row.viewed_count,
+          row.llm_judge_count,
+          row.llm_judge_hit_count,
+        ),
       })),
     [byCluster],
   );
@@ -570,10 +604,10 @@ function SynthesisQualitySection({
             <Tooltip content={<ChartTooltip />} />
             <Bar dataKey="useful_rate" radius={[0, 4, 4, 0]} barSize={14}>
               <LabelList
-                dataKey="viewed_count"
+                dataKey="annotation"
                 position="right"
                 formatter={(value: unknown) =>
-                  typeof value === 'number' ? `n=${value}` : ''
+                  typeof value === 'string' ? value : ''
                 }
                 fill="#64748b"
                 fontSize={10}

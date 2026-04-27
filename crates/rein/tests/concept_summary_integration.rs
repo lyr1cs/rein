@@ -39,6 +39,7 @@ fn make_concept(memoir_name: &str, name: &str, revision: u32) -> Concept {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     }
 }
 
