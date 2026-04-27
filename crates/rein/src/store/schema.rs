@@ -576,6 +576,17 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     // table-recreate path doesn't silently drop the new columns.
     migrate_cold_archive_summary(conn)?;
 
+    // v0.27.1 E direction: judge_call_ledger table for J2 atomic call-cap
+    // reservation. Idempotent — safe to call on already-migrated DBs.
+    migrate_judge_call_ledger(conn)?;
+
+    // v0.27.1 E direction: concepts.living_summary_id column (Cap A summary
+    // instance ULID, R8 P1 fix) + concept_summary_instances retention table
+    // (R9-K3) so the judge can validate J5 against an immutable snapshot
+    // even after a subsequent refresh overwrites the live row.
+    migrate_concepts_living_summary_id(conn)?;
+    migrate_concept_summary_instances(conn)?;
+
     Ok(())
 }
 
@@ -723,6 +734,106 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
         .ok();
     }
     // No backfill: existing cold rows stay NULL until run_tiering re-flags them.
+    Ok(())
+}
+
+/// v0.27.1 E direction (spec §4 J2 + R8 P1 fix): atomic call-cap reservation
+/// ledger for the runtime LLM judge worker.
+///
+/// `judge_call_ledger.id` is a ULID minted by the worker before the LLM HTTP
+/// call; `status` transitions `reserved → done | failed | stale`.
+/// `done` = LLM call succeeded. `failed` = LLM call attempted but errored
+/// or returned unparseable output (still counts toward daily_call_cap as
+/// it incurred an HTTP cost). `stale` = reservation never made it to the
+/// LLM call (worker crash, reaped by next sweep) and is excluded from
+/// the cap count — Codex R4 P2 fix.
+/// The rolling 24h reservation count is computed from this table inside
+/// `BEGIN IMMEDIATE` so two dispatchers can't both observe the same
+/// below-cap count and burst `N × cap` calls. Stale `reserved` rows
+/// older than 5 minutes are reaped by the worker on each pull
+/// (worker-crash recovery; mirrors v0.23 resummerize claim-token pattern).
+///
+/// Idempotent: safe to call on already-migrated DBs. Pre-v0.27.1 R4
+/// rows with status='failed' that were actually stale-reaped (rather
+/// than LLM-attempted) will incorrectly count toward the cap until they
+/// age out of the 24h window — acceptable transient cost for the
+/// schema migration.
+pub fn migrate_judge_call_ledger(conn: &Connection) -> ReinResult<()> {
+    // CHECK constraints can't be altered; we re-create the table only if
+    // the old constraint is in place. Detect via PRAGMA — if the table
+    // exists with the old shape, drop+recreate. Since this is brand-new
+    // in v0.27.1, drop is safe (no production data yet).
+    let needs_migrate: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND name='judge_call_ledger' \
+             AND sql NOT LIKE '%''stale''%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if needs_migrate {
+        conn.execute("DROP TABLE judge_call_ledger", []).ok();
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS judge_call_ledger (
+            id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('reserved','done','failed','stale'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_judge_call_ledger_ts_status
+            ON judge_call_ledger(ts, status);
+        ",
+    )?;
+    Ok(())
+}
+
+/// v0.27.1 E direction (spec §3.2 R8 P1 + §15 R9-K3): add
+/// `concepts.living_summary_id TEXT` column. Minted as a ULID on every
+/// `refresh_living_summary` call so judge events can link back to a stable
+/// per-instance id.
+///
+/// Idempotent.
+pub fn migrate_concepts_living_summary_id(conn: &Connection) -> ReinResult<()> {
+    let has_col: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('concepts') WHERE name='living_summary_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_col {
+        conn.execute_batch("ALTER TABLE concepts ADD COLUMN living_summary_id TEXT")
+            .ok();
+    }
+    Ok(())
+}
+
+/// v0.27.1 E direction (spec §15 R9-K3): retention table for concept-summary
+/// instances. When a concept is refreshed before a queued/manual judge
+/// processes the previous summary, `concepts.living_summary_id` is
+/// overwritten — without this table, J5 link-present can't validate the
+/// old summary. Rows are retained for 7 days; pruned by the worker reaper.
+///
+/// Idempotent.
+pub fn migrate_concept_summary_instances(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS concept_summary_instances (
+            summary_id TEXT PRIMARY KEY,
+            concept_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            refreshed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_concept_summary_instances_concept
+            ON concept_summary_instances(concept_id, refreshed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_concept_summary_instances_refreshed
+            ON concept_summary_instances(refreshed_at);
+        ",
+    )?;
     Ok(())
 }
 

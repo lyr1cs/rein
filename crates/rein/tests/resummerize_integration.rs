@@ -567,15 +567,22 @@ fn resummerize_skipped_when_disabled() {
     assert_eq!(outcome.succeeded, 0);
 }
 
-/// When resummerize is enabled but no LLM provider is configured
-/// (default test config has no API key), the op returns `skipped_no_llm`
-/// rather than failing or looping.
+/// When resummerize is enabled but no LLM provider is configured,
+/// the op returns `skipped_no_llm` rather than failing or looping.
+///
+/// Codex R4 P3 — explicitly force `Provider::None` instead of mutating
+/// the process-global `GEMINI_API_KEY` env var. Cargo runs tests in
+/// parallel and env mutation in one test affects all concurrent tests
+/// that read the same var (e.g. config back-compat snapshot tests).
 #[test]
 fn resummerize_skipped_when_no_llm_configured() {
     let store = SqliteStore::in_memory().unwrap();
     let mut config = ReinConfig::default();
     config.resummerize.enabled = true;
-    // extract.google.api_key defaults to None → create_extractor() → None.
+    // Force the resolver to return Provider::None regardless of env
+    // var presence. `extract.provider = "none"` is the canonical
+    // way to disable LLM at this section per validate_provider_name.
+    config.extract.provider = "none".to_string();
 
     let outcome = rein::ops::resummerize::run_resummerize(&store, &config, None, false).unwrap();
 

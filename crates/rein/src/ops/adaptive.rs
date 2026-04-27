@@ -96,12 +96,21 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // bucket, the gate falls back to the global flag — see
     // `ops/recall_synthesis::decide_synthesize`. Same peek+commit + CAS-merge
     // pattern as concept_refresh_stats above (5-invariant pattern).
-    match crate::store::adaptive::recompute_synthesis_feedback_stats(
+    // Codex R1 P1 fix — call the judge-aware variant so v0.27.1 runtime
+    // SynthesisLlmJudge events fold into `llm_judge_count` / hit_count
+    // and the κ pair cache. Without this swap the new consumer is dead
+    // code and judge events that landed past the offset are lost.
+    match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge(
         store.conn(),
         state.synthesis_feedback_stats.clone(),
+        state.pending_kappa_half_pairs.clone(),
+        state.judge_calibration_state.clone().unwrap_or_default(),
+        config.ars.llm_judge.weight_decay_rate,
     ) {
-        Ok((stats, max_id)) => {
+        Ok((stats, pairs, calibration, max_id)) => {
             state.synthesis_feedback_stats = Some(stats);
+            state.pending_kappa_half_pairs = pairs;
+            state.judge_calibration_state = Some(calibration);
             if let Some(id) = max_id {
                 pending_offset_batches.push(vec![("synthesis_feedback", id)]);
             }
@@ -114,17 +123,69 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // pattern. `decide_concept_summary_quality` consults this state per
     // (cluster_id, query_type) bucket; cold-start falls back to the global
     // `[ars].concept_summary_enabled` flag.
-    match crate::store::adaptive::recompute_concept_summary_feedback_stats(
+    // Codex R1 P1 fix — Cap A judge-aware mirror of the synthesis
+    // recompute call above. Same shared pending_kappa_half_pairs cache
+    // and judge_calibration_state are folded so concept-summary judge
+    // events flow into useful_rate / κ pairs identically to synthesis.
+    match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge(
         store.conn(),
         state.concept_summary_feedback_stats.clone(),
+        state.pending_kappa_half_pairs.clone(),
+        state.judge_calibration_state.clone().unwrap_or_default(),
+        config.ars.llm_judge.weight_decay_rate,
     ) {
-        Ok((stats, max_id)) => {
+        Ok((stats, pairs, calibration, max_id)) => {
             state.concept_summary_feedback_stats = Some(stats);
+            state.pending_kappa_half_pairs = pairs;
+            state.judge_calibration_state = Some(calibration);
             if let Some(id) = max_id {
                 pending_offset_batches.push(vec![("concept_summary_feedback", id)]);
             }
         }
         Err(e) => tracing::warn!("failed to recompute concept_summary_feedback_stats: {e}"),
+    }
+
+    // Step 1f-bis: v0.27.1 E direction — drain the judge worker queue
+    // (Codex R1 P1 fix). Auto-sampled + manual MCP enqueues land in
+    // `<resolve_buffer_dir>/queue/<db_hash>/judge_queue.jsonl`. Without
+    // this drain, the queue grew indefinitely and no
+    // `synthesis_llm_judge` / `concept_summary_llm_judge` events ever
+    // reached `feedback_events`, making the entire judge feedback loop
+    // dead code in production. Default-off when
+    // `[ars.llm_judge].enabled = false` (no queue file is ever written
+    // under that flag, so the drain is a fast no-op).
+    let drain_stats = crate::ops::llm_judge_worker::drain_queue(store, config);
+    if drain_stats.emitted > 0
+        || drain_stats.dropped > 0
+        || drain_stats.errors > 0
+        || drain_stats.malformed > 0
+    {
+        tracing::info!(
+            emitted = drain_stats.emitted,
+            dropped = drain_stats.dropped,
+            errors = drain_stats.errors,
+            malformed = drain_stats.malformed,
+            "judge drain pass"
+        );
+    }
+
+    // Step 1g: v0.27.1 E direction — judge_calibration consumer (Layer 2).
+    // Drains any new SynthesisLlmJudgeOfflineCron + ConceptSummaryLlmJudgeOfflineCron
+    // events into the rolling `JudgeCalibrationState.recent_pairs_runtime_vs_offline`,
+    // recomputes `runtime_vs_offline_kappa`, and bumps `judge_drift_alert` when
+    // κ falls below `JUDGE_DRIFT_THRESHOLD`. Codex R7 P2: without this wiring
+    // the consumer's offset never advances and `runtime_vs_offline_kappa`
+    // stays stale forever.
+    {
+        let drift_log_path = crate::extract::hooks::buffer::resolve_buffer_dir(config)
+            .join("judge_drift.log");
+        if let Some(batch) = crate::ops::judge_calibration::run_judge_calibration_consumer(
+            store,
+            &mut state,
+            Some(&drift_log_path),
+        ) {
+            pending_offset_batches.push(batch);
+        }
     }
 
     // Step 2: M3 — Build per-cluster survival curves from access data

@@ -531,27 +531,65 @@ fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
     }
 }
 
+/// Codex R5 P3 helper — return true if the Google API key is reachable
+/// via either the resolver's `api_key_env` (preferred path used by
+/// migrated constructors) OR the legacy `config.extract.google.api_key`
+/// field (populated from `GEMINI_API_KEY` at config-load time).
+/// Mirrors the resolution order of `extract::llm::create_extractor`
+/// post-R2 fix.
+fn google_api_key_resolved(
+    config: &ReinConfig,
+    resolved: Option<&crate::config::ResolvedLlmConfig>,
+) -> bool {
+    // Resolved api_key_env path takes precedence — reflects how the
+    // constructors actually decide whether the key exists at runtime.
+    let env_present = resolved
+        .and_then(|r| r.api_key_env.as_deref())
+        .and_then(|env_name| std::env::var(env_name).ok())
+        .is_some();
+    env_present || config.extract.google.api_key.is_some()
+}
+
 fn check_extract_provider(config: &ReinConfig) -> DoctorCheck {
-    match config.extract_provider() {
-        Provider::Google => match config.extract.google.api_key.as_ref() {
-            Some(_) => ok_in(
-                DoctorCategory::Configuration,
-                "extract_provider",
-                format!("google:{} configured", config.extract.google.model),
-            ),
-            None => warn_in(
-                DoctorCategory::Configuration,
-                "extract_provider",
-                "google configured but GEMINI_API_KEY is missing; LLM extraction is disabled",
-            ),
-        },
+    // v0.27.1 B2 (spec §15 R9-K6): route through `resolve_llm_for("extract")`
+    // so doctor reports the same provider/model production reads. Reading
+    // legacy `[extract]` directly would mislead operators using `[llm]`
+    // inheritance into thinking the resolved model differs from production.
+    let resolved = config.resolve_llm_for("extract").ok();
+    let provider = resolved
+        .as_ref()
+        .map(|r| r.provider)
+        .unwrap_or(Provider::None);
+    let model = resolved
+        .as_ref()
+        .map(|r| r.model.clone())
+        .unwrap_or_default();
+    let endpoint = resolved
+        .as_ref()
+        .map(|r| r.endpoint.clone())
+        .unwrap_or_default();
+    // Codex R5 P3 fix — honor the resolver's api_key_env. v0 doctor
+    // hardcoded `GEMINI_API_KEY`, so an operator on a custom env name
+    // (e.g. `[llm.google].api_key_env = "MY_KEY"`) saw a false WARN
+    // even though the migrated constructors successfully read MY_KEY.
+    let api_key_present_for_extract =
+        google_api_key_resolved(config, resolved.as_ref());
+    match provider {
+        Provider::Google if api_key_present_for_extract => ok_in(
+            DoctorCategory::Configuration,
+            "extract_provider",
+            format!("google:{model} configured"),
+        ),
+        Provider::Google => warn_in(
+            DoctorCategory::Configuration,
+            "extract_provider",
+            "google configured but no API key found at the resolved api_key_env \
+             (default GEMINI_API_KEY); LLM extraction is disabled",
+        ),
         Provider::Omlx => ok_in(
             DoctorCategory::Configuration,
             "extract_provider",
-            format!(
-                "omlx:{} at {}",
-                config.extract.omlx.model, config.extract.omlx.endpoint
-            ),
+            format!("omlx:{model} at {endpoint}"),
         ),
         Provider::None => ok_in(
             DoctorCategory::Configuration,
@@ -562,57 +600,91 @@ fn check_extract_provider(config: &ReinConfig) -> DoctorCheck {
 }
 
 fn check_query_expansion_provider(config: &ReinConfig) -> DoctorCheck {
-    match config.expand_provider() {
-        Provider::Google => match config.query_expansion.google.api_key.as_ref() {
-            Some(_) => ok_in(
-                DoctorCategory::Configuration,
-                "query_expansion",
-                format!("google:{} configured", config.query_expansion.google.model),
-            ),
-            None => warn_in(
-                DoctorCategory::Configuration,
-                "query_expansion",
-                "google configured but GEMINI_API_KEY is missing; expansion is disabled",
-            ),
-        },
+    // v0.27.1 B2 (spec §15 R9-K6): route through
+    // `resolve_llm_for("query_expansion")`.
+    let resolved = config.resolve_llm_for("query_expansion").ok();
+    let provider = resolved
+        .as_ref()
+        .map(|r| r.provider)
+        .unwrap_or(Provider::None);
+    let model = resolved
+        .as_ref()
+        .map(|r| r.model.clone())
+        .unwrap_or_default();
+    let endpoint = resolved
+        .as_ref()
+        .map(|r| r.endpoint.clone())
+        .unwrap_or_default();
+    // Codex R5 P3 — honor resolved api_key_env (mirror of extract path).
+    let key_present = google_api_key_resolved_for_qe(config, resolved.as_ref());
+    match provider {
+        Provider::Google if key_present => ok_in(
+            DoctorCategory::Configuration,
+            "query_expansion",
+            format!("google:{model} configured"),
+        ),
+        Provider::Google => warn_in(
+            DoctorCategory::Configuration,
+            "query_expansion",
+            "google configured but no API key found at the resolved api_key_env \
+             (default GEMINI_API_KEY); expansion is disabled",
+        ),
         Provider::Omlx => ok_in(
             DoctorCategory::Configuration,
             "query_expansion",
-            format!(
-                "omlx:{} at {}",
-                config.query_expansion.omlx.model, config.query_expansion.omlx.endpoint
-            ),
+            format!("omlx:{model} at {endpoint}"),
         ),
         Provider::None => ok_in(DoctorCategory::Configuration, "query_expansion", "disabled"),
     }
 }
 
+fn google_api_key_resolved_for_qe(
+    config: &ReinConfig,
+    resolved: Option<&crate::config::ResolvedLlmConfig>,
+) -> bool {
+    let env_present = resolved
+        .and_then(|r| r.api_key_env.as_deref())
+        .and_then(|env_name| std::env::var(env_name).ok())
+        .is_some();
+    env_present || config.query_expansion.google.api_key.is_some()
+}
+
 fn check_reranker_provider(config: &ReinConfig) -> DoctorCheck {
-    match config.reranker_provider() {
-        Provider::Google => match config.query_expansion.google.api_key.as_ref() {
-            Some(_) => ok_in(
-                DoctorCategory::Configuration,
-                "llm_reranker",
-                format!(
-                    "google:{} configured (top_n={})",
-                    config.query_expansion.google.model, config.search.llm_reranker_top_n
-                ),
-            ),
-            None => warn_in(
-                DoctorCategory::Configuration,
-                "llm_reranker",
-                "google reranker configured but GEMINI_API_KEY is missing; reranker will be skipped",
-            ),
-        },
+    // v0.27.1 B2 (spec §15 R9-K6): route through
+    // `resolve_llm_for("search.llm_reranker")`.
+    let resolved = config.resolve_llm_for("search.llm_reranker").ok();
+    let provider = resolved
+        .as_ref()
+        .map(|r| r.provider)
+        .unwrap_or(Provider::None);
+    let model = resolved
+        .as_ref()
+        .map(|r| r.model.clone())
+        .unwrap_or_default();
+    let endpoint = resolved
+        .as_ref()
+        .map(|r| r.endpoint.clone())
+        .unwrap_or_default();
+    let top_n = config.search.llm_reranker_top_n;
+    // Codex R5 P3 — honor resolved api_key_env (mirror of extract path).
+    // Reranker shares `[query_expansion.google]` for the api_key field.
+    let key_present = google_api_key_resolved_for_qe(config, resolved.as_ref());
+    match provider {
+        Provider::Google if key_present => ok_in(
+            DoctorCategory::Configuration,
+            "llm_reranker",
+            format!("google:{model} configured (top_n={top_n})"),
+        ),
+        Provider::Google => warn_in(
+            DoctorCategory::Configuration,
+            "llm_reranker",
+            "google reranker configured but no API key found at the resolved \
+             api_key_env (default GEMINI_API_KEY); reranker will be skipped",
+        ),
         Provider::Omlx => ok_in(
             DoctorCategory::Configuration,
             "llm_reranker",
-            format!(
-                "omlx:{} at {} (top_n={})",
-                config.query_expansion.omlx.model,
-                config.query_expansion.omlx.endpoint,
-                config.search.llm_reranker_top_n
-            ),
+            format!("omlx:{model} at {endpoint} (top_n={top_n})"),
         ),
         Provider::None => ok_in(DoctorCategory::Configuration, "llm_reranker", "disabled"),
     }

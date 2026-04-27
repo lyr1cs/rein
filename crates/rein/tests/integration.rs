@@ -513,6 +513,7 @@ fn test_dot_export_cjk() {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     store.add_concept(c1).unwrap();
 
@@ -531,6 +532,7 @@ fn test_dot_export_cjk() {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     store.add_concept(c2).unwrap();
 

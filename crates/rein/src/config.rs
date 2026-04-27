@@ -65,6 +65,17 @@ pub struct ReinConfig {
     pub ars: ArsConfig,
     #[serde(default)]
     pub dedup: DedupConfig,
+    /// v0.27.1 Track 2 — `[llm]` parent section providing 4-level
+    /// inheritance precedence for every LLM consumer (extract /
+    /// query_expansion / search.llm_reranker / ars.recall_synthesis /
+    /// ars.concept_summary / ars.cold_archive / ars.llm_judge / etc.).
+    ///
+    /// Back-compat: when absent, `resolve_llm_for` skips levels 2 and 3
+    /// of the precedence chain and falls through to per-section explicit
+    /// (level 1) and the hardcoded baseline (level 4) — so every v0.26.x
+    /// config continues to load identically.
+    #[serde(default)]
+    pub llm: LlmDefaultsConfig,
 }
 
 /// v0.27 Track 2 config — feature flags + thresholds for the new
@@ -293,6 +304,13 @@ pub struct ArsConfig {
     /// make this adaptive on cold-tier backlog depth.
     #[serde(default = "default_cold_archive_batch_size")]
     pub cold_archive_batch_size: usize,
+    // ── v0.27.1 Track 1 — runtime LLM judge ──────────────────────────────────
+    /// `[ars.llm_judge]` sub-table — opt-in runtime LLM judge worker for
+    /// auto-feedback on synthesis / concept-summary outputs. Default off.
+    /// J6 invariant `weight_decay_rate ∈ [0.0, 1.0]` is validated at boot
+    /// via `validate_ars_llm_judge`.
+    #[serde(default)]
+    pub llm_judge: ArsLlmJudgeConfig,
 }
 
 fn default_ars_backend() -> String {
@@ -341,6 +359,8 @@ impl Default for ArsConfig {
             cold_archive_enabled: false,
             cold_archive_target_chars: default_cold_archive_target_chars(),
             cold_archive_batch_size: default_cold_archive_batch_size(),
+            // v0.27.1 Track 1 — opt-in runtime LLM judge
+            llm_judge: ArsLlmJudgeConfig::default(),
         }
     }
 }
@@ -354,6 +374,250 @@ impl ArsConfig {
             _ => fallback_extract_provider,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.27.1 Track 1 — `[ars.llm_judge]` runtime LLM judge config
+// ---------------------------------------------------------------------------
+
+/// `[ars.llm_judge]` config block — opt-in runtime LLM judge worker for
+/// auto-feedback on synthesis (Cap B) and concept-summary (Cap A) outputs.
+///
+/// Provider/model fields are NOT stored here; they resolve via
+/// `ReinConfig::resolve_llm_for("ars.llm_judge")` per Track 2 §8 (the
+/// 4-level precedence chain). This config block carries the policy /
+/// rate / cost knobs that are unique to the judge worker.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArsLlmJudgeConfig {
+    /// Master feature flag. Default `false` per
+    /// [[feedback_no_early_deploy]].
+    #[serde(default)]
+    pub enabled: bool,
+    /// Judge Cap B (synthesis) outputs. Default `true` once master is on.
+    #[serde(default = "default_true")]
+    pub synthesis_enabled: bool,
+    /// Judge Cap A (concept-summary) outputs. Default `true` once master
+    /// is on.
+    #[serde(default = "default_true")]
+    pub concept_summary_enabled: bool,
+    /// Recall-ranking judge — deferred to v0.27.2+.
+    #[serde(default)]
+    pub recall_ranking_enabled: bool,
+    /// Sample-rate when cluster human-signal count is below
+    /// `human_signal_threshold` (cold start). Default 1.0 (100%).
+    #[serde(default = "default_judge_sample_rate_cold_start")]
+    pub sample_rate_cold_start: f64,
+    /// Sample-rate when cluster has ≥ `human_signal_threshold` human
+    /// events (warm). Default 0.2 (20%).
+    #[serde(default = "default_judge_sample_rate_warm")]
+    pub sample_rate_warm: f64,
+    /// Cold→warm trigger per cluster. Default 50.
+    #[serde(default = "default_judge_human_signal_threshold")]
+    pub human_signal_threshold: u64,
+    /// `useful_rate` weight decay: `w_llm = w_thumb × weight_decay_rate`.
+    /// Codex R2 P3 — default 0.3 (LLM at 30% of human signal). J6
+    /// invariant requires `weight_decay_rate ∈ [0.0, 1.0]` AND finite;
+    /// validated at boot via `validate_ars_llm_judge`.
+    #[serde(default = "default_judge_weight_decay_rate")]
+    pub weight_decay_rate: f64,
+    /// Hard cap on LLM judge HTTP calls per rolling 24h. Default 10000.
+    /// Worker drops events when hit (J2 invariant).
+    #[serde(default = "default_judge_daily_call_cap")]
+    pub daily_call_cap: u64,
+    /// TTL for the synthesis-cache jsonl entry used by the manual MCP
+    /// rehydration path (`rein_judge_synthesis`). Default 600s.
+    #[serde(default = "default_judge_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// `[ars.llm_judge.nightly_cron]` sub-table — Layer 2 calibration
+    /// cron policy.
+    #[serde(default)]
+    pub nightly_cron: ArsLlmJudgeNightlyCronConfig,
+}
+
+/// `[ars.llm_judge.nightly_cron]` sub-table — Layer 2 of the calibration
+/// triangle. Re-judges a sampled subset of the last 24h synthesis events
+/// with a (potentially stricter) LLM regime, and accumulates κ vs the
+/// runtime judge.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ArsLlmJudgeNightlyCronConfig {
+    /// Master cron flag. Default `false` (gated separately from
+    /// `[ars.llm_judge].enabled`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fraction of the last 24h synthesis events to re-judge. Default
+    /// 0.2 (20%).
+    #[serde(default = "default_judge_cron_sample_rate")]
+    pub sample_rate: f64,
+}
+
+fn default_judge_sample_rate_cold_start() -> f64 {
+    1.0 // bootstrap; v0.27.2+ → adaptive
+}
+
+fn default_judge_sample_rate_warm() -> f64 {
+    0.2 // bootstrap; v0.27.2+ → adaptive
+}
+
+fn default_judge_human_signal_threshold() -> u64 {
+    50 // bootstrap; v0.27.2+ → adaptive
+}
+
+fn default_judge_weight_decay_rate() -> f64 {
+    0.3 // Codex R2 P3 — LLM at 30% of human signal
+}
+
+fn default_judge_daily_call_cap() -> u64 {
+    10_000
+}
+
+fn default_judge_cache_ttl_secs() -> u64 {
+    600
+}
+
+fn default_judge_cron_sample_rate() -> f64 {
+    0.2
+}
+
+impl Default for ArsLlmJudgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            synthesis_enabled: true,
+            concept_summary_enabled: true,
+            recall_ranking_enabled: false,
+            sample_rate_cold_start: default_judge_sample_rate_cold_start(),
+            sample_rate_warm: default_judge_sample_rate_warm(),
+            human_signal_threshold: default_judge_human_signal_threshold(),
+            weight_decay_rate: default_judge_weight_decay_rate(),
+            daily_call_cap: default_judge_daily_call_cap(),
+            cache_ttl_secs: default_judge_cache_ttl_secs(),
+            nightly_cron: ArsLlmJudgeNightlyCronConfig::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.27.1 Track 2 — `[llm]` parent config + 4-level inheritance
+// ---------------------------------------------------------------------------
+
+/// `[llm]` parent config block — single source of truth for provider /
+/// model defaults shared across every LLM consumer. Each consumer's
+/// section can still override at level 1 (section-explicit) or level 2
+/// (section-provider); the parent block is level 3. Level 4 is the
+/// hardcoded baseline in code.
+///
+/// Back-compat: when `[llm]` is absent (every v0.26.x config), `provider`
+/// defaults to "none", which causes `resolve_llm_for` to skip levels 2-3
+/// of the precedence chain — the resolver falls through to level 1
+/// (per-section) and level 4 (hardcoded), preserving v0.26.x semantics
+/// exactly.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LlmDefaultsConfig {
+    /// Global default provider name: `"google"` | `"omlx"` | `"none"` |
+    /// absent (`""`). Empty string + missing field both mean "no `[llm]`
+    /// provider was set" — back-compat path.
+    #[serde(default)]
+    pub provider: String,
+    /// Provider-agnostic temperature override. Optional; consumers fall
+    /// back to their own internal default when `None`.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Provider-agnostic request timeout override (ms). Optional.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Provider-agnostic max-retries override. Optional.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// `[llm.google]` provider sub-table.
+    #[serde(default)]
+    pub google: LlmProviderTable,
+    /// `[llm.omlx]` provider sub-table.
+    #[serde(default)]
+    pub omlx: LlmProviderTable,
+}
+
+/// Per-provider sub-table inside `[llm.{provider}]` (or
+/// `[{section}.{provider}]` overrides). Fields are optional so the
+/// resolver can detect "not set at this precedence level" and walk
+/// further.
+///
+/// **Provider-scoped fields walk as a unit** (Codex R5 P2): once
+/// `provider` is selected at some precedence level, the resolver reads
+/// `model` / `api_key_env` / `endpoint` / `max_input_chars` from the
+/// SELECTED provider's sub-table at that level (or walks back through
+/// level 2/3 with the same provider). They never independently fall
+/// over to the OTHER provider's sub-table.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LlmProviderTable {
+    /// Model name (e.g. `"gemini-3.1-flash-lite-preview"`,
+    /// `"gemini-3.1-pro"`, `"default"`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Environment variable that holds the provider's API key. Resolver
+    /// passes this through unchanged; the consumer reads `std::env::var`.
+    /// Convention mirrors the pre-Track-2 pattern of `GEMINI_API_KEY`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Provider endpoint override (proxy / mirror / local server).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Max prompt characters. `0` is reserved for known 1M-token Gemini
+    /// models; the consumer rejects `0` for any other model and falls
+    /// back to a 16K safety limit.
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
+}
+
+/// Source level a `ResolvedLlmConfig` came from — surfaced for
+/// `rein doctor` diagnostics + Layer-3 telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrecedenceSource {
+    /// Level 1: `[{section}.{provider}].{field}` — section-explicit.
+    SectionExplicit,
+    /// Level 2: `[{section}].provider` selects → `[llm.{provider}]`
+    /// scoped fields read at level 3 with the section-chosen provider.
+    SectionProvider,
+    /// Level 3: `[llm].provider` + `[llm.{provider}]`.
+    GlobalDefault,
+    /// Level 4: hardcoded baseline in code.
+    HardcodedFallback,
+}
+
+/// Resolved LLM config for a given consumer section. Returned by
+/// `ReinConfig::resolve_llm_for(section)`.
+///
+/// Fields mirror the existing per-section LLM blob shape so call-site
+/// migration is mostly mechanical. `source` is reported for telemetry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedLlmConfig {
+    /// Resolved provider — `Provider::None` means "no LLM configured for
+    /// this section" (consumer should disable that path).
+    pub provider: Provider,
+    /// Resolved model name. Empty when `provider == None`.
+    pub model: String,
+    /// Resolved env-var name for the API key (e.g. `"GEMINI_API_KEY"`).
+    /// `None` when not applicable (OMLX / None).
+    pub api_key_env: Option<String>,
+    /// Resolved endpoint (proxy / mirror / local server).
+    pub endpoint: String,
+    /// Max prompt characters. `0` means "no truncation" — only valid for
+    /// known 1M-token Gemini models; consumer enforces.
+    pub max_input_chars: usize,
+    /// Optional temperature override (consumer falls back to its own
+    /// default when `None`).
+    pub temperature: Option<f64>,
+    /// Optional request-timeout override in ms.
+    pub request_timeout_ms: Option<u64>,
+    /// Optional max-retries override.
+    pub max_retries: Option<u32>,
+    /// Which precedence level supplied the dominant `provider` choice.
+    pub source: PrecedenceSource,
+    /// Consumer section name (echoed back for logging).
+    pub section: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1246,9 +1510,17 @@ impl ReinConfig {
     /// Validate configuration and return an error for invalid values.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_provider_name("embedding.provider", &self.embedding.provider)?;
-        validate_provider_name("extract.provider", &self.extract.provider)?;
-        validate_provider_name("query_expansion.provider", &self.query_expansion.provider)?;
-        validate_provider_name("search.llm_reranker", &self.search.llm_reranker)?;
+        // Codex R4 P2 fix — extract / query_expansion / search.llm_reranker
+        // accept "inherit" sentinel (in addition to google/omlx/none) so
+        // operators can opt INTO `[llm]` global override. Without this
+        // there's no way to override default-pinned sections without
+        // writing each one explicitly.
+        validate_provider_name_or_inherit("extract.provider", &self.extract.provider)?;
+        validate_provider_name_or_inherit(
+            "query_expansion.provider",
+            &self.query_expansion.provider,
+        )?;
+        validate_provider_name_or_inherit("search.llm_reranker", &self.search.llm_reranker)?;
         validate_provider_name_or_inherit("async_memory.provider", &self.async_memory.provider)?;
         validate_provider_name_or_inherit(
             "resummerize.llm_backend",
@@ -1381,7 +1653,53 @@ impl ReinConfig {
             anyhow::bail!("ars.batch_size must be >= 1");
         }
 
+        // v0.27.1 J6 invariant — `weight_decay_rate` must be finite + in
+        // [0.0, 1.0] so `w_llm = w_thumb × weight_decay_rate` enforces both
+        // ordering (`w_llm ≤ w_thumb`) and non-negativity (`w_llm ≥ 0`).
+        // Codex R8 P2 fix — v0 only checked `> 1.0`, accepting negative
+        // values that would make `w_llm` subtract judge hits from the
+        // human signal. NaN / non-finite also rejected.
+        validate_ars_llm_judge(&self.ars.llm_judge)?;
+
+        // v0.27.1 Track 2 — validate the optional `[llm]` provider name
+        // when present (empty string = absent, treated as back-compat).
+        if !self.llm.provider.is_empty() {
+            validate_provider_name("llm.provider", &self.llm.provider)?;
+        }
+
         Ok(())
+    }
+
+    /// v0.27.1 Track 2 — resolve the effective LLM config for a given
+    /// consumer section.
+    ///
+    /// `section` is the dotted path identifying the consumer; valid
+    /// values per spec §8.5:
+    ///
+    /// - `"extract"`, `"extract.async_memory"`, `"extract.intelligent_merge"`,
+    ///   `"extract.dedup"`
+    /// - `"query_expansion"`
+    /// - `"search.llm_reranker"`
+    /// - `"ars.recall_synthesis"`, `"ars.concept_summary"`,
+    ///   `"ars.cold_archive"`
+    /// - `"resummerize"`
+    /// - `"ars.llm_judge"`, `"ars.llm_judge.nightly_cron"`
+    ///
+    /// Walks the 4-level precedence chain per spec §8.1. Returns
+    /// `Err(Config(...))` only when:
+    /// - the section name is unknown, or
+    /// - the resolved provider is `Google`/`Omlx` but no provider
+    ///   sub-table at any walked level supplied a `model` (Codex R5 P2
+    ///   fail-fast — silent cross-provider corruption beats nothing).
+    ///
+    /// **Provider-scoped fields walk as a unit**: once `provider` is
+    /// chosen at a precedence level, the resolver reads
+    /// `model` / `api_key_env` / `endpoint` / `max_input_chars` from the
+    /// SELECTED provider's sub-table at that level (or walks back through
+    /// level 2 → level 3 with the same provider). They never
+    /// independently fall over to the OTHER provider's sub-table.
+    pub fn resolve_llm_for(&self, section: &str) -> crate::types::ReinResult<ResolvedLlmConfig> {
+        resolve_llm_for_impl(self, section)
     }
 
     /// Open a SqliteStore with the current config's model and dimensions.
@@ -1571,6 +1889,770 @@ fn validate_provider_name_or_inherit(field: &str, value: &str) -> anyhow::Result
         _ => {
             anyhow::bail!("invalid {field}='{value}'. Expected one of: inherit, google, omlx, none")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.27.1 Track 1 — `[ars.llm_judge]` validation (J6 invariant)
+// ---------------------------------------------------------------------------
+
+/// Validate `[ars.llm_judge]`. Enforces J6: `weight_decay_rate` finite
+/// and in `[0.0, 1.0]`. Codex R8 P2 fix — v0 only checked `> 1.0`,
+/// accepting negative values that would make `w_llm` subtract judge
+/// hits from the human signal. NaN / non-finite also rejected.
+pub fn validate_ars_llm_judge(cfg: &ArsLlmJudgeConfig) -> anyhow::Result<()> {
+    if !cfg.weight_decay_rate.is_finite() || !(0.0..=1.0).contains(&cfg.weight_decay_rate) {
+        anyhow::bail!(
+            "ars.llm_judge.weight_decay_rate must be finite and in [0.0, 1.0], got {}",
+            cfg.weight_decay_rate
+        );
+    }
+    if !(0.0..=1.0).contains(&cfg.sample_rate_cold_start) || !cfg.sample_rate_cold_start.is_finite()
+    {
+        anyhow::bail!(
+            "ars.llm_judge.sample_rate_cold_start must be finite and in [0.0, 1.0], got {}",
+            cfg.sample_rate_cold_start
+        );
+    }
+    if !(0.0..=1.0).contains(&cfg.sample_rate_warm) || !cfg.sample_rate_warm.is_finite() {
+        anyhow::bail!(
+            "ars.llm_judge.sample_rate_warm must be finite and in [0.0, 1.0], got {}",
+            cfg.sample_rate_warm
+        );
+    }
+    if cfg.nightly_cron.enabled
+        && (!(0.0..=1.0).contains(&cfg.nightly_cron.sample_rate)
+            || !cfg.nightly_cron.sample_rate.is_finite())
+    {
+        anyhow::bail!(
+            "ars.llm_judge.nightly_cron.sample_rate must be finite and in [0.0, 1.0], got {}",
+            cfg.nightly_cron.sample_rate
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.27.1 Track 2 — 4-level LLM config inheritance resolver
+// ---------------------------------------------------------------------------
+
+/// Section identity — the resolver knows how to read each consumer's
+/// pre-Track-2 explicit fields (level 1) and the hardcoded baseline
+/// (level 4) for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmSection {
+    Extract,
+    ExtractAsyncMemory,
+    ExtractIntelligentMerge,
+    ExtractDedup,
+    QueryExpansion,
+    SearchLlmReranker,
+    ArsRecallSynthesis,
+    ArsConceptSummary,
+    ArsColdArchive,
+    Resummerize,
+    ArsLlmJudge,
+    ArsLlmJudgeNightlyCron,
+}
+
+impl LlmSection {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "extract" => Self::Extract,
+            "extract.async_memory" => Self::ExtractAsyncMemory,
+            "extract.intelligent_merge" => Self::ExtractIntelligentMerge,
+            "extract.dedup" => Self::ExtractDedup,
+            "query_expansion" => Self::QueryExpansion,
+            "search.llm_reranker" => Self::SearchLlmReranker,
+            "ars.recall_synthesis" => Self::ArsRecallSynthesis,
+            "ars.concept_summary" => Self::ArsConceptSummary,
+            "ars.cold_archive" => Self::ArsColdArchive,
+            "resummerize" => Self::Resummerize,
+            "ars.llm_judge" => Self::ArsLlmJudge,
+            "ars.llm_judge.nightly_cron" => Self::ArsLlmJudgeNightlyCron,
+            _ => return None,
+        })
+    }
+}
+
+/// Level-1 (section-explicit) snapshot. `provider` may be `"inherit"`
+/// for the slow-channel sections (`resummerize`, `ars.*`,
+/// `async_memory`) or absent (`""`) for all v0.27.1-new sections.
+struct SectionExplicit<'a> {
+    /// `Some(name)` when the section ITSELF carries a `provider = "..."`
+    /// field. Lowercased. Empty string treated as `None`.
+    provider: Option<&'a str>,
+    /// Whether `provider == "inherit"` — slow-channel "fall through" hint.
+    inherit: bool,
+    /// Section's own provider sub-tables (legacy v0.26.x shape).
+    google_model: Option<&'a str>,
+    google_api_key_env: Option<&'static str>,
+    google_endpoint: Option<&'a str>,
+    google_max_input_chars: Option<usize>,
+    omlx_model: Option<&'a str>,
+    omlx_endpoint: Option<&'a str>,
+    omlx_max_input_chars: Option<usize>,
+}
+
+impl<'a> SectionExplicit<'a> {
+    fn empty() -> Self {
+        Self {
+            provider: None,
+            inherit: false,
+            google_model: None,
+            google_api_key_env: None,
+            google_endpoint: None,
+            google_max_input_chars: None,
+            omlx_model: None,
+            omlx_endpoint: None,
+            omlx_max_input_chars: None,
+        }
+    }
+}
+
+/// Snapshot the section-explicit (level-1) fields for a given consumer.
+/// Centralizes the legacy field-path knowledge so the resolver core stays
+/// generic.
+///
+/// For sections that didn't exist before v0.27.1 (`ars.llm_judge`,
+/// `ars.llm_judge.nightly_cron`, dotted `extract.*` virtual sections),
+/// returns `SectionExplicit::empty()` — they have no level-1 explicit
+/// shape; resolution falls through to level 2/3/4.
+fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit<'a> {
+    use LlmSection::*;
+    // Codex R4 P2 fix — revert the R2 "default-suppress" heuristic. We
+    // can't reliably distinguish "operator wrote `provider = \"google\"`
+    // to opt out of a global OMLX" from "merge_toml filled the compiled
+    // default". The opt-out semantics requires the explicit value to
+    // win.
+    //
+    // To still let operators globally override `[llm]` for v0.26.x
+    // sections, accept the explicit sentinel `"inherit"` on extract /
+    // query_expansion / search.llm_reranker — same pattern already used
+    // by `async_memory.provider` and `resummerize.llm_backend`. Inherit
+    // means "fall through to `[llm]`"; any other value (including
+    // compiled-default `"google"`) is treated as section-explicit.
+    let extract_inherit = cfg.extract.provider.eq_ignore_ascii_case("inherit");
+    let query_expansion_inherit = cfg.query_expansion.provider.eq_ignore_ascii_case("inherit");
+    let reranker_inherit = cfg.search.llm_reranker.eq_ignore_ascii_case("inherit");
+    match sec {
+        Extract => SectionExplicit {
+            provider: if extract_inherit {
+                None
+            } else {
+                Some(cfg.extract.provider.as_str())
+            },
+            inherit: extract_inherit,
+            google_model: nonempty(&cfg.extract.google.model),
+            google_api_key_env: Some("GEMINI_API_KEY"),
+            google_endpoint: nonempty(&cfg.extract.google.endpoint),
+            google_max_input_chars: Some(cfg.extract.google.max_input_chars),
+            omlx_model: nonempty(&cfg.extract.omlx.model),
+            omlx_endpoint: nonempty(&cfg.extract.omlx.endpoint),
+            omlx_max_input_chars: Some(cfg.extract.omlx.max_input_chars),
+        },
+        ExtractAsyncMemory => {
+            // `[async_memory].provider` may be "inherit" → walk to
+            // `[extract]` semantics; the resolver core treats that as a
+            // level-1 skip (move to level 2/3).
+            let prov = cfg.async_memory.provider.to_lowercase();
+            let inherit = prov == "inherit";
+            SectionExplicit {
+                provider: if inherit {
+                    None
+                } else {
+                    Some(cfg.async_memory.provider.as_str())
+                },
+                inherit,
+                // No async-memory-specific provider sub-table; reuse
+                // `[extract.{provider}]` (matches the v0.26.x semantic
+                // implemented in `extract/llm.rs::create_memory_worker_extractor`).
+                google_model: nonempty(&cfg.extract.google.model),
+                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_endpoint: nonempty(&cfg.extract.google.endpoint),
+                google_max_input_chars: Some(cfg.extract.google.max_input_chars),
+                omlx_model: nonempty(&cfg.extract.omlx.model),
+                omlx_endpoint: nonempty(&cfg.extract.omlx.endpoint),
+                omlx_max_input_chars: Some(cfg.extract.omlx.max_input_chars),
+            }
+        }
+        ExtractIntelligentMerge => {
+            // `[intelligent_merge].provider == "none"` is the back-compat
+            // sentinel meaning "fall back to query_expansion" — v0 used
+            // a separate `resolved_provider` accessor. Map it to inherit
+            // (level-1 skip) so the resolver walks levels 2/3.
+            let prov = cfg.intelligent_merge.provider.to_lowercase();
+            let inherit = matches!(prov.as_str(), "none" | "inherit");
+            SectionExplicit {
+                provider: if inherit {
+                    None
+                } else {
+                    Some(cfg.intelligent_merge.provider.as_str())
+                },
+                inherit,
+                google_model: nonempty(&cfg.intelligent_merge.google.model),
+                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_endpoint: nonempty(&cfg.intelligent_merge.google.endpoint),
+                google_max_input_chars: None,
+                omlx_model: nonempty(&cfg.intelligent_merge.omlx.model),
+                omlx_endpoint: nonempty(&cfg.intelligent_merge.omlx.endpoint),
+                omlx_max_input_chars: None,
+            }
+        }
+        ExtractDedup => {
+            // No dedicated `[extract.dedup]` block in v0.26.x — the
+            // dedup verdict path reuses `[extract]`. Mirror it as
+            // level-1 inherit so the resolver walks to level 2/3.
+            SectionExplicit::empty()
+        }
+        QueryExpansion => SectionExplicit {
+            provider: if query_expansion_inherit {
+                None
+            } else {
+                Some(cfg.query_expansion.provider.as_str())
+            },
+            inherit: query_expansion_inherit,
+            google_model: nonempty(&cfg.query_expansion.google.model),
+            google_api_key_env: Some("GEMINI_API_KEY"),
+            google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
+            google_max_input_chars: None,
+            omlx_model: nonempty(&cfg.query_expansion.omlx.model),
+            omlx_endpoint: nonempty(&cfg.query_expansion.omlx.endpoint),
+            omlx_max_input_chars: None,
+        },
+        SearchLlmReranker => {
+            // `[search].llm_reranker` is the section-provider field for
+            // the reranker; the actual provider sub-tables it reads from
+            // are `[query_expansion.{provider}]` (see
+            // `search/rerank_llm.rs`). Mirror that v0.26.x behavior.
+            SectionExplicit {
+                provider: if reranker_inherit {
+                    None
+                } else {
+                    Some(cfg.search.llm_reranker.as_str())
+                },
+                inherit: reranker_inherit,
+                google_model: nonempty(&cfg.query_expansion.google.model),
+                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
+                google_max_input_chars: None,
+                omlx_model: nonempty(&cfg.query_expansion.omlx.model),
+                omlx_endpoint: nonempty(&cfg.query_expansion.omlx.endpoint),
+                omlx_max_input_chars: None,
+            }
+        }
+        ArsRecallSynthesis | ArsConceptSummary | ArsColdArchive => {
+            // All three Ars Cap A/B/C sections share `[ars].llm_backend`
+            // ("inherit" / "google" / "omlx" / "none") and reuse
+            // `[extract.{provider}]` blocks for provider-scoped fields
+            // (matches v0.26.x semantics in `ops/concept_summary.rs` etc.)
+            let backend = cfg.ars.llm_backend.to_lowercase();
+            let inherit = backend == "inherit";
+            SectionExplicit {
+                provider: if inherit {
+                    None
+                } else {
+                    Some(cfg.ars.llm_backend.as_str())
+                },
+                inherit,
+                google_model: nonempty(&cfg.extract.google.model),
+                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_endpoint: nonempty(&cfg.extract.google.endpoint),
+                google_max_input_chars: Some(cfg.extract.google.max_input_chars),
+                omlx_model: nonempty(&cfg.extract.omlx.model),
+                omlx_endpoint: nonempty(&cfg.extract.omlx.endpoint),
+                omlx_max_input_chars: Some(cfg.extract.omlx.max_input_chars),
+            }
+        }
+        Resummerize => {
+            let backend = cfg.resummerize.llm_backend.to_lowercase();
+            let inherit = backend == "inherit";
+            SectionExplicit {
+                provider: if inherit {
+                    None
+                } else {
+                    Some(cfg.resummerize.llm_backend.as_str())
+                },
+                inherit,
+                google_model: nonempty(&cfg.extract.google.model),
+                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_endpoint: nonempty(&cfg.extract.google.endpoint),
+                google_max_input_chars: Some(cfg.extract.google.max_input_chars),
+                omlx_model: nonempty(&cfg.extract.omlx.model),
+                omlx_endpoint: nonempty(&cfg.extract.omlx.endpoint),
+                omlx_max_input_chars: Some(cfg.extract.omlx.max_input_chars),
+            }
+        }
+        ArsLlmJudge | ArsLlmJudgeNightlyCron => {
+            // New-in-v0.27.1 sections — no level-1 explicit shape.
+            // Resolver walks to level 2 (parent section provider for the
+            // nightly cron variant) → level 3 (`[llm]`) → level 4
+            // (hardcoded).
+            SectionExplicit::empty()
+        }
+    }
+}
+
+/// Hardcoded baseline (level 4) per consumer.
+///
+/// Pre-Track-2 invariant: "no provider configured = no LLM call" —
+/// every consumer's level-4 fallback is `Provider::None`, so the
+/// consumer disables its LLM path gracefully. The endpoint string
+/// stored here is purely informational (no HTTP traffic when provider
+/// is None) but gets carried through anyway for telemetry symmetry.
+fn hardcoded_fallback(sec: LlmSection) -> ResolvedLlmConfig {
+    ResolvedLlmConfig {
+        provider: Provider::None,
+        model: String::new(),
+        api_key_env: None,
+        endpoint: default_google_endpoint(),
+        max_input_chars: 0,
+        temperature: None,
+        request_timeout_ms: None,
+        max_retries: None,
+        source: PrecedenceSource::HardcodedFallback,
+        section: section_name(sec).to_string(),
+    }
+}
+
+fn section_name(sec: LlmSection) -> &'static str {
+    use LlmSection::*;
+    match sec {
+        Extract => "extract",
+        ExtractAsyncMemory => "extract.async_memory",
+        ExtractIntelligentMerge => "extract.intelligent_merge",
+        ExtractDedup => "extract.dedup",
+        QueryExpansion => "query_expansion",
+        SearchLlmReranker => "search.llm_reranker",
+        ArsRecallSynthesis => "ars.recall_synthesis",
+        ArsConceptSummary => "ars.concept_summary",
+        ArsColdArchive => "ars.cold_archive",
+        Resummerize => "resummerize",
+        ArsLlmJudge => "ars.llm_judge",
+        ArsLlmJudgeNightlyCron => "ars.llm_judge.nightly_cron",
+    }
+}
+
+fn nonempty(s: &str) -> Option<&str> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Pick a provider name string and return `Some(Provider)` if it parses
+/// to a concrete provider (Google / Omlx). `"none"` and unknown values
+/// produce `None`. Empty strings also produce `None` (back-compat: a
+/// missing field).
+fn pick_provider(name: &str) -> Option<Provider> {
+    match name.to_lowercase().as_str() {
+        "google" | "gemini" => Some(Provider::Google),
+        "omlx" | "local" => Some(Provider::Omlx),
+        _ => None,
+    }
+}
+
+/// Read the four provider-scoped fields from a level-1 section snapshot
+/// for the chosen provider. Returns `None` for any missing field.
+fn level1_scoped_fields<'a>(
+    explicit: &SectionExplicit<'a>,
+    chosen: Provider,
+) -> (
+    Option<&'a str>,        // model
+    Option<&'static str>,   // api_key_env
+    Option<&'a str>,        // endpoint
+    Option<usize>,          // max_input_chars
+) {
+    match chosen {
+        Provider::Google => (
+            explicit.google_model,
+            explicit.google_api_key_env,
+            explicit.google_endpoint,
+            explicit.google_max_input_chars,
+        ),
+        Provider::Omlx => (
+            explicit.omlx_model,
+            None,
+            explicit.omlx_endpoint,
+            explicit.omlx_max_input_chars,
+        ),
+        Provider::None => (None, None, None, None),
+    }
+}
+
+/// Read the four provider-scoped fields from `[llm.{provider}]`
+/// (level-3 sub-table). Returns `None` for any field not set in the
+/// config file. Borrows from `llm` — the caller (`build_resolved_for_provider`)
+/// already converts everything to `String` for the owned
+/// `ResolvedLlmConfig`, so no `'static` lifetime is needed.
+fn level3_scoped_fields<'a>(
+    llm: &'a LlmDefaultsConfig,
+    chosen: Provider,
+) -> (
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<usize>,
+) {
+    let table = match chosen {
+        Provider::Google => &llm.google,
+        Provider::Omlx => &llm.omlx,
+        Provider::None => return (None, None, None, None),
+    };
+    // Operator may set `[llm.google].api_key_env = "MY_KEY"` to point at
+    // a non-default env var. When unset, fall through to the pre-Track-2
+    // baseline `"GEMINI_API_KEY"` for Google. OMLX has no API key.
+    let api_key_env: Option<&'a str> = match chosen {
+        Provider::Google => table
+            .api_key_env
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(Some("GEMINI_API_KEY")),
+        _ => None,
+    };
+    (
+        table.model.as_deref().filter(|s| !s.is_empty()),
+        api_key_env,
+        table.endpoint.as_deref().filter(|s| !s.is_empty()),
+        table.max_input_chars,
+    )
+}
+
+/// Build the `ResolvedLlmConfig` for a given chosen provider, walking
+/// the provider-scoped fields as a unit per spec §8.1.
+///
+/// Precedence for scoped fields (with `provider` already chosen at level
+/// `provider_level`):
+/// 1. If `provider_level == SectionExplicit` or `SectionProvider`, read
+///    scoped fields from the `explicit` snapshot's `[{provider}]` block.
+/// 2. Else (or if level-1 missing a field) read `[llm.{provider}].{field}`.
+/// 3. Final fallback to baseline values inside this fn.
+///
+/// Note: `SectionProvider` (level 2) is the "inherit" path — the
+/// `explicit` snapshot the caller passes in MUST already be re-pointed
+/// at the inherited section's data (e.g. `[extract]` for an
+/// `[ars].llm_backend = "inherit"` walk). The caller — `resolve_llm_for_impl`
+/// — sets that up before calling here.
+fn build_resolved_for_provider(
+    sec: LlmSection,
+    section: &str,
+    chosen: Provider,
+    provider_level: PrecedenceSource,
+    explicit: &SectionExplicit<'_>,
+    llm: &LlmDefaultsConfig,
+) -> crate::types::ReinResult<ResolvedLlmConfig> {
+    // Level 1 / 2 — section-explicit (or inherited-section's) scoped
+    // fields. Both levels read from the same `explicit` snapshot since
+    // the resolver pre-rewires `explicit` to point at the inherited
+    // section's blocks before calling here in the inherit path.
+    // Codex R5 P2 fix — when the section explicitly opted into inherit
+    // (provider = "inherit" sentinel), level-1 scoped fields MUST NOT
+    // win over level-3 `[llm.{provider}]`. The inherit signal means the
+    // operator wants the global block to apply uniformly; reading
+    // `[extract.google].model` before `[llm.google].model` defeats the
+    // whole point of the sentinel. Only `SectionExplicit` (provider was
+    // genuinely written by user, not inherit) preserves level-1 priority.
+    let (l1_model, l1_api_key_env, l1_endpoint, l1_max_input_chars) = match provider_level {
+        PrecedenceSource::SectionExplicit => level1_scoped_fields(explicit, chosen),
+        PrecedenceSource::SectionProvider if !explicit.inherit => {
+            level1_scoped_fields(explicit, chosen)
+        }
+        _ => (None, None, None, None),
+    };
+
+    // Level 3 — `[llm.{provider}]` scoped fields.
+    let (l3_model, l3_api_key_env, l3_endpoint, l3_max_input_chars) =
+        level3_scoped_fields(llm, chosen);
+
+    // Codex R3 P2 fix — when the provider was selected via GlobalDefault
+    // (`[llm].provider = "omlx"`) but the operator didn't write
+    // `[llm.omlx].model`, fall back to the legacy section's same-provider
+    // sub-table (e.g. `[extract.omlx].model`) before erroring. Without
+    // this, an operator who only writes `[llm].provider = "omlx"` and
+    // leaves the section default-populated sees `resolve_llm_for("extract")`
+    // fail with no model configured, even though `[extract.omlx]` has the
+    // same default `"default"` model the section path would have used.
+    let (l_legacy_model, l_legacy_api_key_env, l_legacy_endpoint, l_legacy_max_input_chars) =
+        match provider_level {
+            PrecedenceSource::GlobalDefault => level1_scoped_fields(explicit, chosen),
+            _ => (None, None, None, None),
+        };
+
+    let model = l1_model
+        .or(l3_model)
+        .or(l_legacy_model)
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            crate::types::ReinError::Config(format!(
+                "resolve_llm_for(\"{section}\"): provider = {provider:?} but no \
+                 model is configured at any precedence level — set \
+                 `[{section}.{provider_lc}].model` or \
+                 `[llm.{provider_lc}].model`",
+                provider = chosen,
+                provider_lc = match chosen {
+                    Provider::Google => "google",
+                    Provider::Omlx => "omlx",
+                    Provider::None => unreachable!(),
+                }
+            ))
+        })?;
+
+    // Coerce `&'static str` from level 1 into `&str` matching level 3
+    // before `.or()` — the borrow ends in `to_string()` either way.
+    // Codex R3 P2: include legacy-section fallback at the end of the
+    // chain for the GlobalDefault path (mirror of model fallback above).
+    let api_key_env = l1_api_key_env
+        .map(|s| s.to_string())
+        .or_else(|| l3_api_key_env.map(|s| s.to_string()))
+        .or_else(|| l_legacy_api_key_env.map(|s| s.to_string()));
+
+    let endpoint = l1_endpoint
+        .map(|s| s.to_string())
+        .or_else(|| l3_endpoint.map(|s| s.to_string()))
+        .or_else(|| l_legacy_endpoint.map(|s| s.to_string()))
+        .unwrap_or_else(|| match (sec, chosen) {
+            (LlmSection::QueryExpansion | LlmSection::SearchLlmReranker, Provider::Omlx) => {
+                "http://localhost:8000/v1".to_string()
+            }
+            (_, Provider::Omlx) => "http://localhost:11434/v1".to_string(),
+            (_, _) => default_google_endpoint(),
+        });
+
+    let max_input_chars = l1_max_input_chars
+        .or(l3_max_input_chars)
+        .or(l_legacy_max_input_chars)
+        .unwrap_or(match chosen {
+            Provider::Google => 0, // 1M-token model default
+            Provider::Omlx => default_omlx_max_input_chars(),
+            Provider::None => 0,
+        });
+
+    Ok(ResolvedLlmConfig {
+        provider: chosen,
+        model,
+        api_key_env,
+        endpoint,
+        max_input_chars,
+        temperature: llm.temperature,
+        request_timeout_ms: llm.request_timeout_ms,
+        max_retries: llm.max_retries,
+        source: provider_level,
+        section: section.to_string(),
+    })
+}
+
+/// Core resolver — walks the 4-level precedence chain.
+fn resolve_llm_for_impl(
+    cfg: &ReinConfig,
+    section: &str,
+) -> crate::types::ReinResult<ResolvedLlmConfig> {
+    // Special-case the dotted nightly_cron section — it reads its
+    // section-provider field from `[ars.llm_judge]` rather than from a
+    // `[ars.llm_judge.nightly_cron].provider` field (which doesn't exist
+    // in v0.27.1; operator overrides via `[ars.llm_judge.nightly_cron.{p}]`
+    // are deferred to v0.27.2+ when the cron actually runs).
+    let sec = LlmSection::parse(section).ok_or_else(|| {
+        crate::types::ReinError::Config(format!(
+            "resolve_llm_for: unknown section \"{section}\". Valid sections: \
+             extract, extract.async_memory, extract.intelligent_merge, \
+             extract.dedup, query_expansion, search.llm_reranker, \
+             ars.recall_synthesis, ars.concept_summary, ars.cold_archive, \
+             resummerize, ars.llm_judge, ars.llm_judge.nightly_cron"
+        ))
+    })?;
+
+    let explicit = section_explicit(cfg, sec);
+
+    // Level 1 — section-explicit `provider` (skipped when `inherit` or
+    // when the section has no level-1 explicit shape).
+    if let Some(name) = explicit.provider {
+        if let Some(chosen) = pick_provider(name) {
+            return build_resolved_for_provider(
+                sec,
+                section,
+                chosen,
+                PrecedenceSource::SectionExplicit,
+                &explicit,
+                &cfg.llm,
+            );
+        }
+        // Section provider was set but resolves to None — back-compat
+        // path: a `provider = "none"` extract block disables LLM paths.
+        // `expand_provider() == None` is also a real production setting.
+        // Skip levels 2/3 — falling through to `[llm]` would silently
+        // re-enable an LLM the operator turned off.
+        if name.eq_ignore_ascii_case("none") {
+            return Ok(ResolvedLlmConfig {
+                provider: Provider::None,
+                model: String::new(),
+                api_key_env: None,
+                endpoint: default_google_endpoint(),
+                max_input_chars: 0,
+                temperature: cfg.llm.temperature,
+                request_timeout_ms: cfg.llm.request_timeout_ms,
+                max_retries: cfg.llm.max_retries,
+                source: PrecedenceSource::SectionExplicit,
+                section: section.to_string(),
+            });
+        }
+        // Unknown provider name — validate() should have caught this
+        // earlier, but defensively fall through to the [llm] chain.
+    }
+
+    // Level 2 — section-explicit `inherit` AND `[llm].provider` exists →
+    // read scoped fields from `[llm.{provider}]` but the provider choice
+    // came from `[llm]`. (Conceptually identical to level 3 in this
+    // implementation since "inherit" is the only thing that distinguishes
+    // them; spec §8.1 lists them separately for documentation symmetry.)
+    if explicit.inherit {
+        if let Some(chosen) = pick_provider(&cfg.llm.provider) {
+            return build_resolved_for_provider(
+                sec,
+                section,
+                chosen,
+                PrecedenceSource::SectionProvider,
+                &explicit,
+                &cfg.llm,
+            );
+        }
+        // No `[llm]` provider AND section says "inherit" — for the
+        // existing v0.26.x slow-channel sections (`ars.*`,
+        // `resummerize`, `async_memory`), "inherit" historically meant
+        // "fall back to `[extract].provider`". Preserve that semantic
+        // for back-compat by walking `[extract]`.
+        if matches!(
+            sec,
+            LlmSection::ExtractAsyncMemory
+                | LlmSection::ArsRecallSynthesis
+                | LlmSection::ArsConceptSummary
+                | LlmSection::ArsColdArchive
+                | LlmSection::Resummerize
+                | LlmSection::ExtractIntelligentMerge
+        ) {
+            // Synthesize a level-1 result by reading `[extract]` directly.
+            let extract_explicit = section_explicit(cfg, LlmSection::Extract);
+            if let Some(name) = extract_explicit.provider {
+                if let Some(chosen) = pick_provider(name) {
+                    return build_resolved_for_provider(
+                        sec,
+                        section,
+                        chosen,
+                        PrecedenceSource::SectionProvider,
+                        &extract_explicit,
+                        &cfg.llm,
+                    );
+                }
+                if name.eq_ignore_ascii_case("none") {
+                    return Ok(ResolvedLlmConfig {
+                        provider: Provider::None,
+                        model: String::new(),
+                        api_key_env: None,
+                        endpoint: default_google_endpoint(),
+                        max_input_chars: 0,
+                        temperature: cfg.llm.temperature,
+                        request_timeout_ms: cfg.llm.request_timeout_ms,
+                        max_retries: cfg.llm.max_retries,
+                        source: PrecedenceSource::SectionProvider,
+                        section: section.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Level 3 — global default `[llm].provider` + `[llm.{provider}]`.
+    // Note: for the new-in-v0.27.1 sections (`ars.llm_judge`,
+    // `ars.llm_judge.nightly_cron`, `extract.dedup`) we entered this
+    // branch directly because `explicit.provider` was `None` and
+    // `explicit.inherit` was `false` (their level-1 was empty()).
+    if let Some(chosen) = pick_provider(&cfg.llm.provider) {
+        return build_resolved_for_provider(
+            sec,
+            section,
+            chosen,
+            PrecedenceSource::GlobalDefault,
+            &explicit,
+            &cfg.llm,
+        );
+    }
+
+    // For `ars.llm_judge.nightly_cron`, level 2 also walks back to
+    // `[ars.llm_judge]` resolution. Only relevant when no `[llm]` was
+    // set; matches spec §3.3 commentary about cron inheriting from
+    // `[ars.llm_judge]` by default.
+    if sec == LlmSection::ArsLlmJudgeNightlyCron {
+        return resolve_llm_for_impl(cfg, "ars.llm_judge");
+    }
+
+    // For `extract.intelligent_merge`, "fall back to query_expansion"
+    // is the v0.26.x semantic (`extract/intelligent_merge.rs::
+    // build_classifier`). Reproduce that walk before hitting level 4.
+    if sec == LlmSection::ExtractIntelligentMerge {
+        let qe_explicit = section_explicit(cfg, LlmSection::QueryExpansion);
+        if let Some(name) = qe_explicit.provider {
+            if let Some(chosen) = pick_provider(name) {
+                return build_resolved_for_provider(
+                    sec,
+                    section,
+                    chosen,
+                    PrecedenceSource::SectionProvider,
+                    &qe_explicit,
+                    &cfg.llm,
+                );
+            }
+            if name.eq_ignore_ascii_case("none") {
+                return Ok(none_resolved(sec, section, &cfg.llm));
+            }
+        }
+    }
+
+    // For `extract.dedup`, "inherit" semantic is "fall back to
+    // [extract]" (matches v0.26.x `extract/dedup.rs::
+    // build_dedup_extractor`).
+    if sec == LlmSection::ExtractDedup {
+        let ex_explicit = section_explicit(cfg, LlmSection::Extract);
+        if let Some(name) = ex_explicit.provider {
+            if let Some(chosen) = pick_provider(name) {
+                return build_resolved_for_provider(
+                    sec,
+                    section,
+                    chosen,
+                    PrecedenceSource::SectionProvider,
+                    &ex_explicit,
+                    &cfg.llm,
+                );
+            }
+            if name.eq_ignore_ascii_case("none") {
+                return Ok(none_resolved(sec, section, &cfg.llm));
+            }
+        }
+    }
+
+    // Level 4 — hardcoded baseline (Provider::None for every
+    // pre-Track-2-untouched consumer when no provider was configured at
+    // any level).
+    Ok(hardcoded_fallback(sec))
+}
+
+/// Helper: build a `Provider::None` resolved config — used by every
+/// "section explicitly turned LLM off" branch.
+fn none_resolved(
+    sec: LlmSection,
+    section: &str,
+    llm: &LlmDefaultsConfig,
+) -> ResolvedLlmConfig {
+    ResolvedLlmConfig {
+        provider: Provider::None,
+        model: String::new(),
+        api_key_env: None,
+        endpoint: default_google_endpoint(),
+        max_input_chars: 0,
+        temperature: llm.temperature,
+        request_timeout_ms: llm.request_timeout_ms,
+        max_retries: llm.max_retries,
+        source: PrecedenceSource::SectionExplicit,
+        section: if section.is_empty() {
+            section_name(sec).to_string()
+        } else {
+            section.to_string()
+        },
     }
 }
 
