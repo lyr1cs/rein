@@ -646,6 +646,17 @@ pub fn decide_concept_summary_quality(
     let Some(cs_state) = state.concept_summary_feedback_stats.as_ref() else {
         return ConceptSummaryDecision::Yes;
     };
+    // v0.27.2 R2 P2 revert — the R1 fallback to global `(None, "unknown")`
+    // bucket conflated Cap A auto-judge signal with metadata-less
+    // human interactions that also fold into the same bucket. A low
+    // `useful_rate` from unrelated human events could mistakenly skip
+    // summaries for new clustered concepts. Restore v0.27.1 behavior:
+    // miss on the per-cluster bucket → cold-start `Yes`. The deeper
+    // R7-#1 architectural mismatch (concepts have no natural cluster
+    // at refresh time, so Cap A auto-judge can never warm a clustered
+    // bucket without recall-surface routing) is documented in spec
+    // §15 as v0.28+ work — needs either per-concept routing or a
+    // dedicated judge-only bucket subspace.
     let key = concept_summary_bucket_key(Some(cid), query_type);
     let Some(cluster) = cs_state.by_cluster.get(&key) else {
         return ConceptSummaryDecision::Yes;
