@@ -100,6 +100,12 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
         .get::<_, Option<i64>>("living_summary_source_revision")
         .unwrap_or(None)
         .map(|v| v.max(0) as u32);
+    // v0.27.1 E direction (spec §3.2 R8 P1) — `living_summary_id` is
+    // a nullable column added by `migrate_concepts_living_summary_id`.
+    // `unwrap_or(None)` guards against the column being missing on a
+    // partially-migrated DB.
+    let living_summary_id: Option<String> =
+        row.get::<_, Option<String>>("living_summary_id").unwrap_or(None);
 
     Ok(Concept {
         id,
@@ -116,6 +122,7 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
         living_summary,
         living_summary_updated_at,
         living_summary_source_revision,
+        living_summary_id,
     })
 }
 
@@ -1552,6 +1559,7 @@ mod tests {
             living_summary: None,
             living_summary_updated_at: None,
             living_summary_source_revision: None,
+            living_summary_id: None,
         }
     }
 

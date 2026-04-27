@@ -226,23 +226,29 @@ struct Claim {
 /// meaningless against a different backend. Post-fix audit M-1.
 /// **Not a stable public API.**
 pub fn create_resummerize_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
-    let extract_provider = config.extract_provider();
-    match config.resummerize.resolved_provider(extract_provider) {
+    // v0.27.1 B2: route through `resolve_llm_for("resummerize")` so `[llm]`
+    // inheritance applies. The resolver replicates v0.26.x's
+    // `[resummerize].llm_backend` semantic ("inherit" → [extract].provider;
+    // named provider → use that). API key + disable_thinking still live
+    // on `[extract.{provider}]` per v0.26.x mapping.
+    let r = config.resolve_llm_for("resummerize").ok()?;
+    match r.provider {
         Provider::None => None,
         Provider::Google => {
-            let api_key = config.extract.google.api_key.as_ref()?.clone();
+            // Codex R3 P2 fix — honor resolver's api_key_env.
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(
-                crate::extract::llm::GeminiExtractor::new(
-                    api_key,
-                    config.extract.google.endpoint.clone(),
-                    config.extract.google.model.clone(),
-                ),
+                crate::extract::llm::GeminiExtractor::new(api_key, r.endpoint, r.model),
             ))
         }
         Provider::Omlx => Some(ExtractorKind::Omlx(
             crate::extract::llm::OmlxExtractor::new(
-                config.extract.omlx.endpoint.clone(),
-                config.extract.omlx.model.clone(),
+                r.endpoint,
+                r.model,
                 config.extract.omlx.disable_thinking,
             ),
         )),

@@ -135,6 +135,7 @@ impl SqliteStore {
                             living_summary: None,
                             living_summary_updated_at: None,
                             living_summary_source_revision: None,
+                            living_summary_id: None,
                         };
                         self.add_concept(concept)?;
                         report.concepts_added += 1;

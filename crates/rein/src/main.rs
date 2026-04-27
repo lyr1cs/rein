@@ -141,6 +141,23 @@ enum Commands {
         #[arg(value_enum)]
         action: ServiceAction,
     },
+    /// v0.27.1 E direction Layer 2: run the nightly stricter offline LLM
+    /// judge calibration cron. Reads the 24h cron-archive jsonl, joins
+    /// against runtime judge verdicts in feedback_events by synthesis_id,
+    /// re-judges via the `[ars.llm_judge.nightly_cron]`-resolved LLM, and
+    /// emits SynthesisLlmJudgeOfflineCron / ConceptSummaryLlmJudgeOfflineCron
+    /// events. The `judge_calibration` M1 consumer absorbs them on the
+    /// next adaptive-pipeline pass and recomputes `runtime_vs_offline_kappa`
+    /// + bumps `judge_drift_alert` when κ falls below threshold.
+    ///
+    /// Default-off in v0.27.1 (`[ars.llm_judge.nightly_cron].enabled = false`).
+    #[command(name = "judge-calibrate-cron")]
+    JudgeCalibrateCron {
+        /// Print verbose per-entry processing logs. Default false (only the
+        /// final summary report is printed).
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -310,6 +327,37 @@ async fn main() -> anyhow::Result<()> {
             ServiceAction::On => commands::handle_proxy_on()?,
             ServiceAction::Off => commands::handle_proxy_off()?,
         },
+        Some(Commands::JudgeCalibrateCron { verbose }) => {
+            // v0.27.1 E direction Layer 2 — emit-only cron. Re-judges
+            // sampled syntheses with stricter LLM, writes OfflineCron
+            // events. The `judge_calibration` consumer absorbs them on
+            // the next slow-channel pass and updates κ + drift alert.
+            let store = config.open_store()?;
+            let report = rein::ops::judge_calibration::run_judge_calibration_cron(
+                &store, &config,
+            )?;
+            if verbose {
+                println!("considered:                  {}", report.considered);
+                println!("emitted (OfflineCron events): {}", report.emitted);
+                println!(
+                    "skipped (no runtime verdict): {}",
+                    report.skipped_no_runtime_verdict
+                );
+                println!("dropped (errors):             {}", report.dropped);
+                println!(
+                    "dropped (cap reservation):    {} [Wave-1.5: R9-K1 reserve_call wiring pending]",
+                    report.dropped_cap
+                );
+            } else {
+                println!(
+                    "judge-calibrate-cron: considered={} emitted={} skipped={} dropped={}",
+                    report.considered,
+                    report.emitted,
+                    report.skipped_no_runtime_verdict,
+                    report.dropped,
+                );
+            }
+        }
     }
     Ok(())
 }

@@ -261,53 +261,59 @@ impl ClassifierKind {
 }
 
 fn build_classifier(config: &ReinConfig) -> Option<ClassifierKind> {
-    // Prefer the dedicated `[intelligent_merge]` provider block when set;
-    // otherwise fall back to `[query_expansion]` so existing setups keep working.
-    let (provider, google, omlx) = match config.intelligent_merge.resolved_provider() {
-        Provider::None => (
-            config.expand_provider(),
-            (
-                config.query_expansion.google.api_key.clone(),
-                config.query_expansion.google.endpoint.clone(),
-                config.query_expansion.google.model.clone(),
-            ),
-            (
-                config.query_expansion.omlx.endpoint.clone(),
-                config.query_expansion.omlx.model.clone(),
-                config.query_expansion.omlx.disable_thinking,
-            ),
-        ),
-        own => (
-            own,
-            (
-                config.intelligent_merge.google.api_key.clone(),
-                config.intelligent_merge.google.endpoint.clone(),
-                config.intelligent_merge.google.model.clone(),
-            ),
-            (
-                config.intelligent_merge.omlx.endpoint.clone(),
-                config.intelligent_merge.omlx.model.clone(),
-                config.intelligent_merge.omlx.disable_thinking,
-            ),
-        ),
-    };
+    // v0.27.1 B2: the resolver replicates v0.26.x's "prefer dedicated
+    // [intelligent_merge] section, fall back to [query_expansion]"
+    // semantic for `extract.intelligent_merge` (see config.rs §8.1
+    // fall-through chain). Just call resolve_llm_for and trust it.
+    let r = config.resolve_llm_for("extract.intelligent_merge").ok()?;
 
-    match provider {
+    // For api_key + disable_thinking, mirror the v0.26.x source-block
+    // selection: when the resolver chose the dedicated `[intelligent_merge]`
+    // provider, read those struct fields; otherwise use `[query_expansion]`.
+    // We detect "dedicated section was used" by checking the section
+    // explicit provider string — if it parses to a concrete provider, the
+    // resolver took the dedicated path.
+    let used_dedicated = matches!(
+        config.intelligent_merge.resolved_provider(),
+        Provider::Google | Provider::Omlx
+    );
+
+    match r.provider {
         Provider::Google => {
-            let api_key = google.0?;
+            // Codex R4 P2 fix — honor resolver's api_key_env first.
+            // Falls back to v0.26.x section-specific TOML field for
+            // operators who haven't migrated.
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| {
+                    if used_dedicated {
+                        config.intelligent_merge.google.api_key.clone()
+                    } else {
+                        config.query_expansion.google.api_key.clone()
+                    }
+                })?;
             Some(ClassifierKind::Gemini(GeminiClassifier {
                 client: crate::search::cache::http_client_15s(),
                 api_key,
-                endpoint: google.1,
-                model: google.2,
+                endpoint: r.endpoint,
+                model: r.model,
             }))
         }
-        Provider::Omlx => Some(ClassifierKind::Omlx(OmlxClassifier {
-            client: crate::search::cache::http_client_15s(),
-            endpoint: omlx.0,
-            model: omlx.1,
-            disable_thinking: omlx.2,
-        })),
+        Provider::Omlx => {
+            let disable_thinking = if used_dedicated {
+                config.intelligent_merge.omlx.disable_thinking
+            } else {
+                config.query_expansion.omlx.disable_thinking
+            };
+            Some(ClassifierKind::Omlx(OmlxClassifier {
+                client: crate::search::cache::http_client_15s(),
+                endpoint: r.endpoint,
+                model: r.model,
+                disable_thinking,
+            }))
+        }
         Provider::None => None,
     }
 }

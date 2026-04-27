@@ -24,6 +24,7 @@ pub mod embed;
 pub mod eval;
 pub mod extract;
 pub mod init;
+pub mod judge;
 pub mod mcp;
 pub mod ops;
 pub mod proxy;

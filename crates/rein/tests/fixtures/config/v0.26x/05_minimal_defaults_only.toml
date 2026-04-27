@@ -1,0 +1,14 @@
+# v0.26.x fixture #5: minimal config — only `[database]` set, every
+# other section gets its compiled-in default.  Covers the "fresh
+# install" path — operator runs `rein doctor --fix` and gets a stub
+# config; resolver must reproduce the v0.26.x default chain
+# (provider="google", model="gemini-3.1-flash-lite-preview" everywhere).
+#
+# Also covers the "embedded API key via env var only" path: no
+# `api_key` in any section, expected to read from `GEMINI_API_KEY` at
+# extractor construction time. This invariant survives Track 2 because
+# the resolver returns `api_key_env: Some("GEMINI_API_KEY")` and the
+# downstream consumer (B2's job) does the env read.
+
+[database]
+path = "/tmp/rein-fixture-05.db"

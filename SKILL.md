@@ -1,7 +1,7 @@
 ---
 name: rein
 description: |
-  Multi-source cross-validated memory MCP server for AI agents. Provides 36 MCP tools and a CLI for persistent memory across sessions, with knowledge graph, temporal links, and adaptive learning loops (M1-M6 + A1 + ARS Cap A/B/C).
+  Multi-source cross-validated memory MCP server for AI agents. Provides 38 MCP tools and a CLI for persistent memory across sessions, with knowledge graph, temporal links, and adaptive learning loops (M1-M6 + A1 + ARS Cap A/B/C).
 
   Trigger this skill whenever the user (in any language, including English / 中文) wants to save, store, recall, search, or recover information across sessions, or mentions any of:
   memory / 记忆, recall / 召回 / 回忆, remember / 记住, save / 存储 / 保存, search past / 搜索历史,
@@ -16,9 +16,9 @@ allowed-tools:
   - Bash
 ---
 
-# rein Memory System (v0.27.0)
+# rein Memory System (v0.27.1)
 
-Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server (36 tools) or via CLI. Storage is `~/.rein/memories.db` (SQLite + FTS5 + sqlite-vec); the same DB is shared across every rein client (Claude Desktop, Claude Code, CLI, REST). Embeddings via Gemini 3.1 (or local Ollama / OMLX). Optional Neural Wiki GUI on `:8680`.
+Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server (38 tools) or via CLI. Storage is `~/.rein/memories.db` (SQLite + FTS5 + sqlite-vec); the same DB is shared across every rein client (Claude Desktop, Claude Code, CLI, REST). Embeddings via Gemini 3.1 (or local Ollama / OMLX). Optional Neural Wiki GUI on `:8680`.
 
 ## When to use rein
 
@@ -83,7 +83,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
 OPENAI_BASE_URL=http://127.0.0.1:8690 codex
 ```
 
-## MCP Tools (36, as of v0.27.0)
+## MCP Tools (38, as of v0.27.1)
 
 ### Core memory (13)
 `rein_recall`, `rein_store`, `rein_update`, `rein_forget`, `rein_list_topics`, `rein_stats`, `rein_health`, `rein_consolidate`, `rein_dedup`, `rein_cleanup`, `rein_recent`, `rein_gc`, `rein_organize`
@@ -94,8 +94,8 @@ OPENAI_BASE_URL=http://127.0.0.1:8690 codex
 ### Temporal (2)
 `rein_timeline`, `rein_concept_history`
 
-### Adaptive / session / ARS (11)
-`rein_adaptive_status`, `rein_feedback`, `rein_ingest_session`, `rein_concept_state`, `rein_archive_summary_refresh`, `rein_feedback_concept_summary` (v0.27 ARS Cap A), and 5 more registered via `#[op]`.
+### Adaptive / session / ARS (13)
+`rein_adaptive_status`, `rein_feedback`, `rein_ingest_session`, `rein_concept_state`, `rein_archive_summary_refresh`, `rein_feedback_concept_summary` (v0.27 ARS Cap A), `rein_judge_synthesis` + `rein_judge_concept_summary` (v0.27.1 — manually trigger an LLM judge call against a recent synthesis / concept-summary so MCP-only callers can prime ARS adaptive feedback without GUI dwell/click traffic), and 5 more registered via `#[op]`.
 
 ## Architecture highlights (v0.27.0)
 
