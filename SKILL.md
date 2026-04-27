@@ -1,157 +1,122 @@
 ---
 name: rein
-description: >
-  Multi-source cross-validated memory system with adaptive engine, temporal knowledge graph,
-  autonomous retrieval routing, query expansion, LLM reranking, MMR diversity, and LLM extraction.
-  28 MCP tools, 20+ CLI commands. Features Neural Wiki GUI (React + Tailwind web dashboard),
-  self-learning fusion weights (counterfactual alpha optimization — global, per-query-type, and
-  per-cluster M2), survival-based decay (per-cluster Kaplan-Meier + global cold-start prior M3),
-  HDBSCAN semantic clustering (M4), three-tier memory Hot/Warm/Cold (M5), per-cluster adaptive
-  dedup thresholds A1 (full pipeline: store/batch/vec dedup), temporal knowledge graph (revision
-  history, episodes, temporal links), autonomous query routing (6 strategies, rule-based, 0 LLM
-  calls), memory evolution, canonical-first read model, evidence-aware recall, multi-factor
-  admission control, hybrid CJK lexical dedup (jieba-rs + bigrams), survival-driven STM promotion,
-  Maximal Marginal Relevance reranking, and CC/RRF fusion with learned alpha weights.
-  Triggers when user mentions memory, recall, remember, past sessions, knowledge graph,
-  memoir, concepts, timeline, history, export, GUI, dashboard, or wants to save/search
-  important context.
+description: |
+  Multi-source cross-validated memory MCP server for AI agents. Provides 36 MCP tools and a CLI for persistent memory across sessions, with knowledge graph, temporal links, and adaptive learning loops (M1-M6 + A1 + ARS Cap A/B/C).
+
+  Trigger this skill whenever the user (in any language, including English / 中文) wants to save, store, recall, search, or recover information across sessions, or mentions any of:
+  memory / 记忆, recall / 召回 / 回忆, remember / 记住, save / 存储 / 保存, search past / 搜索历史,
+  knowledge graph / 知识图谱 / 概念 / concepts, memoir / 知识库, timeline / 时间线 / 历史, episode / session / 会话,
+  rein, rein_store, rein_recall, MCP memory, GUI / dashboard / Neural Wiki,
+  past sessions / 之前的工作 / 上次说过, "what do I know about X" / "我对 X 了解什么".
+
+  Use rein_store for new facts/decisions/preferences, rein_recall for retrieval,
+  rein_memoir_* for the knowledge graph, rein_timeline / rein_concept_history for temporal queries,
+  rein_feedback after acting on recall, and rein_adaptive_status to inspect learning state.
+allowed-tools:
+  - Bash
 ---
 
-# rein Memory System (v0.20.2)
+# rein Memory System (v0.27.0)
 
-Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server
-(28 tools) or via CLI (20+ commands). Features Neural Wiki GUI (`rein serve --gui`),
-LLM-powered extraction (Gemini 3.1 Flash Lite or local models), temporal knowledge graph,
-autonomous retrieval routing (6 strategies), query expansion (2-3 variants), LLM reranker
-with strong-signal bypass, MMR diversity pass, memory evolution, transparent LLM proxy
-(record-only) including **Codex subscription loopback** (`codexsubp` / `codexsubpws`
-via `rein init --proxy` — ChatGPT-login WebSocket mirror with permessage-deflate, first-party
-routing, ArtifactMirrorOnly lock for non-`/responses` routes, `/api/artifacts` readback),
-concept name normalization and dedup, async memory pipeline with file-based queue and
-background worker, project-scoped working set + always-on index for memory surfaces,
-canonical-first recall with evidence previews, and adaptive learning loops (M1-M6 + A1).
+Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server (36 tools) or via CLI. Storage is `~/.rein/memories.db` (SQLite + FTS5 + sqlite-vec); the same DB is shared across every rein client (Claude Desktop, Claude Code, CLI, REST). Embeddings via Gemini 3.1 (or local Ollama / OMLX). Optional Neural Wiki GUI on `:8680`.
+
+## When to use rein
+
+| User intent | Tool |
+|---|---|
+| "记住这件事" / "save this" / "存到记忆里" | `rein_store` |
+| "我们之前说过什么" / "recall X" / "search past" | `rein_recall` |
+| "X 是什么时候改的" / temporal questions | `rein_recall` with `from`/`to`, or `rein_timeline` |
+| "X 这个概念演化过吗" / concept history | `rein_concept_history` |
+| Build / inspect knowledge graph | `rein_memoir_*` (10 tools) |
+| Report which recalled memory was useful | `rein_feedback` |
+| Inspect learning state | `rein_adaptive_status` |
+| Refresh archival summaries (cold tier) | `rein_archive_summary_refresh` |
+
+Default to `rein_recall` at the start of a session when the user references past work. Default to `rein_store` after solving bugs, making architecture decisions, capturing user preferences, or learning project facts.
 
 ## CLI Commands
 
-### Core Memory
+### Core memory
 ```bash
-rein recall "query" [-t topic] [-l limit] [--from DATE] [--to DATE]  # Search memories
+rein recall "query" [-t topic] [-l limit] [--from DATE] [--to DATE]  # search
 rein store -t <topic> -c <content> -I <importance> [-k kw1,kw2]
 rein update <id> -c <new_content> [-I <importance>]
-rein forget <id>                             # Delete a memory
-rein topics                                  # List all topics
-rein stats                                   # Store statistics
-rein health [topic]                          # Health check
-rein recent [-l 20]                          # Most recent memories
+rein forget <id>
+rein topics
+rein recent [-l 20]
+rein stats
+rein health [topic]
 ```
 
 ### Maintenance
 ```bash
-rein consolidate <topic> -s "summary"        # Merge topic into one memory
-rein dedup [--dry-run]                       # Scan/remove duplicates
-rein cleanup --all [--dry-run] [--async]     # One-click consolidate + dedup + adaptive refresh
-rein gc [--dry-run]                          # Garbage collect weak STM
-rein organize                                # Auto-link related memories
-rein dedup-concepts                          # Merge duplicate concepts (case/separator variants)
-rein upgrade [--topic X] [--dry-run]         # Upgrade old memories to knowledge graph
+rein consolidate <topic> -s "summary"    # merge topic into one memory
+rein dedup [--dry-run]                   # scan/remove duplicates
+rein cleanup --all [--dry-run] [--async] # consolidate + dedup + adaptive refresh
+rein gc [--dry-run]                      # garbage collect weak STM
+rein organize                            # auto-link related memories
+rein dedup-concepts                      # merge duplicate concepts
+rein doctor [--fix]                      # health check + auto-repair
 ```
 
-### System
+### System / runtime
 ```bash
-rein serve [--compact] [--sse] [--proxy] [--gui]  # Start MCP server, proxy, or GUI
-rein init [--dry-run]                        # Auto-configure MCP clients
-rein config                                  # Show configuration
-rein warmup                                  # Pre-compute embeddings
-rein migrate [--from-qmd path] [--reindex]   # Import/reindex
-rein worker memory                           # Drain async memory queue
-rein doctor [--fix]                          # Health diagnostics and auto-repair
+rein serve [--sse] [--proxy] [--gui]    # MCP stdio / HTTP / proxy / Neural Wiki GUI
+rein init [--dry-run]                   # auto-configure MCP clients
+rein config                             # show config
+rein warmup                             # pre-compute embeddings
+rein worker memory                      # drain async memory queue
 ```
 
-### Hooks (used by Claude Code)
+### Hooks (Claude Code only — wired in `~/.claude/settings.json`)
 ```bash
-rein hook post      # Buffer tool output + pattern extraction (crash safety net)
-rein hook compact   # Record compact context for async extraction
-rein hook prompt    # Compatibility no-op (injection disabled)
-rein hook stop      # Queue full knowledge extraction via async worker
+rein hook post     # PostToolUse  → LLM extraction → store (async)
+rein hook compact  # PreCompact   → context snapshot
+rein hook prompt   # UserPromptSubmit (compatibility no-op)
+rein hook stop     # Stop         → session summary + Episode
 ```
 
-### Proxy (record-only)
+### Proxy (record-only LLM mirror)
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude   # Claude Code
-OPENAI_BASE_URL=http://127.0.0.1:8690 codex       # Codex CLI
+ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
+OPENAI_BASE_URL=http://127.0.0.1:8690 codex
 ```
 
-## MCP Tools (28)
+## MCP Tools (36, as of v0.27.0)
 
-### Core (13)
-| Tool | Description |
-|------|-------------|
-| `rein_recall` | Semantic search with recency boost + time range filtering (from/to) |
-| `rein_store` | Store with auto-dedup + evolution + knowledge graph |
-| `rein_update` | Update memory content/importance |
-| `rein_forget` | Delete by ID |
-| `rein_list_topics` | List all topics |
-| `rein_stats` | Store statistics |
-| `rein_health` | Topic health check |
-| `rein_consolidate` | Merge topic memories (supports --all, --pattern, --merge-variants) |
-| `rein_dedup` | Scan/remove duplicates |
-| `rein_cleanup` | One-click: consolidate + dedup + adaptive refresh |
-| `rein_recent` | Most recent memories |
-| `rein_gc` | Garbage collect weak STM |
-| `rein_organize` | Auto-link related memories |
+### Core memory (13)
+`rein_recall`, `rein_store`, `rein_update`, `rein_forget`, `rein_list_topics`, `rein_stats`, `rein_health`, `rein_consolidate`, `rein_dedup`, `rein_cleanup`, `rein_recent`, `rein_gc`, `rein_organize`
 
-### Knowledge Graph (10)
-| Tool | Description |
-|------|-------------|
-| `rein_memoir_create` | Create knowledge container |
-| `rein_memoir_list` | List all memoirs |
-| `rein_memoir_show` | Show memoir + concepts |
-| `rein_memoir_add_concept` | Add knowledge node |
-| `rein_memoir_refine` | Update concept, boost confidence |
-| `rein_memoir_search` | FTS search within memoir |
-| `rein_memoir_search_all` | Search across all memoirs |
-| `rein_memoir_link` | Link concepts (9 relation types) |
-| `rein_memoir_inspect` | BFS neighborhood traversal |
-| `rein_memoir_export` | Export graph (json/ascii/dot) |
+### Knowledge graph (10)
+`rein_memoir_create`, `rein_memoir_list`, `rein_memoir_show`, `rein_memoir_add_concept`, `rein_memoir_refine`, `rein_memoir_search`, `rein_memoir_search_all`, `rein_memoir_link`, `rein_memoir_inspect`, `rein_memoir_export`
 
 ### Temporal (2)
-| Tool | Description |
-|------|-------------|
-| `rein_timeline` | Chronological view of episodes, concept changes, memory events |
-| `rein_concept_history` | Revision history of a concept over time |
+`rein_timeline`, `rein_concept_history`
 
-### Adaptive & Session (3)
-| Tool | Description |
-|------|-------------|
-| `rein_adaptive_status` | Inspect learned alpha weights, cluster profiles, dedup thresholds, survival curve stats |
-| `rein_feedback` | Report which recalled memories were used (drives M1 event sourcing) |
-| `rein_ingest_session` | Ingest full session transcript through extraction pipeline |
+### Adaptive / session / ARS (11)
+`rein_adaptive_status`, `rein_feedback`, `rein_ingest_session`, `rein_concept_state`, `rein_archive_summary_refresh`, `rein_feedback_concept_summary` (v0.27 ARS Cap A), and 5 more registered via `#[op]`.
 
-## Key Features
+## Architecture highlights (v0.27.0)
 
-- **LLM Extraction**: Gemini 3.1 Flash Lite or local models (Ollama/LM Studio/vLLM)
-- **Query Expansion**: LLM rewrites query into 2-3 variants; results merged before fusion
-- **LLM Reranker**: Gemini/OMLX rescoring with strong-signal bypass
-- **MMR Diversity**: Maximal Marginal Relevance post-rerank pass
-- **Adaptive Engine M1-M6+A1**: All learning loops closed — data drives fusion weights, decay curves, dedup thresholds, tier boundaries
-- **M2 Per-cluster Alpha**: CC alpha learned globally, per-query-type, and per-cluster with Bayesian shrinkage
-- **M3 Global Prior**: Kaplan-Meier survival curves per-cluster; global cold-start prior bridges new clusters
-- **A1 Adaptive Dedup**: Per-cluster P90 similarity thresholds applied across all dedup paths
-- **Knowledge Graph**: Auto-creates concepts + typed links from session transcripts
-- **Memory Evolution**: New memories automatically refine or supersede similar old ones
-- **Canonical-First Read Model**: recall returns canonicals by default; evidence expands on demand
-- **Evidence-Aware Recall**: low-confidence recall uses evidence previews and second-stage evidence rerank
-- **Autonomous Routing**: 6 query strategies (Episodic/Temporal/Preference/ExactKeyword/Semantic/Exploratory)
-- **Hybrid CJK Dedup**: Chinese/Japanese/Korean lexical dedup uses jieba-rs plus character bigrams
-- **Cluster-Aware Admission**: admission threshold and novelty scoring incorporate cluster strength and cold-start blending
-- **Survival-Driven Promotion**: STM→LTM promotion uses survival curves when cluster data exists
-- **Provenance-Preserving Merge**: temporal anchors and unique details never lost on dedup
+- **Search pipeline**: 3-channel waterfall (Tantivy BM25 + usearch HNSW + Gemini embeddings) → RRF/CC fusion with adaptive `cc_alpha` → multi-feature reranker → optional LLM rerank → MMR diversity → Ebbinghaus / Kaplan-Meier decay
+- **Autonomous routing**: 6 query strategies (Episodic / Temporal / Preference / ExactKeyword / Semantic / Exploratory), rule-based, 0 LLM calls
+- **Adaptive engine M1-M6 + A1**: feedback event sourcing → counterfactual alpha optimization → per-cluster survival decay → HDBSCAN clustering → hot/warm/cold tiering → randomized exploration → per-cluster dedup thresholds
+- **ARS Cap A/B/C**: concept living-summary, recall-time LLM synthesis (`synthesize=true`), cold-tier archival summary — all opt-in via `[ars]` config
+- **v0.27 dedup**: triple extraction (S, P, O), N-memory merge (`MergeIntoMany`) with savepoint atomicity, temporal supersede with `2026年` CJK form support
+- **Storage**: per-request SQLite connection model + WAL + FULL_MUTEX (multi-process safe)
+- **Hybrid CJK**: jieba-rs + character bigrams (avoids the `is_alphanumeric` collapse-Chinese-to-mega-token trap)
 
-## When to Use
+## Tips for Claude
 
-- **Store**: After solving bugs, learning patterns, making architecture decisions
-- **Recall**: Start of session, when context seems relevant, user asks about past work
-- **Feedback**: After using recalled memories, report which ones were helpful
-- **Ingest Session**: When you want to persist a full conversation to the knowledge base
-- **Upgrade**: Convert old memories to knowledge graph format
-- **GC**: Periodically clean up weak memories
+1. **Don't try to spawn rein from inside Cowork's VM** — the rein binary lives at `~/.cargo/bin/rein` on the host and the Cowork VM doesn't mount it. Use rein from the main Claude Desktop UI or Claude Code CLI on the host instead.
+2. **All ARS feature flags default off**. If user says "concept summary 没出来", check `~/.rein/config.toml` for `[ars].concept_summary_enabled = true`.
+3. **Memory is shared**: rein's SQLite DB at `~/.rein/memories.db` is a single source of truth across every client, so memory written from Claude Desktop is immediately visible from Claude Code and vice versa.
+4. **Two-tier hooks for Claude Code only**: the 4 `rein hook *` commands write to `~/.rein/memories.db` automatically. Claude Desktop has no equivalent — there you must call `rein_store` explicitly.
+5. **Auto-memory markdown** at `~/.claude/projects/.../memory/MEMORY.md` is independent from rein's DB unless `sync/auto_memory.rs` is wired up.
+
+## Common pitfalls
+
+- LLM JSON output may be wrapped in code fences — prefer `rein_recall`'s built-in handling
+- `rein doctor` reports `Overall: degraded` mainly on doc-version drift — usually benign, check `mcp_registry` line
+- Cold-tier memories excluded from non-Exploratory queries (M5 filter) — switch to `query_type=Exploratory` if needed
