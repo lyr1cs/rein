@@ -490,6 +490,15 @@ fn intelligent_merge_try_cli_only_surface() {
             .join("memories.db")
             .to_string_lossy()
             .into_owned();
+        // Codex R4 P3 — explicitly force no-LLM path. v0.27.1 R3 P2
+        // added env-var fallback for `api_key_env`; if GEMINI_API_KEY
+        // is set in the dev shell, the resolver would build a real
+        // Gemini classifier and panic in `tokio::task::block_in_place`
+        // on the single-threaded test runtime. Setting provider="none"
+        // matches the test's "no LLM configured → None path" intent.
+        c.intelligent_merge.provider = "none".to_string();
+        c.query_expansion.provider = "none".to_string();
+        c.extract.provider = "none".to_string();
         Arc::new(c)
     };
 
@@ -1036,6 +1045,7 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
             living_summary: None,
             living_summary_updated_at: None,
             living_summary_source_revision: None,
+            living_summary_id: None,
         };
 
         store
@@ -1098,6 +1108,7 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
             living_summary: None,
             living_summary_updated_at: None,
             living_summary_source_revision: None,
+            living_summary_id: None,
         };
         store
             .add_concept(make_concept("dc_c1", "adaptive engine"))
@@ -1155,6 +1166,7 @@ async fn dedup_concepts_dry_run_parity_across_surfaces() {
             living_summary: None,
             living_summary_updated_at: None,
             living_summary_source_revision: None,
+            living_summary_id: None,
         };
         store
             .add_concept(make_concept("dc_c1", "adaptive engine"))

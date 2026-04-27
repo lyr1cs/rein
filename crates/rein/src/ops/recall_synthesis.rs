@@ -11,10 +11,11 @@
 
 use crate::config::ReinConfig;
 use crate::extract::llm::{strip_code_fences, ExtractorKind};
-use crate::ops::concept_summary::create_concept_summary_extractor;
+use crate::ops::concept_summary::create_ars_extractor;
 use crate::search::recall::RecallResult;
 use crate::store::adaptive::{
-    synthesis_bucket_key, AdaptiveState, SYNTHESIS_USEFUL_RATE_THRESHOLD,
+    synthesis_bucket_key, AdaptiveState, ClusterSynthesisStats,
+    SYNTHESIS_USEFUL_RATE_THRESHOLD,
 };
 use crate::types::ReinResult;
 use serde::Serialize;
@@ -212,6 +213,14 @@ pub fn decide_synthesize(
     query_type: &str,
     adaptive_state: Option<&AdaptiveState>,
     cold_start_n: u64,
+    // Codex R6 P2 fix — when operator sets weight_decay_rate=0.0
+    // (collect judge telemetry without affecting decisions), zero-weight
+    // judge events MUST NOT advance cold-start. Otherwise judge-only
+    // buckets graduate cold-start, but useful_rate falls back to 0
+    // because all judge contributions zero out, and decide_synthesize
+    // adaptively SKIPS synthesis despite no human signal — surprising
+    // operator. Caller passes `config.ars.llm_judge.weight_decay_rate`.
+    judge_weight_decay_rate: f64,
 ) -> SynthesizeDecision {
     // Operator override wins. Even with rich adaptive data, if the operator
     // disabled the global flag, the synthesis path is off.
@@ -243,7 +252,28 @@ pub fn decide_synthesize(
     let Some(cluster) = synth_state.by_cluster.get(&key) else {
         return SynthesizeDecision::Yes;
     };
-    if cluster.viewed_count < cold_start_n {
+    // v0.27.1 E direction (Codex R8 P1 fix): cold-start total_signal counts
+    // ALL signals including LLM judge events. Without this, an MCP-only
+    // canary with zero `viewed_count` and a warm `llm_judge_count` bucket
+    // would fall back to the global flag forever — defeating the entire
+    // E direction premise.
+    // Default to 0.3 when caller passes 0 sentinel (test convenience —
+    // production caller always passes config.ars.llm_judge.weight_decay_rate
+    // which is validated > 0 by J6, but tests can pass 0.0 and get
+    // standard counting behavior). Use < 0 to opt INTO zero-weight
+    // skip semantics... actually just use the value: > 0.0 includes
+    // judge events, == 0.0 excludes them.
+    let llm_contribution = if judge_weight_decay_rate > 0.0 {
+        cluster.llm_judge_count
+    } else {
+        0
+    };
+    let total_signal = cluster
+        .viewed_count
+        .saturating_add(cluster.explicit_up)
+        .saturating_add(cluster.explicit_down)
+        .saturating_add(llm_contribution);
+    if total_signal < cold_start_n {
         return SynthesizeDecision::Yes;
     }
 
@@ -353,6 +383,7 @@ pub fn run_recall_synthesis(
         query_type,
         adaptive_state,
         config.ars.synthesis_cold_start_n,
+        config.ars.llm_judge.weight_decay_rate,
     ) {
         SynthesizeDecision::Yes => { /* fall through to synthesis path */ }
         SynthesizeDecision::Skip(SkipReason::OperatorDisabled) => {
@@ -373,7 +404,11 @@ pub fn run_recall_synthesis(
 
     let extractor = match extractor_override {
         Some(e) => e,
-        None => match create_concept_summary_extractor(config) {
+        // v0.27.1 B2 (spec §8.5 row 9): resolve via the Cap B section
+        // name so a per-`[ars.recall_synthesis]` provider override (or
+        // `[llm]` inheritance) applies — separate from Cap A's
+        // `ars.concept_summary` resolution path.
+        None => match create_ars_extractor(config, "ars.recall_synthesis") {
             Some(e) => e,
             None => {
                 outcome.skipped_no_llm = true;
@@ -388,7 +423,15 @@ pub fn run_recall_synthesis(
     // `synthesize=true` + `limit=200` + 100KB memories could send a
     // multi-megabyte payload to the LLM provider — costly, slow, and
     // possibly over the model's context window. Codex audit Round 2 P2.
-    let max_chars = crate::extract::llm::resolve_max_input_for_kind(config, &extractor);
+    //
+    // v0.27.1 B2 (spec §8.5 R6 P2): use the section-aware variant so the
+    // prompt-truncation cap follows the same `[ars.recall_synthesis]`
+    // resolved config as the LLM call itself.
+    let max_chars = crate::extract::llm::resolve_max_input_for_section_kind(
+        config,
+        "ars.recall_synthesis",
+        &extractor,
+    );
     // Codex R2 G4: use `included_count` (the actual number of memory
     // blocks the LLM sees in the prompt after truncation) — not the
     // pre-truncation `source_count` — as the citation max-rank. Without
@@ -425,14 +468,35 @@ pub fn run_recall_synthesis(
                 // post-strip so citation-only is treated as the empty
                 // output it effectively is (per contract §8 invariant 9).
                 if !clean.trim().is_empty() {
-                    outcome.synthesis = Some(clean);
+                    outcome.synthesis = Some(clean.clone());
                     outcome.citations = citations;
                     // v0.26 D direction: stamp a fresh ULID **only** on
                     // a successful synthesis. Empty LLM output (text
                     // was empty post-strip) leaves `synthesis_id =
                     // None` so clients know not to emit interaction
                     // feedback. Per contract §8 invariant 9.
-                    outcome.synthesis_id = Some(ulid::Ulid::new().to_string());
+                    let synthesis_id = ulid::Ulid::new().to_string();
+                    outcome.synthesis_id = Some(synthesis_id.clone());
+
+                    // v0.27.1 E direction (spec §6.5 + §7 + §9.1) — runtime
+                    // LLM judge integration. Codex R2 P2: honor BOTH the
+                    // master `[ars.llm_judge].enabled` AND the per-surface
+                    // `synthesis_enabled` flag. Manual MCP handlers respect
+                    // the per-surface flag; auto-sampled traffic must too,
+                    // otherwise opt-out is incomplete.
+                    if config.ars.llm_judge.enabled && config.ars.llm_judge.synthesis_enabled {
+                        enqueue_judge_for_synthesis(
+                            config,
+                            adaptive_state,
+                            &synthesis_id,
+                            query,
+                            query_type,
+                            cluster_id,
+                            &prompt,
+                            &clean,
+                            included_count,
+                        );
+                    }
                 }
             }
         }
@@ -728,6 +792,214 @@ pub fn call_synthesis_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinR
                 .raw_text_with_prompt(SYNTHESIS_SYSTEM_PROMPT, prompt)
                 .await
         })
+    }
+}
+
+// ─── v0.27.1 E direction — runtime LLM judge wiring ─────────────────────────
+//
+// Spec §6.5 (sample-rate cold→warm ladder), §7 (Layer 2 cron archive sample),
+// §9.1 (manual MCP rehydration cache). All three writes are conditional on
+// `config.ars.llm_judge.enabled` — the caller in `run_recall_synthesis`
+// short-circuits before invoking [`enqueue_judge_for_synthesis`].
+
+/// Compute the per-(cluster, query_type) sample rate per spec §6.5.
+///
+/// Reads `human_count = explicit_up + explicit_down + viewed_count` off the
+/// matching bucket; if absent, treats `human_count = 0` → cold-start rate.
+fn current_sample_rate(
+    bucket: Option<&ClusterSynthesisStats>,
+    cfg: &crate::config::ArsLlmJudgeConfig,
+) -> f64 {
+    let human_count = bucket
+        .map(|s| s.explicit_up.saturating_add(s.explicit_down).saturating_add(s.viewed_count))
+        .unwrap_or(0);
+    if human_count >= cfg.human_signal_threshold {
+        cfg.sample_rate_warm
+    } else {
+        cfg.sample_rate_cold_start
+    }
+}
+
+/// Bernoulli sample with the same xorshift-style nanos+id mix used elsewhere
+/// in the codebase (`extract/dedup.rs::adaptive_threshold_with_exploration`).
+/// Avoids pulling in `rand` for one call site.
+fn bernoulli_fire(rate: f64, salt: &str) -> bool {
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    nanos.hash(&mut h);
+    salt.hash(&mut h);
+    let n = h.finish();
+    let frac = (n as f64) / (u64::MAX as f64);
+    frac < rate
+}
+
+/// Enqueue the runtime LLM judge artifacts for a freshly-stamped synthesis:
+///
+/// 1. Always — write the post-truncation rehydration cache entry. Manual MCP
+///    `rein_judge_synthesis` calls read this back to reconstruct the J7
+///    stamp-time payload.
+/// 2. Bernoulli-sampled per `current_sample_rate(cluster_stats, cfg)` —
+///    enqueue a [`crate::ops::llm_judge_worker::JudgeJob`]-shaped row to the
+///    judge worker queue.
+/// 3. Deterministically sampled per `should_archive_for_cron(synthesis_id,
+///    cron.sample_rate)` — append to the day's cron-archive jsonl when the
+///    nightly_cron flag is on.
+///
+/// All writes are best-effort — IO errors are logged and swallowed so the
+/// recall critical path is never blocked.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_judge_for_synthesis(
+    config: &ReinConfig,
+    adaptive_state: Option<&AdaptiveState>,
+    synthesis_id: &str,
+    query: &str,
+    query_type: &str,
+    cluster_id: Option<i64>,
+    prompt: &str,
+    candidate: &str,
+    source_count: usize,
+) {
+    use crate::ops::handlers::judge::{
+        append_jsonl_line, judge_queue_path_for_config, synthesis_cache_path_for_config,
+    };
+    use crate::ops::llm_judge_worker::{JudgeJob, JUDGE_MAX_INPUT_CHARS};
+
+    // Codex R7+R8 P2 fix — truncate at mint so the JOINED string the
+    // worker sends to the LLM is at most JUDGE_MAX_INPUT_CHARS. The
+    // worker builds `format!("{prompt}\n\nCandidate:\n{candidate}")`;
+    // if we truncate prompt and candidate independently to
+    // JUDGE_MAX_INPUT_CHARS each, the combined could be 2×cap and the
+    // worker's defensive truncation would chop the Candidate section
+    // mid-string while stamp_hash described the un-chopped bytes
+    // (R8 P2 — invalid κ joins). Reserve space for the joiner +
+    // candidate + reasonable prompt minimum: prompt gets up to
+    // (cap - candidate.len() - joiner.len()), with a 1KB floor.
+    const CANDIDATE_RESERVE_MAX: usize = 4_096;
+    const PROMPT_FLOOR: usize = 1_024;
+    let candidate_capped: String = candidate
+        .chars()
+        .take(CANDIDATE_RESERVE_MAX.min(JUDGE_MAX_INPUT_CHARS / 4))
+        .collect();
+    let joiner_overhead = "\n\nCandidate:\n".len();
+    let prompt_budget = JUDGE_MAX_INPUT_CHARS
+        .saturating_sub(candidate_capped.chars().count())
+        .saturating_sub(joiner_overhead)
+        .max(PROMPT_FLOOR);
+    let prompt_truncated: String = prompt.chars().take(prompt_budget).collect();
+    let prompt = prompt_truncated.as_str();
+    let candidate = candidate_capped.as_str();
+
+    let stamp_hash = JudgeJob::compute_stamp_hash(query, prompt, candidate);
+    let cache_entry = serde_json::json!({
+        "synthesis_id": synthesis_id,
+        "query": query,
+        "prompt": prompt,
+        "candidate": candidate,
+        "stamp_hash": stamp_hash,
+        "query_type": query_type,
+        "cluster_id": cluster_id,
+        "source_count": source_count as u32,
+        "stamped_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    // (1) Cache write — feeds manual MCP rehydration. TTL is enforced by
+    // a separate reaper thread; a stale cache row simply gets evicted.
+    let cache_path = synthesis_cache_path_for_config(config);
+    if let Err(e) = append_jsonl_line(&cache_path, &cache_entry) {
+        tracing::warn!(
+            target: "rein.judge",
+            synthesis_id = %synthesis_id,
+            "recall_synthesis: failed to write judge cache entry: {e}",
+        );
+    }
+
+    // (2) Sample-rate Bernoulli → judge worker queue.
+    let bucket = adaptive_state
+        .and_then(|s| s.synthesis_feedback_stats.as_ref())
+        .and_then(|sfs| sfs.by_cluster.get(&synthesis_bucket_key(cluster_id, query_type)));
+    let rate = current_sample_rate(bucket, &config.ars.llm_judge);
+    if bernoulli_fire(rate, synthesis_id) {
+        let job = serde_json::json!({
+            "kind": "synthesis",
+            "surface_id": synthesis_id,
+            "concept_id": serde_json::Value::Null,
+            "query": query,
+            "prompt": prompt,
+            "candidate": candidate,
+            "stamp_hash": stamp_hash,
+            "source": "AutoSampled",
+            "query_type": query_type,
+            "cluster_id": cluster_id,
+            "source_count": source_count as u32,
+        });
+        let queue_path = judge_queue_path_for_config(config);
+        if let Err(e) = append_jsonl_line(&queue_path, &job) {
+            tracing::warn!(
+                target: "rein.judge",
+                synthesis_id = %synthesis_id,
+                "recall_synthesis: failed to enqueue judge job: {e}",
+            );
+        }
+    }
+
+    // (3) Cron-archive deterministic sample (gated independently on
+    //     `nightly_cron.enabled`). Spec §7: the archive is sized off
+    //     `nightly_cron.sample_rate`, NOT `daily_call_cap`.
+    //
+    // Codex R1 P2 fix — entry MUST match the `CronArchiveEntry` shape
+    // expected by `judge_calibration::collect_archive_entries`:
+    //   { surface, id, concept_id, stamp_hash, query, sources,
+    //     candidate, metadata, minted_at }
+    // The v0 enqueue reused `cache_entry` (synthesis-cache shape:
+    // {synthesis_id, prompt, source_count, stamped_at}) which deserialized
+    // as malformed and skipped — Layer 2 cron never fired. Build a
+    // separate archive_entry below.
+    if config.ars.llm_judge.nightly_cron.enabled
+        && crate::ops::judge_calibration::should_archive_for_cron(
+            synthesis_id,
+            config.ars.llm_judge.nightly_cron.sample_rate,
+        )
+    {
+        let date = chrono::Utc::now().date_naive();
+        let archive_path = crate::ops::judge_calibration::cron_archive_path(config, date, 0);
+        let archive_entry = serde_json::json!({
+            "surface": "Synthesis",
+            "id": synthesis_id,
+            "concept_id": "",
+            "stamp_hash": stamp_hash,
+            "query": query,
+            // Cron's stricter judge needs the per-source list to apply the
+            // hit-checker rubric. recall_synthesis carried `prompt` (joined)
+            // through; the cron judge will treat the joined prompt as one
+            // source — acceptable for v0.27.1 (operators can split via
+            // §15 known-issue / future enhancement).
+            "sources": [prompt],
+            "candidate": candidate,
+            "metadata": {
+                "query_type": query_type,
+                "cluster_id": cluster_id,
+                "source_count": source_count as u32,
+                "judge_latency_ms": serde_json::Value::Null,
+            },
+            "minted_at": chrono::Utc::now().timestamp(),
+        });
+        if let Err(e) = append_jsonl_line(&archive_path, &archive_entry) {
+            tracing::warn!(
+                target: "rein.judge",
+                synthesis_id = %synthesis_id,
+                "recall_synthesis: failed to write cron-archive entry: {e}",
+            );
+        }
     }
 }
 
@@ -1300,7 +1572,7 @@ mod tests {
     /// (matches v0.25.x behavior). Per contract §8 invariant 4.
     #[test]
     fn decide_synthesize_cold_start_no_state_returns_yes() {
-        let decision = decide_synthesize(true, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N);
+        let decision = decide_synthesize(true, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N, 0.3);
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
 
@@ -1315,6 +1587,7 @@ mod tests {
             "Semantic",
             Some(&state),
             SYNTHESIS_COLD_START_N,
+            0.3,
         );
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
@@ -1329,7 +1602,7 @@ mod tests {
             cluster_stats(100, 0.1), // would skip if it were looked up
         );
         let decision =
-            decide_synthesize(true, None, "Semantic", Some(&state), SYNTHESIS_COLD_START_N);
+            decide_synthesize(true, None, "Semantic", Some(&state), SYNTHESIS_COLD_START_N, 0.3);
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
 
@@ -1347,6 +1620,7 @@ mod tests {
             "Semantic",
             Some(&state),
             SYNTHESIS_COLD_START_N,
+            0.3,
         );
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
@@ -1365,6 +1639,7 @@ mod tests {
             "Semantic",
             Some(&state),
             SYNTHESIS_COLD_START_N,
+            0.3,
         );
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
@@ -1384,6 +1659,7 @@ mod tests {
             "Semantic",
             Some(&state),
             SYNTHESIS_COLD_START_N,
+            0.3,
         );
         assert_eq!(decision, SynthesizeDecision::Skip(SkipReason::AdaptiveDecision));
     }
@@ -1402,6 +1678,7 @@ mod tests {
             "Semantic",
             Some(&state),
             SYNTHESIS_COLD_START_N,
+            0.3,
         );
         assert_eq!(
             decision,
@@ -1415,7 +1692,7 @@ mod tests {
     #[test]
     fn decide_synthesize_operator_disabled_with_no_state() {
         let decision =
-            decide_synthesize(false, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N);
+            decide_synthesize(false, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N, 0.3);
         assert_eq!(
             decision,
             SynthesizeDecision::Skip(SkipReason::OperatorDisabled)
@@ -1441,6 +1718,7 @@ mod tests {
             "Semantic",
             Some(&state),
             SYNTHESIS_COLD_START_N,
+            0.3,
         );
         assert_eq!(
             decision,
@@ -1459,13 +1737,13 @@ mod tests {
         );
         // viewed=3 < default cold_start_n=10 → Yes
         assert_eq!(
-            decide_synthesize(true, Some(42), "Semantic", Some(&state), 10),
+            decide_synthesize(true, Some(42), "Semantic", Some(&state), 10, 0.3),
             SynthesizeDecision::Yes
         );
         // viewed=3 >= custom cold_start_n=2 → consults useful_rate (below
         // threshold) → Skip
         assert_eq!(
-            decide_synthesize(true, Some(42), "Semantic", Some(&state), 2),
+            decide_synthesize(true, Some(42), "Semantic", Some(&state), 2, 0.3),
             SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)
         );
     }
@@ -1576,7 +1854,8 @@ mod tests {
                 "Semantic",
                 Some(&warm_state),
                 SYNTHESIS_COLD_START_N,
-            );
+                0.3,
+        );
             assert_eq!(decision, expected);
             // Reduce to the (skipped_disabled, skipped_adaptive_decision)
             // pair the run_recall_synthesis gate would set:
@@ -2000,8 +2279,9 @@ mod tests {
         // Compute what included_count would be under the same Mock cap
         // (LARGE_CONTEXT_DEFAULT_CAP). Reuse the public helper so the
         // arithmetic is identical to what run_recall_synthesis used.
-        let max_chars = crate::extract::llm::resolve_max_input_for_kind(
+        let max_chars = crate::extract::llm::resolve_max_input_for_section_kind(
             &config,
+            "ars.recall_synthesis",
             &ExtractorKind::Mock(MockExtractor::with_fixed_response("")),
         );
         let (_, included) = build_synthesis_prompt_with_count(&results, "q", max_chars);

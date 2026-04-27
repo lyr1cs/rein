@@ -12,6 +12,8 @@ pub mod cold_archive_summary;
 pub mod concept_summary;
 pub mod consolidation;
 pub mod dedup;
+pub mod judge_calibration;
+pub mod llm_judge_worker;
 pub mod recall_synthesis;
 pub mod resummerize;
 pub mod system_health;
@@ -1717,6 +1719,16 @@ pub(crate) fn project_synthesis_status(
         } else {
             0.0
         };
+        // v0.27.1 E direction: surface the runtime LLM judge counters so the
+        // GUI Adaptive page can render an "LLM judge" column alongside the
+        // existing useful_rate bar. `llm_judge_hit_rate` is `null` when no
+        // judge events have folded into this bucket yet (cold-start) — the
+        // GUI distinguishes "0%" (zero hits across N calls) from "n/a".
+        let llm_judge_hit_rate = if stats.llm_judge_count > 0 {
+            Some(stats.llm_judge_hit_count as f64 / stats.llm_judge_count as f64)
+        } else {
+            None
+        };
         by_cluster.push(serde_json::json!({
             "cluster_id": cid,
             "query_type": qtype,
@@ -1726,6 +1738,9 @@ pub(crate) fn project_synthesis_status(
             "clicked_source_rate": clicked_source_rate,
             "immediate_requery_rate": immediate_requery_rate,
             "explicit_thumb_up_rate": explicit_thumb_up_rate,
+            "llm_judge_count": stats.llm_judge_count,
+            "llm_judge_hit_count": stats.llm_judge_hit_count,
+            "llm_judge_hit_rate": llm_judge_hit_rate,
         }));
     }
     // Stable order for the GUI table — by cluster_id ascending, then
@@ -2334,6 +2349,7 @@ mod tests {
                 explicit_up: 30,
                 explicit_down: 5,
                 useful_rate: 0.73,
+                ..Default::default()
             },
         );
         by_cluster.insert(
@@ -2348,6 +2364,7 @@ mod tests {
                 explicit_up: 10,
                 explicit_down: 0,
                 useful_rate: 0.55,
+                ..Default::default()
             },
         );
         // The global sink — cid=-1, qtype=_global. Must NOT appear in
@@ -2364,6 +2381,7 @@ mod tests {
                 explicit_up: 0,
                 explicit_down: 0,
                 useful_rate: 0.68,
+                ..Default::default()
             },
         );
 

@@ -864,20 +864,33 @@ impl MockExtractor {
 }
 
 /// Create an extractor from config. Returns None if provider is "none" or API key is missing.
+///
+/// v0.27.1 B2: routes through `resolve_llm_for("extract")` so `[llm]`
+/// inheritance applies. API key still lives on the
+/// `[extract.google]` struct field — the resolver only carries the
+/// env-var name, not the merged TOML value.
 pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
     use crate::config::Provider;
-    match config.extract_provider() {
+    let r = config.resolve_llm_for("extract").ok()?;
+    match r.provider {
         Provider::Google => {
-            let api_key = config.extract.google.api_key.as_ref()?;
+            // Codex R2 P2 fix — honor `r.api_key_env` (e.g.
+            // `[llm.google].api_key_env = "MY_KEY"`). v0 hardcoded
+            // `config.extract.google.api_key`, which `load()` only
+            // populates from `GEMINI_API_KEY` — operators with custom
+            // env vars were silently disabled.
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(GeminiExtractor::new(
-                api_key.clone(),
-                config.extract.google.endpoint.clone(),
-                config.extract.google.model.clone(),
+                api_key, r.endpoint, r.model,
             )))
         }
         Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
-            config.extract.omlx.endpoint.clone(),
-            config.extract.omlx.model.clone(),
+            r.endpoint,
+            r.model,
             config.extract.omlx.disable_thinking,
         ))),
         Provider::None => None,
@@ -886,37 +899,34 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
 
 /// Create an extractor for async memory labeling.
 ///
-/// Provider is configuration-driven:
-/// - "inherit" => follow [extract].provider
+/// v0.27.1 B2: routes through `resolve_llm_for("extract.async_memory")`
+/// which preserves the v0.26.x semantic:
+/// - "inherit" => follow `[extract].provider`
 /// - "google"  => force Gemini path
 /// - "omlx"    => force OMLX path
 /// - "none"    => disable LLM labeling for the async worker
 pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
     use crate::config::Provider;
-    match config.async_memory.provider.to_lowercase().as_str() {
-        "inherit" => create_extractor(config),
-        "google" => {
-            let api_key = config.extract.google.api_key.as_ref()?;
+    let r = config.resolve_llm_for("extract.async_memory").ok()?;
+    match r.provider {
+        Provider::Google => {
+            // Codex R2 P2 fix — honor resolver's api_key_env (mirror of
+            // create_extractor fix above).
+            let api_key = r
+                .api_key_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(GeminiExtractor::new(
-                api_key.clone(),
-                config.extract.google.endpoint.clone(),
-                config.extract.google.model.clone(),
+                api_key, r.endpoint, r.model,
             )))
         }
-        "omlx" => Some(ExtractorKind::Omlx(OmlxExtractor::new(
-            config.extract.omlx.endpoint.clone(),
-            config.extract.omlx.model.clone(),
+        Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
+            r.endpoint,
+            r.model,
             config.extract.omlx.disable_thinking,
         ))),
-        "none" => None,
-        other => {
-            tracing::warn!(
-                "unknown async_memory.provider '{other}', falling back to extract.provider"
-            );
-            match config.extract_provider() {
-                Provider::Google | Provider::Omlx | Provider::None => create_extractor(config),
-            }
-        }
+        Provider::None => None,
     }
 }
 
@@ -1254,22 +1264,60 @@ fn prepare_with_context_for_kind(
 
 /// Resolve the per-call `max_input_chars` cap for an `ExtractorKind`.
 ///
+/// v0.27.1 B2 (spec §8.5 R6 P2): reads from
+/// `resolve_llm_for("extract")` so prompt truncation honors the same
+/// provider-resolved fields as model selection. For section-specific
+/// callers (e.g. `ars.recall_synthesis`), use
+/// [`resolve_max_input_for_section_kind`] which threads a section name
+/// through. Without this, an operator selecting model via `[llm]` or
+/// `[ars.recall_synthesis.*]` while truncation reads legacy
+/// `[extract.google]` would change the bytes sent to the LLM AND
+/// invalidate stamp_hash deterministic re-judge.
+///
 /// `pub` (not `pub(crate)`) so the v0.25.1 A3 `rein-eval synthesis` binary,
 /// which is a separate `bin/` target, can build the synthesis prompt with
-/// the same cap production uses (`run_recall_synthesis` calls this through
-/// `crate::extract::llm::resolve_max_input_for_kind`). Drift here would
-/// silently change which evidence the LLM sees and invalidate the McNemar
-/// comparison.
+/// the same cap production uses. Drift here would silently change which
+/// evidence the LLM sees and invalidate the McNemar comparison.
 pub fn resolve_max_input_for_kind(
     config: &ReinConfig,
     extractor: &ExtractorKind,
 ) -> usize {
+    resolve_max_input_for_section_kind(config, "extract", extractor)
+}
+
+/// Section-aware variant of [`resolve_max_input_for_kind`]. Reads
+/// `max_input_chars` for the given consumer section via
+/// `resolve_llm_for(section)` so a per-section override (or `[llm]`
+/// inheritance) propagates to prompt truncation.
+///
+/// Falls back to the legacy `[extract.{provider}].max_input_chars` /
+/// large-context default when the resolver returns no positive cap —
+/// preserving v0.26.x behavior for sections with no explicit override.
+pub fn resolve_max_input_for_section_kind(
+    config: &ReinConfig,
+    section: &str,
+    extractor: &ExtractorKind,
+) -> usize {
+    let resolved = config.resolve_llm_for(section).ok();
     match extractor {
         ExtractorKind::Gemini(_) => {
-            let configured = config.extract.google.max_input_chars;
+            let configured = resolved
+                .as_ref()
+                .map(|r| r.max_input_chars)
+                .unwrap_or(0);
             if configured > 0 {
-                configured
-            } else if is_large_context_model(&config.extract.google.model) {
+                return configured;
+            }
+            // Resolver returned 0 (no override) — apply the same
+            // large-context heuristic the legacy code did, but using the
+            // resolved model name when available so a `[llm]`-driven
+            // model swap is honored here too.
+            let model = resolved
+                .as_ref()
+                .map(|r| r.model.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(config.extract.google.model.as_str());
+            if is_large_context_model(model) {
                 // Large-context Gemini models nominally accept 1M+ tokens, but
                 // sending literally unlimited bytes per extraction is wasteful
                 // (bandwidth) and hides runaway inputs. Default to 1M chars
@@ -1281,7 +1329,10 @@ pub fn resolve_max_input_for_kind(
             }
         }
         ExtractorKind::Omlx(_) => {
-            let configured = config.extract.omlx.max_input_chars;
+            let configured = resolved
+                .as_ref()
+                .map(|r| r.max_input_chars)
+                .unwrap_or(0);
             if configured > 0 {
                 configured
             } else {
@@ -1297,33 +1348,7 @@ pub fn resolve_max_input_for_kind(
 }
 
 fn prepare_input_for_kind(config: &ReinConfig, text: &str, extractor: &ExtractorKind) -> String {
-    let max_chars = match extractor {
-        ExtractorKind::Gemini(_) => {
-            let configured = config.extract.google.max_input_chars;
-            if configured > 0 {
-                configured
-            } else if is_large_context_model(&config.extract.google.model) {
-                // Large-context Gemini models nominally accept 1M+ tokens, but
-                // sending literally unlimited bytes per extraction is wasteful
-                // (bandwidth) and hides runaway inputs. Default to 1M chars
-                // (~250k tokens), which still fits comfortably inside a 1M-token
-                // window; set `max_input_chars` explicitly to override.
-                LARGE_CONTEXT_DEFAULT_CAP
-            } else {
-                SAFE_DEFAULT_MAX_CHARS
-            }
-        }
-        ExtractorKind::Omlx(_) => {
-            let configured = config.extract.omlx.max_input_chars;
-            if configured > 0 {
-                configured
-            } else {
-                SAFE_DEFAULT_MAX_CHARS
-            }
-        }
-        #[cfg(feature = "test-support")]
-        ExtractorKind::Mock(_) => LARGE_CONTEXT_DEFAULT_CAP,
-    };
+    let max_chars = resolve_max_input_for_section_kind(config, "extract", extractor);
     if max_chars > 0 {
         text.chars().take(max_chars).collect()
     } else {
@@ -1492,7 +1517,8 @@ pub async fn extract_full_with_worker_preference(
 ) -> ExtractionResult {
     if let Some(extractor) = create_memory_worker_extractor(config) {
         // Use the worker extractor's actual context limit (may differ from main provider)
-        let worker_max = resolve_max_input_for_kind(config, &extractor);
+        let worker_max =
+            resolve_max_input_for_section_kind(config, "extract.async_memory", &extractor);
         let context_prefix = build_context_prefix_if_enabled(config, text);
         let chunks = chunk_for_extraction(text, worker_max, context_prefix.len());
         if chunks.len() > 1 {
@@ -1556,11 +1582,20 @@ fn is_large_context_model(model: &str) -> bool {
 /// - If the user explicitly set a value (> 0), use it.
 /// - If max_input_chars is 0 (no truncation), only allow it for known large-context Gemini models.
 /// - For any other model with 0, apply a safe default to prevent API errors and memory loss.
+///
+/// v0.27.1 B2: routes through `resolve_llm_for("extract")` so the
+/// prompt-truncation cap follows the same provider/model selection as
+/// the LLM call itself.
 fn resolve_max_input_chars(config: &ReinConfig) -> usize {
     use crate::config::Provider;
-    match config.extract_provider() {
+    let resolved = config.resolve_llm_for("extract").ok();
+    let provider = resolved
+        .as_ref()
+        .map(|r| r.provider)
+        .unwrap_or(Provider::None);
+    let configured = resolved.as_ref().map(|r| r.max_input_chars).unwrap_or(0);
+    match provider {
         Provider::Omlx => {
-            let configured = config.extract.omlx.max_input_chars;
             if configured > 0 {
                 configured
             } else {
@@ -1568,7 +1603,6 @@ fn resolve_max_input_chars(config: &ReinConfig) -> usize {
             }
         }
         Provider::Google | Provider::None => {
-            let configured = config.extract.google.max_input_chars;
             if configured > 0 {
                 return configured;
             }
@@ -1576,7 +1610,15 @@ fn resolve_max_input_chars(config: &ReinConfig) -> usize {
             // 1M-char cap (see LARGE_CONTEXT_DEFAULT_CAP); other models get
             // SAFE_DEFAULT_MAX_CHARS. Previously 0 meant "literally unlimited"
             // which allowed multi-MB POSTs per extraction with no upper bound.
-            let model = &config.extract.google.model;
+            // Prefer the resolver's model (so `[llm]`-driven model swaps
+            // apply); fall back to legacy `[extract.google].model` when
+            // resolver carried no model.
+            let resolved_model = resolved.as_ref().map(|r| r.model.as_str()).unwrap_or("");
+            let model = if resolved_model.is_empty() {
+                config.extract.google.model.as_str()
+            } else {
+                resolved_model
+            };
             if is_large_context_model(model) {
                 LARGE_CONTEXT_DEFAULT_CAP
             } else {

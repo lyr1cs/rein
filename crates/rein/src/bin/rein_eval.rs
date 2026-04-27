@@ -430,6 +430,7 @@ impl ConceptFixture {
             living_summary: None,
             living_summary_updated_at: None,
             living_summary_source_revision: None,
+            living_summary_id: None,
         }
     }
 
@@ -859,11 +860,14 @@ fn build_judge(config: &ReinConfig, mode: JudgeMode) -> Option<LlmJudgeHitChecke
         return None;
     }
     // Mode picks the LLM backend the same way the production scoring
-    // path picks it: synthesis judging shares Cap B's `[ars].llm_backend`,
-    // concept-summary judging shares Cap A's `create_concept_summary_extractor`.
+    // path picks it: synthesis judging resolves via the Cap B section
+    // (`ars.recall_synthesis`); concept-summary judging resolves via the
+    // Cap A section (`ars.concept_summary`). v0.27.1 B2 spec §8.5 rows
+    // 9 and 10 — each call site uses its own resolver section so a
+    // per-section level-1 override applies independently.
     let extractor = match mode {
         JudgeMode::SynthesisSourceCoverage => {
-            rein::ops::concept_summary::create_concept_summary_extractor(config)
+            rein::ops::concept_summary::create_ars_extractor(config, "ars.recall_synthesis")
         }
         JudgeMode::ConceptSummaryFactCoverage => {
             rein::ops::concept_summary::create_concept_summary_extractor(config)
@@ -1954,16 +1958,20 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
 
 /// Drive the recall-synthesis treatment: build the production prompt via
 /// `build_synthesis_prompt`, call the same LLM bridge production uses
-/// (`call_synthesis_llm_sync` + `create_concept_summary_extractor`), and
-/// score the prose output against `evidence_keywords`.
+/// (`call_synthesis_llm_sync` + the Cap B `ars.recall_synthesis`
+/// extractor), and score the prose output against `evidence_keywords`.
 fn cmd_synthesis_run(fixtures: &Path, output: &Path, verbose: bool) -> Result<()> {
     let config = ReinConfig::load().context("loading rein config for synthesis run")?;
-    // Use the production extractor-selection path so eval honors
-    // `[ars].llm_backend` (inherit / google / omlx) the same way
-    // `run_recall_synthesis` does. Without this, an operator who
-    // configured a different ARS backend would see `compare` verdicts
-    // that don't reflect production behavior.
-    let extractor = create_concept_summary_extractor(&config).ok_or_else(|| {
+    // Use the production extractor-selection path so eval honors the
+    // resolved `[ars.recall_synthesis]` config (with `[llm]` inheritance)
+    // the same way `run_recall_synthesis` does. Without this, an operator
+    // who configured a different ARS backend would see `compare`
+    // verdicts that don't reflect production behavior.
+    let extractor = rein::ops::concept_summary::create_ars_extractor(
+        &config,
+        "ars.recall_synthesis",
+    )
+    .ok_or_else(|| {
         anyhow!(
             "no LLM extractor available for recall synthesis — configure \
              `[extract].provider` (or `[ars].llm_backend = \"google\"`) with \
@@ -2016,7 +2024,15 @@ fn run_synthesis_treatment_with_extractor(
     // truncates the prompt the same way `run_recall_synthesis` would.
     // Drift here would silently change which evidence the LLM sees and
     // invalidate the McNemar comparison.
-    let max_chars = rein::extract::llm::resolve_max_input_for_kind(config, extractor);
+    //
+    // v0.27.1 B2 (spec §8.5 R6 P2): use the section-aware variant so the
+    // eval honors the same `[ars.recall_synthesis]` resolved config as
+    // production.
+    let max_chars = rein::extract::llm::resolve_max_input_for_section_kind(
+        config,
+        "ars.recall_synthesis",
+        extractor,
+    );
 
     for fx in fixtures_list {
         if fx.evidence_keywords.is_empty() {

@@ -473,6 +473,11 @@ async fn handle_api<B>(
         // GET /api/dedup_decisions migrated to #[op] inventory (dedup_log op in
         // ops/handlers/maintenance.rs); served via try_dispatch_inventory_rest above.
         (&Method::GET, "/api/intelligent_merge_metrics") => api_intelligent_merge_metrics(),
+        // v0.27.1 E direction (spec §7 Layer 2): drift κ + Layer 1 J3 κ +
+        // alert counts. Pure read; no auth. Cold-start (no AdaptiveState
+        // row, no judge_calibration_state field) returns the zero-value
+        // shape so the GUI never sees `undefined`.
+        (&Method::GET, "/api/judge/calibration") => api_judge_calibration(config),
         (&Method::GET, "/api/version") => json_response(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
@@ -648,6 +653,46 @@ fn api_activity(
         StatusCode::OK,
         json!({ "activity": activity, "granularity": granularity }),
     )
+}
+
+/// v0.27.1 E direction (spec §7) — surface `JudgeCalibrationState` to the GUI
+/// + doctor + operators. Cold-start (consumer hasn't run yet) returns the
+/// zero-value shape so the GUI never sees `null` / `undefined` for the
+/// numeric fields.
+fn api_judge_calibration(config: &ReinConfig) -> BoxedResponse {
+    // Codex R2 P2 fix — `database.path` defaults to `"auto"` (sentinel for
+    // `~/.rein/memories.db`). Passing the literal opens a stray DB named
+    // `auto` instead of the resolved store. Use `resolve_db_path()`
+    // which expands the sentinel + honors `REIN_DB` env override.
+    let store = match crate::store::SqliteStore::new(
+        &config.resolve_db_path(),
+        &config.embedding_model(),
+        config.embedding.dimensions,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target: "rein.judge", "api_judge_calibration: store open failed: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "judge calibration store unavailable",
+            );
+        }
+    };
+    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+        .unwrap_or_default();
+    let cal = state.judge_calibration_state.unwrap_or_default();
+    let body = json!({
+        "kappa": cal.kappa,
+        "runtime_vs_offline_kappa": cal.runtime_vs_offline_kappa,
+        "judge_drift_alert": cal.judge_drift_alert,
+        "total_offline_cron_events": cal.total_offline_cron_events,
+        "last_consumed_event_id_calibration": cal.last_consumed_event_id_calibration,
+        "last_computed_at": cal.last_computed_at,
+        "recent_pairs_synthesis_count": cal.recent_pairs_synthesis.len(),
+        "recent_pairs_concept_count": cal.recent_pairs_concept.len(),
+        "recent_pairs_runtime_vs_offline_count": cal.recent_pairs_runtime_vs_offline.len(),
+    });
+    json_response(StatusCode::OK, body)
 }
 
 /// Return process-wide intelligent_merge classifier counters for monitoring.

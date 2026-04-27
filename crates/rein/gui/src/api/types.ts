@@ -211,6 +211,16 @@ export interface AdaptiveStatusSynthesisCluster {
   clicked_source_rate: number;
   immediate_requery_rate: number;
   explicit_thumb_up_rate: number;
+  /**
+   * v0.27.1 E direction — runtime LLM judge counters per bucket. Older
+   * backends (pre-v0.27.1) won't emit these keys; UI treats `undefined` as
+   * cold-start ("no judge events folded yet"). `llm_judge_hit_rate` is
+   * `null` when `llm_judge_count = 0` (zero division) — UI renders "n/a"
+   * for that case rather than "0%".
+   */
+  llm_judge_count?: number;
+  llm_judge_hit_count?: number;
+  llm_judge_hit_rate?: number | null;
 }
 
 export interface AdaptiveStatusSynthesisGlobal {

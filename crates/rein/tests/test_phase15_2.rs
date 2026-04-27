@@ -79,6 +79,7 @@ fn setup_memoir_with_concept(
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     store.add_concept(concept).unwrap()
 }
@@ -167,6 +168,7 @@ fn test_bfs_expand_skips_expired_links() {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     let c1_id = store.add_concept(c1).unwrap();
 
@@ -185,6 +187,7 @@ fn test_bfs_expand_skips_expired_links() {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     let c2_id = store.add_concept(c2).unwrap();
 
@@ -264,6 +267,7 @@ fn test_bfs_expand_follows_valid_links() {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     let c1_id = store.add_concept(c1).unwrap();
 
@@ -282,6 +286,7 @@ fn test_bfs_expand_follows_valid_links() {
         living_summary: None,
         living_summary_updated_at: None,
         living_summary_source_revision: None,
+        living_summary_id: None,
     };
     let c2_id = store.add_concept(c2).unwrap();
 

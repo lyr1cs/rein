@@ -57,6 +57,27 @@ pub enum EventType {
     /// dispatch via `event_type`, no exhaustive match on `EventType` outside
     /// `EventType::as_str`.
     ConceptSummaryInteraction,
+    /// v0.27.1 E direction Layer 1 — **runtime** LLM judge produced a
+    /// synthesis-quality label for a Cap B output. Consumed by
+    /// `synthesis_feedback` consumer + folded into `useful_rate` via the
+    /// `llm_judge_count` / `llm_judge_hit_count` counters. Payload is JSON-
+    /// serialized [`SynthesisLlmJudgePayload`] in `feedback_events.payload`.
+    /// Distinct from `SynthesisInteraction` (human signal) so the consumer
+    /// can apply `w_llm` weight. Back-compat: string dispatch + `_ => {}`
+    /// fall-through in old consumers.
+    SynthesisLlmJudge,
+    /// v0.27.1 E direction Cap A Layer 1 mirror.
+    ConceptSummaryLlmJudge,
+    /// v0.27.1 E direction Layer 2 — **offline calibration cron** judged a
+    /// previously-synthesized output via the stricter nightly_cron LLM.
+    /// Consumed by `judge_calibration` consumer for κ accumulation
+    /// **only**; MUST NOT enter `useful_rate`. Codex R2 P2 caught the v0
+    /// draft's source-discriminated single-event-type design — separate
+    /// event type prevents calibration data from training the gate it
+    /// audits.
+    SynthesisLlmJudgeOfflineCron,
+    /// v0.27.1 E direction Cap A Layer 2 mirror.
+    ConceptSummaryLlmJudgeOfflineCron,
 }
 
 impl EventType {
@@ -75,6 +96,10 @@ impl EventType {
             Self::ConceptSummaryRefreshed => "concept_summary_refreshed",
             Self::SynthesisInteraction => "synthesis_interaction",
             Self::ConceptSummaryInteraction => "concept_summary_interaction",
+            Self::SynthesisLlmJudge => "synthesis_llm_judge",
+            Self::ConceptSummaryLlmJudge => "concept_summary_llm_judge",
+            Self::SynthesisLlmJudgeOfflineCron => "synthesis_llm_judge_offline_cron",
+            Self::ConceptSummaryLlmJudgeOfflineCron => "concept_summary_llm_judge_offline_cron",
         }
     }
 }
@@ -514,6 +539,44 @@ pub struct AdaptiveState {
     #[serde(default)]
     pub concept_summary_feedback_stats: Option<ConceptSummaryFeedbackState>,
 
+    /// v0.27.1 E direction: judge calibration state (Layer 1 J3 κ pairs +
+    /// Layer 2 runtime-vs-offline κ + drift alerts). `None` on fresh
+    /// install — J3 invariant treats absence as "κ undefined → invariant
+    /// dormant" (§4 J3 row). Layer 1 fields (`recent_pairs_synthesis`,
+    /// `recent_pairs_concept`, `kappa`) are owned by `synthesis_feedback`
+    /// / `concept_summary_feedback` consumers per §6.2.1; Layer 2 fields
+    /// (`runtime_vs_offline_kappa`, `last_consumed_event_id_calibration`,
+    /// `judge_drift_alert`) are owned by the `judge_calibration` consumer
+    /// per §7. R9-K5 mandates field-grouped CAS merge.
+    ///
+    /// Wave-1 D_CALIBRATION_CRON staging: A_JUDGE_CORE will own this field
+    /// definition once Wave 1 lands; D added it here so the cron + consumer
+    /// can read/write it. Field-grouped merge is implemented in
+    /// `save_snapshot` per R9-K5.
+    #[serde(default)]
+    pub judge_calibration_state: Option<JudgeCalibrationState>,
+
+    /// v0.27.1 E direction (spec §6.2.1) — opportunistic κ-pair join cache.
+    ///
+    /// Keyed by the surface-id `synthesis_id` or `concept_summary_id`; value
+    /// is whichever half (judge verdict OR human ExplicitThumb) arrived
+    /// first. When the matching half lands, the consumer takes the cached
+    /// half, completes the pair, and pushes it into
+    /// `JudgeCalibrationState.recent_pairs_*` (per the surface
+    /// discriminator). Bounded LRU at [`LLM_JUDGE_PAIR_CACHE_CAPACITY`];
+    /// FIFO evicts oldest entries with timestamps older than
+    /// [`LLM_JUDGE_HALF_PAIR_TTL_SECS`].
+    ///
+    /// Lives on `AdaptiveState` rather than the consumer state structs
+    /// because BOTH `synthesis_feedback` and `concept_summary_feedback`
+    /// share the cache (humans on either surface can match a judge call,
+    /// no cross-surface contamination because the surface is part of the
+    /// HalfPair payload). Treated as a derived cache for snapshot purposes
+    /// — wholesale-replaced under CAS by the writer with the higher
+    /// `synthesis_feedback_stats.last_consumed_event_id`.
+    #[serde(default)]
+    pub pending_kappa_half_pairs: HashMap<String, HalfPair>,
+
     /// Global version (incremented on each slow-channel update).
     pub version: u64,
 }
@@ -892,6 +955,141 @@ impl AdaptiveState {
                         }
                         (None, _) => { /* keep current */ }
                     }
+                    // v0.27.1 E direction: judge_calibration_state — R9-K5
+                    // mandates field-grouped CAS merge because Layer 1 and
+                    // Layer 2 consumers each own a different subset of the
+                    // struct. A naive single-watermark merge would drop
+                    // whichever side has a lower watermark on the merge pass.
+                    //
+                    //   Layer 1 fields (synthesis_feedback / concept_summary_feedback owned):
+                    //     - recent_pairs_synthesis, recent_pairs_concept, kappa
+                    //     - merged-by-event-id-MAX from
+                    //       synthesis_feedback_stats.last_consumed_event_id
+                    //       (Layer 1 consumers update Layer 1 fields atomically
+                    //        with their own watermark; we use the OWNER's
+                    //        watermark to arbitrate).
+                    //
+                    //   Layer 2 fields (judge_calibration owned):
+                    //     - runtime_vs_offline_kappa,
+                    //       last_consumed_event_id_calibration,
+                    //       recent_pairs_runtime_vs_offline,
+                    //       total_offline_cron_events,
+                    //       judge_drift_alert, last_computed_at
+                    //     - merged-by-MAX of last_consumed_event_id_calibration.
+                    //
+                    // We compose the merged struct field-by-field rather
+                    // than wholesale-replacing the Option, so Layer 1 progress
+                    // doesn't clobber Layer 2 state and vice versa.
+                    {
+                        let merged = match (
+                            &self.judge_calibration_state,
+                            &current.judge_calibration_state,
+                        ) {
+                            (None, None) => None,
+                            (Some(m), None) => Some(m.clone()),
+                            (None, Some(t)) => Some(t.clone()),
+                            (Some(mine), Some(theirs)) => {
+                                let mut out = theirs.clone();
+                                // Layer 1 arbitration: whichever side
+                                // incorporated more synthesis_feedback events
+                                // wins the Layer 1 fields. We approximate
+                                // "Layer 1 watermark" by inferring from
+                                // synthesis_feedback_stats.last_consumed_event_id
+                                // on the same Self/current.
+                                let mine_l1 = self
+                                    .synthesis_feedback_stats
+                                    .as_ref()
+                                    .map(|s| s.last_consumed_event_id)
+                                    .unwrap_or(0);
+                                let theirs_l1 = current
+                                    .synthesis_feedback_stats
+                                    .as_ref()
+                                    .map(|s| s.last_consumed_event_id)
+                                    .unwrap_or(0);
+                                if mine_l1 > theirs_l1 {
+                                    out.recent_pairs_synthesis =
+                                        mine.recent_pairs_synthesis.clone();
+                                    out.kappa = mine.kappa;
+                                }
+                                let mine_capa = self
+                                    .concept_summary_feedback_stats
+                                    .as_ref()
+                                    .map(|s| s.last_consumed_event_id)
+                                    .unwrap_or(0);
+                                let theirs_capa = current
+                                    .concept_summary_feedback_stats
+                                    .as_ref()
+                                    .map(|s| s.last_consumed_event_id)
+                                    .unwrap_or(0);
+                                if mine_capa > theirs_capa {
+                                    out.recent_pairs_concept =
+                                        mine.recent_pairs_concept.clone();
+                                }
+                                // Layer 2 arbitration by judge_calibration
+                                // watermark (MAX wins; ties keep current).
+                                if mine.last_consumed_event_id_calibration
+                                    > theirs.last_consumed_event_id_calibration
+                                {
+                                    out.runtime_vs_offline_kappa =
+                                        mine.runtime_vs_offline_kappa;
+                                    out.last_consumed_event_id_calibration =
+                                        mine.last_consumed_event_id_calibration;
+                                    out.recent_pairs_runtime_vs_offline =
+                                        mine.recent_pairs_runtime_vs_offline.clone();
+                                    out.total_offline_cron_events =
+                                        mine.total_offline_cron_events;
+                                    out.judge_drift_alert = mine.judge_drift_alert;
+                                    out.last_computed_at = mine.last_computed_at;
+                                }
+                                Some(out)
+                            }
+                        };
+                        current.judge_calibration_state = merged;
+                    }
+                    // v0.27.1 E direction: pending_kappa_half_pairs is a
+                    // derived cache over the same monotonic event log as
+                    // `synthesis_feedback_stats` (and the Cap A mirror).
+                    // Whoever drained more events wins — we approximate
+                    // by taking the side with the higher
+                    // `synthesis_feedback_stats.last_consumed_event_id`.
+                    // Wholesale replace because partial merge would leave
+                    // a half-pair whose other half never arrives.
+                    {
+                        // Codex R4 P2 fix — both `synthesis_feedback` AND
+                        // `concept_summary_feedback` consumers write into
+                        // the shared `pending_kappa_half_pairs` cache.
+                        // Choose the side whose MAX of the two watermarks
+                        // is higher (i.e. whoever drained more events
+                        // total). Without this, a Cap A advance with no
+                        // synthesis advance left mine_l1 == theirs_l1 and
+                        // dropped Cap A's half-pairs.
+                        let mine_synth = self
+                            .synthesis_feedback_stats
+                            .as_ref()
+                            .map(|s| s.last_consumed_event_id)
+                            .unwrap_or(0);
+                        let mine_cs = self
+                            .concept_summary_feedback_stats
+                            .as_ref()
+                            .map(|s| s.last_consumed_event_id)
+                            .unwrap_or(0);
+                        let theirs_synth = current
+                            .synthesis_feedback_stats
+                            .as_ref()
+                            .map(|s| s.last_consumed_event_id)
+                            .unwrap_or(0);
+                        let theirs_cs = current
+                            .concept_summary_feedback_stats
+                            .as_ref()
+                            .map(|s| s.last_consumed_event_id)
+                            .unwrap_or(0);
+                        let mine_max = mine_synth.max(mine_cs);
+                        let theirs_max = theirs_synth.max(theirs_cs);
+                        if mine_max > theirs_max {
+                            current.pending_kappa_half_pairs =
+                                self.pending_kappa_half_pairs.clone();
+                        }
+                    }
                     current.version = db_version + 1;
 
                     let merged_json =
@@ -1176,7 +1374,7 @@ pub const CONCEPT_REFRESH_SAMPLE_CAP: usize = 500;
 /// They still contribute to the revision percentile and to the *total*
 /// `count`, so revision-side bootstrap exit doesn't get blocked while
 /// steady-state age samples accumulate.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RefreshSample {
     pub revisions_since_last: u32,
     pub age_secs_since_last: i64,
@@ -1187,6 +1385,17 @@ pub struct RefreshSample {
     /// `wip` yet so this back-compat is a safety net, not a migration.
     #[serde(default)]
     pub first_refresh: bool,
+    /// v0.27.1 E direction (spec §3.2 R8 P1) — ULID minted by
+    /// `refresh_living_summary` on every successful Cap A summary write.
+    /// Lets the LLM judge link J5 back to the immutable
+    /// `concept_summary_instances` retention row even after a subsequent
+    /// refresh overwrites `concepts.living_summary_id`.
+    ///
+    /// `#[serde(default)]` so pre-v0.27.1 events parse with an empty
+    /// string — the judge worker treats empty `summary_id` as J5
+    /// link-absent and skips.
+    #[serde(default)]
+    pub summary_id: String,
 }
 
 /// v0.24 ARS: learned statistics for concept living-summary refresh.
@@ -1557,6 +1766,21 @@ pub struct ClusterSynthesisStats {
     pub immediate_requery_count: u64,
     pub explicit_up: u64,
     pub explicit_down: u64,
+    // ── v0.27.1 E direction LLM judge counters ──
+    //
+    // Codex R4 P2 — `#[serde(default)]` is mandatory on every new persisted
+    // counter. Existing nodes upgrading to v0.27.1 already have
+    // `synthesis_feedback_stats` JSON in `adaptive_state` blobs; bare `u64`
+    // fields without a default would make `serde_json::from_str` fail on
+    // those rows and `restore_snapshot` would drop the entire learned
+    // adaptive state on first boot.
+    /// Number of [`EventType::SynthesisLlmJudge`] events folded into this
+    /// bucket. Counts toward `total_signal` for cold-start fallback.
+    #[serde(default)]
+    pub llm_judge_count: u64,
+    /// Number of those events whose `hit = true`.
+    #[serde(default)]
+    pub llm_judge_hit_count: u64,
     /// Derived metric, recomputed on every consumer pass.
     pub useful_rate: f64,
 }
@@ -1884,6 +2108,13 @@ impl AdaptiveState {
     /// returned only when the bucket has accumulated at least
     /// [`SYNTHESIS_COLD_START_N`] viewed samples (cold-start fallback
     /// otherwise — caller falls back to the global `synthesize` flag).
+    ///
+    /// v0.27.1 E direction: also returns the bucket when LLM judge events
+    /// alone push `total_signal = viewed_count + explicit_up + explicit_down
+    /// + llm_judge_count` over the cold-start threshold. This is the
+    /// minimum change per Codex R8 P1 fix; the per-query gate caller in
+    /// `decide_synthesize` re-checks `total_signal` so the threshold logic
+    /// stays in one place.
     pub fn synthesis_bucket(
         &self,
         cluster_id: Option<i64>,
@@ -1891,11 +2122,394 @@ impl AdaptiveState {
     ) -> Option<&ClusterSynthesisStats> {
         let state = self.synthesis_feedback_stats.as_ref()?;
         let key = synthesis_bucket_key(cluster_id, query_type);
-        state
-            .by_cluster
-            .get(&key)
-            .filter(|s| s.viewed_count >= SYNTHESIS_COLD_START_N)
+        state.by_cluster.get(&key).filter(|s| {
+            // Accept when any individual signal already crossed the
+            // cold-start threshold OR the cumulative signal does.
+            // `decide_synthesize` re-applies its own threshold; this
+            // method is only used as an "is this bucket interesting"
+            // probe (see /api/adaptive surface).
+            let total = s
+                .viewed_count
+                .saturating_add(s.explicit_up)
+                .saturating_add(s.explicit_down)
+                .saturating_add(s.llm_judge_count);
+            total >= SYNTHESIS_COLD_START_N
+        })
     }
+}
+
+/// v0.27.1 E direction (spec §6) — extended `synthesis_feedback` consumer
+/// fold that also peeks runtime LLM judge events ([`EventType::SynthesisLlmJudge`])
+/// and owns the κ-pair join per spec §6.2.1.
+///
+/// **Single watermark, single offset** — the consumer peeks BOTH event
+/// types in one query (Codex R1 P1 fix: a separate `llm_judge_feedback`
+/// offset against a shared state would let interleaved production traffic
+/// silently drop judge events).
+///
+/// **κ-pair join (spec §6.2.1)** — when an `ExplicitThumb` arrives, the
+/// consumer looks up `synthesis_id` in `pending_pairs`; on hit, completes
+/// a `(judge_hit, thumb_up, ts)` pair into
+/// `calibration.recent_pairs_synthesis`. When a `SynthesisLlmJudge` event
+/// arrives, mirror logic — cache the judge half OR complete a pair if the
+/// human thumb already arrived. This is the only consumer that sees BOTH
+/// halves on the same offset.
+///
+/// All five M1 invariants (peek, watermark filter, applied-prefix bump,
+/// replay-drain, CAS merge) are inherited from the original
+/// `recompute_synthesis_feedback_stats` shape — extending the
+/// `event_types` filter is non-invariant-breaking.
+#[allow(clippy::too_many_arguments)]
+pub fn recompute_synthesis_feedback_stats_with_judge(
+    conn: &Connection,
+    prior: Option<SynthesisFeedbackState>,
+    pending_pairs_prior: HashMap<String, HalfPair>,
+    calibration_prior: JudgeCalibrationState,
+    // Codex R2 P2 fix — operator-tunable LLM signal weight (default 0.3
+    // per spec §6.4). Caller threads `[ars.llm_judge].weight_decay_rate`
+    // here so `useful_rate = 0.0` lets operators keep judge events for
+    // observability while disabling their effect on `decide_synthesize`.
+    weight_decay_rate: f64,
+) -> ReinResult<(
+    SynthesisFeedbackState,
+    HashMap<String, HalfPair>,
+    JudgeCalibrationState,
+    Option<i64>,
+)> {
+    let mut state = prior.unwrap_or_default();
+    let mut pending_pairs = pending_pairs_prior;
+    let mut calibration = calibration_prior;
+
+    let events = peek_events(
+        conn,
+        "synthesis_feedback",
+        &[
+            EventType::SynthesisInteraction.as_str(),
+            EventType::SynthesisLlmJudge.as_str(),
+        ],
+        50_000,
+    )?;
+    if events.is_empty() {
+        return Ok((state, pending_pairs, calibration, None));
+    }
+    let max_id_this_pass = events.last().map(|e| e.id);
+
+    // Invariants 1 + 2 — watermark filter + applied-prefix bump.
+    let prior_high_water = state.last_consumed_event_id;
+    if let Some(max_id) = max_id_this_pass {
+        state.last_consumed_event_id = state.last_consumed_event_id.max(max_id);
+    }
+
+    let mut touched_buckets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Pre-prune the half-pair cache by 7-day TTL using the latest event
+    // timestamp as a clock anchor. Robust to NTP drift on the worker
+    // host (don't rely on `chrono::Utc::now()` for cache TTL).
+    let now_ts = chrono::Utc::now().timestamp();
+    let cutoff = now_ts.saturating_sub(LLM_JUDGE_HALF_PAIR_TTL_SECS);
+    pending_pairs.retain(|_, half| half.ts() >= cutoff);
+
+    for ev in events {
+        if ev.id <= prior_high_water {
+            continue;
+        }
+        let payload_str = match ev.payload.as_deref() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    event_id = ev.id,
+                    "synthesis_feedback: event missing payload, skipping"
+                );
+                continue;
+            }
+        };
+        match ev.event_type.as_str() {
+            "synthesis_interaction" => {
+                let payload: SynthesisInteractionPayload =
+                    match serde_json::from_str(payload_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                event_id = ev.id,
+                                error = %e,
+                                "synthesis_feedback: malformed SynthesisInteractionPayload, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                fold_synthesis_interaction(
+                    &mut state,
+                    &mut pending_pairs,
+                    &mut calibration,
+                    &mut touched_buckets,
+                    &payload,
+                );
+            }
+            "synthesis_llm_judge" => {
+                let payload: SynthesisLlmJudgePayload =
+                    match serde_json::from_str(payload_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                event_id = ev.id,
+                                error = %e,
+                                "synthesis_feedback: malformed SynthesisLlmJudgePayload, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                fold_synthesis_llm_judge(
+                    &mut state,
+                    &mut pending_pairs,
+                    &mut calibration,
+                    &mut touched_buckets,
+                    &payload,
+                );
+            }
+            other => {
+                tracing::debug!(
+                    event_id = ev.id,
+                    event_type = %other,
+                    "synthesis_feedback: unexpected event_type in peek, skipping"
+                );
+            }
+        }
+    }
+
+    // Recompute derived metrics for buckets touched this pass.
+    for key in touched_buckets {
+        if let Some(bucket) = state.by_cluster.get_mut(&key) {
+            bucket.viewed_dwell_p50_ms = dwell_p50_ms(&bucket.dwell_samples);
+            // v0.27.1: switch to the active-signal-mask formula when this
+            // bucket has any LLM-judge contribution; fall back to the
+            // v0.26 fixed-denominator formula otherwise so existing
+            // human-only buckets keep their previously-computed values
+            // bit-identical (avoids invalidating in-flight A/B tests).
+            bucket.useful_rate = if bucket.llm_judge_count > 0 {
+                compute_useful_rate_with_judge(bucket, weight_decay_rate)
+                    .unwrap_or_else(|| compute_useful_rate(bucket))
+            } else {
+                compute_useful_rate(bucket)
+            };
+        }
+    }
+
+    // LRU cap on the pending pairs map. Eviction is best-effort FIFO —
+    // since HashMap iteration order is randomized, we drop arbitrary
+    // entries. The 7-day TTL bound above limits the steady-state size
+    // anyway; cap is a defense against pathological floods.
+    if pending_pairs.len() > LLM_JUDGE_PAIR_CACHE_CAPACITY {
+        let drop_n = pending_pairs.len() - LLM_JUDGE_PAIR_CACHE_CAPACITY;
+        let to_drop: Vec<String> = pending_pairs
+            .iter()
+            .take(drop_n)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in to_drop {
+            pending_pairs.remove(&k);
+        }
+    }
+
+    Ok((state, pending_pairs, calibration, max_id_this_pass))
+}
+
+/// Fold a single `SynthesisInteraction` event into the consumer's state.
+/// Pulled out of the loop so the same logic applies inside both the
+/// human-only `recompute_synthesis_feedback_stats` and the v0.27.1 extended
+/// variant. Mutates `state`, `pending_pairs`, `calibration`,
+/// `touched_buckets` in place.
+fn fold_synthesis_interaction(
+    state: &mut SynthesisFeedbackState,
+    pending_pairs: &mut HashMap<String, HalfPair>,
+    calibration: &mut JudgeCalibrationState,
+    touched_buckets: &mut std::collections::HashSet<String>,
+    payload: &SynthesisInteractionPayload,
+) {
+    let metadata = payload.metadata.clone().unwrap_or_default();
+    let cluster_id = metadata.cluster_id;
+    let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
+    let query_type = if SYNTHESIS_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+        raw_qtype.to_string()
+    } else {
+        "unknown".to_string()
+    };
+    let bucket_key = synthesis_bucket_key(cluster_id, &query_type);
+
+    // Hard cap.
+    if !state.by_cluster.contains_key(&bucket_key)
+        && state.by_cluster.len() >= SYNTHESIS_BY_CLUSTER_CAP
+    {
+        tracing::warn!(
+            cluster_id = ?cluster_id,
+            query_type = %query_type,
+            cap = SYNTHESIS_BY_CLUSTER_CAP,
+            "synthesis_feedback: by_cluster cap reached; dropping new bucket event"
+        );
+        state.total_events = state.total_events.saturating_add(1);
+        return;
+    }
+
+    let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    match &payload.interaction {
+        SynthesisInteractionKind::Viewed { dwell_ms } => {
+            bucket.viewed_count = bucket.viewed_count.saturating_add(1);
+            bucket.viewed_dwell_total_ms = bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
+            bucket.dwell_samples.push(*dwell_ms);
+            if bucket.dwell_samples.len() > SYNTHESIS_DWELL_RESERVOIR_CAP {
+                let overflow = bucket.dwell_samples.len() - SYNTHESIS_DWELL_RESERVOIR_CAP;
+                bucket.dwell_samples.drain(0..overflow);
+            }
+        }
+        SynthesisInteractionKind::ClickedSource { .. } => {
+            bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
+        }
+        SynthesisInteractionKind::ImmediateRequery { .. } => {
+            bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
+        }
+        SynthesisInteractionKind::ExplicitThumb { up } => {
+            if *up {
+                bucket.explicit_up = bucket.explicit_up.saturating_add(1);
+            } else {
+                bucket.explicit_down = bucket.explicit_down.saturating_add(1);
+            }
+            // v0.27.1 κ-pair join: ExplicitThumb half-pair construction
+            // per spec §6.2.1.
+            let now_ts = chrono::Utc::now().timestamp();
+            if let Some(half) = pending_pairs.remove(&payload.synthesis_id) {
+                if let HalfPair::Judge { hit, ts, surface } = half {
+                    // Judge arrived first → complete the pair now.
+                    calibration.push_pair(surface, hit, *up, ts);
+                } else {
+                    // Same-side double-thumb (rare) — overwrite with the
+                    // newer half-pair, drop the prior one.
+                    pending_pairs.insert(
+                        payload.synthesis_id.clone(),
+                        HalfPair::Thumb {
+                            up: *up,
+                            ts: now_ts,
+                            surface: JudgeSurface::Synthesis,
+                        },
+                    );
+                }
+            } else {
+                pending_pairs.insert(
+                    payload.synthesis_id.clone(),
+                    HalfPair::Thumb {
+                        up: *up,
+                        ts: now_ts,
+                        surface: JudgeSurface::Synthesis,
+                    },
+                );
+            }
+        }
+    }
+    touched_buckets.insert(bucket_key);
+
+    // Per-synthesis_id LRU fold (mirrors original implementation).
+    let sid = payload.synthesis_id.clone();
+    let existed = state.by_synthesis.contains_key(&sid);
+    {
+        let per = state.by_synthesis.entry(sid.clone()).or_default();
+        match &payload.interaction {
+            SynthesisInteractionKind::Viewed { .. } => {
+                per.viewed_count = per.viewed_count.saturating_add(1);
+            }
+            SynthesisInteractionKind::ClickedSource { .. } => {
+                per.clicked_source_count = per.clicked_source_count.saturating_add(1);
+            }
+            SynthesisInteractionKind::ExplicitThumb { up } => {
+                if *up {
+                    per.explicit_up = per.explicit_up.saturating_add(1);
+                } else {
+                    per.explicit_down = per.explicit_down.saturating_add(1);
+                }
+            }
+            SynthesisInteractionKind::ImmediateRequery { .. } => {}
+        }
+        per.last_interaction_ts = chrono::Utc::now().timestamp();
+    }
+    if !existed {
+        state.by_synthesis_order.push(sid.clone());
+        while state.by_synthesis_order.len() > SYNTHESIS_PER_ID_CAP {
+            let evict = state.by_synthesis_order.remove(0);
+            state.by_synthesis.remove(&evict);
+        }
+    }
+
+    state.total_events = state.total_events.saturating_add(1);
+}
+
+/// Fold a single `SynthesisLlmJudge` event into the consumer's state.
+/// v0.27.1 E direction. Updates the bucket's `llm_judge_count` /
+/// `llm_judge_hit_count` and runs the κ-pair join (cache half OR complete
+/// pair) per spec §6.2.1.
+fn fold_synthesis_llm_judge(
+    state: &mut SynthesisFeedbackState,
+    pending_pairs: &mut HashMap<String, HalfPair>,
+    calibration: &mut JudgeCalibrationState,
+    touched_buckets: &mut std::collections::HashSet<String>,
+    payload: &SynthesisLlmJudgePayload,
+) {
+    let metadata = payload.metadata.clone().unwrap_or_default();
+    let cluster_id = metadata.cluster_id;
+    let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
+    let query_type = if SYNTHESIS_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+        raw_qtype.to_string()
+    } else {
+        "unknown".to_string()
+    };
+    let bucket_key = synthesis_bucket_key(cluster_id, &query_type);
+
+    if !state.by_cluster.contains_key(&bucket_key)
+        && state.by_cluster.len() >= SYNTHESIS_BY_CLUSTER_CAP
+    {
+        tracing::warn!(
+            cluster_id = ?cluster_id,
+            query_type = %query_type,
+            cap = SYNTHESIS_BY_CLUSTER_CAP,
+            "synthesis_feedback: by_cluster cap reached; dropping new judge event"
+        );
+        state.total_events = state.total_events.saturating_add(1);
+        return;
+    }
+
+    let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    bucket.llm_judge_count = bucket.llm_judge_count.saturating_add(1);
+    if payload.hit {
+        bucket.llm_judge_hit_count = bucket.llm_judge_hit_count.saturating_add(1);
+    }
+    touched_buckets.insert(bucket_key);
+
+    // κ-pair join: judge half-pair construction per spec §6.2.1.
+    let now_ts = chrono::Utc::now().timestamp();
+    if let Some(half) = pending_pairs.remove(&payload.synthesis_id) {
+        if let HalfPair::Thumb { up, ts, surface } = half {
+            // Thumb arrived first → complete the pair.
+            calibration.push_pair(surface, payload.hit, up, ts);
+        } else {
+            // Two judge events for the same synthesis_id — overwrite with
+            // the newer half-pair (LWW, last-write-wins).
+            pending_pairs.insert(
+                payload.synthesis_id.clone(),
+                HalfPair::Judge {
+                    hit: payload.hit,
+                    ts: now_ts,
+                    surface: JudgeSurface::Synthesis,
+                },
+            );
+        }
+    } else {
+        pending_pairs.insert(
+            payload.synthesis_id.clone(),
+            HalfPair::Judge {
+                hit: payload.hit,
+                ts: now_ts,
+                surface: JudgeSurface::Synthesis,
+            },
+        );
+    }
+
+    state.total_events = state.total_events.saturating_add(1);
 }
 
 // ── v0.27 ARS Cap A feedback loop (Track 1) — concept-summary feedback ──────
@@ -2086,6 +2700,14 @@ pub struct ClusterConceptSummaryStats {
     pub immediate_requery_count: u64,
     pub explicit_up: u64,
     pub explicit_down: u64,
+    // ── v0.27.1 E direction LLM judge counters (Cap A mirror) ──
+    /// Number of [`EventType::ConceptSummaryLlmJudge`] events folded into
+    /// this bucket. Counts toward `total_signal` for cold-start fallback.
+    #[serde(default)]
+    pub llm_judge_count: u64,
+    /// Number of those events whose `hit = true`.
+    #[serde(default)]
+    pub llm_judge_hit_count: u64,
     /// Derived metric, recomputed on every consumer pass.
     pub useful_rate: f64,
 }
@@ -2402,9 +3024,10 @@ pub fn recompute_concept_summary_feedback_stats(
 impl AdaptiveState {
     /// v0.27 ARS Cap A: per-`(cluster_id, query_type)` concept-summary
     /// bucket, returned only when the bucket has accumulated at least
-    /// [`CONCEPT_SUMMARY_COLD_START_N`] viewed samples (cold-start
-    /// fallback otherwise — caller falls back to the global Cap A
-    /// `[ars].concept_summary_enabled` flag). Mirrors [`Self::synthesis_bucket`].
+    /// [`CONCEPT_SUMMARY_COLD_START_N`] samples across any signal class
+    /// (v0.27.1 E direction extends from `viewed_count` alone to a
+    /// cumulative `total_signal` so MCP-only clusters with judge-only
+    /// counts can still surface). Mirrors [`Self::synthesis_bucket`].
     pub fn concept_summary_bucket(
         &self,
         cluster_id: Option<i64>,
@@ -2412,10 +3035,917 @@ impl AdaptiveState {
     ) -> Option<&ClusterConceptSummaryStats> {
         let state = self.concept_summary_feedback_stats.as_ref()?;
         let key = concept_summary_bucket_key(cluster_id, query_type);
-        state
-            .by_cluster
-            .get(&key)
-            .filter(|s| s.viewed_count >= CONCEPT_SUMMARY_COLD_START_N)
+        state.by_cluster.get(&key).filter(|s| {
+            let total = s
+                .viewed_count
+                .saturating_add(s.explicit_up)
+                .saturating_add(s.explicit_down)
+                .saturating_add(s.llm_judge_count);
+            total >= CONCEPT_SUMMARY_COLD_START_N
+        })
+    }
+}
+
+/// v0.27.1 E direction Cap A mirror of
+/// [`recompute_synthesis_feedback_stats_with_judge`]. Peeks both
+/// `ConceptSummaryInteraction` and `ConceptSummaryLlmJudge` event types
+/// in one query and runs the κ-pair join per spec §6.2.1 +  §6.6.
+#[allow(clippy::too_many_arguments)]
+pub fn recompute_concept_summary_feedback_stats_with_judge(
+    conn: &Connection,
+    prior: Option<ConceptSummaryFeedbackState>,
+    pending_pairs_prior: HashMap<String, HalfPair>,
+    calibration_prior: JudgeCalibrationState,
+    // Codex R2 P2 fix — same threading as synthesis variant.
+    weight_decay_rate: f64,
+) -> ReinResult<(
+    ConceptSummaryFeedbackState,
+    HashMap<String, HalfPair>,
+    JudgeCalibrationState,
+    Option<i64>,
+)> {
+    let mut state = prior.unwrap_or_default();
+    let mut pending_pairs = pending_pairs_prior;
+    let mut calibration = calibration_prior;
+
+    let events = peek_events(
+        conn,
+        "concept_summary_feedback",
+        &[
+            EventType::ConceptSummaryInteraction.as_str(),
+            EventType::ConceptSummaryLlmJudge.as_str(),
+        ],
+        50_000,
+    )?;
+    if events.is_empty() {
+        return Ok((state, pending_pairs, calibration, None));
+    }
+    let max_id_this_pass = events.last().map(|e| e.id);
+
+    let prior_high_water = state.last_consumed_event_id;
+    if let Some(max_id) = max_id_this_pass {
+        state.last_consumed_event_id = state.last_consumed_event_id.max(max_id);
+    }
+
+    let mut touched_buckets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let now_ts = chrono::Utc::now().timestamp();
+    let cutoff = now_ts.saturating_sub(LLM_JUDGE_HALF_PAIR_TTL_SECS);
+    pending_pairs.retain(|_, half| half.ts() >= cutoff);
+
+    for ev in events {
+        if ev.id <= prior_high_water {
+            continue;
+        }
+        let payload_str = match ev.payload.as_deref() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    event_id = ev.id,
+                    "concept_summary_feedback: event missing payload, skipping"
+                );
+                continue;
+            }
+        };
+        match ev.event_type.as_str() {
+            "concept_summary_interaction" => {
+                let payload: ConceptSummaryInteractionPayload =
+                    match serde_json::from_str(payload_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                event_id = ev.id,
+                                error = %e,
+                                "concept_summary_feedback: malformed ConceptSummaryInteractionPayload, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                fold_concept_summary_interaction(
+                    &mut state,
+                    &mut pending_pairs,
+                    &mut calibration,
+                    &mut touched_buckets,
+                    &payload,
+                );
+            }
+            "concept_summary_llm_judge" => {
+                let payload: ConceptSummaryLlmJudgePayload =
+                    match serde_json::from_str(payload_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                event_id = ev.id,
+                                error = %e,
+                                "concept_summary_feedback: malformed ConceptSummaryLlmJudgePayload, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                fold_concept_summary_llm_judge(
+                    &mut state,
+                    &mut pending_pairs,
+                    &mut calibration,
+                    &mut touched_buckets,
+                    &payload,
+                );
+            }
+            other => {
+                tracing::debug!(
+                    event_id = ev.id,
+                    event_type = %other,
+                    "concept_summary_feedback: unexpected event_type in peek, skipping"
+                );
+            }
+        }
+    }
+
+    for key in touched_buckets {
+        if let Some(bucket) = state.by_cluster.get_mut(&key) {
+            bucket.viewed_dwell_p50_ms = concept_summary_dwell_p50_ms(&bucket.dwell_samples);
+            bucket.useful_rate = if bucket.llm_judge_count > 0 {
+                compute_concept_summary_useful_rate_with_judge(bucket, weight_decay_rate)
+                    .unwrap_or_else(|| compute_concept_summary_useful_rate(bucket))
+            } else {
+                compute_concept_summary_useful_rate(bucket)
+            };
+        }
+    }
+
+    if pending_pairs.len() > LLM_JUDGE_PAIR_CACHE_CAPACITY {
+        let drop_n = pending_pairs.len() - LLM_JUDGE_PAIR_CACHE_CAPACITY;
+        let to_drop: Vec<String> = pending_pairs
+            .iter()
+            .take(drop_n)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in to_drop {
+            pending_pairs.remove(&k);
+        }
+    }
+
+    Ok((state, pending_pairs, calibration, max_id_this_pass))
+}
+
+fn fold_concept_summary_interaction(
+    state: &mut ConceptSummaryFeedbackState,
+    pending_pairs: &mut HashMap<String, HalfPair>,
+    calibration: &mut JudgeCalibrationState,
+    touched_buckets: &mut std::collections::HashSet<String>,
+    payload: &ConceptSummaryInteractionPayload,
+) {
+    let metadata = payload.metadata.clone().unwrap_or_default();
+    let cluster_id = metadata.cluster_id;
+    let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
+    let query_type = if CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+        raw_qtype.to_string()
+    } else {
+        "unknown".to_string()
+    };
+    let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
+
+    if !state.by_cluster.contains_key(&bucket_key)
+        && state.by_cluster.len() >= CONCEPT_SUMMARY_BY_CLUSTER_CAP
+    {
+        tracing::warn!(
+            cluster_id = ?cluster_id,
+            query_type = %query_type,
+            cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+            "concept_summary_feedback: by_cluster cap reached; dropping new bucket event"
+        );
+        state.total_events = state.total_events.saturating_add(1);
+        return;
+    }
+
+    let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    match &payload.interaction {
+        ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
+            bucket.viewed_count = bucket.viewed_count.saturating_add(1);
+            bucket.viewed_dwell_total_ms = bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
+            bucket.dwell_samples.push(*dwell_ms);
+            if bucket.dwell_samples.len() > CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP {
+                let overflow = bucket.dwell_samples.len() - CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP;
+                bucket.dwell_samples.drain(0..overflow);
+            }
+        }
+        ConceptSummaryInteractionKind::ClickedSource { .. } => {
+            bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
+        }
+        ConceptSummaryInteractionKind::ImmediateRequery { .. } => {
+            bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
+        }
+        ConceptSummaryInteractionKind::ExplicitThumb { up } => {
+            if *up {
+                bucket.explicit_up = bucket.explicit_up.saturating_add(1);
+            } else {
+                bucket.explicit_down = bucket.explicit_down.saturating_add(1);
+            }
+            // κ-pair join (spec §6.2.1 Cap A mirror) keyed on concept_id
+            // when there's no per-instance summary_id available.
+            //
+            // TODO Wave 1.5: ConceptSummaryInteractionPayload only carries
+            // `concept_id`, while ConceptSummaryLlmJudgePayload carries
+            // `concept_summary_id` (per-instance ULID). Until E_INTEGRATE
+            // wires `concept_summary_id` into the GUI thumb path, the
+            // Cap A pair-join is best-effort only — judge half-pairs
+            // keyed on the instance ULID won't match thumb half-pairs
+            // keyed on the concept ULID. v0.27.1 ships this as
+            // documented behaviour; v0.27.2 unifies the surface IDs.
+            let now_ts = chrono::Utc::now().timestamp();
+            let key = payload.concept_id.clone();
+            if let Some(half) = pending_pairs.remove(&key) {
+                if let HalfPair::Judge { hit, ts, surface } = half {
+                    calibration.push_pair(surface, hit, *up, ts);
+                } else {
+                    pending_pairs.insert(
+                        key,
+                        HalfPair::Thumb {
+                            up: *up,
+                            ts: now_ts,
+                            surface: JudgeSurface::ConceptSummary,
+                        },
+                    );
+                }
+            } else {
+                pending_pairs.insert(
+                    key,
+                    HalfPair::Thumb {
+                        up: *up,
+                        ts: now_ts,
+                        surface: JudgeSurface::ConceptSummary,
+                    },
+                );
+            }
+        }
+    }
+    touched_buckets.insert(bucket_key);
+
+    let cid_str = payload.concept_id.clone();
+    let existed = state.by_concept.contains_key(&cid_str);
+    {
+        let per = state.by_concept.entry(cid_str.clone()).or_default();
+        match &payload.interaction {
+            ConceptSummaryInteractionKind::Viewed { .. } => {
+                per.viewed_count = per.viewed_count.saturating_add(1);
+            }
+            ConceptSummaryInteractionKind::ClickedSource { .. } => {
+                per.clicked_source_count = per.clicked_source_count.saturating_add(1);
+            }
+            ConceptSummaryInteractionKind::ExplicitThumb { up } => {
+                if *up {
+                    per.explicit_up = per.explicit_up.saturating_add(1);
+                } else {
+                    per.explicit_down = per.explicit_down.saturating_add(1);
+                }
+            }
+            ConceptSummaryInteractionKind::ImmediateRequery { .. } => {}
+        }
+        per.last_interaction_ts = chrono::Utc::now().timestamp();
+    }
+    if !existed {
+        state.by_concept_order.push(cid_str.clone());
+        while state.by_concept_order.len() > CONCEPT_SUMMARY_PER_ID_CAP {
+            let evict = state.by_concept_order.remove(0);
+            state.by_concept.remove(&evict);
+        }
+    }
+
+    state.total_events = state.total_events.saturating_add(1);
+}
+
+fn fold_concept_summary_llm_judge(
+    state: &mut ConceptSummaryFeedbackState,
+    pending_pairs: &mut HashMap<String, HalfPair>,
+    calibration: &mut JudgeCalibrationState,
+    touched_buckets: &mut std::collections::HashSet<String>,
+    payload: &ConceptSummaryLlmJudgePayload,
+) {
+    let metadata = payload.metadata.clone().unwrap_or_default();
+    let cluster_id = metadata.cluster_id;
+    let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
+    let query_type = if CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+        raw_qtype.to_string()
+    } else {
+        "unknown".to_string()
+    };
+    let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
+
+    if !state.by_cluster.contains_key(&bucket_key)
+        && state.by_cluster.len() >= CONCEPT_SUMMARY_BY_CLUSTER_CAP
+    {
+        tracing::warn!(
+            cluster_id = ?cluster_id,
+            query_type = %query_type,
+            cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+            "concept_summary_feedback: by_cluster cap reached; dropping new judge event"
+        );
+        state.total_events = state.total_events.saturating_add(1);
+        return;
+    }
+
+    let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    bucket.llm_judge_count = bucket.llm_judge_count.saturating_add(1);
+    if payload.hit {
+        bucket.llm_judge_hit_count = bucket.llm_judge_hit_count.saturating_add(1);
+    }
+    touched_buckets.insert(bucket_key);
+
+    // κ-pair join keyed on concept_summary_id (per-refresh ULID) so
+    // multi-refresh within the half-pair TTL window can't pair a judge
+    // verdict for one summary instance with a thumb for a different
+    // instance. Codex R10 P2 fix — v0 keyed on concept_id, which
+    // collides across mints. Now that v0.27.1 mints concept_summary_id
+    // per refresh, use it directly. The fold_concept_summary_interaction
+    // path also keys on concept_summary_id (when ExplicitThumb payload
+    // carries it; v0.27.0 events without it can no longer be paired —
+    // documented loss for upgrade-time events, marginal cost).
+    let now_ts = chrono::Utc::now().timestamp();
+    let key = payload.concept_summary_id.clone();
+    if let Some(half) = pending_pairs.remove(&key) {
+        if let HalfPair::Thumb { up, ts, surface } = half {
+            calibration.push_pair(surface, payload.hit, up, ts);
+        } else {
+            pending_pairs.insert(
+                key,
+                HalfPair::Judge {
+                    hit: payload.hit,
+                    ts: now_ts,
+                    surface: JudgeSurface::ConceptSummary,
+                },
+            );
+        }
+    } else {
+        pending_pairs.insert(
+            key,
+            HalfPair::Judge {
+                hit: payload.hit,
+                ts: now_ts,
+                surface: JudgeSurface::ConceptSummary,
+            },
+        );
+    }
+
+    state.total_events = state.total_events.saturating_add(1);
+}
+
+// ── v0.27.1 E direction — LLM judge OfflineCron payloads + JudgeCalibrationState ──
+
+/// v0.27.1 E direction — bootstrap signal source for the runtime LLM judge.
+///
+/// Reserved for future per-stream tagging within the Runtime tier (e.g.
+/// distinguishing `MCP-triggered` from `auto-sampled` runtime calls).
+/// **NOT** used to discriminate runtime vs offline cron — that distinction
+/// is carried by [`EventType`] itself per Codex R2 P2 fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JudgeSource {
+    /// Auto-sampled (sample-rate ladder fired).
+    AutoSampled,
+    /// Manually triggered via `rein_judge_synthesis` MCP tool.
+    ManualMcp,
+}
+
+/// v0.28 acceleration extension point per spec §16.1. v0.27.1 ships this
+/// struct as a forward-compat placeholder — emitter never populates,
+/// consumer ignores `Some`. Field set is stable across v0.28+: new fields
+/// land as `Option<...>` only (back-compat with stored events).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SignalHint {
+    /// LLM judge's inferred-from-rationale "ideal" view weight. Used as a
+    /// training label for v0.28 multi-param logistic-regression fit.
+    /// Computed by v0.28 from judge `reason` + observed signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_w_view: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_w_click: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_w_thumb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_w_req: Option<f64>,
+    /// Rolling confidence interval width on this cluster's `useful_rate`
+    /// estimate, computed by Bayesian posterior in v0.28. v0.27.1 stub
+    /// leaves `None`; v0.28 uses for active-sampling decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub useful_rate_ci_width: Option<f64>,
+}
+
+/// v0.27.1 E direction Layer 1 — runtime LLM judge payload for Cap B
+/// synthesis outputs. Persisted as JSON inside `feedback_events.payload`
+/// for an event of type [`EventType::SynthesisLlmJudge`].
+///
+/// Spec §3.2: separate variant from `SynthesisInteraction` so the consumer
+/// can apply `w_llm` weight when folding into `useful_rate`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SynthesisLlmJudgePayload {
+    /// ULID of the synthesis output (links to
+    /// `RecallSynthesisOutcome.synthesis_id`).
+    pub synthesis_id: String,
+    /// Judge model identifier (e.g. `"gemini-3.1-flash-lite-preview"`).
+    /// Recorded for retroactive κ recompute when operators swap models.
+    pub judge_model: String,
+    /// LLM judge verdict.
+    pub hit: bool,
+    /// One-sentence rationale (truncated to 280 chars on emit).
+    pub reason: String,
+    /// SHA-256 of the post-truncation prompt bytes the runtime judge actually
+    /// saw. Lets the nightly cron re-judge byte-identical input and detect
+    /// drift without storing the full text. NOT a hash of the full source list.
+    pub stamp_hash: String,
+    /// Bootstrap signal source — fixed per emit.
+    pub source: JudgeSource,
+    /// Optional metadata for bucket routing — `query_type`, `cluster_id`,
+    /// `source_count`, `judge_latency_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JudgeMetadata>,
+    /// v0.28 acceleration extension point per spec §16.1. v0.27.1 always
+    /// `None`; v0.28 multi-param fit pipeline populates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_hint: Option<SignalHint>,
+}
+
+/// v0.27.1 E direction Cap A mirror payload.
+///
+/// Codex R8 P1 fix — Cap A summary_id minting (per spec §3.2): v0.27.0
+/// stored `living_summary` directly on the `concepts` row with no per-
+/// refresh instance id. v0.27.1 adds `concepts.living_summary_id` (ULID
+/// minted on every refresh) plus the `concept_summary_instances`
+/// retention table (R9-K3) so the judge can validate J5 against an
+/// immutable snapshot even after a subsequent refresh overwrites
+/// `concepts.living_summary_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConceptSummaryLlmJudgePayload {
+    /// ULID identifying the concept-summary instance judged.
+    pub concept_summary_id: String,
+    /// Persistent concept ID the summary belongs to.
+    pub concept_id: String,
+    pub judge_model: String,
+    pub hit: bool,
+    pub reason: String,
+    pub stamp_hash: String,
+    pub source: JudgeSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JudgeMetadata>,
+    /// v0.28 acceleration extension point per spec §16.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_hint: Option<SignalHint>,
+}
+
+/// v0.27.1 E direction — discriminated half-pair entry in the κ pair-join
+/// LRU cache (`AdaptiveState::pending_kappa_half_pairs`).
+///
+/// Spec §6.2.1: humans usually thumb AFTER judge runs (judge ~1-5s
+/// post-synthesis; human dwells ~10-60s post-synthesis). But MCP-only
+/// callers may invoke `rein_judge_synthesis` AFTER an ExplicitThumb that
+/// came in via a separate path. Cache-on-arrival handles both orderings
+/// symmetrically.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "side", rename_all = "snake_case")]
+pub enum HalfPair {
+    Judge {
+        hit: bool,
+        ts: i64,
+        surface: JudgeSurface,
+    },
+    Thumb {
+        up: bool,
+        ts: i64,
+        surface: JudgeSurface,
+    },
+}
+
+impl HalfPair {
+    pub fn ts(&self) -> i64 {
+        match self {
+            Self::Judge { ts, .. } | Self::Thumb { ts, .. } => *ts,
+        }
+    }
+    pub fn surface(&self) -> JudgeSurface {
+        match self {
+            Self::Judge { surface, .. } | Self::Thumb { surface, .. } => *surface,
+        }
+    }
+}
+
+/// v0.27.1 E direction — per-surface calibration window discriminator
+/// (per spec §15 R9-K4). Synthesis vs concept_summary rubrics differ, so
+/// per-surface windows prevent one surface's high volume from masking
+/// the other's drift.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeSurface {
+    #[default]
+    Synthesis,
+    ConceptSummary,
+}
+
+/// LRU cap for `pending_kappa_half_pairs` (spec §6.2.1). Bounds memory
+/// growth on high-volume nodes; FIFO eviction matches the 7-day window of
+/// `JudgeCalibrationState.recent_pairs_*`. Operators can override via
+/// `[ars.llm_judge].pair_cache_capacity`.
+pub const LLM_JUDGE_PAIR_CACHE_CAPACITY: usize = 10_000;
+
+/// 7-day TTL on a half-pair before it is evicted unmatched. Mirrors the
+/// rolling-pair window in [`JudgeCalibrationState`] so cache eviction and
+/// pair eviction stay aligned.
+pub const LLM_JUDGE_HALF_PAIR_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// Bootstrap κ floor used by the J3 invariant. Below this, the runtime
+/// worker MUST NOT raise `sample_rate_warm`.
+pub const LLM_JUDGE_KAPPA_FLOOR: f64 = 0.6;
+
+/// Minimum (judge, ExplicitThumb) pairs before J3 is checked at all.
+/// Below this, J3 is dormant per spec §4 — runtime judge runs unconstrained
+/// at cold-start sample rate. This is the defensible policy: J3 protects
+/// against a calibrated drift signal, not against the absence of data.
+pub const LLM_JUDGE_J3_MIN_PAIRS: usize = 30;
+
+/// Bootstrap weight-decay rate for `useful_rate`'s LLM-judge contribution.
+/// `w_llm = w_thumb × weight_decay_rate`. Codex R2 P3 — 0.3 NOT 0.7. LLM
+/// signal heavily discounted relative to human thumb so any human signal
+/// dominates immediately. Conservative default per rein's "human is
+/// golden ground truth" philosophy.
+pub const LLM_JUDGE_WEIGHT_DECAY_RATE: f64 = 0.3;
+
+// Wave-1 D_CALIBRATION_CRON staging. A_JUDGE_CORE owns the runtime payload
+// + worker; D_CALIBRATION_CRON owns the OfflineCron emitter and the
+// `judge_calibration` consumer pass.
+
+/// v0.27.1 E direction Layer 2 — payload for `SynthesisLlmJudgeOfflineCron`.
+///
+/// Codex R7 P2 fix: distinct payload from `SynthesisLlmJudgePayload` because
+/// it carries BOTH the runtime verdict (joined from `feedback_events` at cron
+/// emit time via `synthesis_id`) AND the cron's stricter verdict, so the
+/// `judge_calibration` consumer can compute κ from a single event without
+/// re-querying `feedback_events`. Reusing the runtime-judge payload would
+/// only carry one `hit` field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SynthesisLlmJudgeOfflineCronPayload {
+    /// ULID of the synthesis output (links to RecallSynthesisOutcome.synthesis_id).
+    pub synthesis_id: String,
+    /// SHA-256 of the post-truncation prompt + candidate bytes the runtime
+    /// judge actually saw (J7 stamp-time invariant). Cron uses byte-identical
+    /// input for re-judge; mismatch would make κ comparison meaningless.
+    pub stamp_hash: String,
+    /// Verdict from the runtime LLM judge (Layer 1) for this synthesis_id.
+    /// Already in `feedback_events` at cron emit time; copied here so the
+    /// calibration consumer doesn't have to re-query.
+    pub runtime_hit: bool,
+    /// Identifier of the runtime judge model (e.g.
+    /// "gemini-3.1-flash-lite-preview"). Recorded for retroactive κ
+    /// recompute when operators swap models.
+    pub runtime_judge_model: String,
+    /// Verdict from the stricter nightly LLM judge (Layer 2).
+    pub cron_hit: bool,
+    /// Identifier of the cron judge model. Typical operator override
+    /// (`[ars.llm_judge.nightly_cron]`) selects a stricter rubric / different-
+    /// family model.
+    pub cron_judge_model: String,
+    /// One-sentence rationale from the cron judge (truncated to 280 chars
+    /// on emit). Stricter rubric / different model usually => non-trivial reason.
+    pub cron_reason: String,
+    /// Optional metadata for bucket routing — query_type, cluster_id, etc.
+    /// `#[serde(default)]` so old payloads parse after schema bumps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JudgeMetadata>,
+}
+
+/// v0.27.1 E direction Cap A Layer 2 mirror — payload for
+/// `ConceptSummaryLlmJudgeOfflineCron`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConceptSummaryLlmJudgeOfflineCronPayload {
+    /// ULID identifying the concept-summary instance judged. Links to
+    /// `concepts.living_summary_id` (v0.27.1 NEW column owned by A_JUDGE_CORE).
+    pub concept_summary_id: String,
+    /// Persistent concept ID the summary belongs to.
+    pub concept_id: String,
+    /// SHA-256 of the post-truncation prompt + candidate bytes the runtime
+    /// judge saw (J7 stamp-time invariant).
+    pub stamp_hash: String,
+    pub runtime_hit: bool,
+    pub runtime_judge_model: String,
+    pub cron_hit: bool,
+    pub cron_judge_model: String,
+    pub cron_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JudgeMetadata>,
+}
+
+/// v0.27.1 E direction — optional metadata travelling with judge events.
+/// Reused by both runtime and OfflineCron payload variants. All fields
+/// optional so JSON round-trips remain back-compat across schema bumps.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgeMetadata {
+    pub query_type: Option<String>,
+    pub cluster_id: Option<i64>,
+    pub source_count: Option<u32>,
+    pub judge_latency_ms: Option<u32>,
+}
+
+/// Layer 1 κ rolling-window cap. Mirrors `recent_pairs` 7-day window — caps
+/// memory growth on high-volume nodes. Independent for each surface
+/// (synthesis vs concept) per R9-K4 (per-surface calibration windows).
+pub const JUDGE_KAPPA_RECENT_PAIRS_CAP: usize = 4_096;
+
+/// Layer 2 κ rolling-window cap. Same rationale as Layer 1; sized to fit a
+/// week of `[ars.llm_judge.nightly_cron].max_archive_per_day` (default 5000
+/// per spec §7) at 20% sample rate ≈ 7,000 cron events / week — slightly
+/// above one week's worth so a single missed cron pass doesn't lose all
+/// drift signal.
+pub const JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP: usize = 8_192;
+
+/// Drift alert threshold. When `runtime_vs_offline_kappa < 0.7`, the
+/// `judge_calibration` consumer logs a one-line warning to
+/// `~/.rein/judge_drift.log` and bumps `judge_drift_alert`. Bootstrap const;
+/// v0.28 ablation per [[feedback_no_subjective_params]].
+pub const JUDGE_DRIFT_THRESHOLD: f64 = 0.7;
+
+/// Minimum pair count before `runtime_vs_offline_kappa` is trusted enough
+/// to fire a drift alert. Below this, κ is too noisy. Bootstrap const.
+pub const JUDGE_DRIFT_MIN_PAIRS: usize = 30;
+
+/// v0.27.1 E direction — judge calibration state container. Persisted as
+/// part of [`AdaptiveState`].
+///
+/// **Field grouping (R9-K5)**: Layer 1 (synthesis_feedback) and Layer 2
+/// (judge_calibration) consumers both write to this struct. Layer 1 fields
+/// merge under `synthesis_feedback`'s watermark; Layer 2 fields merge
+/// under `judge_calibration`'s watermark — see `AdaptiveState::save_snapshot`
+/// for the field-grouped CAS merge implementation.
+///
+/// **Per-surface windows (R9-K4)**: synthesis and concept-summary each get
+/// their own `recent_pairs_*` deque so one surface's high volume can't mask
+/// the other's drift.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct JudgeCalibrationState {
+    // ── Layer 1 fields (owned by synthesis_feedback / concept_summary_feedback) ──
+    /// Rolling 7-day window of `(judge_hit, human_thumb_up)` pairs joined
+    /// on `synthesis_id`. Owned by `synthesis_feedback` consumer per §6.2.1.
+    /// Read by J3 invariant. Capped at [`JUDGE_KAPPA_RECENT_PAIRS_CAP`];
+    /// FIFO-evict oldest on overflow.
+    #[serde(default)]
+    pub recent_pairs_synthesis: std::collections::VecDeque<(bool, bool, i64)>,
+    /// Cap A mirror — `(judge_hit, human_thumb_up)` pairs joined on
+    /// `concept_summary_id`. Owned by `concept_summary_feedback` consumer.
+    #[serde(default)]
+    pub recent_pairs_concept: std::collections::VecDeque<(bool, bool, i64)>,
+    /// J3 κ (runtime judge vs ExplicitThumb) over `recent_pairs_synthesis`.
+    /// Recomputed when pairs change. Used by `judge/contract.rs::no_self_reinforce`.
+    /// `0.0` when undefined (insufficient pairs); J3 reads `synthesis_feedback`
+    /// pair count to decide whether to consult κ.
+    #[serde(default)]
+    pub kappa: f64,
+
+    // ── Layer 2 fields (owned by judge_calibration consumer) ──
+    /// Drift κ between runtime judge and stricter offline cron over the
+    /// same synthesis_ids. Owned by `judge_calibration` consumer.
+    /// Used by drift alert + doctor; NEVER read by J3.
+    /// `0.0` when undefined.
+    #[serde(default)]
+    pub runtime_vs_offline_kappa: f64,
+    /// Durable watermark for `judge_calibration` consumer.
+    /// Without this, if `save_snapshot` succeeds and
+    /// `commit_offset('judge_calibration')` fails, the same OfflineCron
+    /// events replay next pass and double-append κ pairs / bump drift
+    /// alert counts. Updated CAS-by-max alongside `consumer_offsets` row.
+    #[serde(default)]
+    pub last_consumed_event_id_calibration: i64,
+    /// Rolling window of `(runtime_hit, cron_hit)` pairs. Owned by
+    /// `judge_calibration` consumer. Capped at [`JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP`];
+    /// FIFO-evict oldest on overflow.
+    #[serde(default)]
+    pub recent_pairs_runtime_vs_offline: std::collections::VecDeque<(bool, bool, i64)>,
+    /// Total Layer 2 events the consumer has processed (replay-counted once).
+    /// Useful for `/api/judge/calibration` exposure of drift coverage.
+    #[serde(default)]
+    pub total_offline_cron_events: u64,
+    /// Bumped each time the consumer detects `runtime_vs_offline_kappa <
+    /// JUDGE_DRIFT_THRESHOLD` while `recent_pairs_runtime_vs_offline.len()
+    /// >= JUDGE_DRIFT_MIN_PAIRS`. Doctor surfaces this; operator response
+    /// is to swap `nightly_cron.model`, lower `sample_rate_warm`, or
+    /// disable runtime judge.
+    #[serde(default)]
+    pub judge_drift_alert: u64,
+    /// Unix timestamp (seconds) of the last `runtime_vs_offline_kappa`
+    /// recomputation. Diagnostic — surfaced by doctor / `/api/judge/calibration`.
+    #[serde(default)]
+    pub last_computed_at: i64,
+}
+
+impl JudgeCalibrationState {
+    /// Push a completed `(judge_hit, thumb_up, ts)` κ pair into the
+    /// surface-matching rolling window per spec §6.2.1. Evicts pairs older
+    /// than 7 days from the front, then caps at
+    /// [`JUDGE_KAPPA_RECENT_PAIRS_CAP`]. Recomputes `kappa` when the
+    /// surface is `Synthesis` (Layer 1 J3 reads only the synthesis κ —
+    /// per-surface κ split is a v0.27.2 ablation per spec §15 R9-K4 and
+    /// is currently approximated by routing all J3 reads through
+    /// `recent_pairs_synthesis`).
+    pub fn push_pair(&mut self, surface: JudgeSurface, hit: bool, up: bool, ts: i64) {
+        let cutoff = ts.saturating_sub(LLM_JUDGE_HALF_PAIR_TTL_SECS);
+        let pairs = match surface {
+            JudgeSurface::Synthesis => &mut self.recent_pairs_synthesis,
+            JudgeSurface::ConceptSummary => &mut self.recent_pairs_concept,
+        };
+        // FIFO-evict pairs older than the 7-day window.
+        while let Some(&(_, _, t)) = pairs.front() {
+            if t < cutoff {
+                pairs.pop_front();
+            } else {
+                break;
+            }
+        }
+        pairs.push_back((hit, up, ts));
+        while pairs.len() > JUDGE_KAPPA_RECENT_PAIRS_CAP {
+            pairs.pop_front();
+        }
+        // Layer 1 κ recomputation. R9-K4: J3 reads the synthesis surface
+        // window today; concept-summary κ split is a v0.27.2 ablation.
+        if matches!(surface, JudgeSurface::Synthesis) {
+            self.kappa = compute_cohens_kappa(&self.recent_pairs_synthesis);
+        }
+    }
+}
+
+/// v0.27.1 E direction — Cohen's κ over a binary (judge_hit,
+/// human_thumb_up) pair list. `κ = (p_o - p_e) / (1 - p_e)`, where `p_o`
+/// is observed agreement and `p_e` is expected agreement under chance.
+///
+/// Returns `0.0` for an empty pair list or for the perfect-uniform edge
+/// case (all yes or all no on both sides). The clamp to `[-1.0, 1.0]`
+/// guards against floating-point noise pushing κ slightly outside its
+/// theoretical range.
+pub fn compute_cohens_kappa(pairs: &std::collections::VecDeque<(bool, bool, i64)>) -> f64 {
+    let n = pairs.len() as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+    let mut both_hit = 0_u64;
+    let mut both_miss = 0_u64;
+    let mut judge_hit = 0_u64;
+    let mut thumb_up = 0_u64;
+    for &(j, t, _) in pairs {
+        match (j, t) {
+            (true, true) => {
+                both_hit += 1;
+                judge_hit += 1;
+                thumb_up += 1;
+            }
+            (true, false) => {
+                judge_hit += 1;
+            }
+            (false, true) => {
+                thumb_up += 1;
+            }
+            (false, false) => {
+                both_miss += 1;
+            }
+        }
+    }
+    let p_o = (both_hit + both_miss) as f64 / n;
+    let p_judge_yes = judge_hit as f64 / n;
+    let p_thumb_yes = thumb_up as f64 / n;
+    let p_judge_no = 1.0 - p_judge_yes;
+    let p_thumb_no = 1.0 - p_thumb_yes;
+    let p_e = p_judge_yes * p_thumb_yes + p_judge_no * p_thumb_no;
+    let denom = 1.0 - p_e;
+    if denom.abs() < 1e-12 {
+        // Codex R1 P2 fix — degenerate case: p_e = 1.0 (one rater always
+        // says yes OR always says no). Cohen's κ is undefined here, but
+        // observed agreement carries the meaningful signal: if both raters
+        // happen to agree on every sample (p_o = 1.0), J3 should NOT
+        // tank to 0 and refuse to raise sample rate. Return p_o so
+        // perfect agreement scores as 1.0; perfect disagreement (p_o = 0)
+        // scores as 0.0 — both consistent with the observed-agreement
+        // floor when the chance-correction is undefined.
+        return p_o.clamp(0.0, 1.0);
+    }
+    ((p_o - p_e) / denom).clamp(-1.0, 1.0)
+}
+
+/// v0.27.1 E direction — active-signal-mask `useful_rate` per spec §6.4.
+///
+/// Replaces the v0.26 fixed-denominator [`compute_useful_rate`] for
+/// buckets with any LLM-judge signal. Missing signals contribute neither
+/// to numerator nor denominator. Returns `None` only when the bucket has
+/// no signal at all (caller falls back to cold-start ladder).
+///
+/// **Cold start with only LLM signal** (the entire point of E direction):
+/// numerator = `w_thumb × decay × llm_hit_rate`, denominator =
+/// `w_thumb × decay`, result = `llm_hit_rate`. A 100%-LLM-hit cluster
+/// reads as 1.0; `decide_synthesize → Yes`.
+///
+/// **Mixed cold start (LLM + a few humans)**: human signal weighted at
+/// `w_thumb`, LLM weighted at `w_thumb × decay`. Humans dominate as soon
+/// as they appear.
+///
+/// **Steady state (all signals active)**: full multi-source weighted
+/// average; with default `weight_decay_rate = 0.3`, LLM contributes 30%
+/// of the human-thumb weight. J6 invariant (`w_llm ≤ w_thumb`) is
+/// guaranteed for any `weight_decay_rate ∈ [0, 1]`.
+pub fn compute_useful_rate_with_judge(
+    stats: &ClusterSynthesisStats,
+    weight_decay_rate: f64,
+) -> Option<f64> {
+    let total_views = stats.viewed_count;
+    let explicit_total = stats.explicit_up + stats.explicit_down;
+    let llm_total = stats.llm_judge_count;
+
+    let mut numerator = 0.0_f64;
+    let mut denominator = 0.0_f64;
+
+    // Behavioral signals — only active when any view exists.
+    if total_views > 0 {
+        let viewed_signal = if stats.dwell_samples.is_empty() {
+            0.0
+        } else {
+            let above_threshold = stats
+                .dwell_samples
+                .iter()
+                .filter(|&&ms| ms > SYNTHESIS_DWELL_THRESHOLD_MS)
+                .count();
+            (above_threshold as f64 / stats.dwell_samples.len() as f64).clamp(0.0, 1.0)
+        };
+        let click_signal = (stats.clicked_source_count as f64 / total_views as f64).min(1.0);
+        let requery_signal =
+            (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
+        numerator += SYNTHESIS_W_VIEW * viewed_signal + SYNTHESIS_W_CLICK * click_signal
+            - SYNTHESIS_W_REQUERY * requery_signal;
+        denominator += SYNTHESIS_W_VIEW + SYNTHESIS_W_CLICK + SYNTHESIS_W_REQUERY;
+    }
+
+    // Explicit thumb — only active when any thumb exists.
+    if explicit_total > 0 {
+        let thumb_signal = stats.explicit_up as f64 / explicit_total as f64;
+        numerator += SYNTHESIS_W_THUMB * thumb_signal;
+        denominator += SYNTHESIS_W_THUMB;
+    }
+
+    // LLM judge — only active when any judge event exists. Weight is
+    // strictly ≤ W_THUMB by J6 (config-validated weight_decay_rate ≤ 1.0).
+    if llm_total > 0 {
+        let w_llm = SYNTHESIS_W_THUMB * weight_decay_rate;
+        let llm_signal = stats.llm_judge_hit_count as f64 / llm_total as f64;
+        numerator += w_llm * llm_signal;
+        denominator += w_llm;
+    }
+
+    if denominator > 0.0 {
+        // Codex R4 P2 — clamp to [0, 1].
+        Some((numerator / denominator).clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
+
+/// v0.27.1 E direction Cap A mirror of [`compute_useful_rate_with_judge`].
+pub fn compute_concept_summary_useful_rate_with_judge(
+    stats: &ClusterConceptSummaryStats,
+    weight_decay_rate: f64,
+) -> Option<f64> {
+    let total_views = stats.viewed_count;
+    let explicit_total = stats.explicit_up + stats.explicit_down;
+    let llm_total = stats.llm_judge_count;
+
+    let mut numerator = 0.0_f64;
+    let mut denominator = 0.0_f64;
+
+    if total_views > 0 {
+        let viewed_signal = if stats.dwell_samples.is_empty() {
+            0.0
+        } else {
+            let above_threshold = stats
+                .dwell_samples
+                .iter()
+                .filter(|&&ms| ms > CONCEPT_SUMMARY_DWELL_THRESHOLD_MS)
+                .count();
+            (above_threshold as f64 / stats.dwell_samples.len() as f64).clamp(0.0, 1.0)
+        };
+        let click_signal = (stats.clicked_source_count as f64 / total_views as f64).min(1.0);
+        let requery_signal =
+            (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
+        numerator += CONCEPT_SUMMARY_W_VIEW * viewed_signal
+            + CONCEPT_SUMMARY_W_CLICK * click_signal
+            - CONCEPT_SUMMARY_W_REQUERY * requery_signal;
+        denominator +=
+            CONCEPT_SUMMARY_W_VIEW + CONCEPT_SUMMARY_W_CLICK + CONCEPT_SUMMARY_W_REQUERY;
+    }
+
+    if explicit_total > 0 {
+        let thumb_signal = stats.explicit_up as f64 / explicit_total as f64;
+        numerator += CONCEPT_SUMMARY_W_THUMB * thumb_signal;
+        denominator += CONCEPT_SUMMARY_W_THUMB;
+    }
+
+    if llm_total > 0 {
+        let w_llm = CONCEPT_SUMMARY_W_THUMB * weight_decay_rate;
+        let llm_signal = stats.llm_judge_hit_count as f64 / llm_total as f64;
+        numerator += w_llm * llm_signal;
+        denominator += w_llm;
+    }
+
+    if denominator > 0.0 {
+        Some((numerator / denominator).clamp(0.0, 1.0))
+    } else {
+        None
     }
 }
 
@@ -2763,6 +4293,7 @@ mod tests {
             revisions_since_last: revisions,
             age_secs_since_last: age_secs,
             first_refresh,
+            summary_id: String::new(),
         })
         .unwrap();
         emit_event(
@@ -2945,9 +4476,9 @@ mod tests {
             revision_p75: 7,
             age_p50_secs: 3600,
             samples: vec![
-                RefreshSample { revisions_since_last: 5, age_secs_since_last: 1000, first_refresh: false },
-                RefreshSample { revisions_since_last: 7, age_secs_since_last: 2000, first_refresh: false },
-                RefreshSample { revisions_since_last: 9, age_secs_since_last: 3600, first_refresh: false },
+                RefreshSample { revisions_since_last: 5, age_secs_since_last: 1000, first_refresh: false, summary_id: String::new() },
+                RefreshSample { revisions_since_last: 7, age_secs_since_last: 2000, first_refresh: false, summary_id: String::new() },
+                RefreshSample { revisions_since_last: 9, age_secs_since_last: 3600, first_refresh: false, summary_id: String::new() },
             ],
             last_consumed_event_id: 50,
         };
@@ -2975,6 +4506,7 @@ mod tests {
                 revisions_since_last: 4,
                 age_secs_since_last: 600,
                 first_refresh: false,
+                summary_id: String::new(),
             }],
             last_consumed_event_id: 30,
         };
@@ -3007,6 +4539,7 @@ mod tests {
                 revisions_since_last: 4,
                 age_secs_since_last: 600,
                 first_refresh: false,
+                summary_id: String::new(),
             }],
             last_consumed_event_id: 30,
         };
@@ -3028,8 +4561,8 @@ mod tests {
             revision_p75: 8,
             age_p50_secs: 1800,
             samples: vec![
-                RefreshSample { revisions_since_last: 6, age_secs_since_last: 1200, first_refresh: false },
-                RefreshSample { revisions_since_last: 10, age_secs_since_last: 1800, first_refresh: false },
+                RefreshSample { revisions_since_last: 6, age_secs_since_last: 1200, first_refresh: false, summary_id: String::new() },
+                RefreshSample { revisions_since_last: 10, age_secs_since_last: 1800, first_refresh: false, summary_id: String::new() },
             ],
             last_consumed_event_id: 99,
         };
@@ -3067,6 +4600,7 @@ mod tests {
                 revisions_since_last: 7,
                 age_secs_since_last: 3600,
                 first_refresh: false,
+                summary_id: String::new(),
             }],
             last_consumed_event_id: 100,
         };
@@ -3261,6 +4795,7 @@ mod tests {
             explicit_up: 8,
             explicit_down: 0,
             useful_rate: 0.0,
+            ..Default::default()
         };
         let happy_rate = compute_useful_rate(&happy);
         assert!(
@@ -3281,6 +4816,7 @@ mod tests {
             explicit_up: 0,
             explicit_down: 5,
             useful_rate: 0.0,
+            ..Default::default()
         };
         let bad_rate = compute_useful_rate(&bad);
         assert!(bad_rate >= 0.0, "useful_rate must clamp at 0.0");
@@ -3559,6 +5095,7 @@ mod tests {
                 explicit_up: 12,
                 explicit_down: 2,
                 useful_rate: 0.7,
+                ..Default::default()
             },
         );
         let winner_synth = SynthesisFeedbackState {
@@ -3862,6 +5399,7 @@ mod tests {
             explicit_up: 8,
             explicit_down: 0,
             useful_rate: 0.0,
+            ..Default::default()
         };
         let happy_rate = compute_concept_summary_useful_rate(&happy);
         assert!(happy_rate > 0.5, "happy path useful_rate={happy_rate}");
@@ -3879,6 +5417,7 @@ mod tests {
             explicit_up: 0,
             explicit_down: 5,
             useful_rate: 0.0,
+            ..Default::default()
         };
         let bad_rate = compute_concept_summary_useful_rate(&bad);
         assert!(bad_rate >= 0.0);
@@ -4384,6 +5923,7 @@ mod tests {
                 explicit_up: 12,
                 explicit_down: 2,
                 useful_rate: 0.7,
+                ..Default::default()
             },
         );
         let winner_csf = ConceptSummaryFeedbackState {

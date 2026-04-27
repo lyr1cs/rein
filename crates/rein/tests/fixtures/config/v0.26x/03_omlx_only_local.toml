@@ -1,0 +1,90 @@
+# v0.26.x fixture #3: single-provider OMLX-only config — local models
+# only, no Google. Covers the v0.9.0+ pattern of operators running
+# entirely against a local OMLX server (Ollama / LM Studio / vLLM).
+#
+# Validates that when `provider = "omlx"` walks the chain, every
+# scoped field reads from `[*.omlx]` — never from `[*.google]`. This is
+# the load-bearing "provider-scoped fields walk as a unit" semantic
+# (Codex R5 P2 / spec §8.1).
+
+[database]
+path = "/tmp/rein-fixture-03.db"
+
+[embedding]
+provider = "omlx"
+dimensions = 768
+
+[embedding.google]
+model = "gemini-embedding-001"
+
+[embedding.omlx]
+endpoint = "http://localhost:8000/v1"
+model = "nomic-embed-text"
+
+[extract]
+provider = "omlx"
+
+[extract.google]
+model = "gemini-3.1-flash-lite-preview"
+max_input_chars = 0
+
+[extract.omlx]
+endpoint = "http://localhost:11434/v1"
+model = "qwen2.5:14b"
+max_input_chars = 32000
+disable_thinking = true
+
+[query_expansion]
+provider = "omlx"
+max_expansions = 3
+
+[query_expansion.google]
+model = "gemini-3.1-flash-lite-preview"
+
+[query_expansion.omlx]
+endpoint = "http://localhost:8000/v1"
+model = "qwen2.5:7b"
+disable_thinking = true
+
+[search]
+rrf_k = 60.0
+rrf_fts_weight = 0.3
+rrf_vec_weight = 0.7
+dedup_similarity = 0.70
+dedup_time_window_days = 7
+llm_reranker = "omlx"
+llm_reranker_top_n = 15
+
+[chunking]
+max_tokens = 512
+overlap_percent = 10
+metadata_prefix = true
+
+[sync]
+supermemory_enabled = false
+auto_memory_enabled = false
+auto_memory_glob = ""
+
+[decay]
+base_lambda = 0.06
+ltm_beta = 0.8
+stm_beta = 1.2
+interval_hours = 24
+prune_threshold = 0.05
+stm_to_ltm_access_count = 5
+
+[server]
+compact = false
+sse_enabled = false
+sse_port = 8680
+sse_bind = "127.0.0.1"
+
+[ars]
+llm_backend = "omlx"
+
+[resummerize]
+enabled = false
+llm_backend = "omlx"
+
+[async_memory]
+provider = "omlx"

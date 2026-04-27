@@ -7,6 +7,7 @@ pub mod adaptive;
 pub mod cold_archive;
 pub mod concept_summary_feedback;
 pub mod diagnostics;
+pub mod judge;
 pub mod knowledge;
 pub mod maintenance;
 pub mod memory;

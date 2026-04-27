@@ -825,6 +825,7 @@ impl OpsRuntime {
                 living_summary: None,
                 living_summary_updated_at: None,
                 living_summary_source_revision: None,
+                living_summary_id: None,
             };
             let id = store.add_concept(concept)?;
             Ok(ConceptAddOutput {
@@ -1085,6 +1086,7 @@ impl OpsRuntime {
                         qtype,
                         Some(&adaptive_state),
                         cold_start_n,
+                        self.config().ars.llm_judge.weight_decay_rate,
                     ) {
                         crate::ops::concept_summary::ConceptSummaryDecision::Yes => {
                             (concept.living_summary.clone(), false)
@@ -1191,6 +1193,7 @@ mod tests {
                 living_summary: None,
                 living_summary_updated_at: None,
                 living_summary_source_revision: None,
+                living_summary_id: None,
             })
             .expect("add concept");
         (Arc::new(crate::ops::OpsRuntime::for_rest(config)), tmp)
