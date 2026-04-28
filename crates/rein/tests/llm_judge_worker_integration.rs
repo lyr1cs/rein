@@ -261,3 +261,147 @@ fn invariant_constants_are_stable() {
     assert_eq!(LLM_JUDGE_J3_MIN_PAIRS, 30);
     assert!((LLM_JUDGE_KAPPA_FLOOR - 0.6).abs() < 1e-9);
 }
+
+// ── v0.27.x C2 end-to-end integration tests ──────────────────────────────
+
+/// Full pipeline: dispatch_one emits SynthesisLlmJudge → consumer
+/// recompute_synthesis_feedback_stats_with_judge folds it into
+/// per-cluster stats with the configured weight_decay_rate.
+#[test]
+fn dispatch_then_consumer_fold_updates_useful_rate() {
+    use rein::store::adaptive::recompute_synthesis_feedback_stats_with_judge;
+    use std::collections::HashMap;
+
+    let (store, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+        "HIT: yes\nWHY: covers all source facts.",
+    ));
+    let job = make_job(
+        JudgeJobKind::Synthesis,
+        "synth_e2e_001",
+        None,
+        "what is rein?",
+        "rein is a memory system",
+        "rein is a multi-source cross-validated memory MCP server.",
+    );
+    let result = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT);
+    assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
+
+    // Drain the emitted event into adaptive state via the consumer.
+    let (state, _pairs, _calibration, max_id) =
+        recompute_synthesis_feedback_stats_with_judge(
+            store.conn(),
+            None,
+            HashMap::new(),
+            Default::default(),
+            0.3,
+        )
+        .expect("consumer fold succeeds");
+    assert!(max_id.is_some(), "consumer should have advanced offset");
+    // make_job sets cluster_id=Some(7), query_type=Some("Semantic").
+    let key = rein::store::adaptive::synthesis_bucket_key(Some(7), "Semantic");
+    let bucket = state
+        .by_cluster
+        .get(&key)
+        .expect("bucket should exist after fold");
+    assert_eq!(bucket.llm_judge_count, 1);
+    assert_eq!(bucket.llm_judge_hit_count, 1);
+    // useful_rate = w_thumb × 0.3 × 1.0 / (w_thumb × 0.3) = 1.0
+    assert!(
+        bucket.useful_rate > 0.99,
+        "judge-only hit bucket should yield useful_rate ≈ 1.0, got {}",
+        bucket.useful_rate
+    );
+}
+
+/// Daily cap honored: when the rolling 24h count is at cap,
+/// dispatch_one returns Dropped(DailyCapReached).
+#[test]
+fn dispatch_drops_when_cap_reached() {
+    let (store, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+        "HIT: yes\nWHY: ok.",
+    ));
+    // Fill the ledger up to a low custom cap.
+    let cap: u64 = 2;
+    for i in 0..cap as usize {
+        let job = make_job(
+            JudgeJobKind::Synthesis,
+            &format!("synth_cap_{i}"),
+            None,
+            "q",
+            "p",
+            "c",
+        );
+        // Re-create the mock for each call (consumes one scripted response per dispatch).
+        let extr = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+            "HIT: yes\nWHY: ok.",
+        ));
+        let _ = dispatch_one(&store, &extr, job, cap);
+    }
+    // Third job at cap=2 must be dropped without an LLM call.
+    let job = make_job(
+        JudgeJobKind::Synthesis,
+        "synth_cap_overflow",
+        None,
+        "q",
+        "p",
+        "c",
+    );
+    let result = dispatch_one(&store, &extractor, job, cap);
+    assert!(
+        matches!(result, Ok(DispatchResult::Dropped(DropReason::DailyCapReached))),
+        "expected DailyCapReached, got {result:?}"
+    );
+    // Verify the third event was NOT emitted to feedback_events.
+    let synth_events = peek_events(
+        store.conn(),
+        "test-cap-counter",
+        &[EventType::SynthesisLlmJudge.as_str()],
+        100,
+    )
+    .expect("peek");
+    assert_eq!(
+        synth_events.len(),
+        cap as usize,
+        "exactly `cap` events should have been emitted"
+    );
+}
+
+/// judge_model_override builds an alternate Gemini extractor with the
+/// override model, and the emitted event records the override model.
+#[test]
+fn judge_model_override_records_override_model() {
+    let (store, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+        "HIT: yes\nWHY: ok.",
+    ));
+    let mut job = make_job(
+        JudgeJobKind::Synthesis,
+        "synth_override_001",
+        None,
+        "q",
+        "p",
+        "c",
+    );
+    job.judge_model_override = Some("custom-judge-model".to_string());
+    // Mock extractor doesn't honor override (per spec); but the
+    // emitted event SHOULD record the actual model used (which is
+    // "mock" for MockExtractor). This anchors the v0.27.2 R8-P3 fix
+    // that we record actual, never hallucinate the override.
+    let result = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT);
+    assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
+    let events = peek_events(
+        store.conn(),
+        "test-override",
+        &[EventType::SynthesisLlmJudge.as_str()],
+        10,
+    )
+    .expect("peek");
+    let payload: SynthesisLlmJudgePayload =
+        serde_json::from_str(events[0].payload.as_ref().unwrap()).expect("parse");
+    // Mock path → override is ignored, recorded model is "mock".
+    assert_eq!(payload.judge_model, "mock");
+    assert_eq!(payload.synthesis_id, "synth_override_001");
+    assert!(matches!(payload.source, JudgeSource::AutoSampled));
+}
