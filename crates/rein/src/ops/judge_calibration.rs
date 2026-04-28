@@ -500,9 +500,9 @@ pub struct CronReport {
     /// hash mismatch). Logged at `tracing::warn!`.
     pub dropped: usize,
     /// Entries dropped because the cron LLM-call ledger reservation failed
-    /// (R9-K1 — cap reached). v0.27.1 leaves reservation as a TODO Wave-1.5
-    /// because A_JUDGE_CORE owns `reserve_call`; field reserved for that
-    /// future wiring. Currently always 0.
+    /// (R9-K1 fix — cron path now reserves via judge::contract::reserve_call
+    /// alongside the runtime worker, sharing the same daily_call_cap budget).
+    /// Bumped when the rolling 24h call count is at cap.
     pub dropped_cap: usize,
 }
 
@@ -685,19 +685,27 @@ fn process_archive_entry(
 
     // 2. Re-judge via the stricter cron LLM.
     //
-    // TODO Wave-1.5 — R9-K1: reserve a slot via judge::contract::reserve_call
-    // before the LLM HTTP call. A_JUDGE_CORE owns the reservation primitive;
-    // until it lands, cron proceeds without reservation. Default-off
-    // mitigates risk. When A lands, replace this comment with:
-    //     let token = match crate::judge::contract::reserve_call(store.conn()) {
-    //         Some(t) => t,
-    //         None => return ProcessOutcome::DroppedCap,
-    //     };
-    //     // ... LLM call ...
-    //     token.mark_done(...);
+    // v0.27.2 R9-K1 fix — reserve a J2 ledger slot before the HTTP
+    // call so cron LLM calls count toward `[ars.llm_judge].daily_call_cap`
+    // alongside runtime worker calls. Without this the runtime + cron
+    // could combined exceed the configured cap. Default-off mitigates,
+    // but operators enabling both paths need consistent budgeting.
+    let daily_cap = config.ars.llm_judge.daily_call_cap;
+    let token = match crate::judge::contract::reserve_call(store.conn(), daily_cap) {
+        Ok(Some(t)) => t,
+        Ok(None) => return ProcessOutcome::DroppedCap,
+        Err(e) => return ProcessOutcome::Dropped(format!("reserve_call: {e}")),
+    };
+
     let (cron_hit, cron_reason, cron_judge_model) = match call_cron_judge(config, entry) {
-        Ok(v) => v,
+        Ok(v) => {
+            // Successful HTTP call — mark ledger row done.
+            let _ = token.commit(store.conn());
+            v
+        }
         Err(e) => {
+            // HTTP attempt was made (counts toward cap) but failed.
+            let _ = token.fail(store.conn());
             return ProcessOutcome::Dropped(format!("cron LLM call failed: {e}"));
         }
     };
