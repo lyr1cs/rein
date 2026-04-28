@@ -29,6 +29,14 @@ use crate::types::{OpsErrorKind, ReinError, ReinResult};
 pub struct ConceptSummaryFeedbackParams {
     /// Concept's persistent id (NOT a per-call ULID — concepts span sessions).
     pub concept_id: String,
+    /// Per-refresh concept-summary ULID when the client knows it. Older
+    /// clients omit this and the consumer falls back to `concept_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_summary_id: Option<String>,
+    /// Back-compat alias used by concept-state clients. Folded into
+    /// `concept_summary_id` by the handler when the canonical field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub living_summary_id: Option<String>,
     /// ULID echoing `RecallMemoryOutput.request_id` so the back-end can join
     /// downstream recall traces with concept-summary interactions when the
     /// surface was reached via recall.
@@ -60,20 +68,25 @@ impl OpsRuntime {
         // Mirror the synthesis-interaction handler shape: lift query_type onto
         // the FeedbackEvent column so consumers can filter via the indexed
         // column without parsing the payload JSON for every event.
-        let query_type = params
-            .metadata
-            .as_ref()
-            .and_then(|m| m.query_type.clone());
+        let query_type = params.metadata.as_ref().and_then(|m| m.query_type.clone());
+        let concept_summary_id = params
+            .concept_summary_id
+            .clone()
+            .or_else(|| params.living_summary_id.clone())
+            .or_else(|| Some(params.concept_id.clone()));
 
         let payload = crate::store::adaptive::ConceptSummaryInteractionPayload {
             concept_id: params.concept_id.clone(),
+            concept_summary_id,
             recall_id: params.recall_id.clone(),
             interaction: params.interaction.clone(),
             metadata: params.metadata.clone(),
         };
         let payload_value = serde_json::to_value(&payload).map_err(|e| {
-            ReinError::Config(format!("concept_summary interaction payload serialize: {e}"))
-                .with_kind(OpsErrorKind::Internal)
+            ReinError::Config(format!(
+                "concept_summary interaction payload serialize: {e}"
+            ))
+            .with_kind(OpsErrorKind::Internal)
         })?;
 
         self.with_store(|store| {
@@ -127,6 +140,8 @@ mod tests {
     fn concept_summary_feedback_params_round_trip_serde() {
         let p = ConceptSummaryFeedbackParams {
             concept_id: "con-1".into(),
+            concept_summary_id: Some("cs-1".into()),
+            living_summary_id: None,
             recall_id: "rec-1".into(),
             interaction: crate::store::adaptive::ConceptSummaryInteractionKind::Viewed {
                 dwell_ms: 4200,
@@ -141,8 +156,23 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: ConceptSummaryFeedbackParams = serde_json::from_str(&json).unwrap();
         assert_eq!(back.concept_id, p.concept_id);
+        assert_eq!(back.concept_summary_id, p.concept_summary_id);
         assert_eq!(back.recall_id, p.recall_id);
         assert_eq!(back.metadata.unwrap().cluster_id, Some(42));
+    }
+
+    #[test]
+    fn concept_summary_feedback_params_accept_living_summary_alias() {
+        let json = serde_json::json!({
+            "concept_id": "con-x",
+            "living_summary_id": "cs-x",
+            "recall_id": "rec-x",
+            "interaction": {"kind": "explicit_thumb", "up": true}
+        });
+        let parsed: ConceptSummaryFeedbackParams =
+            serde_json::from_value(json).expect("living_summary_id alias should parse");
+        assert_eq!(parsed.concept_summary_id, None);
+        assert_eq!(parsed.living_summary_id.as_deref(), Some("cs-x"));
     }
 
     /// JsonSchema derive sanity check: the schema must not panic to render.

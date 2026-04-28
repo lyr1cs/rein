@@ -25,6 +25,8 @@ export default function ConceptSummaryCard({
   queryType,
   clusterId,
   revisionVersion,
+  conceptSummaryId,
+  livingSummaryId,
 }: {
   conceptId: string;
   recallId: string;
@@ -33,6 +35,8 @@ export default function ConceptSummaryCard({
   queryType?: string;
   clusterId?: number;
   revisionVersion?: number;
+  conceptSummaryId?: string | null;
+  livingSummaryId?: string | null;
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null);
   const [thumbState, setThumbState] = useState<'up' | 'down' | null>(null);
@@ -69,9 +73,10 @@ export default function ConceptSummaryCard({
         recallId,
         { kind: 'viewed', dwell_ms: Math.floor(dwellMs) },
         metadata,
+        { conceptSummaryId, livingSummaryId },
       );
     },
-    [conceptId, recallId, metadata],
+    [conceptId, recallId, metadata, conceptSummaryId, livingSummaryId],
   );
   // Key the dwell window on the (concept, recall) pair so re-selecting
   // the same concept under a fresh recallId emits a new Viewed event.
@@ -85,9 +90,10 @@ export default function ConceptSummaryCard({
         recallId,
         { kind: 'clicked_source', source_index: rank },
         metadata,
+        { conceptSummaryId, livingSummaryId },
       );
     },
-    [conceptId, recallId, metadata],
+    [conceptId, recallId, metadata, conceptSummaryId, livingSummaryId],
   );
 
   const handleThumb = useCallback(
@@ -99,10 +105,11 @@ export default function ConceptSummaryCard({
           recallId,
           { kind: 'explicit_thumb', up },
           metadata,
+          { conceptSummaryId, livingSummaryId },
         );
       }
     },
-    [conceptId, recallId, metadata, thumbState],
+    [conceptId, recallId, metadata, thumbState, conceptSummaryId, livingSummaryId],
   );
 
   if (summary.trim().length === 0) return null;

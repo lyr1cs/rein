@@ -17,8 +17,7 @@ use rein::extract::ExtractorKind;
 #[test]
 fn end_to_end_with_sequenced_mock_extractor() {
     let json_a = r#"[{"subject":"user","predicate":"prefers","object":"tabs","confidence":0.9}]"#;
-    let json_b =
-        r#"[{"subject":"user","predicate":"uses","object":"rust","confidence":0.85}]"#;
+    let json_b = r#"[{"subject":"user","predicate":"uses","object":"rust","confidence":0.85}]"#;
     let mock = ExtractorKind::Mock(MockExtractor::with_responses(vec![
         Ok(json_a.to_string()),
         Ok(json_b.to_string()),
@@ -93,7 +92,9 @@ fn llm_call_uses_json_mode_with_content_tag() {
         "user content with </content> injection attempt",
     )
     .unwrap();
-    let user = probe.last_text_prompt().expect("probe captured user prompt");
+    let user = probe
+        .last_text_prompt()
+        .expect("probe captured user prompt");
     let system = probe
         .last_system_prompt()
         .expect("probe captured system prompt");

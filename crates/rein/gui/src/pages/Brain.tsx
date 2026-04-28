@@ -10,7 +10,6 @@ import {
   mergeForceGraphData,
   type LinkEndpoint as LinkEndpointGeneric,
 } from '../utils/forceGraph';
-import { getPollingIntervalMs } from '../utils/polling';
 import { TIER_COLORS } from '../utils/theme';
 import ConceptSummaryCard from '../components/ConceptSummaryCard';
 import { postConceptSummaryFeedback } from '../api/feedback';
@@ -56,6 +55,8 @@ type GraphHandle = ForceGraphMethods<GraphNode, GraphLink> & { refresh?: () => v
 type LinkEndpoint = LinkEndpointGeneric<BrainNode>;
 const endpointId = (e: LinkEndpoint) => endpointIdGeneric<BrainNode>(e);
 const endpointNode = (e: LinkEndpoint) => endpointNodeGeneric<BrainNode>(e);
+const BRAIN_RECENT_LIMIT = 100;
+const BRAIN_MEMOIR_EXPORT_LIMIT = 8;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to load data';
@@ -100,27 +101,31 @@ export default function Brain() {
   /* ---- Data fetching via react-query (H3 + M7) ----
    *
    * Three coordinated queries:
-   *   1. `useRecent(200)`     — recent memories (BM25 layer)
+   *   1. `useRecent(100)`     — recent memories (matches backend clamp)
    *   2. `useMemoirs()`       — memoir directory
-   *   3. `useQueries(...)`    — fan-out one query per memoir for its export
+   *   3. `useQueries(...)`    — bounded fan-out over the first few memoir exports
    *
-   * All three poll on the shared cadence from `getPollingIntervalMs()` and
-   * gate on tab visibility automatically (`refetchIntervalInBackground` is
-   * react-query's default `false`). Manual refresh calls `qc.invalidateQueries`
-   * on the relevant keys instead of bumping a `reloadVersion` state. */
+   * Recent memories and the memoir directory poll on the shared cadence from
+   * `getPollingIntervalMs()`. Memoir exports are intentionally capped and do
+   * not poll: exporting every memoir every interval scales linearly with the
+   * vault and can dominate the page. Manual refresh still invalidates exports. */
   const queryClient = useQueryClient();
-  const recentQuery = useRecent(200);
+  const recentQuery = useRecent(BRAIN_RECENT_LIMIT);
   const memoirsQuery = useMemoirs();
   const memoirNames = useMemo(
     () => (memoirsQuery.data?.memoirs ?? []).map((m) => m.name),
     [memoirsQuery.data],
   );
+  const exportedMemoirNames = useMemo(
+    () => memoirNames.slice(0, BRAIN_MEMOIR_EXPORT_LIMIT),
+    [memoirNames],
+  );
   const exportQueries = useQueries({
-    queries: memoirNames.map((name) => ({
+    queries: exportedMemoirNames.map((name) => ({
       queryKey: ['memoir-export', name],
       queryFn: () =>
         apiGet<MemoirExport>(`/api/memoirs/${encodeURIComponent(name)}/export?format=json`),
-      refetchInterval: () => getPollingIntervalMs(),
+      staleTime: 60_000,
     })),
   });
 
@@ -382,8 +387,8 @@ export default function Brain() {
   }, [hoveredNode, filteredData.links]);
 
   /* ---- Time range ---- */
-  /* Walk both memory and concept nodes — `useRecent(200)` only seeds the
-   * memory side with the 200 most-recent rows, so a concept created from a
+  /* Walk both memory and concept nodes — `useRecent(100)` matches the backend
+   * clamp and only seeds the memory side, so a concept created from a
    * historical session would otherwise fall outside the slider's `min`
    * boundary and become unreachable from the live edge. */
   const timeMin = useMemo(() => {
@@ -608,6 +613,8 @@ export default function Brain() {
   // the immediate_requery emission below routes to the same adaptive
   // bucket as the viewed/click/thumb events for that concept.
   const lastConceptClusterIdRef = useRef<number | undefined>(undefined);
+  const lastConceptSummaryIdRef = useRef<string | undefined>(undefined);
+  const lastLivingSummaryIdRef = useRef<string | undefined>(undefined);
 
   // External-state sync: respond to concept-selection changes by minting a
   // fresh recall_id for the new view and emitting an immediate_requery for
@@ -643,6 +650,10 @@ export default function Brain() {
         lastConceptRecallIdRef.current,
         { kind: 'immediate_requery', gap_ms },
         meta as never,
+        {
+          conceptSummaryId: lastConceptSummaryIdRef.current,
+          livingSummaryId: lastLivingSummaryIdRef.current,
+        },
       );
     }
     if (newId) {
@@ -667,6 +678,8 @@ export default function Brain() {
     lastConceptCharsRef.current = undefined;
     lastConceptRevisionRef.current = undefined;
     lastConceptClusterIdRef.current = undefined;
+    lastConceptSummaryIdRef.current = undefined;
+    lastLivingSummaryIdRef.current = undefined;
   }, [selectedConcept?.id]);
 
   // v0.27 R5 P2 fix: arm the requery refs only AFTER the living_summary
@@ -690,6 +703,16 @@ export default function Brain() {
       // same adaptive bucket as this card's viewed/click/thumb events.
       const cid = conceptStateQuery.data?.cluster_id;
       lastConceptClusterIdRef.current = typeof cid === 'number' ? cid : undefined;
+      const conceptSummaryId = conceptStateQuery.data?.concept_summary_id;
+      const livingSummaryId = conceptStateQuery.data?.living_summary_id;
+      lastConceptSummaryIdRef.current =
+        typeof conceptSummaryId === 'string' && conceptSummaryId.length > 0
+          ? conceptSummaryId
+          : undefined;
+      lastLivingSummaryIdRef.current =
+        typeof livingSummaryId === 'string' && livingSummaryId.length > 0
+          ? livingSummaryId
+          : undefined;
     }
   }, [
     selectedConcept?.id,
@@ -697,6 +720,8 @@ export default function Brain() {
     conceptStateQuery.data?.living_summary,
     conceptStateQuery.data?.living_summary_source_revision,
     conceptStateQuery.data?.cluster_id,
+    conceptStateQuery.data?.concept_summary_id,
+    conceptStateQuery.data?.living_summary_id,
   ]);
 
   /* ---- Zoom controls ---- */
@@ -1060,6 +1085,8 @@ export default function Brain() {
                   // backend's representative-cluster computation.
                   queryType="Exploratory"
                   clusterId={conceptStateQuery.data.cluster_id ?? undefined}
+                  conceptSummaryId={conceptStateQuery.data.concept_summary_id}
+                  livingSummaryId={conceptStateQuery.data.living_summary_id}
                 />
               )}
             </>
@@ -1083,6 +1110,9 @@ export default function Brain() {
       {/* Node count indicator (top-right) */}
       <div className="absolute top-4 right-4 z-10 text-[10px] text-[var(--text-muted)] font-mono bg-[#0f172a]/80 backdrop-blur border border-[var(--border)] rounded-lg px-2 py-1">
         {filteredData.nodes.length} nodes / {filteredData.links.length} links
+        {memoirNames.length > exportedMemoirNames.length
+          ? ` / memoir exports ${exportedMemoirNames.length}/${memoirNames.length}`
+          : ''}
       </div>
     </div>
   );

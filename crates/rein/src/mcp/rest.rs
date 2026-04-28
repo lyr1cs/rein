@@ -678,8 +678,8 @@ fn api_judge_calibration(config: &ReinConfig) -> BoxedResponse {
             );
         }
     };
-    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
-        .unwrap_or_default();
+    let state =
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
     let cal = state.judge_calibration_state.unwrap_or_default();
     let body = json!({
         "kappa": cal.kappa,
@@ -856,6 +856,15 @@ fn api_clear_session() -> BoxedResponse {
     )
 }
 
+fn recall_synthesis_adaptive_state(
+    config: &ReinConfig,
+) -> Option<crate::store::adaptive::AdaptiveState> {
+    config
+        .open_store()
+        .ok()
+        .and_then(|s| crate::store::adaptive::AdaptiveState::restore_snapshot(s.conn()))
+}
+
 fn api_recall(
     config: &ReinConfig,
     query: &std::collections::HashMap<String, String>,
@@ -873,24 +882,15 @@ fn api_recall(
             // the per-cluster `useful_rate` signal is invisible to REST
             // recalls — the very deployments most likely to feed back
             // `synthesis_interaction` events via the GUI. Codex round 1 F-6.
-            let adaptive_state = crate::store::SqliteStore::new(
-                std::path::Path::new(&config.database.path),
-                &config.embedding_model(),
-                config.embedding.dimensions,
-            )
-            .ok()
-            .and_then(|s| crate::store::adaptive::AdaptiveState::restore_snapshot(s.conn()));
+            let adaptive_state = recall_synthesis_adaptive_state(config);
             // v0.26.1: classify the original query so the synthesis gate
             // reads the matching per-cluster bucket (parity with the
             // MCP/CLI path in `ops/handlers/memory.rs:673` which already
             // classifies for routing). The classifier is rule-based and
             // pure — no LLM cost — so calling it twice across the recall
             // pipeline is fine.
-            let route = crate::search::classify::classify(
-                &synthesize_query.original_query,
-                false,
-                false,
-            );
+            let route =
+                crate::search::classify::classify(&synthesize_query.original_query, false, false);
             let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
                 &results,
                 &synthesize_query.original_query,
@@ -1264,7 +1264,7 @@ fn api_artifacts(
     config: &ReinConfig,
     query: &std::collections::HashMap<String, String>,
 ) -> BoxedResponse {
-    let limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
+    let page_limit = match parse_bounded_usize(query, "limit", 20, 1, 100) {
         Ok(limit) => limit,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
@@ -1277,12 +1277,18 @@ fn api_artifacts(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
+    // Pagination response shape:
+    //   { artifacts, count, offset, limit, next_offset, has_more }
+    // `artifacts` remains the legacy GUI field; new callers should use
+    // `has_more` instead of inferring from `artifacts.length == limit`.
+    let fetch_limit = page_limit.saturating_add(1);
+
     // Query session_artifacts table directly
     let sql = "SELECT id, artifact_kind, title, summary, source_agent, source_label, \
                turn_count, episode_id, created_at FROM session_artifacts \
                ORDER BY created_at DESC LIMIT ?1 OFFSET ?2";
     let result = store.conn().prepare(sql).and_then(|mut stmt| {
-        let rows = stmt.query_map(rusqlite::params![limit, offset], |row| {
+        let rows = stmt.query_map(rusqlite::params![fetch_limit, offset], |row| {
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "artifact_kind": row.get::<_, String>(1)?,
@@ -1299,7 +1305,28 @@ fn api_artifacts(
     });
 
     match result {
-        Ok(artifacts) => json_response(StatusCode::OK, json!({ "artifacts": artifacts })),
+        Ok(mut artifacts) => {
+            let has_more = artifacts.len() > page_limit;
+            if has_more {
+                artifacts.truncate(page_limit);
+            }
+            let next_offset = if has_more {
+                Some(offset.saturating_add(artifacts.len()))
+            } else {
+                None
+            };
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "artifacts": artifacts,
+                    "count": artifacts.len(),
+                    "offset": offset,
+                    "limit": page_limit,
+                    "next_offset": next_offset,
+                    "has_more": has_more,
+                }),
+            )
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1990,6 +2017,162 @@ mod tests {
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn api_artifacts_reports_page_metadata_for_offset_limit_clients() {
+        let _guard = env_lock().lock().await;
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("artifacts.db");
+        let config = test_config(&db_path);
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+        insert_artifact(&store, "artifact one", None);
+        insert_artifact(&store, "artifact two", None);
+        insert_artifact(&store, "artifact three", None);
+        drop(store);
+
+        let page1 = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts?limit=2&offset=0")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&page1, &config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = read_json(response).await;
+        assert_eq!(json["artifacts"].as_array().unwrap().len(), 2);
+        assert_eq!(json["count"].as_u64(), Some(2));
+        assert_eq!(json["offset"].as_u64(), Some(0));
+        assert_eq!(json["limit"].as_u64(), Some(2));
+        assert_eq!(json["next_offset"].as_u64(), Some(2));
+        assert_eq!(json["has_more"].as_bool(), Some(true));
+
+        let page2 = Request::builder()
+            .method("GET")
+            .uri("/api/artifacts?limit=2&offset=2")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&page2, &config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = read_json(response).await;
+        assert_eq!(json["artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(json["count"].as_u64(), Some(1));
+        assert_eq!(json["offset"].as_u64(), Some(2));
+        assert_eq!(json["limit"].as_u64(), Some(2));
+        assert!(json["next_offset"].is_null());
+        assert_eq!(json["has_more"].as_bool(), Some(false));
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    struct CurrentDirGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn recall_synthesis_adaptive_state_uses_resolved_auto_path() {
+        let dir = tempdir().unwrap();
+        let _home = EnvVarGuard::set_path("HOME", dir.path());
+
+        let mut config = ReinConfig::default();
+        config.database.path = "auto".to_string();
+        config.embedding.provider = "none".to_string();
+        config.query_expansion.provider = "none".to_string();
+        config.sync.supermemory_enabled = false;
+        config.sync.auto_memory_enabled = false;
+
+        let resolved_db = config.resolve_db_path();
+        assert_ne!(
+            resolved_db,
+            std::path::PathBuf::from("auto"),
+            "test must exercise the auto sentinel rather than a literal path"
+        );
+        let store = SqliteStore::new(&resolved_db, &config.embedding_model(), 3072).unwrap();
+
+        let query = "connection pool";
+        let query_type = crate::search::classify::classify(query, false, false)
+            .query_type
+            .synthesis_bucket_label()
+            .to_string();
+        let mut by_cluster = std::collections::HashMap::new();
+        by_cluster.insert(
+            crate::store::adaptive::synthesis_bucket_key(Some(42), &query_type),
+            crate::store::adaptive::ClusterSynthesisStats {
+                viewed_count: 1,
+                useful_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        let state = crate::store::adaptive::AdaptiveState {
+            synthesis_feedback_stats: Some(crate::store::adaptive::SynthesisFeedbackState {
+                by_cluster,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.save_snapshot(store.conn()).unwrap();
+        drop(store);
+
+        let loaded = {
+            let _cwd = CurrentDirGuard::change_to(dir.path());
+            recall_synthesis_adaptive_state(&config)
+        }
+        .expect("adaptive state must load from the resolved auto DB");
+        let loaded_synthesis = loaded
+            .synthesis_feedback_stats
+            .expect("saved synthesis feedback state");
+        assert!(
+            loaded_synthesis.by_cluster.contains_key(
+                &crate::store::adaptive::synthesis_bucket_key(Some(42), &query_type)
+            ),
+            "REST synthesis adaptive helper must not open a literal `auto` DB"
+        );
+        assert!(
+            !dir.path().join("auto").exists(),
+            "resolved auto helper must not create/read a literal `auto` DB"
+        );
     }
 
     #[tokio::test]

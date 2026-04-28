@@ -1308,6 +1308,18 @@ pub struct CleanupParams {
     pub asynchronous: bool,
 }
 
+impl CleanupParams {
+    fn has_explicit_scope(&self) -> bool {
+        self.all
+            || self.topic.as_ref().is_some_and(|s| !s.trim().is_empty())
+            || self
+                .topics
+                .as_ref()
+                .is_some_and(|topics| topics.iter().any(|s| !s.trim().is_empty()))
+            || self.pattern.as_ref().is_some_and(|s| !s.trim().is_empty())
+    }
+}
+
 /// Per-group detail line in the cleanup consolidation output.
 #[derive(Serialize, Clone, Debug)]
 pub struct CleanupGroupDetail {
@@ -1476,6 +1488,13 @@ impl OpsRuntime {
         auth = "mutation_marker"
     )]
     pub fn cleanup(&self, params: CleanupParams) -> ReinResult<CleanupOutput> {
+        if !params.dry_run && !params.has_explicit_scope() {
+            return Err(ReinError::Config(
+                "cleanup requires an explicit scope for destructive runs; pass --all or select a topic/topics/pattern".into(),
+            )
+            .with_kind(crate::types::OpsErrorKind::BadRequest));
+        }
+
         // Handle deprecated --asynchronous flag: queue via the worker queue
         // instead of running inline. Emit a deprecation warning to stderr so
         // it doesn't pollute scripted stdout output.
@@ -1699,5 +1718,66 @@ impl OpsRuntime {
                 dry_run: outcome.dry_run,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::ReinConfig;
+    use crate::types::OpsErrorKind;
+
+    fn runtime_for_cleanup_test() -> (OpsRuntime, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        (OpsRuntime::for_cli(Arc::new(config)), tmp)
+    }
+
+    #[test]
+    fn cleanup_without_scope_rejects_destructive_run() {
+        let (runtime, _tmp) = runtime_for_cleanup_test();
+        let err = runtime
+            .cleanup(CleanupParams {
+                topic: None,
+                topics: None,
+                pattern: None,
+                all: false,
+                exact_topics: false,
+                dry_run: false,
+                asynchronous: false,
+            })
+            .expect_err("destructive cleanup requires an explicit scope");
+
+        assert_eq!(err.kind(), OpsErrorKind::BadRequest);
+        assert!(
+            err.to_string().contains("--all"),
+            "error should tell the operator how to request all topics, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cleanup_explicit_all_preserves_existing_behavior() {
+        let (runtime, _tmp) = runtime_for_cleanup_test();
+        let out = runtime
+            .cleanup(CleanupParams {
+                topic: None,
+                topics: None,
+                pattern: None,
+                all: true,
+                exact_topics: false,
+                dry_run: false,
+                asynchronous: false,
+            })
+            .expect("explicit all should keep the existing all-topics path");
+
+        assert!(!out.matched);
+        assert_eq!(out.groups_consolidated, 0);
     }
 }

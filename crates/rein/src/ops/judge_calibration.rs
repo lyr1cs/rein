@@ -56,10 +56,10 @@
 use crate::config::ReinConfig;
 use crate::eval::llm_judge::kappa_runtime_vs_offline;
 use crate::store::adaptive::{
-    commit_offset, emit_event, peek_events, AdaptiveState, EventType, FeedbackEvent,
-    JudgeCalibrationState, JudgeMetadata, SynthesisLlmJudgeOfflineCronPayload,
-    ConceptSummaryLlmJudgeOfflineCronPayload, JUDGE_DRIFT_MIN_PAIRS, JUDGE_DRIFT_THRESHOLD,
-    JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
+    commit_offset, emit_event, peek_events, AdaptiveState,
+    ConceptSummaryLlmJudgeOfflineCronPayload, EventType, FeedbackEvent, JudgeCalibrationState,
+    JudgeMetadata, SynthesisLlmJudgeOfflineCronPayload, JUDGE_DRIFT_MIN_PAIRS,
+    JUDGE_DRIFT_THRESHOLD, JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
 };
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
@@ -198,9 +198,7 @@ pub fn cron_archive_path(config: &ReinConfig, date: chrono::NaiveDate, shard: u3
     let queue_dir = base.join("queue").join(&db_tag);
     let _ = std::fs::create_dir_all(&queue_dir);
     let date_str = date.format("%Y%m%d").to_string();
-    queue_dir.join(format!(
-        "synthesis_cron_archive_{date_str}_{shard}.jsonl"
-    ))
+    queue_dir.join(format!("synthesis_cron_archive_{date_str}_{shard}.jsonl"))
 }
 
 // ── M1 consumer — `judge_calibration` ───────────────────────────────────────
@@ -339,15 +337,16 @@ pub fn recompute_judge_calibration_state(
         };
 
         if let Some((runtime, cron)) = pair {
-            state
-                .recent_pairs_runtime_vs_offline
-                .push_back((runtime, cron, ev.ts_to_unix().unwrap_or(now)));
+            state.recent_pairs_runtime_vs_offline.push_back((
+                runtime,
+                cron,
+                ev.ts_to_unix().unwrap_or(now),
+            ));
             // FIFO-evict oldest pair if over cap.
             while state.recent_pairs_runtime_vs_offline.len() > JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP {
                 state.recent_pairs_runtime_vs_offline.pop_front();
             }
-            state.total_offline_cron_events =
-                state.total_offline_cron_events.saturating_add(1);
+            state.total_offline_cron_events = state.total_offline_cron_events.saturating_add(1);
             any_new_pair = true;
         }
     }
@@ -384,8 +383,8 @@ pub fn recompute_judge_calibration_state(
         // (κ now below) AND (edge crossing OR first qualifying window).
         let alert_first_window =
             previous_last_computed_at == 0 && new_kappa < JUDGE_DRIFT_THRESHOLD;
-        let edge_crossing = new_kappa < JUDGE_DRIFT_THRESHOLD
-            && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
+        let edge_crossing =
+            new_kappa < JUDGE_DRIFT_THRESHOLD && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
         if pair_count >= JUDGE_DRIFT_MIN_PAIRS && (edge_crossing || alert_first_window) {
             state.judge_drift_alert = state.judge_drift_alert.saturating_add(1);
             if let Some(path) = drift_log_path {
@@ -626,9 +625,7 @@ fn cron_event_already_emitted(
 ) -> ReinResult<bool> {
     let event_type = match surface {
         CronArchiveSurface::Synthesis => EventType::SynthesisLlmJudgeOfflineCron.as_str(),
-        CronArchiveSurface::ConceptSummary => {
-            EventType::ConceptSummaryLlmJudgeOfflineCron.as_str()
-        }
+        CronArchiveSurface::ConceptSummary => EventType::ConceptSummaryLlmJudgeOfflineCron.as_str(),
     };
     // Match BOTH id and stamp_hash so a re-mint of the same surface_id
     // with different content (different stamp_hash) is judged afresh.
@@ -673,15 +670,12 @@ fn process_archive_entry(
     //    stamp_hash collisions across distinct synthesis_ids would pair
     //    the cron verdict for one synthesis with a different runtime
     //    verdict.
-    let (runtime_hit, runtime_judge_model) = match lookup_runtime_verdict(
-        store.conn(),
-        &entry.surface,
-        &entry.id,
-    ) {
-        Ok(Some(v)) => v,
-        Ok(None) => return ProcessOutcome::SkippedNoRuntimeVerdict,
-        Err(e) => return ProcessOutcome::Dropped(format!("verdict lookup failed: {e}")),
-    };
+    let (runtime_hit, runtime_judge_model) =
+        match lookup_runtime_verdict(store.conn(), &entry.surface, &entry.id) {
+            Ok(Some(v)) => v,
+            Ok(None) => return ProcessOutcome::SkippedNoRuntimeVerdict,
+            Err(e) => return ProcessOutcome::Dropped(format!("verdict lookup failed: {e}")),
+        };
 
     // 2. Re-judge via the stricter cron LLM.
     //
@@ -740,10 +734,7 @@ fn process_archive_entry(
                     memory_id: None,
                     concept_id: None,
                     query: None,
-                    query_type: payload
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.query_type.clone()),
+                    query_type: payload.metadata.as_ref().and_then(|m| m.query_type.clone()),
                     topic: None,
                     payload: Some(payload_value),
                 },
@@ -775,10 +766,7 @@ fn process_archive_entry(
                     memory_id: None,
                     concept_id: Some(entry.concept_id.clone()),
                     query: None,
-                    query_type: payload
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.query_type.clone()),
+                    query_type: payload.metadata.as_ref().and_then(|m| m.query_type.clone()),
                     topic: None,
                     payload: Some(payload_value),
                 },
@@ -852,10 +840,7 @@ fn lookup_runtime_verdict(
         if !matches_id {
             continue;
         }
-        let hit = value
-            .get("hit")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let hit = value.get("hit").and_then(|v| v.as_bool()).unwrap_or(false);
         let model = value
             .get("judge_model")
             .and_then(|v| v.as_str())
@@ -885,18 +870,16 @@ fn call_cron_judge(
     // existing prose-mode judge prompt + parser from the runtime worker.
     // Stricter rubric is delivered via `[ars.llm_judge.nightly_cron]`
     // operator config (typically a larger / different-family model).
-    let extractor = crate::ops::concept_summary::create_ars_extractor(
-        config,
-        "ars.llm_judge.nightly_cron",
-    )
-    .ok_or_else(|| {
-        ReinError::Config(
-            "judge_calibration cron: no LLM provider configured for \
+    let extractor =
+        crate::ops::concept_summary::create_ars_extractor(config, "ars.llm_judge.nightly_cron")
+            .ok_or_else(|| {
+                ReinError::Config(
+                    "judge_calibration cron: no LLM provider configured for \
              [ars.llm_judge.nightly_cron] — set provider/model or disable \
              [ars.llm_judge.nightly_cron].enabled = false"
-                .to_string(),
-        )
-    })?;
+                        .to_string(),
+                )
+            })?;
 
     // Reconstruct the same prompt the runtime worker would have built.
     // Joining `entry.sources` with `\n` matches `recall_synthesis`'s
@@ -909,8 +892,8 @@ fn call_cron_judge(
         &joined_sources,
         &entry.candidate,
     )?;
-    let (hit, reason) = crate::ops::llm_judge_worker::parse_judge_output(&raw)
-        .ok_or_else(|| {
+    let (hit, reason) =
+        crate::ops::llm_judge_worker::parse_judge_output(&raw).ok_or_else(|| {
             ReinError::Extract(format!(
                 "cron judge output unparseable (expected `HIT: yes|no\\nWHY: ...`): {}",
                 raw.chars().take(120).collect::<String>()
@@ -1044,7 +1027,9 @@ pub fn run_consumer_and_commit(
     drift_log_path: Option<&std::path::Path>,
 ) -> ReinResult<Option<i64>> {
     let prior = AdaptiveState::restore_snapshot(store.conn());
-    let prior_state = prior.as_ref().and_then(|s| s.judge_calibration_state.clone());
+    let prior_state = prior
+        .as_ref()
+        .and_then(|s| s.judge_calibration_state.clone());
     let (new_state, max_id_opt) =
         recompute_judge_calibration_state(store.conn(), prior_state, drift_log_path)?;
 
@@ -1257,7 +1242,10 @@ mod tests {
             recompute_judge_calibration_state(&conn, Some(state.clone()), None).unwrap();
         // peek still returns events (offset not committed), but the
         // applied-prefix in `state` filters them all out.
-        assert_eq!(state2.total_offline_cron_events, 2, "no replay double-count");
+        assert_eq!(
+            state2.total_offline_cron_events, 2,
+            "no replay double-count"
+        );
         // max_id is None when no NEW events past prior_high_water are
         // seen. Wait — peek returns events past consumer_offset (not state
         // watermark). On a fresh DB without commit_offset call,

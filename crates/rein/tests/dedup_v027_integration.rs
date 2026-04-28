@@ -62,7 +62,11 @@ fn n_merge_atomically_collapses_losers_into_winner() {
     let store = SqliteStore::in_memory().unwrap();
 
     let winner = store
-        .store(mem("01W", "deploy", "stack uses docker compose with healthchecks"))
+        .store(mem(
+            "01W",
+            "deploy",
+            "stack uses docker compose with healthchecks",
+        ))
         .unwrap();
     let loser1 = store
         .store(mem(
@@ -111,11 +115,15 @@ fn n_merge_atomically_collapses_losers_into_winner() {
     let canonical = store.canonical_id_for(&winner).unwrap();
     let evidence = store.list_memory_evidence(&canonical, 100).unwrap();
     assert!(
-        evidence.iter().any(|e| e.memory_id.as_deref() == Some(loser1.as_str())),
+        evidence
+            .iter()
+            .any(|e| e.memory_id.as_deref() == Some(loser1.as_str())),
         "loser1 must have an evidence row"
     );
     assert!(
-        evidence.iter().any(|e| e.memory_id.as_deref() == Some(loser2.as_str())),
+        evidence
+            .iter()
+            .any(|e| e.memory_id.as_deref() == Some(loser2.as_str())),
         "loser2 must have an evidence row"
     );
 
@@ -210,7 +218,9 @@ fn n_merge_preserves_winner_canonical_state_after_fold() {
     let canonical_pre = store.canonical_id_for(&winner).unwrap();
     assert_eq!(canonical_pre, winner);
 
-    let n = store.apply_n_merge(&winner, std::slice::from_ref(&loser)).unwrap();
+    let n = store
+        .apply_n_merge(&winner, std::slice::from_ref(&loser))
+        .unwrap();
     assert_eq!(n, 1);
 
     // Post-fold: winner is still its own canonical, loser maps to winner's canonical.

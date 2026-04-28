@@ -1278,10 +1278,7 @@ fn prepare_with_context_for_kind(
 /// which is a separate `bin/` target, can build the synthesis prompt with
 /// the same cap production uses. Drift here would silently change which
 /// evidence the LLM sees and invalidate the McNemar comparison.
-pub fn resolve_max_input_for_kind(
-    config: &ReinConfig,
-    extractor: &ExtractorKind,
-) -> usize {
+pub fn resolve_max_input_for_kind(config: &ReinConfig, extractor: &ExtractorKind) -> usize {
     resolve_max_input_for_section_kind(config, "extract", extractor)
 }
 
@@ -1301,10 +1298,7 @@ pub fn resolve_max_input_for_section_kind(
     let resolved = config.resolve_llm_for(section).ok();
     match extractor {
         ExtractorKind::Gemini(_) => {
-            let configured = resolved
-                .as_ref()
-                .map(|r| r.max_input_chars)
-                .unwrap_or(0);
+            let configured = resolved.as_ref().map(|r| r.max_input_chars).unwrap_or(0);
             if configured > 0 {
                 return configured;
             }
@@ -1329,10 +1323,7 @@ pub fn resolve_max_input_for_section_kind(
             }
         }
         ExtractorKind::Omlx(_) => {
-            let configured = resolved
-                .as_ref()
-                .map(|r| r.max_input_chars)
-                .unwrap_or(0);
+            let configured = resolved.as_ref().map(|r| r.max_input_chars).unwrap_or(0);
             if configured > 0 {
                 configured
             } else {

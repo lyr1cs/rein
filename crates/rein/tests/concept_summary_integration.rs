@@ -247,7 +247,9 @@ fn successful_refresh_emits_concept_summary_refreshed_event_and_populates_stats(
     //   2. recompute_concept_refresh_stats consumes that event into the
     //      AdaptiveState reservoir.
     let (store, config, id) = setup(10);
-    let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response("current state synthesis"));
+    let mock = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+        "current state synthesis",
+    ));
     let outcome =
         run_concept_summary_with_extractor(&store, &config, Some(&id), false, mock).unwrap();
     assert_eq!(outcome.succeeded, 1);

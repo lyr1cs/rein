@@ -575,8 +575,12 @@ impl SynthesisFixture {
     /// results already mention the answer?" floor. Treatment scoring then
     /// asks "does the synthesized prose preserve that?".
     fn baseline_text(&self) -> String {
-        let mut buf =
-            String::with_capacity(self.recall_results.iter().map(|r| r.summary.len() + 64).sum());
+        let mut buf = String::with_capacity(
+            self.recall_results
+                .iter()
+                .map(|r| r.summary.len() + 64)
+                .sum(),
+        );
         for r in &self.recall_results {
             buf.push_str(&r.summary);
             buf.push(' ');
@@ -1853,7 +1857,10 @@ fn build_concept_category_map(fixtures_list: &[ConceptFixture]) -> HashMap<Strin
 fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
     let fixtures_list = load_synthesis_fixtures(fixtures)?;
     if fixtures_list.is_empty() {
-        bail!("no recall-synthesis fixtures found in {}", fixtures.display());
+        bail!(
+            "no recall-synthesis fixtures found in {}",
+            fixtures.display()
+        );
     }
 
     // Symmetric scoring with `run_synthesis_treatment_with_extractor` —
@@ -1967,22 +1974,23 @@ fn cmd_synthesis_run(fixtures: &Path, output: &Path, verbose: bool) -> Result<()
     // the same way `run_recall_synthesis` does. Without this, an operator
     // who configured a different ARS backend would see `compare`
     // verdicts that don't reflect production behavior.
-    let extractor = rein::ops::concept_summary::create_ars_extractor(
-        &config,
-        "ars.recall_synthesis",
-    )
-    .ok_or_else(|| {
-        anyhow!(
-            "no LLM extractor available for recall synthesis — configure \
+    let extractor =
+        rein::ops::concept_summary::create_ars_extractor(&config, "ars.recall_synthesis")
+            .ok_or_else(|| {
+                anyhow!(
+                    "no LLM extractor available for recall synthesis — configure \
              `[extract].provider` (or `[ars].llm_backend = \"google\"`) with \
              a valid API key (GEMINI_API_KEY) or `[ars].llm_backend = \"omlx\"` \
              with a configured `[extract.omlx]` block."
-        )
-    })?;
+                )
+            })?;
 
     let fixtures_list = load_synthesis_fixtures(fixtures)?;
     if fixtures_list.is_empty() {
-        bail!("no recall-synthesis fixtures found in {}", fixtures.display());
+        bail!(
+            "no recall-synthesis fixtures found in {}",
+            fixtures.display()
+        );
     }
 
     let extractor_tag = match &extractor {
@@ -1997,7 +2005,14 @@ fn cmd_synthesis_run(fixtures: &Path, output: &Path, verbose: bool) -> Result<()
         extractor_tag,
     );
 
-    run_synthesis_treatment_with_extractor(&fixtures_list, &extractor, &config, output, fixtures, verbose)
+    run_synthesis_treatment_with_extractor(
+        &fixtures_list,
+        &extractor,
+        &config,
+        output,
+        fixtures,
+        verbose,
+    )
 }
 
 /// Treatment loop extracted so unit tests can drive it with a `MockExtractor`
@@ -2068,14 +2083,10 @@ fn run_synthesis_treatment_with_extractor(
                 // Mirror production: strip markers, keep clean prose for
                 // scoring + recording. `included_count` matches the prod
                 // contract; out-of-range markers are silently dropped.
-                let (synthesis, _citations) =
-                    extract_citations(&raw_text, included_count);
+                let (synthesis, _citations) = extract_citations(&raw_text, included_count);
                 if synthesis.is_empty() {
                     if verbose {
-                        eprintln!(
-                            "[rein-eval] synthesis run: {} empty LLM output",
-                            fx.case_id
-                        );
+                        eprintln!("[rein-eval] synthesis run: {} empty LLM output", fx.case_id);
                     }
                     empty_output += 1;
                     outcomes.push(PairedOutcome {
@@ -2202,8 +2213,7 @@ fn cmd_cold_archive_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         bail!("no cold-archive fixtures found in {}", fixtures.display());
     }
 
-    let config =
-        ReinConfig::load().context("loading rein config for cold-archive baseline")?;
+    let config = ReinConfig::load().context("loading rein config for cold-archive baseline")?;
     let checker = build_hybrid_checker(&config);
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
@@ -3091,12 +3101,7 @@ mod tests {
 
         let out_path = tmp_path("synth_run_mock");
         run_synthesis_treatment_with_extractor(
-            &fixtures,
-            &extractor,
-            &config,
-            &out_path,
-            &dir,
-            /* verbose */ false,
+            &fixtures, &extractor, &config, &out_path, &dir, /* verbose */ false,
         )
         .expect("treatment loop should succeed under mock");
 
@@ -3115,7 +3120,11 @@ mod tests {
             );
             assert_eq!(o.treatment_summary.as_deref(), Some(mock_response));
         }
-        assert_eq!(sc.category_map.len(), 24, "category_map populated per fixture");
+        assert_eq!(
+            sc.category_map.len(),
+            24,
+            "category_map populated per fixture"
+        );
         let _ = fs::remove_file(&out_path);
     }
 
@@ -3133,12 +3142,7 @@ mod tests {
 
         let out_path = tmp_path("synth_run_err");
         run_synthesis_treatment_with_extractor(
-            &fixtures,
-            &extractor,
-            &config,
-            &out_path,
-            &dir,
-            /* verbose */ false,
+            &fixtures, &extractor, &config, &out_path, &dir, /* verbose */ false,
         )
         .expect("treatment loop should still write a scorecard on LLM error");
 
@@ -3165,15 +3169,14 @@ mod tests {
     #[test]
     fn synthesis_compare_with_synthetic_scorecards_ships_when_treatment_wins() {
         // Baseline: all misses; Treatment: all hits → strong superiority.
-        let make_outcome =
-            |case_id: &str, baseline_hit: bool, treatment_hit: bool| PairedOutcome {
-                case_id: case_id.into(),
-                baseline_hit,
-                treatment_hit,
-                baseline_length: 1000,
-                treatment_length: 1500,
-                treatment_summary: None,
-            };
+        let make_outcome = |case_id: &str, baseline_hit: bool, treatment_hit: bool| PairedOutcome {
+            case_id: case_id.into(),
+            baseline_hit,
+            treatment_hit,
+            baseline_length: 1000,
+            treatment_length: 1500,
+            treatment_summary: None,
+        };
 
         let baseline_outcomes = (0..30)
             .map(|i| make_outcome(&format!("case_{i:03}"), false, false))
@@ -3209,12 +3212,7 @@ mod tests {
         // Run the compare path through the production code, then load the
         // McNemar via direct calls to confirm the decision the user would
         // see. (cmd_compare prints to stdout; we re-derive the verdict.)
-        let res = cmd_compare(
-            &baseline_path,
-            &treat_path,
-            0.02,
-            DecideShipKind::Synthesis,
-        );
+        let res = cmd_compare(&baseline_path, &treat_path, 0.02, DecideShipKind::Synthesis);
         assert!(res.is_ok(), "compare must succeed: {res:?}");
 
         // Independent re-derivation: McNemar over (baseline=0, treatment=1)
@@ -3245,9 +3243,9 @@ mod tests {
                 reason: ShipReason::Superior { .. },
                 ..
             } => {}
-            other => panic!(
-                "expected Superior ship verdict for clean treatment win, got {other:?}"
-            ),
+            other => {
+                panic!("expected Superior ship verdict for clean treatment win, got {other:?}")
+            }
         }
 
         let _ = fs::remove_file(&baseline_path);
@@ -3336,11 +3334,7 @@ mod tests {
         // is a directory of JSON files, not a single file).
         let _ = fs::create_dir_all(&dir);
         let fixture_path = dir.join("mini.json");
-        fs::write(
-            &fixture_path,
-            serde_json::to_vec_pretty(&vec![fx]).unwrap(),
-        )
-        .unwrap();
+        fs::write(&fixture_path, serde_json::to_vec_pretty(&vec![fx]).unwrap()).unwrap();
 
         let out_path = tmp_path("ca_baseline");
         let res = cmd_cold_archive_baseline(&dir, &out_path);
@@ -3382,9 +3376,10 @@ mod tests {
                             resummerize on commit and batches rows per pass with a wall \
                             time bound."
             .to_string();
-        let extractor = std::sync::Arc::new(ExtractorKind::Mock(MockExtractor::with_responses(
-            vec![Ok(mock_summary.clone())],
-        )));
+        let extractor =
+            std::sync::Arc::new(ExtractorKind::Mock(MockExtractor::with_responses(vec![
+                Ok(mock_summary.clone()),
+            ])));
         let config = ReinConfig::default();
         let out_path = tmp_path("ca_run_pass");
         let res = run_cold_archive_treatment_with_extractor(
@@ -3443,7 +3438,10 @@ mod tests {
             Path::new("dummy"),
             /* verbose */ false,
         );
-        assert!(res.is_ok(), "cold_archive run with LLM error must still write a scorecard");
+        assert!(
+            res.is_ok(),
+            "cold_archive run with LLM error must still write a scorecard"
+        );
 
         let sc: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
         assert_eq!(sc.outcomes.len(), 1);
@@ -3466,10 +3464,8 @@ mod tests {
     /// long enough to clear the generator's "already short" skip).
     #[test]
     fn cold_archive_corpus_loads_and_has_well_formed_cases() {
-        let dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cold_archive");
-        let cases =
-            load_cold_archive_fixtures(&dir).expect("cold_archive fixtures should parse");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cold_archive");
+        let cases = load_cold_archive_fixtures(&dir).expect("cold_archive fixtures should parse");
         assert!(
             cases.len() >= 5,
             "corpus should have ≥5 fixtures (power-limited acknowledged); got {}",
@@ -3505,8 +3501,7 @@ mod tests {
     ///     discriminate against the topic+summary surface)
     #[test]
     fn cold_archive_baseline_runs_against_bundled_corpus() {
-        let dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cold_archive");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cold_archive");
         let expected = load_cold_archive_fixtures(&dir).expect("corpus parses");
         let out_path = tmp_path("ca_corpus_baseline");
         let res = cmd_cold_archive_baseline(&dir, &out_path);
