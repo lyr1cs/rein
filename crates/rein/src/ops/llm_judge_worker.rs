@@ -669,16 +669,108 @@ fn reap_one_cache_file(
     Ok(())
 }
 
+/// v0.27.x C4 — reap stale `judge_queue.jsonl.processing-{ts}-{pid}`
+/// files left by crashed prior drains. After 24h orphans are freed.
+/// Use the timestamp EMBEDDED IN THE FILENAME (millis since unix epoch)
+/// — Codex C234 P2 fix — NOT mtime, because rename inherits the old
+/// queue file's mtime and could falsely-mark in-progress batches as
+/// stale. Also: 24h floor (not 1h) so the no-extractor restore path's
+/// 1h-aged files are preserved for manual recovery.
+/// Best-effort: errors logged and ignored.
+fn reap_stale_processing_files(config: &crate::config::ReinConfig) {
+    let queue_path =
+        crate::ops::handlers::judge::judge_queue_path_for_config(config);
+    let queue_dir = match queue_path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let entries = match std::fs::read_dir(queue_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    const STALE_AGE_MS: i64 = 24 * 3600 * 1000; // 24 hours
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Filename pattern: judge_queue.jsonl.processing-{ts_ms}-{pid}
+        // Parse the timestamp; skip if it doesn't match the pattern.
+        let Some(suffix) = name.strip_prefix("judge_queue.jsonl.processing-")
+        else {
+            continue;
+        };
+        let Some(ts_str) = suffix.split('-').next() else {
+            continue;
+        };
+        let Ok(ts_ms) = ts_str.parse::<i64>() else {
+            continue;
+        };
+        let age_ms = now_ms - ts_ms;
+        if age_ms > STALE_AGE_MS {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "judge drain: failed to reap stale .processing-* file"
+                );
+            } else {
+                tracing::debug!(
+                    path = %path.display(),
+                    age_secs = age_ms / 1000,
+                    "judge drain: reaped stale .processing-* file"
+                );
+            }
+        }
+    }
+}
+
 pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> DrainStats {
-    // v0.27.2 R5-K2 — opportunistic reap on each drain tick. Cheap
-    // when files are small/missing; bounded by daily-rotated cache
-    // size (~80MB worst case at full daily_call_cap).
-    reap_expired_caches(config);
     use std::io::BufRead;
 
     if !config.ars.llm_judge.enabled {
+        // Codex C234 P2 fix — fast no-op when judge is disabled. Don't
+        // touch the queue dir at all; default-off must mean zero new
+        // disk writes.
         return DrainStats::default();
     }
+
+    // v0.27.2 R5-K2 — opportunistic reap on each drain tick. Cheap
+    // when files are small/missing; bounded by daily-rotated cache
+    // size (~80MB worst case at full daily_call_cap). Cache reap is
+    // independent of extractor configuration (caches just get
+    // truncated by TTL).
+    reap_expired_caches(config);
+
+    // Codex C234-R3 P2 fix — resolve extractor FIRST (before queue
+    // existence check) so we can:
+    //   (a) skip stale-.processing reaping when no extractor is
+    //       configured (preserves manual-recovery files), AND
+    //   (b) still reap stale .processing files in the idle-but-
+    //       configured case where queue is empty but old .processing-*
+    //       crash orphans exist on disk.
+    let extractor =
+        match crate::ops::concept_summary::create_ars_extractor(config, "ars.llm_judge") {
+            Some(e) => e,
+            None => {
+                // No extractor — preserve any existing .processing-*
+                // files for manual recovery; don't reap them. Cache
+                // reaper above is harmless in this case.
+                tracing::debug!(
+                    "judge drain: no extractor configured for [ars.llm_judge]; \
+                     skipping drain + .processing reap (preserving any \
+                     existing files for manual recovery)"
+                );
+                return DrainStats::default();
+            }
+        };
+
+    // v0.27.x C4 — reap stale .processing-{ts}-{pid} files from
+    // crashed prior drains. Now safe: extractor resolved means any
+    // .processing-* files older than 24h are real crash orphans,
+    // not preserved-for-recovery batches from misconfig.
+    reap_stale_processing_files(config);
 
     let queue_path = crate::ops::handlers::judge::judge_queue_path_for_config(config);
     if !queue_path.exists() {
@@ -743,34 +835,11 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
         return DrainStats::default();
     }
 
-    // Resolve the judge extractor via Track 2 inheritance so operators
-    // can override `[ars.llm_judge]` independently of `[extract]`.
-    let extractor = match crate::ops::concept_summary::create_ars_extractor(config, "ars.llm_judge")
-    {
-        Some(e) => e,
-        None => {
-            // Codex R9 P2 fix — DO NOT restore by renaming over the
-            // active queue. The rotation lock is already released so
-            // a concurrent appender may have created a fresh
-            // `judge_queue.jsonl`; renaming `.processing-...` over it
-            // would clobber the new appends. Instead leave the
-            // `.processing-...` file on disk for operator recovery
-            // (`cat .processing-* >> judge_queue.jsonl` after
-            // configuring an extractor). Filename includes timestamp
-            // so successive failed drains don't collide.
-            tracing::warn!(
-                processing = %processing_path.display(),
-                "judge drain: no extractor configured for [ars.llm_judge]; \
-                 jobs preserved in .processing-* file for manual recovery"
-            );
-            return DrainStats::default();
-        }
-    };
-
     // Codex R2 P1 fix — read configured cap, not hardcoded default.
     // When an operator sets `[ars.llm_judge].daily_call_cap` lower
     // than 10000 (e.g. for cost control), the drain MUST honor it.
     let daily_cap = config.ars.llm_judge.daily_call_cap;
+
     let mut stats = DrainStats::default();
 
     let file = match std::fs::File::open(&processing_path) {

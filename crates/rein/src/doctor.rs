@@ -144,6 +144,10 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(hnsw_check);
                             checks.push(check_resummerize(&store));
                             checks.push(check_pool_saturation(config));
+                            // v0.27.x judge checks
+                            checks.push(check_judge_calibration(&store, config));
+                            checks.push(check_judge_call_ledger(&store, config));
+                            checks.push(check_judge_cache_size(config));
                         }
                         Err(e) => checks.push(fail_in(
                             DoctorCategory::Storage,
@@ -1494,6 +1498,167 @@ fn recover_inflight_file(
     }
     let _ = std::fs::remove_file(inflight_path);
     Ok(Some(recovered))
+}
+
+// ── v0.27.x judge checks ───────────────────────────────────────────────────
+
+/// v0.27.1 — surface `JudgeCalibrationState` stats so operators know
+/// the runtime LLM judge is producing usable signal. Reports κ values,
+/// pair counts, drift alert count, and last-computed timestamp.
+fn check_judge_calibration(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    if !config.ars.llm_judge.enabled {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "judge_calibration",
+            "[ars.llm_judge].enabled = false (default-off)".to_string(),
+        );
+    }
+    let state = match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
+        Some(s) => s,
+        None => {
+            return ok_in(
+                DoctorCategory::Configuration,
+                "judge_calibration",
+                "no AdaptiveState snapshot yet (no recall traffic)".to_string(),
+            );
+        }
+    };
+    let cal = match state.judge_calibration_state {
+        Some(c) => c,
+        None => {
+            return ok_in(
+                DoctorCategory::Configuration,
+                "judge_calibration",
+                "no calibration state yet (no judge events processed)".to_string(),
+            );
+        }
+    };
+    let synth_pairs = cal.recent_pairs_synthesis.len();
+    let concept_pairs = cal.recent_pairs_concept.len();
+    let summary = format!(
+        "kappa={:.2} runtime_vs_offline_kappa={:.2} drift_alerts={} synth_pairs={} \
+         concept_pairs={} total_offline={}",
+        cal.kappa,
+        cal.runtime_vs_offline_kappa,
+        cal.judge_drift_alert,
+        synth_pairs,
+        concept_pairs,
+        cal.total_offline_cron_events,
+    );
+    if cal.judge_drift_alert > 0 {
+        warn_in(
+            DoctorCategory::Configuration,
+            "judge_calibration",
+            format!("drift alerts present: {summary}"),
+        )
+    } else {
+        ok_in(DoctorCategory::Configuration, "judge_calibration", summary)
+    }
+}
+
+/// v0.27.1 — rolling 24h judge_call_ledger usage vs daily_call_cap.
+fn check_judge_call_ledger(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    if !config.ars.llm_judge.enabled {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "judge_call_ledger",
+            "[ars.llm_judge].enabled = false".to_string(),
+        );
+    }
+    let cap = config.ars.llm_judge.daily_call_cap;
+    // Codex C234 P3 fix — exclude `reserved` rows older than
+    // LLM_JUDGE_STALE_CLAIM_SECS from the active count. A worker
+    // crash leaves these rows orphaned until next dispatch reaps
+    // them; counting them as in_flight makes doctor falsely report
+    // cap-reached for up to 24h post-crash.
+    let stale_secs: i64 = crate::judge::contract::LLM_JUDGE_STALE_CLAIM_SECS;
+    let result: Result<(i64, i64, i64), rusqlite::Error> = store.conn().query_row(
+        "SELECT \
+            COALESCE(SUM(CASE WHEN \
+                status='done' OR status='failed' \
+                OR (status='reserved' AND ts >= strftime('%s','now') - ?1) \
+                THEN 1 ELSE 0 END), 0), \
+            COALESCE(SUM(CASE WHEN status='reserved' AND ts >= strftime('%s','now') - ?1 \
+                THEN 1 ELSE 0 END), 0), \
+            COALESCE(SUM(CASE WHEN status='stale' OR \
+                (status='reserved' AND ts < strftime('%s','now') - ?1) \
+                THEN 1 ELSE 0 END), 0) \
+         FROM judge_call_ledger \
+         WHERE ts >= strftime('%s','now') - 86400",
+        [stale_secs],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    let (active, in_flight, stale) = match result {
+        Ok(t) => t,
+        Err(rusqlite::Error::SqliteFailure(_, ref msg))
+            if msg.as_deref().is_some_and(|m| m.contains("no such table")) =>
+        {
+            return ok_in(
+                DoctorCategory::Configuration,
+                "judge_call_ledger",
+                "ledger not initialized (no judge calls yet)".to_string(),
+            );
+        }
+        Err(e) => {
+            return warn_in(
+                DoctorCategory::Configuration,
+                "judge_call_ledger",
+                format!("ledger query failed: {e}"),
+            );
+        }
+    };
+    let summary = format!(
+        "24h: {active}/{cap} (in_flight={in_flight} stale={stale})"
+    );
+    if (active as u64) >= cap {
+        warn_in(DoctorCategory::Configuration, "judge_call_ledger", summary)
+    } else {
+        ok_in(DoctorCategory::Configuration, "judge_call_ledger", summary)
+    }
+}
+
+/// v0.27.2 — synthesis + concept-summary cache file size. Catches
+/// reaper failures (cache should stay bounded around TTL × peak rate).
+fn check_judge_cache_size(config: &ReinConfig) -> DoctorCheck {
+    if !config.ars.llm_judge.enabled {
+        return ok_in(
+            DoctorCategory::Storage,
+            "judge_cache_size",
+            "[ars.llm_judge].enabled = false".to_string(),
+        );
+    }
+    let synth = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
+    let concept = crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
+    let size_of = |p: &std::path::Path| -> u64 {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    };
+    let synth_bytes = size_of(&synth);
+    let concept_bytes = size_of(&concept);
+    let total_mb = (synth_bytes + concept_bytes) as f64 / 1_048_576.0;
+    let summary = format!(
+        "synthesis={}KB concept_summary={}KB total={:.1}MB",
+        synth_bytes / 1024,
+        concept_bytes / 1024,
+        total_mb,
+    );
+    // 100MB threshold — well above expected steady-state for default
+    // ttl (10 min) and daily_call_cap (10000 calls × ~8KB each = 80MB
+    // worst case). If we cross this, the reaper is likely broken.
+    if total_mb > 100.0 {
+        warn_in(
+            DoctorCategory::Storage,
+            "judge_cache_size",
+            format!("cache larger than expected: {summary} (reaper may be misfiring)"),
+        )
+    } else {
+        ok_in(DoctorCategory::Storage, "judge_cache_size", summary)
+    }
 }
 
 #[cfg(test)]
