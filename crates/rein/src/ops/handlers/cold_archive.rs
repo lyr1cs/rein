@@ -171,7 +171,10 @@ mod tests {
             "expected disabled-flag reason, got: {reason}"
         );
         assert_eq!(out.memory_id, "doesnotexist");
-        assert_eq!(out.version, crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION);
+        assert_eq!(
+            out.version,
+            crate::ops::cold_archive_summary::ARCHIVAL_SUMMARY_VERSION
+        );
     }
 
     #[test]

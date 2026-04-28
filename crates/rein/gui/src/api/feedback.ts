@@ -81,6 +81,7 @@ export async function postConceptSummaryFeedback(
   recallId: string | undefined,
   interaction: ConceptSummaryInteractionKind,
   metadata?: ConceptSummaryMetadata,
+  ids?: { conceptSummaryId?: string | null; livingSummaryId?: string | null },
 ): Promise<boolean> {
   if (
     typeof conceptId !== 'string' ||
@@ -91,9 +92,20 @@ export async function postConceptSummaryFeedback(
     return false;
   }
 
+  const livingSummaryId =
+    typeof ids?.livingSummaryId === 'string' && ids.livingSummaryId.length > 0
+      ? ids.livingSummaryId
+      : undefined;
+  const conceptSummaryId =
+    typeof ids?.conceptSummaryId === 'string' && ids.conceptSummaryId.length > 0
+      ? ids.conceptSummaryId
+      : livingSummaryId;
+
   const body: ConceptSummaryInteractionEvent = {
     concept_id: conceptId,
     recall_id: recallId,
+    ...(conceptSummaryId ? { concept_summary_id: conceptSummaryId } : {}),
+    ...(livingSummaryId ? { living_summary_id: livingSummaryId } : {}),
     interaction,
     ...(metadata ? { metadata } : {}),
   };

@@ -385,18 +385,17 @@ pub fn save_weights_cas(
             // INSERT path below (treat-as-fresh contract is consistent
             // with what `load_weights` already returns to consumers).
             let err_str = e.to_string();
-            let is_malformed_json = err_str.contains("malformed JSON")
-                || err_str.contains("malformed json");
+            let is_malformed_json =
+                err_str.contains("malformed JSON") || err_str.contains("malformed json");
             if is_malformed_json {
                 tracing::warn!(
                     error = %e,
                     "save_weights CAS hit malformed JSON in stored row; \
                      deleting corrupt row + retrying as first-install INSERT"
                 );
-                if let Err(del_err) = conn.execute(
-                    "DELETE FROM metadata WHERE key = 'rerank_weights'",
-                    [],
-                ) {
+                if let Err(del_err) =
+                    conn.execute("DELETE FROM metadata WHERE key = 'rerank_weights'", [])
+                {
                     tracing::warn!(
                         error = %del_err,
                         "save_weights recovery DELETE failed; row stays corrupt"
@@ -431,8 +430,9 @@ pub fn save_weights_cas(
         // constraint rather than silently last-writes-wins.
         return match conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('rerank_weights', ?1)",
-            rusqlite::params![&serde_json::to_string(weights)
-                .expect("RerankWeights serialization cannot fail")],
+            rusqlite::params![
+                &serde_json::to_string(weights).expect("RerankWeights serialization cannot fail")
+            ],
         ) {
             Ok(_) => true,
             Err(e) => {
@@ -789,7 +789,10 @@ mod tests {
         w.last_recall_event_id = 17;
 
         // First save (row absent → INSERT path).
-        assert!(save_weights_cas(&conn, &w, 0, 0), "first install should succeed");
+        assert!(
+            save_weights_cas(&conn, &w, 0, 0),
+            "first install should succeed"
+        );
 
         let (acc, rec) = read_persisted_watermarks(&conn);
         assert_eq!(acc, Some(42), "last_access_event_id missing from row");
@@ -816,13 +819,19 @@ mod tests {
         // higher-level half.
         let conn = ws_conn();
         let mut w = default_weights();
-        assert!(save_weights_cas(&conn, &w, 0, 0), "first install should succeed"); // watermarks = 0
+        assert!(
+            save_weights_cas(&conn, &w, 0, 0),
+            "first install should succeed"
+        ); // watermarks = 0
 
         // Pretend cycle 1 absorbed events through id=5 on both streams.
         w.w_fts = 0.20;
         w.last_access_event_id = 5;
         w.last_recall_event_id = 5;
-        assert!(save_weights_cas(&conn, &w, 0, 0), "cycle 1 CAS should hit (expected=0,0 matches)");
+        assert!(
+            save_weights_cas(&conn, &w, 0, 0),
+            "cycle 1 CAS should hit (expected=0,0 matches)"
+        );
         let after_cycle1 = read_persisted_watermarks(&conn);
         assert_eq!(after_cycle1, (Some(5), Some(5)));
 
@@ -869,14 +878,20 @@ mod tests {
         // "log + skip the cycle (do not panic)".
         let conn = ws_conn();
         let initial = default_weights();
-        assert!(save_weights_cas(&conn, &initial, 0, 0), "first install should succeed");
+        assert!(
+            save_weights_cas(&conn, &initial, 0, 0),
+            "first install should succeed"
+        );
 
         // Worker A: observed (0, 0), bumps to (10, 20), updates w_fts.
         let mut worker_a = initial.clone();
         worker_a.w_fts = 0.30;
         worker_a.last_access_event_id = 10;
         worker_a.last_recall_event_id = 20;
-        assert!(save_weights_cas(&conn, &worker_a, 0, 0), "worker A CAS should hit");
+        assert!(
+            save_weights_cas(&conn, &worker_a, 0, 0),
+            "worker A CAS should hit"
+        );
 
         let after_a = read_persisted_watermarks(&conn);
         assert_eq!(after_a, (Some(10), Some(20)), "worker A must commit first");

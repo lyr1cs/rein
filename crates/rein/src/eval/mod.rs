@@ -21,11 +21,11 @@ pub mod llm_judge;
 pub mod mcnemar;
 pub mod scorecard;
 
+pub use llm_judge::{JudgeMode, JudgeOutcome, LlmJudgeHitChecker, LLM_JUDGE_VERSION};
 pub use mcnemar::{mcnemar, McNemarResult, PairedOutcome};
 pub use scorecard::{
     decide_ship, CategoryStats, DecideShipKind, Scorecard, ShipDecision, ShipReason,
 };
-pub use llm_judge::{JudgeMode, JudgeOutcome, LlmJudgeHitChecker, LLM_JUDGE_VERSION};
 
 /// Oracle that decides whether a surfaced evidence/context answers the
 /// canonical expected content for a case.

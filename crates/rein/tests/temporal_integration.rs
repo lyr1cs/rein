@@ -90,7 +90,10 @@ async fn bilingual_content_extracts_both_languages_via_rules() {
     let content = "yesterday I tested 上周 we deployed";
     let result = extract_temporal_rule_based(content, fixed_now());
     let kinds: Vec<_> = result.iter().map(|a| a.kind).collect();
-    assert_eq!(kinds.iter().filter(|k| **k == AnchorKind::Relative).count(), 2);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == AnchorKind::Relative).count(),
+        2
+    );
     // One should be the prior day; one should be the prior ISO week.
     let starts: Vec<_> = result.iter().filter_map(|a| a.start).collect();
     assert!(

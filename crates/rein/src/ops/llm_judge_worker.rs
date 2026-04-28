@@ -13,11 +13,12 @@
 //!
 //! # Pipeline-interaction discipline (spec §5)
 //!
-//! Worker writes `feedback_events` + `judge_call_ledger` only. NEVER
-//! touches `update()` / `apply_evolution` / `cold_archive` / `M5 strip` /
-//! `memories` / `concepts` — see `judge::contract::J1_ALLOWED_WRITE_TABLES`.
-//! This is the entire reason the judge worker stays out of the v0.26.x
-//! 4-way pipeline-interaction matrix.
+//! Worker emits `feedback_events`, reserves `judge_call_ledger`, and prunes
+//! stale `concept_summary_instances` rows on the judge-cache TTL cadence.
+//! It NEVER touches `update()` / `apply_evolution` / `cold_archive` /
+//! `M5 strip` / `memories` / `concepts` — see
+//! `judge::contract::J1_ALLOWED_WRITE_TABLES`. This is the reason the judge
+//! worker stays out of the v0.26.x 4-way pipeline-interaction matrix.
 
 use crate::extract::llm::ExtractorKind;
 use crate::judge::contract::{
@@ -29,6 +30,7 @@ use crate::store::adaptive::{
 };
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -167,6 +169,7 @@ pub enum DropReason {
 /// `rein` server process; revisit if memory pressure becomes a problem.
 pub fn dispatch_one(
     store: &SqliteStore,
+    config: &crate::config::ReinConfig,
     extractor: &ExtractorKind,
     job: JudgeJob,
     daily_cap: u64,
@@ -239,6 +242,17 @@ pub fn dispatch_one(
         )));
     }
 
+    if !verify_durable_judge_target(store, config, &job)? {
+        tracing::warn!(
+            kind = ?job.kind,
+            surface_id = %job.surface_id,
+            "judge worker: J5 durable target lookup failed, dropping before reservation"
+        );
+        return Ok(DispatchResult::Dropped(DropReason::ContractViolation(
+            "durable judge target missing".to_string(),
+        )));
+    }
+
     // J2 atomic reservation — runs `BEGIN IMMEDIATE` so concurrent
     // workers can't burst N×cap.
     let token = match contract::reserve_call(store.conn(), daily_cap)? {
@@ -253,7 +267,8 @@ pub fn dispatch_one(
     // The override extractor lives only for this dispatch_one call.
     // For Mock extractor (test-support), override is ignored — tests
     // script the response queue directly.
-    let override_extractor = build_override_extractor(extractor, job.judge_model_override.as_deref());
+    let override_extractor =
+        build_override_extractor(extractor, job.judge_model_override.as_deref());
     let active_extractor: &ExtractorKind = override_extractor.as_ref().unwrap_or(extractor);
 
     // LLM call (J4 — failures never propagate).
@@ -360,6 +375,154 @@ pub fn dispatch_one(
     Ok(DispatchResult::Emitted(event_id))
 }
 
+fn verify_durable_judge_target(
+    store: &SqliteStore,
+    config: &crate::config::ReinConfig,
+    job: &JudgeJob,
+) -> ReinResult<bool> {
+    let ttl = match config.ars.llm_judge.cache_ttl_secs {
+        0 => None,
+        secs => Some(secs),
+    };
+    match job.kind {
+        JudgeJobKind::Synthesis => {
+            let cache_path = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
+            Ok(cache_has_id_and_stamp(
+                &cache_path,
+                "synthesis_id",
+                &job.surface_id,
+                &job.stamp_hash,
+                ttl,
+            ))
+        }
+        JudgeJobKind::ConceptSummary => {
+            let cache_path =
+                crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
+            if !cache_has_id_and_stamp(
+                &cache_path,
+                "concept_summary_id",
+                &job.surface_id,
+                &job.stamp_hash,
+                ttl,
+            ) {
+                return Ok(false);
+            }
+            concept_summary_target_exists(store, &job.surface_id, job.concept_id.as_deref())
+        }
+    }
+}
+
+fn cache_has_id_and_stamp(
+    path: &std::path::Path,
+    id_field: &str,
+    id_value: &str,
+    stamp_hash: &str,
+    ttl_secs: Option<u64>,
+) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let now = chrono::Utc::now();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get(id_field).and_then(|v| v.as_str()) != Some(id_value) {
+            continue;
+        }
+        if value.get("stamp_hash").and_then(|v| v.as_str()) != Some(stamp_hash) {
+            continue;
+        }
+        if let Some(ttl) = ttl_secs {
+            let Some(stamped_at) = value.get("stamped_at").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(stamped_at) else {
+                continue;
+            };
+            let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+            if age.num_seconds() > ttl as i64 {
+                continue;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn concept_summary_target_exists(
+    store: &SqliteStore,
+    summary_id: &str,
+    concept_id: Option<&str>,
+) -> ReinResult<bool> {
+    let retained: Option<i64> = store
+        .conn()
+        .query_row(
+            "SELECT 1 FROM concept_summary_instances \
+             WHERE summary_id = ?1 \
+               AND (?2 IS NULL OR concept_id = ?2) \
+             LIMIT 1",
+            rusqlite::params![summary_id, concept_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if retained.is_some() {
+        return Ok(true);
+    }
+    let live: Option<i64> = store
+        .conn()
+        .query_row(
+            "SELECT 1 FROM concepts \
+             WHERE living_summary_id = ?1 \
+               AND (?2 IS NULL OR id = ?2) \
+             LIMIT 1",
+            rusqlite::params![summary_id, concept_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(live.is_some())
+}
+
+#[cfg(feature = "test-support")]
+pub fn write_test_judge_cache_entry(
+    config: &crate::config::ReinConfig,
+    job: &JudgeJob,
+) -> std::io::Result<u32> {
+    let (path, id_field) = match job.kind {
+        JudgeJobKind::Synthesis => (
+            crate::ops::handlers::judge::synthesis_cache_path_for_config(config),
+            "synthesis_id",
+        ),
+        JudgeJobKind::ConceptSummary => (
+            crate::ops::handlers::judge::concept_summary_cache_path_for_config(config),
+            "concept_summary_id",
+        ),
+    };
+    let mut entry = serde_json::json!({
+        "query": &job.query,
+        "prompt": &job.prompt,
+        "candidate": &job.candidate,
+        "stamp_hash": &job.stamp_hash,
+        "query_type": &job.query_type,
+        "cluster_id": job.cluster_id,
+        "source_count": job.source_count,
+        "stamped_at": chrono::Utc::now().to_rfc3339(),
+    });
+    entry[id_field] = serde_json::Value::String(job.surface_id.clone());
+    if matches!(job.kind, JudgeJobKind::ConceptSummary) {
+        entry["concept_id"] = job
+            .concept_id
+            .as_ref()
+            .map(|id| serde_json::Value::String(id.clone()))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    crate::ops::handlers::judge::append_jsonl_line(&path, &entry)
+}
+
 /// Truncate a string to `max_chars` Unicode-scalar values (NOT bytes —
 /// CJK-safe per [[feedback_rust_cjk_alphanumeric_trap]]).
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -438,7 +601,11 @@ fn judge_model_id(extractor: &ExtractorKind) -> String {
 /// Mirrors `ops::concept_summary::call_llm_sync` so the runtime
 /// invariants ("don't use `reqwest::blocking` inside tokio") stay
 /// consistent across ARS modules.
-pub fn call_judge_sync(extractor: &ExtractorKind, prompt: &str, candidate: &str) -> ReinResult<String> {
+pub fn call_judge_sync(
+    extractor: &ExtractorKind,
+    prompt: &str,
+    candidate: &str,
+) -> ReinResult<String> {
     // Codex R6 P2 fix — truncate the combined prompt+candidate to
     // JUDGE_MAX_INPUT_CHARS BEFORE the LLM call. v0 sent
     // `prompt.len() + candidate.len()` unbounded; large-context Cap B
@@ -449,15 +616,22 @@ pub fn call_judge_sync(extractor: &ExtractorKind, prompt: &str, candidate: &str)
     let user: String = combined.chars().take(JUDGE_MAX_INPUT_CHARS).collect();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
-            handle
-                .block_on(async { extractor.raw_text_with_prompt(JUDGE_SYSTEM_PROMPT, &user).await })
+            handle.block_on(async {
+                extractor
+                    .raw_text_with_prompt(JUDGE_SYSTEM_PROMPT, &user)
+                    .await
+            })
         })
     } else {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| ReinError::Config(format!("failed to build tokio runtime: {e}")))?;
-        rt.block_on(async { extractor.raw_text_with_prompt(JUDGE_SYSTEM_PROMPT, &user).await })
+        rt.block_on(async {
+            extractor
+                .raw_text_with_prompt(JUDGE_SYSTEM_PROMPT, &user)
+                .await
+        })
     }
 }
 
@@ -536,19 +710,20 @@ pub struct DrainStats {
 /// / judge_calibration consumers.
 /// v0.27.2 R5-K2 fix — reap expired entries from the synthesis +
 /// concept-summary judge rehydration caches. The append-only jsonl
-/// caches grow unbounded on long-running nodes; manual MCP lookup
-/// already enforces TTL via `cache_lookup_value_with_ttl`, but the
-/// disk file kept all old rows. This reaper rewrites each cache file
-/// in place, keeping only rows whose `stamped_at` is within the
-/// configured `[ars.llm_judge].cache_ttl_secs` window.
+/// caches and `concept_summary_instances` table grow unbounded on
+/// long-running nodes; manual MCP lookup already enforces TTL via
+/// `cache_lookup_value_with_ttl`, but the stored rows remained. This
+/// reaper keeps only rows within the configured
+/// `[ars.llm_judge].cache_ttl_secs` window.
 ///
 /// Default-off (`enabled = false` short-circuits before the reaper
-/// touches disk). Best-effort: any IO error is logged and ignored
-/// — the manual lookup TTL guard remains the correctness boundary.
+/// touches disk/SQL). Best-effort: any IO/DB error is logged and
+/// ignored — the manual lookup TTL guard remains the correctness
+/// boundary.
 ///
 /// Called from `drain_queue` so the reaper runs at the same slow-channel
 /// cadence as judge dispatch. No need for a dedicated thread.
-pub fn reap_expired_caches(config: &crate::config::ReinConfig) {
+pub fn reap_expired_caches(store: &SqliteStore, config: &crate::config::ReinConfig) {
     if !config.ars.llm_judge.enabled {
         return;
     }
@@ -556,10 +731,8 @@ pub fn reap_expired_caches(config: &crate::config::ReinConfig) {
     if ttl_secs == 0 {
         return; // 0 means "never expire" — skip reaper.
     }
-    let synth_path =
-        crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
-    let concept_path =
-        crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
+    let synth_path = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
+    let concept_path = crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
     for path in [&synth_path, &concept_path] {
         if let Err(e) = reap_one_cache_file(path, ttl_secs) {
             tracing::warn!(
@@ -569,12 +742,26 @@ pub fn reap_expired_caches(config: &crate::config::ReinConfig) {
             );
         }
     }
+    if let Err(e) = reap_concept_summary_instances(store, ttl_secs) {
+        tracing::warn!(
+            error = %e,
+            "judge cache reaper: failed to prune concept_summary_instances (non-fatal)"
+        );
+    }
 }
 
-fn reap_one_cache_file(
-    path: &std::path::Path,
-    ttl_secs: u64,
-) -> std::io::Result<()> {
+fn reap_concept_summary_instances(store: &SqliteStore, ttl_secs: u64) -> ReinResult<u64> {
+    let cutoff = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(ttl_secs as i64);
+    let deleted = store.conn().execute(
+        "DELETE FROM concept_summary_instances WHERE refreshed_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    Ok(deleted as u64)
+}
+
+fn reap_one_cache_file(path: &std::path::Path, ttl_secs: u64) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -678,8 +865,7 @@ fn reap_one_cache_file(
 /// 1h-aged files are preserved for manual recovery.
 /// Best-effort: errors logged and ignored.
 fn reap_stale_processing_files(config: &crate::config::ReinConfig) {
-    let queue_path =
-        crate::ops::handlers::judge::judge_queue_path_for_config(config);
+    let queue_path = crate::ops::handlers::judge::judge_queue_path_for_config(config);
     let queue_dir = match queue_path.parent() {
         Some(d) => d,
         None => return,
@@ -697,8 +883,7 @@ fn reap_stale_processing_files(config: &crate::config::ReinConfig) {
         };
         // Filename pattern: judge_queue.jsonl.processing-{ts_ms}-{pid}
         // Parse the timestamp; skip if it doesn't match the pattern.
-        let Some(suffix) = name.strip_prefix("judge_queue.jsonl.processing-")
-        else {
+        let Some(suffix) = name.strip_prefix("judge_queue.jsonl.processing-") else {
             continue;
         };
         let Some(ts_str) = suffix.split('-').next() else {
@@ -741,7 +926,7 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
     // size (~80MB worst case at full daily_call_cap). Cache reap is
     // independent of extractor configuration (caches just get
     // truncated by TTL).
-    reap_expired_caches(config);
+    reap_expired_caches(store, config);
 
     // Codex C234-R3 P2 fix — resolve extractor FIRST (before queue
     // existence check) so we can:
@@ -750,21 +935,21 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
     //   (b) still reap stale .processing files in the idle-but-
     //       configured case where queue is empty but old .processing-*
     //       crash orphans exist on disk.
-    let extractor =
-        match crate::ops::concept_summary::create_ars_extractor(config, "ars.llm_judge") {
-            Some(e) => e,
-            None => {
-                // No extractor — preserve any existing .processing-*
-                // files for manual recovery; don't reap them. Cache
-                // reaper above is harmless in this case.
-                tracing::debug!(
-                    "judge drain: no extractor configured for [ars.llm_judge]; \
+    let extractor = match crate::ops::concept_summary::create_ars_extractor(config, "ars.llm_judge")
+    {
+        Some(e) => e,
+        None => {
+            // No extractor — preserve any existing .processing-*
+            // files for manual recovery; don't reap them. Cache
+            // reaper above is harmless in this case.
+            tracing::debug!(
+                "judge drain: no extractor configured for [ars.llm_judge]; \
                      skipping drain + .processing reap (preserving any \
                      existing files for manual recovery)"
-                );
-                return DrainStats::default();
-            }
-        };
+            );
+            return DrainStats::default();
+        }
+    };
 
     // v0.27.x C4 — reap stale .processing-{ts}-{pid} files from
     // crashed prior drains. Now safe: extractor resolved means any
@@ -868,7 +1053,7 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
                 continue;
             }
         };
-        match dispatch_one(store, &extractor, job, daily_cap) {
+        match dispatch_one(store, config, &extractor, job, daily_cap) {
             Ok(DispatchResult::Emitted(_)) => stats.emitted += 1,
             Ok(DispatchResult::Dropped(reason)) => {
                 tracing::debug!(?reason, "judge drain: job dropped");
@@ -895,6 +1080,15 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_judge_config(dir: &tempfile::TempDir) -> crate::config::ReinConfig {
+        let mut config = crate::config::ReinConfig::default();
+        config.hooks.buffer_dir = dir.path().join("buffer").display().to_string();
+        config.database.path = dir.path().join("rein.db").display().to_string();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.cache_ttl_secs = 600;
+        config
+    }
 
     #[test]
     fn parse_judge_output_happy_path() {
@@ -965,5 +1159,135 @@ mod tests {
         assert_ne!(h1, h2);
         assert_ne!(h1, h3);
         assert_ne!(h2, h3);
+    }
+
+    #[test]
+    fn j5_rejects_synthesis_job_without_matching_cache_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_judge_config(&dir);
+        let store = SqliteStore::in_memory().unwrap();
+        let job = JudgeJob {
+            kind: JudgeJobKind::Synthesis,
+            surface_id: "syn-forged".to_string(),
+            concept_id: None,
+            query: "q".to_string(),
+            prompt: "p".to_string(),
+            candidate: "c".to_string(),
+            stamp_hash: JudgeJob::compute_stamp_hash("q", "p", "c"),
+            source: JudgeSource::ManualMcp,
+            query_type: None,
+            cluster_id: None,
+            source_count: Some(1),
+            judge_model_override: None,
+        };
+
+        assert!(
+            !verify_durable_judge_target(&store, &config, &job).unwrap(),
+            "forged synthesis job without cache-backed id+stamp must fail J5 before reservation"
+        );
+    }
+
+    #[test]
+    fn j5_accepts_concept_summary_when_cache_stamp_and_sql_target_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_judge_config(&dir);
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO concept_summary_instances \
+                 (summary_id, concept_id, summary_text, refreshed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "cs-live",
+                    "concept-live",
+                    "summary",
+                    chrono::Utc::now().timestamp()
+                ],
+            )
+            .unwrap();
+
+        let query = "";
+        let prompt = "prompt";
+        let candidate = "summary";
+        let stamp_hash = JudgeJob::compute_stamp_hash(query, prompt, candidate);
+        let cache_entry = serde_json::json!({
+            "concept_summary_id": "cs-live",
+            "concept_id": "concept-live",
+            "query": query,
+            "prompt": prompt,
+            "candidate": candidate,
+            "stamp_hash": stamp_hash,
+            "stamped_at": chrono::Utc::now().to_rfc3339()
+        });
+        let cache_path =
+            crate::ops::handlers::judge::concept_summary_cache_path_for_config(&config);
+        crate::ops::handlers::judge::append_jsonl_line(&cache_path, &cache_entry).unwrap();
+
+        let job = JudgeJob {
+            kind: JudgeJobKind::ConceptSummary,
+            surface_id: "cs-live".to_string(),
+            concept_id: Some("concept-live".to_string()),
+            query: query.to_string(),
+            prompt: prompt.to_string(),
+            candidate: candidate.to_string(),
+            stamp_hash,
+            source: JudgeSource::ManualMcp,
+            query_type: None,
+            cluster_id: None,
+            source_count: Some(0),
+            judge_model_override: None,
+        };
+
+        assert!(
+            verify_durable_judge_target(&store, &config, &job).unwrap(),
+            "concept-summary judge target should pass when cache stamp and durable SQL row agree"
+        );
+    }
+
+    #[test]
+    fn reap_expired_caches_prunes_concept_summary_instances_by_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = temp_judge_config(&dir);
+        config.ars.llm_judge.cache_ttl_secs = 60;
+        let store = SqliteStore::in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO concept_summary_instances \
+                 (summary_id, concept_id, summary_text, refreshed_at) \
+                 VALUES (?1, ?2, ?3, ?4), (?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "old-cs",
+                    "concept-a",
+                    "old",
+                    now - 120,
+                    "fresh-cs",
+                    "concept-b",
+                    "fresh",
+                    now,
+                ],
+            )
+            .unwrap();
+
+        reap_expired_caches(&store, &config);
+
+        let rows: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM concept_summary_instances", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let old_rows: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM concept_summary_instances WHERE summary_id = 'old-cs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(old_rows, 0);
     }
 }

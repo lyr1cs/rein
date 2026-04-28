@@ -14,7 +14,7 @@
 //! 4-way pipeline-interaction matrix** (`update()` × `apply_evolution`
 //! × `cold_archive` × `M5 strip`). J1 enforces this by allow-listing the
 //! worker's write set to `{feedback_events, judge_call_ledger,
-//! consumer_offsets, adaptive_state}` only. See
+//! consumer_offsets, adaptive_state, concept_summary_instances}` only. See
 //! `feedback_pipeline_interaction_matrix.md` for the broader v0.26.x
 //! audit lesson.
 
@@ -98,7 +98,7 @@ pub struct JudgeContext<'a> {
 pub enum JudgeViolation {
     /// J1 — worker attempted a write outside the allow-list
     /// `{feedback_events, judge_call_ledger, consumer_offsets,
-    /// adaptive_state}`.
+    /// adaptive_state, concept_summary_instances}`.
     NoMemoryWrites { table: String },
     /// J2 — daily call cap reached. Surfaced when reservation fails;
     /// worker drops the job.
@@ -174,7 +174,8 @@ pub const J1_ALLOWED_WRITE_TABLES: &[&str] = &[
     "feedback_events",
     "judge_call_ledger",
     "consumer_offsets",
-    "metadata", // adaptive_state lives inside metadata table
+    "metadata",                  // adaptive_state lives inside metadata table
+    "concept_summary_instances", // judge cache TTL reaper prunes Cap A retention rows
 ];
 
 /// J1 — verify a candidate SQL target table is in the allow-list. Pure
@@ -433,14 +434,24 @@ mod tests {
 
     #[test]
     fn j3_blocks_below_floor_when_defined() {
-        let ctx = ctx_for("h", LLM_JUDGE_J3_MIN_PAIRS + 5, LLM_JUDGE_KAPPA_FLOOR - 0.1, true);
+        let ctx = ctx_for(
+            "h",
+            LLM_JUDGE_J3_MIN_PAIRS + 5,
+            LLM_JUDGE_KAPPA_FLOOR - 0.1,
+            true,
+        );
         let err = no_self_reinforce(&ctx).unwrap_err();
         assert!(matches!(err, JudgeViolation::SelfReinforce { .. }));
     }
 
     #[test]
     fn j3_passes_above_floor() {
-        let ctx = ctx_for("h", LLM_JUDGE_J3_MIN_PAIRS + 5, LLM_JUDGE_KAPPA_FLOOR + 0.1, true);
+        let ctx = ctx_for(
+            "h",
+            LLM_JUDGE_J3_MIN_PAIRS + 5,
+            LLM_JUDGE_KAPPA_FLOOR + 0.1,
+            true,
+        );
         assert!(no_self_reinforce(&ctx).is_ok());
     }
 

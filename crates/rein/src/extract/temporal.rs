@@ -207,9 +207,7 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
     // Track byte ranges already consumed so later passes don't double-count.
     let mut consumed: Vec<(usize, usize)> = Vec::new();
     let is_consumed = |consumed: &Vec<(usize, usize)>, start: usize, end: usize| -> bool {
-        consumed
-            .iter()
-            .any(|(s, e)| !(end <= *s || start >= *e))
+        consumed.iter().any(|(s, e)| !(end <= *s || start >= *e))
     };
 
     // -----------------------------------------------------------------
@@ -316,9 +314,8 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
         }
     }
 
-    let cn_open_start =
-        Regex::new(r"((?:\d{4}-\d{2}-\d{2})|(?:(?:19|20)\d{2}))\s*(?:之前|以前)")
-            .expect("static regex compiles");
+    let cn_open_start = Regex::new(r"((?:\d{4}-\d{2}-\d{2})|(?:(?:19|20)\d{2}))\s*(?:之前|以前)")
+        .expect("static regex compiles");
     for cap in cn_open_start.captures_iter(content) {
         let m = cap.get(0).expect("group 0");
         if is_consumed(&consumed, m.start(), m.end()) {
@@ -400,10 +397,9 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
     // 4. English "N (days|weeks|months|years) ago"
     //    "in N (days|weeks|months|years)"
     // -----------------------------------------------------------------
-    let en_n_ago = Regex::new(
-        r"(?i)\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago\b",
-    )
-    .expect("static regex compiles");
+    let en_n_ago =
+        Regex::new(r"(?i)\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago\b")
+            .expect("static regex compiles");
     for cap in en_n_ago.captures_iter(content) {
         let m = cap.get(0).expect("group 0");
         if is_consumed(&consumed, m.start(), m.end()) {
@@ -429,10 +425,8 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
         consumed.push((m.start(), m.end()));
     }
 
-    let en_in_n = Regex::new(
-        r"(?i)\bin\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b",
-    )
-    .expect("static regex compiles");
+    let en_in_n = Regex::new(r"(?i)\bin\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b")
+        .expect("static regex compiles");
     for cap in en_in_n.captures_iter(content) {
         let m = cap.get(0).expect("group 0");
         if is_consumed(&consumed, m.start(), m.end()) {
@@ -461,62 +455,141 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
     // -----------------------------------------------------------------
     // 5. Fixed-vocabulary relative phrases (English + 中文).
     // -----------------------------------------------------------------
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "yesterday", |now| {
-        let now_floor = floor_to_day(now);
-        (now_floor - Duration::days(1), now_floor)
-    }, now, true);
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "tomorrow", |now| {
-        let now_floor = floor_to_day(now);
-        (now_floor + Duration::days(1), now_floor + Duration::days(2))
-    }, now, true);
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "last week", |now| {
-        last_iso_week_interval(now)
-    }, now, true);
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "this week", |now| {
-        this_iso_week_interval(now)
-    }, now, true);
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "last month", |now| {
-        let date = now.date_naive();
-        let (y, m) = if date.month() == 1 {
-            (date.year() - 1, 12)
-        } else {
-            (date.year(), date.month() - 1)
-        };
-        month_interval(y, m).unwrap_or((now, now))
-    }, now, true);
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "last year", |now| {
-        year_interval(now.date_naive().year() - 1).unwrap_or((now, now))
-    }, now, true);
-    push_fixed_phrase(content, &mut anchors, &mut consumed, "this year", |now| {
-        year_interval(now.date_naive().year()).unwrap_or((now, now))
-    }, now, true);
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "yesterday",
+        |now| {
+            let now_floor = floor_to_day(now);
+            (now_floor - Duration::days(1), now_floor)
+        },
+        now,
+        true,
+    );
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "tomorrow",
+        |now| {
+            let now_floor = floor_to_day(now);
+            (now_floor + Duration::days(1), now_floor + Duration::days(2))
+        },
+        now,
+        true,
+    );
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "last week",
+        last_iso_week_interval,
+        now,
+        true,
+    );
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "this week",
+        this_iso_week_interval,
+        now,
+        true,
+    );
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "last month",
+        |now| {
+            let date = now.date_naive();
+            let (y, m) = if date.month() == 1 {
+                (date.year() - 1, 12)
+            } else {
+                (date.year(), date.month() - 1)
+            };
+            month_interval(y, m).unwrap_or((now, now))
+        },
+        now,
+        true,
+    );
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "last year",
+        |now| year_interval(now.date_naive().year() - 1).unwrap_or((now, now)),
+        now,
+        true,
+    );
+    push_fixed_phrase(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "this year",
+        |now| year_interval(now.date_naive().year()).unwrap_or((now, now)),
+        now,
+        true,
+    );
 
     // 中文 fixed phrases. Use case-sensitive match (Chinese has no case)
     // and treat them as substring matches with no word boundary —
     // \b doesn't work for CJK in Rust regex.
-    push_fixed_phrase_cn(content, &mut anchors, &mut consumed, "昨天", |now| {
-        let now_floor = floor_to_day(now);
-        (now_floor - Duration::days(1), now_floor)
-    }, now);
-    push_fixed_phrase_cn(content, &mut anchors, &mut consumed, "明天", |now| {
-        let now_floor = floor_to_day(now);
-        (now_floor + Duration::days(1), now_floor + Duration::days(2))
-    }, now);
-    push_fixed_phrase_cn(content, &mut anchors, &mut consumed, "上周", |now| {
-        last_iso_week_interval(now)
-    }, now);
-    push_fixed_phrase_cn(content, &mut anchors, &mut consumed, "上个月", |now| {
-        let date = now.date_naive();
-        let (y, m) = if date.month() == 1 {
-            (date.year() - 1, 12)
-        } else {
-            (date.year(), date.month() - 1)
-        };
-        month_interval(y, m).unwrap_or((now, now))
-    }, now);
-    push_fixed_phrase_cn(content, &mut anchors, &mut consumed, "去年", |now| {
-        year_interval(now.date_naive().year() - 1).unwrap_or((now, now))
-    }, now);
+    push_fixed_phrase_cn(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "昨天",
+        |now| {
+            let now_floor = floor_to_day(now);
+            (now_floor - Duration::days(1), now_floor)
+        },
+        now,
+    );
+    push_fixed_phrase_cn(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "明天",
+        |now| {
+            let now_floor = floor_to_day(now);
+            (now_floor + Duration::days(1), now_floor + Duration::days(2))
+        },
+        now,
+    );
+    push_fixed_phrase_cn(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "上周",
+        last_iso_week_interval,
+        now,
+    );
+    push_fixed_phrase_cn(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "上个月",
+        |now| {
+            let date = now.date_naive();
+            let (y, m) = if date.month() == 1 {
+                (date.year() - 1, 12)
+            } else {
+                (date.year(), date.month() - 1)
+            };
+            month_interval(y, m).unwrap_or((now, now))
+        },
+        now,
+    );
+    push_fixed_phrase_cn(
+        content,
+        &mut anchors,
+        &mut consumed,
+        "去年",
+        |now| year_interval(now.date_naive().year() - 1).unwrap_or((now, now)),
+        now,
+    );
 
     // -----------------------------------------------------------------
     // 6. Month-name + year ("April 2024", "Jan 2026").
@@ -563,8 +636,7 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
     // year. The `regex` crate has no lookaround, so we drop the trailing
     // boundary from the regex and post-filter the next byte instead.
     // -----------------------------------------------------------------
-    let year_re =
-        Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(年?)").expect("static regex compiles");
+    let year_re = Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(年?)").expect("static regex compiles");
     for cap in year_re.captures_iter(content) {
         let year_match = cap.get(1).expect("group 1");
         let suffix_match = cap.get(2).expect("group 2");
@@ -778,8 +850,7 @@ pub async fn extract_temporal_llm(
     content: &str,
     now: DateTime<Utc>,
 ) -> ReinResult<Vec<TemporalAnchor>> {
-    let system =
-        TEMPORAL_LLM_SYSTEM_PROMPT_TEMPLATE.replace("{NOW_RFC3339}", &now.to_rfc3339());
+    let system = TEMPORAL_LLM_SYSTEM_PROMPT_TEMPLATE.replace("{NOW_RFC3339}", &now.to_rfc3339());
     // v0.27 R1 P2 fix: neutralize `</content>` close-tags in user input so
     // attacker-controlled content can't escape the data block. Mirror of
     // `extract/triples.rs::escape_for_tag` / `eval/llm_judge.rs`.
@@ -935,7 +1006,9 @@ pub fn temporal_overlap_score(a: &[TemporalAnchor], b: &[TemporalAnchor]) -> f32
     }
     let mut compatible = 0usize;
     for anchor_a in a {
-        let has_compat = b.iter().any(|anchor_b| !temporal_conflict(anchor_a, anchor_b));
+        let has_compat = b
+            .iter()
+            .any(|anchor_b| !temporal_conflict(anchor_a, anchor_b));
         if has_compat {
             compatible += 1;
         }
@@ -1070,8 +1143,10 @@ mod tests {
         // because the dash separator was eaten by the prior match leaving
         // the engine pointing at a digit. All three years must be captured.
         let anchors = extract_temporal_rule_based("in 2024-2025-2026 era", fixed_now());
-        let mut starts: Vec<i32> =
-            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        let mut starts: Vec<i32> = anchors
+            .iter()
+            .filter_map(|a| a.start.map(|s| s.year()))
+            .collect();
         starts.sort();
         starts.dedup();
         assert_eq!(starts, vec![2024, 2025, 2026]);
@@ -1080,8 +1155,10 @@ mod tests {
     #[test]
     fn consecutive_years_two_year_dash() {
         let anchors = extract_temporal_rule_based("2024-2025", fixed_now());
-        let mut starts: Vec<i32> =
-            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        let mut starts: Vec<i32> = anchors
+            .iter()
+            .filter_map(|a| a.start.map(|s| s.year()))
+            .collect();
         starts.sort();
         starts.dedup();
         assert_eq!(starts, vec![2024, 2025]);
@@ -1090,8 +1167,10 @@ mod tests {
     #[test]
     fn consecutive_years_slash_separated() {
         let anchors = extract_temporal_rule_based("2024/2025/2026", fixed_now());
-        let mut starts: Vec<i32> =
-            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        let mut starts: Vec<i32> = anchors
+            .iter()
+            .filter_map(|a| a.start.map(|s| s.year()))
+            .collect();
         starts.sort();
         starts.dedup();
         assert_eq!(starts, vec![2024, 2025, 2026]);
@@ -1102,8 +1181,10 @@ mod tests {
         // 2024年-2025年 — both years must be harvested, including the 年
         // suffix on each.
         let anchors = extract_temporal_rule_based("shipped 2024年-2025年", fixed_now());
-        let mut starts: Vec<i32> =
-            anchors.iter().filter_map(|a| a.start.map(|s| s.year())).collect();
+        let mut starts: Vec<i32> = anchors
+            .iter()
+            .filter_map(|a| a.start.map(|s| s.year()))
+            .collect();
         starts.sort();
         starts.dedup();
         assert_eq!(starts, vec![2024, 2025]);
@@ -1302,8 +1383,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result =
-            rt.block_on(extract_temporal_llm(&extractor, "yesterday", fixed_now()));
+        let result = rt.block_on(extract_temporal_llm(&extractor, "yesterday", fixed_now()));
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -1322,7 +1402,11 @@ mod tests {
             .build()
             .unwrap();
         let result = rt
-            .block_on(extract_temporal_llm(&extractor, "yesterday I shipped", fixed_now()))
+            .block_on(extract_temporal_llm(
+                &extractor,
+                "yesterday I shipped",
+                fixed_now(),
+            ))
             .expect("happy path");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].kind, AnchorKind::Relative);
@@ -1343,7 +1427,11 @@ mod tests {
         let result = rt
             .block_on(extract_temporal(Some(&extractor), "yesterday", fixed_now()))
             .expect("dispatcher returns Ok");
-        assert_eq!(result.len(), 1, "rule-based fallback should fire on LLM empty");
+        assert_eq!(
+            result.len(),
+            1,
+            "rule-based fallback should fire on LLM empty"
+        );
         assert_eq!(result[0].kind, AnchorKind::Relative);
     }
 

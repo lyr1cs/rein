@@ -224,7 +224,7 @@ export interface AdaptiveStatusSynthesisCluster {
 }
 
 export interface AdaptiveStatusSynthesisGlobal {
-  useful_rate: number;
+  useful_rate: number | null;
   total_events: number;
   last_consumed_event_id: number;
 }
@@ -336,6 +336,14 @@ export interface ConceptSummaryMetadata {
 export interface ConceptSummaryInteractionEvent {
   concept_id: string;
   recall_id: string;
+  /**
+   * v0.27.3 — per-refresh summary identity. Backends may expose this as
+   * `concept_summary_id` directly or as `living_summary_id` on concept-state;
+   * callers send whichever value is available so judge feedback can join to
+   * the exact summary instance the user saw.
+   */
+  concept_summary_id?: string;
+  living_summary_id?: string;
   interaction: ConceptSummaryInteractionKind;
   metadata?: ConceptSummaryMetadata;
 }
@@ -452,8 +460,8 @@ export interface Memoir {
 
 /**
  * Full export of a memoir's concepts + concept-links via
- * `GET /api/memoirs/{name}/export?format=json`. Used by Brain.tsx (fanned out
- * over every memoir via `useQueries`) and Graph.tsx (single-memoir view).
+ * `GET /api/memoirs/{name}/export?format=json`. Used by Brain.tsx (bounded
+ * fan-out via `useQueries`) and Graph.tsx (single-memoir view).
  */
 export interface MemoirExport {
   memoir: Memoir;
@@ -478,6 +486,8 @@ export interface ConceptState {
   revision: number;
   last_episode_id: string | null;
   living_summary: string | null;
+  living_summary_id?: string | null;
+  concept_summary_id?: string | null;
   living_summary_updated_at: string | null;
   living_summary_source_revision: number | null;
   created_at: string;

@@ -137,10 +137,13 @@ export function useEpisodes(limit = 20) {
   });
 }
 
-export function useArtifacts(limit = 20) {
+export function useArtifacts(limit = 20, offset = 0) {
   return useQuery({
-    queryKey: ['artifacts', limit],
-    queryFn: () => apiGet<{ artifacts: Artifact[] }>(`/api/artifacts?limit=${limit}`),
+    queryKey: ['artifacts', limit, offset],
+    queryFn: () =>
+      apiGet<{ artifacts: Artifact[] }>(
+        `/api/artifacts?limit=${limit}&offset=${offset}`,
+      ),
   });
 }
 
@@ -168,8 +171,8 @@ export function useMemoirs() {
 
 /**
  * Single memoir export — concepts + concept-links — keyed by memoir name so
- * each memoir has its own cache slot. Used directly by Graph.tsx and via
- * `useQueries` in Brain.tsx to fan out across every memoir.
+ * each memoir has its own cache slot. Used directly by Graph.tsx and by
+ * Brain.tsx's bounded export fan-out.
  *
  * Disabled when `name` is null so the hook composes cleanly with Graph.tsx's
  * "wait until selectedMemoir is set" flow.

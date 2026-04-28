@@ -24,9 +24,7 @@
 
 use std::sync::Arc;
 
-use rein::eval::llm_judge::{
-    JudgeMode, JudgeOutcome, LlmJudgeHitChecker, LLM_JUDGE_VERSION,
-};
+use rein::eval::llm_judge::{JudgeMode, JudgeOutcome, LlmJudgeHitChecker, LLM_JUDGE_VERSION};
 use rein::eval::HIT_CHECKER_VERSION;
 use rein::extract::{ExtractorKind, MockExtractor};
 
@@ -50,7 +48,10 @@ fn judge_synthesis_hit_path() {
             "synthesized text covering both sources",
         )
         .expect("hit-path mock returned valid JSON; judge must succeed");
-    assert!(outcome.hit, "mock returned hit=true; outcome must mirror it");
+    assert!(
+        outcome.hit,
+        "mock returned hit=true; outcome must mirror it"
+    );
     assert!(
         !outcome.reason.is_empty(),
         "reason field must propagate from the LLM JSON to the outcome"
@@ -121,7 +122,10 @@ fn judge_concept_summary_hit_path() {
     )]);
     let extractor = Arc::new(ExtractorKind::Mock(mock));
     let judge = LlmJudgeHitChecker::new(extractor, JudgeMode::ConceptSummaryFactCoverage);
-    let evidence = vec!["evidence theme 1".to_string(), "evidence theme 2".to_string()];
+    let evidence = vec![
+        "evidence theme 1".to_string(),
+        "evidence theme 2".to_string(),
+    ];
     let outcome = judge
         .judge_concept_summary(
             "concept definition covering both evidence themes",
@@ -129,7 +133,10 @@ fn judge_concept_summary_hit_path() {
             &evidence,
         )
         .expect("hit-path mock for concept-summary must succeed");
-    assert!(outcome.hit, "mock returned hit=true; outcome must mirror it");
+    assert!(
+        outcome.hit,
+        "mock returned hit=true; outcome must mirror it"
+    );
     assert!(
         !outcome.reason.is_empty(),
         "reason field must propagate for concept-summary mode too"

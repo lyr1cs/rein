@@ -618,6 +618,10 @@ pub struct ConceptStateOutput {
     pub revision: u32,
     pub last_episode_id: Option<String>,
     pub living_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub living_summary_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_summary_id: Option<String>,
     pub living_summary_updated_at: Option<String>,
     pub living_summary_source_revision: Option<u32>,
     pub created_at: String,
@@ -635,7 +639,9 @@ pub struct ConceptStateOutput {
     pub cluster_id: Option<i64>,
 }
 
-fn is_false(b: &bool) -> bool { !*b }
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 
 impl IntoJson for ConceptStateOutput {
     fn to_json(&self) -> serde_json::Value {
@@ -1055,7 +1061,10 @@ impl OpsRuntime {
                         }
                     }
                 }
-                counts.into_iter().max_by_key(|(_, n)| *n).map(|(cid, _)| cid)
+                counts
+                    .into_iter()
+                    .max_by_key(|(_, n)| *n)
+                    .map(|(cid, _)| cid)
             };
 
             // v0.27 R2 P2 fix: consult the Cap A adaptive gate when caller
@@ -1107,6 +1116,8 @@ impl OpsRuntime {
                 revision: concept.revision,
                 last_episode_id: concept.last_episode_id,
                 living_summary,
+                living_summary_id: concept.living_summary_id.clone(),
+                concept_summary_id: concept.living_summary_id,
                 living_summary_updated_at: concept
                     .living_summary_updated_at
                     .map(|dt| dt.to_rfc3339()),

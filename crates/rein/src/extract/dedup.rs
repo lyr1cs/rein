@@ -675,27 +675,23 @@ pub fn check_dedup(
             let filtered_losers: Vec<String> = if dedup_cfg.temporal_supersede_enabled
                 && new_anchors_cache.as_ref().is_some_and(|a| !a.is_empty())
             {
-                let new_anchors = new_anchors_cache
-                    .as_deref()
-                    .unwrap_or(&[]);
+                let new_anchors = new_anchors_cache.as_deref().unwrap_or(&[]);
                 losers
                     .into_iter()
                     .filter(|loser_id| {
                         let Some(loser) = candidates.iter().find(|c| &c.id == loser_id) else {
                             return true;
                         };
-                        let cand_anchors = extract_temporal_rule_based(
-                            &loser.content,
-                            loser.created_at,
-                        );
+                        let cand_anchors =
+                            extract_temporal_rule_based(&loser.content, loser.created_at);
                         if cand_anchors.is_empty() {
                             return true;
                         }
                         // Drop the loser when at least one new anchor has
                         // NO compatible counterpart on the loser side.
-                        let conflict = new_anchors.iter().any(|a| {
-                            cand_anchors.iter().all(|b| temporal_conflict(a, b))
-                        });
+                        let conflict = new_anchors
+                            .iter()
+                            .any(|a| cand_anchors.iter().all(|b| temporal_conflict(a, b)));
                         !conflict
                     })
                     .collect()
@@ -707,7 +703,10 @@ pub fn check_dedup(
             if filtered_losers.is_empty() {
                 return Ok(DedupAction::MergeInto(winner.memory_id.clone()));
             }
-            return Ok(DedupAction::MergeIntoMany(winner.memory_id.clone(), filtered_losers));
+            return Ok(DedupAction::MergeIntoMany(
+                winner.memory_id.clone(),
+                filtered_losers,
+            ));
         } else {
             return Ok(DedupAction::Supersede(winner.memory_id.clone()));
         }
@@ -1015,11 +1014,9 @@ fn maybe_temporal_supersede(
     // supersede each other — the 2024-vs-2026 cross-pair conflicts but
     // each anchor has an identical match. Conflict only when at least one
     // new anchor has NO compatible (= non-conflicting) counterpart.
-    let conflict = new_anchors.iter().any(|a| {
-        cand_anchors
-            .iter()
-            .all(|b| temporal_conflict(a, b))
-    });
+    let conflict = new_anchors
+        .iter()
+        .any(|a| cand_anchors.iter().all(|b| temporal_conflict(a, b)));
     if !conflict {
         return None;
     }
@@ -1029,9 +1026,9 @@ fn maybe_temporal_supersede(
     // already supersede this candidate's canonical (transitively) — gives a
     // monotonic value good enough for audit-log purposes. v0.28+ will
     // formalize this against a memory_revisions table.
-    let canonical = store.canonical_id_for(&candidate.id).unwrap_or_else(|_| {
-        candidate.id.clone()
-    });
+    let canonical = store
+        .canonical_id_for(&candidate.id)
+        .unwrap_or_else(|_| candidate.id.clone());
     let version: u32 = store
         .conn()
         .query_row(
@@ -1053,7 +1050,10 @@ fn maybe_temporal_supersede(
         version = version,
         "v0.27 #8: temporal conflict — MergeInto → TemporalSupersede"
     );
-    Some(DedupAction::TemporalSupersede(candidate.id.clone(), version))
+    Some(DedupAction::TemporalSupersede(
+        candidate.id.clone(),
+        version,
+    ))
 }
 
 /// Look up embedding-based candidates for cross-topic dedup (zero API cost).
@@ -1583,16 +1583,8 @@ mod tests {
             fts_hits.len()
         );
 
-        let action = check_dedup(
-            &store,
-            "deploys",
-            "deploys summary",
-            shared,
-            0.30,
-            7,
-            None,
-        )
-        .unwrap();
+        let action =
+            check_dedup(&store, "deploys", "deploys summary", shared, 0.30, 7, None).unwrap();
 
         let DedupAction::MergeIntoMany(winner, losers) = action else {
             panic!("expected MergeIntoMany, got {action:?}");
@@ -1697,14 +1689,8 @@ mod tests {
 
         // "user prefers spaces" ≠ "Alice prefers tabs" → triple overlap is
         // 0 (objects differ AND subjects differ after pronoun normalization).
-        let action = maybe_triple_upgrade(
-            None,
-            "I prefer spaces",
-            &candidate,
-            &cfg,
-            &mut cache,
-            30,
-        );
+        let action =
+            maybe_triple_upgrade(None, "I prefer spaces", &candidate, &cfg, &mut cache, 30);
         assert!(
             action.is_none(),
             "low triple overlap must NOT upgrade, got {action:?}"
@@ -1777,6 +1763,9 @@ mod tests {
     fn v027_merge_into_many_with_empty_losers_renders_safely() {
         let action = DedupAction::MergeIntoMany("W".into(), vec![]);
         let rendered = format!("{action}");
-        assert!(rendered.contains("0 losers"), "expected '0 losers', got {rendered}");
+        assert!(
+            rendered.contains("0 losers"),
+            "expected '0 losers', got {rendered}"
+        );
     }
 }

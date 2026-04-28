@@ -11,10 +11,12 @@
 
 #![cfg(feature = "test-support")]
 
+use rein::config::ReinConfig;
 use rein::extract::llm::{ExtractorKind, MockExtractor};
 use rein::judge::contract::LLM_JUDGE_DAILY_CALL_CAP_DEFAULT;
 use rein::ops::llm_judge_worker::{
-    dispatch_one, parse_judge_output, DispatchResult, DropReason, JudgeJob, JudgeJobKind,
+    dispatch_one, parse_judge_output, write_test_judge_cache_entry, DispatchResult, DropReason,
+    JudgeJob, JudgeJobKind,
 };
 use rein::store::adaptive::{
     peek_events, EventType, JudgeSource, SynthesisLlmJudgePayload, LLM_JUDGE_J3_MIN_PAIRS,
@@ -22,7 +24,7 @@ use rein::store::adaptive::{
 };
 use rein::store::SqliteStore;
 
-fn temp_store() -> (SqliteStore, tempfile::TempDir) {
+fn temp_store() -> (SqliteStore, ReinConfig, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut config = rein::config::ReinConfig::default();
     config.database.path = tmp
@@ -30,8 +32,11 @@ fn temp_store() -> (SqliteStore, tempfile::TempDir) {
         .join("memories.db")
         .to_string_lossy()
         .into_owned();
+    config.hooks.buffer_dir = tmp.path().join("buffer").to_string_lossy().into_owned();
+    config.ars.llm_judge.enabled = true;
+    config.ars.llm_judge.cache_ttl_secs = 600;
     let store = config.open_store().expect("open store");
-    (store, tmp)
+    (store, config, tmp)
 }
 
 fn make_job(
@@ -59,9 +64,30 @@ fn make_job(
     }
 }
 
+fn prepare_j5_target(store: &SqliteStore, config: &ReinConfig, job: &JudgeJob) {
+    write_test_judge_cache_entry(config, job).expect("write judge cache entry");
+    if matches!(job.kind, JudgeJobKind::ConceptSummary) {
+        let concept_id = job.concept_id.as_deref().unwrap_or("concept-test");
+        store
+            .conn()
+            .execute(
+                "INSERT OR IGNORE INTO concept_summary_instances \
+                 (summary_id, concept_id, summary_text, refreshed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    &job.surface_id,
+                    concept_id,
+                    &job.candidate,
+                    chrono::Utc::now().timestamp()
+                ],
+            )
+            .expect("insert concept summary target");
+    }
+}
+
 #[test]
 fn dispatch_emits_synthesis_judge_event_on_hit() {
-    let (store, _tmp) = temp_store();
+    let (store, config, _tmp) = temp_store();
     let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
         "HIT: yes\nWHY: synthesis cites every evidence id.",
     ));
@@ -73,9 +99,16 @@ fn dispatch_emits_synthesis_judge_event_on_hit() {
         "Sources: [#1] note about migration. [#2] decision to add index.",
         "v0.27 added a migration and a new index.",
     );
+    prepare_j5_target(&store, &config, &job);
 
-    let res = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT)
-        .expect("dispatch ok");
+    let res = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    )
+    .expect("dispatch ok");
     let event_id = match res {
         DispatchResult::Emitted(id) => id,
         other => panic!("expected Emitted, got {other:?}"),
@@ -95,8 +128,8 @@ fn dispatch_emits_synthesis_judge_event_on_hit() {
         "emitted event must be peekable"
     );
     let target = events.iter().find(|e| e.id == event_id).unwrap();
-    let payload: SynthesisLlmJudgePayload = serde_json::from_str(target.payload.as_deref().unwrap())
-        .expect("payload deserializes");
+    let payload: SynthesisLlmJudgePayload =
+        serde_json::from_str(target.payload.as_deref().unwrap()).expect("payload deserializes");
     assert_eq!(payload.synthesis_id, "syn_test_1");
     assert!(payload.hit, "verdict should be HIT=yes");
     assert!(
@@ -107,7 +140,7 @@ fn dispatch_emits_synthesis_judge_event_on_hit() {
 
 #[test]
 fn dispatch_emits_concept_summary_judge_event_on_miss() {
-    let (store, _tmp) = temp_store();
+    let (store, config, _tmp) = temp_store();
     let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
         "HIT: no\nWHY: paraphrased the version string into a generic term.",
     ));
@@ -119,9 +152,16 @@ fn dispatch_emits_concept_summary_judge_event_on_miss() {
         "Definition: usearch HNSW wrapper.",
         "A vector library wrapper.",
     );
+    prepare_j5_target(&store, &config, &job);
 
-    let res = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT)
-        .expect("dispatch ok");
+    let res = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    )
+    .expect("dispatch ok");
     let event_id = match res {
         DispatchResult::Emitted(id) => id,
         other => panic!("expected Emitted, got {other:?}"),
@@ -140,7 +180,7 @@ fn dispatch_emits_concept_summary_judge_event_on_miss() {
 
 #[test]
 fn dispatch_drops_when_daily_cap_reached() {
-    let (store, _tmp) = temp_store();
+    let (store, config, _tmp) = temp_store();
     let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![
         Ok("HIT: yes\nWHY: ok".to_string()),
         Ok("HIT: yes\nWHY: ok".to_string()),
@@ -148,19 +188,14 @@ fn dispatch_drops_when_daily_cap_reached() {
     ]));
     // Cap = 2. Third dispatch should drop with DailyCapReached.
     for _ in 0..2 {
-        let job = make_job(
-            JudgeJobKind::Synthesis,
-            "syn_cap",
-            None,
-            "q",
-            "p",
-            "c",
-        );
-        let res = dispatch_one(&store, &extractor, job, 2).expect("dispatch ok");
+        let job = make_job(JudgeJobKind::Synthesis, "syn_cap", None, "q", "p", "c");
+        prepare_j5_target(&store, &config, &job);
+        let res = dispatch_one(&store, &config, &extractor, job, 2).expect("dispatch ok");
         assert!(matches!(res, DispatchResult::Emitted(_)));
     }
     let job = make_job(JudgeJobKind::Synthesis, "syn_cap2", None, "q", "p", "c");
-    let res = dispatch_one(&store, &extractor, job, 2).expect("dispatch ok");
+    prepare_j5_target(&store, &config, &job);
+    let res = dispatch_one(&store, &config, &extractor, job, 2).expect("dispatch ok");
     match res {
         DispatchResult::Dropped(DropReason::DailyCapReached) => {}
         other => panic!("expected DailyCapReached, got {other:?}"),
@@ -169,20 +204,20 @@ fn dispatch_drops_when_daily_cap_reached() {
 
 #[test]
 fn dispatch_drops_on_unparseable_llm_output() {
-    let (store, _tmp) = temp_store();
+    let (store, config, _tmp) = temp_store();
     let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
         "this is not the strict format",
     ));
-    let job = make_job(
-        JudgeJobKind::Synthesis,
-        "syn_bad",
-        None,
-        "q",
-        "p",
-        "c",
-    );
-    let res = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT)
-        .expect("dispatch ok");
+    let job = make_job(JudgeJobKind::Synthesis, "syn_bad", None, "q", "p", "c");
+    prepare_j5_target(&store, &config, &job);
+    let res = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    )
+    .expect("dispatch ok");
     match res {
         DispatchResult::Dropped(DropReason::LlmError(msg)) => {
             assert!(msg.contains("unparseable") || msg.contains("verdict"));
@@ -193,14 +228,18 @@ fn dispatch_drops_on_unparseable_llm_output() {
 
 #[test]
 fn dispatch_drops_on_empty_surface_id() {
-    let (store, _tmp) = temp_store();
-    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
-        "HIT: yes\nWHY: ok",
-    ));
+    let (store, config, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response("HIT: yes\nWHY: ok"));
     // Empty surface_id violates J5 link-present.
     let job = make_job(JudgeJobKind::Synthesis, "", None, "q", "p", "c");
-    let res = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT)
-        .expect("dispatch ok");
+    let res = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    )
+    .expect("dispatch ok");
     match res {
         DispatchResult::Dropped(DropReason::ContractViolation(msg)) => {
             assert!(msg.contains("LinkAbsent") || msg.contains("J5"));
@@ -211,15 +250,19 @@ fn dispatch_drops_on_empty_surface_id() {
 
 #[test]
 fn dispatch_drops_on_stamp_hash_mismatch() {
-    let (store, _tmp) = temp_store();
-    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
-        "HIT: yes\nWHY: ok",
-    ));
+    let (store, config, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response("HIT: yes\nWHY: ok"));
     let mut job = make_job(JudgeJobKind::Synthesis, "syn_hash", None, "q", "p", "c");
     // Forge an invalid stamp_hash so J7 must catch the mismatch.
     job.stamp_hash = "deadbeef".to_string();
-    let res = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT)
-        .expect("dispatch ok");
+    let res = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    )
+    .expect("dispatch ok");
     match res {
         DispatchResult::Dropped(DropReason::ContractViolation(msg)) => {
             assert!(msg.contains("stamp_hash"));
@@ -230,11 +273,18 @@ fn dispatch_drops_on_stamp_hash_mismatch() {
 
 #[test]
 fn dispatch_lets_llm_error_failures_drop_gracefully() {
-    let (store, _tmp) = temp_store();
+    let (store, config, _tmp) = temp_store();
     let extractor = ExtractorKind::Mock(MockExtractor::with_persistent_error("upstream 503"));
     let job = make_job(JudgeJobKind::Synthesis, "syn_err", None, "q", "p", "c");
-    let res = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT)
-        .expect("dispatch never propagates LLM errors per J4");
+    prepare_j5_target(&store, &config, &job);
+    let res = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    )
+    .expect("dispatch never propagates LLM errors per J4");
     match res {
         DispatchResult::Dropped(DropReason::LlmError(_)) => {}
         other => panic!("expected LlmError, got {other:?}"),
@@ -272,7 +322,7 @@ fn dispatch_then_consumer_fold_updates_useful_rate() {
     use rein::store::adaptive::recompute_synthesis_feedback_stats_with_judge;
     use std::collections::HashMap;
 
-    let (store, _tmp) = temp_store();
+    let (store, config, _tmp) = temp_store();
     let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
         "HIT: yes\nWHY: covers all source facts.",
     ));
@@ -284,19 +334,25 @@ fn dispatch_then_consumer_fold_updates_useful_rate() {
         "rein is a memory system",
         "rein is a multi-source cross-validated memory MCP server.",
     );
-    let result = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT);
+    prepare_j5_target(&store, &config, &job);
+    let result = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    );
     assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
 
     // Drain the emitted event into adaptive state via the consumer.
-    let (state, _pairs, _calibration, max_id) =
-        recompute_synthesis_feedback_stats_with_judge(
-            store.conn(),
-            None,
-            HashMap::new(),
-            Default::default(),
-            0.3,
-        )
-        .expect("consumer fold succeeds");
+    let (state, _pairs, _calibration, max_id) = recompute_synthesis_feedback_stats_with_judge(
+        store.conn(),
+        None,
+        HashMap::new(),
+        Default::default(),
+        0.3,
+    )
+    .expect("consumer fold succeeds");
     assert!(max_id.is_some(), "consumer should have advanced offset");
     // make_job sets cluster_id=Some(7), query_type=Some("Semantic").
     let key = rein::store::adaptive::synthesis_bucket_key(Some(7), "Semantic");
@@ -318,10 +374,8 @@ fn dispatch_then_consumer_fold_updates_useful_rate() {
 /// dispatch_one returns Dropped(DailyCapReached).
 #[test]
 fn dispatch_drops_when_cap_reached() {
-    let (store, _tmp) = temp_store();
-    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
-        "HIT: yes\nWHY: ok.",
-    ));
+    let (store, config, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response("HIT: yes\nWHY: ok."));
     // Fill the ledger up to a low custom cap.
     let cap: u64 = 2;
     for i in 0..cap as usize {
@@ -334,10 +388,9 @@ fn dispatch_drops_when_cap_reached() {
             "c",
         );
         // Re-create the mock for each call (consumes one scripted response per dispatch).
-        let extr = ExtractorKind::Mock(MockExtractor::with_fixed_response(
-            "HIT: yes\nWHY: ok.",
-        ));
-        let _ = dispatch_one(&store, &extr, job, cap);
+        let extr = ExtractorKind::Mock(MockExtractor::with_fixed_response("HIT: yes\nWHY: ok."));
+        prepare_j5_target(&store, &config, &job);
+        let _ = dispatch_one(&store, &config, &extr, job, cap);
     }
     // Third job at cap=2 must be dropped without an LLM call.
     let job = make_job(
@@ -348,9 +401,13 @@ fn dispatch_drops_when_cap_reached() {
         "p",
         "c",
     );
-    let result = dispatch_one(&store, &extractor, job, cap);
+    prepare_j5_target(&store, &config, &job);
+    let result = dispatch_one(&store, &config, &extractor, job, cap);
     assert!(
-        matches!(result, Ok(DispatchResult::Dropped(DropReason::DailyCapReached))),
+        matches!(
+            result,
+            Ok(DispatchResult::Dropped(DropReason::DailyCapReached))
+        ),
         "expected DailyCapReached, got {result:?}"
     );
     // Verify the third event was NOT emitted to feedback_events.
@@ -372,10 +429,8 @@ fn dispatch_drops_when_cap_reached() {
 /// override model, and the emitted event records the override model.
 #[test]
 fn judge_model_override_records_override_model() {
-    let (store, _tmp) = temp_store();
-    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
-        "HIT: yes\nWHY: ok.",
-    ));
+    let (store, config, _tmp) = temp_store();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response("HIT: yes\nWHY: ok."));
     let mut job = make_job(
         JudgeJobKind::Synthesis,
         "synth_override_001",
@@ -389,7 +444,14 @@ fn judge_model_override_records_override_model() {
     // emitted event SHOULD record the actual model used (which is
     // "mock" for MockExtractor). This anchors the v0.27.2 R8-P3 fix
     // that we record actual, never hallucinate the override.
-    let result = dispatch_one(&store, &extractor, job, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT);
+    prepare_j5_target(&store, &config, &job);
+    let result = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    );
     assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
     let events = peek_events(
         store.conn(),

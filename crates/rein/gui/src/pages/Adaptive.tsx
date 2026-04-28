@@ -408,6 +408,7 @@ const DWELL_BUCKETS: Array<{ label: string; max: number }> = [
   { label: '5-10s', max: 10000 },
   { label: '10s+', max: Number.POSITIVE_INFINITY },
 ];
+const SYNTHESIS_BUCKET_DISPLAY_LIMIT = 40;
 
 /**
  * v0.27.1 E direction — render the per-bucket label that sits next to each
@@ -433,6 +434,10 @@ function formatBucketAnnotation(
   return `${base} · judge ${hits}/${judgeCount} (${pct}%)`;
 }
 
+function bucketSignalCount(row: AdaptiveStatusSynthesis['by_cluster'][number]): number {
+  return row.viewed_count + (row.llm_judge_count ?? 0);
+}
+
 function SynthesisQualitySection({
   projection,
 }: {
@@ -452,20 +457,44 @@ function SynthesisQualitySection({
   );
   const global = projection?.global ?? null;
   const hasData = byCluster.length > 0 || global !== null;
+  const sortedRows = useMemo(
+    () =>
+      [...byCluster]
+        .sort(
+          (a, b) =>
+            bucketSignalCount(b) - bucketSignalCount(a) ||
+            b.useful_rate - a.useful_rate ||
+            a.cluster_id - b.cluster_id ||
+            a.query_type.localeCompare(b.query_type),
+        ),
+    [byCluster],
+  );
+  const displayRows = useMemo(
+    () => sortedRows.slice(0, SYNTHESIS_BUCKET_DISPLAY_LIMIT),
+    [sortedRows],
+  );
+  const hiddenBucketCount = Math.max(0, byCluster.length - displayRows.length);
+  const hiddenSignalCount = useMemo(
+    () =>
+      sortedRows
+        .slice(displayRows.length)
+        .reduce((sum, row) => sum + bucketSignalCount(row), 0),
+    [sortedRows, displayRows.length],
+  );
 
   // Distinct query types in the data — used for both the bar fill and the
   // legend chips. Stable order = first-seen (matches server projection).
   const queryTypes = useMemo(() => {
     const seen: string[] = [];
-    for (const row of byCluster) {
+    for (const row of displayRows) {
       if (!seen.includes(row.query_type)) seen.push(row.query_type);
     }
     return seen;
-  }, [byCluster]);
+  }, [displayRows]);
 
   const usefulBars = useMemo(
     () =>
-      byCluster.map((row) => ({
+      displayRows.map((row) => ({
         bucket: `C${row.cluster_id}/${row.query_type === '_global' ? 'global' : row.query_type}`,
         cluster_id: row.cluster_id,
         query_type: row.query_type,
@@ -482,22 +511,22 @@ function SynthesisQualitySection({
           row.llm_judge_hit_count,
         ),
       })),
-    [byCluster],
+    [displayRows],
   );
 
   const clickBars = useMemo(
     () =>
-      byCluster.map((row) => ({
+      displayRows.map((row) => ({
         bucket: `C${row.cluster_id}/${row.query_type === '_global' ? 'global' : row.query_type}`,
         clicked_source_rate: row.clicked_source_rate,
         query_type: row.query_type,
       })),
-    [byCluster],
+    [displayRows],
   );
 
   const dwellHistogram = useMemo(() => {
     const buckets = DWELL_BUCKETS.map((b) => ({ label: b.label, count: 0 }));
-    for (const row of byCluster) {
+    for (const row of displayRows) {
       if (row.viewed_dwell_p50_ms === null) continue;
       const idx = DWELL_BUCKETS.findIndex(
         (b) => (row.viewed_dwell_p50_ms ?? 0) <= b.max,
@@ -505,7 +534,7 @@ function SynthesisQualitySection({
       if (idx >= 0) buckets[idx].count += 1;
     }
     return buckets;
-  }, [byCluster]);
+  }, [displayRows]);
 
   if (!hasData) {
     return (
@@ -542,7 +571,9 @@ function SynthesisQualitySection({
             Useful Rate
           </div>
           <div className="text-3xl font-mono text-[var(--text-primary)]">
-            {global !== null ? (global.useful_rate * 100).toFixed(0) + '%' : '—'}
+            {global?.useful_rate != null
+              ? (global.useful_rate * 100).toFixed(0) + '%'
+              : '—'}
           </div>
           {global !== null && (
             <>
@@ -569,6 +600,13 @@ function SynthesisQualitySection({
           boundary — bars above the line vote-in synthesis for that
           cluster, bars below vote-out. */}
       <Panel title="Useful Rate (per cluster)" className="md:col-span-2">
+        {hiddenBucketCount > 0 && (
+          <div className="mb-2 rounded border border-[var(--border)] bg-[var(--bg-primary)]/60 px-2 py-1 text-[10px] text-[var(--text-muted)]">
+            Showing top {displayRows.length} of {byCluster.length} buckets by
+            signal count; {hiddenBucketCount} lower-signal buckets hidden
+            ({hiddenSignalCount.toLocaleString()} signals).
+          </div>
+        )}
         <div className="flex gap-3 mb-2 flex-wrap">
           {queryTypes.map((qt) => (
             <div key={qt} className="flex items-center gap-1.5 text-[10px]">
@@ -584,7 +622,7 @@ function SynthesisQualitySection({
             </div>
           ))}
         </div>
-        <ResponsiveContainer width="100%" height={Math.max(180, byCluster.length * 22)}>
+        <ResponsiveContainer width="100%" height={Math.max(180, displayRows.length * 22)}>
           <BarChart data={usefulBars} layout="vertical" margin={{ top: 0, right: 30, left: 60, bottom: 0 }}>
             <XAxis
               type="number"
@@ -655,7 +693,7 @@ function SynthesisQualitySection({
           reads as a separate signal from useful_rate even when both
           panels stack. */}
       <Panel title="Click-through rate (per cluster)" className="md:col-span-2">
-        <ResponsiveContainer width="100%" height={Math.max(180, byCluster.length * 22)}>
+        <ResponsiveContainer width="100%" height={Math.max(180, displayRows.length * 22)}>
           <BarChart data={clickBars} layout="vertical" margin={{ top: 0, right: 20, left: 60, bottom: 0 }}>
             <XAxis
               type="number"

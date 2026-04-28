@@ -47,19 +47,46 @@ function parseTranscript(text: string): Turn[] {
 
 /* ── Artifacts page ─────────────────────────────────────────────── */
 
+const ARTIFACT_PAGE_SIZE = 20;
+
 export default function Artifacts() {
-  const [limit, setLimit] = useState(20);
+  const [offset, setOffset] = useState(0);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [hasMore, setHasMore] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ArtifactDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const detailAbortRef = useRef<AbortController | null>(null);
   const detailRequestRef = useRef(0);
+  const appliedPageRef = useRef<string | null>(null);
 
-  const { data, isLoading } = useArtifacts(limit);
-  const artifacts = data?.artifacts ?? [];
+  const { data, isLoading, isFetching } = useArtifacts(ARTIFACT_PAGE_SIZE, offset);
 
   useEffect(() => () => detailAbortRef.current?.abort(), []);
+
+  useEffect(() => {
+    if (!data?.artifacts) return;
+
+    const page = data.artifacts;
+    const pageKey = `${offset}:${page.map((artifact) => artifact.id).join('|')}`;
+    if (appliedPageRef.current === pageKey) return;
+    appliedPageRef.current = pageKey;
+    setHasMore(page.length === ARTIFACT_PAGE_SIZE);
+
+    setArtifacts((prev) => {
+      if (offset === 0) return page;
+      const seen = new Set(prev.map((artifact) => artifact.id));
+      return [
+        ...prev,
+        ...page.filter((artifact) => {
+          if (seen.has(artifact.id)) return false;
+          seen.add(artifact.id);
+          return true;
+        }),
+      ];
+    });
+  }, [data, offset]);
 
   const handleRowClick = useCallback(
     async (artifact: Artifact) => {
@@ -106,8 +133,10 @@ export default function Artifacts() {
   );
 
   const handleLoadMore = useCallback(() => {
-    setLimit((prev) => prev + 20);
-  }, []);
+    if (hasMore && !isFetching) {
+      setOffset((prev) => prev + ARTIFACT_PAGE_SIZE);
+    }
+  }, [hasMore, isFetching]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -232,14 +261,17 @@ export default function Artifacts() {
             ))}
 
             {/* Load More */}
-            <div className="flex justify-center py-4">
-              <button
-                onClick={handleLoadMore}
-                className="px-6 py-2 text-xs rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--accent)] transition-colors"
-              >
-                Load More
-              </button>
-            </div>
+            {hasMore && (
+              <div className="flex justify-center py-4">
+                <button
+                  onClick={handleLoadMore}
+                  disabled={isFetching}
+                  className="px-6 py-2 text-xs rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--accent)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isFetching ? 'Loading...' : 'Load More'}
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

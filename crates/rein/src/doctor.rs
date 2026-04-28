@@ -576,8 +576,7 @@ fn check_extract_provider(config: &ReinConfig) -> DoctorCheck {
     // hardcoded `GEMINI_API_KEY`, so an operator on a custom env name
     // (e.g. `[llm.google].api_key_env = "MY_KEY"`) saw a false WARN
     // even though the migrated constructors successfully read MY_KEY.
-    let api_key_present_for_extract =
-        google_api_key_resolved(config, resolved.as_ref());
+    let api_key_present_for_extract = google_api_key_resolved(config, resolved.as_ref());
     match provider {
         Provider::Google if api_key_present_for_extract => ok_in(
             DoctorCategory::Configuration,
@@ -1505,10 +1504,7 @@ fn recover_inflight_file(
 /// v0.27.1 — surface `JudgeCalibrationState` stats so operators know
 /// the runtime LLM judge is producing usable signal. Reports κ values,
 /// pair counts, drift alert count, and last-computed timestamp.
-fn check_judge_calibration(
-    store: &crate::store::SqliteStore,
-    config: &ReinConfig,
-) -> DoctorCheck {
+fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfig) -> DoctorCheck {
     if !config.ars.llm_judge.enabled {
         return ok_in(
             DoctorCategory::Configuration,
@@ -1560,10 +1556,7 @@ fn check_judge_calibration(
 }
 
 /// v0.27.1 — rolling 24h judge_call_ledger usage vs daily_call_cap.
-fn check_judge_call_ledger(
-    store: &crate::store::SqliteStore,
-    config: &ReinConfig,
-) -> DoctorCheck {
+fn check_judge_call_ledger(store: &crate::store::SqliteStore, config: &ReinConfig) -> DoctorCheck {
     if !config.ars.llm_judge.enabled {
         return ok_in(
             DoctorCategory::Configuration,
@@ -1613,9 +1606,7 @@ fn check_judge_call_ledger(
             );
         }
     };
-    let summary = format!(
-        "24h: {active}/{cap} (in_flight={in_flight} stale={stale})"
-    );
+    let summary = format!("24h: {active}/{cap} (in_flight={in_flight} stale={stale})");
     if (active as u64) >= cap {
         warn_in(DoctorCategory::Configuration, "judge_call_ledger", summary)
     } else {
@@ -1635,9 +1626,8 @@ fn check_judge_cache_size(config: &ReinConfig) -> DoctorCheck {
     }
     let synth = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
     let concept = crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
-    let size_of = |p: &std::path::Path| -> u64 {
-        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-    };
+    let size_of =
+        |p: &std::path::Path| -> u64 { std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) };
     let synth_bytes = size_of(&synth);
     let concept_bytes = size_of(&concept);
     let total_mb = (synth_bytes + concept_bytes) as f64 / 1_048_576.0;

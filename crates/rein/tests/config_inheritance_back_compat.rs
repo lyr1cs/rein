@@ -35,10 +35,8 @@ const FIXTURE_DIR: &str = "tests/fixtures/config/v0.26x";
 
 fn load_fixture(name: &str) -> ReinConfig {
     let path = format!("{FIXTURE_DIR}/{name}");
-    let toml_str =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    ReinConfig::load_from_str(&toml_str)
-        .unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    let toml_str = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    ReinConfig::load_from_str(&toml_str).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
 // ---------------------------------------------------------------------------

@@ -26,7 +26,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use provider::{ProviderKind, RecordingMode};
@@ -795,6 +795,37 @@ async fn send_with_retry(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CappedResponseBody {
+    Complete(Bytes),
+    OverCap(Vec<Bytes>),
+}
+
+async fn collect_response_prefix_capped<S, E>(
+    mut stream: std::pin::Pin<&mut S>,
+    max_bytes: usize,
+) -> Result<CappedResponseBody, E>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+{
+    let mut total = 0usize;
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.as_mut().next().await {
+        let chunk = chunk?;
+        total = total.saturating_add(chunk.len());
+        chunks.push(chunk);
+        if total > max_bytes {
+            return Ok(CappedResponseBody::OverCap(chunks));
+        }
+    }
+
+    let mut body = bytes::BytesMut::with_capacity(total);
+    for chunk in chunks {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(CappedResponseBody::Complete(body.freeze()))
+}
+
 /// Handle a single proxied request.
 async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
@@ -1026,21 +1057,49 @@ async fn handle_request(
             tracing::info!(
                 "response too large ({content_length} bytes), streaming without extraction"
             );
-            return stream_response(
-                upstream_resp,
+            return stream_response_from_stream(
+                upstream_resp.bytes_stream(),
                 status,
                 &resp_headers,
                 &config,
                 artifact_input,
                 query,
                 &state,
+                false,
             )
             .await;
         }
 
-        // Non-streaming: read full response, extract, forward.
-        let resp_body = match upstream_resp.bytes().await {
-            Ok(body) => body,
+        // Non-streaming: progressively buffer up to max_response_buffer. If a
+        // chunked/no-Content-Length response crosses the cap, replay the bytes
+        // already read and stream the rest without extraction.
+        let mut upstream_stream = Box::pin(upstream_resp.bytes_stream());
+        let resp_body = match collect_response_prefix_capped(
+            upstream_stream.as_mut(),
+            config.proxy.max_response_buffer,
+        )
+        .await
+        {
+            Ok(CappedResponseBody::Complete(body)) => body,
+            Ok(CappedResponseBody::OverCap(prefix)) => {
+                tracing::info!(
+                    "response exceeded {} byte cap while reading, streaming without extraction",
+                    config.proxy.max_response_buffer
+                );
+                let replay =
+                    futures_util::stream::iter(prefix.into_iter().map(Ok::<Bytes, reqwest::Error>));
+                return stream_response_from_stream(
+                    replay.chain(upstream_stream),
+                    status,
+                    &resp_headers,
+                    &config,
+                    artifact_input,
+                    query,
+                    &state,
+                    false,
+                )
+                .await;
+            }
             Err(error) => {
                 tracing::warn!("failed to read upstream response body: {error}");
                 state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
@@ -1106,10 +1165,38 @@ async fn stream_response(
     query: Option<String>,
     state: &Arc<ProxyState>,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
+    stream_response_from_stream(
+        upstream_resp.bytes_stream(),
+        status,
+        resp_headers,
+        config,
+        artifact,
+        query,
+        state,
+        true,
+    )
+    .await
+}
+
+async fn stream_response_from_stream<S, E>(
+    upstream_stream: S,
+    status: reqwest::StatusCode,
+    resp_headers: &reqwest::header::HeaderMap,
+    config: &ReinConfig,
+    artifact: ProxyArtifactInput,
+    query: Option<String>,
+    state: &Arc<ProxyState>,
+    allow_extraction: bool,
+) -> Result<hyper::Response<BoxBody>, hyper::Error>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(64);
 
-    let extract_enabled =
-        config.proxy.extract_enabled && artifact.route.recording_mode.captures_structured_text();
+    let extract_enabled = allow_extraction
+        && config.proxy.extract_enabled
+        && artifact.route.recording_mode.captures_structured_text();
     let max_sse_buffer = config.proxy.max_sse_buffer;
     let provider_clone = artifact.route.provider;
     let config_clone = config.clone();
@@ -1119,7 +1206,7 @@ async fn stream_response(
 
     // Spawn task to read upstream stream, forward chunks, buffer text.
     tokio::spawn(async move {
-        let mut stream = upstream_resp.bytes_stream();
+        futures_util::pin_mut!(upstream_stream);
         let mut assistant_buf = String::new();
         let mut raw_response_buf = Vec::new();
         // SSE line buffer: transport chunks may split across SSE event boundaries.
@@ -1133,7 +1220,7 @@ async fn stream_response(
         use futures_util::StreamExt;
         let mut clean_completion = false;
         loop {
-            let chunk_result = match stream.next().await {
+            let chunk_result = match upstream_stream.next().await {
                 Some(chunk_result) => chunk_result,
                 None => {
                     clean_completion = true;
@@ -2128,6 +2215,36 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
                 "chatgpt_account_id": "acct_test"
             }
         }))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_cap_detects_chunked_overflow_without_content_length() {
+        let chunks = tokio_stream::iter(vec![
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"1234")),
+            Ok(Bytes::from_static(b"56789")),
+            Ok(Bytes::from_static(b"tail")),
+        ]);
+        let mut stream = Box::pin(chunks);
+
+        let result = collect_response_prefix_capped(stream.as_mut(), 8)
+            .await
+            .unwrap();
+
+        match result {
+            CappedResponseBody::OverCap(prefix) => {
+                let joined: Vec<u8> = prefix
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .collect();
+                assert_eq!(joined, Bytes::from_static(b"123456789").to_vec());
+            }
+            CappedResponseBody::Complete(body) => {
+                panic!("expected over-cap response, got {body:?}");
+            }
+        }
+
+        let tail = stream.next().await.unwrap().unwrap();
+        assert_eq!(tail, Bytes::from_static(b"tail"));
     }
 
     #[derive(Clone, Copy)]

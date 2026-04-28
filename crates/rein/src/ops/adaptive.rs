@@ -177,8 +177,8 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // the consumer's offset never advances and `runtime_vs_offline_kappa`
     // stays stale forever.
     {
-        let drift_log_path = crate::extract::hooks::buffer::resolve_buffer_dir(config)
-            .join("judge_drift.log");
+        let drift_log_path =
+            crate::extract::hooks::buffer::resolve_buffer_dir(config).join("judge_drift.log");
         if let Some(batch) = crate::ops::judge_calibration::run_judge_calibration_consumer(
             store,
             &mut state,
@@ -212,8 +212,13 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // (v0.26.0 patch: Option C — defended inside the worker rather than
     // by reordering pipeline steps).
     {
-        let cold_config = crate::ops::cold_archive_summary::ColdArchiveConfig::from_ars(&config.ars);
-        match crate::ops::cold_archive_summary::run_cold_archive_summary(store, config, &cold_config) {
+        let cold_config =
+            crate::ops::cold_archive_summary::ColdArchiveConfig::from_ars(&config.ars);
+        match crate::ops::cold_archive_summary::run_cold_archive_summary(
+            store,
+            config,
+            &cold_config,
+        ) {
             Ok(report) => {
                 if report.considered > 0 {
                     tracing::info!(
@@ -269,8 +274,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // discarded; the next pipeline pass will re-peek and replay.
     if snapshot_saved {
         for batch in &pending_offset_batches {
-            let pairs: Vec<(&str, i64)> =
-                batch.iter().map(|(c, id)| (*c, *id)).collect();
+            let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
             if let Err(e) = crate::store::adaptive::commit_offset(store.conn(), &pairs) {
                 tracing::warn!(
                     consumers = ?batch.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
@@ -726,12 +730,10 @@ fn run_tiering(
     let mut rates_present = false;
 
     // Compute access rates for all memories
-    if let Ok(mut stmt) = store
-        .conn()
-        .prepare(
-            "SELECT access_count, created_at FROM memories WHERE status IN ('active', 'updated')",
-        )
-    {
+    if let Ok(mut stmt) = store.conn().prepare(
+        "SELECT access_count, created_at FROM memories \
+	             WHERE status IN ('active', 'updated') AND superseded_by IS NULL",
+    ) {
         let rates: Vec<f64> = stmt
             .query_map([], |row| {
                 let ac: u32 = row.get(0)?;
@@ -758,24 +760,24 @@ fn run_tiering(
     if rates_present {
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'hot'
-             WHERE status IN ('active', 'updated') AND tier != 'hot'
-             AND CAST(access_count AS REAL) / MAX(1, CAST(
-               (julianday('now') - julianday(created_at)) AS REAL)) >= ?1",
+	             WHERE status IN ('active', 'updated') AND superseded_by IS NULL AND tier != 'hot'
+	             AND CAST(access_count AS REAL) / MAX(1, CAST(
+	               (julianday('now') - julianday(created_at)) AS REAL)) >= ?1",
             rusqlite::params![state.hot_threshold],
         );
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'cold'
-             WHERE status IN ('active', 'updated') AND tier != 'cold'
-             AND CAST(access_count AS REAL) / MAX(1, CAST(
-               (julianday('now') - julianday(created_at)) AS REAL)) <= ?1",
+	             WHERE status IN ('active', 'updated') AND superseded_by IS NULL AND tier != 'cold'
+	             AND CAST(access_count AS REAL) / MAX(1, CAST(
+	               (julianday('now') - julianday(created_at)) AS REAL)) <= ?1",
             rusqlite::params![state.cold_threshold],
         );
         let _ = store.conn().execute(
             "UPDATE memories SET tier = 'warm'
-             WHERE status IN ('active', 'updated') AND (
-               tier NOT IN ('hot', 'cold')
-               OR (tier = 'hot' AND CAST(access_count AS REAL) / MAX(1, CAST(
-                 (julianday('now') - julianday(created_at)) AS REAL)) < ?1)
+	             WHERE status IN ('active', 'updated') AND superseded_by IS NULL AND (
+	               tier NOT IN ('hot', 'cold')
+	               OR (tier = 'hot' AND CAST(access_count AS REAL) / MAX(1, CAST(
+	                 (julianday('now') - julianday(created_at)) AS REAL)) < ?1)
                OR (tier = 'cold' AND CAST(access_count AS REAL) / MAX(1, CAST(
                  (julianday('now') - julianday(created_at)) AS REAL)) > ?2)
              )",
@@ -792,9 +794,10 @@ fn run_tiering(
         // (terminal) and stays invisible until the next cold transition rebumps it.
         let _ = store.conn().execute(
             "UPDATE memories SET needs_archival_summary = 1
-             WHERE status IN ('active', 'updated')
-               AND tier = 'cold'
-               AND needs_archival_summary = 0
+	             WHERE status IN ('active', 'updated')
+	               AND superseded_by IS NULL
+	               AND tier = 'cold'
+	               AND needs_archival_summary = 0
                AND (
                    archival_summary IS NULL
                    OR archival_summary_version IS NULL
@@ -812,10 +815,12 @@ fn run_tiering(
     // in `attempt_one`, instead of relying on pipeline step ordering).
     let migrated: u64 = match store.conn().execute(
         "INSERT OR IGNORE INTO cold_archive (memory_id, content, archived_at)
-         SELECT id, content, strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         FROM memories
-         WHERE tier = 'cold' AND strength < 0.3 AND access_count = 0
-         AND id NOT IN (SELECT memory_id FROM cold_archive)",
+	         SELECT id, content, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	         FROM memories
+	         WHERE status IN ('active', 'updated')
+	         AND superseded_by IS NULL
+	         AND tier = 'cold' AND strength < 0.3 AND access_count = 0
+	         AND id NOT IN (SELECT memory_id FROM cold_archive)",
         [],
     ) {
         Ok(n) => n as u64,
@@ -835,9 +840,13 @@ fn run_tiering(
         let archived_ids: Vec<String> = store
             .conn()
             .prepare(
-                "SELECT memory_id FROM cold_archive WHERE memory_id IN (
-                SELECT id FROM memories WHERE tier = 'cold' AND strength < 0.3 AND access_count = 0
-            )",
+                "SELECT ca.memory_id FROM cold_archive ca
+	                 JOIN memories m ON m.id = ca.memory_id
+	                 WHERE m.status IN ('active', 'updated')
+	                   AND m.superseded_by IS NULL
+	                   AND m.tier = 'cold'
+	                   AND m.strength < 0.3
+	                   AND m.access_count = 0",
             )
             .ok()
             .and_then(|mut stmt| {
@@ -1264,7 +1273,11 @@ fn run_alpha_learning(
             if prior_access_water > 0 {
                 pending.push(("alpha_optimizer_access", prior_access_water));
             }
-            return if pending.is_empty() { None } else { Some(pending) };
+            return if pending.is_empty() {
+                None
+            } else {
+                Some(pending)
+            };
         }
         return None;
     }
@@ -1357,8 +1370,7 @@ fn run_alpha_learning(
         state.alpha_optimizer_last_id = state.alpha_optimizer_last_id.max(off);
     }
     if let Some(off) = access_advance_to {
-        state.alpha_optimizer_access_last_id =
-            state.alpha_optimizer_access_last_id.max(off);
+        state.alpha_optimizer_access_last_id = state.alpha_optimizer_access_last_id.max(off);
     }
 
     let mut pending: Vec<(&'static str, i64)> = Vec::new();
@@ -1376,7 +1388,11 @@ fn run_alpha_learning(
         );
         // Even with no learnable signal yet we still return any pending
         // offset advances — `expired-by-cutoff` events should not loop.
-        return if pending.is_empty() { None } else { Some(pending) };
+        return if pending.is_empty() {
+            None
+        } else {
+            Some(pending)
+        };
     }
 
     compute_counterfactual_alphas(&events_with_access, &events, state, config);
@@ -2629,6 +2645,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_run_tiering_excludes_superseded_memories_from_tier_archive_strip() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.tier_cold_start = 5;
+
+        // Normal live population gives the tierer enough data to compute
+        // boundaries. The superseded row below should not be tiered,
+        // flagged, archived, or stripped even though its access pattern
+        // would otherwise qualify as cold.
+        let mut canonical_id = String::new();
+        for i in 0..8u32 {
+            let mut mem = test_memory("m5-live", &format!("live {i}"), 10 + i);
+            mem.created_at = Utc::now() - chrono::Duration::days(7);
+            let id = mem.id.clone();
+            store.store(mem).unwrap();
+            canonical_id = id;
+        }
+
+        let mut superseded = test_memory("m5-live", "superseded full content", 0);
+        superseded.created_at = Utc::now() - chrono::Duration::days(120);
+        superseded.strength = 0.01;
+        superseded.summary = "superseded short summary".to_string();
+        superseded.content = "superseded full content that must not be stripped".to_string();
+        let superseded_id = superseded.id.clone();
+        store.store(superseded).unwrap();
+        store
+            .mark_superseded(&superseded_id, &canonical_id)
+            .unwrap();
+
+        let mut state = AdaptiveState::default();
+        run_tiering(&store, &mut state, &config);
+
+        let (tier, needs, content, archived): (String, i64, String, i64) = store
+            .conn()
+            .query_row(
+                "SELECT m.tier, m.needs_archival_summary, m.content, \
+                        EXISTS(SELECT 1 FROM cold_archive ca WHERE ca.memory_id = m.id) \
+                 FROM memories m WHERE m.id = ?1",
+                rusqlite::params![&superseded_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            tier, "warm",
+            "superseded rows are historical collapse inputs, not M5 tier targets"
+        );
+        assert_eq!(
+            needs, 0,
+            "superseded rows must not be queued for Cap C summaries"
+        );
+        assert_eq!(content, "superseded full content that must not be stripped");
+        assert_eq!(
+            archived, 0,
+            "superseded rows must not be inserted into cold_archive"
+        );
+    }
+
     // ── Test 1d (v0.26.2 Bug #O5): access attribution prefers request_id ─────
 
     /// Two recalls touching the *same* memory inside the same 10-minute
@@ -2710,10 +2785,10 @@ mod tests {
 
         let access_events = vec![access_a, access_b];
 
-        let parsed_a = parse_candidates_from_event(&recall_a, &access_events)
-            .expect("recall A should parse");
-        let parsed_b = parse_candidates_from_event(&recall_b, &access_events)
-            .expect("recall B should parse");
+        let parsed_a =
+            parse_candidates_from_event(&recall_a, &access_events).expect("recall A should parse");
+        let parsed_b =
+            parse_candidates_from_event(&recall_b, &access_events).expect("recall B should parse");
 
         // Each recall must see EXACTLY ONE accessed memory id (its own),
         // not two. Pre-fix this assertion would trigger because both
@@ -2797,8 +2872,8 @@ mod tests {
         };
 
         let access_events = vec![access_close, access_far];
-        let parsed = parse_candidates_from_event(&recall, &access_events)
-            .expect("recall should parse");
+        let parsed =
+            parse_candidates_from_event(&recall, &access_events).expect("recall should parse");
 
         // The 2-hour-old access is outside the 600s window and must be
         // dropped; the 50-second-old access must be attributed.
@@ -2957,9 +3032,12 @@ mod tests {
         // committing after save_snapshot succeeds. The function no
         // longer advances the offset itself.
         let pending = run_alpha_learning(&store, &mut state, &config);
-        let pending = pending.expect("alpha_optimizer should report pending offsets after learning");
+        let pending =
+            pending.expect("alpha_optimizer should report pending offsets after learning");
         assert!(
-            pending.iter().any(|(c, off)| *c == "alpha_optimizer" && *off > 0),
+            pending
+                .iter()
+                .any(|(c, off)| *c == "alpha_optimizer" && *off > 0),
             "alpha_optimizer pending offset should be present and > 0, got {pending:?}"
         );
 
@@ -3976,5 +4054,4 @@ mod tests {
              A `max(correlated_id)` strategy would fail this assertion."
         );
     }
-
 }
