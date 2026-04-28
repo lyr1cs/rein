@@ -152,7 +152,12 @@ mod tests {
             "inventory".to_string(),
             "tensor cores".to_string(),
         ];
-        assert!(score_concept_case(def, ls, &kws, &KeywordOverlapHitChecker::stem_only()));
+        assert!(score_concept_case(
+            def,
+            ls,
+            &kws,
+            &KeywordOverlapHitChecker::stem_only()
+        ));
     }
 
     #[test]
@@ -190,7 +195,12 @@ mod tests {
         ));
         let ls = Some("CJK content routes through jieba with bigram fallback.");
         // With living_summary, 2/3 keywords hit ("token", "jieba") → majority.
-        assert!(score_concept_case(def, ls, &kws, &KeywordOverlapHitChecker::stem_only()));
+        assert!(score_concept_case(
+            def,
+            ls,
+            &kws,
+            &KeywordOverlapHitChecker::stem_only()
+        ));
     }
 
     #[test]
@@ -218,6 +228,11 @@ mod tests {
         ];
         // Hits: 操作 (def), inventory (ls). Miss: 不相关 (neither).
         // 2 hits of 3 → strict majority → pass.
-        assert!(score_concept_case(def, ls, &kws, &KeywordOverlapHitChecker::stem_only()));
+        assert!(score_concept_case(
+            def,
+            ls,
+            &kws,
+            &KeywordOverlapHitChecker::stem_only()
+        ));
     }
 }

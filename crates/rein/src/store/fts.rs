@@ -328,16 +328,36 @@ mod tests {
         // for `Updated` and `Deprecated` so we can place exact statuses
         // without going through the `update()` path.
         let active_id = store
-            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .store(fixture(
+                "life",
+                "alpha beta gamma",
+                MemoryStatus::Active,
+                None,
+            ))
             .unwrap();
         let updated_id = store
-            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .store(fixture(
+                "life",
+                "alpha beta gamma",
+                MemoryStatus::Active,
+                None,
+            ))
             .unwrap();
         let deprecated_id = store
-            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .store(fixture(
+                "life",
+                "alpha beta gamma",
+                MemoryStatus::Active,
+                None,
+            ))
             .unwrap();
         let superseded_id = store
-            .store(fixture("life", "alpha beta gamma", MemoryStatus::Active, None))
+            .store(fixture(
+                "life",
+                "alpha beta gamma",
+                MemoryStatus::Active,
+                None,
+            ))
             .unwrap();
         // Force the dead statuses post-insert so the FTS row exists.
         store

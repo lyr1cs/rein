@@ -183,10 +183,7 @@ pub struct ColdArchiveSummaryGenerator {
 }
 
 impl ColdArchiveSummaryGenerator {
-    pub fn new(
-        extractor: std::sync::Arc<ExtractorKind>,
-        config: ColdArchiveConfig,
-    ) -> Self {
+    pub fn new(extractor: std::sync::Arc<ExtractorKind>, config: ColdArchiveConfig) -> Self {
         Self { extractor, config }
     }
 
@@ -374,10 +371,8 @@ pub(crate) fn validate_cold_archive_contract(
 /// (degenerate case — bounded_length already gated).
 fn trigram_coverage(source: &str, summary: &str) -> f64 {
     let src_chars: Vec<char> = source.chars().collect();
-    let src_grams: std::collections::HashSet<[char; 3]> = src_chars
-        .windows(3)
-        .map(|w| [w[0], w[1], w[2]])
-        .collect();
+    let src_grams: std::collections::HashSet<[char; 3]> =
+        src_chars.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
     let sum_chars: Vec<char> = summary.chars().collect();
     if sum_chars.len() < 3 {
         return 1.0;
@@ -455,11 +450,7 @@ pub fn create_cold_archive_extractor(config: &ReinConfig) -> Option<ExtractorKin
 /// rule (Codex round 1 F-8 — promoted from user prompt where an inline
 /// override embedded in the archived content could outrank a peer
 /// instruction).
-fn call_extractor_sync(
-    extractor: &ExtractorKind,
-    system: &str,
-    user: &str,
-) -> ReinResult<String> {
+fn call_extractor_sync(extractor: &ExtractorKind, system: &str, user: &str) -> ReinResult<String> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
             handle.block_on(async { extractor.raw_text_with_prompt(system, user).await })
@@ -579,8 +570,7 @@ fn run_cold_archive_summary_inner(
             break;
         }
         report.considered += 1;
-        let (verdict, strikes_this_row) =
-            process_one_with_strike_fuse(store, &generator, &claim);
+        let (verdict, strikes_this_row) = process_one_with_strike_fuse(store, &generator, &claim);
         report.strikes += strikes_this_row;
         match verdict {
             ProcessVerdict::Success => report.generated += 1,
@@ -712,9 +702,7 @@ fn attempt_one(
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::other(format!(
-                            "Cap C row_to_memory: {e}"
-                        ))),
+                        Box::new(std::io::Error::other(format!("Cap C row_to_memory: {e}"))),
                     )
                 })?;
                 let raw: String = row.get("updated_at")?;
@@ -879,8 +867,8 @@ struct Claim {
 /// `batch_size`, and never rows that another live worker holds a fresh
 /// claim on. Mirrors `ops/resummerize.rs::claim_batch`.
 fn claim_batch(store: &SqliteStore, batch_size: usize) -> ReinResult<Vec<Claim>> {
-    let stale = (Utc::now() - chrono::Duration::seconds(ARCHIVAL_SUMMARY_CLAIM_TIMEOUT_SECS))
-        .to_rfc3339();
+    let stale =
+        (Utc::now() - chrono::Duration::seconds(ARCHIVAL_SUMMARY_CLAIM_TIMEOUT_SECS)).to_rfc3339();
     let limit = batch_size.max(1) as i64;
 
     // Step 1: pick eligible ids (read-only scan).
@@ -1046,10 +1034,7 @@ fn refresh_one_for_handler_inner(
             generated: false,
             version: ARCHIVAL_SUMMARY_VERSION,
             summary_chars: 0,
-            skipped_reason: Some(format!(
-                "memory tier is {:?}, not Cold",
-                memory.tier
-            )),
+            skipped_reason: Some(format!("memory tier is {:?}, not Cold", memory.tier)),
         });
     }
     // Honor `force`: when false, skip if the row already has a current-version
@@ -1287,8 +1272,7 @@ mod tests {
         // 1000 chars when target is 100 → 1.5×100 = 150 ceiling exceeded.
         let summary: String = "abcdefghij".repeat(100);
         let m = cold_memory("m1", source);
-        let err = validate_cold_archive_contract(&m, &summary, 100)
-            .expect_err("INV-3 must reject");
+        let err = validate_cold_archive_contract(&m, &summary, 100).expect_err("INV-3 must reject");
         let msg = err.to_string();
         assert!(msg.contains("INV-3 bounded_length"), "got: {msg}");
     }
@@ -1425,9 +1409,13 @@ mod tests {
         use super::*;
         use crate::extract::llm::MockExtractor;
 
-        fn mock_generator(responses: Vec<Result<String, String>>, target: usize) -> ColdArchiveSummaryGenerator {
-            let extractor =
-                std::sync::Arc::new(ExtractorKind::Mock(MockExtractor::with_responses(responses)));
+        fn mock_generator(
+            responses: Vec<Result<String, String>>,
+            target: usize,
+        ) -> ColdArchiveSummaryGenerator {
+            let extractor = std::sync::Arc::new(ExtractorKind::Mock(
+                MockExtractor::with_responses(responses),
+            ));
             let cfg = ColdArchiveConfig {
                 enabled: true,
                 target_chars: target,
@@ -1495,7 +1483,8 @@ mod tests {
         fn generate_rejects_fabrication_returns_contract_violation_error() {
             let source = "Anthropic released Claude 4.6 in 2026 with 200K context.".repeat(10);
             // LLM hallucinates completely unrelated content.
-            let bogus = "Quantum entanglement teleports state between distant particles instantly. \
+            let bogus =
+                "Quantum entanglement teleports state between distant particles instantly. \
                 The phenomenon was first demonstrated experimentally in 1997 by Anton Zeilinger.";
             let gen_ = mock_generator(vec![Ok(bogus.to_string())], 100);
             let m = cold_memory("m1", &source);
@@ -1554,12 +1543,7 @@ mod tests {
         /// SAFETY: writes raw SQL because `MemoryStore::store` doesn't
         /// know about the v0.26 columns yet (those go through A_SCHEMA's
         /// row_to_memory + INSERT updates).
-        fn seed_cold_flagged(
-            store: &SqliteStore,
-            id: &str,
-            content: &str,
-            updated_at_rfc: &str,
-        ) {
+        fn seed_cold_flagged(store: &SqliteStore, id: &str, content: &str, updated_at_rfc: &str) {
             let now = chrono::Utc::now().to_rfc3339();
             store
                 .conn()
@@ -1639,13 +1623,11 @@ mod tests {
             seed_cold_flagged(&store, "happy1", source, "2026-04-01T00:00:00Z");
 
             let cold_config = ColdArchiveConfig::from_ars(&config.ars);
-            let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
-                summary.to_string()
-            )]));
-            let report = run_cold_archive_summary_with_extractor(
-                &store, &config, &cold_config, extractor,
-            )
-            .expect("worker must succeed");
+            let extractor =
+                ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker must succeed");
             assert_eq!(report.considered, 1);
             assert_eq!(report.generated, 1);
             assert_eq!(report.errors, 0);
@@ -1699,20 +1681,21 @@ mod tests {
                 .expect("stamp stale claim");
 
             let cold_config = ColdArchiveConfig::from_ars(&config.ars);
-            let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
-                summary.to_string()
-            )]));
-            let report = run_cold_archive_summary_with_extractor(
-                &store, &config, &cold_config, extractor,
-            )
-            .expect("worker must succeed against stale claim");
+            let extractor =
+                ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker must succeed against stale claim");
             assert_eq!(report.considered, 1);
             assert_eq!(report.generated, 1, "stale-claim takeover must commit");
 
             let (saved, _, version, flag) = read_archival_state(&store, "race1");
             assert!(saved.is_some(), "summary must be persisted post-takeover");
             assert_eq!(version, Some(ARCHIVAL_SUMMARY_VERSION as i64));
-            assert_eq!(flag, 0, "needs_archival_summary cleared by 5-way CAS commit");
+            assert_eq!(
+                flag, 0,
+                "needs_archival_summary cleared by 5-way CAS commit"
+            );
         }
 
         #[test]
@@ -1740,10 +1723,9 @@ mod tests {
             let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
                 "should not be called".to_string(),
             )]));
-            let report = run_cold_archive_summary_with_extractor(
-                &store, &config, &cold_config, extractor,
-            )
-            .expect("worker must succeed (no-op)");
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker must succeed (no-op)");
             assert_eq!(
                 report.considered, 0,
                 "live peer claim must block our claim_batch entirely"
@@ -1767,10 +1749,9 @@ mod tests {
                 Ok(bogus.to_string()),
                 Ok(bogus.to_string()),
             ]));
-            let report = run_cold_archive_summary_with_extractor(
-                &store, &config, &cold_config, extractor,
-            )
-            .expect("worker must succeed even when fuse trips");
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker must succeed even when fuse trips");
             assert_eq!(report.considered, 1);
             assert_eq!(report.generated, 0);
             assert_eq!(report.exhausted, 1, "row must hit terminal state");
@@ -1791,10 +1772,9 @@ mod tests {
             let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
                 "should not be called".to_string(),
             )]));
-            let report2 = run_cold_archive_summary_with_extractor(
-                &store, &config, &cold_config, extractor,
-            )
-            .expect("second pass must succeed");
+            let report2 =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("second pass must succeed");
             assert_eq!(
                 report2.considered, 0,
                 "exhausted row must be invisible to subsequent passes"
@@ -1815,10 +1795,9 @@ mod tests {
             let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(
                 "should not be called".to_string(),
             )]));
-            let report = run_cold_archive_summary_with_extractor(
-                &store, &config, &cold_config, extractor,
-            )
-            .expect("worker must succeed");
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker must succeed");
             assert_eq!(report.considered, 1);
             assert_eq!(report.generated, 0);
             assert_eq!(report.skipped_short, 1);
@@ -1877,13 +1856,9 @@ mod tests {
                 synthesis, multi-turn tool use, Sonnet upgrade, structured output.";
             let extractor =
                 ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
-            let report = run_cold_archive_summary_with_extractor(
-                &store,
-                &config,
-                &cold_config,
-                extractor,
-            )
-            .expect("worker must succeed");
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker must succeed");
 
             // Without the cold_archive fallback the worker would see
             // memory.content = "short summary placeholder..." (≤ target_chars

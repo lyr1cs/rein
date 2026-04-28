@@ -12,6 +12,8 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
+Current source status: `v0.27.3` remediation candidate. This branch is not yet pushed, tagged, released, installed, or restarted in production; in the vault workspace, use `docs/backlog/v0.27.3-full-audit-remediation.md` and `docs/devlog/v0.27.3-release-notes.md` for the active audit-remediation ledger and draft release notes.
+
 ### Features
 
 | Feature | Description |

@@ -31,16 +31,16 @@ use std::collections::HashMap;
 /// All feedback event types emitted by the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
-    RecallComplete,   // recall returned results (includes full candidate set)
-    RecallAccess,     // agent used a recalled memory
-    RecallMiss,       // recall returned but not accessed (record-only)
-    RecallRetry,      // same query recalled again in session
-    Store,            // new memory stored
-    StoreQuickRecall, // memory recalled shortly after being stored
-    Forget,           // agent explicitly forgot/deprecated
-    Refine,           // concept refined/superseded
-    SessionEnd,       // hook_stop fired
-    ParamUpdate,      // slow-channel parameter update (audit trail)
+    RecallComplete,          // recall returned results (includes full candidate set)
+    RecallAccess,            // agent used a recalled memory
+    RecallMiss,              // recall returned but not accessed (record-only)
+    RecallRetry,             // same query recalled again in session
+    Store,                   // new memory stored
+    StoreQuickRecall,        // memory recalled shortly after being stored
+    Forget,                  // agent explicitly forgot/deprecated
+    Refine,                  // concept refined/superseded
+    SessionEnd,              // hook_stop fired
+    ParamUpdate,             // slow-channel parameter update (audit trail)
     ConceptSummaryRefreshed, // v0.24 ARS L3: concept living-summary refreshed
     /// v0.26 D direction: user interacted with a Cap B synthesis prose surface.
     /// Payload is a JSON-serialized [`SynthesisInteractionPayload`] in
@@ -876,8 +876,9 @@ impl AdaptiveState {
                         current.m6_threshold_last_id.max(self.m6_threshold_last_id);
                     current.m6_corecall_last_id =
                         current.m6_corecall_last_id.max(self.m6_corecall_last_id);
-                    current.alpha_optimizer_last_id =
-                        current.alpha_optimizer_last_id.max(self.alpha_optimizer_last_id);
+                    current.alpha_optimizer_last_id = current
+                        .alpha_optimizer_last_id
+                        .max(self.alpha_optimizer_last_id);
                     current.alpha_optimizer_access_last_id = current
                         .alpha_optimizer_access_last_id
                         .max(self.alpha_optimizer_access_last_id);
@@ -1022,22 +1023,19 @@ impl AdaptiveState {
                                     .map(|s| s.last_consumed_event_id)
                                     .unwrap_or(0);
                                 if mine_capa > theirs_capa {
-                                    out.recent_pairs_concept =
-                                        mine.recent_pairs_concept.clone();
+                                    out.recent_pairs_concept = mine.recent_pairs_concept.clone();
                                 }
                                 // Layer 2 arbitration by judge_calibration
                                 // watermark (MAX wins; ties keep current).
                                 if mine.last_consumed_event_id_calibration
                                     > theirs.last_consumed_event_id_calibration
                                 {
-                                    out.runtime_vs_offline_kappa =
-                                        mine.runtime_vs_offline_kappa;
+                                    out.runtime_vs_offline_kappa = mine.runtime_vs_offline_kappa;
                                     out.last_consumed_event_id_calibration =
                                         mine.last_consumed_event_id_calibration;
                                     out.recent_pairs_runtime_vs_offline =
                                         mine.recent_pairs_runtime_vs_offline.clone();
-                                    out.total_offline_cron_events =
-                                        mine.total_offline_cron_events;
+                                    out.total_offline_cron_events = mine.total_offline_cron_events;
                                     out.judge_drift_alert = mine.judge_drift_alert;
                                     out.last_computed_at = mine.last_computed_at;
                                 }
@@ -1533,7 +1531,11 @@ pub fn recompute_concept_refresh_stats(
     stats.count = stats.samples.len();
     stats.count_steady_state = stats.samples.iter().filter(|s| !s.first_refresh).count();
     if stats.count > 0 {
-        let mut revs: Vec<u32> = stats.samples.iter().map(|s| s.revisions_since_last).collect();
+        let mut revs: Vec<u32> = stats
+            .samples
+            .iter()
+            .map(|s| s.revisions_since_last)
+            .collect();
         revs.sort_unstable();
         stats.revision_p75 = percentile_u32(&revs, 0.75);
     } else {
@@ -2225,18 +2227,17 @@ pub fn recompute_synthesis_feedback_stats_with_judge(
         };
         match ev.event_type.as_str() {
             "synthesis_interaction" => {
-                let payload: SynthesisInteractionPayload =
-                    match serde_json::from_str(payload_str) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                event_id = ev.id,
-                                error = %e,
-                                "synthesis_feedback: malformed SynthesisInteractionPayload, skipping"
-                            );
-                            continue;
-                        }
-                    };
+                let payload: SynthesisInteractionPayload = match serde_json::from_str(payload_str) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = ev.id,
+                            error = %e,
+                            "synthesis_feedback: malformed SynthesisInteractionPayload, skipping"
+                        );
+                        continue;
+                    }
+                };
                 fold_synthesis_interaction(
                     &mut state,
                     &mut pending_pairs,
@@ -2246,18 +2247,17 @@ pub fn recompute_synthesis_feedback_stats_with_judge(
                 );
             }
             "synthesis_llm_judge" => {
-                let payload: SynthesisLlmJudgePayload =
-                    match serde_json::from_str(payload_str) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                event_id = ev.id,
-                                error = %e,
-                                "synthesis_feedback: malformed SynthesisLlmJudgePayload, skipping"
-                            );
-                            continue;
-                        }
-                    };
+                let payload: SynthesisLlmJudgePayload = match serde_json::from_str(payload_str) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = ev.id,
+                            error = %e,
+                            "synthesis_feedback: malformed SynthesisLlmJudgePayload, skipping"
+                        );
+                        continue;
+                    }
+                };
                 fold_synthesis_llm_judge(
                     &mut state,
                     &mut pending_pairs,
@@ -2376,7 +2376,10 @@ fn fold_synthesis_interaction(
             // per spec §6.2.1.
             let now_ts = chrono::Utc::now().timestamp();
             if let Some(half) = pending_pairs.remove(&payload.synthesis_id) {
-                if let HalfPair::Judge { hit, ts, surface } = half {
+                if let HalfPair::Judge {
+                    hit, ts, surface, ..
+                } = half
+                {
                     // Judge arrived first → complete the pair now.
                     calibration.push_pair(surface, hit, *up, ts);
                 } else {
@@ -2495,6 +2498,7 @@ fn fold_synthesis_llm_judge(
                     hit: payload.hit,
                     ts: now_ts,
                     surface: JudgeSurface::Synthesis,
+                    alias_key: None,
                 },
             );
         }
@@ -2505,6 +2509,7 @@ fn fold_synthesis_llm_judge(
                 hit: payload.hit,
                 ts: now_ts,
                 surface: JudgeSurface::Synthesis,
+                alias_key: None,
             },
         );
     }
@@ -2544,6 +2549,11 @@ fn fold_synthesis_llm_judge(
 pub struct ConceptSummaryInteractionPayload {
     /// Concept's persistent id (NOT a per-call ULID — concepts span sessions).
     pub concept_id: String,
+    /// Per-refresh concept-summary ULID when the emitting surface knows it.
+    /// Older clients omit this; consumers fall back to `concept_id` for
+    /// backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_summary_id: Option<String>,
     /// Opaque correlation id. ULID echoing `RecallMemoryOutput.request_id`
     /// when the concept-summary surface was reached via recall; otherwise
     /// any non-empty client-minted id (UUID, etc.) — back-end treats as
@@ -3109,18 +3119,19 @@ pub fn recompute_concept_summary_feedback_stats_with_judge(
         };
         match ev.event_type.as_str() {
             "concept_summary_interaction" => {
-                let payload: ConceptSummaryInteractionPayload =
-                    match serde_json::from_str(payload_str) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                event_id = ev.id,
-                                error = %e,
-                                "concept_summary_feedback: malformed ConceptSummaryInteractionPayload, skipping"
-                            );
-                            continue;
-                        }
-                    };
+                let payload: ConceptSummaryInteractionPayload = match serde_json::from_str(
+                    payload_str,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = ev.id,
+                            error = %e,
+                            "concept_summary_feedback: malformed ConceptSummaryInteractionPayload, skipping"
+                        );
+                        continue;
+                    }
+                };
                 fold_concept_summary_interaction(
                     &mut state,
                     &mut pending_pairs,
@@ -3130,18 +3141,18 @@ pub fn recompute_concept_summary_feedback_stats_with_judge(
                 );
             }
             "concept_summary_llm_judge" => {
-                let payload: ConceptSummaryLlmJudgePayload =
-                    match serde_json::from_str(payload_str) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                event_id = ev.id,
-                                error = %e,
-                                "concept_summary_feedback: malformed ConceptSummaryLlmJudgePayload, skipping"
-                            );
-                            continue;
-                        }
-                    };
+                let payload: ConceptSummaryLlmJudgePayload = match serde_json::from_str(payload_str)
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = ev.id,
+                            error = %e,
+                            "concept_summary_feedback: malformed ConceptSummaryLlmJudgePayload, skipping"
+                        );
+                        continue;
+                    }
+                };
                 fold_concept_summary_llm_judge(
                     &mut state,
                     &mut pending_pairs,
@@ -3240,22 +3251,23 @@ fn fold_concept_summary_interaction(
             } else {
                 bucket.explicit_down = bucket.explicit_down.saturating_add(1);
             }
-            // κ-pair join (spec §6.2.1 Cap A mirror) keyed on concept_id
-            // when there's no per-instance summary_id available.
-            //
-            // TODO Wave 1.5: ConceptSummaryInteractionPayload only carries
-            // `concept_id`, while ConceptSummaryLlmJudgePayload carries
-            // `concept_summary_id` (per-instance ULID). Until E_INTEGRATE
-            // wires `concept_summary_id` into the GUI thumb path, the
-            // Cap A pair-join is best-effort only — judge half-pairs
-            // keyed on the instance ULID won't match thumb half-pairs
-            // keyed on the concept ULID. v0.27.1 ships this as
-            // documented behaviour; v0.27.2 unifies the surface IDs.
+            // κ-pair join (spec §6.2.1 Cap A mirror). New clients key by
+            // per-refresh `concept_summary_id` so a thumb cannot pair with a
+            // judge verdict for another summary instance. Older clients omit
+            // the field and keep the legacy concept_id key.
             let now_ts = chrono::Utc::now().timestamp();
-            let key = payload.concept_id.clone();
+            let key = payload
+                .concept_summary_id
+                .as_ref()
+                .unwrap_or(&payload.concept_id)
+                .clone();
             if let Some(half) = pending_pairs.remove(&key) {
-                if let HalfPair::Judge { hit, ts, surface } = half {
-                    calibration.push_pair(surface, hit, *up, ts);
+                if let HalfPair::Judge {
+                    hit, ts, surface, ..
+                } = &half
+                {
+                    remove_half_pair_alias(pending_pairs, &key, &half);
+                    calibration.push_pair(*surface, *hit, *up, *ts);
                 } else {
                     pending_pairs.insert(
                         key,
@@ -3353,35 +3365,49 @@ fn fold_concept_summary_llm_judge(
     // κ-pair join keyed on concept_summary_id (per-refresh ULID) so
     // multi-refresh within the half-pair TTL window can't pair a judge
     // verdict for one summary instance with a thumb for a different
-    // instance. Codex R10 P2 fix — v0 keyed on concept_id, which
-    // collides across mints. Now that v0.27.1 mints concept_summary_id
-    // per refresh, use it directly. The fold_concept_summary_interaction
-    // path also keys on concept_summary_id (when ExplicitThumb payload
-    // carries it; v0.27.0 events without it can no longer be paired —
-    // documented loss for upgrade-time events, marginal cost).
+    // instance. For older clients that emitted thumbs before the optional
+    // concept_summary_id field existed, also check the legacy concept_id key
+    // before inserting a new judge half-pair.
     let now_ts = chrono::Utc::now().timestamp();
     let key = payload.concept_summary_id.clone();
-    if let Some(half) = pending_pairs.remove(&key) {
-        if let HalfPair::Thumb { up, ts, surface } = half {
-            calibration.push_pair(surface, payload.hit, up, ts);
+    let legacy_key = payload.concept_id.clone();
+    let matched = pending_pairs.remove(&key).map(|half| (key.clone(), half));
+    let matched = matched.or_else(|| {
+        if !legacy_key.is_empty() && legacy_key != key {
+            pending_pairs
+                .remove(&legacy_key)
+                .map(|half| (legacy_key.clone(), half))
         } else {
-            pending_pairs.insert(
-                key,
-                HalfPair::Judge {
-                    hit: payload.hit,
-                    ts: now_ts,
-                    surface: JudgeSurface::ConceptSummary,
-                },
-            );
+            None
+        }
+    });
+    if let Some((matched_key, half)) = matched {
+        match half {
+            HalfPair::Thumb { up, ts, surface } => {
+                calibration.push_pair(surface, payload.hit, up, ts);
+            }
+            other => {
+                if matched_key == key {
+                    remove_half_pair_alias(pending_pairs, &matched_key, &other);
+                }
+                insert_judge_half_pair(
+                    pending_pairs,
+                    key,
+                    Some(legacy_key),
+                    payload.hit,
+                    now_ts,
+                    JudgeSurface::ConceptSummary,
+                );
+            }
         }
     } else {
-        pending_pairs.insert(
+        insert_judge_half_pair(
+            pending_pairs,
             key,
-            HalfPair::Judge {
-                hit: payload.hit,
-                ts: now_ts,
-                surface: JudgeSurface::ConceptSummary,
-            },
+            Some(legacy_key),
+            payload.hit,
+            now_ts,
+            JudgeSurface::ConceptSummary,
         );
     }
 
@@ -3497,19 +3523,75 @@ pub struct ConceptSummaryLlmJudgePayload {
 /// callers may invoke `rein_judge_synthesis` AFTER an ExplicitThumb that
 /// came in via a separate path. Cache-on-arrival handles both orderings
 /// symmetrically.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "side", rename_all = "snake_case")]
 pub enum HalfPair {
     Judge {
         hit: bool,
         ts: i64,
         surface: JudgeSurface,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias_key: Option<String>,
     },
     Thumb {
         up: bool,
         ts: i64,
         surface: JudgeSurface,
     },
+}
+
+fn remove_half_pair_alias(
+    pending_pairs: &mut HashMap<String, HalfPair>,
+    key: &str,
+    half: &HalfPair,
+) {
+    if let HalfPair::Judge {
+        alias_key: Some(alias_key),
+        ..
+    } = half
+    {
+        let alias_points_back = matches!(
+            pending_pairs.get(alias_key),
+            Some(HalfPair::Judge {
+                alias_key: Some(backlink),
+                ..
+            }) if backlink == key
+        );
+        if alias_points_back {
+            pending_pairs.remove(alias_key);
+        }
+    }
+}
+
+fn insert_judge_half_pair(
+    pending_pairs: &mut HashMap<String, HalfPair>,
+    key: String,
+    alias_key: Option<String>,
+    hit: bool,
+    ts: i64,
+    surface: JudgeSurface,
+) {
+    let alias_key = alias_key.filter(|alias| !alias.is_empty() && alias != &key);
+    pending_pairs.insert(
+        key.clone(),
+        HalfPair::Judge {
+            hit,
+            ts,
+            surface,
+            alias_key: alias_key.clone(),
+        },
+    );
+    if let Some(alias_key) = alias_key {
+        pending_pairs.insert(
+            alias_key,
+            HalfPair::Judge {
+                hit,
+                ts,
+                surface,
+                alias_key: Some(key),
+            },
+        );
+    }
 }
 
 impl HalfPair {
@@ -3865,8 +3947,7 @@ pub fn compute_useful_rate_with_judge(
             (above_threshold as f64 / stats.dwell_samples.len() as f64).clamp(0.0, 1.0)
         };
         let click_signal = (stats.clicked_source_count as f64 / total_views as f64).min(1.0);
-        let requery_signal =
-            (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
+        let requery_signal = (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
         numerator += SYNTHESIS_W_VIEW * viewed_signal + SYNTHESIS_W_CLICK * click_signal
             - SYNTHESIS_W_REQUERY * requery_signal;
         denominator += SYNTHESIS_W_VIEW + SYNTHESIS_W_CLICK + SYNTHESIS_W_REQUERY;
@@ -3920,13 +4001,11 @@ pub fn compute_concept_summary_useful_rate_with_judge(
             (above_threshold as f64 / stats.dwell_samples.len() as f64).clamp(0.0, 1.0)
         };
         let click_signal = (stats.clicked_source_count as f64 / total_views as f64).min(1.0);
-        let requery_signal =
-            (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
+        let requery_signal = (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
         numerator += CONCEPT_SUMMARY_W_VIEW * viewed_signal
             + CONCEPT_SUMMARY_W_CLICK * click_signal
             - CONCEPT_SUMMARY_W_REQUERY * requery_signal;
-        denominator +=
-            CONCEPT_SUMMARY_W_VIEW + CONCEPT_SUMMARY_W_CLICK + CONCEPT_SUMMARY_W_REQUERY;
+        denominator += CONCEPT_SUMMARY_W_VIEW + CONCEPT_SUMMARY_W_CLICK + CONCEPT_SUMMARY_W_REQUERY;
     }
 
     if explicit_total > 0 {
@@ -4201,14 +4280,20 @@ mod tests {
     fn peek_events_does_not_advance_offset() {
         let conn = setup_db();
         for i in 0..3 {
-            emit_event(&conn, FeedbackEvent {
-                event_type: EventType::Store,
-                request_id: Some(format!("r{i}")),
-                memory_id: Some(format!("m{i}")),
-                concept_id: None,
-                query: None, query_type: None, topic: None,
-                payload: None,
-            }).unwrap();
+            emit_event(
+                &conn,
+                FeedbackEvent {
+                    event_type: EventType::Store,
+                    request_id: Some(format!("r{i}")),
+                    memory_id: Some(format!("m{i}")),
+                    concept_id: None,
+                    query: None,
+                    query_type: None,
+                    topic: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
         }
 
         // Peek: returns all 3, no offset advance.
@@ -4229,24 +4314,38 @@ mod tests {
     fn commit_offset_atomic_batch_advances_all_or_nothing() {
         let conn = setup_db();
         for i in 0..2 {
-            emit_event(&conn, FeedbackEvent {
-                event_type: EventType::Store,
-                request_id: Some(format!("r{i}")),
-                memory_id: None, concept_id: None,
-                query: None, query_type: None, topic: None, payload: None,
-            }).unwrap();
+            emit_event(
+                &conn,
+                FeedbackEvent {
+                    event_type: EventType::Store,
+                    request_id: Some(format!("r{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: None,
+                    query_type: None,
+                    topic: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
         }
 
         // Commit two consumers in one batch.
         commit_offset(&conn, &[("c_a", 1), ("c_b", 2)]).unwrap();
-        let off_a: i64 = conn.query_row(
-            "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'c_a'",
-            [], |r| r.get(0),
-        ).unwrap();
-        let off_b: i64 = conn.query_row(
-            "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'c_b'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let off_a: i64 = conn
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'c_a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let off_b: i64 = conn
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'c_b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(off_a, 1);
         assert_eq!(off_b, 2);
     }
@@ -4259,10 +4358,13 @@ mod tests {
         let conn = setup_db();
         commit_offset(&conn, &[("c1", 10)]).unwrap();
         commit_offset(&conn, &[("c1", 5)]).unwrap(); // stale
-        let off: i64 = conn.query_row(
-            "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'c1'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let off: i64 = conn
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(off, 10);
     }
 
@@ -4270,10 +4372,9 @@ mod tests {
     fn commit_offset_empty_batch_is_noop() {
         let conn = setup_db();
         commit_offset(&conn, &[]).unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM consumer_offsets",
-            [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM consumer_offsets", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -4368,13 +4469,18 @@ mod tests {
         // persisted `stats` (with last_consumed_event_id=2 + 2 samples)
         // but commit_offset never landed. Next pass: peek returns the
         // SAME events again. Replay must be a no-op.
-        let (stats2, max_id2) = recompute_concept_refresh_stats(&conn, Some(stats.clone())).unwrap();
+        let (stats2, max_id2) =
+            recompute_concept_refresh_stats(&conn, Some(stats.clone())).unwrap();
         assert_eq!(
             stats2.count, 2,
             "replay-safety: events with id ≤ last_consumed_event_id are skipped"
         );
         assert_eq!(stats2.samples, stats.samples, "no double-append on replay");
-        assert_eq!(max_id2, Some(2), "max_id still reported so caller can re-attempt commit");
+        assert_eq!(
+            max_id2,
+            Some(2),
+            "max_id still reported so caller can re-attempt commit"
+        );
 
         // Caller successfully commits this pass; subsequent peek finds nothing.
         commit_offset(&conn, &[("concept_refresh_stats", max_id2.unwrap())]).unwrap();
@@ -4476,9 +4582,24 @@ mod tests {
             revision_p75: 7,
             age_p50_secs: 3600,
             samples: vec![
-                RefreshSample { revisions_since_last: 5, age_secs_since_last: 1000, first_refresh: false, summary_id: String::new() },
-                RefreshSample { revisions_since_last: 7, age_secs_since_last: 2000, first_refresh: false, summary_id: String::new() },
-                RefreshSample { revisions_since_last: 9, age_secs_since_last: 3600, first_refresh: false, summary_id: String::new() },
+                RefreshSample {
+                    revisions_since_last: 5,
+                    age_secs_since_last: 1000,
+                    first_refresh: false,
+                    summary_id: String::new(),
+                },
+                RefreshSample {
+                    revisions_since_last: 7,
+                    age_secs_since_last: 2000,
+                    first_refresh: false,
+                    summary_id: String::new(),
+                },
+                RefreshSample {
+                    revisions_since_last: 9,
+                    age_secs_since_last: 3600,
+                    first_refresh: false,
+                    summary_id: String::new(),
+                },
             ],
             last_consumed_event_id: 50,
         };
@@ -4561,8 +4682,18 @@ mod tests {
             revision_p75: 8,
             age_p50_secs: 1800,
             samples: vec![
-                RefreshSample { revisions_since_last: 6, age_secs_since_last: 1200, first_refresh: false, summary_id: String::new() },
-                RefreshSample { revisions_since_last: 10, age_secs_since_last: 1800, first_refresh: false, summary_id: String::new() },
+                RefreshSample {
+                    revisions_since_last: 6,
+                    age_secs_since_last: 1200,
+                    first_refresh: false,
+                    summary_id: String::new(),
+                },
+                RefreshSample {
+                    revisions_since_last: 10,
+                    age_secs_since_last: 1800,
+                    first_refresh: false,
+                    summary_id: String::new(),
+                },
             ],
             last_consumed_event_id: 99,
         };
@@ -4689,10 +4820,7 @@ mod tests {
                 memory_id: None,
                 concept_id: None,
                 query: None,
-                query_type: payload
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.query_type.clone()),
+                query_type: payload.metadata.as_ref().and_then(|m| m.query_type.clone()),
                 topic: None,
                 payload: Some(serde_json::to_value(payload).unwrap()),
             },
@@ -5024,7 +5152,9 @@ mod tests {
                 &conn,
                 mk_payload(
                     &format!("syn-fifo-{i}"),
-                    SynthesisInteractionKind::Viewed { dwell_ms: (i + 1) as u64 },
+                    SynthesisInteractionKind::Viewed {
+                        dwell_ms: (i + 1) as u64,
+                    },
                     Some(3),
                     Some("Exploratory"),
                 ),
@@ -5036,7 +5166,10 @@ mod tests {
         assert_eq!(bucket.dwell_samples.len(), SYNTHESIS_DWELL_RESERVOIR_CAP);
         // Oldest `overflow` samples evicted → smallest surviving dwell
         // is `overflow + 1`.
-        assert_eq!(*bucket.dwell_samples.first().unwrap(), (overflow + 1) as u64);
+        assert_eq!(
+            *bucket.dwell_samples.first().unwrap(),
+            (overflow + 1) as u64
+        );
     }
 
     #[test]
@@ -5255,15 +5388,14 @@ mod tests {
             }),
             ..AdaptiveState::default()
         };
-        assert!(state.synthesis_bucket(Some(8), "Semantic").is_none(),
-            "cold-start: bucket below SYNTHESIS_COLD_START_N must return None");
+        assert!(
+            state.synthesis_bucket(Some(8), "Semantic").is_none(),
+            "cold-start: bucket below SYNTHESIS_COLD_START_N must return None"
+        );
 
         // At cold-start threshold → Some.
         let s = state.synthesis_feedback_stats.as_mut().unwrap();
-        s.by_cluster
-            .get_mut(&key)
-            .unwrap()
-            .viewed_count = SYNTHESIS_COLD_START_N;
+        s.by_cluster.get_mut(&key).unwrap().viewed_count = SYNTHESIS_COLD_START_N;
         assert!(state.synthesis_bucket(Some(8), "Semantic").is_some());
     }
 
@@ -5296,10 +5428,7 @@ mod tests {
 
     // ── v0.27 ARS Cap A: concept_summary_feedback consumer tests ───────────
 
-    fn emit_concept_summary_event(
-        conn: &Connection,
-        payload: ConceptSummaryInteractionPayload,
-    ) {
+    fn emit_concept_summary_event(conn: &Connection, payload: ConceptSummaryInteractionPayload) {
         emit_event(
             conn,
             FeedbackEvent {
@@ -5308,10 +5437,7 @@ mod tests {
                 memory_id: None,
                 concept_id: Some(payload.concept_id.clone()),
                 query: None,
-                query_type: payload
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.query_type.clone()),
+                query_type: payload.metadata.as_ref().and_then(|m| m.query_type.clone()),
                 topic: None,
                 payload: Some(serde_json::to_value(payload).unwrap()),
             },
@@ -5327,6 +5453,7 @@ mod tests {
     ) -> ConceptSummaryInteractionPayload {
         ConceptSummaryInteractionPayload {
             concept_id: concept_id.to_string(),
+            concept_summary_id: None,
             recall_id: format!("recall-{concept_id}"),
             interaction: kind,
             metadata: Some(ConceptSummaryMetadata {
@@ -5379,6 +5506,24 @@ mod tests {
             ConceptSummaryInteractionKind::Viewed { dwell_ms: 1000 }
         ));
         assert!(p.metadata.is_none(), "missing metadata → None, not panic");
+    }
+
+    #[test]
+    fn concept_summary_interaction_payload_round_trips_summary_id() {
+        let json = r#"{
+            "concept_id":"con-x",
+            "concept_summary_id":"cs-x",
+            "recall_id":"rec-x",
+            "interaction":{"kind":"explicit_thumb","up":true}
+        }"#;
+        let p: ConceptSummaryInteractionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(p.concept_summary_id.as_deref(), Some("cs-x"));
+
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            back.get("concept_summary_id").and_then(|v| v.as_str()),
+            Some("cs-x")
+        );
     }
 
     #[test]
@@ -5549,7 +5694,10 @@ mod tests {
         // watermark filter, no double-counting.
         let (state2, max_id2) =
             recompute_concept_summary_feedback_stats(&conn, Some(state.clone())).unwrap();
-        assert_eq!(state2.total_events, 2, "replay-safety: events with id <= last_consumed_event_id are skipped");
+        assert_eq!(
+            state2.total_events, 2,
+            "replay-safety: events with id <= last_consumed_event_id are skipped"
+        );
         let key = concept_summary_bucket_key(Some(7), "Semantic");
         let bucket = state2.by_cluster.get(&key).unwrap();
         assert_eq!(bucket.viewed_count, 1);
@@ -5608,8 +5756,7 @@ mod tests {
                 Some("Semantic"),
             ),
         );
-        let (state, max_id) =
-            recompute_concept_summary_feedback_stats(&conn, Some(prior)).unwrap();
+        let (state, max_id) = recompute_concept_summary_feedback_stats(&conn, Some(prior)).unwrap();
         assert_eq!(state.by_cluster.len(), CONCEPT_SUMMARY_BY_CLUSTER_CAP);
         // New bucket NOT inserted, but total_events bumps so the offset
         // advances and we don't replay this event forever.
@@ -5851,7 +5998,9 @@ mod tests {
                 &conn,
                 mk_concept_summary_payload(
                     &format!("con-fifo-{i}"),
-                    ConceptSummaryInteractionKind::Viewed { dwell_ms: (i + 1) as u64 },
+                    ConceptSummaryInteractionKind::Viewed {
+                        dwell_ms: (i + 1) as u64,
+                    },
                     Some(3),
                     Some("Exploratory"),
                 ),
@@ -5866,7 +6015,10 @@ mod tests {
         );
         // Oldest `overflow` samples evicted → smallest surviving dwell is
         // `overflow + 1`.
-        assert_eq!(*bucket.dwell_samples.first().unwrap(), (overflow + 1) as u64);
+        assert_eq!(
+            *bucket.dwell_samples.first().unwrap(),
+            (overflow + 1) as u64
+        );
     }
 
     #[test]
@@ -6005,6 +6157,241 @@ mod tests {
             restored.concept_summary_feedback_stats,
             Some(learned),
             "CAS merge must preserve existing concept_summary stats when writer has None"
+        );
+    }
+
+    #[test]
+    fn concept_summary_feedback_pairs_human_thumb_by_summary_id_when_present() {
+        let conn = setup_db();
+        let metadata = Some(JudgeMetadata {
+            query_type: Some("Semantic".to_string()),
+            cluster_id: Some(7),
+            source_count: Some(0),
+            judge_latency_ms: None,
+        });
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("concept-a".to_string()),
+                query: None,
+                query_type: Some("Semantic".to_string()),
+                topic: None,
+                payload: Some(
+                    serde_json::to_value(ConceptSummaryLlmJudgePayload {
+                        concept_summary_id: "cs-a".to_string(),
+                        concept_id: "concept-a".to_string(),
+                        judge_model: "mock".to_string(),
+                        hit: true,
+                        reason: "ok".to_string(),
+                        stamp_hash: "hash".to_string(),
+                        source: JudgeSource::ManualMcp,
+                        metadata: metadata.clone(),
+                        signal_hint: None,
+                    })
+                    .unwrap(),
+                ),
+            },
+        )
+        .unwrap();
+        emit_concept_summary_event(
+            &conn,
+            ConceptSummaryInteractionPayload {
+                concept_id: "concept-a".to_string(),
+                concept_summary_id: Some("cs-a".to_string()),
+                recall_id: "rec-a".to_string(),
+                interaction: ConceptSummaryInteractionKind::ExplicitThumb { up: true },
+                metadata: Some(ConceptSummaryMetadata {
+                    query_type: Some("Semantic".to_string()),
+                    cluster_id: Some(7),
+                    concept_chars: None,
+                    revision_version: None,
+                }),
+            },
+        );
+
+        let (_state, pending, calibration, _max_id) =
+            recompute_concept_summary_feedback_stats_with_judge(
+                &conn,
+                None,
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+
+        assert!(
+            pending.is_empty(),
+            "matching concept_summary_id should complete the half-pair"
+        );
+        assert_eq!(calibration.recent_pairs_concept.len(), 1);
+        assert!(calibration.recent_pairs_concept[0].0);
+        assert!(calibration.recent_pairs_concept[0].1);
+    }
+
+    #[test]
+    fn concept_summary_feedback_pairs_judge_first_legacy_thumb_by_concept_id() {
+        let conn = setup_db();
+        let metadata = Some(JudgeMetadata {
+            query_type: Some("Semantic".to_string()),
+            cluster_id: Some(7),
+            source_count: Some(0),
+            judge_latency_ms: None,
+        });
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("concept-a".to_string()),
+                query: None,
+                query_type: Some("Semantic".to_string()),
+                topic: None,
+                payload: Some(
+                    serde_json::to_value(ConceptSummaryLlmJudgePayload {
+                        concept_summary_id: "cs-a".to_string(),
+                        concept_id: "concept-a".to_string(),
+                        judge_model: "mock".to_string(),
+                        hit: false,
+                        reason: "miss".to_string(),
+                        stamp_hash: "hash".to_string(),
+                        source: JudgeSource::ManualMcp,
+                        metadata: metadata.clone(),
+                        signal_hint: None,
+                    })
+                    .unwrap(),
+                ),
+            },
+        )
+        .unwrap();
+        emit_concept_summary_event(
+            &conn,
+            ConceptSummaryInteractionPayload {
+                concept_id: "concept-a".to_string(),
+                concept_summary_id: None,
+                recall_id: "rec-a".to_string(),
+                interaction: ConceptSummaryInteractionKind::ExplicitThumb { up: false },
+                metadata: Some(ConceptSummaryMetadata {
+                    query_type: Some("Semantic".to_string()),
+                    cluster_id: Some(7),
+                    concept_chars: None,
+                    revision_version: None,
+                }),
+            },
+        );
+
+        let (_state, pending, calibration, _max_id) =
+            recompute_concept_summary_feedback_stats_with_judge(
+                &conn,
+                None,
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+
+        assert!(
+            pending.is_empty(),
+            "legacy concept_id alias should be consumed with the canonical summary-id half-pair"
+        );
+        assert_eq!(calibration.recent_pairs_concept.len(), 1);
+        assert!(!calibration.recent_pairs_concept[0].0);
+        assert!(!calibration.recent_pairs_concept[0].1);
+    }
+
+    #[test]
+    fn concept_summary_alias_cleanup_preserves_newer_summary_alias() {
+        let conn = setup_db();
+        let metadata = Some(JudgeMetadata {
+            query_type: Some("Semantic".to_string()),
+            cluster_id: Some(7),
+            source_count: Some(0),
+            judge_latency_ms: None,
+        });
+        for summary_id in ["cs-old", "cs-new"] {
+            emit_event(
+                &conn,
+                FeedbackEvent {
+                    event_type: EventType::ConceptSummaryLlmJudge,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: Some("concept-a".to_string()),
+                    query: None,
+                    query_type: Some("Semantic".to_string()),
+                    topic: None,
+                    payload: Some(
+                        serde_json::to_value(ConceptSummaryLlmJudgePayload {
+                            concept_summary_id: summary_id.to_string(),
+                            concept_id: "concept-a".to_string(),
+                            judge_model: "mock".to_string(),
+                            hit: true,
+                            reason: "ok".to_string(),
+                            stamp_hash: format!("hash-{summary_id}"),
+                            source: JudgeSource::ManualMcp,
+                            metadata: metadata.clone(),
+                            signal_hint: None,
+                        })
+                        .unwrap(),
+                    ),
+                },
+            )
+            .unwrap();
+        }
+        emit_concept_summary_event(
+            &conn,
+            ConceptSummaryInteractionPayload {
+                concept_id: "concept-a".to_string(),
+                concept_summary_id: Some("cs-old".to_string()),
+                recall_id: "rec-a".to_string(),
+                interaction: ConceptSummaryInteractionKind::ExplicitThumb { up: true },
+                metadata: Some(ConceptSummaryMetadata {
+                    query_type: Some("Semantic".to_string()),
+                    cluster_id: Some(7),
+                    concept_chars: None,
+                    revision_version: None,
+                }),
+            },
+        );
+
+        let (_state, pending, calibration, _max_id) =
+            recompute_concept_summary_feedback_stats_with_judge(
+                &conn,
+                None,
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+
+        assert_eq!(calibration.recent_pairs_concept.len(), 1);
+        assert!(pending.contains_key("cs-new"));
+        assert!(
+            matches!(
+                pending.get("concept-a"),
+                Some(HalfPair::Judge {
+                    alias_key: Some(alias_key),
+                    ..
+                }) if alias_key == "cs-new"
+            ),
+            "pairing the old summary must not remove the newer legacy alias"
+        );
+    }
+
+    #[test]
+    fn half_pair_judge_alias_is_backward_compatible() {
+        let json = r#"{"side":"judge","hit":true,"ts":42,"surface":"concept_summary"}"#;
+        let half: HalfPair = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            half,
+            HalfPair::Judge {
+                hit: true,
+                ts: 42,
+                surface: JudgeSurface::ConceptSummary,
+                alias_key: None,
+            }
         );
     }
 

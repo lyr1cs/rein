@@ -319,10 +319,7 @@ impl OpsRuntime {
         // consumer can route via the indexed column without parsing the
         // payload JSON for every event. Mirrors how `concept_summary_refresh`
         // sets `concept_id` on the event row alongside payload.
-        let query_type = params
-            .metadata
-            .as_ref()
-            .and_then(|m| m.query_type.clone());
+        let query_type = params.metadata.as_ref().and_then(|m| m.query_type.clone());
 
         let payload = crate::store::adaptive::SynthesisInteractionPayload {
             synthesis_id: params.synthesis_id.clone(),
@@ -514,7 +511,10 @@ mod tests {
             "memory_ids": ["mem_x"]
         });
         let result: Result<FeedbackParams, _> = serde_json::from_value(json);
-        assert!(result.is_err(), "unknown kind must error, not silently default");
+        assert!(
+            result.is_err(),
+            "unknown kind must error, not silently default"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("unknown feedback kind"),
@@ -541,9 +541,7 @@ mod tests {
             .or_else(|| value.pointer("/definitions/FeedbackParams/oneOf"))
             .or_else(|| value.pointer("/$defs/FeedbackParams/oneOf"))
             .expect("schema must expose a oneOf for the FeedbackParams variants");
-        let branches = oneof
-            .as_array()
-            .expect("oneOf must be an array");
+        let branches = oneof.as_array().expect("oneOf must be an array");
         assert_eq!(
             branches.len(),
             2,

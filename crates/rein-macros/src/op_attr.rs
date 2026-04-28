@@ -560,8 +560,10 @@ fn emit_rest_block(
     let path = &rest.path;
     let path_span = Span::call_site();
 
-    // Check whether the path contains any placeholders at all before parsing.
-    let has_placeholder = path.contains('{');
+    // Check whether the path contains any brace/template syntax before parsing.
+    // A stray closing brace (`/api/foo/id}`) must be rejected here too; otherwise
+    // it is treated as a literal-only path and the macro emits registry code.
+    let has_placeholder = path.contains('{') || path.contains('}');
     let path_segments_tokens = if has_placeholder {
         let segs = parse_path_segments(path, path_span)?;
         quote! { &[ #( #segs ),* ] }

@@ -333,9 +333,7 @@ async fn main() -> anyhow::Result<()> {
             // events. The `judge_calibration` consumer absorbs them on
             // the next slow-channel pass and updates κ + drift alert.
             let store = config.open_store()?;
-            let report = rein::ops::judge_calibration::run_judge_calibration_cron(
-                &store, &config,
-            )?;
+            let report = rein::ops::judge_calibration::run_judge_calibration_cron(&store, &config)?;
             if verbose {
                 println!("considered:                  {}", report.considered);
                 println!("emitted (OfflineCron events): {}", report.emitted);

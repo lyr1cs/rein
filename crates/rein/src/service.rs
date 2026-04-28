@@ -43,6 +43,10 @@ fn pid_path(name: &str) -> PathBuf {
     pid_dir().join(format!("{name}.pid"))
 }
 
+fn effective_pid_name(name: &str) -> &str {
+    name
+}
+
 /// Write PID + exe path to `~/.rein/{name}.pid` for identity verification.
 pub fn write_pid(name: &str) -> anyhow::Result<()> {
     write_pid_of(name, std::process::id())
@@ -54,13 +58,13 @@ pub fn write_pid_of(name: &str, pid: u32) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let exe = std::env::current_exe().unwrap_or_default();
     let content = format!("{}\n{}", pid, exe.display());
-    std::fs::write(pid_path(name), content)?;
+    std::fs::write(pid_path(effective_pid_name(name)), content)?;
     Ok(())
 }
 
 /// Remove PID file on shutdown.
 pub fn remove_pid(name: &str) {
-    let _ = std::fs::remove_file(pid_path(name));
+    let _ = std::fs::remove_file(pid_path(effective_pid_name(name)));
 }
 
 fn matches_recorded_executable(running: &std::path::Path, saved_exe: &str) -> bool {
@@ -101,7 +105,7 @@ fn is_process_rein(pid: u32, saved_exe: &str) -> bool {
 
 /// Read PID from file, verify it's still a rein process, and return PID if alive.
 pub fn is_running(name: &str) -> Option<u32> {
-    let content = std::fs::read_to_string(pid_path(name)).ok()?;
+    let content = std::fs::read_to_string(pid_path(effective_pid_name(name))).ok()?;
     let mut lines = content.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
     let saved_exe = lines.next().unwrap_or("");
@@ -377,4 +381,16 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
         })
         .unwrap_or(0);
     println!("\nQueue: {pending} pending");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_pid_names_are_not_rewritten() {
+        assert_eq!(effective_pid_name("gui"), "gui");
+        assert_eq!(effective_pid_name("http"), "http");
+        assert_eq!(effective_pid_name("proxy"), "proxy");
+    }
 }

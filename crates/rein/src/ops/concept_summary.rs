@@ -1,8 +1,8 @@
 use crate::config::{Provider, ReinConfig};
 use crate::extract::llm::{strip_code_fences, ExtractorKind};
 use crate::store::adaptive::{
-    concept_summary_bucket_key, emit_event, AdaptiveState, ClusterConceptSummaryStats,
-    EventType, FeedbackEvent, RefreshSample, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+    concept_summary_bucket_key, emit_event, AdaptiveState, ClusterConceptSummaryStats, EventType,
+    FeedbackEvent, RefreshSample, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
 };
 use crate::store::memoir::{row_to_concept, should_refresh_living_summary};
 use crate::store::SqliteStore;
@@ -215,7 +215,12 @@ fn summarize_one(
     // won) — caller treats empty as "skipped, no id to surface".
     let revisions =
         load_revisions(store, &concept.id, REVISION_HISTORY_LIMIT).map_err(SummaryError::Store)?;
-    let prompt = build_concept_summary_prompt(concept, &revisions);
+    let max_chars = crate::extract::llm::resolve_max_input_for_section_kind(
+        config,
+        "ars.concept_summary",
+        extractor,
+    );
+    let prompt = build_concept_summary_prompt_with_cap(concept, &revisions, max_chars);
     let source_revision = concept.revision;
 
     let llm_output = call_llm_sync(extractor, &prompt).map_err(SummaryError::Llm)?;
@@ -349,9 +354,8 @@ fn emit_refresh_event(
     concept_id: &str,
     sample: RefreshSample,
 ) -> ReinResult<()> {
-    let payload = serde_json::to_value(sample).map_err(|e| {
-        ReinError::Config(format!("failed to serialize RefreshSample: {e}"))
-    })?;
+    let payload = serde_json::to_value(sample)
+        .map_err(|e| ReinError::Config(format!("failed to serialize RefreshSample: {e}")))?;
     emit_event(
         store.conn(),
         FeedbackEvent {
@@ -465,6 +469,14 @@ fn load_revisions(
 }
 
 pub fn build_concept_summary_prompt(concept: &Concept, revisions: &[ConceptRevision]) -> String {
+    build_concept_summary_prompt_with_cap(concept, revisions, 0)
+}
+
+pub fn build_concept_summary_prompt_with_cap(
+    concept: &Concept,
+    revisions: &[ConceptRevision],
+    max_chars: usize,
+) -> String {
     let mut buf = String::with_capacity(
         concept.definition.len()
             + revisions.iter().map(|r| r.definition.len()).sum::<usize>()
@@ -493,7 +505,29 @@ pub fn build_concept_summary_prompt(concept: &Concept, revisions: &[ConceptRevis
         }
     }
     buf.push_str("\nNow produce the 3-to-5-sentence current-state summary.");
+    if max_chars > 0 && buf.chars().count() > max_chars {
+        buf = cap_concept_summary_prompt(buf, max_chars);
+    }
     buf
+}
+
+fn cap_concept_summary_prompt(mut prompt: String, max_chars: usize) -> String {
+    const NOTICE: &str = "\n[...revision history truncated for prompt budget]\n";
+    if max_chars == 0 || prompt.chars().count() <= max_chars {
+        return prompt;
+    }
+    let notice_chars = NOTICE.chars().count();
+    if max_chars <= notice_chars {
+        return prompt.chars().take(max_chars).collect();
+    }
+    let take = max_chars.saturating_sub(notice_chars);
+    prompt = prompt.chars().take(take).collect();
+    prompt.push_str(NOTICE);
+    if prompt.chars().count() > max_chars {
+        prompt.chars().take(max_chars).collect()
+    } else {
+        prompt
+    }
 }
 
 /// Build an `ExtractorKind` honoring the resolved LLM config for the
@@ -812,7 +846,10 @@ fn enqueue_judge_for_concept_summary(
     let bucket = adaptive_state
         .concept_summary_feedback_stats
         .as_ref()
-        .and_then(|sfs| sfs.by_cluster.get(&concept_summary_bucket_key(None, "unknown")));
+        .and_then(|sfs| {
+            sfs.by_cluster
+                .get(&concept_summary_bucket_key(None, "unknown"))
+        });
     let rate = current_sample_rate_concept_summary(bucket, &config.ars.llm_judge);
     if bernoulli_fire_concept_summary(rate, summary_id) {
         let job = serde_json::json!({
@@ -912,6 +949,40 @@ mod tests {
             living_summary_source_revision: None,
             living_summary_id: None,
         }
+    }
+
+    fn make_revision(concept_id: &str, revision: u32, definition: &str) -> ConceptRevision {
+        ConceptRevision {
+            id: format!("rev-{revision}"),
+            concept_id: concept_id.to_string(),
+            revision,
+            definition: definition.to_string(),
+            confidence: 0.8,
+            labels: Vec::new(),
+            source_memory_ids: Vec::new(),
+            episode_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn build_concept_summary_prompt_with_cap_truncates_cjk_safely() {
+        let mut concept = make_concept("test-memoir", "bounded-concept");
+        concept.id = "concept-bounded".to_string();
+        concept.definition = "当前定义".repeat(300);
+        let revisions = vec![
+            make_revision(&concept.id, 1, &"旧版本事实".repeat(300)),
+            make_revision(&concept.id, 2, &"第二版事实".repeat(300)),
+        ];
+
+        let prompt = build_concept_summary_prompt_with_cap(&concept, &revisions, 512);
+
+        assert!(
+            prompt.chars().count() <= 512,
+            "prompt must honor max_input_chars using char count"
+        );
+        assert!(prompt.contains("Concept: bounded-concept"));
+        assert!(prompt.is_char_boundary(prompt.len()));
     }
 
     #[test]
@@ -1087,7 +1158,10 @@ mod tests {
         bucket: ClusterConceptSummaryStats,
     ) -> AdaptiveState {
         let mut by_cluster = HashMap::new();
-        by_cluster.insert(concept_summary_bucket_key(Some(cluster_id), query_type), bucket);
+        by_cluster.insert(
+            concept_summary_bucket_key(Some(cluster_id), query_type),
+            bucket,
+        );
         AdaptiveState {
             concept_summary_feedback_stats: Some(ConceptSummaryFeedbackState {
                 by_cluster,

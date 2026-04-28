@@ -1691,7 +1691,8 @@ pub fn recall_temporal_with_request_id(
     // memory-local — no DB IO.
     let cold_archive_enabled = config.ars.cold_archive_enabled;
     for result in &mut results {
-        if let Some(summary) = maybe_archival_summary_for_recall(cold_archive_enabled, &result.memory)
+        if let Some(summary) =
+            maybe_archival_summary_for_recall(cold_archive_enabled, &result.memory)
         {
             result.archival_summary = Some(summary);
         }
@@ -2409,7 +2410,10 @@ mod tests {
         superseded.superseded_by = Some("active".to_string());
 
         assert!(predicate(&active), "Active + superseded_by=None must pass");
-        assert!(predicate(&updated), "Updated + superseded_by=None must pass");
+        assert!(
+            predicate(&updated),
+            "Updated + superseded_by=None must pass"
+        );
         assert!(!predicate(&deprecated), "Deprecated must be dropped");
         assert!(
             predicate(&superseded),

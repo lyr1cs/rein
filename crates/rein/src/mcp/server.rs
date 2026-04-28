@@ -2,6 +2,7 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
+use http_body_util::BodyExt;
 
 /// MCP server for rein memory system.
 ///
@@ -63,6 +64,241 @@ impl ReinServer {
 }
 
 const HTTP_SESSION_COOKIE: &str = "rein_http_token";
+const SEC_FETCH_SITE: &str = "sec-fetch-site";
+
+type HttpBoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpRequestHost {
+    host: String,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HttpGuardRejection {
+    BadRequest(&'static str),
+    Forbidden(&'static str),
+}
+
+impl HttpGuardRejection {
+    fn status(&self) -> hyper::StatusCode {
+        match self {
+            Self::BadRequest(_) => hyper::StatusCode::BAD_REQUEST,
+            Self::Forbidden(_) => hyper::StatusCode::FORBIDDEN,
+        }
+    }
+
+    fn message(&self) -> &'static str {
+        match self {
+            Self::BadRequest(message) | Self::Forbidden(message) => message,
+        }
+    }
+}
+
+fn plain_http_response(
+    status: hyper::StatusCode,
+    body: &'static str,
+) -> hyper::Response<HttpBoxBody> {
+    hyper::Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(http_body_util::Full::new(bytes::Bytes::from_static(body.as_bytes())).boxed())
+        .unwrap_or_else(|_| {
+            hyper::Response::new(
+                http_body_util::Full::new(bytes::Bytes::from_static(b"internal error")).boxed(),
+            )
+        })
+}
+
+fn http_guard_response(rejection: HttpGuardRejection) -> hyper::Response<HttpBoxBody> {
+    plain_http_response(rejection.status(), rejection.message())
+}
+
+fn normalize_host_for_guard(host: &str) -> String {
+    let trimmed = host.trim();
+    let without_brackets = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    without_brackets.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn parse_http_authority(value: &str) -> Option<HttpRequestHost> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let authority = hyper::http::uri::Authority::try_from(value).ok()?;
+    Some(HttpRequestHost {
+        host: normalize_host_for_guard(authority.host()),
+        port: authority.port_u16(),
+    })
+}
+
+fn parse_allowed_http_authority(value: &str) -> Option<HttpRequestHost> {
+    parse_http_authority(value).or_else(|| {
+        let host = normalize_host_for_guard(value);
+        if host.is_empty() {
+            None
+        } else {
+            Some(HttpRequestHost { host, port: None })
+        }
+    })
+}
+
+fn parse_http_request_host(
+    headers: &hyper::HeaderMap,
+) -> Result<HttpRequestHost, HttpGuardRejection> {
+    let host = headers
+        .get(hyper::header::HOST)
+        .ok_or(HttpGuardRejection::BadRequest("missing Host header"))?;
+    let host = host
+        .to_str()
+        .map_err(|_| HttpGuardRejection::BadRequest("invalid Host header"))?;
+    parse_http_authority(host).ok_or(HttpGuardRejection::BadRequest("invalid Host header"))
+}
+
+fn is_specific_bind_host(host: &str) -> bool {
+    !matches!(host, "" | "*" | "0.0.0.0" | "::")
+}
+
+fn http_host_guard_enabled(bind_host: &str) -> bool {
+    is_specific_bind_host(&normalize_host_for_guard(bind_host))
+}
+
+fn http_allowed_hosts(bind_host: &str) -> Vec<String> {
+    let mut allowed = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let normalized_bind = normalize_host_for_guard(bind_host);
+    if is_specific_bind_host(&normalized_bind)
+        && !allowed
+            .iter()
+            .any(|host| normalize_host_for_guard(host) == normalized_bind)
+    {
+        allowed.push(bind_host.trim().to_string());
+    }
+    allowed
+}
+
+fn http_host_is_allowed(host: &HttpRequestHost, bind_host: &str) -> bool {
+    http_allowed_hosts(bind_host)
+        .iter()
+        .filter_map(|allowed| parse_allowed_http_authority(allowed))
+        .any(|allowed| {
+            allowed.host == host.host
+                && match allowed.port {
+                    Some(port) => host.port == Some(port),
+                    None => true,
+                }
+        })
+}
+
+fn validate_http_request_host(
+    headers: &hyper::HeaderMap,
+    bind_host: &str,
+) -> Result<HttpRequestHost, HttpGuardRejection> {
+    let host = parse_http_request_host(headers)?;
+    if !http_host_is_allowed(&host, bind_host) {
+        return Err(HttpGuardRejection::Forbidden("Host header is not allowed"));
+    }
+    Ok(host)
+}
+
+fn is_mutating_http_surface_request(method: &hyper::Method, path: &str) -> bool {
+    matches!(
+        *method,
+        hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH | hyper::Method::DELETE
+    ) && (path.starts_with("/api/") || path.starts_with("/mcp"))
+}
+
+fn request_has_browser_mutation_headers(headers: &hyper::HeaderMap) -> bool {
+    headers.contains_key(hyper::header::ORIGIN) || headers.contains_key(SEC_FETCH_SITE)
+}
+
+fn origin_authority(origin: &str) -> Option<(String, HttpRequestHost)> {
+    let uri = origin.trim().parse::<hyper::Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let authority = uri.authority()?;
+    Some((
+        scheme,
+        HttpRequestHost {
+            host: normalize_host_for_guard(authority.host()),
+            port: authority.port_u16(),
+        },
+    ))
+}
+
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn same_origin_as_request(origin: &str, request_host: &HttpRequestHost) -> bool {
+    let Some((scheme, origin_host)) = origin_authority(origin) else {
+        return false;
+    };
+    if scheme != "http" {
+        return false;
+    }
+    let origin_port = origin_host
+        .port
+        .or_else(|| default_port_for_scheme(&scheme));
+    let request_port = request_host
+        .port
+        .or_else(|| default_port_for_scheme(&scheme));
+    origin_host.host == request_host.host && origin_port == request_port
+}
+
+fn validate_browser_mutation_guard(
+    method: &hyper::Method,
+    path: &str,
+    headers: &hyper::HeaderMap,
+    request_host: &HttpRequestHost,
+) -> Result<(), HttpGuardRejection> {
+    if !is_mutating_http_surface_request(method, path) {
+        return Ok(());
+    }
+
+    if let Some(fetch_site) = headers.get(SEC_FETCH_SITE).and_then(|v| v.to_str().ok()) {
+        match fetch_site.to_ascii_lowercase().as_str() {
+            "same-origin" | "none" => {}
+            _ => {
+                return Err(HttpGuardRejection::Forbidden(
+                    "cross-site browser request blocked",
+                ));
+            }
+        }
+    }
+
+    if let Some(origin) = headers
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !same_origin_as_request(origin, request_host) {
+            return Err(HttpGuardRejection::Forbidden(
+                "cross-origin browser request blocked",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn collect_mcp_request_body_capped<B>(
+    body: B,
+) -> Result<bytes::Bytes, hyper::Response<HttpBoxBody>>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    crate::mcp::rest::collect_body_capped(body).await
+}
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
     use sha2::{Digest, Sha256};
@@ -125,10 +361,11 @@ impl ServerHandler for ReinServer {
                  Knowledge graph: rein_memoir_* (10 tools — create/list/show/add_concept/refine/\
                  search/search_all/link/inspect/export). Temporal: rein_timeline, \
                  rein_concept_history. Adaptive/feedback: rein_adaptive_status, rein_feedback, \
-                 rein_feedback_concept_summary, rein_concept_state, rein_archive_summary_refresh. \
+                 rein_feedback_concept_summary, rein_concept_state, rein_archive_summary_refresh, \
+                 rein_judge_synthesis, rein_judge_concept_summary. \
                  Maintenance: rein_consolidate, rein_dedup, rein_cleanup, rein_gc, rein_organize. \
                  Listing: rein_list_topics, rein_recent, rein_stats, rein_health. \
-                 Total: 36 tools as of v0.27.0.\n\
+                 Total: 38 tools as of v0.27.3.\n\
                  \n\
                  Defaults: call rein_recall at the start of a session when the user references \
                  past work; call rein_store after solving bugs, making architecture decisions, \
@@ -274,7 +511,6 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     spawn_background_warmup(&config);
 
-    use http_body_util::BodyExt;
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
@@ -339,7 +575,14 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         eprintln!("Neural Wiki GUI available at http://{bind}/");
     }
     // Write PID file for service management (rein gui on/off, rein dashboard).
-    let _ = crate::service::write_pid("gui");
+    // Plain SSE/MCP HTTP must not masquerade as GUI, or `rein gui off` can
+    // stop a non-GUI server.
+    let pid_name = if config.server.gui_enabled {
+        "gui"
+    } else {
+        "http"
+    };
+    let _ = crate::service::write_pid(pid_name);
 
     let rest_config = config.clone();
     let gui_enabled = config.server.gui_enabled;
@@ -348,28 +591,47 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         let token = auth_token.clone();
         let cfg = rest_config.clone();
         async move {
+            let path = req.uri().path();
+            let method = req.method();
+            let host_for_origin = if http_host_guard_enabled(&cfg.server.sse_bind) {
+                match validate_http_request_host(req.headers(), &cfg.server.sse_bind) {
+                    Ok(host) => Some(host),
+                    Err(rejection) => {
+                        return Ok::<_, std::convert::Infallible>(http_guard_response(rejection));
+                    }
+                }
+            } else {
+                parse_http_request_host(req.headers()).ok()
+            };
+
+            if let Some(host) = host_for_origin.as_ref() {
+                if let Err(rejection) =
+                    validate_browser_mutation_guard(method, path, req.headers(), host)
+                {
+                    return Ok::<_, std::convert::Infallible>(http_guard_response(rejection));
+                }
+            } else if is_mutating_http_surface_request(method, path)
+                && request_has_browser_mutation_headers(req.headers())
+            {
+                return Ok::<_, std::convert::Infallible>(http_guard_response(
+                    HttpGuardRejection::BadRequest("missing Host header"),
+                ));
+            }
+
             // v0.26.2 default-deny: any request requires bearer auth UNLESS
             // it is the stale-cookie clear path OR a GUI surface served when
             // the SPA is enabled. Earlier allowlist (`/api/` || `/mcp`) let
             // unmatched paths fall through to the MCP service, so a request
             // like `POST /not-mcp` ran MCP `initialize` with no token. The
             // pure helper `http_request_needs_auth` is unit-tested below.
-            let path = req.uri().path();
-            let method = req.method();
             let needs_auth = http_request_needs_auth(method, path, gui_enabled);
             if needs_auth {
                 if let Some(ref expected) = token {
                     if !request_has_valid_http_auth(req.headers(), expected) {
-                        return Ok::<_, std::convert::Infallible>(
-                            hyper::Response::builder()
-                                .status(401)
-                                .body(
-                                    http_body_util::Full::new(bytes::Bytes::from("Unauthorized"))
-                                        .map_err(|never: std::convert::Infallible| match never {})
-                                        .boxed(),
-                                )
-                                .unwrap(),
-                        );
+                        return Ok::<_, std::convert::Infallible>(plain_http_response(
+                            hyper::StatusCode::UNAUTHORIZED,
+                            "Unauthorized",
+                        ));
                     }
                 }
             } // needs_auth
@@ -384,13 +646,19 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                 return Ok::<_, std::convert::Infallible>(response);
             }
 
-            if config.server.gui_enabled && !path.starts_with("/mcp") {
+            if gui_enabled && !path.starts_with("/mcp") {
                 if let Some(response) = crate::mcp::rest::handle_rest_request(&req, &cfg).await {
                     return Ok::<_, std::convert::Infallible>(response);
                 }
             }
 
             // /mcp or unmatched path: pass through with original body.
+            let (parts, body) = req.into_parts();
+            let body = match collect_mcp_request_body_capped(body).await {
+                Ok(body) => body,
+                Err(response) => return Ok::<_, std::convert::Infallible>(response),
+            };
+            let req = hyper::Request::from_parts(parts, http_body_util::Full::new(body));
             Ok::<_, std::convert::Infallible>(svc.handle(req).await)
         }
     });
@@ -404,7 +672,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                 tracing::info!("rein HTTP server: shutdown signal received, stopping accept loop");
                 eprintln!("rein HTTP server: shutting down gracefully");
                 cancel.cancel();
-                crate::service::remove_pid("gui");
+                crate::service::remove_pid(pid_name);
                 break;
             }
         };
@@ -443,7 +711,11 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
 ///
 /// All other paths require auth; the previous allowlist (`/api/` || `/mcp`)
 /// let `POST /not-mcp` fall through to the MCP service with no token.
-pub(crate) fn http_request_needs_auth(method: &hyper::Method, path: &str, gui_enabled: bool) -> bool {
+pub(crate) fn http_request_needs_auth(
+    method: &hyper::Method,
+    path: &str,
+    gui_enabled: bool,
+) -> bool {
     if method == hyper::Method::DELETE && path == "/api/session" {
         return false;
     }
@@ -538,8 +810,16 @@ mod tests {
         // SPA fallback to index.html for any client-side route.
         assert!(!http_request_needs_auth(&Method::GET, "/", true));
         assert!(!http_request_needs_auth(&Method::GET, "/index.html", true));
-        assert!(!http_request_needs_auth(&Method::GET, "/assets/app.js", true));
-        assert!(!http_request_needs_auth(&Method::GET, "/synthesis-lab", true));
+        assert!(!http_request_needs_auth(
+            &Method::GET,
+            "/assets/app.js",
+            true
+        ));
+        assert!(!http_request_needs_auth(
+            &Method::GET,
+            "/synthesis-lab",
+            true
+        ));
     }
 
     #[test]
@@ -564,5 +844,123 @@ mod tests {
             false
         ));
         assert!(http_request_needs_auth(&Method::GET, "/api/session", true));
+    }
+
+    #[test]
+    fn loopback_host_guard_rejects_dns_rebinding_host() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("attacker.example:8691"),
+        );
+
+        assert!(matches!(
+            validate_http_request_host(&headers, "127.0.0.1"),
+            Err(HttpGuardRejection::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn host_guard_allows_loopback_and_specific_bind_hosts() {
+        for host in ["localhost:8691", "127.0.0.1:8691", "[::1]:8691"] {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                hyper::header::HOST,
+                hyper::header::HeaderValue::from_str(host).unwrap(),
+            );
+            assert!(
+                validate_http_request_host(&headers, "127.0.0.1").is_ok(),
+                "{host} should be accepted"
+            );
+        }
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("192.0.2.10:8691"),
+        );
+        assert!(validate_http_request_host(&headers, "192.0.2.10").is_ok());
+    }
+
+    #[test]
+    fn browser_mutating_surface_guard_rejects_cross_site_origin() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("localhost:8691"),
+        );
+        headers.insert(
+            hyper::header::ORIGIN,
+            hyper::header::HeaderValue::from_static("http://attacker.example"),
+        );
+        headers.insert(
+            "sec-fetch-site",
+            hyper::header::HeaderValue::from_static("cross-site"),
+        );
+        let host = validate_http_request_host(&headers, "127.0.0.1").unwrap();
+
+        assert!(matches!(
+            validate_browser_mutation_guard(&Method::POST, "/api/memories", &headers, &host),
+            Err(HttpGuardRejection::Forbidden(_))
+        ));
+        assert!(matches!(
+            validate_browser_mutation_guard(&Method::POST, "/mcp", &headers, &host),
+            Err(HttpGuardRejection::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn browser_mutating_surface_guard_allows_same_origin_and_native_clients() {
+        let mut same_origin = hyper::HeaderMap::new();
+        same_origin.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("localhost:8691"),
+        );
+        same_origin.insert(
+            hyper::header::ORIGIN,
+            hyper::header::HeaderValue::from_static("http://localhost:8691"),
+        );
+        same_origin.insert(
+            "sec-fetch-site",
+            hyper::header::HeaderValue::from_static("same-origin"),
+        );
+        let host = validate_http_request_host(&same_origin, "127.0.0.1").unwrap();
+        assert!(validate_browser_mutation_guard(
+            &Method::POST,
+            "/api/memories",
+            &same_origin,
+            &host
+        )
+        .is_ok());
+        assert!(
+            validate_browser_mutation_guard(&Method::POST, "/mcp", &same_origin, &host).is_ok()
+        );
+
+        let mut native = hyper::HeaderMap::new();
+        native.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("localhost:8691"),
+        );
+        let host = validate_http_request_host(&native, "127.0.0.1").unwrap();
+        assert!(
+            validate_browser_mutation_guard(&Method::POST, "/api/memories", &native, &host).is_ok()
+        );
+        assert!(validate_browser_mutation_guard(&Method::POST, "/mcp", &native, &host).is_ok());
+    }
+
+    #[tokio::test]
+    async fn mcp_body_cap_rejects_chunked_body_without_content_length() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let first_chunk = bytes::Bytes::from(vec![b'a'; 1024 * 1024]);
+        let chunks = tokio_stream::iter(vec![
+            Ok::<_, std::convert::Infallible>(Frame::data(first_chunk)),
+            Ok(Frame::data(bytes::Bytes::from_static(b"x"))),
+        ]);
+        let body = StreamBody::new(chunks);
+        let response = collect_mcp_request_body_capped(body).await.unwrap_err();
+
+        assert_eq!(response.status(), hyper::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

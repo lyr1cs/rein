@@ -2234,7 +2234,11 @@ fn section_name(sec: LlmSection) -> &'static str {
 }
 
 fn nonempty(s: &str) -> Option<&str> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Pick a provider name string and return `Some(Provider)` if it parses
@@ -2255,10 +2259,10 @@ fn level1_scoped_fields<'a>(
     explicit: &SectionExplicit<'a>,
     chosen: Provider,
 ) -> (
-    Option<&'a str>,        // model
-    Option<&'static str>,   // api_key_env
-    Option<&'a str>,        // endpoint
-    Option<usize>,          // max_input_chars
+    Option<&'a str>,      // model
+    Option<&'static str>, // api_key_env
+    Option<&'a str>,      // endpoint
+    Option<usize>,        // max_input_chars
 ) {
     match chosen {
         Provider::Google => (
@@ -2633,11 +2637,7 @@ fn resolve_llm_for_impl(
 
 /// Helper: build a `Provider::None` resolved config — used by every
 /// "section explicitly turned LLM off" branch.
-fn none_resolved(
-    sec: LlmSection,
-    section: &str,
-    llm: &LlmDefaultsConfig,
-) -> ResolvedLlmConfig {
+fn none_resolved(sec: LlmSection, section: &str, llm: &LlmDefaultsConfig) -> ResolvedLlmConfig {
     ResolvedLlmConfig {
         provider: Provider::None,
         model: String::new(),

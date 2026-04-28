@@ -188,10 +188,7 @@ impl OpsRuntime {
         auth = "mutation_marker",
         mutating = true
     )]
-    pub fn judge_synthesis(
-        &self,
-        params: JudgeSynthesisParams,
-    ) -> ReinResult<JudgeEnqueueResult> {
+    pub fn judge_synthesis(&self, params: JudgeSynthesisParams) -> ReinResult<JudgeEnqueueResult> {
         if params.synthesis_id.trim().is_empty() {
             return Err(ReinError::Config("synthesis_id cannot be empty".into())
                 .with_kind(OpsErrorKind::BadRequest));
@@ -301,10 +298,10 @@ impl OpsRuntime {
         params: JudgeConceptSummaryParams,
     ) -> ReinResult<JudgeEnqueueResult> {
         if params.concept_summary_id.trim().is_empty() {
-            return Err(ReinError::Config(
-                "concept_summary_id cannot be empty".into(),
-            )
-            .with_kind(OpsErrorKind::BadRequest));
+            return Err(
+                ReinError::Config("concept_summary_id cannot be empty".into())
+                    .with_kind(OpsErrorKind::BadRequest),
+            );
         }
 
         if !judge_enabled_for_concept_summary(self) {
@@ -419,9 +416,7 @@ pub(crate) fn queue_scoped_path_for_config(
 /// Path to the synthesis-source rehydration cache. The auto-enqueue side
 /// in `ops/recall_synthesis.rs` writes to this path on a successful
 /// synthesis when `[ars.llm_judge].enabled = true`.
-pub(crate) fn synthesis_cache_path_for_config(
-    config: &crate::config::ReinConfig,
-) -> PathBuf {
+pub(crate) fn synthesis_cache_path_for_config(config: &crate::config::ReinConfig) -> PathBuf {
     queue_scoped_path_for_config(config, "synthesis_cache")
 }
 
@@ -430,9 +425,7 @@ fn synthesis_cache_path(runtime: &OpsRuntime) -> PathBuf {
 }
 
 /// Path to the concept-summary rehydration cache.
-pub(crate) fn concept_summary_cache_path_for_config(
-    config: &crate::config::ReinConfig,
-) -> PathBuf {
+pub(crate) fn concept_summary_cache_path_for_config(config: &crate::config::ReinConfig) -> PathBuf {
     queue_scoped_path_for_config(config, "concept_summary_cache")
 }
 
@@ -442,9 +435,7 @@ fn concept_summary_cache_path(runtime: &OpsRuntime) -> PathBuf {
 
 /// Path to the judge worker queue. Same path used by the auto-enqueue
 /// side so the worker drains both manual + auto jobs from one queue.
-pub(crate) fn judge_queue_path_for_config(
-    config: &crate::config::ReinConfig,
-) -> PathBuf {
+pub(crate) fn judge_queue_path_for_config(config: &crate::config::ReinConfig) -> PathBuf {
     queue_scoped_path_for_config(config, "judge_queue")
 }
 
@@ -591,7 +582,7 @@ pub(crate) fn append_jsonl_line(
 /// required fields).
 fn build_synthesis_judge_job(
     cache_entry: &serde_json::Value,
-    source: &str, // "AutoSampled" | "ManualMcp"
+    source: &str,                       // "AutoSampled" | "ManualMcp"
     judge_model_override: Option<&str>, // Codex R1 P3 fix
 ) -> Option<serde_json::Value> {
     let synthesis_id = cache_entry.get("synthesis_id")?.as_str()?;

@@ -104,8 +104,9 @@ pub(crate) fn row_to_concept(row: &rusqlite::Row) -> ReinResult<Concept> {
     // a nullable column added by `migrate_concepts_living_summary_id`.
     // `unwrap_or(None)` guards against the column being missing on a
     // partially-migrated DB.
-    let living_summary_id: Option<String> =
-        row.get::<_, Option<String>>("living_summary_id").unwrap_or(None);
+    let living_summary_id: Option<String> = row
+        .get::<_, Option<String>>("living_summary_id")
+        .unwrap_or(None);
 
     Ok(Concept {
         id,

@@ -489,8 +489,7 @@ impl SqliteStore {
                     // would leave Tantivy/HNSW serving the refined text
                     // for DB content that was reverted. Mirrors the
                     // deprecation path's split.
-                    let refined_content =
-                        format!("{}\n\n[refined] {}", old.content, new_content);
+                    let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
                     let refined_summary: String = refined_content
                         .chars()
                         .take(crate::types::SUMMARY_MAX_CHARS)
@@ -1352,12 +1351,7 @@ mod tests {
         // Seed the new memory so FTS has it indexed; apply_evolution skips
         // `old.id == new_id` internally so the new row doesn't self-match.
         store
-            .store(test_memory(
-                new_id,
-                "topic-a",
-                "new summary",
-                new_content,
-            ))
+            .store(test_memory(new_id, "topic-a", "new summary", new_content))
             .unwrap();
 
         let evolved = store.apply_evolution(new_id, new_content, None).unwrap();

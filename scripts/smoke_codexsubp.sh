@@ -5,7 +5,24 @@ set -euo pipefail
 # Keep `codexsubp_provider.toml.tmpl` as the single source of truth.
 PROMPT=${1:-"Reply with exactly OK."}
 PROXY_URL=${REIN_PROXY_URL:-http://127.0.0.1:8690}
-WORKDIR=${REIN_SMOKE_WORKDIR:-$(pwd)}
+TMP_WORKDIR=""
+if [[ -n "${REIN_SMOKE_WORKDIR:-}" ]]; then
+  WORKDIR=$REIN_SMOKE_WORKDIR
+  mkdir -p "$WORKDIR"
+else
+  WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/rein-smoke-codexsubp.XXXXXX")
+  TMP_WORKDIR=$WORKDIR
+fi
+cleanup() {
+  if [[ -n "$TMP_WORKDIR" ]]; then
+    rm -rf "$TMP_WORKDIR"
+  fi
+}
+trap cleanup EXIT
+SANDBOX_ARGS=()
+if [[ "${REIN_SMOKE_ALLOW_DANGEROUS_SANDBOX:-0}" == "1" ]]; then
+  SANDBOX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
+fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROVIDER_OVERRIDE=$(sed "s#__PROXY_URL__#${PROXY_URL//\\/\\\\}#g" "$SCRIPT_DIR/codexsubp_provider.toml.tmpl")
 PROVIDER_OVERRIDE=$(printf '%s' "$PROVIDER_OVERRIDE" \
@@ -19,5 +36,5 @@ codex exec \
   -c "$PROVIDER_OVERRIDE" \
   -c "model_provider=\"rein_sub_proxy\"" \
   -c "chatgpt_base_url=\"$PROXY_URL\"" \
-  --dangerously-bypass-approvals-and-sandbox \
+  "${SANDBOX_ARGS[@]}" \
   "$PROMPT" < /dev/null

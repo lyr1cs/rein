@@ -14,8 +14,7 @@ use crate::extract::llm::{strip_code_fences, ExtractorKind};
 use crate::ops::concept_summary::create_ars_extractor;
 use crate::search::recall::RecallResult;
 use crate::store::adaptive::{
-    synthesis_bucket_key, AdaptiveState, ClusterSynthesisStats,
-    SYNTHESIS_USEFUL_RATE_THRESHOLD,
+    synthesis_bucket_key, AdaptiveState, ClusterSynthesisStats, SYNTHESIS_USEFUL_RATE_THRESHOLD,
 };
 use crate::types::ReinResult;
 use serde::Serialize;
@@ -438,8 +437,7 @@ pub fn run_recall_synthesis(
     // this, a marker like `[#10]` is accepted even when truncation only
     // included the first 5 memories, so the UI would render an inline
     // reference to a source the LLM never saw.
-    let (prompt, included_count) =
-        build_synthesis_prompt_with_count(results, query, max_chars);
+    let (prompt, included_count) = build_synthesis_prompt_with_count(results, query, max_chars);
     // v0.26.2 (Bug #O6): replace `outcome.source_count` (pre-truncation
     // `results.len()`) with `included_count` — the count of memory blocks
     // the LLM ACTUALLY saw after the prompt-budget truncation. The GUI
@@ -512,8 +510,7 @@ pub fn run_recall_synthesis(
     Some(outcome)
 }
 
-const TRUNCATION_NOTICE: &str =
-    "\n[…remaining memories truncated to fit the LLM input budget]\n";
+const TRUNCATION_NOTICE: &str = "\n[…remaining memories truncated to fit the LLM input budget]\n";
 const FOOTER: &str =
     "\nNow produce the concise narrative synthesis based solely on the memories above.";
 
@@ -639,27 +636,24 @@ pub fn build_synthesis_prompt_with_count(
     const QUERY_TRUNC_NOTICE: &str = " […query truncated for prompt budget]";
 
     let query_chars = query.chars().count();
-    let (query_owned, query_truncated): (String, bool) = if max_chars == 0
-        || query_chars <= QUERY_BUDGET_FLOOR
-    {
-        (query.to_string(), false)
-    } else {
-        let budget = (max_chars / QUERY_BUDGET_DIVISOR).max(QUERY_BUDGET_FLOOR);
-        if query_chars > budget {
-            (query.chars().take(budget).collect(), true)
-        } else {
+    let (query_owned, query_truncated): (String, bool) =
+        if max_chars == 0 || query_chars <= QUERY_BUDGET_FLOOR {
             (query.to_string(), false)
-        }
-    };
+        } else {
+            let budget = (max_chars / QUERY_BUDGET_DIVISOR).max(QUERY_BUDGET_FLOOR);
+            if query_chars > budget {
+                (query.chars().take(budget).collect(), true)
+            } else {
+                (query.to_string(), false)
+            }
+        };
 
     let header = if query_truncated {
         format!(
             "Query: {query_owned}{QUERY_TRUNC_NOTICE}\n\nMemories (ordered by relevance, most relevant first):\n"
         )
     } else {
-        format!(
-            "Query: {query_owned}\n\nMemories (ordered by relevance, most relevant first):\n"
-        )
+        format!("Query: {query_owned}\n\nMemories (ordered by relevance, most relevant first):\n")
     };
 
     if max_chars == 0 {
@@ -682,9 +676,8 @@ pub fn build_synthesis_prompt_with_count(
     // Reserve headroom for header + footer + the truncation notice (only
     // appended if we actually truncate, but reserving unconditionally
     // keeps the budget arithmetic simple and never overshoots `max_chars`).
-    let reserved = header.chars().count()
-        + FOOTER.chars().count()
-        + TRUNCATION_NOTICE.chars().count();
+    let reserved =
+        header.chars().count() + FOOTER.chars().count() + TRUNCATION_NOTICE.chars().count();
     let body_budget = max_chars.saturating_sub(reserved);
 
     let mut buf = String::with_capacity(max_chars + 32);
@@ -712,7 +705,11 @@ pub fn build_synthesis_prompt_with_count(
         included_count = i + 1;
 
         let content_chars = r.memory.content.chars().count();
-        let trailing_newline = if r.memory.content.ends_with('\n') { 0 } else { 1 };
+        let trailing_newline = if r.memory.content.ends_with('\n') {
+            0
+        } else {
+            1
+        };
         let needed = content_chars + trailing_newline;
         let remaining = body_budget.saturating_sub(used);
 
@@ -811,7 +808,11 @@ fn current_sample_rate(
     cfg: &crate::config::ArsLlmJudgeConfig,
 ) -> f64 {
     let human_count = bucket
-        .map(|s| s.explicit_up.saturating_add(s.explicit_down).saturating_add(s.viewed_count))
+        .map(|s| {
+            s.explicit_up
+                .saturating_add(s.explicit_down)
+                .saturating_add(s.viewed_count)
+        })
         .unwrap_or(0);
     if human_count >= cfg.human_signal_threshold {
         cfg.sample_rate_warm
@@ -926,7 +927,10 @@ fn enqueue_judge_for_synthesis(
     // (2) Sample-rate Bernoulli → judge worker queue.
     let bucket = adaptive_state
         .and_then(|s| s.synthesis_feedback_stats.as_ref())
-        .and_then(|sfs| sfs.by_cluster.get(&synthesis_bucket_key(cluster_id, query_type)));
+        .and_then(|sfs| {
+            sfs.by_cluster
+                .get(&synthesis_bucket_key(cluster_id, query_type))
+        });
     let rate = current_sample_rate(bucket, &config.ars.llm_judge);
     if bernoulli_fire(rate, synthesis_id) {
         let job = serde_json::json!({
@@ -1063,8 +1067,16 @@ mod tests {
         let config = ReinConfig::default();
         let results = make_results(5);
         assert!(
-            run_recall_synthesis(&results, "test query", &config, None, "Semantic", None, None)
-                .is_none(),
+            run_recall_synthesis(
+                &results,
+                "test query",
+                &config,
+                None,
+                "Semantic",
+                None,
+                None
+            )
+            .is_none(),
             "None synthesize param → None outcome"
         );
         assert!(
@@ -1086,9 +1098,16 @@ mod tests {
     fn skipped_disabled_when_feature_off() {
         let config = ReinConfig::default(); // recall_synthesis_enabled = false
         let results = make_results(5);
-        let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), "Semantic", None, None)
-                .unwrap();
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(outcome.skipped_disabled, "feature off → skipped_disabled");
         assert!(!outcome.skipped_adaptive_decision);
         assert!(!outcome.skipped_no_llm);
@@ -1108,9 +1127,16 @@ mod tests {
         config.ars.recall_synthesis_enabled = true;
         config.ars.recall_synthesis_min_results = 3;
         let results = make_results(2); // < 3
-        let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), "Semantic", None, None)
-                .unwrap();
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             outcome.skipped_too_few_results,
             "2 results < min 3 → skipped_too_few_results"
@@ -1130,9 +1156,16 @@ mod tests {
         // create_concept_summary_extractor returns None → skipped_no_llm
         config.extract.provider = "none".to_string();
         let results = make_results(5); // >= 3
-        let outcome =
-            run_recall_synthesis(&results, "test", &config, Some(true), "Semantic", None, None)
-                .unwrap();
+        let outcome = run_recall_synthesis(
+            &results,
+            "test",
+            &config,
+            Some(true),
+            "Semantic",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(outcome.skipped_no_llm, "no provider → skipped_no_llm");
         assert!(!outcome.skipped_disabled);
         assert!(!outcome.skipped_adaptive_decision);
@@ -1198,7 +1231,10 @@ mod tests {
         assert!(prompt.contains("content of memory 0"));
         assert!(prompt.contains("content of memory 1"));
         assert!(prompt.contains("content of memory 2"));
-        assert!(!prompt.contains("truncated"), "no cap → no truncation notice");
+        assert!(
+            !prompt.contains("truncated"),
+            "no cap → no truncation notice"
+        );
     }
 
     /// When the budget comfortably fits everything, no truncation notice
@@ -1356,8 +1392,14 @@ mod tests {
         assert_eq!(
             cites,
             vec![
-                Citation { rank: 1, span_end: 3 },
-                Citation { rank: 3, span_end: 3 },
+                Citation {
+                    rank: 1,
+                    span_end: 3
+                },
+                Citation {
+                    rank: 3,
+                    span_end: 3
+                },
             ]
         );
     }
@@ -1413,7 +1455,10 @@ mod tests {
         assert_eq!(clean, "中文。");
         assert_eq!(
             cites,
-            vec![Citation { rank: 1, span_end: 2 }],
+            vec![Citation {
+                rank: 1,
+                span_end: 2
+            }],
             "span_end must be 2 (char count of 中文), not 6 (byte length)"
         );
 
@@ -1423,8 +1468,14 @@ mod tests {
         assert_eq!(
             cites,
             vec![
-                Citation { rank: 2, span_end: 4 },
-                Citation { rank: 3, span_end: 8 },
+                Citation {
+                    rank: 2,
+                    span_end: 4
+                },
+                Citation {
+                    rank: 3,
+                    span_end: 8
+                },
             ]
         );
     }
@@ -1435,7 +1486,13 @@ mod tests {
     fn extract_citations_at_start() {
         let (clean, cites) = extract_citations("[#1]Foo.", 5);
         assert_eq!(clean, "Foo.");
-        assert_eq!(cites, vec![Citation { rank: 1, span_end: 0 }]);
+        assert_eq!(
+            cites,
+            vec![Citation {
+                rank: 1,
+                span_end: 0
+            }]
+        );
     }
 
     /// Multi-claim spec example: `"Foo[#1][#2]bar[#3]." → ("Foobar.", …)`.
@@ -1446,9 +1503,18 @@ mod tests {
         assert_eq!(
             cites,
             vec![
-                Citation { rank: 1, span_end: 3 },
-                Citation { rank: 2, span_end: 3 },
-                Citation { rank: 3, span_end: 6 },
+                Citation {
+                    rank: 1,
+                    span_end: 3
+                },
+                Citation {
+                    rank: 2,
+                    span_end: 3
+                },
+                Citation {
+                    rank: 3,
+                    span_end: 6
+                },
             ]
         );
     }
@@ -1493,9 +1559,10 @@ mod tests {
                 },
                 Citation {
                     rank: 2,
-                    span_end: "The auth middleware was rewritten. The new design uses session storage"
-                        .chars()
-                        .count(),
+                    span_end:
+                        "The auth middleware was rewritten. The new design uses session storage"
+                            .chars()
+                            .count(),
                 },
             ]
         );
@@ -1572,7 +1639,14 @@ mod tests {
     /// (matches v0.25.x behavior). Per contract §8 invariant 4.
     #[test]
     fn decide_synthesize_cold_start_no_state_returns_yes() {
-        let decision = decide_synthesize(true, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N, 0.3);
+        let decision = decide_synthesize(
+            true,
+            Some(42),
+            "Semantic",
+            None,
+            SYNTHESIS_COLD_START_N,
+            0.3,
+        );
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
 
@@ -1601,8 +1675,14 @@ mod tests {
             &synthesis_bucket_key(Some(42), "Semantic"),
             cluster_stats(100, 0.1), // would skip if it were looked up
         );
-        let decision =
-            decide_synthesize(true, None, "Semantic", Some(&state), SYNTHESIS_COLD_START_N, 0.3);
+        let decision = decide_synthesize(
+            true,
+            None,
+            "Semantic",
+            Some(&state),
+            SYNTHESIS_COLD_START_N,
+            0.3,
+        );
         assert_eq!(decision, SynthesizeDecision::Yes);
     }
 
@@ -1631,7 +1711,10 @@ mod tests {
     fn decide_synthesize_warm_cluster_above_threshold_returns_yes() {
         let state = state_with_bucket(
             &synthesis_bucket_key(Some(42), "Semantic"),
-            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD + 0.1),
+            cluster_stats(
+                SYNTHESIS_COLD_START_N + 10,
+                SYNTHESIS_USEFUL_RATE_THRESHOLD + 0.1,
+            ),
         );
         let decision = decide_synthesize(
             true,
@@ -1651,7 +1734,10 @@ mod tests {
     fn decide_synthesize_warm_cluster_below_threshold_returns_skip_adaptive() {
         let state = state_with_bucket(
             &synthesis_bucket_key(Some(42), "Semantic"),
-            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+            cluster_stats(
+                SYNTHESIS_COLD_START_N + 10,
+                SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1,
+            ),
         );
         let decision = decide_synthesize(
             true,
@@ -1661,7 +1747,10 @@ mod tests {
             SYNTHESIS_COLD_START_N,
             0.3,
         );
-        assert_eq!(decision, SynthesizeDecision::Skip(SkipReason::AdaptiveDecision));
+        assert_eq!(
+            decision,
+            SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)
+        );
     }
 
     /// Operator-off ALWAYS short-circuits — even with rich adaptive data
@@ -1691,8 +1780,14 @@ mod tests {
     /// distinct surfaces for the GUI.
     #[test]
     fn decide_synthesize_operator_disabled_with_no_state() {
-        let decision =
-            decide_synthesize(false, Some(42), "Semantic", None, SYNTHESIS_COLD_START_N, 0.3);
+        let decision = decide_synthesize(
+            false,
+            Some(42),
+            "Semantic",
+            None,
+            SYNTHESIS_COLD_START_N,
+            0.3,
+        );
         assert_eq!(
             decision,
             SynthesizeDecision::Skip(SkipReason::OperatorDisabled)
@@ -1840,12 +1935,18 @@ mod tests {
         // outcome has at most ONE skipped flag set.
         let warm_state = state_with_bucket(
             &synthesis_bucket_key(Some(42), "Semantic"),
-            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+            cluster_stats(
+                SYNTHESIS_COLD_START_N + 10,
+                SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1,
+            ),
         );
         let scenarios = [
             // (global, expected_decision)
             (true, SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)),
-            (false, SynthesizeDecision::Skip(SkipReason::OperatorDisabled)),
+            (
+                false,
+                SynthesizeDecision::Skip(SkipReason::OperatorDisabled),
+            ),
         ];
         for (global, expected) in scenarios {
             let decision = decide_synthesize(
@@ -1855,7 +1956,7 @@ mod tests {
                 Some(&warm_state),
                 SYNTHESIS_COLD_START_N,
                 0.3,
-        );
+            );
             assert_eq!(decision, expected);
             // Reduce to the (skipped_disabled, skipped_adaptive_decision)
             // pair the run_recall_synthesis gate would set:
@@ -1938,7 +2039,10 @@ mod tests {
         // `useful_rate` below threshold → Skip(AdaptiveDecision).
         let state = state_with_bucket(
             &synthesis_bucket_key(Some(0), "Semantic"),
-            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+            cluster_stats(
+                SYNTHESIS_COLD_START_N + 10,
+                SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1,
+            ),
         );
 
         let mut config = ReinConfig::default();
@@ -1993,7 +2097,10 @@ mod tests {
         // Same Semantic-bucket-skip state as the test above.
         let state = state_with_bucket(
             &synthesis_bucket_key(Some(0), "Semantic"),
-            cluster_stats(SYNTHESIS_COLD_START_N + 10, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),
+            cluster_stats(
+                SYNTHESIS_COLD_START_N + 10,
+                SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1,
+            ),
         );
 
         let mut config = ReinConfig::default();
@@ -2043,7 +2150,10 @@ mod tests {
         // Without the config knob the gate would fall back to Yes; with it,
         // the below-threshold useful_rate routes to Skip(AdaptiveDecision).
         let viewed = 5u64;
-        assert!(viewed < SYNTHESIS_COLD_START_N, "test premise: under default");
+        assert!(
+            viewed < SYNTHESIS_COLD_START_N,
+            "test premise: under default"
+        );
         let state = state_with_bucket(
             &synthesis_bucket_key(Some(0), "Semantic"),
             cluster_stats(viewed, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1),

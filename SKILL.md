@@ -16,9 +16,9 @@ allowed-tools:
   - Bash
 ---
 
-# rein Memory System (v0.27.1)
+# rein Memory System (v0.27.3 remediation candidate)
 
-Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server (38 tools) or via CLI. Storage is `~/.rein/memories.db` (SQLite + FTS5 + sqlite-vec); the same DB is shared across every rein client (Claude Desktop, Claude Code, CLI, REST). Embeddings via Gemini 3.1 (or local Ollama / OMLX). Optional Neural Wiki GUI on `:8680`.
+Use rein to persist and retrieve knowledge across sessions. rein runs as an MCP server (38 tools) or via CLI. Storage is `~/.rein/memories.db` (SQLite + FTS5 + sqlite-vec); the same DB is shared across every rein client (Claude Desktop, Claude Code, CLI, REST). Embeddings via Gemini 3.1 (or local Ollama / OMLX). Optional Neural Wiki GUI on `:8680`. The current source tree is a `v0.27.3` audit-remediation candidate; push, tag, release, install, and service restart are pending main-thread verification.
 
 ## When to use rein
 
@@ -83,7 +83,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8690 claude
 OPENAI_BASE_URL=http://127.0.0.1:8690 codex
 ```
 
-## MCP Tools (38, as of v0.27.1)
+## MCP Tools (38, as of v0.27.x)
 
 ### Core memory (13)
 `rein_recall`, `rein_store`, `rein_update`, `rein_forget`, `rein_list_topics`, `rein_stats`, `rein_health`, `rein_consolidate`, `rein_dedup`, `rein_cleanup`, `rein_recent`, `rein_gc`, `rein_organize`

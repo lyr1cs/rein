@@ -233,8 +233,7 @@ impl LlmJudgeHitChecker {
         living_summary: Option<&str>,
         evidence_keywords: &[String],
     ) -> ReinResult<JudgeOutcome> {
-        let user_prompt =
-            build_concept_user_prompt(definition, living_summary, evidence_keywords);
+        let user_prompt = build_concept_user_prompt(definition, living_summary, evidence_keywords);
         let extractor = self.extractor.clone();
         let raw = super::block_on_future(async move {
             extractor
@@ -462,8 +461,7 @@ mod tests {
     #[test]
     fn judge_synthesis_hit() {
         let extractor = mock_extractor(vec![Ok(
-            r#"{"hit": true, "reason": "covers source 1 facts about resummerize"}"#
-                .to_string(),
+            r#"{"hit": true, "reason": "covers source 1 facts about resummerize"}"#.to_string(),
         )]);
         let checker = LlmJudgeHitChecker::new(extractor, JudgeMode::SynthesisSourceCoverage);
         let outcome = checker
@@ -480,8 +478,7 @@ mod tests {
     #[test]
     fn judge_synthesis_miss() {
         let extractor = mock_extractor(vec![Ok(
-            r#"{"hit": false, "reason": "candidate missed the M3 Kaplan-Meier fact"}"#
-                .to_string(),
+            r#"{"hit": false, "reason": "candidate missed the M3 Kaplan-Meier fact"}"#.to_string(),
         )]);
         let checker = LlmJudgeHitChecker::new(extractor, JudgeMode::SynthesisSourceCoverage);
         let outcome = checker
@@ -577,11 +574,8 @@ mod tests {
         // wrapper when the field is absent — Codex R1 P1 hardening uses
         // XML-like delimiters instead of `KEY: value` lines, but the
         // "skip the optional field entirely" semantics is preserved.
-        let prompt = build_concept_user_prompt(
-            "definition text",
-            None,
-            &["a".to_string(), "b".to_string()],
-        );
+        let prompt =
+            build_concept_user_prompt("definition text", None, &["a".to_string(), "b".to_string()]);
         // The instruction text mentions `<living_summary>` literally, so
         // we can't just check `contains` — we need to verify there's no
         // wrapped instance of the field. A concrete absence check: the
@@ -590,11 +584,8 @@ mod tests {
         assert!(prompt.contains("<definition>definition text</definition>"));
         assert!(prompt.contains("<evidence_keywords>"));
 
-        let prompt_with = build_concept_user_prompt(
-            "definition text",
-            Some("the summary"),
-            &["a".to_string()],
-        );
+        let prompt_with =
+            build_concept_user_prompt("definition text", Some("the summary"), &["a".to_string()]);
         assert!(prompt_with.contains("<living_summary>the summary</living_summary>"));
     }
 
@@ -612,8 +603,8 @@ mod tests {
             (r#"{"hit": 0, "reason": "x"}"#, false),
         ];
         for (raw, expected) in cases {
-            let outcome: JudgeOutcome = serde_json::from_str(raw)
-                .unwrap_or_else(|e| panic!("must parse {raw}: {e}"));
+            let outcome: JudgeOutcome =
+                serde_json::from_str(raw).unwrap_or_else(|e| panic!("must parse {raw}: {e}"));
             assert_eq!(outcome.hit, expected, "raw was {raw}");
         }
         // Non-bool / non-0/1 / non-true/false strings must error.

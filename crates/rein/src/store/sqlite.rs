@@ -738,8 +738,7 @@ pub fn row_to_memory(row: &rusqlite::Row) -> ReinResult<Memory> {
     // a missing column reads as `None`, never as an error.
     let archival_summary: Option<String> = row.get("archival_summary").unwrap_or(None);
     let archival_summary_at: Option<i64> = row.get("archival_summary_at").unwrap_or(None);
-    let archival_summary_version: Option<u32> =
-        row.get("archival_summary_version").unwrap_or(None);
+    let archival_summary_version: Option<u32> = row.get("archival_summary_version").unwrap_or(None);
     let created_at_str: String = row.get("created_at").map_err(ReinError::Database)?;
     let updated_at_str: String = row.get("updated_at").map_err(ReinError::Database)?;
     let last_accessed_str: String = row.get("last_accessed").map_err(ReinError::Database)?;
@@ -2269,10 +2268,7 @@ impl SqliteStore {
                         e
                     })?;
                 }
-                self.store_with_dedup_resolved(
-                    memory,
-                    DedupAction::MergeInto(winner_id.clone()),
-                )
+                self.store_with_dedup_resolved(memory, DedupAction::MergeInto(winner_id.clone()))
             }
             // v0.27 Track 2 #8: temporal supersede — preserve the old
             // memory as a historical version. Currently degrades to
@@ -2418,7 +2414,14 @@ impl SqliteStore {
     }
 
     /// Fire-and-forget: update Tantivy index after a write.
-    pub(crate) fn update_tantivy(&self, id: &str, topic: &str, summary: &str, content: &str, keywords: &str) {
+    pub(crate) fn update_tantivy(
+        &self,
+        id: &str,
+        topic: &str,
+        summary: &str,
+        content: &str,
+        keywords: &str,
+    ) {
         self.with_tantivy(|t| {
             if let Err(error) = t.insert(id, topic, summary, content, keywords) {
                 tracing::warn!("tantivy insert failed for {id}: {error}");
