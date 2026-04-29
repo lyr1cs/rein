@@ -3,7 +3,7 @@ name = "rein"
 version = "0.27.5"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }
