@@ -12,13 +12,13 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-Current source status: `v0.27.3` remediation candidate. This branch is not yet pushed, tagged, released, installed, or restarted in production; in the vault workspace, use `docs/backlog/v0.27.3-full-audit-remediation.md` and `docs/devlog/v0.27.3-release-notes.md` for the active audit-remediation ledger and draft release notes.
+**Current release: `v0.27.5`** (2026-04-29) — released + deployed. Tag `v0.27.5` pushed, GitHub Release with 18.2 MB GUI binary, 1035 lib tests / 0 clippy / 0 fmt. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.27.5 progression.
 
 ### Features
 
 | Feature | Description |
 |---------|-------------|
-| **38 MCP tools** | 8 core memory + 9 maintenance + 10 knowledge graph + 2 temporal + 2 adaptive + 1 session ingest + 2 ARS concept-summary (v0.24) + 1 Cap C archival summary refresh (v0.26) + 1 GUI/MCP synthesis interaction feedback (v0.26) + 1 Cap A mirror feedback (v0.27.0) + 2 runtime LLM judge enqueue tools (v0.27.1: `rein_judge_synthesis` + `rein_judge_concept_summary`). Counted live via `python3` over `#[op(... mcp(name = "..."))]` attributes — `total=47 mcp-visible=38`. v0.25 extends `rein_recall` with opt-in `synthesize=true` for recall-time LLM narrative synthesis (Cap B); v0.26 adds Cap C cold-tier archival summaries + D direction synthesis-feedback events flowing into M1; v0.27 adds the runtime LLM judge — opt-in via `[ars.llm_judge].enabled`, hooked at synthesis/concept-summary mint time so MCP-only deployments still produce adaptive feedback without GUI dwell/click events; v0.26.2 closes 32 audit findings (8 HIGH + 8 MEDIUM original + 16 audit-cycle additions across 5-agent fan-out + 11 Codex review rounds): auth default-deny, recall correctness with status-aware SQL filters + canonical-first preservation of superseded rows, `apply_evolution` side-index discipline, full backend↔GUI synthesis bucket round-trip, archival_summary lifecycle in `update()`, M5 strip vec/HNSW invalidation. |
+| **38 MCP tools** | core memory ops, knowledge graph, temporal recall, adaptive maintenance, ARS feedback (Cap A mirror, Cap B synthesis, Cap C archival summary), and runtime LLM judge enqueue. All authored once via `#[op]` macro (v0.21+) and exposed through CLI / MCP / REST simultaneously. |
 | **Unified operation registry** | One `#[op]` declaration drives CLI / MCP / REST surfaces (v0.21, A1). Inventory-based dispatch; zero hand-maintained lists. |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
@@ -408,6 +408,29 @@ rein's core philosophy: **zero subjective parameters** — all parameters are da
 - **Embedding-based semantic dedup** in GC slow channel (catches paraphrases Jaccard misses)
 - **Provenance-preserving merge** — temporal anchors and unique details never lost
 - **Snapshot CAS** — adaptive state saved with read-merge-write on version conflict
+
+### Recent releases
+
+The v0.21 → v0.27.5 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+
+| Version | Theme | Highlights |
+|---|---|---|
+| **v0.27.5** (2026-04-29) | R10-residual cleanup | Cold archive too-large backoff (`last_too_large_at` + claim_batch ORDER BY); Cap A 4096-bucket LRU eviction; cron `cron_claims` pre-LLM dedup with claim_token ownership + 5-min stale takeover + post-claim TOCTOU re-check + post-emit-crash reaper. **10 codex review rounds saturated (R6 + R10 fully clean).** 1035 lib tests / 0 clippy / 0 fmt. |
+| **v0.27.4** (2026-04-29) | audit-team remediation | 5-agent disjoint-slice fan-out closed 1 CRIT + 8 HIGH + 9 MED + 5 LOW from a v0.27.3 audit, then 10 codex rounds drove P1 to 0. Headline: **C1** `[server,proxy].allow_unauthenticated_loopback` default flipped `true → false`; **E2** M5 strip post-COMMIT side-index discipline; **D1+D2** SHA-256-prefix synthetic `cluster_id` for Cap A bucket alignment. 1265 tests. |
+| **v0.27.3** (2026-04-28) | full-audit remediation | Closes the v0.27.0/.1/.2 implementation audit. Released to GitHub. |
+| **v0.27.2** (2026-04-27) | judge ledger / cache reaper | `judge_call_ledger` daily-cap reservation shared across runtime + cron (R9-K1); judge cache reaper; `judge_model_override` extractor swap; doctor judge checks. |
+| **v0.27.1** (2026-04-27) | E direction — runtime LLM judge | Opt-in via `[ars.llm_judge].enabled = false`. Hooks at synthesis (Cap B) and concept-summary (Cap A) mint time so MCP-only deployments still produce adaptive feedback without GUI dwell/click. **7-invariant judge contract J1-J7** (stamp-time payload, atomic `reserve_call`, worker-pull, cache rehydration). New MCP tools `rein_judge_synthesis` + `rein_judge_concept_summary`. `[llm]` config inheritance with `provider = "inherit"` sentinel. |
+| **v0.27.0** (2026-04-26) | Cap A mirror feedback + fact-layer dedup | `rein_feedback_concept_summary` mirrors Cap B's loop onto concept living-summary. Triple extraction + N-memory merge + temporal supersede direction. |
+| **v0.26.2** (2026-04-26) | 32-bug security + correctness hotfix | 8 HIGH + 8 MEDIUM from a user-driven Codex audit on v0.26.1, plus 16 audit-cycle additions across 11 follow-up codex review rounds. Auth default-deny via `http_request_needs_auth(method, path, gui_enabled)`. Recall correctness with status-aware SQL filters + canonical-first preservation of superseded rows. `apply_evolution` side-index discipline. Backend↔GUI synthesis bucket round-trip. `update()` archival lifecycle clears archival_summary cols on semantic content change. 1002 tests. |
+| **v0.26.1** (2026-04-25) | D direction wiring fix + cold_archive eval | v0.26.0 hardcoded `query_type = "Semantic"` made the per-cluster gate dead code for 5 of 6 query types; fixed by routing real `QueryType::synthesis_bucket_label()` through MCP/CLI/REST. `[ars].synthesis_cold_start_n` config (default 10). `rein-eval cold_archive {baseline,run,compare}` subcommand. |
+| **v0.26.0** (2026-04-25) | ARS Cap C + D direction full vertical | Cap C cold-tier archival summary (`rein_archive_summary_refresh` MCP tool, slow-channel worker with 5-way CAS + 3-invariant lossless contract). D direction event-sourced loop: `SynthesisInteraction` event → `synthesis_feedback` M1 consumer → per-query adaptive synthesis-decision gate (`decide_synthesize`) surfaced via REST/MCP/GUI. |
+| **v0.25.x** (2026-04-24/25) | ARS Cap B + Synthesis Lab | Opt-in recall-time LLM narrative synthesis: `rein_recall` extended with `synthesize=true` (no new MCP tool added). `rein-eval synthesis` McNemar harness. Synthesis Lab GUI page (`/synthesis-lab`) with editable evidence + dwell/click telemetry. v0.25.2 hybrid hit-checker (Snowball Porter2 stem + Gemini cosine fallback). v0.25.3 LLM-judged hit checker (`REIN_EVAL_JUDGE=llm`). |
+| **v0.24.0** (2026-04-24) | ARS Cap A — concept living-summary | Per-concept rolling LLM summary refreshed via L3 adaptive policy (revision_p75 + age_p50) + L4 concurrent CAS. Cross-cutting peek+commit refactor across 5 consumer offsets. New MCP tools `rein_concept_state` + `rein_concept_summary_refresh`. 819 tests. |
+| **v0.23.0** (2026-04-23) | Resummerize + 7-invariant Lossless Compression Contract | LLM-driven canonical recompression at the 10 KB `MergeInto` cap (replaces v0.21 keep-tail truncation). Atomic `apply_resummerize` with 5-way CAS + 3-strike exhaustion fuse + 5-minute stale-claim takeover. Paired `rein-eval` McNemar non-inferiority test. 750 tests. |
+| **v0.22.0** (2026-04-22) | KG pool + service wiring + try_get fast-path | 675 tests / 7 codex audit rounds. |
+| **v0.21.0** (2026-04-20) | A1 Operation Registry | `#[op]` proc-macro: each operation authored **once** in source, dispatched via `inventory` to thin CLI / MCP / REST adapters. Eliminated three parallel hand-maintained registries. 625 tests. |
+
+All ARS features (`[ars].concept_summary_enabled`, `recall_synthesis_enabled`, `archive_summary_enabled`, `[ars.llm_judge].enabled`, `[resummerize].enabled`) ship **opt-in / default-off**. Operators get zero new disk activity until they explicitly turn a capability on.
 
 ### Architecture Diagrams
 
@@ -963,11 +986,13 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，核心理念是**零主观参数** — 所有参数由数据驱动、自动学习，不需要人工调参。
 
+**当前版本：`v0.27.5`**（2026-04-29）— 已发布并部署。tag `v0.27.5` 已推送，GitHub Release 含 18.2 MB GUI binary，1035 lib tests / 0 clippy / 0 fmt。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+
 ### 核心特性
 
 | 特性 | 说明 |
 |------|------|
-| **34 个 MCP 工具** | 8 个核心记忆 + 9 个维护 + 10 个知识图谱 + 2 个时序 + 2 个自适应 + 1 个会话摄入 + 2 个 ARS 概念摘要（v0.24）。v0.25 在 `rein_recall` 上新增可选参数 `synthesize=true`，用于召回时 LLM 叙事合成（Cap B）— 不新增工具。 |
+| **38 个 MCP 工具** | 核心记忆操作、知识图谱、时序召回、自适应维护、ARS 反馈（Cap A 镜像、Cap B 合成、Cap C 归档摘要）、runtime LLM judge 入队。所有操作通过 `#[op]` 宏（v0.21+）单点声明，CLI / MCP / REST 三端共用。 |
 | **自适应引擎** | M1-M6 + A1：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
 | **反事实 Alpha 优化** | 回放历史 recall，学习全局 / 按查询类型 / **按聚类** 的最优 CC 融合权重（M2） |
 | **Per-cluster KM 衰减 + 全局先验** | Kaplan-Meier 生存曲线替代固定遗忘曲线；全局先验曲线覆盖冷启动新聚类（M3） |
@@ -1521,6 +1546,29 @@ open http://localhost:8680
 #### 认证
 
 设置 `REIN_HTTP_TOKEN` 后，API 端点需要 Bearer 令牌认证。GUI 页面本身无需认证，可以在设置页面输入令牌。
+
+### 最近版本
+
+v0.21 → v0.27.5 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+
+| 版本 | 主题 | 重点 |
+|---|---|---|
+| **v0.27.5** (2026-04-29) | R10-residual 清理 | Cold archive 太大行 backoff（`last_too_large_at` + claim_batch ORDER BY）；Cap A 4096-bucket LRU 驱逐；cron `cron_claims` pre-LLM 去重，含 claim_token 所有权 + 5 分钟 stale 接管 + post-claim TOCTOU 复检 + post-emit-crash 清理。**10 轮 codex review 收敛（R6 + R10 全清）**。1035 lib tests。 |
+| **v0.27.4** (2026-04-29) | agent-team 修复 | 5 agent 分片 fan-out 修 v0.27.3 audit (1 CRIT + 8 HIGH + 9 MED + 5 LOW)，再跑 10 轮 codex 把 P1 打到 0。**C1** 默认 deny-loopback；**E2** M5 strip post-COMMIT 边索引纪律；**D1+D2** SHA-256 prefix 合成 `cluster_id` 修 Cap A bucket 对齐。1265 tests。 |
+| **v0.27.3** (2026-04-28) | full-audit 修复 | 闭环 v0.27.0/.1/.2 的实现 audit。 |
+| **v0.27.2** (2026-04-27) | judge ledger / cache reaper | `judge_call_ledger` 让 runtime + cron 共享日 cap 预留（R9-K1）；judge cache reaper；`judge_model_override` 提取器替换；doctor judge checks。 |
+| **v0.27.1** (2026-04-27) | E direction — runtime LLM judge | 默认 opt-in `[ars.llm_judge].enabled = false`。在 synthesis（Cap B）和 concept-summary（Cap A）打戳时挂钩，让纯 MCP 部署也能在没有 GUI dwell/click 的情况下产生自适应反馈。**7-invariant judge 合约 J1-J7**（打戳时 payload、原子 `reserve_call`、worker pull、cache 重水化）。新 MCP 工具 `rein_judge_synthesis` + `rein_judge_concept_summary`。`[llm]` 配置继承用 `provider = "inherit"` 哨兵。 |
+| **v0.27.0** (2026-04-26) | Cap A 镜像反馈 + fact-layer 去重 | `rein_feedback_concept_summary` 把 Cap B 的反馈 loop 镜像到 concept living-summary。三元组提取 + N-memory merge + 时间替代方向。 |
+| **v0.26.2** (2026-04-26) | 32 bug 安全 + 正确性 hotfix | 用户独立跑 Codex audit v0.26.1 报 16 bug (8 HIGH + 8 MEDIUM)，后续 11 轮 codex review 加修 16 (3 P1 + 13 P2)。`http_request_needs_auth(method, path, gui_enabled)` 默认 deny；status-aware SQL 滤器 + canonical-first 保留 superseded 行；`apply_evolution` 边索引纪律；GUI↔后端 synthesis bucket 全程往返；`update()` 在 semantic 内容变化时清 archival_summary 列。1002 tests。 |
+| **v0.26.1** (2026-04-25) | D direction wiring 修复 + cold_archive eval | v0.26.0 把 `query_type` 硬写 `"Semantic"`，让 6 种 query type 中的 5 种 per-cluster gate 是 dead code；通过把真实 `QueryType::synthesis_bucket_label()` 从 MCP/CLI/REST 透传修复。`[ars].synthesis_cold_start_n` 配置（默认 10）。`rein-eval cold_archive {baseline,run,compare}` 子命令。 |
+| **v0.26.0** (2026-04-25) | ARS Cap C + D direction 全栈 | Cap C 冷层归档摘要（`rein_archive_summary_refresh` MCP 工具，慢通道 worker 5-way CAS + 3-invariant 无损合约）。D direction 事件溯源 loop：`SynthesisInteraction` → `synthesis_feedback` M1 consumer → per-query 自适应 synthesis-decision gate（`decide_synthesize`）通过 REST/MCP/GUI 暴露。 |
+| **v0.25.x** (2026-04-24/25) | ARS Cap B + Synthesis Lab | 召回时 LLM 叙事合成 opt-in：`rein_recall` 加 `synthesize=true`（不增加 MCP 工具）。`rein-eval synthesis` McNemar 评估器。Synthesis Lab GUI 页面 (`/synthesis-lab`) 含可编辑 evidence + dwell/click 遥测。v0.25.2 hybrid hit-checker（Snowball Porter2 词干 + Gemini 余弦兜底）。v0.25.3 LLM-judged hit checker（`REIN_EVAL_JUDGE=llm`）。 |
+| **v0.24.0** (2026-04-24) | ARS Cap A — concept living-summary | 每个 concept 滚动 LLM 摘要，L3 自适应刷新策略（revision_p75 + age_p50） + L4 并发 CAS。跨 5 个 consumer offset 的 peek+commit 重构。新 MCP 工具 `rein_concept_state` + `rein_concept_summary_refresh`。819 tests。 |
+| **v0.23.0** (2026-04-23) | Resummerize + 7-invariant 无损压缩合约 | 在 10 KB `MergeInto` 阈值上做 LLM 驱动的 canonical 重压缩（替代 v0.21 keep-tail 截断）。原子 `apply_resummerize` 5-way CAS + 3 strike 失败保险 + 5 分钟 stale claim 接管。配套 `rein-eval` McNemar 非劣效检验。750 tests。 |
+| **v0.22.0** (2026-04-22) | KG pool + service 接线 + try_get fast-path | 675 tests / 7 轮 codex audit。 |
+| **v0.21.0** (2026-04-20) | A1 Operation Registry | `#[op]` proc-macro：每个操作在源码里**只写一次**，通过 `inventory` 派发到三个薄 CLI / MCP / REST 适配器。消灭三套手工维护的并行注册表。625 tests。 |
+
+所有 ARS 特性（`[ars].concept_summary_enabled`、`recall_synthesis_enabled`、`archive_summary_enabled`、`[ars.llm_judge].enabled`、`[resummerize].enabled`）默认**全部 opt-in / off**。operator 不显式打开就零新增磁盘活动。
 
 ### 自适应引擎 (v0.6.0+)
 
