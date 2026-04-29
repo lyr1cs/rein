@@ -80,9 +80,8 @@ impl OpsRuntime {
         // proper recall-context routing is v0.28+ work; until then,
         // unifying both writers under the synthetic key keeps the loop
         // closed.
-        let synthetic_cid = crate::ops::concept_summary::synthetic_cluster_id_for_concept(
-            &params.concept_id,
-        );
+        let synthetic_cid =
+            crate::ops::concept_summary::synthetic_cluster_id_for_concept(&params.concept_id);
         let aligned_metadata = match &params.metadata {
             Some(meta) => {
                 let mut m = meta.clone();

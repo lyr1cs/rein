@@ -907,8 +907,10 @@ fn enqueue_judge_for_concept_summary(
         .concept_summary_feedback_stats
         .as_ref()
         .and_then(|sfs| {
-            sfs.by_cluster
-                .get(&concept_summary_bucket_key(Some(synthetic_cid), routing_query_type))
+            sfs.by_cluster.get(&concept_summary_bucket_key(
+                Some(synthetic_cid),
+                routing_query_type,
+            ))
         });
     let rate = current_sample_rate_concept_summary(bucket, &config.ars.llm_judge);
     if bernoulli_fire_concept_summary(rate, summary_id) {

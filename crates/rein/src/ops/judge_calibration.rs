@@ -658,25 +658,25 @@ fn process_archive_entry(
     // input" (re-mint with different prompt) from "same id, same input"
     // (true duplicate).
     match cron_event_already_emitted(store.conn(), &entry.surface, &entry.id, &entry.stamp_hash) {
-        Ok(true) => return ProcessOutcome::SkippedDuplicate,
+        Ok(true) => {
+            // Codex R9 P3 — reap orphan `cron_claims` row left when a
+            // previous pass crashed AFTER `emit_event` succeeded but
+            // BEFORE the post-emit `release_cron_claim` ran. The
+            // OfflineCron event is durable, so any extant claim row
+            // for this tuple is guaranteed-orphan; tokenless DELETE
+            // is safe because (a) a fresh peer holding the row would
+            // imminently release it on its own emit, and (b) a peer
+            // mid-LLM-call after stale takeover would lose its emit
+            // to F4 A3 UNIQUE and release on the failure path.
+            let _ =
+                reap_emitted_cron_claim(store.conn(), &entry.surface, &entry.id, &entry.stamp_hash);
+            return ProcessOutcome::SkippedDuplicate;
+        }
         Ok(false) => {}
         Err(e) => {
             tracing::warn!(error = %e, "cron idempotency check failed, proceeding (best-effort)");
         }
     }
-    // codex R9 P2 — known residual race: between this check and the
-    // post-LLM `emit_event`, a concurrent cron worker can pass the
-    // same check, both consume `daily_call_cap` via `reserve_call`,
-    // both pay for an LLM call, and the second emit hits the
-    // R1-introduced UNIQUE index → caller sees `SkippedDuplicate`.
-    // Daily budget + dollar cost is wasted on the loser.
-    //
-    // Closing this fully requires a pre-LLM claim row (e.g. an
-    // `INSERT INTO cron_claims (...) ON CONFLICT DO NOTHING`
-    // primitive that atomically reserves the (surface, id, stamp)
-    // tuple). That's a small schema change tracked for v0.27.5+.
-    // Single-cron deployments are unaffected; the duplicate-cron
-    // case is rare in practice (the user's setup is one cron).
 
     // 1. Look up runtime verdict in feedback_events by synthesis_id.
     //    Codex R5 P2 fix: join by synthesis_id ONLY, NOT stamp_hash —
@@ -719,6 +719,68 @@ fn process_archive_entry(
         ));
     }
 
+    // v0.27.5 R3 — pre-LLM atomic claim. Closes the v0.27.4 R9 P2
+    // concurrent-cron race: two workers could both clear the
+    // `cron_event_already_emitted` LIKE check, both burn `daily_call_cap`
+    // via `reserve_call`, both pay for an LLM call, and only the second
+    // emit would lose on the F4 A3 UNIQUE index. The claim row is
+    // inserted via `INSERT OR IGNORE` (atomic) BEFORE `reserve_call`,
+    // so only the claim winner proceeds; the loser short-circuits to
+    // `SkippedDuplicate` without burning quota or paying for the LLM.
+    //
+    // The returned `claim_token` (codex R3 P2) is the ownership proof
+    // for `release_cron_claim` — without it, a slow original cron whose
+    // claim was taken over by a fresh peer (after the stale window)
+    // could DELETE the new owner's row.
+    let claim_token =
+        match try_claim_cron(store.conn(), &entry.surface, &entry.id, &entry.stamp_hash) {
+            Ok(Some(token)) => token,
+            Ok(None) => return ProcessOutcome::SkippedDuplicate,
+            Err(e) => {
+                // Codex R5 P2 — DO NOT proceed without a claim. If the
+                // INSERT errors (e.g. SQLite busy during a concurrent
+                // cron pass), the entry is exactly the contention case
+                // `cron_claims` exists to serialize. Bypassing here
+                // would let two concurrent workers both reserve
+                // `daily_call_cap` and pay for an LLM call, with only
+                // the second emit losing on the F4 A3 UNIQUE index —
+                // the bug this primitive was shipped to close. Treat
+                // as a retryable drop; the next cron pass will
+                // rediscover the entry and try again.
+                tracing::warn!(error = %e, "cron claim insert failed; dropping (retryable)");
+                return ProcessOutcome::Dropped(format!("cron claim insert failed: {e}"));
+            }
+        };
+
+    // Codex R8 P2 — post-claim TOCTOU re-check. The initial
+    // `cron_event_already_emitted` LIKE check ran BEFORE we acquired
+    // the claim, so a peer may have completed (claim → LLM → emit →
+    // release) in the gap between our check and our acquire. Without
+    // this re-check we'd burn cap + pay for a duplicate LLM call only
+    // for the F4 A3 UNIQUE index to catch the second emit. Re-running
+    // the LIKE check after the claim is held closes the window: if
+    // the event now exists, release the claim and SkippedDuplicate
+    // without paying anything.
+    match cron_event_already_emitted(store.conn(), &entry.surface, &entry.id, &entry.stamp_hash) {
+        Ok(true) => {
+            let _ = release_cron_claim(
+                store.conn(),
+                &entry.surface,
+                &entry.id,
+                &entry.stamp_hash,
+                &claim_token,
+            );
+            return ProcessOutcome::SkippedDuplicate;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            // Best-effort: if the LIKE check errors, fall through to
+            // the normal flow. The F4 A3 UNIQUE index on
+            // `feedback_events` remains as the strict guard.
+            tracing::warn!(error = %e, "post-claim emitted re-check failed, proceeding (best-effort)");
+        }
+    }
+
     // 2. Re-judge via the stricter cron LLM.
     //
     // v0.27.2 R9-K1 fix — reserve a J2 ledger slot before the HTTP
@@ -729,8 +791,37 @@ fn process_archive_entry(
     let daily_cap = config.ars.llm_judge.daily_call_cap;
     let token = match crate::judge::contract::reserve_call(store.conn(), daily_cap) {
         Ok(Some(t)) => t,
-        Ok(None) => return ProcessOutcome::DroppedCap,
-        Err(e) => return ProcessOutcome::Dropped(format!("reserve_call: {e}")),
+        Ok(None) => {
+            // v0.27.5 R3 — cap exhausted before any LLM call. Release
+            // the claim so a future cron pass (e.g. tomorrow under a
+            // refilled cap) can retry, otherwise the entry is
+            // permanently `SkippedDuplicate` on every retry. Best-
+            // effort: even if the delete races, the F4 A3 UNIQUE index
+            // on `feedback_events` still prevents double-emit, so
+            // worst case is a wasted retry that the LIKE fast-path
+            // catches.
+            let _ = release_cron_claim(
+                store.conn(),
+                &entry.surface,
+                &entry.id,
+                &entry.stamp_hash,
+                &claim_token,
+            );
+            return ProcessOutcome::DroppedCap;
+        }
+        Err(e) => {
+            // Same rationale as the DroppedCap arm — no LLM was called,
+            // so the claim row must not stick around as a permanent
+            // skip marker.
+            let _ = release_cron_claim(
+                store.conn(),
+                &entry.surface,
+                &entry.id,
+                &entry.stamp_hash,
+                &claim_token,
+            );
+            return ProcessOutcome::Dropped(format!("reserve_call: {e}"));
+        }
     };
 
     let (cron_hit, cron_reason, cron_judge_model) = match call_cron_judge(config, entry) {
@@ -742,6 +833,22 @@ fn process_archive_entry(
         Err(e) => {
             // HTTP attempt was made (counts toward cap) but failed.
             let _ = token.fail(store.conn());
+            // v0.27.5 R3 — release the claim so a future cron pass can
+            // retry. The cap was burned, but holding the claim row
+            // forever would prevent any retry from emitting (LIKE
+            // check would say "no event yet" but try_claim_cron would
+            // still see the orphaned claim and SkippedDuplicate). The
+            // tradeoff is: retry will burn cap again on subsequent
+            // failures; operator who sees daily_cap exhausted by
+            // cron retry storms can investigate the LLM failure root
+            // cause directly.
+            let _ = release_cron_claim(
+                store.conn(),
+                &entry.surface,
+                &entry.id,
+                &entry.stamp_hash,
+                &claim_token,
+            );
             return ProcessOutcome::Dropped(format!("cron LLM call failed: {e}"));
         }
     };
@@ -765,6 +872,17 @@ fn process_archive_entry(
             let payload_value = match serde_json::to_value(&payload) {
                 Ok(v) => v,
                 Err(e) => {
+                    // v0.27.5 R3 — payload serialize is deterministic
+                    // from the entry; if it fails it'll fail again on
+                    // retry. Release anyway so we don't permanently
+                    // block; the caller can fix the bug + retry.
+                    let _ = release_cron_claim(
+                        store.conn(),
+                        &entry.surface,
+                        &entry.id,
+                        &entry.stamp_hash,
+                        &claim_token,
+                    );
                     return ProcessOutcome::Dropped(format!("payload serialize: {e}"));
                 }
             };
@@ -797,6 +915,16 @@ fn process_archive_entry(
             let payload_value = match serde_json::to_value(&payload) {
                 Ok(v) => v,
                 Err(e) => {
+                    // v0.27.5 R3 — same release rationale as the
+                    // Synthesis arm: don't permanently block a future
+                    // retry on a deterministic serialize failure.
+                    let _ = release_cron_claim(
+                        store.conn(),
+                        &entry.surface,
+                        &entry.id,
+                        &entry.stamp_hash,
+                        &claim_token,
+                    );
                     return ProcessOutcome::Dropped(format!("payload serialize: {e}"));
                 }
             };
@@ -817,7 +945,24 @@ fn process_archive_entry(
     };
 
     match emit_result {
-        Ok(_) => ProcessOutcome::Emitted,
+        Ok(_) => {
+            // Codex R7 P2 — release the claim on successful emit too.
+            // The `feedback_events` row is now durable, and the LIKE
+            // check in `cron_event_already_emitted` becomes the
+            // authoritative future-dedup guard. Holding the claim row
+            // forever would grow `cron_claims` unbounded (one row per
+            // processed entry, up to `daily_call_cap` per day) for
+            // operators who enable the nightly cron. Stale takeover
+            // is still in place for crash recovery.
+            let _ = release_cron_claim(
+                store.conn(),
+                &entry.surface,
+                &entry.id,
+                &entry.stamp_hash,
+                &claim_token,
+            );
+            ProcessOutcome::Emitted
+        }
         Err(e) => {
             // F4 A3 fix — partial UNIQUE index on
             // `idx_feedback_events_offlinecron_dedup` is the atomic guard
@@ -825,11 +970,160 @@ fn process_archive_entry(
             // here means a peer cron run beat us to it; treat as a
             // duplicate (no-op) instead of a hard error.
             if is_unique_constraint_violation(&e) {
+                // v0.27.5 R3 — peer beat us to feedback_events. Future
+                // passes will SkippedDuplicate via `cron_event_already_emitted`,
+                // so the orphan claim row would block nothing meaningful;
+                // release anyway for a clean lifecycle (defensive — if a
+                // peer of a peer ever clears feedback_events out-of-band
+                // we want the claim gone too).
+                let _ = release_cron_claim(
+                    store.conn(),
+                    &entry.surface,
+                    &entry.id,
+                    &entry.stamp_hash,
+                    &claim_token,
+                );
                 return ProcessOutcome::SkippedDuplicate;
             }
+            // v0.27.5 R3 — non-UNIQUE emit failure means no event was
+            // committed; release the claim so a future retry can re-emit.
+            let _ = release_cron_claim(
+                store.conn(),
+                &entry.surface,
+                &entry.id,
+                &entry.stamp_hash,
+                &claim_token,
+            );
             ProcessOutcome::Dropped(format!("emit_event failed: {e}"))
         }
     }
+}
+
+/// v0.27.5 R3 — stale-claim takeover window. A `cron_claims` row whose
+/// `claimed_at` is older than this is treated as orphaned (process
+/// crash / kill -9 between claim and emit) and reclaimable by the next
+/// `try_claim_cron` caller. Mirrors the 5-minute pattern used by the
+/// resummerize and cold_archive claim-token leases. Picked to comfortably
+/// outlive a normal cron LLM round-trip (typically 5-30s) while still
+/// short enough to recover from real crashes within one cron cycle.
+const CRON_CLAIM_STALE_SECS: i64 = 300;
+
+/// v0.27.5 R3 — atomic pre-LLM claim primitive. Inserts a row into
+/// `cron_claims` keyed by `(event_type, surface_id, stamp_hash)` via
+/// `INSERT OR IGNORE`. On success returns `Ok(Some(token))` carrying
+/// the freshly minted ULID claim token; subsequent
+/// [`release_cron_claim`] calls MUST pass that token so the DELETE
+/// only matches if the caller is still the row's owner.
+///
+/// `Ok(None)` means a fresh peer already owns the tuple; the caller
+/// MUST short-circuit to `SkippedDuplicate` without calling
+/// `reserve_call` or the LLM.
+///
+/// **Stale takeover** (codex R3 P2 ownership-safe variant) — when
+/// INSERT OR IGNORE finds an existing row whose `claimed_at` is older
+/// than [`CRON_CLAIM_STALE_SECS`] (orphan from a crashed peer that
+/// never emitted), the takeover UPDATE overwrites `claim_token` AND
+/// `claimed_at` with fresh values and returns the new token. The
+/// UPDATE predicate `claimed_at < cutoff` is the atomic staleness
+/// guard: a peer that concurrently refreshed the row stays the winner,
+/// and the original (slow) cron's `release_cron_claim` will see
+/// `claim_token != ?token` and DELETE 0 rows — never clobbering the
+/// new owner.
+///
+/// Atomic at the SQLite level: the PRIMARY KEY uniqueness contest +
+/// the staleness UPDATE both happen inside SQLite's row-lock.
+fn try_claim_cron(
+    conn: &rusqlite::Connection,
+    surface: &CronArchiveSurface,
+    id: &str,
+    stamp_hash: &str,
+) -> ReinResult<Option<String>> {
+    let event_type = match surface {
+        CronArchiveSurface::Synthesis => EventType::SynthesisLlmJudgeOfflineCron.as_str(),
+        CronArchiveSurface::ConceptSummary => EventType::ConceptSummaryLlmJudgeOfflineCron.as_str(),
+    };
+    let token = ulid::Ulid::new().to_string();
+    let now_unix = chrono::Utc::now().timestamp();
+    // Fast path: no row exists yet → INSERT OR IGNORE wins.
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO cron_claims \
+           (event_type, surface_id, stamp_hash, claim_token, claimed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![event_type, id, stamp_hash, token, now_unix],
+    )?;
+    if inserted == 1 {
+        return Ok(Some(token));
+    }
+    // Slow path: row exists. Take it over IFF stale (atomic via the
+    // `claimed_at < cutoff` predicate). The takeover overwrites both
+    // `claim_token` and `claimed_at`, so the original owner's release
+    // attempt becomes a no-op.
+    let stale_cutoff = now_unix - CRON_CLAIM_STALE_SECS;
+    let updated = conn.execute(
+        "UPDATE cron_claims \
+         SET claim_token = ?4, claimed_at = ?5 \
+         WHERE event_type = ?1 AND surface_id = ?2 AND stamp_hash = ?3 \
+           AND claimed_at < ?6",
+        rusqlite::params![event_type, id, stamp_hash, token, now_unix, stale_cutoff],
+    )?;
+    if updated == 1 {
+        Ok(Some(token))
+    } else {
+        Ok(None)
+    }
+}
+
+/// v0.27.5 R3 — release a `cron_claims` row on no-cap-burn failure
+/// paths so a future cron pass can retry instead of being permanently
+/// `SkippedDuplicate`.
+///
+/// Codex R3 P2 fix: predicate the DELETE on `claim_token`. If a stale
+/// original cron's claim was taken over by a fresh peer, the original
+/// caller's stored `token` no longer matches the row, so the DELETE
+/// affects 0 rows and the fresh peer's row is preserved.
+fn release_cron_claim(
+    conn: &rusqlite::Connection,
+    surface: &CronArchiveSurface,
+    id: &str,
+    stamp_hash: &str,
+    token: &str,
+) -> ReinResult<()> {
+    let event_type = match surface {
+        CronArchiveSurface::Synthesis => EventType::SynthesisLlmJudgeOfflineCron.as_str(),
+        CronArchiveSurface::ConceptSummary => EventType::ConceptSummaryLlmJudgeOfflineCron.as_str(),
+    };
+    conn.execute(
+        "DELETE FROM cron_claims \
+         WHERE event_type = ?1 AND surface_id = ?2 AND stamp_hash = ?3 \
+           AND claim_token = ?4",
+        rusqlite::params![event_type, id, stamp_hash, token],
+    )?;
+    Ok(())
+}
+
+/// v0.27.5 R3 (codex R9 P3) — tokenless reaper for orphan `cron_claims`
+/// rows discovered during the fast-path `cron_event_already_emitted`
+/// LIKE check. Caller MUST have confirmed a durable OfflineCron event
+/// exists for the tuple before calling — that's the safety invariant
+/// that lets us skip the `claim_token` predicate. The event's
+/// existence makes any contemporaneous claim-row holder a no-op (they
+/// either crashed mid-emit or are about to lose to F4 A3 UNIQUE).
+fn reap_emitted_cron_claim(
+    conn: &rusqlite::Connection,
+    surface: &CronArchiveSurface,
+    id: &str,
+    stamp_hash: &str,
+) -> ReinResult<()> {
+    let event_type = match surface {
+        CronArchiveSurface::Synthesis => EventType::SynthesisLlmJudgeOfflineCron.as_str(),
+        CronArchiveSurface::ConceptSummary => EventType::ConceptSummaryLlmJudgeOfflineCron.as_str(),
+    };
+    conn.execute(
+        "DELETE FROM cron_claims \
+         WHERE event_type = ?1 AND surface_id = ?2 AND stamp_hash = ?3",
+        rusqlite::params![event_type, id, stamp_hash],
+    )?;
+    Ok(())
 }
 
 /// F4 A3 helper — detect SQLite UNIQUE constraint violations so the
@@ -1159,6 +1453,14 @@ mod tests {
                 last_event_id INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT
             );
+            CREATE TABLE cron_claims (
+                event_type TEXT NOT NULL,
+                surface_id TEXT NOT NULL,
+                stamp_hash TEXT NOT NULL,
+                claim_token TEXT NOT NULL DEFAULT '',
+                claimed_at INTEGER NOT NULL,
+                PRIMARY KEY (event_type, surface_id, stamp_hash)
+            );
             ",
         )
         .unwrap();
@@ -1413,6 +1715,171 @@ mod tests {
         let s = p.to_string_lossy().into_owned();
         assert!(s.contains("queue"));
         assert!(s.contains("synthesis_cron_archive_20260501_0.jsonl"));
+    }
+
+    #[test]
+    fn try_claim_cron_first_winner_wins_loser_skips() {
+        // v0.27.5 R3 — pre-LLM atomic claim primitive. The first
+        // INSERT OR IGNORE for a (event_type, surface_id, stamp_hash)
+        // tuple MUST return Ok(Some(token)); a second for the same
+        // tuple MUST return Ok(None). This proves two concurrent
+        // crons can't both burn `daily_call_cap` on the same entry.
+        let conn = setup_db();
+        let surface = CronArchiveSurface::Synthesis;
+
+        // First writer wins.
+        let first = try_claim_cron(&conn, &surface, "synth-1", "stamp-A").unwrap();
+        assert!(first.is_some(), "first writer must win the claim");
+
+        // Second writer (concurrent peer) loses.
+        let second = try_claim_cron(&conn, &surface, "synth-1", "stamp-A").unwrap();
+        assert!(
+            second.is_none(),
+            "second writer of identical tuple MUST observe the conflict"
+        );
+
+        // Different stamp_hash on same id is a fresh tuple — proves the
+        // claim is keyed correctly (re-mint with different prompt judges
+        // afresh).
+        let fresh_stamp = try_claim_cron(&conn, &surface, "synth-1", "stamp-B").unwrap();
+        assert!(
+            fresh_stamp.is_some(),
+            "different stamp_hash on same id MUST be a fresh tuple"
+        );
+
+        // Different surface_id under the same event_type also fresh.
+        let fresh_id = try_claim_cron(&conn, &surface, "synth-2", "stamp-A").unwrap();
+        assert!(
+            fresh_id.is_some(),
+            "different surface_id MUST be a fresh tuple"
+        );
+
+        // ConceptSummary surface uses a different event_type → also fresh,
+        // even with identical id + stamp.
+        let fresh_surface = try_claim_cron(
+            &conn,
+            &CronArchiveSurface::ConceptSummary,
+            "synth-1",
+            "stamp-A",
+        )
+        .unwrap();
+        assert!(
+            fresh_surface.is_some(),
+            "different event_type MUST be a fresh tuple"
+        );
+
+        // Verify exactly 4 winning rows landed.
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cron_claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            row_count, 4,
+            "only winning claims persist; losers are no-ops"
+        );
+
+        // Each winning claim MUST hold a non-empty token (codex R3 P2
+        // ownership-safety requires it for `release_cron_claim`).
+        assert!(!first.unwrap().is_empty());
+        assert!(!fresh_stamp.unwrap().is_empty());
+        assert!(!fresh_id.unwrap().is_empty());
+        assert!(!fresh_surface.unwrap().is_empty());
+    }
+
+    #[test]
+    fn try_claim_cron_takes_over_stale_claim_after_crash_window() {
+        // v0.27.5 R3 — stale-claim takeover. If a previous cron crashed
+        // after `try_claim_cron` inserted a row but before it emitted,
+        // the row's `claimed_at` is older than `CRON_CLAIM_STALE_SECS`.
+        // The next caller MUST treat the row as orphaned and take it
+        // over (return Ok(Some(new_token)) and bump claimed_at to now).
+        // Without this, the entry would be permanently `SkippedDuplicate`.
+        let conn = setup_db();
+        let surface = CronArchiveSurface::Synthesis;
+        let event_type = EventType::SynthesisLlmJudgeOfflineCron.as_str();
+
+        // Pre-insert a stale claim row (claimed_at far in the past) with
+        // a known token belonging to the "original" (now dead) cron.
+        conn.execute(
+            "INSERT INTO cron_claims (event_type, surface_id, stamp_hash, claim_token, claimed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![event_type, "synth-1", "stamp-A", "ORIGINAL_TOKEN", 1_000_000i64],
+        )
+        .unwrap();
+
+        // Stale takeover: try_claim_cron returns Ok(Some(new_token)),
+        // claim_token is overwritten, claimed_at bumped to ~now.
+        let new_token = try_claim_cron(&conn, &surface, "synth-1", "stamp-A").unwrap();
+        let new_token = new_token.expect("stale claim row MUST be reclaimable");
+        assert_ne!(new_token, "ORIGINAL_TOKEN", "takeover mints a fresh token");
+
+        let (stored_token, claimed_at): (String, i64) = conn
+            .query_row(
+                "SELECT claim_token, claimed_at FROM cron_claims \
+                 WHERE event_type = ?1 AND surface_id = ?2 AND stamp_hash = ?3",
+                rusqlite::params![event_type, "synth-1", "stamp-A"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_token, new_token, "stored token MUST match returned");
+        let now_unix = chrono::Utc::now().timestamp();
+        assert!(
+            (now_unix - claimed_at).abs() < 10,
+            "stale takeover MUST refresh claimed_at to ~now (got {claimed_at} vs now {now_unix})"
+        );
+
+        // Concurrent peer immediately after takeover: claim is fresh,
+        // so peer loses.
+        let peer = try_claim_cron(&conn, &surface, "synth-1", "stamp-A").unwrap();
+        assert!(
+            peer.is_none(),
+            "after takeover the new owner is fresh, peer MUST lose"
+        );
+
+        // Codex R3 P2 ownership-safety: the original (slow) cron's
+        // `release_cron_claim` with the OLD token MUST be a no-op,
+        // never clobbering the fresh peer's row.
+        release_cron_claim(&conn, &surface, "synth-1", "stamp-A", "ORIGINAL_TOKEN").unwrap();
+        let still_owned: String = conn
+            .query_row(
+                "SELECT claim_token FROM cron_claims \
+                 WHERE event_type = ?1 AND surface_id = ?2 AND stamp_hash = ?3",
+                rusqlite::params![event_type, "synth-1", "stamp-A"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_owned, new_token,
+            "original-token release MUST NOT delete the fresh peer's row"
+        );
+    }
+
+    #[test]
+    fn release_cron_claim_lets_a_future_cron_pass_retry() {
+        // v0.27.5 R3 — `release_cron_claim` is called on no-cap-burn
+        // failure paths (`reserve_call` → Ok(None) / Err) so a future
+        // cron pass can retry. After release, `try_claim_cron` for the
+        // same tuple MUST succeed again.
+        let conn = setup_db();
+        let surface = CronArchiveSurface::Synthesis;
+
+        // First claim wins.
+        let token1 = try_claim_cron(&conn, &surface, "synth-1", "stamp-A").unwrap();
+        let token1 = token1.expect("first claim wins");
+        // Concurrent peer loses.
+        assert!(try_claim_cron(&conn, &surface, "synth-1", "stamp-A")
+            .unwrap()
+            .is_none());
+
+        // Simulate a no-cap-burn failure: owner releases the claim.
+        release_cron_claim(&conn, &surface, "synth-1", "stamp-A", &token1).unwrap();
+
+        // Future cron pass for the same tuple MUST succeed again.
+        let retry = try_claim_cron(&conn, &surface, "synth-1", "stamp-A").unwrap();
+        assert!(retry.is_some(), "after release, future claim MUST succeed");
+
+        // Releasing a non-existent claim is a no-op (best-effort
+        // semantics — used inside `let _ = ...` patterns).
+        release_cron_claim(&conn, &surface, "synth-never", "stamp-Z", "wrong-token").unwrap();
     }
 
     #[test]
