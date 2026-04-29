@@ -664,6 +664,19 @@ fn process_archive_entry(
             tracing::warn!(error = %e, "cron idempotency check failed, proceeding (best-effort)");
         }
     }
+    // codex R9 P2 — known residual race: between this check and the
+    // post-LLM `emit_event`, a concurrent cron worker can pass the
+    // same check, both consume `daily_call_cap` via `reserve_call`,
+    // both pay for an LLM call, and the second emit hits the
+    // R1-introduced UNIQUE index → caller sees `SkippedDuplicate`.
+    // Daily budget + dollar cost is wasted on the loser.
+    //
+    // Closing this fully requires a pre-LLM claim row (e.g. an
+    // `INSERT INTO cron_claims (...) ON CONFLICT DO NOTHING`
+    // primitive that atomically reserves the (surface, id, stamp)
+    // tuple). That's a small schema change tracked for v0.27.5+.
+    // Single-cron deployments are unaffected; the duplicate-cron
+    // case is rare in practice (the user's setup is one cron).
 
     // 1. Look up runtime verdict in feedback_events by synthesis_id.
     //    Codex R5 P2 fix: join by synthesis_id ONLY, NOT stamp_hash —
@@ -676,6 +689,35 @@ fn process_archive_entry(
             Ok(None) => return ProcessOutcome::SkippedNoRuntimeVerdict,
             Err(e) => return ProcessOutcome::Dropped(format!("verdict lookup failed: {e}")),
         };
+
+    // codex R5 P2: defensive size check BEFORE cap reservation. Cron
+    // archive lines from a pre-enqueue-cap version (or manually-injected
+    // archive entries) may exceed `JUDGE_MAX_INPUT_CHARS`, and the cron
+    // LLM call site (`call_cron_judge` → `call_judge_sync`) no longer
+    // truncates (R1 J7 fix). Without this guard, oversized cron lines
+    // would burn `daily_call_cap` AND send untruncated payloads to the
+    // cron judge model. Mirror `llm_judge_worker::dispatch_one`'s pre-
+    // reservation ceiling exactly, including the same const.
+    let combined_chars = entry
+        .sources
+        .iter()
+        .map(|s| s.chars().count())
+        .sum::<usize>()
+        + entry.candidate.chars().count();
+    if combined_chars > crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS {
+        tracing::warn!(
+            surface = ?entry.surface,
+            id = %entry.id,
+            combined_chars = combined_chars,
+            ceiling = crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS,
+            "cron judge: archive payload exceeds dispatch ceiling; dropped pre-reservation"
+        );
+        return ProcessOutcome::Dropped(format!(
+            "cron archive payload too large ({} chars > ceiling {})",
+            combined_chars,
+            crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS
+        ));
+    }
 
     // 2. Re-judge via the stricter cron LLM.
     //
@@ -776,7 +818,29 @@ fn process_archive_entry(
 
     match emit_result {
         Ok(_) => ProcessOutcome::Emitted,
-        Err(e) => ProcessOutcome::Dropped(format!("emit_event failed: {e}")),
+        Err(e) => {
+            // F4 A3 fix — partial UNIQUE index on
+            // `idx_feedback_events_offlinecron_dedup` is the atomic guard
+            // for concurrent cron emit. A UNIQUE constraint violation
+            // here means a peer cron run beat us to it; treat as a
+            // duplicate (no-op) instead of a hard error.
+            if is_unique_constraint_violation(&e) {
+                return ProcessOutcome::SkippedDuplicate;
+            }
+            ProcessOutcome::Dropped(format!("emit_event failed: {e}"))
+        }
+    }
+}
+
+/// F4 A3 helper — detect SQLite UNIQUE constraint violations so the
+/// cron emit path can absorb concurrent-emit races as no-ops.
+fn is_unique_constraint_violation(err: &ReinError) -> bool {
+    match err {
+        ReinError::Database(rusqlite::Error::SqliteFailure(ffi, _)) => {
+            ffi.code == rusqlite::ErrorCode::ConstraintViolation
+                && ffi.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        }
+        _ => false,
     }
 }
 
@@ -887,7 +951,11 @@ fn call_cron_judge(
     // when archive_entry was emitted with `sources = [prompt]` (Codex
     // R1 P2 archive shape fix).
     let joined_sources = entry.sources.join("\n");
+    // F4 B2 — pass config so the cron LLM call honors the resolved
+    // `[ars.llm_judge.nightly_cron]` (or inherited `[ars.llm_judge]`
+    // / `[llm]`) max_input_chars override at runtime.
     let raw = crate::ops::llm_judge_worker::call_judge_sync(
+        config,
         &extractor,
         &joined_sources,
         &entry.candidate,

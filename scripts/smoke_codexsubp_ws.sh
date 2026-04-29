@@ -24,10 +24,13 @@ if [[ "${REIN_SMOKE_ALLOW_DANGEROUS_SANDBOX:-0}" == "1" ]]; then
   SANDBOX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
 fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SOH=$'\x01'
+# v0.27.4 codex R5 P1 + R7 P3: env_http_headers — see
+# smoke_codexsubp.sh for the matching block.
 PROVIDER_OVERRIDE=$(sed \
   -e "s#__PROVIDER_KEY__#rein_sub_proxy_ws#g" \
   -e "s#__PROVIDER_NAME__#Rein Subscription Proxy WS#g" \
-  -e "s#__PROXY_URL__#${PROXY_URL//\\/\\\\}#g" \
+  -e "s${SOH}__PROXY_URL__${SOH}${PROXY_URL//\\/\\\\}${SOH}g" \
   -e "s#__SUPPORTS_WEBSOCKETS__#true#g" \
   "$SCRIPT_DIR/codexsubp_provider.toml.tmpl")
 

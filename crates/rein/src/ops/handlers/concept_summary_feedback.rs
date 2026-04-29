@@ -65,10 +65,45 @@ impl OpsRuntime {
         &self,
         params: ConceptSummaryFeedbackParams,
     ) -> ReinResult<FeedbackOutput> {
+        // codex R1 P2 (D1/D2 follow-up): rewrite the interaction's
+        // `(cluster_id, query_type)` to the SAME synthetic per-concept
+        // bucket the writer (`enqueue_judge_for_concept_summary`) and
+        // gate reader (`decide_concept_summary_quality` from
+        // `concept_state`) use. GUI clients still POST with their real
+        // recall-context metadata (e.g. `query_type = "Exploratory"`,
+        // `cluster_id = 7`), but Cap A pools all auto-judge events under
+        // `(synthetic_hash(concept_id), "concept_refresh")`. Without
+        // this override, human thumbs/dwell from GUI traffic accumulate
+        // in `(7, "Exploratory")` and never influence the gate that
+        // reads from the synthetic bucket — the per-concept feedback
+        // loop is dead code for current clients. Per spec §15 R7-#1,
+        // proper recall-context routing is v0.28+ work; until then,
+        // unifying both writers under the synthetic key keeps the loop
+        // closed.
+        let synthetic_cid = crate::ops::concept_summary::synthetic_cluster_id_for_concept(
+            &params.concept_id,
+        );
+        let aligned_metadata = match &params.metadata {
+            Some(meta) => {
+                let mut m = meta.clone();
+                m.cluster_id = Some(synthetic_cid);
+                m.query_type = Some(
+                    crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH.to_string(),
+                );
+                Some(m)
+            }
+            None => Some(crate::store::adaptive::ConceptSummaryMetadata {
+                query_type: Some(
+                    crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH.to_string(),
+                ),
+                cluster_id: Some(synthetic_cid),
+                ..crate::store::adaptive::ConceptSummaryMetadata::default()
+            }),
+        };
         // Mirror the synthesis-interaction handler shape: lift query_type onto
         // the FeedbackEvent column so consumers can filter via the indexed
         // column without parsing the payload JSON for every event.
-        let query_type = params.metadata.as_ref().and_then(|m| m.query_type.clone());
+        let query_type = aligned_metadata.as_ref().and_then(|m| m.query_type.clone());
         let concept_summary_id = params
             .concept_summary_id
             .clone()
@@ -80,7 +115,7 @@ impl OpsRuntime {
             concept_summary_id,
             recall_id: params.recall_id.clone(),
             interaction: params.interaction.clone(),
-            metadata: params.metadata.clone(),
+            metadata: aligned_metadata,
         };
         let payload_value = serde_json::to_value(&payload).map_err(|e| {
             ReinError::Config(format!(

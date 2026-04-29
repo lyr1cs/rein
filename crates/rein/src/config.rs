@@ -912,6 +912,13 @@ pub struct ServerConfig {
     pub gui_enabled: bool,
     #[serde(default)]
     pub allow_unauthenticated_loopback: bool,
+    /// v0.27.3 F5/C3: optional explicit Host-header allowlist used by the
+    /// HTTP guard. Required when binding to a wildcard address
+    /// (`0.0.0.0`, `::`, `*`) to defend against DNS-rebinding. When `None`
+    /// and the bind is specific (loopback or a concrete LAN IP), the
+    /// allowlist is derived from the bind host.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1185,7 +1192,15 @@ impl Default for ServerConfig {
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
             gui_enabled: false,
-            allow_unauthenticated_loopback: true,
+            // v0.27.3 F5/C1: default-deny. Operators must opt in to
+            // unauthenticated loopback or set REIN_HTTP_TOKEN. The doctor
+            // template already writes `false` (see doctor.rs:1742).
+            allow_unauthenticated_loopback: false,
+            // v0.27.3 F5/C3: when [server].sse_bind is a wildcard
+            // (0.0.0.0, ::, *, empty), startup refuses unless allowed_hosts
+            // is set. None means "derive allowlist from bind", which is
+            // the safe default for specific (loopback or LAN-IP) binds.
+            allowed_hosts: None,
         }
     }
 }
@@ -1230,7 +1245,10 @@ impl Default for ProxyConfig {
             max_response_buffer: 1_048_576,
             max_sse_buffer: 1_048_576,
             max_concurrent_extractions: 4,
-            allow_unauthenticated_loopback: true,
+            // v0.27.3 F5/C1: default-deny. Operators must opt in to
+            // unauthenticated loopback or set REIN_PROXY_TOKEN. The doctor
+            // template already writes `false` (see doctor.rs:1767).
+            allow_unauthenticated_loopback: false,
         }
     }
 }

@@ -170,6 +170,15 @@ fn codexsub_provider_override(
     proxy_url: &str,
     supports_websockets: bool,
 ) -> String {
+    // codex R7 P2: do NOT bake the proxy token into the generated
+    // alias. The template uses Codex CLI's `env_http_headers = { ... =
+    // "REIN_PROXY_TOKEN" }` form, which expands the env var at
+    // invocation time. This means:
+    //   - rotating REIN_PROXY_TOKEN immediately takes effect
+    //   - secrets never land in the user's shell rc file
+    //   - running `rein init --proxy` before setting the token still
+    //     produces a working alias (just authenticate later by
+    //     setting the env var).
     include_str!("../../../scripts/codexsubp_provider.toml.tmpl")
         .trim()
         .replace("__PROVIDER_KEY__", provider_key)
@@ -239,8 +248,19 @@ fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
         // expects. See investigation in docs/backlog/architecture.md #C3.
         (
             "codexsubp".to_string(),
+            // codex R9 P2: ensure REIN_PROXY_TOKEN is set before
+            // invoking codex. The provider template's
+            // `env_http_headers` reads REIN_PROXY_TOKEN exclusively,
+            // but the proxy itself ALSO accepts REIN_HTTP_TOKEN as a
+            // fallback (`run_proxy`, `check_proxy_auth`, dashboard
+            // metrics). Without this fallback, an operator who set
+            // only REIN_HTTP_TOKEN gets 401 from the alias even though
+            // every other proxy surface works. The `:=` shell
+            // assignment exports the resolved token to the codex
+            // child process at invocation time, so token rotation
+            // takes effect on the next call (no rc re-source needed).
             format!(
-                r#"codexsubp() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="{}/backend-api"' "$@"; }}"#,
+                r#"codexsubp() {{ REIN_PROXY_ACTIVE=1 REIN_PROXY_TOKEN="${{REIN_PROXY_TOKEN:-${{REIN_HTTP_TOKEN:-}}}}" codex -c '{}' -c 'model_provider="rein_sub_proxy"' -c 'chatgpt_base_url="{}/backend-api"' "$@"; }}"#,
                 codexsubp_provider_override(&proxy_url),
                 proxy_url,
             ),
@@ -248,7 +268,7 @@ fn proxy_aliases(bind: &str, port: u16) -> Vec<(String, String)> {
         (
             "codexsubpws".to_string(),
             format!(
-                r#"codexsubpws() {{ REIN_PROXY_ACTIVE=1 codex -c '{}' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="{}/backend-api"' "$@"; }}"#,
+                r#"codexsubpws() {{ REIN_PROXY_ACTIVE=1 REIN_PROXY_TOKEN="${{REIN_PROXY_TOKEN:-${{REIN_HTTP_TOKEN:-}}}}" codex -c '{}' -c 'model_provider="rein_sub_proxy_ws"' -c 'chatgpt_base_url="{}/backend-api"' "$@"; }}"#,
                 codexsubpws_provider_override(&proxy_url),
                 proxy_url,
             ),
