@@ -243,7 +243,10 @@ fn proxy_host_is_allowed(
     port: u16,
     token_protected: bool,
 ) -> bool {
-    let host_value = match headers.get(hyper::header::HOST).and_then(|v| v.to_str().ok()) {
+    let host_value = match headers
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.trim(),
         None => return false,
     };
@@ -287,9 +290,7 @@ fn proxy_host_is_allowed(
     if token_protected {
         return true;
     }
-    if !is_wildcard_bind
-        && !allowed.iter().any(|(h, _)| h == &bind_normalized)
-    {
+    if !is_wildcard_bind && !allowed.iter().any(|(h, _)| h == &bind_normalized) {
         allowed.push((bind_normalized, None));
     }
 
