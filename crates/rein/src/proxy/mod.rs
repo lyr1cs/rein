@@ -1098,27 +1098,19 @@ async fn handle_request(
     }
 
     // Metrics endpoint.
-    // v0.27.3 F5/C4: require bearer auth on /rein/metrics even on
-    // loopback-unauth listeners. The general bearer check above only
-    // fires when `expected_token` is `Some`, so on loopback-unauth this
-    // endpoint was previously open. Operators must set REIN_PROXY_TOKEN
-    // (or REIN_HTTP_TOKEN) to access metrics — by design.
+    // v0.27.3 F5/C4 + v0.27.4 follow-up: respect the proxy's auth posture
+    // — when a bearer token IS configured, the general check at the top
+    // of `handle_request` already enforced it; when loopback-unauth is
+    // enabled (`expected_token = None`), the Host/Origin guard at
+    // `proxy_host_is_allowed` is the DNS-rebind defense, so a metrics-
+    // specific 401 here just blocks the operator's own `rein doctor`
+    // probe with no security upside. Earlier `[F5/C4 always-401]`
+    // version was reverted because (a) Host guard already rejects
+    // browser-via-rebound-DNS, (b) it broke the doctor health-check
+    // flow on the standard single-user loopback config, (c) operators
+    // wanting strict metrics auth simply set REIN_PROXY_TOKEN — the
+    // general check above handles that case identically.
     if method == hyper::Method::GET && path == "/rein/metrics" {
-        let authenticated = match expected_token {
-            Some(expected) => {
-                let auth_header = req
-                    .headers()
-                    .get("x-rein-token")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                proxy_token_eq(auth_header, expected)
-            }
-            None => false,
-        };
-        if !authenticated {
-            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
-            return Ok(error_response(401, "unauthorized"));
-        }
         let json = state.metrics.to_json();
         return Ok(build_response(
             hyper::Response::builder()
