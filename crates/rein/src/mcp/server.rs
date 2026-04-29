@@ -170,8 +170,7 @@ pub(crate) fn wildcard_bind_requires_allowlist(
     bind_host: &str,
     allowed_hosts: Option<&[String]>,
 ) -> bool {
-    !is_specific_bind_host(bind_host)
-        && allowed_hosts.is_none_or(|hosts| hosts.is_empty())
+    !is_specific_bind_host(bind_host) && allowed_hosts.is_none_or(|hosts| hosts.is_empty())
 }
 
 /// True when the in-process Host-header guard should run for this bind.
@@ -662,23 +661,17 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             let path = req.uri().path();
             let method = req.method();
             let allowed_hosts = cfg.server.allowed_hosts.as_deref();
-            let host_for_origin =
-                if http_host_guard_enabled(&cfg.server.sse_bind, allowed_hosts) {
-                    match validate_http_request_host(
-                        req.headers(),
-                        &cfg.server.sse_bind,
-                        allowed_hosts,
-                    ) {
-                        Ok(host) => Some(host),
-                        Err(rejection) => {
-                            return Ok::<_, std::convert::Infallible>(http_guard_response(
-                                rejection,
-                            ));
-                        }
+            let host_for_origin = if http_host_guard_enabled(&cfg.server.sse_bind, allowed_hosts) {
+                match validate_http_request_host(req.headers(), &cfg.server.sse_bind, allowed_hosts)
+                {
+                    Ok(host) => Some(host),
+                    Err(rejection) => {
+                        return Ok::<_, std::convert::Infallible>(http_guard_response(rejection));
                     }
-                } else {
-                    parse_http_request_host(req.headers()).ok()
-                };
+                }
+            } else {
+                parse_http_request_host(req.headers()).ok()
+            };
 
             if let Some(host) = host_for_origin.as_ref() {
                 if let Err(rejection) =

@@ -342,10 +342,7 @@ async fn main() -> anyhow::Result<()> {
                     report.skipped_no_runtime_verdict
                 );
                 println!("dropped (errors):             {}", report.dropped);
-                println!(
-                    "dropped (cap reservation):    {}",
-                    report.dropped_cap
-                );
+                println!("dropped (cap reservation):    {}", report.dropped_cap);
             } else {
                 println!(
                     "judge-calibrate-cron: considered={} emitted={} skipped={} dropped={}",

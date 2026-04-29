@@ -1032,6 +1032,12 @@ impl MemoryStore for SqliteStore {
             // Otherwise the GUI surface and recall metadata would expose a
             // stale generated-at timestamp pointing at content that no longer
             // exists, until the worker regenerates the summary.
+            //
+            // v0.27.5 R1 — also clear `last_too_large_at`. The backoff stamp
+            // is only meaningful while the row's CURRENT content was rejected
+            // for being oversized; on semantic_changed the body / summary /
+            // topic was rewritten, so the prior verdict no longer applies and
+            // the row should compete for a claim slot at full priority again.
             self.conn.execute(
                 "UPDATE memories
                  SET archival_summary = NULL,
@@ -1039,7 +1045,8 @@ impl MemoryStore for SqliteStore {
                      archival_summary_version = NULL,
                      needs_archival_summary = 1,
                      in_progress_archival_summary_at = NULL,
-                     archival_claim_token = NULL
+                     archival_claim_token = NULL,
+                     last_too_large_at = NULL
                  WHERE id = ?1",
                 rusqlite::params![memory.id],
             )?;
