@@ -82,9 +82,12 @@ where
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> BoxedResponse {
     let json_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    // AGPL §13: every network response carries a pointer to the source.
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        .header("x-source-code", crate::SOURCE_URL)
+        .header("x-license", crate::LICENSE_SPDX)
         .body(
             Full::new(Bytes::from(json_bytes))
                 .map_err(|never: std::convert::Infallible| match never {})
@@ -117,10 +120,13 @@ fn json_response_with_cookie(
     cookie: &str,
 ) -> BoxedResponse {
     let json_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    // AGPL §13: every network response carries a pointer to the source.
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .header("set-cookie", cookie)
+        .header("x-source-code", crate::SOURCE_URL)
+        .header("x-license", crate::LICENSE_SPDX)
         .body(
             Full::new(Bytes::from(json_bytes))
                 .map_err(|never: std::convert::Infallible| match never {})
@@ -807,6 +813,8 @@ async fn try_dispatch_inventory_rest<B>(
             Response::builder()
                 .status(status)
                 .header("content-type", content_type)
+                .header("x-source-code", crate::SOURCE_URL)
+                .header("x-license", crate::LICENSE_SPDX)
                 .body(
                     Full::new(body)
                         .map_err(|never: std::convert::Infallible| match never {})
@@ -1555,6 +1563,10 @@ fn gui_response_builder(mime: &'static str) -> hyper::http::response::Builder {
         .header("x-frame-options", "DENY")
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "no-referrer")
+        // AGPL §13: even SPA static-asset responses carry the source pointer
+        // so a curl user pulling the GUI from a network deployment sees it.
+        .header("x-source-code", crate::SOURCE_URL)
+        .header("x-license", crate::LICENSE_SPDX)
 }
 
 #[cfg(feature = "gui")]

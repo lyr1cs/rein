@@ -16,6 +16,9 @@ A sign-off is a single line at the end of your commit message:
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
+(GitHub users who prefer to keep their real email private can use the
+GitHub-provided no-reply form: `<id>+<username>@users.noreply.github.com`.)
+
 `git` can add it automatically:
 
 ```bash
