@@ -836,7 +836,15 @@ fn run_tiering(
     // worker would lose its full-body fallback for every freshly-cold
     // memory. We do the strip inline with raw SQL + a direct Tantivy
     // refresh so the cold_archive row stays intact.
-    if migrated > 0 {
+    // codex R4 P3: drop the `if migrated > 0` gate. Previously, when
+    // BEGIN IMMEDIATE failed mid-pass (or any future code path skipped
+    // the strip block), the archived rows kept their full
+    // `memories.content` indefinitely until some unrelated row
+    // migrated. Now the strip pass runs every tiering cycle and uses
+    // the `content != summary` filter to skip already-stripped rows,
+    // so re-runs are no-ops. Pre-existing archived-but-not-yet-stripped
+    // rows are picked up automatically.
+    {
         let archived_ids: Vec<String> = store
             .conn()
             .prepare(
@@ -846,7 +854,8 @@ fn run_tiering(
 	                   AND m.superseded_by IS NULL
 	                   AND m.tier = 'cold'
 	                   AND m.strength < 0.3
-	                   AND m.access_count = 0",
+	                   AND m.access_count = 0
+	                   AND m.content != m.summary",
             )
             .ok()
             .and_then(|mut stmt| {
@@ -856,48 +865,149 @@ fn run_tiering(
             })
             .unwrap_or_default();
 
-        let _ = store.conn().execute_batch("BEGIN");
-        for aid in &archived_ids {
-            if let Ok(mem) = store.get(aid) {
-                let keywords_json =
-                    serde_json::to_string(&mem.keywords).unwrap_or_else(|_| "[]".to_string());
-                // Raw SQL: rewrite content := summary. We deliberately do
-                // NOT bump status (this is internal data-shape change,
-                // not a user-edit semantic change) and do NOT touch
-                // archival_summary fields (they're owned by Cap C's
-                // worker per the `needs_archival_summary` flag set above).
-                let _ = store.conn().execute(
-                    "UPDATE memories SET content = summary WHERE id = ?1",
+        // Snapshot memory records outside the transaction so we can pass them
+        // to Tantivy/HNSW post-COMMIT (external side-indexes must not be
+        // updated inside the DB transaction — a COMMIT failure would leave
+        // side-indexes reflecting state the DB never committed).
+        let strip_targets: Vec<(String, String, String)> = archived_ids
+            .iter()
+            .filter_map(|aid| {
+                store.get(aid).ok().map(|mem| {
+                    let keywords_json =
+                        serde_json::to_string(&mem.keywords).unwrap_or_else(|_| "[]".to_string());
+                    (aid.clone(), mem.topic.clone(), keywords_json)
+                })
+            })
+            .collect();
+
+        // BEGIN IMMEDIATE prevents concurrent writer races on the strip batch.
+        if let Err(e) = store.conn().execute_batch("BEGIN IMMEDIATE") {
+            tracing::warn!("M5 strip: failed to BEGIN IMMEDIATE: {e}");
+            // Skip the strip pass; cold_archive rows are intact, content will
+            // be stripped on the next tiering cycle.
+        } else {
+            // Apply DB mutations + sqlite-vec deletes inside the transaction.
+            // E3: UPDATE WHERE clause re-asserts the status/tier/superseded
+            // guards so a concurrent write that changed a row's status between
+            // the SELECT and this UPDATE will cause `affected == 0` and the
+            // row is safely skipped.
+            let mut applied: Vec<(String, String, String)> = Vec::new();
+            for (aid, topic, keywords_json) in &strip_targets {
+                let affected = match store.conn().execute(
+                    "UPDATE memories
+                     SET content = summary
+                     WHERE id = ?1
+                       AND superseded_by IS NULL
+                       AND status IN ('active', 'updated')
+                       AND tier = 'cold'",
                     rusqlite::params![aid],
-                );
-                // Direct Tantivy refresh — the indexed content field now
-                // matches the summary, mirroring the SQL truncation.
-                store.update_tantivy(aid, &mem.topic, &mem.summary, &mem.summary, &keywords_json);
-                // R9 F1: also invalidate vec_memories + HNSW. The
-                // pre-strip embedding represented the full body; leaving
-                // it in place lets the vector channel rank this cold row
-                // by facts that are no longer in `memory.content`. Cold
-                // rows are filtered out of non-Exploratory recall anyway,
-                // so the entry is dead weight for everything except the
-                // exploratory channel — and for that channel we'd rather
-                // miss the row than mismatch its semantic surface.
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("M5 strip: UPDATE failed for {aid}: {e}");
+                        0
+                    }
+                };
+                if affected != 1 {
+                    // Peer-write guard fired or row disappeared — skip both
+                    // the sqlite-vec delete and side-index update for this id.
+                    continue;
+                }
+                // sqlite-vec delete is in-transaction: if COMMIT fails the
+                // embedding row stays, which is consistent (content also
+                // rolled back).
                 let _ = crate::store::vec::delete_embedding(store.conn(), aid);
-                store.remove_from_hnsw(aid);
+                applied.push((aid.clone(), topic.clone(), keywords_json.clone()));
+            }
+
+            // COMMIT — if this fails we ROLLBACK and do NOT touch external
+            // side-indexes; the DB retains original content so Tantivy/HNSW
+            // remains consistent with it.
+            match store.conn().execute_batch("COMMIT") {
+                Ok(()) => {
+                    // POST-COMMIT: update external side-indexes only for rows
+                    // whose DB write we know committed AND whose post-commit
+                    // state still matches our strip. codex R1 P2: a peer
+                    // writer (apply_evolution / mark_superseded / forget /
+                    // user-edit) can mutate or remove the row between
+                    // COMMIT and this loop, so re-fetch and skip when:
+                    //   - row is gone (`store.get` errors) → don't resurrect
+                    //   - status flipped to non-active/non-updated → we no
+                    //     longer own the indexable representation
+                    //   - superseded_by is now set → row is dead-data
+                    //   - tier flipped off cold → peer un-archived it
+                    //   - content no longer equals the summary we stripped
+                    //     to (peer ran update() with new content) → our
+                    //     stripped-summary index would clobber theirs
+                    for (aid, _pre_topic, _pre_keywords_json) in &applied {
+                        let Ok(mem) = store.get(aid) else { continue };
+                        if mem.superseded_by.is_some() {
+                            continue;
+                        }
+                        if !matches!(
+                            mem.status,
+                            crate::types::memory::MemoryStatus::Active
+                                | crate::types::memory::MemoryStatus::Updated
+                        ) {
+                            continue;
+                        }
+                        if !matches!(mem.tier, crate::store::tiering::MemoryTier::Cold) {
+                            continue;
+                        }
+                        if mem.content != mem.summary {
+                            // Peer wrote new content into the row after our
+                            // commit; their write owns the index now.
+                            continue;
+                        }
+                        // codex R2 P3: read topic + keywords from the
+                        // post-commit row, not the pre-transaction snapshot.
+                        // A peer `update()` that only changed
+                        // topic/keywords/summary (with content == summary)
+                        // would otherwise be clobbered by stale metadata
+                        // here — we already passed the content-equality
+                        // gate but the row's surface fields may have
+                        // shifted under us between commit and this loop.
+                        let live_keywords_json = serde_json::to_string(&mem.keywords)
+                            .unwrap_or_else(|_| "[]".to_string());
+                        // Tantivy: index content now mirrors summary.
+                        // We pass summary for both the `content` and `summary`
+                        // fields since the strip sets content := summary.
+                        store.update_tantivy(
+                            aid,
+                            &mem.topic,
+                            &mem.summary,
+                            &mem.summary,
+                            &live_keywords_json,
+                        );
+                        // R9 F1: invalidate HNSW — the pre-strip embedding
+                        // represented the full body, which is no longer in
+                        // content. The next dedup/re-embed pass will
+                        // re-insert a summary-based embedding.
+                        store.remove_from_hnsw(aid);
+                    }
+                }
+                Err(e) => {
+                    let _ = store.conn().execute_batch("ROLLBACK");
+                    tracing::error!(
+                        "M5 strip: COMMIT failed ({e}); rolled back — side-indexes untouched"
+                    );
+                }
             }
         }
-        let _ = store.conn().execute_batch("COMMIT");
-        tracing::info!(
-            "M5: migrated {migrated} cold memories to archive ({} stripped), hot={:.4} cold={:.4}",
-            archived_ids.len(),
-            state.hot_threshold,
-            state.cold_threshold
-        );
-    } else {
-        tracing::debug!(
-            "M5: hot={:.4}, cold={:.4}, no migrations needed",
-            state.hot_threshold,
-            state.cold_threshold
-        );
+        if migrated > 0 || !archived_ids.is_empty() {
+            tracing::info!(
+                "M5: migrated {migrated} cold memories to archive ({} stripped), hot={:.4} cold={:.4}",
+                archived_ids.len(),
+                state.hot_threshold,
+                state.cold_threshold
+            );
+        } else {
+            tracing::debug!(
+                "M5: hot={:.4}, cold={:.4}, no migrations needed",
+                state.hot_threshold,
+                state.cold_threshold
+            );
+        }
     }
 }
 

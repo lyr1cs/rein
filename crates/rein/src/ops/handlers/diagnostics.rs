@@ -99,6 +99,51 @@ impl OpsRuntime {
     }
 }
 
+/// `GET /api/version` — server version probe.
+///
+/// v0.27.3 F5/C4: gated behind `auth = "read_token"` so an unauthenticated
+/// caller can no longer fingerprint deployments by querying the version.
+/// The previous literal match arm in `mcp/rest.rs` returned the version as
+/// `AuthPolicy::Public`. The inventory dispatcher now intercepts the route
+/// before that match arm and enforces the declared policy.
+#[derive(Serialize, Clone, Debug)]
+pub struct VersionOutput {
+    pub version: String,
+}
+
+impl IntoJson for VersionOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for VersionOutput {
+    fn to_markdown(&self) -> String {
+        format!("rein {}", self.version)
+    }
+}
+
+impl IntoCliText for VersionOutput {
+    fn to_cli_text(&self) -> String {
+        self.to_markdown()
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "version",
+        category = "diagnostics",
+        description = "Return the running rein server version. Read-only; gated behind read_token auth so unauthenticated callers cannot fingerprint deployments.",
+        rest(method = "GET", path = "/api/version"),
+        auth = "read_token"
+    )]
+    pub fn version(&self) -> ReinResult<VersionOutput> {
+        Ok(VersionOutput {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+}
+
 #[derive(Args, Deserialize, JsonSchema, Debug, Clone, Default)]
 pub struct HealthParams {
     /// Filter reports to a single topic (positional; pre-A1 CLI compat).
@@ -460,5 +505,34 @@ impl OpsRuntime {
             decay_base_lambda: cfg.decay.base_lambda,
             dedup_similarity: cfg.search.dedup_similarity,
         })
+    }
+}
+
+#[cfg(test)]
+mod auth_policy_tests {
+    use crate::ops::{AuthPolicy, OpsRestEntry};
+
+    /// v0.27.3 F5/C4: `/api/version` must require `read_token` auth.
+    /// The route is registered through the `#[op]` inventory; the REST
+    /// dispatcher (`mcp/rest.rs::handle_api_request`) enforces the
+    /// declared policy before body collection. A regression here would
+    /// re-open the unauthenticated version-fingerprint surface that the
+    /// pre-v0.27.3 literal match arm exposed.
+    #[test]
+    fn c4_api_version_requires_auth() {
+        crate::ops::inventory::ensure_unique_registrations();
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.method == hyper::Method::GET && e.path_template == "/api/version")
+            .expect("/api/version GET op should be registered via #[op] inventory");
+        assert_eq!(
+            entry.auth_policy,
+            AuthPolicy::ReadToken,
+            "/api/version must be guarded by AuthPolicy::ReadToken (was {:?})",
+            entry.auth_policy
+        );
+        assert!(
+            !matches!(entry.auth_policy, AuthPolicy::Public),
+            "/api/version must not regress to Public"
+        );
     }
 }

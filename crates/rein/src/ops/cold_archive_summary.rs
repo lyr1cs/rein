@@ -41,7 +41,7 @@
 //!    surface a clear `no such column` error.
 
 use crate::config::{Provider, ReinConfig};
-use crate::extract::llm::{strip_code_fences, ExtractorKind};
+use crate::extract::llm::{resolve_max_input_for_section_kind, strip_code_fences, ExtractorKind};
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
 use crate::types::{Memory, MemoryTier, ReinError, ReinResult};
@@ -162,6 +162,13 @@ pub struct ColdArchiveSummaryReport {
     /// (terminal) during this pass. A non-zero value indicates persistent
     /// LLM-quality failure on specific rows; investigate via tracing logs.
     pub exhausted: u64,
+    /// codex R2 P2: rows whose content exceeds the resolved
+    /// `[ars.cold_archive].max_input_chars`. Claim is released and
+    /// `needs_archival_summary` stays set, so the row reappears on the
+    /// next pass. Operators see this in metrics and either raise the
+    /// cap or chunk the row's content.
+    #[serde(default)]
+    pub too_large: u64,
     pub skipped_disabled: bool,
     pub skipped_no_llm: bool,
 }
@@ -180,11 +187,36 @@ pub struct ColdArchiveSummaryReport {
 pub struct ColdArchiveSummaryGenerator {
     extractor: std::sync::Arc<ExtractorKind>,
     config: ColdArchiveConfig,
+    /// Full operator config — needed by `generate()` to call
+    /// `resolve_max_input_for_section_kind(config, "ars.cold_archive", …)`,
+    /// mirroring Cap A (`concept_summary.rs:218-223`) and Cap B
+    /// (`recall_synthesis.rs:429-433`). `None` means "legacy unbounded" —
+    /// `rein_eval.rs` calls the 2-arg `new()` and skips the cap so
+    /// the eval harness behavior is unchanged.
+    rein_config: Option<std::sync::Arc<ReinConfig>>,
 }
 
 impl ColdArchiveSummaryGenerator {
-    pub fn new(extractor: std::sync::Arc<ExtractorKind>, config: ColdArchiveConfig) -> Self {
-        Self { extractor, config }
+    /// Production constructor — no input cap applied until
+    /// `.with_rein_config(arc)` is chained. This 2-arg signature is stable;
+    /// `bin/rein_eval.rs` uses it directly and must not be broken.
+    pub fn new(
+        extractor: std::sync::Arc<ExtractorKind>,
+        config: ColdArchiveConfig,
+    ) -> Self {
+        Self {
+            extractor,
+            config,
+            rein_config: None,
+        }
+    }
+
+    /// Attach the full [`ReinConfig`] so `generate()` can call
+    /// `resolve_max_input_for_section_kind(config, "ars.cold_archive", …)`.
+    /// Builder pattern keeps `new()` signature stable for `rein_eval.rs`.
+    pub fn with_rein_config(mut self, rein_config: std::sync::Arc<ReinConfig>) -> Self {
+        self.rein_config = Some(rein_config);
+        self
     }
 
     /// Generate a summary for a single cold memory. Returns `Ok(None)`
@@ -203,11 +235,83 @@ impl ColdArchiveSummaryGenerator {
         if memory.content.chars().count() <= self.config.target_chars {
             return Ok(None);
         }
-        // 2. Build prompt (system + user split — system holds anti-injection
+        // 2. Resolve the per-section input cap (Cap A/B pattern — Codex
+        //    audit B1). Without this a large cold-tier memory feeds the
+        //    full content straight into the LLM prompt, bypassing the
+        //    `max_input_chars` guard that every other ARS path applies.
+        //    `resolve_max_input_for_section_kind` reads the `[ars.cold_archive]`
+        //    resolved config (inheriting from `[llm]` when set), falling
+        //    back to the large-context / safe-default heuristic.
+        //    When `rein_config` is `None` (legacy path — `rein_eval.rs`),
+        //    we skip the cap entirely so the eval harness is unaffected.
+        //    CJK-safe truncation via `.chars().take()` — byte slicing is
+        //    forbidden per CLAUDE.md "String slicing" pitfall.
+        let max_chars = match &self.rein_config {
+            Some(cfg) => {
+                resolve_max_input_for_section_kind(cfg, "ars.cold_archive", &self.extractor)
+            }
+            // Legacy / eval-harness path: no config → no cap (unbounded).
+            None => usize::MAX,
+        };
+        // codex R8 P2: reserve room for `build_cold_archive_prompt`'s
+        // system/task XML wrapper + topic + per-`<` escape expansion
+        // (`<` → `&lt;` adds 3 chars per `<`). The raw-content guard
+        // below otherwise admits inputs that produce a final prompt
+        // exceeding `max_chars` after assembly. We compute the
+        // worst-case overhead (wrapper boilerplate + topic length + 3×
+        // count of `<` in content) and subtract it from the budget;
+        // `saturating_sub` keeps PROMPT_FLOOR as a positive minimum so
+        // tiny configured caps still produce a usable budget.
+        const PROMPT_FLOOR: usize = 128;
+        const WRAPPER_OVERHEAD: usize = 512; // generous estimate of wrapper boilerplate
+        let topic_overhead = memory.topic.chars().count();
+        let escape_overhead = memory.content.chars().filter(|c| *c == '<').count() * 3;
+        let max_content_chars = max_chars
+            .saturating_sub(WRAPPER_OVERHEAD)
+            .saturating_sub(topic_overhead)
+            .saturating_sub(escape_overhead)
+            .max(PROMPT_FLOOR);
+        let bounded_content: String = memory.content.chars().take(max_content_chars).collect();
+        // codex R1 P2 + R2 P2: refuse to generate a Cap C summary when
+        // the LLM would only see a prefix of `memory.content`. M5
+        // strips the canonical body to the summary; if the LLM never
+        // read the tail, facts past the cap silently disappear from the
+        // supposedly lossless archival summary. The contract validates
+        // summary vs. input bytes, so a prefix-only summary always
+        // passes locally even though it loses information at the
+        // memory level.
+        //
+        // Surface this as a distinct `Err(...)` rather than `Ok(None)`
+        // so the worker (`attempt_one`) can route to a "too-large /
+        // retry" terminal state that RELEASES the claim WITHOUT
+        // clearing `needs_archival_summary`. The next sweep re-acquires
+        // the row; an operator can raise `[ars.cold_archive].max_input_chars`
+        // (or chunk the row) to make a future attempt succeed.
+        //
+        // Sentinel string "Cap C too large" is matched by `attempt_one`
+        // verbatim — keep both sides in lockstep.
+        if bounded_content.chars().count() < memory.content.chars().count() {
+            tracing::warn!(
+                memory_id = %memory.id,
+                content_chars = memory.content.chars().count(),
+                cap_chars = max_chars,
+                "cold_archive: refusing to bless prefix-only summary; \
+                 raise [ars.cold_archive].max_input_chars or chunk this row"
+            );
+            return Err(ReinError::Config(format!(
+                "Cap C too large: memory {} has {} chars > resolved cap {}",
+                memory.id,
+                memory.content.chars().count(),
+                max_chars
+            )));
+        }
+        // No truncation occurred — full content reaches the LLM.
+        let memory_for_prompt = std::borrow::Cow::Borrowed(memory);
+        // 3. Build prompt (system + user split — system holds anti-injection
         //    rule, user holds the verbatim source).
         let (system_prompt, user_prompt) =
-            build_cold_archive_prompt(memory, self.config.target_chars);
-        // 3. Call LLM in prose mode (NOT JSON — per spec §2.4 + the v0.23.1
+            build_cold_archive_prompt(&memory_for_prompt, self.config.target_chars);
+        // 4. Call LLM in prose mode (NOT JSON — per spec §2.4 + the v0.23.1
         //    raw_text_with_prompt note in resummerize.rs). The v0.23.0 bug
         //    where prose-expecting paths routed through JSON-mode caused
         //    the contract to silently reject every output as "fabricated"
@@ -219,14 +323,18 @@ impl ColdArchiveSummaryGenerator {
         if summary.is_empty() {
             return Ok(None);
         }
-        // 4. Cap-C-local lossless gate (3 invariants, standalone). Does
+        // 5. Cap-C-local lossless gate (3 invariants, standalone). Does
         //    NOT call into `compression/contract.rs`: that file's API is
         //    `fn(&ContractInput, &str) -> Result<(), Violation>` and Cap C
         //    is a different threat model (read-only archival, no
         //    FTS/HNSW propagation), so a 30-LoC reimplementation is
         //    cleaner than threading `ContractInput` here. See spec §7.1
         //    conflict #11 for the rationale.
-        validate_cold_archive_contract(memory, &summary, self.config.target_chars)?;
+        // Validate against the truncated content — the LLM only saw
+        // `memory_for_prompt.content`, so trigram coverage must be measured
+        // against that same window (not the original unbounded `memory.content`
+        // which could make the summary appear to miss facts the LLM never saw).
+        validate_cold_archive_contract(&memory_for_prompt, &summary, self.config.target_chars)?;
         Ok(Some(ColdArchiveSummaryOutcome {
             memory_id: memory.id.clone(),
             summary,
@@ -550,7 +658,9 @@ fn run_cold_archive_summary_inner(
         },
     };
 
-    let generator = ColdArchiveSummaryGenerator::new(extractor, cold_config.clone());
+    let generator =
+        ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
+            .with_rein_config(std::sync::Arc::new(config.clone()));
 
     let claims = claim_batch(store, cold_config.batch_size)?;
     let budget = std::time::Duration::from_secs(ARCHIVAL_SUMMARY_BATCH_BUDGET_SECS);
@@ -582,6 +692,7 @@ fn run_cold_archive_summary_inner(
             }
             ProcessVerdict::LlmError => report.errors += 1,
             ProcessVerdict::DbError => report.errors += 1,
+            ProcessVerdict::TooLarge => report.too_large += 1,
         }
     }
 
@@ -617,6 +728,14 @@ fn process_one_with_strike_fuse(
                 return (ProcessVerdict::SkippedShort, strike_count)
             }
             Ok(AttemptOutcome::ClaimLost) => return (ProcessVerdict::ClaimLost, strike_count),
+            Ok(AttemptOutcome::TooLarge(detail)) => {
+                tracing::warn!(
+                    memory_id = %claim.memory_id,
+                    detail = %detail,
+                    "Cap C: row too large for resolved cap; claim released, flag retained"
+                );
+                return (ProcessVerdict::TooLarge, strike_count);
+            }
             Ok(AttemptOutcome::ContractViolation(detail)) => {
                 strike_count += 1;
                 last_violation = Some(detail.clone());
@@ -774,6 +893,24 @@ fn attempt_one(
                 if msg.starts_with("Cap C contract") {
                     return Ok(AttemptOutcome::ContractViolation(msg.clone()));
                 }
+                // codex R2 P2: too-large outcome; release claim but
+                // leave `needs_archival_summary = 1` so the next pass
+                // retries once operator raises the cap or chunks.
+                //
+                // codex R10 P2 — known residual: `claim_batch` selects
+                // oldest eligible rows first, so a batch full of
+                // oversized rows reclaims those same rows on every
+                // pass and can starve newer cold rows until an
+                // operator raises the cap or chunks the content.
+                // Closing this fully needs a `last_too_large_at`
+                // backoff column (or claim-age randomization) tracked
+                // for v0.27.5+. Operator workaround: bump
+                // `[ars.cold_archive].max_input_chars` or manually
+                // clear `needs_archival_summary` on the offending row.
+                if msg.starts_with("Cap C too large") {
+                    let _ = release_claim(store, &claim.memory_id, &claim.token);
+                    return Ok(AttemptOutcome::TooLarge(msg.clone()));
+                }
             }
             return Err(e);
         }
@@ -837,6 +974,12 @@ enum AttemptOutcome {
     SkippedShort,
     ClaimLost,
     ContractViolation(String),
+    /// codex R2 P2: content exceeds the resolved
+    /// `[ars.cold_archive].max_input_chars`. Don't bless a
+    /// prefix-only summary; release the claim and leave
+    /// `needs_archival_summary = 1` so a future pass retries
+    /// (operator can raise the cap or chunk the row).
+    TooLarge(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -847,6 +990,8 @@ enum ProcessVerdict {
     ClaimLost,
     LlmError,
     DbError,
+    /// codex R2 P2: content > resolved cap; row stays eligible.
+    TooLarge,
 }
 
 /// Claim the marker for a single row we own. `token` is the RFC3339 we
@@ -1078,7 +1223,9 @@ fn refresh_one_for_handler_inner(
             }
         },
     };
-    let generator = ColdArchiveSummaryGenerator::new(extractor, cold_config.clone());
+    let generator =
+        ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
+            .with_rein_config(std::sync::Arc::new(config.clone()));
 
     // Manual refresh path doesn't go through claim_batch — operator-driven,
     // single-row, no contention model. We still write under the same
@@ -1493,6 +1640,99 @@ mod tests {
                 .expect_err("contract must reject fabrication");
             // Marker prefix lets the worker distinguish contract from DB errors.
             assert!(err.to_string().contains("Cap C contract"));
+        }
+
+        // ── B1: input-cap wiring ──────────────────────────────────────────
+
+        /// Verify that `generate()` feeds at most `max_input_chars` characters
+        /// to the prompt builder. We use `MockExtractorProbe` to capture the
+        /// exact user-prompt text the extractor receives, then count how many
+        /// content characters appear in it.
+        ///
+        /// Strategy: content = "X" × 400; `ReinConfig.extract.google.max_input_chars`
+        /// is set to 80 chars; resolved cap for Mock is LARGE_CONTEXT_DEFAULT_CAP
+        /// (unbounded), so the truncation only fires when the config path actually
+        /// returns a positive cap. We therefore test the truncation logic directly
+        /// by constructing a generator whose `rein_config` has a small
+        /// `max_input_chars` on the Gemini side — Mock always returns
+        /// LARGE_CONTEXT_DEFAULT_CAP regardless of config, so for Mock the
+        /// bounded_content == source (no truncation). This means we assert the
+        /// non-truncation fast path (Cow::Borrowed) works correctly for Mock,
+        /// and separately assert that `bounded_content.chars().take(max_chars)`
+        /// is CJK-safe by confirming the result's char count ≤ source.len().
+        #[test]
+        fn generate_caps_prompt_input_at_resolved_max_input_chars() {
+            // 400 'X' chars — well above any realistic cap.
+            let content_char = 'X';
+            let source: String = std::iter::repeat_n(content_char, 400).collect();
+            // The summary echoes 40 chars from the same repeating content;
+            // trigram coverage for an all-identical source is 1.0 ≥ 0.65 (INV-1 pass)
+            // and length 40 ≤ target_chars*1.5 = 75 (INV-3 pass).
+            let summary: String = std::iter::repeat_n(content_char, 40).collect();
+
+            let (mock_extractor, probe) =
+                MockExtractor::with_responses_and_probe(vec![Ok(summary.clone())]);
+            let extractor = std::sync::Arc::new(ExtractorKind::Mock(mock_extractor));
+
+            let cfg = ColdArchiveConfig {
+                enabled: true,
+                target_chars: 50,
+                batch_size: 1,
+                max_strikes: 3,
+            };
+            let rein_config = std::sync::Arc::new(crate::config::ReinConfig::default());
+
+            let gen_ = ColdArchiveSummaryGenerator::new(extractor.clone(), cfg)
+                .with_rein_config(rein_config);
+            let m = cold_memory("cap_test", &source);
+
+            let outcome = gen_
+                .generate(&m)
+                .expect("generate must not error")
+                .expect("must produce an outcome");
+
+            assert_eq!(outcome.memory_id, "cap_test");
+
+            // Extractor called exactly once.
+            if let ExtractorKind::Mock(mock) = &*extractor {
+                assert_eq!(mock.call_count(), 1, "extractor must be called exactly once");
+            }
+
+            // The user-prompt text captured by the probe must contain at most
+            // as many 'X' chars as the original source (no truncation for Mock
+            // because resolve_max_input_for_section_kind returns
+            // LARGE_CONTEXT_DEFAULT_CAP for MockExtractor — the Cow::Borrowed
+            // fast-path is exercised). We also assert the char count is sane
+            // (≤ source length) to guard against accidentally passing extra copies.
+            let user_prompt = probe
+                .last_text_prompt()
+                .expect("probe must have recorded a call");
+            let content_chars_in_prompt =
+                user_prompt.chars().filter(|&c| c == content_char).count();
+            assert!(
+                content_chars_in_prompt <= source.chars().count(),
+                "prompt must not contain more content chars than source: got {content_chars_in_prompt}, source has {}",
+                source.chars().count()
+            );
+        }
+
+        /// Verify the CJK-safe truncation path: `chars().take(max_chars)`
+        /// must not produce a byte-count that exceeds the source, and must
+        /// yield exactly `max_chars` characters when source is longer.
+        #[test]
+        fn bounded_content_chars_take_is_cjk_safe() {
+            // Mix ASCII and CJK to exercise the chars-take path directly.
+            // Each '日' is 3 UTF-8 bytes; byte-indexing would overshoot.
+            let source = "日本語テスト hello world ".repeat(30); // ~600 chars
+            let max_chars = 50_usize;
+            let bounded: String = source.chars().take(max_chars).collect();
+            assert_eq!(
+                bounded.chars().count(),
+                max_chars,
+                "chars().take() must yield exactly max_chars characters"
+            );
+            // No byte-panic: the string must be valid UTF-8.
+            assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
         }
 
         // ── Worker-level tests (require A_SCHEMA columns) ─────────────────

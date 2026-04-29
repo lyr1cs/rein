@@ -587,6 +587,82 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     migrate_concepts_living_summary_id(conn)?;
     migrate_concept_summary_instances(conn)?;
 
+    // v0.27.3 F4 A3 fix — partial UNIQUE index on feedback_events for
+    // OfflineCron event dedup. Closes the concurrent-cron emit race that
+    // the prior LIKE check + reserve_call + emit_event check-then-act
+    // pattern could not (two concurrent cron passes can both pass the
+    // LIKE check, both make the HTTP call, both emit). Constraint
+    // violations are absorbed in the cron emit path as no-ops.
+    migrate_offlinecron_dedup_index(conn)?;
+
+    Ok(())
+}
+
+/// v0.27.3 F4 A3 — partial UNIQUE index on feedback_events for OfflineCron
+/// event dedup. SQLite supports indexes on JSON-extract expressions and
+/// partial indexes via `WHERE`. The index covers
+/// `(event_type, synthesis_id|concept_summary_id, stamp_hash)` and only
+/// applies to the two OfflineCron event types so the rest of
+/// feedback_events is untouched.
+///
+/// Idempotent.
+pub fn migrate_offlinecron_dedup_index(conn: &Connection) -> ReinResult<()> {
+    // v0.27.4 codex R1 P1: backfill duplicate rows BEFORE creating the
+    // UNIQUE index. Existing DBs that hit the v0.27.x concurrent
+    // OfflineCron emit race already have duplicates by
+    // `(event_type, surface_id, stamp_hash)`; CREATE UNIQUE INDEX would
+    // fail and lock the user out of `init_schema`/`open_store`. Coalesce
+    // by keeping the lowest `id` per duplicate group (oldest row wins,
+    // preserving the offset that the consumer already advanced past).
+    conn.execute_batch(
+        "DELETE FROM feedback_events \
+         WHERE event_type IN ( \
+                 'synthesis_llm_judge_offline_cron', \
+                 'concept_summary_llm_judge_offline_cron' \
+             ) \
+           AND json_valid(payload) \
+           AND id NOT IN ( \
+                 SELECT MIN(id) FROM feedback_events \
+                 WHERE event_type IN ( \
+                         'synthesis_llm_judge_offline_cron', \
+                         'concept_summary_llm_judge_offline_cron' \
+                     ) \
+                   AND json_valid(payload) \
+                 GROUP BY \
+                     event_type, \
+                     COALESCE( \
+                         json_extract(payload, '$.synthesis_id'), \
+                         json_extract(payload, '$.concept_summary_id') \
+                     ), \
+                     json_extract(payload, '$.stamp_hash') \
+             );",
+    )?;
+    // codex R10 P2: guard `json_extract` against malformed `payload`
+    // text. SQLite raises `malformed JSON` when `json_extract` runs on
+    // a non-JSON string, which would make `init_schema` (and therefore
+    // `open_store`) fail at startup on any DB that has even a single
+    // OfflineCron event with a corrupted payload. The runtime
+    // consumers already tolerate malformed payloads by skipping them;
+    // the migration/index must be at least as forgiving. We add
+    // `json_valid(payload)` to both the partial index `WHERE` clause
+    // (so the index simply omits malformed rows) and the dedup-DELETE
+    // above (so the GROUP BY never invokes `json_extract` on bad rows).
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_events_offlinecron_dedup \
+         ON feedback_events( \
+             event_type, \
+             COALESCE( \
+                 json_extract(payload, '$.synthesis_id'), \
+                 json_extract(payload, '$.concept_summary_id') \
+             ), \
+             json_extract(payload, '$.stamp_hash') \
+         ) \
+         WHERE event_type IN ( \
+             'synthesis_llm_judge_offline_cron', \
+             'concept_summary_llm_judge_offline_cron' \
+         ) \
+           AND json_valid(payload);",
+    )?;
     Ok(())
 }
 

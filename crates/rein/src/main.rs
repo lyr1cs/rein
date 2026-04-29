@@ -343,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("dropped (errors):             {}", report.dropped);
                 println!(
-                    "dropped (cap reservation):    {} [Wave-1.5: R9-K1 reserve_call wiring pending]",
+                    "dropped (cap reservation):    {}",
                     report.dropped_cap
                 );
             } else {

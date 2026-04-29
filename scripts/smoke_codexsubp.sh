@@ -24,7 +24,15 @@ if [[ "${REIN_SMOKE_ALLOW_DANGEROUS_SANDBOX:-0}" == "1" ]]; then
   SANDBOX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
 fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PROVIDER_OVERRIDE=$(sed "s#__PROXY_URL__#${PROXY_URL//\\/\\\\}#g" "$SCRIPT_DIR/codexsubp_provider.toml.tmpl")
+SOH=$'\x01'
+# v0.27.4 codex R5 P1 + R7 P3: the template uses Codex CLI's
+# `env_http_headers` form, which reads `REIN_PROXY_TOKEN` at invocation
+# time. We don't substitute the token literally here. Operators running
+# against an authenticated proxy must set REIN_PROXY_TOKEN; operators
+# running with `[proxy].allow_unauthenticated_loopback = true` don't
+# need to set anything, and `env_http_headers` simply omits the header
+# when the env var is unset.
+PROVIDER_OVERRIDE=$(sed "s${SOH}__PROXY_URL__${SOH}${PROXY_URL//\\/\\\\}${SOH}g" "$SCRIPT_DIR/codexsubp_provider.toml.tmpl")
 PROVIDER_OVERRIDE=$(printf '%s' "$PROVIDER_OVERRIDE" \
   | sed \
       -e "s#__PROVIDER_KEY__#rein_sub_proxy#g" \

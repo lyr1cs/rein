@@ -680,17 +680,16 @@ pub fn decide_concept_summary_quality(
     let Some(cs_state) = state.concept_summary_feedback_stats.as_ref() else {
         return ConceptSummaryDecision::Yes;
     };
-    // v0.27.2 R2 P2 revert — the R1 fallback to global `(None, "unknown")`
-    // bucket conflated Cap A auto-judge signal with metadata-less
-    // human interactions that also fold into the same bucket. A low
-    // `useful_rate` from unrelated human events could mistakenly skip
-    // summaries for new clustered concepts. Restore v0.27.1 behavior:
-    // miss on the per-cluster bucket → cold-start `Yes`. The deeper
-    // R7-#1 architectural mismatch (concepts have no natural cluster
-    // at refresh time, so Cap A auto-judge can never warm a clustered
-    // bucket without recall-surface routing) is documented in spec
-    // §15 as v0.28+ work — needs either per-concept routing or a
-    // dedicated judge-only bucket subspace.
+    // v0.27.4 D1/D2 — closes the R7-#1 architectural mismatch (spec §15)
+    // via per-concept synthetic routing. Callers that have access to
+    // `concept_id` MUST pre-derive `cid = synthetic_cluster_id_for_concept(id)`
+    // and pass `query_type = "concept_refresh"` so the gate reader lands
+    // in the SAME bucket the writer (`enqueue_judge_for_concept_summary`)
+    // populates. Real-cluster + recall query_type lookups go through the
+    // cold-start `Yes` branch by design — Cap A judge events never land
+    // there. v0.28+ may revisit by threading recall context through the
+    // refresh trigger, at which point cluster-aware pooling becomes
+    // possible without losing this writer/reader alignment guarantee.
     let key = concept_summary_bucket_key(Some(cid), query_type);
     let Some(cluster) = cs_state.by_cluster.get(&key) else {
         return ConceptSummaryDecision::Yes;
@@ -770,12 +769,53 @@ fn bernoulli_fire_concept_summary(rate: f64, salt: &str) -> bool {
     frac < rate
 }
 
+/// v0.27.4 D1/D2 fix — drop cluster_id reliance for Cap A. Cap A judge
+/// events have no recall-time context; pooling them by recall-derived
+/// cluster was the R7-#1 architectural mismatch (spec §15). We now route
+/// by a per-concept synthetic hash so the gate at
+/// `decide_concept_summary_quality` reads the same bucket the worker
+/// writes. Cluster-aware pooling remains possible in a v0.28+ refactor
+/// that threads recall context through the summary refresh trigger.
+///
+/// Pair this with `CONCEPT_SUMMARY_QUERY_TYPE_REFRESH` and add
+/// `"concept_refresh"` to `CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES` so the
+/// consumer side preserves the writer's literal instead of clamping to
+/// `"unknown"`.
+pub(crate) fn synthetic_cluster_id_for_concept(concept_id: &str) -> i64 {
+    // codex R2 P2: stable across rustc versions. The synthetic id is
+    // persisted in cache/queue/feedback_events and adaptive snapshots,
+    // so the hash MUST be stable across builds — `DefaultHasher` is
+    // explicitly documented as not stable across releases, which would
+    // shift bucket keys under operators on stdlib upgrade and effectively
+    // cold-start learned Cap A signal.
+    //
+    // Using SHA-256 (already in deps via `sha2`); first 8 bytes mapped
+    // to i64 little-endian. Sign bit retained — cluster_ids are i64 in
+    // the schema. Collision probability is ~2^-32 within a 4B-concept
+    // corpus, which is far above any realistic concept count.
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(concept_id.as_bytes());
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    i64::from_le_bytes(buf)
+}
+
+/// v0.27.4 sentinel: Cap A judge has no recall query, so we route bucket
+/// keys via a literal `query_type` that the consumer allowlist accepts
+/// (see `CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES`). Mirrored verbatim by both
+/// the writer (`enqueue_judge_for_concept_summary`) and the reader-side
+/// gate when the caller supplies a `concept_id` — a literal mismatch here
+/// reproduces the v0.26.0 D-direction silent dead-code bug.
+pub(crate) const CONCEPT_SUMMARY_QUERY_TYPE_REFRESH: &str = "concept_refresh";
+
 /// Enqueue the runtime LLM judge artifacts for a freshly-minted
 /// concept-summary refresh. Mirrors
-/// `recall_synthesis::enqueue_judge_for_synthesis`. Cluster routing for
-/// the sample-rate ladder uses `cluster_id = None` because Concept rows
-/// don't carry a cluster id — the bucket lookup folds into the
-/// `(None, "")` global bucket via `concept_summary_bucket_key`.
+/// `recall_synthesis::enqueue_judge_for_synthesis`.
+///
+/// v0.27.4 D1/D2 fix — Cap A judge events route via
+/// `(synthetic_cluster_id_for_concept(concept_id), "concept_refresh")`
+/// so the writer + reader land in the same bucket without recall-time
+/// cluster context. See `synthetic_cluster_id_for_concept` for rationale.
 fn enqueue_judge_for_concept_summary(
     config: &ReinConfig,
     adaptive_state: &AdaptiveState,
@@ -793,6 +833,27 @@ fn enqueue_judge_for_concept_summary(
     // revisions, not a recall query. Use the empty string so the J7 stamp
     // hash stays deterministic across runtime + cron passes.
     let query = "";
+
+    // v0.27.4 D1/D2 — derive the synthetic per-concept routing key once
+    // and reuse it across cache + queue + cron-archive writers AND the
+    // sample-rate bucket lookup. All four sites must agree, otherwise the
+    // bucket-alignment fix degrades back into the v0.27.x dead-code path.
+    //
+    // codex R10 P2 — known residual: vaults with more than
+    // `CONCEPT_SUMMARY_BY_CLUSTER_CAP` (= 4096) distinct concepts that
+    // collect feedback or judge events will hit the consumer's bucket
+    // cap, after which new concept-summary buckets are dropped and
+    // those concepts can never warm the adaptive gate. The proper fix
+    // is either an LRU eviction strategy or a per-concept storage path
+    // that doesn't share the cluster-bucket budget — tracked for
+    // v0.28+ alongside the broader R7-#1 architectural alignment.
+    // Practical impact: a vault would need 4k+ concepts each receiving
+    // GUI feedback before this matters; for typical use the synthetic-
+    // per-concept routing is a strict improvement over the previous
+    // dead-code bucket key.
+    let synthetic_cid = synthetic_cluster_id_for_concept(concept_id);
+    let routing_query_type = CONCEPT_SUMMARY_QUERY_TYPE_REFRESH;
+
     // Codex R7+R8 P2 fix — same combined-cap truncation as
     // recall_synthesis (see that function for the algorithm + rationale).
     use crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS;
@@ -819,8 +880,8 @@ fn enqueue_judge_for_concept_summary(
         "prompt": prompt,
         "candidate": candidate,
         "stamp_hash": stamp_hash,
-        "query_type": serde_json::Value::Null,
-        "cluster_id": serde_json::Value::Null,
+        "query_type": routing_query_type,
+        "cluster_id": synthetic_cid,
         "source_count": 0u32,
         "stamped_at": chrono::Utc::now().to_rfc3339(),
     });
@@ -837,18 +898,17 @@ fn enqueue_judge_for_concept_summary(
     }
 
     // (2) Sample-rate Bernoulli → judge worker queue.
-    // Codex R6 P2 fix — bucket key alignment. The consumer normalizes
-    // empty/null query_type to "unknown" before storing (per
-    // store::adaptive F-11 query_type clamp); the sampler must use
-    // the same normalized key, otherwise it looks up empty-string
-    // bucket while counts accumulate under "unknown" and the warm
-    // ladder never fires for Cap A auto-sampled paths.
+    // v0.27.4 D1/D2 — read the per-bucket aggregate off the SAME
+    // `(synthetic_cid, "concept_refresh")` key the worker will write to,
+    // so the warm-ladder graduation actually fires once judge events
+    // accumulate. Pre-v0.27.4 this looked up `(None, "unknown")`, which
+    // was where ZERO Cap A judge events ever landed.
     let bucket = adaptive_state
         .concept_summary_feedback_stats
         .as_ref()
         .and_then(|sfs| {
             sfs.by_cluster
-                .get(&concept_summary_bucket_key(None, "unknown"))
+                .get(&concept_summary_bucket_key(Some(synthetic_cid), routing_query_type))
         });
     let rate = current_sample_rate_concept_summary(bucket, &config.ars.llm_judge);
     if bernoulli_fire_concept_summary(rate, summary_id) {
@@ -861,8 +921,8 @@ fn enqueue_judge_for_concept_summary(
             "candidate": candidate,
             "stamp_hash": stamp_hash,
             "source": "AutoSampled",
-            "query_type": serde_json::Value::Null,
-            "cluster_id": serde_json::Value::Null,
+            "query_type": routing_query_type,
+            "cluster_id": synthetic_cid,
             "source_count": 0u32,
         });
         let queue_path = judge_queue_path_for_config(config);
@@ -899,8 +959,8 @@ fn enqueue_judge_for_concept_summary(
             "sources": [prompt],
             "candidate": candidate,
             "metadata": {
-                "query_type": serde_json::Value::Null,
-                "cluster_id": serde_json::Value::Null,
+                "query_type": routing_query_type,
+                "cluster_id": synthetic_cid,
                 "source_count": 0u32,
                 "judge_latency_ms": serde_json::Value::Null,
             },
@@ -1103,10 +1163,13 @@ mod tests {
             Utc::now(),
         )
         .unwrap();
-        // Bump to revision 5 (two refines).
+        // Bump to revision 5 (four refines). Pass the SAME definition
+        // each time so E1's invalidation guard (memoir.rs `refine_concept`
+        // CASE-on-`definition = ?1`) keeps the seeded living_summary
+        // intact — the test exercises CAS, not the invalidation path.
         for _ in 0..4 {
             store
-                .refine_concept("test-memoir", "race-concept-steady", "refined")
+                .refine_concept("test-memoir", "race-concept-steady", "initial definition")
                 .unwrap();
         }
 
@@ -1369,6 +1432,91 @@ mod tests {
             decision_canary,
             ConceptSummaryDecision::Skip(ConceptSummarySkipReason::AdaptiveDecision),
             "cold_start_n=2 met and rate below threshold → Skip"
+        );
+    }
+
+    // ── v0.27.4 D1/D2 — synthetic per-concept routing ────────────────────────
+
+    /// The synthetic cluster id derived from a concept_id must be stable
+    /// across calls — both writers (cache + queue + cron-archive) and the
+    /// reader-side gate must land in the same bucket. A non-deterministic
+    /// hash here would silently degrade back to the v0.27.x dead-code path
+    /// (writer-side bucket never agrees with reader-side gate lookup).
+    #[test]
+    fn synthetic_cluster_id_is_stable_for_same_concept_id() {
+        let id = "concept-bounded-42";
+        let a = synthetic_cluster_id_for_concept(id);
+        let b = synthetic_cluster_id_for_concept(id);
+        assert_eq!(a, b, "synthetic cluster id must be deterministic");
+        // Cross-check that distinct concept ids generally diverge — DefaultHasher
+        // is not collision-free, but two short distinct ids should never collide
+        // in a single test run. If this ever flakes, swap to a fixed-seed SipHash.
+        let other = synthetic_cluster_id_for_concept("concept-other-99");
+        assert_ne!(
+            a, other,
+            "different concept_ids should map to different synthetic cluster ids \
+             (DefaultHasher collision is theoretically possible — adjust if flaky)"
+        );
+    }
+
+    /// End-to-end: `enqueue_judge_for_concept_summary` writes a cache line
+    /// whose `cluster_id` is non-null AND equals `synthetic_cluster_id_for_concept`
+    /// of the concept. Pre-v0.27.4 both fields were `null` so the reader-side
+    /// gate could never align with the writer; this test pins the alignment.
+    #[test]
+    fn enqueue_judge_uses_synthetic_cluster_id() {
+        use crate::config::ReinConfig;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ReinConfig::default();
+        // Point the buffer dir at a fresh tempdir so the cache + queue files
+        // land somewhere we can inspect after.
+        config.hooks.buffer_dir = dir.path().to_string_lossy().to_string();
+        // db.path is hashed to derive the per-shard tag; any non-"auto" value
+        // keeps the test hermetic.
+        config.database.path = dir.path().join("test.db").to_string_lossy().to_string();
+        // Disable the Bernoulli queue write to keep the test deterministic —
+        // we only need the cache write (always-on) for the assertion.
+        config.ars.llm_judge.sample_rate_cold_start = 0.0;
+        config.ars.llm_judge.sample_rate_warm = 0.0;
+        config.ars.llm_judge.nightly_cron.enabled = false;
+
+        let adaptive_state = AdaptiveState::default();
+
+        let summary_id = "cs_test_synthetic_routing";
+        let concept_id = "concept-bounded-42";
+        let prompt = "concept revision history (test)";
+        let candidate = "summary candidate (test)";
+
+        enqueue_judge_for_concept_summary(
+            &config,
+            &adaptive_state,
+            summary_id,
+            concept_id,
+            prompt,
+            candidate,
+        );
+
+        // Read the cache jsonl line back and assert the routing fields.
+        let cache_path =
+            crate::ops::handlers::judge::concept_summary_cache_path_for_config(&config);
+        let body = std::fs::read_to_string(&cache_path)
+            .expect("cache file written by enqueue_judge_for_concept_summary");
+        let line = body.lines().next().expect("at least one cache line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("cache line is valid JSON");
+
+        let expected_cid = synthetic_cluster_id_for_concept(concept_id);
+        assert_eq!(
+            parsed.get("cluster_id").and_then(|v| v.as_i64()),
+            Some(expected_cid),
+            "cache cluster_id must equal synthetic_cluster_id_for_concept(concept_id); \
+             got {parsed}",
+        );
+        assert_eq!(
+            parsed.get("query_type").and_then(|v| v.as_str()),
+            Some(CONCEPT_SUMMARY_QUERY_TYPE_REFRESH),
+            "cache query_type must equal CONCEPT_SUMMARY_QUERY_TYPE_REFRESH sentinel; \
+             got {parsed}",
         );
     }
 }

@@ -491,12 +491,25 @@ impl SqliteStore {
             }
 
             let now = Utc::now();
+            // E1: invalidate Cap A `living_summary*` only when the
+            // definition actually changes. Mirror `update():1055`'s
+            // `content_changed` guard — a no-op refine (same definition,
+            // revision-only bump from CAS callers) preserves the
+            // existing summary; a real definition change clears all four
+            // columns so stale summary text never leaks to readers.
+            // The SQL CASE references the OLD `definition` (column value
+            // BEFORE the SET applies); SQLite evaluates the entire SET
+            // expression list against the pre-update row.
             let rows = conn.execute(
                 "UPDATE concepts
                  SET definition = ?1,
                      revision = revision + 1,
                      confidence = MIN(confidence + 0.1, 1.0),
-                     updated_at = ?2
+                     updated_at = ?2,
+                     living_summary = CASE WHEN definition = ?1 THEN living_summary ELSE NULL END,
+                     living_summary_id = CASE WHEN definition = ?1 THEN living_summary_id ELSE NULL END,
+                     living_summary_updated_at = CASE WHEN definition = ?1 THEN living_summary_updated_at ELSE NULL END,
+                     living_summary_source_revision = CASE WHEN definition = ?1 THEN living_summary_source_revision ELSE NULL END
                  WHERE memoir_id = ?3 AND name = ?4",
                 rusqlite::params![new_definition, now.to_rfc3339(), memoir.id, concept_name],
             )?;
@@ -2256,5 +2269,74 @@ mod tests {
         });
         assert_eq!(adaptive.concept_refresh_revision_threshold(), 42);
         assert_eq!(adaptive.concept_refresh_age_threshold_secs(), 12345);
+    }
+
+    // ── E1: refine_concept must clear stale living_summary fields ────────────
+
+    #[test]
+    fn test_refine_concept_clears_living_summary() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memoir_id = store
+            .create_memoir(make_memoir("test", "Test memoir"))
+            .unwrap();
+
+        // Add a concept and immediately seed living_summary via raw SQL.
+        store
+            .add_concept(make_concept(
+                &memoir_id,
+                "caching",
+                "Initial definition of caching",
+            ))
+            .unwrap();
+
+        // Seed all four living_summary columns directly, simulating a Cap A
+        // worker that already wrote a summary for this concept.
+        store
+            .conn()
+            .execute(
+                "UPDATE concepts
+                 SET living_summary = 'old summary',
+                     living_summary_id = 'ls-001',
+                     living_summary_updated_at = '2026-01-01T00:00:00Z',
+                     living_summary_source_revision = 1
+                 WHERE memoir_id = ?1 AND name = 'caching'",
+                rusqlite::params![memoir_id],
+            )
+            .unwrap();
+
+        // Sanity-check that the seed took effect before the refine.
+        let before = store.get_concept("test", "caching").unwrap().unwrap();
+        assert!(
+            before.living_summary.is_some(),
+            "living_summary should be seeded before refine"
+        );
+
+        // Now refine the concept (definition change → should wipe the stale summary).
+        store
+            .refine_concept("test", "caching", "Updated definition: caching with TTL")
+            .unwrap();
+
+        // All four columns must now be NULL.
+        let after = store.get_concept("test", "caching").unwrap().unwrap();
+        assert!(
+            after.living_summary.is_none(),
+            "living_summary must be NULL after refine_concept"
+        );
+        assert!(
+            after.living_summary_id.is_none(),
+            "living_summary_id must be NULL after refine_concept"
+        );
+        assert!(
+            after.living_summary_updated_at.is_none(),
+            "living_summary_updated_at must be NULL after refine_concept"
+        );
+        assert!(
+            after.living_summary_source_revision.is_none(),
+            "living_summary_source_revision must be NULL after refine_concept"
+        );
+
+        // Revision should have incremented and definition updated.
+        assert_eq!(after.revision, 2);
+        assert!(after.definition.contains("TTL"));
     }
 }

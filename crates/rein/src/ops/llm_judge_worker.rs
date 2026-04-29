@@ -253,6 +253,38 @@ pub fn dispatch_one(
         )));
     }
 
+    // codex R3 P2 + R4 P2 tighten: defensive size check BEFORE the
+    // daily-cap reservation. Pre-existing oversized queue lines (e.g.
+    // on-disk jobs from a pre-enqueue-cap version, manually injected
+    // entries, or future bugs that bypass enqueue-time truncation) MUST
+    // be rejected without consuming `daily_call_cap`. Otherwise a
+    // handful of stale oversized lines could burn the cap with
+    // `reserve_call` → `token.fail()` → billable `failed` ledger rows,
+    // blocking legitimate judge work for the rolling 24h window even
+    // though no HTTP call was made.
+    //
+    // Ceiling = `JUDGE_MAX_INPUT_CHARS` exactly (NOT 4×): the enqueue
+    // path always truncates at this const, so any payload above it is
+    // by construction stale/manual. Earlier 4× headroom let
+    // 16K-65K-byte stale lines burn `daily_call_cap` AND reach
+    // `call_judge_sync` (which no longer truncates → R1 J7 fix), so
+    // the LLM saw the untruncated bytes.
+    const JUDGE_DISPATCH_CEILING: usize = JUDGE_MAX_INPUT_CHARS;
+    let combined_len = job.prompt.chars().count() + job.candidate.chars().count();
+    if combined_len > JUDGE_DISPATCH_CEILING {
+        tracing::warn!(
+            surface = ?job.kind,
+            surface_id = %job.surface_id,
+            combined_chars = combined_len,
+            ceiling = JUDGE_DISPATCH_CEILING,
+            "judge worker: payload exceeds dispatch ceiling; dropped pre-reservation"
+        );
+        return Ok(DispatchResult::Dropped(DropReason::ContractViolation(format!(
+            "judge job payload too large at dispatch ({} chars > ceiling {})",
+            combined_len, JUDGE_DISPATCH_CEILING
+        ))));
+    }
+
     // J2 atomic reservation — runs `BEGIN IMMEDIATE` so concurrent
     // workers can't burst N×cap.
     let token = match contract::reserve_call(store.conn(), daily_cap)? {
@@ -272,7 +304,7 @@ pub fn dispatch_one(
     let active_extractor: &ExtractorKind = override_extractor.as_ref().unwrap_or(extractor);
 
     // LLM call (J4 — failures never propagate).
-    let raw = match call_judge_sync(active_extractor, &job.prompt, &job.candidate) {
+    let raw = match call_judge_sync(config, active_extractor, &job.prompt, &job.candidate) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "judge worker: LLM call failed, ledger row → failed");
@@ -407,7 +439,16 @@ fn verify_durable_judge_target(
             ) {
                 return Ok(false);
             }
-            concept_summary_target_exists(store, &job.surface_id, job.concept_id.as_deref())
+            // F4 A2 fix — concept_summary jobs MUST carry a concept_id
+            // (paired with A1: the cache reader rejects null concept_id).
+            // A malformed job missing concept_id fails J5 here rather
+            // than the downstream SQL accepting any concept via the old
+            // `?2 IS NULL OR concept_id = ?2` half.
+            let concept_id = match job.concept_id.as_deref() {
+                Some(id) if !id.is_empty() => id,
+                _ => return Ok(false),
+            };
+            concept_summary_target_exists(store, &job.surface_id, concept_id)
         }
     }
 }
@@ -419,52 +460,31 @@ fn cache_has_id_and_stamp(
     stamp_hash: &str,
     ttl_secs: Option<u64>,
 ) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let now = chrono::Utc::now();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        if value.get(id_field).and_then(|v| v.as_str()) != Some(id_value) {
-            continue;
-        }
-        if value.get("stamp_hash").and_then(|v| v.as_str()) != Some(stamp_hash) {
-            continue;
-        }
-        if let Some(ttl) = ttl_secs {
-            let Some(stamped_at) = value.get("stamped_at").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(stamped_at) else {
-                continue;
-            };
-            let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
-            if age.num_seconds() > ttl as i64 {
-                continue;
-            }
-        }
-        return true;
-    }
-    false
+    // F4 A4 — delegate the cache scan + TTL filter to the shared
+    // helper so the worker and manual MCP path agree on stale-row
+    // semantics. Then layer the stamp_hash predicate on top.
+    crate::ops::handlers::judge::read_cache_entries_within_ttl(
+        path, id_field, id_value, ttl_secs,
+    )
+    .iter()
+    .any(|value| value.get("stamp_hash").and_then(|v| v.as_str()) == Some(stamp_hash))
 }
 
 fn concept_summary_target_exists(
     store: &SqliteStore,
     summary_id: &str,
-    concept_id: Option<&str>,
+    concept_id: &str,
 ) -> ReinResult<bool> {
+    // F4 A2 fix — caller (verify_durable_judge_target) guarantees
+    // concept_id is non-empty (paired with A1's reader-side null
+    // rejection). Drop the `?2 IS NULL OR ...` half so a forged job
+    // with omitted concept_id can't match an arbitrary concept row.
     let retained: Option<i64> = store
         .conn()
         .query_row(
             "SELECT 1 FROM concept_summary_instances \
              WHERE summary_id = ?1 \
-               AND (?2 IS NULL OR concept_id = ?2) \
+               AND concept_id = ?2 \
              LIMIT 1",
             rusqlite::params![summary_id, concept_id],
             |row| row.get(0),
@@ -478,7 +498,7 @@ fn concept_summary_target_exists(
         .query_row(
             "SELECT 1 FROM concepts \
              WHERE living_summary_id = ?1 \
-               AND (?2 IS NULL OR id = ?2) \
+               AND id = ?2 \
              LIMIT 1",
             rusqlite::params![summary_id, concept_id],
             |row| row.get(0),
@@ -602,18 +622,29 @@ fn judge_model_id(extractor: &ExtractorKind) -> String {
 /// invariants ("don't use `reqwest::blocking` inside tokio") stay
 /// consistent across ARS modules.
 pub fn call_judge_sync(
+    config: &crate::config::ReinConfig,
     extractor: &ExtractorKind,
     prompt: &str,
     candidate: &str,
 ) -> ReinResult<String> {
-    // Codex R6 P2 fix — truncate the combined prompt+candidate to
-    // JUDGE_MAX_INPUT_CHARS BEFORE the LLM call. v0 sent
-    // `prompt.len() + candidate.len()` unbounded; large-context Cap B
-    // can produce 100KB+ prompts, but `[ars.llm_judge]` may point at
-    // a smaller / local model that overflows context or bills surprise
-    // tokens. CJK-safe via `.chars()` truncation per pitfall doc.
-    let combined = format!("{prompt}\n\nCandidate:\n{candidate}");
-    let user: String = combined.chars().take(JUDGE_MAX_INPUT_CHARS).collect();
+    // codex R1 P2 (J7 fix): the queued payload was already truncated at
+    // enqueue time using `JUDGE_MAX_INPUT_CHARS`, and `compute_stamp_hash`
+    // ran over those exact bytes. Re-truncating here with a smaller
+    // operator-resolved cap (e.g. `[ars.llm_judge].max_input_chars =
+    // 4_000`) would change the bytes the LLM actually sees while leaving
+    // the stamped hash unchanged, breaking the J7 invariant ("stamp_hash
+    // identifies the exact bytes judged"). The fix: do NOT re-truncate
+    // at dispatch. Honoring a smaller operator cap correctly requires
+    // resolving at enqueue time so the hash matches; that needs the
+    // extractor available at the enqueue call site (deferred to v0.27.5).
+    // Until then, the effective cap is the enqueue-time const.
+    // CJK-safe via `.chars()` truncation upstream per pitfall doc.
+    // codex R3 P2: dispatch ceiling check moved to `dispatch_one` so
+    // oversized stale queue lines don't burn `daily_call_cap` via
+    // `reserve_call` + `token.fail()`. By the time we reach this fn the
+    // payload has been validated.
+    let _ = (config, extractor); // reserved for future extractor-aware path
+    let user = format!("{prompt}\n\nCandidate:\n{candidate}");
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
@@ -727,9 +758,27 @@ pub fn reap_expired_caches(store: &SqliteStore, config: &crate::config::ReinConf
     if !config.ars.llm_judge.enabled {
         return;
     }
+    // codex R7 P3: ledger prune runs FIRST and INDEPENDENT of
+    // `cache_ttl_secs`. `reap_old_judge_call_ledger` retention is its
+    // own const (7 days) — disabling the cache TTL (`cache_ttl_secs =
+    // 0`) MUST NOT also disable ledger pruning, otherwise terminal
+    // ledger rows accumulate forever even though the operator only
+    // disabled cache expiry. F4 A5 — prune terminal-state rows
+    // (`done`/`failed`/`stale`) older than 7 days. `reserved` rows are
+    // NEVER pruned by this path (their staleness is handled by
+    // `reserve_call`'s 5-minute reaper). Best-effort: any DB error
+    // is logged + ignored.
+    if let Err(e) = reap_old_judge_call_ledger(store, JUDGE_CALL_LEDGER_RETENTION_SECS) {
+        tracing::warn!(
+            error = %e,
+            "judge cache reaper: failed to prune judge_call_ledger (non-fatal)"
+        );
+    }
+
     let ttl_secs = config.ars.llm_judge.cache_ttl_secs;
     if ttl_secs == 0 {
-        return; // 0 means "never expire" — skip reaper.
+        return; // 0 means "never expire" — skip reaper for caches only;
+                // ledger prune above already ran independent of TTL.
     }
     let synth_path = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
     let concept_path = crate::ops::handlers::judge::concept_summary_cache_path_for_config(config);
@@ -748,6 +797,27 @@ pub fn reap_expired_caches(store: &SqliteStore, config: &crate::config::ReinConf
             "judge cache reaper: failed to prune concept_summary_instances (non-fatal)"
         );
     }
+}
+
+/// F4 A5 — terminal `judge_call_ledger` rows are retained for this many
+/// seconds (7 days) before being pruned. `reserved` rows are never
+/// pruned by this path; they age out via the `reserve_call` stale-claim
+/// reaper at `LLM_JUDGE_STALE_CLAIM_SECS`.
+const JUDGE_CALL_LEDGER_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+/// F4 A5 helper — delete `judge_call_ledger` rows older than
+/// `retention_secs` whose status is terminal (`done`/`failed`/`stale`).
+/// Returns the number of rows deleted.
+fn reap_old_judge_call_ledger(store: &SqliteStore, retention_secs: i64) -> ReinResult<u64> {
+    let now_ts = chrono::Utc::now().timestamp();
+    let cutoff = now_ts.saturating_sub(retention_secs);
+    let deleted = store.conn().execute(
+        "DELETE FROM judge_call_ledger \
+         WHERE ts < ?1 \
+           AND status IN ('done', 'failed', 'stale')",
+        rusqlite::params![cutoff],
+    )?;
+    Ok(deleted as u64)
 }
 
 fn reap_concept_summary_instances(store: &SqliteStore, ttl_secs: u64) -> ReinResult<u64> {
