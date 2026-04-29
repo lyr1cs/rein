@@ -388,34 +388,44 @@ fn request_has_valid_http_auth(headers: &hyper::HeaderMap, expected: &str) -> bo
 
 impl ServerHandler for ReinServer {
     fn get_info(&self) -> ServerInfo {
+        // AGPL §13: callers see source location + license straight from the
+        // server's self-description, so a network MCP user always has a
+        // path to the modified Corresponding Source. `format!` rather than
+        // a raw `&str` so `crate::SOURCE_URL` / `crate::LICENSE_SPDX`
+        // stay the single source of truth.
+        let instructions = format!(
+            "rein: Multi-source cross-validated memory MCP server. \
+             Persistent memory across sessions, shared across all rein clients via ~/.rein/memories.db.\n\
+             \n\
+             TRIGGER (English / 中文): memory / 记忆, recall / 召回 / 回忆, remember / 记住, \
+             save / 存储 / 保存, search past / 搜索历史, knowledge graph / 知识图谱 / 概念, \
+             memoir / 知识库, timeline / 时间线 / 历史, episode / session / 会话, \
+             past sessions / 之前的工作 / 上次说过. When the user (any language) asks to save, \
+             store, recall, or search information across sessions, USE THESE TOOLS — do NOT \
+             say you don't know what rein is.\n\
+             \n\
+             Core: rein_store (new facts/decisions/preferences), rein_recall (retrieval, \
+             supports from/to temporal range and synthesize=true for narrative). \
+             Knowledge graph: rein_memoir_* (10 tools — create/list/show/add_concept/refine/\
+             search/search_all/link/inspect/export). Temporal: rein_timeline, \
+             rein_concept_history. Adaptive/feedback: rein_adaptive_status, rein_feedback, \
+             rein_feedback_concept_summary, rein_concept_state, rein_archive_summary_refresh, \
+             rein_judge_synthesis, rein_judge_concept_summary. \
+             Maintenance: rein_consolidate, rein_dedup, rein_cleanup, rein_gc, rein_organize. \
+             Listing: rein_list_topics, rein_recent, rein_stats, rein_health. \
+             Total: 38 tools as of v0.27.5.\n\
+             \n\
+             Defaults: call rein_recall at the start of a session when the user references \
+             past work; call rein_store after solving bugs, making architecture decisions, \
+             or learning user preferences. After acting on a recalled memory, call \
+             rein_feedback to drive adaptive learning.\n\
+             \n\
+             License: {license} — source: {source}",
+            license = crate::LICENSE_SPDX,
+            source = crate::SOURCE_URL,
+        );
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "rein: Multi-source cross-validated memory MCP server. \
-                 Persistent memory across sessions, shared across all rein clients via ~/.rein/memories.db.\n\
-                 \n\
-                 TRIGGER (English / 中文): memory / 记忆, recall / 召回 / 回忆, remember / 记住, \
-                 save / 存储 / 保存, search past / 搜索历史, knowledge graph / 知识图谱 / 概念, \
-                 memoir / 知识库, timeline / 时间线 / 历史, episode / session / 会话, \
-                 past sessions / 之前的工作 / 上次说过. When the user (any language) asks to save, \
-                 store, recall, or search information across sessions, USE THESE TOOLS — do NOT \
-                 say you don't know what rein is.\n\
-                 \n\
-                 Core: rein_store (new facts/decisions/preferences), rein_recall (retrieval, \
-                 supports from/to temporal range and synthesize=true for narrative). \
-                 Knowledge graph: rein_memoir_* (10 tools — create/list/show/add_concept/refine/\
-                 search/search_all/link/inspect/export). Temporal: rein_timeline, \
-                 rein_concept_history. Adaptive/feedback: rein_adaptive_status, rein_feedback, \
-                 rein_feedback_concept_summary, rein_concept_state, rein_archive_summary_refresh, \
-                 rein_judge_synthesis, rein_judge_concept_summary. \
-                 Maintenance: rein_consolidate, rein_dedup, rein_cleanup, rein_gc, rein_organize. \
-                 Listing: rein_list_topics, rein_recent, rein_stats, rein_health. \
-                 Total: 38 tools as of v0.27.3.\n\
-                 \n\
-                 Defaults: call rein_recall at the start of a session when the user references \
-                 past work; call rein_store after solving bugs, making architecture decisions, \
-                 or learning user preferences. After acting on a recalled memory, call \
-                 rein_feedback to drive adaptive learning.",
-            )
+            .with_instructions(instructions)
     }
 
     async fn list_tools(

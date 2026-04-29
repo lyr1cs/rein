@@ -133,6 +133,33 @@ export default function Layout() {
         <main className="flex-1 overflow-auto">
           <Outlet />
         </main>
+
+        {/* AGPL §13 source-code link footer.
+            Operators running modified forks SHOULD change the Source href to
+            their public repo so users can fetch the modified Corresponding
+            Source. */}
+        <footer className="h-7 flex items-center justify-end gap-3 px-4 border-t border-[var(--border)] bg-[var(--bg-primary)]/80 text-[10px] text-[var(--text-muted)] font-mono">
+          <span>rein</span>
+          <span aria-hidden="true">·</span>
+          <a
+            href="https://www.gnu.org/licenses/agpl-3.0.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-[var(--text)] transition-colors"
+          >
+            AGPL-3.0
+          </a>
+          <span aria-hidden="true">·</span>
+          <a
+            href="https://github.com/lyr1cs/rein"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-[var(--text)] transition-colors"
+            title="View source on GitHub (AGPL §13 Corresponding Source)"
+          >
+            Source
+          </a>
+        </footer>
       </div>
     </div>
   );
