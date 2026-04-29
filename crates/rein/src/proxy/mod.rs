@@ -226,6 +226,100 @@ fn proxy_token_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
+/// v0.27.3 F5/C2: minimal Host-header allowlist for the proxy. Mirrors the
+/// MCP server guard in `mcp/server.rs::http_host_is_allowed` but kept
+/// in-module to avoid pulling the lift+wiring in scope for this hotfix.
+///
+/// The allowlist is derived from the proxy's bind config:
+///   * loopback shorthand (`localhost`, `127.0.0.1`, `[::1]`) — accepted
+///     so curl/local clients work without extra config
+///   * the literal bind host:port (when bind is a specific host)
+/// A wildcard bind (`0.0.0.0`, `::`) intentionally falls through to a
+/// permissive accept since the proxy does not (yet) carry an explicit
+/// `[proxy].allowed_hosts` knob; tightening that is tracked separately.
+fn proxy_host_is_allowed(
+    headers: &hyper::HeaderMap,
+    bind_host: &str,
+    port: u16,
+    token_protected: bool,
+) -> bool {
+    let host_value = match headers.get(hyper::header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(v) => v.trim(),
+        None => return false,
+    };
+    if host_value.is_empty() {
+        return false;
+    }
+    // Parse "host[:port]" — strip IPv6 brackets, lowercase, drop trailing dot.
+    let (host, header_port) = match hyper::http::uri::Authority::try_from(host_value) {
+        Ok(a) => (a.host().to_ascii_lowercase(), a.port_u16()),
+        Err(_) => return false,
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(|s| s.to_string())
+        .unwrap_or(host);
+    let host = host.trim_end_matches('.').to_string();
+
+    let mut allowed: Vec<(String, Option<u16>)> = vec![
+        ("localhost".to_string(), None),
+        ("127.0.0.1".to_string(), None),
+        ("::1".to_string(), None),
+    ];
+    let bind_normalized = bind_host.trim().to_ascii_lowercase();
+    let bind_normalized = bind_normalized
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(|s| s.to_string())
+        .unwrap_or(bind_normalized);
+    let is_wildcard_bind = matches!(bind_normalized.as_str(), "" | "*" | "0.0.0.0" | "::");
+    // codex R2 P2 + R4 P2: token-protected proxy deployments — wildcard
+    // OR specific LAN/Tailscale IP — typically reach the proxy via a
+    // DNS name (e.g. `Host: rein.tailnet.example`) rather than the
+    // literal bind IP. Every request must already authenticate via
+    // bearer, so the host allowlist is defense-in-depth, not the only
+    // gate. Skip the loopback-only / bind-IP-only restriction for ANY
+    // token-protected listener — without this, legitimate LAN deploys
+    // return 403 for every authenticated remote request. Mirrors the
+    // parallel server bypass at `mcp/server.rs::run_http`'s wildcard
+    // guard for both bind classes.
+    if token_protected {
+        return true;
+    }
+    if !is_wildcard_bind
+        && !allowed.iter().any(|(h, _)| h == &bind_normalized)
+    {
+        allowed.push((bind_normalized, None));
+    }
+
+    // Wildcard binds: only enforce loopback (defense in depth — operators
+    // running the proxy on a wildcard listener should set REIN_PROXY_TOKEN).
+    //
+    // Port-check exemption: loopback host names (`127.0.0.1`, `::1`,
+    // `localhost`) cannot be spoofed via DNS rebinding (they are literal
+    // IPs / a hard-coded reserved name), so accepting any port from a
+    // loopback Host is safe. The proxy is only reachable on its bound
+    // port anyway. Skipping the port match also unblocks integration
+    // tests (`spawn_one_shot_proxy`) that bind to a random port and
+    // therefore cannot match `config.proxy.port`.
+    let is_loopback_host = matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost");
+    allowed.iter().any(|(h, exact_port)| {
+        if h != &host {
+            return false;
+        }
+        if is_loopback_host {
+            return true;
+        }
+        match (exact_port, header_port) {
+            (Some(want), Some(got)) => *want == got,
+            (Some(_), None) => false,
+            (None, Some(got)) => got == port || got == 0,
+            (None, None) => true,
+        }
+    })
+}
+
 fn error_response(status: u16, msg: &str) -> hyper::Response<BoxBody> {
     hyper::Response::builder()
         .status(status)
@@ -292,6 +386,124 @@ fn segment_resolves_to_dot_segment(seg: &str) -> bool {
         i += 1;
     }
     decoded == ".." || decoded == "."
+}
+
+#[cfg(test)]
+mod host_guard_tests {
+    use super::proxy_host_is_allowed;
+
+    fn headers_with_host(value: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        if !value.is_empty() {
+            h.insert(
+                hyper::header::HOST,
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn c2_loopback_allowed_on_loopback_bind() {
+        // Loopback shorthand should always pass.
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("localhost:8690"),
+            "127.0.0.1",
+            8690,
+            false,
+        ));
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("127.0.0.1:8690"),
+            "127.0.0.1",
+            8690,
+            false,
+        ));
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("[::1]:8690"),
+            "127.0.0.1",
+            8690,
+            false,
+        ));
+    }
+
+    #[test]
+    fn c2_dns_rebinding_host_rejected_on_loopback_bind() {
+        assert!(!proxy_host_is_allowed(
+            &headers_with_host("attacker.example:8690"),
+            "127.0.0.1",
+            8690,
+            false,
+        ));
+        assert!(!proxy_host_is_allowed(
+            &headers_with_host("rein.local:8690"),
+            "127.0.0.1",
+            8690,
+            false,
+        ));
+    }
+
+    #[test]
+    fn c2_missing_host_rejected() {
+        let h = hyper::HeaderMap::new();
+        assert!(!proxy_host_is_allowed(&h, "127.0.0.1", 8690, false));
+    }
+
+    #[test]
+    fn c2_specific_lan_bind_accepts_bind_host() {
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("192.0.2.10:8690"),
+            "192.0.2.10",
+            8690,
+            false,
+        ));
+        // Loopback still allowed alongside a LAN-IP bind.
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("localhost:8690"),
+            "192.0.2.10",
+            8690,
+            false,
+        ));
+    }
+
+    #[test]
+    fn c2_wildcard_bind_still_enforces_loopback_only() {
+        // Wildcard bind WITHOUT token: only loopback hostnames are
+        // accepted by the minimal in-module guard. Operators tightening
+        // this should set REIN_PROXY_TOKEN (the C4 path covers metrics
+        // regardless, and the token-protected path bypasses this guard
+        // entirely — see `c2_wildcard_bind_with_token_accepts_remote_hosts`).
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("localhost:8690"),
+            "0.0.0.0",
+            8690,
+            false,
+        ));
+        assert!(!proxy_host_is_allowed(
+            &headers_with_host("attacker.example:8690"),
+            "0.0.0.0",
+            8690,
+            false,
+        ));
+    }
+
+    #[test]
+    fn c2_wildcard_bind_with_token_accepts_remote_hosts() {
+        // codex R2 P2: token-protected wildcard binds (typical
+        // LAN/Tailscale) MUST accept legitimate remote-host headers
+        // because every request also carries bearer auth.
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("100.64.10.20:8690"),
+            "0.0.0.0",
+            8690,
+            true,
+        ));
+        assert!(proxy_host_is_allowed(
+            &headers_with_host("rein.tailnet.example:8690"),
+            "0.0.0.0",
+            8690,
+            true,
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +1048,20 @@ async fn handle_request(
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     state.metrics.request_count.fetch_add(1, Ordering::Relaxed);
 
+    // v0.27.3 F5/C2: Host-header allowlist (parity with MCP server guard).
+    // Reject browser/cross-origin requests reaching the proxy by way of a
+    // mismatched Host before the bearer check runs. 403 with no leak.
+    let token_protected = expected_token.is_some();
+    if !proxy_host_is_allowed(
+        req.headers(),
+        &config.proxy.bind,
+        config.proxy.port,
+        token_protected,
+    ) {
+        state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+        return Ok(error_response(403, "Host header is not allowed"));
+    }
+
     // Auth check for non-localhost binds.
     // Constant-time compare to prevent timing side channels that would leak the token byte by byte.
     if let Some(expected) = expected_token {
@@ -872,7 +1098,27 @@ async fn handle_request(
     }
 
     // Metrics endpoint.
+    // v0.27.3 F5/C4: require bearer auth on /rein/metrics even on
+    // loopback-unauth listeners. The general bearer check above only
+    // fires when `expected_token` is `Some`, so on loopback-unauth this
+    // endpoint was previously open. Operators must set REIN_PROXY_TOKEN
+    // (or REIN_HTTP_TOKEN) to access metrics — by design.
     if method == hyper::Method::GET && path == "/rein/metrics" {
+        let authenticated = match expected_token {
+            Some(expected) => {
+                let auth_header = req
+                    .headers()
+                    .get("x-rein-token")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                proxy_token_eq(auth_header, expected)
+            }
+            None => false,
+        };
+        if !authenticated {
+            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(error_response(401, "unauthorized"));
+        }
         let json = state.metrics.to_json();
         return Ok(build_response(
             hyper::Response::builder()

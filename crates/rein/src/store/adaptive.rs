@@ -2660,6 +2660,12 @@ pub const CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES: &[&str] = &[
     "Semantic",
     "Exploratory",
     "_global",
+    // v0.27.4 D1/D2 — Cap A judge writers route via this literal so the
+    // consumer fold preserves it instead of clamping to "unknown". Pairs
+    // with `ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH`.
+    // Cap A judge has no recall query, so this sentinel substitutes for
+    // the routing key in the per-(cluster_id, query_type) bucket.
+    "concept_refresh",
 ];
 
 /// Min events per `(cluster_id, query_type)` bucket before per-cluster
@@ -5082,6 +5088,156 @@ mod tests {
     }
 
     #[test]
+    fn recompute_synthesis_feedback_with_judge_replay_is_idempotent() {
+        // Guards the `saturating_add` in `llm_judge_count` / `llm_judge_hit_count`:
+        // replay (commit_offset failed) must NOT double-count LlmJudge events.
+        // Uses `_with_judge` variant — the only consumer that folds SynthesisLlmJudge.
+        let conn = setup_db();
+
+        // Emit one SynthesisInteraction + one SynthesisLlmJudge (hit=true) for
+        // cluster 7 / Semantic.
+        emit_synthesis_event(
+            &conn,
+            mk_payload(
+                "syn-j1",
+                SynthesisInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: Some("Semantic".to_string()),
+                topic: None,
+                payload: Some(
+                    serde_json::to_value(SynthesisLlmJudgePayload {
+                        synthesis_id: "syn-j1".to_string(),
+                        judge_model: "mock".to_string(),
+                        hit: true,
+                        reason: "looks good".to_string(),
+                        stamp_hash: "abc123".to_string(),
+                        source: JudgeSource::AutoSampled,
+                        metadata: Some(JudgeMetadata {
+                            query_type: Some("Semantic".to_string()),
+                            cluster_id: Some(7),
+                            source_count: None,
+                            judge_latency_ms: None,
+                        }),
+                        signal_hint: None,
+                    })
+                    .unwrap(),
+                ),
+            },
+        )
+        .unwrap();
+
+        // First call: drains both events, bumps watermark.
+        let (state, pending, calibration, max_id) =
+            recompute_synthesis_feedback_stats_with_judge(
+                &conn,
+                None,
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        let key = synthesis_bucket_key(Some(7), "Semantic");
+        let bucket = state.by_cluster.get(&key).expect("bucket must exist after first call");
+        assert_eq!(state.last_consumed_event_id, 2);
+        assert_eq!(max_id, Some(2));
+        let first_judge_count = bucket.llm_judge_count;
+        let first_judge_hit_count = bucket.llm_judge_hit_count;
+        let first_useful_rate = bucket.useful_rate;
+        assert_eq!(first_judge_count, 1, "one LlmJudge event consumed");
+        assert_eq!(first_judge_hit_count, 1, "hit=true counted");
+
+        // Replay: simulate commit_offset failure — pass prior state back.
+        // `saturating_add` would double-count WITHOUT the watermark guard.
+        let (state2, _pending2, _calibration2, max_id2) =
+            recompute_synthesis_feedback_stats_with_judge(
+                &conn,
+                Some(state.clone()),
+                pending.clone(),
+                calibration.clone(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        let bucket2 = state2.by_cluster.get(&key).expect("bucket must exist on replay");
+        assert_eq!(
+            bucket2.llm_judge_count, first_judge_count,
+            "replay must not double-count llm_judge_count"
+        );
+        assert_eq!(
+            bucket2.llm_judge_hit_count, first_judge_hit_count,
+            "replay must not double-count llm_judge_hit_count"
+        );
+        assert!(
+            (bucket2.useful_rate - first_useful_rate).abs() < 1e-9,
+            "useful_rate must be identical on replay"
+        );
+        assert_eq!(max_id2, Some(2), "max_id still reported so caller can re-attempt");
+
+        // Commit then confirm a new judge event is picked up exactly once.
+        commit_offset(&conn, &[("synthesis_feedback", max_id2.unwrap())]).unwrap();
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: Some("Semantic".to_string()),
+                topic: None,
+                payload: Some(
+                    serde_json::to_value(SynthesisLlmJudgePayload {
+                        synthesis_id: "syn-j2".to_string(),
+                        judge_model: "mock".to_string(),
+                        hit: false,
+                        reason: "miss".to_string(),
+                        stamp_hash: "def456".to_string(),
+                        source: JudgeSource::AutoSampled,
+                        metadata: Some(JudgeMetadata {
+                            query_type: Some("Semantic".to_string()),
+                            cluster_id: Some(7),
+                            source_count: None,
+                            judge_latency_ms: None,
+                        }),
+                        signal_hint: None,
+                    })
+                    .unwrap(),
+                ),
+            },
+        )
+        .unwrap();
+        let (state3, _pending3, _cal3, max_id3) =
+            recompute_synthesis_feedback_stats_with_judge(
+                &conn,
+                Some(state2),
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        let bucket3 = state3.by_cluster.get(&key).unwrap();
+        assert_eq!(
+            bucket3.llm_judge_count, 2,
+            "second judge event increments to 2"
+        );
+        assert_eq!(
+            bucket3.llm_judge_hit_count, 1,
+            "second judge hit=false, so hit_count stays at 1"
+        );
+        assert_eq!(max_id3, Some(3));
+    }
+
+    #[test]
     fn recompute_synthesis_feedback_skips_malformed_payloads() {
         let conn = setup_db();
         // Two valid + one missing-payload + one malformed JSON.
@@ -5726,6 +5882,160 @@ mod tests {
         assert_eq!(state4.total_events, 3);
         assert_eq!(max_id4, Some(3));
         assert_eq!(state4.by_cluster.get(&key).unwrap().explicit_up, 1);
+    }
+
+    #[test]
+    fn recompute_concept_summary_feedback_with_judge_replay_is_idempotent() {
+        // Guards the `saturating_add` in `llm_judge_count` / `llm_judge_hit_count`:
+        // replay (commit_offset failed) must NOT double-count LlmJudge events.
+        // Uses `_with_judge` variant — the only consumer that folds ConceptSummaryLlmJudge.
+        let conn = setup_db();
+
+        // Emit one ConceptSummaryInteraction + one ConceptSummaryLlmJudge (hit=true).
+        emit_concept_summary_event(
+            &conn,
+            mk_concept_summary_payload(
+                "concept-j1",
+                ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+                Some(7),
+                Some("Semantic"),
+            ),
+        );
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("concept-j1".to_string()),
+                query: None,
+                query_type: Some("Semantic".to_string()),
+                topic: None,
+                payload: Some(
+                    serde_json::to_value(ConceptSummaryLlmJudgePayload {
+                        concept_summary_id: "cs-j1".to_string(),
+                        concept_id: "concept-j1".to_string(),
+                        judge_model: "mock".to_string(),
+                        hit: true,
+                        reason: "looks good".to_string(),
+                        stamp_hash: "abc123".to_string(),
+                        source: JudgeSource::AutoSampled,
+                        metadata: Some(JudgeMetadata {
+                            query_type: Some("Semantic".to_string()),
+                            cluster_id: Some(7),
+                            source_count: None,
+                            judge_latency_ms: None,
+                        }),
+                        signal_hint: None,
+                    })
+                    .unwrap(),
+                ),
+            },
+        )
+        .unwrap();
+
+        // First call: drains both events, bumps watermark.
+        let (state, pending, calibration, max_id) =
+            recompute_concept_summary_feedback_stats_with_judge(
+                &conn,
+                None,
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        let key = concept_summary_bucket_key(Some(7), "Semantic");
+        let bucket = state.by_cluster.get(&key).expect("bucket must exist after first call");
+        assert_eq!(state.last_consumed_event_id, 2);
+        assert_eq!(max_id, Some(2));
+        let first_judge_count = bucket.llm_judge_count;
+        let first_judge_hit_count = bucket.llm_judge_hit_count;
+        let first_useful_rate = bucket.useful_rate;
+        assert_eq!(first_judge_count, 1, "one LlmJudge event consumed");
+        assert_eq!(first_judge_hit_count, 1, "hit=true counted");
+
+        // Replay: simulate commit_offset failure — pass prior state back.
+        // `saturating_add` would double-count WITHOUT the watermark guard.
+        let (state2, _pending2, _calibration2, max_id2) =
+            recompute_concept_summary_feedback_stats_with_judge(
+                &conn,
+                Some(state.clone()),
+                pending.clone(),
+                calibration.clone(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        let bucket2 = state2.by_cluster.get(&key).expect("bucket must exist on replay");
+        assert_eq!(
+            bucket2.llm_judge_count, first_judge_count,
+            "replay must not double-count llm_judge_count"
+        );
+        assert_eq!(
+            bucket2.llm_judge_hit_count, first_judge_hit_count,
+            "replay must not double-count llm_judge_hit_count"
+        );
+        assert!(
+            (bucket2.useful_rate - first_useful_rate).abs() < 1e-9,
+            "useful_rate must be identical on replay"
+        );
+        assert_eq!(max_id2, Some(2), "max_id still reported so caller can re-attempt");
+
+        // Commit then confirm a new judge event is picked up exactly once.
+        commit_offset(&conn, &[("concept_summary_feedback", max_id2.unwrap())]).unwrap();
+        emit_event(
+            &conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("concept-j2".to_string()),
+                query: None,
+                query_type: Some("Semantic".to_string()),
+                topic: None,
+                payload: Some(
+                    serde_json::to_value(ConceptSummaryLlmJudgePayload {
+                        concept_summary_id: "cs-j2".to_string(),
+                        concept_id: "concept-j2".to_string(),
+                        judge_model: "mock".to_string(),
+                        hit: false,
+                        reason: "miss".to_string(),
+                        stamp_hash: "def456".to_string(),
+                        source: JudgeSource::AutoSampled,
+                        metadata: Some(JudgeMetadata {
+                            query_type: Some("Semantic".to_string()),
+                            cluster_id: Some(7),
+                            source_count: None,
+                            judge_latency_ms: None,
+                        }),
+                        signal_hint: None,
+                    })
+                    .unwrap(),
+                ),
+            },
+        )
+        .unwrap();
+        let (state3, _pending3, _cal3, max_id3) =
+            recompute_concept_summary_feedback_stats_with_judge(
+                &conn,
+                Some(state2),
+                HashMap::new(),
+                JudgeCalibrationState::default(),
+                LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        // The second judge event also targets cluster_id=7 / "Semantic" (same
+        // bucket key) so llm_judge_count increments to 2. hit=false so
+        // hit_count stays at 1.
+        let bucket3 = state3.by_cluster.get(&key).unwrap();
+        assert_eq!(
+            bucket3.llm_judge_count, 2,
+            "second judge event (same cluster/query_type) increments to 2"
+        );
+        assert_eq!(
+            bucket3.llm_judge_hit_count, 1,
+            "second judge hit=false, so hit_count stays at 1"
+        );
+        assert_eq!(max_id3, Some(3));
     }
 
     #[test]

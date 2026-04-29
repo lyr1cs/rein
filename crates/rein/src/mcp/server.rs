@@ -162,11 +162,51 @@ fn is_specific_bind_host(host: &str) -> bool {
     !matches!(host, "" | "*" | "0.0.0.0" | "::")
 }
 
-fn http_host_guard_enabled(bind_host: &str) -> bool {
+/// v0.27.3 F5/C3 startup predicate: returns `true` when the bind host is a
+/// wildcard (`0.0.0.0`, `::`, `*`, empty) AND no explicit allowlist is
+/// configured. Centralized so the `run_http` startup-refusal and unit
+/// tests share a single source of truth.
+pub(crate) fn wildcard_bind_requires_allowlist(
+    bind_host: &str,
+    allowed_hosts: Option<&[String]>,
+) -> bool {
+    !is_specific_bind_host(bind_host)
+        && allowed_hosts.is_none_or(|hosts| hosts.is_empty())
+}
+
+/// True when the in-process Host-header guard should run for this bind.
+/// Specific binds (loopback or concrete LAN IPs) always enable the guard;
+/// wildcard binds enable it only when an explicit `[server].allowed_hosts`
+/// is set (v0.27.3 F5/C3 — startup refuses to come up without one for
+/// wildcard listeners, so the guard is never silently disabled there).
+fn http_host_guard_enabled(bind_host: &str, allowed_hosts: Option<&[String]>) -> bool {
+    if allowed_hosts.is_some_and(|hosts| !hosts.is_empty()) {
+        return true;
+    }
     is_specific_bind_host(&normalize_host_for_guard(bind_host))
 }
 
-fn http_allowed_hosts(bind_host: &str) -> Vec<String> {
+fn http_allowed_hosts(bind_host: &str, allowed_hosts: Option<&[String]>) -> Vec<String> {
+    // v0.27.3 F5/C3: when the operator supplies an explicit allowlist,
+    // honor it as-is (still keep loopback so curl/health-checks work).
+    if let Some(extra) = allowed_hosts {
+        if !extra.is_empty() {
+            let mut allowed = vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
+            ];
+            for host in extra {
+                let trimmed = host.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                allowed.push(trimmed.to_string());
+            }
+            return allowed;
+        }
+    }
+
     let mut allowed = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -183,8 +223,12 @@ fn http_allowed_hosts(bind_host: &str) -> Vec<String> {
     allowed
 }
 
-fn http_host_is_allowed(host: &HttpRequestHost, bind_host: &str) -> bool {
-    http_allowed_hosts(bind_host)
+fn http_host_is_allowed(
+    host: &HttpRequestHost,
+    bind_host: &str,
+    allowed_hosts: Option<&[String]>,
+) -> bool {
+    http_allowed_hosts(bind_host, allowed_hosts)
         .iter()
         .filter_map(|allowed| parse_allowed_http_authority(allowed))
         .any(|allowed| {
@@ -199,9 +243,10 @@ fn http_host_is_allowed(host: &HttpRequestHost, bind_host: &str) -> bool {
 fn validate_http_request_host(
     headers: &hyper::HeaderMap,
     bind_host: &str,
+    allowed_hosts: Option<&[String]>,
 ) -> Result<HttpRequestHost, HttpGuardRejection> {
     let host = parse_http_request_host(headers)?;
-    if !http_host_is_allowed(&host, bind_host) {
+    if !http_host_is_allowed(&host, bind_host, allowed_hosts) {
         return Err(HttpGuardRejection::Forbidden("Host header is not allowed"));
     }
     Ok(host)
@@ -536,6 +581,29 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         ));
     }
 
+    // v0.27.3 F5/C3 (codex R1 P1 amendment): refuse to start on wildcard
+    // binds (`0.0.0.0`, `::`, `*`, empty) unless EITHER
+    // `[server].allowed_hosts` is explicitly set OR a bearer token is
+    // configured. With a bearer token, every request must carry valid
+    // auth, so DNS-rebinding requests from third-party origins fail at
+    // the auth check; the Host guard is defense-in-depth, not the only
+    // defense. This keeps the shipped Docker image (`REIN_SSE_BIND=0.0.0.0`
+    // + `REIN_HTTP_TOKEN`) bootable while still requiring an explicit
+    // allowlist for unauthenticated wildcard listeners.
+    if wildcard_bind_requires_allowlist(
+        &config.server.sse_bind,
+        config.server.allowed_hosts.as_deref(),
+    ) && auth_token.is_none()
+    {
+        anyhow::bail!(
+            "Refusing to start: bind is wildcard ({}) without REIN_HTTP_TOKEN and without \
+             [server].allowed_hosts. Either set REIN_HTTP_TOKEN=<secret> (bearer-protected), \
+             or set [server].allowed_hosts = [\"hostname1\", \"hostname2\"] in ~/.rein/config.toml. \
+             Wildcard binds require at least one of these to defend against DNS rebinding.",
+            config.server.sse_bind
+        );
+    }
+
     let cancel = CancellationToken::new();
 
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -593,16 +661,24 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         async move {
             let path = req.uri().path();
             let method = req.method();
-            let host_for_origin = if http_host_guard_enabled(&cfg.server.sse_bind) {
-                match validate_http_request_host(req.headers(), &cfg.server.sse_bind) {
-                    Ok(host) => Some(host),
-                    Err(rejection) => {
-                        return Ok::<_, std::convert::Infallible>(http_guard_response(rejection));
+            let allowed_hosts = cfg.server.allowed_hosts.as_deref();
+            let host_for_origin =
+                if http_host_guard_enabled(&cfg.server.sse_bind, allowed_hosts) {
+                    match validate_http_request_host(
+                        req.headers(),
+                        &cfg.server.sse_bind,
+                        allowed_hosts,
+                    ) {
+                        Ok(host) => Some(host),
+                        Err(rejection) => {
+                            return Ok::<_, std::convert::Infallible>(http_guard_response(
+                                rejection,
+                            ));
+                        }
                     }
-                }
-            } else {
-                parse_http_request_host(req.headers()).ok()
-            };
+                } else {
+                    parse_http_request_host(req.headers()).ok()
+                };
 
             if let Some(host) = host_for_origin.as_ref() {
                 if let Err(rejection) =
@@ -855,7 +931,7 @@ mod tests {
         );
 
         assert!(matches!(
-            validate_http_request_host(&headers, "127.0.0.1"),
+            validate_http_request_host(&headers, "127.0.0.1", None),
             Err(HttpGuardRejection::Forbidden(_))
         ));
     }
@@ -869,7 +945,7 @@ mod tests {
                 hyper::header::HeaderValue::from_str(host).unwrap(),
             );
             assert!(
-                validate_http_request_host(&headers, "127.0.0.1").is_ok(),
+                validate_http_request_host(&headers, "127.0.0.1", None).is_ok(),
                 "{host} should be accepted"
             );
         }
@@ -879,7 +955,102 @@ mod tests {
             hyper::header::HOST,
             hyper::header::HeaderValue::from_static("192.0.2.10:8691"),
         );
-        assert!(validate_http_request_host(&headers, "192.0.2.10").is_ok());
+        assert!(validate_http_request_host(&headers, "192.0.2.10", None).is_ok());
+    }
+
+    #[test]
+    fn host_guard_honors_explicit_allowed_hosts_on_wildcard_bind() {
+        let allowed: Vec<String> = vec!["rein.internal".to_string()];
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("rein.internal:8691"),
+        );
+        assert!(
+            validate_http_request_host(&headers, "0.0.0.0", Some(&allowed)).is_ok(),
+            "explicit allowed_hosts entry must be accepted on wildcard bind"
+        );
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("attacker.example:8691"),
+        );
+        assert!(
+            matches!(
+                validate_http_request_host(&headers, "0.0.0.0", Some(&allowed)),
+                Err(HttpGuardRejection::Forbidden(_))
+            ),
+            "host outside allowed_hosts must still be rejected on wildcard bind"
+        );
+    }
+
+    #[test]
+    fn host_guard_enabled_when_allowed_hosts_set_even_for_wildcard_bind() {
+        let allowed: Vec<String> = vec!["rein.internal".to_string()];
+        // Wildcard bind alone disables the guard (legacy v0.26.x behavior),
+        // but an explicit allow-list re-enables it (v0.27.3 F5/C3).
+        assert!(!http_host_guard_enabled("0.0.0.0", None));
+        assert!(http_host_guard_enabled("0.0.0.0", Some(&allowed)));
+        // Empty allow-list is treated the same as None.
+        let empty: Vec<String> = Vec::new();
+        assert!(!http_host_guard_enabled("0.0.0.0", Some(&empty)));
+    }
+
+    #[test]
+    fn c3_wildcard_bind_without_allowlist_is_refused() {
+        // Wildcard binds with no allowlist trip the startup refusal.
+        for wildcard in ["0.0.0.0", "::", "*", ""] {
+            assert!(
+                wildcard_bind_requires_allowlist(wildcard, None),
+                "{wildcard} should require an explicit allowlist"
+            );
+            let empty: Vec<String> = Vec::new();
+            assert!(
+                wildcard_bind_requires_allowlist(wildcard, Some(&empty)),
+                "{wildcard} with empty allowlist should still refuse"
+            );
+        }
+
+        // Wildcard with an explicit allowlist is permitted.
+        let allowed: Vec<String> = vec!["rein.internal".to_string()];
+        for wildcard in ["0.0.0.0", "::"] {
+            assert!(
+                !wildcard_bind_requires_allowlist(wildcard, Some(&allowed)),
+                "{wildcard} with allowlist should be allowed"
+            );
+        }
+
+        // Specific binds never trigger the refusal.
+        for specific in ["127.0.0.1", "::1", "localhost", "192.0.2.10"] {
+            assert!(
+                !wildcard_bind_requires_allowlist(specific, None),
+                "{specific} is specific; refusal should not apply"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_default_loopback_is_authenticated() {
+        // v0.27.3 F5/C1: fresh ServerConfig and ProxyConfig must default
+        // to authenticated mode. Operators must explicitly opt into
+        // unauthenticated loopback by writing the flag.
+        let server = crate::config::ServerConfig::default();
+        assert!(
+            !server.allow_unauthenticated_loopback,
+            "ServerConfig::default().allow_unauthenticated_loopback must be false"
+        );
+        let proxy = crate::config::ProxyConfig::default();
+        assert!(
+            !proxy.allow_unauthenticated_loopback,
+            "ProxyConfig::default().allow_unauthenticated_loopback must be false"
+        );
+        // C3 sibling: allowed_hosts defaults to None so wildcard binds
+        // hit the startup refusal until operators opt in.
+        assert!(
+            server.allowed_hosts.is_none(),
+            "ServerConfig::default().allowed_hosts must be None"
+        );
     }
 
     #[test]
@@ -897,7 +1068,7 @@ mod tests {
             "sec-fetch-site",
             hyper::header::HeaderValue::from_static("cross-site"),
         );
-        let host = validate_http_request_host(&headers, "127.0.0.1").unwrap();
+        let host = validate_http_request_host(&headers, "127.0.0.1", None).unwrap();
 
         assert!(matches!(
             validate_browser_mutation_guard(&Method::POST, "/api/memories", &headers, &host),
@@ -924,7 +1095,7 @@ mod tests {
             "sec-fetch-site",
             hyper::header::HeaderValue::from_static("same-origin"),
         );
-        let host = validate_http_request_host(&same_origin, "127.0.0.1").unwrap();
+        let host = validate_http_request_host(&same_origin, "127.0.0.1", None).unwrap();
         assert!(validate_browser_mutation_guard(
             &Method::POST,
             "/api/memories",
@@ -941,7 +1112,7 @@ mod tests {
             hyper::header::HOST,
             hyper::header::HeaderValue::from_static("localhost:8691"),
         );
-        let host = validate_http_request_host(&native, "127.0.0.1").unwrap();
+        let host = validate_http_request_host(&native, "127.0.0.1", None).unwrap();
         assert!(
             validate_browser_mutation_guard(&Method::POST, "/api/memories", &native, &host).is_ok()
         );

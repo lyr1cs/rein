@@ -769,6 +769,27 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
         .is_some();
     let is_loopback = is_loopback_bind(&config.proxy.bind);
     let allow_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
+    // F5/C1 follow-up: proxy is a separately-managed service (`rein proxy on`)
+    // and is NOT auto-started. When the bind is loopback AND the service
+    // is offline AND no token is configured, surface OK with a hint string
+    // — a fresh install with default-deny defaults shouldn't bump the
+    // exit code on a fail-check the operator can't act on yet.
+    //
+    // Wildcard binds (0.0.0.0/::/empty) MUST still FAIL without a token,
+    // because they would expose the proxy to the LAN as soon as it
+    // started. Same exposure rationale as the HTTP/SSE check: an
+    // operator picking a wildcard bind is signalling intent to serve
+    // beyond loopback, so the missing-token check is acted on now.
+    if !token_present && !allow_unauth && is_loopback && crate::service::is_running("proxy").is_none() {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "proxy_auth",
+            format!(
+                "proxy not running on {}:{} (set REIN_PROXY_TOKEN or [proxy].allow_unauthenticated_loopback before `rein proxy on`)",
+                config.proxy.bind, config.proxy.port
+            ),
+        );
+    }
 
     if token_present {
         ok_in(

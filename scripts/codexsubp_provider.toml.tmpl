@@ -1,1 +1,1 @@
-model_providers.__PROVIDER_KEY__={ name = "__PROVIDER_NAME__", base_url = "__PROXY_URL__", requires_openai_auth = true, wire_api = "responses", supports_websockets = __SUPPORTS_WEBSOCKETS__ }
+model_providers.__PROVIDER_KEY__={ name = "__PROVIDER_NAME__", base_url = "__PROXY_URL__", requires_openai_auth = true, wire_api = "responses", supports_websockets = __SUPPORTS_WEBSOCKETS__, env_http_headers = { "x-rein-token" = "REIN_PROXY_TOKEN" } }

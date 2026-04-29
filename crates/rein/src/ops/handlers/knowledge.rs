@@ -1024,7 +1024,11 @@ impl OpsRuntime {
     pub fn concept_state(&self, params: ConceptStateParams) -> ReinResult<ConceptStateOutput> {
         let concept_id = params.concept_id.clone();
         let query_type = params.query_type.clone();
-        let cluster_id = params.cluster_id;
+        // v0.27.4 D1/D2 — caller-supplied cluster_id is intentionally
+        // unused for the Cap A gate (synthetic per-concept routing). It
+        // still flows through the request shape so the param remains
+        // forward-compatible if v0.28+ rethreads it.
+        let _caller_cluster_id = params.cluster_id;
         let global_enabled = self.config.ars.concept_summary_enabled;
         let cold_start_n = self.config.ars.concept_summary_cold_start_n;
         self.with_store(|store| {
@@ -1083,16 +1087,29 @@ impl OpsRuntime {
             // concepts could render summaries that the operator turned
             // off globally. None cluster_id falls into the gate's
             // cold-start `Yes` branch when global is true.
-            let effective_cluster_id = cluster_id.or(representative_cluster_id);
+            // v0.27.4 D1/D2 — drop cluster_id reliance for the Cap A gate.
+            // The recall-derived `representative_cluster_id` still surfaces
+            // back to the GUI on `ConceptStateOutput.cluster_id` below (so
+            // callers see the concept's representative cluster), but the
+            // gate ITSELF routes via the same per-concept synthetic key
+            // the writer (`enqueue_judge_for_concept_summary`) uses. Real
+            // recall cluster/query_type buckets accumulate human signal
+            // that never overlaps with Cap A judge writes; pre-v0.27.4 the
+            // gate read those orphan buckets and ignored every judge event.
+            // v0.28+ refactor revisits when recall→refresh threading lands.
             let (living_summary, suppressed) = match &query_type {
-                Some(qtype) => {
+                Some(_qtype) => {
                     let adaptive_state =
                         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                             .unwrap_or_default();
+                    let synthetic_cid =
+                        crate::ops::concept_summary::synthetic_cluster_id_for_concept(
+                            &concept.id,
+                        );
                     match crate::ops::concept_summary::decide_concept_summary_quality(
                         global_enabled,
-                        effective_cluster_id,
-                        qtype,
+                        Some(synthetic_cid),
+                        crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
                         Some(&adaptive_state),
                         cold_start_n,
                         self.config().ars.llm_judge.weight_decay_rate,

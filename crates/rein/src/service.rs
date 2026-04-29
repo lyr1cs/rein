@@ -35,7 +35,7 @@ pub async fn shutdown_signal() {
 fn pid_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
+        .expect("neither HOME nor USERPROFILE is set; refusing to fall back to /tmp for PID files");
     PathBuf::from(home).join(".rein")
 }
 
@@ -278,9 +278,26 @@ fn fetch_proxy_metrics(port: u16) -> Option<(u64, u64, u64)> {
     let request = format!(
         "GET /rein/metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_header}Connection: close\r\n\r\n"
     );
+    stream
+        .set_read_timeout(Some(Duration::from_millis(2000)))
+        .ok()?;
     std::io::Write::write_all(&mut stream, request.as_bytes()).ok()?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
+    const MAX_METRICS_BODY: usize = 1024 * 1024; // 1 MiB
+    let mut response = Vec::with_capacity(8 * 1024);
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > MAX_METRICS_BODY {
+                    return None; // body too large
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let response = String::from_utf8_lossy(&response).into_owned();
     // Parse JSON from response body (after headers)
     let body = response.split("\r\n\r\n").nth(1)?;
     let json: serde_json::Value = serde_json::from_str(body).ok()?;

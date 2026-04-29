@@ -50,7 +50,11 @@ compact = false
 sse_enabled = false
 sse_port = 8680
 sse_bind = "127.0.0.1"    # use 0.0.0.0 for Tailscale/LAN access
-allow_unauthenticated_loopback = true # loopback is safe by default; set false + REIN_PROXY_TOKEN for non-local
+# v0.27.4 F5/C1: default-deny. Operators must opt in to unauthenticated
+# loopback or set REIN_HTTP_TOKEN. Existing fresh-install and
+# file-backed configs that omit this field also resolve to false via
+# the matching Rust struct default in `crates/rein/src/config.rs`.
+allow_unauthenticated_loopback = false
 
 [hooks]
 min_turns = 20
@@ -123,7 +127,9 @@ extract_enabled = true     # extract memories from assistant responses
 store_min_chars = 220      # don't run proxy extraction on short assistant replies
 store_min_score = 3        # pattern score required before proxy extraction runs
 max_request_body = 1048576 # reject oversized client requests before forwarding
-allow_unauthenticated_loopback = true # loopback is safe by default; set false + REIN_PROXY_TOKEN for non-local
+# v0.27.4 F5/C1: default-deny. Operators must opt in to unauthenticated
+# loopback or set REIN_PROXY_TOKEN before running `rein proxy on`.
+allow_unauthenticated_loopback = false
 
 [async_memory]
 provider = "inherit"       # inherit [extract].provider; can be "google", "omlx", or "none"

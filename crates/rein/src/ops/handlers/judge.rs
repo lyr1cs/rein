@@ -478,14 +478,55 @@ fn cache_lookup_value(
 /// `stamped_at` (RFC3339) is older than `now - secs` are treated as
 /// expired and the lookup returns `None` — manual MCP handlers then
 /// surface `*_expired_or_unknown` instead of enqueuing a stale snapshot.
+///
+/// F4 A4 — delegates to [`read_cache_entries_within_ttl`] for shared
+/// TTL semantics with the worker-side `cache_has_id_and_stamp`. Returns
+/// the LAST matching live entry so re-mints supersede older rows in
+/// the append-only jsonl.
 fn cache_lookup_value_with_ttl(
     path: &std::path::Path,
     id_field: &str,
     id_value: &str,
     ttl_secs: Option<u64>,
 ) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
+    read_cache_entries_within_ttl(path, id_field, id_value, ttl_secs)
+        .into_iter()
+        .last()
+}
+
+/// F4 A4 shared helper — scan an append-only judge cache jsonl and
+/// return all live entries matching `(id_field == id_value)`. Used by
+/// both [`cache_lookup_value_with_ttl`] (handlers/judge.rs manual MCP)
+/// and [`crate::ops::llm_judge_worker::cache_has_id_and_stamp`]
+/// (worker-side J5 verification) so the two call sites agree on
+/// stale-row semantics.
+///
+/// **Stale-row contract**: when `ttl_secs = Some(secs)`, a row is
+/// considered live iff:
+///   1. its `stamped_at` field is present AND parseable as RFC3339, AND
+///   2. `(now - stamped_at).as_secs() <= secs`
+///
+/// Rows with missing / unparseable `stamped_at` while TTL is active
+/// are treated as MISSING (skipped) — a strict "stale = absent" rule.
+/// This is the F4 A4 alignment vs the v0.27.2 split where the manual
+/// MCP path treated such rows as live.
+///
+/// `ttl_secs = None` skips the freshness check entirely (used by tests
+/// + the test-only `cache_lookup_value` shim).
+///
+/// Returns entries in file order; the cache is append-only so callers
+/// wanting the latest re-mint should take `.last()`.
+pub(crate) fn read_cache_entries_within_ttl(
+    path: &std::path::Path,
+    id_field: &str,
+    id_value: &str,
+    ttl_secs: Option<u64>,
+) -> Vec<serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
     let now = chrono::Utc::now();
+    let mut matches = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -494,27 +535,27 @@ fn cache_lookup_value_with_ttl(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
-        if value.get(id_field).and_then(|v| v.as_str()) == Some(id_value) {
-            if let Some(ttl) = ttl_secs {
-                let stamped_at = value.get("stamped_at").and_then(|v| v.as_str());
-                if let Some(ts) = stamped_at {
-                    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
-                        let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
-                        if age.num_seconds() > ttl as i64 {
-                            // Expired entry — keep scanning in case a
-                            // newer write for the same id sits later in
-                            // the file (append-only jsonl). Note: cache
-                            // is append-only so dup ids = re-mints; the
-                            // last match wins.
-                            continue;
-                        }
-                    }
-                }
-            }
-            return Some(value);
+        if value.get(id_field).and_then(|v| v.as_str()) != Some(id_value) {
+            continue;
         }
+        if let Some(ttl) = ttl_secs {
+            let Some(stamped_at) = value.get("stamped_at").and_then(|v| v.as_str()) else {
+                // F4 A4 — strict "stale = absent": missing stamped_at
+                // while TTL active is treated as expired, NOT live.
+                continue;
+            };
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(stamped_at) else {
+                // Same rule for unparseable timestamps.
+                continue;
+            };
+            let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+            if age.num_seconds() > ttl as i64 {
+                continue;
+            }
+        }
+        matches.push(value);
     }
-    None
+    matches
 }
 
 /// Append a single JSON line to the queue file. Returns the 1-indexed
@@ -624,7 +665,12 @@ fn build_concept_summary_judge_job(
     judge_model_override: Option<&str>, // Codex R1 P3 fix
 ) -> Option<serde_json::Value> {
     let concept_summary_id = cache_entry.get("concept_summary_id")?.as_str()?;
-    let concept_id = cache_entry.get("concept_id").and_then(|v| v.as_str());
+    // F4 A1 fix — require non-null/non-missing concept_id so the
+    // downstream reader doesn't propagate `None` into the SQL target
+    // existence check (which then matches any concept via the
+    // `?2 IS NULL OR concept_id = ?2` half). Production writer always
+    // populates this; defense-in-depth at the reader closes the gap.
+    let concept_id = cache_entry.get("concept_id")?.as_str()?;
     let query = cache_entry.get("query")?.as_str()?;
     let prompt = cache_entry.get("prompt")?.as_str()?;
     let candidate = cache_entry.get("candidate")?.as_str()?;
