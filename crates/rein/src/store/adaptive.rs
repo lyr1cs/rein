@@ -2726,6 +2726,15 @@ pub struct ClusterConceptSummaryStats {
     pub llm_judge_hit_count: u64,
     /// Derived metric, recomputed on every consumer pass.
     pub useful_rate: f64,
+    /// v0.27.5 R2 — LRU eviction key. Highest `feedback_events.id`
+    /// folded into this bucket. When `by_cluster` is at
+    /// [`CONCEPT_SUMMARY_BY_CLUSTER_CAP`], the consumer evicts the bucket
+    /// with the lowest `last_event_id` to make room for a new bucket.
+    /// Defaults to 0 on legacy snapshots; the next event in any of those
+    /// buckets bumps it past 0, so cold buckets that never see another
+    /// event are the natural eviction candidates once the cap is hit.
+    #[serde(default)]
+    pub last_event_id: i64,
 }
 
 /// v0.27 ARS Cap A: per-concept_id stats with bounded LRU semantics.
@@ -2775,6 +2784,43 @@ pub struct ConceptSummaryFeedbackState {
     /// "how much signal has accumulated".
     #[serde(default)]
     pub total_events: u64,
+}
+
+/// v0.27.5 R2 — LRU eviction for the concept-summary `by_cluster` map.
+/// When the map is at [`CONCEPT_SUMMARY_BY_CLUSTER_CAP`] and
+/// `new_key` would create a new bucket, drop the bucket with the
+/// lowest [`ClusterConceptSummaryStats::last_event_id`] (the
+/// least-recently-active bucket). Replaces the v0.27.4 drop-new-bucket
+/// behavior so vaults with > 4096 distinct concepts stop silently
+/// losing fresh signal once the cap saturates.
+///
+/// No-op when the map is below cap or already contains `new_key`.
+///
+/// Ties on `last_event_id = 0` (legacy snapshots loaded via
+/// `#[serde(default)]`) resolve arbitrarily via `min_by_key` over a
+/// `HashMap` iterator. The next event into the surviving bucket bumps
+/// its `last_event_id` past 0, so the non-determinism is self-healing
+/// and confined to the first eviction after a snapshot reload.
+fn evict_concept_summary_lru_if_at_cap(
+    by_cluster: &mut HashMap<String, ClusterConceptSummaryStats>,
+    new_key: &str,
+) {
+    if by_cluster.contains_key(new_key) || by_cluster.len() < CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+        return;
+    }
+    let victim_key = by_cluster
+        .iter()
+        .min_by_key(|(_, b)| b.last_event_id)
+        .map(|(k, _)| k.clone());
+    if let Some(victim) = victim_key {
+        tracing::warn!(
+            evicted_bucket = %victim,
+            new_bucket = %new_key,
+            cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+            "concept_summary_feedback: by_cluster cap reached; evicting LRU bucket"
+        );
+        by_cluster.remove(&victim);
+    }
 }
 
 /// Pure function — testable in isolation. Computes a `[0.0, 1.0]`
@@ -2936,26 +2982,14 @@ pub fn recompute_concept_summary_feedback_stats(
         };
         let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
 
-        // Hard cap: drop event if creating a new bucket would push
-        // by_cluster past the cap. Existing buckets continue to receive
-        // updates so legitimate signal isn't lost.
-        if !state.by_cluster.contains_key(&bucket_key)
-            && state.by_cluster.len() >= CONCEPT_SUMMARY_BY_CLUSTER_CAP
-        {
-            tracing::warn!(
-                cluster_id = ?cluster_id,
-                query_type = %query_type,
-                cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
-                "concept_summary_feedback: by_cluster cap reached; dropping new bucket event"
-            );
-            // Still bump total_events so the consumer offset advances and
-            // we don't replay this event forever.
-            state.total_events = state.total_events.saturating_add(1);
-            continue;
-        }
+        // v0.27.5 R2 — LRU eviction at cap. New events keep the cap
+        // tight by evicting the least-recently-active bucket (lowest
+        // `last_event_id`). Existing buckets are untouched.
+        evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
 
         // Per-bucket fold.
         let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+        bucket.last_event_id = bucket.last_event_id.max(ev.id);
         match &payload.interaction {
             ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
                 bucket.viewed_count = bucket.viewed_count.saturating_add(1);
@@ -3144,6 +3178,7 @@ pub fn recompute_concept_summary_feedback_stats_with_judge(
                     &mut calibration,
                     &mut touched_buckets,
                     &payload,
+                    ev.id,
                 );
             }
             "concept_summary_llm_judge" => {
@@ -3165,6 +3200,7 @@ pub fn recompute_concept_summary_feedback_stats_with_judge(
                     &mut calibration,
                     &mut touched_buckets,
                     &payload,
+                    ev.id,
                 );
             }
             other => {
@@ -3210,6 +3246,7 @@ fn fold_concept_summary_interaction(
     calibration: &mut JudgeCalibrationState,
     touched_buckets: &mut std::collections::HashSet<String>,
     payload: &ConceptSummaryInteractionPayload,
+    event_id: i64,
 ) {
     let metadata = payload.metadata.clone().unwrap_or_default();
     let cluster_id = metadata.cluster_id;
@@ -3221,20 +3258,11 @@ fn fold_concept_summary_interaction(
     };
     let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
 
-    if !state.by_cluster.contains_key(&bucket_key)
-        && state.by_cluster.len() >= CONCEPT_SUMMARY_BY_CLUSTER_CAP
-    {
-        tracing::warn!(
-            cluster_id = ?cluster_id,
-            query_type = %query_type,
-            cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
-            "concept_summary_feedback: by_cluster cap reached; dropping new bucket event"
-        );
-        state.total_events = state.total_events.saturating_add(1);
-        return;
-    }
+    // v0.27.5 R2 — LRU eviction at cap (replaces v0.27.4 drop-new-bucket).
+    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
 
     let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    bucket.last_event_id = bucket.last_event_id.max(event_id);
     match &payload.interaction {
         ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
             bucket.viewed_count = bucket.viewed_count.saturating_add(1);
@@ -3337,6 +3365,7 @@ fn fold_concept_summary_llm_judge(
     calibration: &mut JudgeCalibrationState,
     touched_buckets: &mut std::collections::HashSet<String>,
     payload: &ConceptSummaryLlmJudgePayload,
+    event_id: i64,
 ) {
     let metadata = payload.metadata.clone().unwrap_or_default();
     let cluster_id = metadata.cluster_id;
@@ -3348,20 +3377,11 @@ fn fold_concept_summary_llm_judge(
     };
     let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
 
-    if !state.by_cluster.contains_key(&bucket_key)
-        && state.by_cluster.len() >= CONCEPT_SUMMARY_BY_CLUSTER_CAP
-    {
-        tracing::warn!(
-            cluster_id = ?cluster_id,
-            query_type = %query_type,
-            cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
-            "concept_summary_feedback: by_cluster cap reached; dropping new judge event"
-        );
-        state.total_events = state.total_events.saturating_add(1);
-        return;
-    }
+    // v0.27.5 R2 — LRU eviction at cap (replaces v0.27.4 drop-new-bucket).
+    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
 
     let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    bucket.last_event_id = bucket.last_event_id.max(event_id);
     bucket.llm_judge_count = bucket.llm_judge_count.saturating_add(1);
     if payload.hit {
         bucket.llm_judge_hit_count = bucket.llm_judge_hit_count.saturating_add(1);
@@ -5138,17 +5158,19 @@ mod tests {
         .unwrap();
 
         // First call: drains both events, bumps watermark.
-        let (state, pending, calibration, max_id) =
-            recompute_synthesis_feedback_stats_with_judge(
-                &conn,
-                None,
-                HashMap::new(),
-                JudgeCalibrationState::default(),
-                LLM_JUDGE_WEIGHT_DECAY_RATE,
-            )
-            .unwrap();
+        let (state, pending, calibration, max_id) = recompute_synthesis_feedback_stats_with_judge(
+            &conn,
+            None,
+            HashMap::new(),
+            JudgeCalibrationState::default(),
+            LLM_JUDGE_WEIGHT_DECAY_RATE,
+        )
+        .unwrap();
         let key = synthesis_bucket_key(Some(7), "Semantic");
-        let bucket = state.by_cluster.get(&key).expect("bucket must exist after first call");
+        let bucket = state
+            .by_cluster
+            .get(&key)
+            .expect("bucket must exist after first call");
         assert_eq!(state.last_consumed_event_id, 2);
         assert_eq!(max_id, Some(2));
         let first_judge_count = bucket.llm_judge_count;
@@ -5168,7 +5190,10 @@ mod tests {
                 LLM_JUDGE_WEIGHT_DECAY_RATE,
             )
             .unwrap();
-        let bucket2 = state2.by_cluster.get(&key).expect("bucket must exist on replay");
+        let bucket2 = state2
+            .by_cluster
+            .get(&key)
+            .expect("bucket must exist on replay");
         assert_eq!(
             bucket2.llm_judge_count, first_judge_count,
             "replay must not double-count llm_judge_count"
@@ -5181,7 +5206,11 @@ mod tests {
             (bucket2.useful_rate - first_useful_rate).abs() < 1e-9,
             "useful_rate must be identical on replay"
         );
-        assert_eq!(max_id2, Some(2), "max_id still reported so caller can re-attempt");
+        assert_eq!(
+            max_id2,
+            Some(2),
+            "max_id still reported so caller can re-attempt"
+        );
 
         // Commit then confirm a new judge event is picked up exactly once.
         commit_offset(&conn, &[("synthesis_feedback", max_id2.unwrap())]).unwrap();
@@ -5216,15 +5245,14 @@ mod tests {
             },
         )
         .unwrap();
-        let (state3, _pending3, _cal3, max_id3) =
-            recompute_synthesis_feedback_stats_with_judge(
-                &conn,
-                Some(state2),
-                HashMap::new(),
-                JudgeCalibrationState::default(),
-                LLM_JUDGE_WEIGHT_DECAY_RATE,
-            )
-            .unwrap();
+        let (state3, _pending3, _cal3, max_id3) = recompute_synthesis_feedback_stats_with_judge(
+            &conn,
+            Some(state2),
+            HashMap::new(),
+            JudgeCalibrationState::default(),
+            LLM_JUDGE_WEIGHT_DECAY_RATE,
+        )
+        .unwrap();
         let bucket3 = state3.by_cluster.get(&key).unwrap();
         assert_eq!(
             bucket3.llm_judge_count, 2,
@@ -5945,7 +5973,10 @@ mod tests {
             )
             .unwrap();
         let key = concept_summary_bucket_key(Some(7), "Semantic");
-        let bucket = state.by_cluster.get(&key).expect("bucket must exist after first call");
+        let bucket = state
+            .by_cluster
+            .get(&key)
+            .expect("bucket must exist after first call");
         assert_eq!(state.last_consumed_event_id, 2);
         assert_eq!(max_id, Some(2));
         let first_judge_count = bucket.llm_judge_count;
@@ -5965,7 +5996,10 @@ mod tests {
                 LLM_JUDGE_WEIGHT_DECAY_RATE,
             )
             .unwrap();
-        let bucket2 = state2.by_cluster.get(&key).expect("bucket must exist on replay");
+        let bucket2 = state2
+            .by_cluster
+            .get(&key)
+            .expect("bucket must exist on replay");
         assert_eq!(
             bucket2.llm_judge_count, first_judge_count,
             "replay must not double-count llm_judge_count"
@@ -5978,7 +6012,11 @@ mod tests {
             (bucket2.useful_rate - first_useful_rate).abs() < 1e-9,
             "useful_rate must be identical on replay"
         );
-        assert_eq!(max_id2, Some(2), "max_id still reported so caller can re-attempt");
+        assert_eq!(
+            max_id2,
+            Some(2),
+            "max_id still reported so caller can re-attempt"
+        );
 
         // Commit then confirm a new judge event is picked up exactly once.
         commit_offset(&conn, &[("concept_summary_feedback", max_id2.unwrap())]).unwrap();
@@ -6039,17 +6077,27 @@ mod tests {
     }
 
     #[test]
-    fn recompute_concept_summary_feedback_bucket_cap_drops_new_buckets() {
-        // Required test #2: bucket cap behavior.
-        // We can't realistically emit 4096 events in a unit test, so we
-        // pre-populate state past the cap and verify that a new bucket
-        // event drops with `total_events` still incrementing.
+    fn recompute_concept_summary_feedback_bucket_cap_evicts_lru_to_admit_new() {
+        // v0.27.5 R2 — LRU eviction at cap (replaces v0.27.4
+        // drop-new-bucket). Pre-populate state at cap with sequential
+        // `last_event_id` values so cluster 0 is the LRU candidate, then
+        // emit one event for a new (out-of-range) cluster. The new bucket
+        // MUST appear and the cluster-0 bucket MUST be evicted; map size
+        // stays at exactly cap; cluster 4095 (most-recent existing) MUST
+        // remain so LRU truly evicted the LEAST-recently-active bucket.
         let conn = setup_db();
         let mut by_cluster = HashMap::new();
         for i in 0..CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+            // Sequential event ids: cluster 0 has the smallest id (= LRU)
+            // and cluster CAP-1 has the largest. Start at 1 so cluster 0
+            // can't be confused with a default-zero last_event_id.
+            let stats = ClusterConceptSummaryStats {
+                last_event_id: (i as i64) + 1,
+                ..Default::default()
+            };
             by_cluster.insert(
                 concept_summary_bucket_key(Some(i as i64), "Semantic"),
-                ClusterConceptSummaryStats::default(),
+                stats,
             );
         }
         let prior = ConceptSummaryFeedbackState {
@@ -6067,11 +6115,33 @@ mod tests {
             ),
         );
         let (state, max_id) = recompute_concept_summary_feedback_stats(&conn, Some(prior)).unwrap();
-        assert_eq!(state.by_cluster.len(), CONCEPT_SUMMARY_BY_CLUSTER_CAP);
-        // New bucket NOT inserted, but total_events bumps so the offset
-        // advances and we don't replay this event forever.
-        let cap_key = concept_summary_bucket_key(Some(99_999), "Semantic");
-        assert!(!state.by_cluster.contains_key(&cap_key));
+        assert_eq!(
+            state.by_cluster.len(),
+            CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+            "by_cluster MUST stay at exactly cap after LRU eviction"
+        );
+        // The new bucket MUST be present (eviction made room).
+        let new_key = concept_summary_bucket_key(Some(99_999), "Semantic");
+        assert!(
+            state.by_cluster.contains_key(&new_key),
+            "new bucket admitted via LRU eviction"
+        );
+        // The LRU candidate (cluster 0) MUST be evicted.
+        let lru_key = concept_summary_bucket_key(Some(0), "Semantic");
+        assert!(
+            !state.by_cluster.contains_key(&lru_key),
+            "LRU bucket (cluster 0, lowest last_event_id) MUST be evicted"
+        );
+        // The most-recent existing bucket (cluster CAP-1) MUST remain —
+        // proves we didn't just evict a random bucket.
+        let recent_key = concept_summary_bucket_key(
+            Some((CONCEPT_SUMMARY_BY_CLUSTER_CAP - 1) as i64),
+            "Semantic",
+        );
+        assert!(
+            state.by_cluster.contains_key(&recent_key),
+            "most-recently-active bucket MUST be preserved by LRU"
+        );
         assert_eq!(state.total_events, 1);
         assert_eq!(max_id, Some(1));
         assert_eq!(state.last_consumed_event_id, 1);

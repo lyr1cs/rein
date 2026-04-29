@@ -780,7 +780,11 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
     // started. Same exposure rationale as the HTTP/SSE check: an
     // operator picking a wildcard bind is signalling intent to serve
     // beyond loopback, so the missing-token check is acted on now.
-    if !token_present && !allow_unauth && is_loopback && crate::service::is_running("proxy").is_none() {
+    if !token_present
+        && !allow_unauth
+        && is_loopback
+        && crate::service::is_running("proxy").is_none()
+    {
         return ok_in(
             DoctorCategory::Configuration,
             "proxy_auth",

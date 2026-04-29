@@ -200,10 +200,7 @@ impl ColdArchiveSummaryGenerator {
     /// Production constructor — no input cap applied until
     /// `.with_rein_config(arc)` is chained. This 2-arg signature is stable;
     /// `bin/rein_eval.rs` uses it directly and must not be broken.
-    pub fn new(
-        extractor: std::sync::Arc<ExtractorKind>,
-        config: ColdArchiveConfig,
-    ) -> Self {
+    pub fn new(extractor: std::sync::Arc<ExtractorKind>, config: ColdArchiveConfig) -> Self {
         Self {
             extractor,
             config,
@@ -658,9 +655,8 @@ fn run_cold_archive_summary_inner(
         },
     };
 
-    let generator =
-        ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
-            .with_rein_config(std::sync::Arc::new(config.clone()));
+    let generator = ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
+        .with_rein_config(std::sync::Arc::new(config.clone()));
 
     let claims = claim_batch(store, cold_config.batch_size)?;
     let budget = std::time::Duration::from_secs(ARCHIVAL_SUMMARY_BATCH_BUDGET_SECS);
@@ -897,18 +893,20 @@ fn attempt_one(
                 // leave `needs_archival_summary = 1` so the next pass
                 // retries once operator raises the cap or chunks.
                 //
-                // codex R10 P2 — known residual: `claim_batch` selects
-                // oldest eligible rows first, so a batch full of
-                // oversized rows reclaims those same rows on every
-                // pass and can starve newer cold rows until an
-                // operator raises the cap or chunks the content.
-                // Closing this fully needs a `last_too_large_at`
-                // backoff column (or claim-age randomization) tracked
-                // for v0.27.5+. Operator workaround: bump
-                // `[ars.cold_archive].max_input_chars` or manually
-                // clear `needs_archival_summary` on the offending row.
+                // v0.27.5 R1 — backoff: stamp `last_too_large_at = now()`
+                // alongside the claim release so `claim_batch` sorts this
+                // row to the back of the queue on the next pass (NULL
+                // stamps come first; among stamped rows the oldest is
+                // tried first so operators who raise the cap see the
+                // oldest queue first). Without this, oversized rows were
+                // reclaimed every pass and starved newer cold rows.
                 if msg.starts_with("Cap C too large") {
-                    let _ = release_claim(store, &claim.memory_id, &claim.token);
+                    let _ = release_claim_too_large(
+                        store,
+                        &claim.memory_id,
+                        &claim.token,
+                        Utc::now().timestamp(),
+                    );
                     return Ok(AttemptOutcome::TooLarge(msg.clone()));
                 }
             }
@@ -923,6 +921,11 @@ fn attempt_one(
     // slow-channel writer).
     let now = Utc::now();
     let now_unix = now.timestamp();
+    // v0.27.5 R1 — clear `last_too_large_at` on the success commit.
+    // The backoff stamp is only meaningful while the current content
+    // was rejected as oversized; a successful archival summary means
+    // the row no longer needs to be deprioritized on future re-flags
+    // (e.g. M5 reclassifying after a content edit).
     let affected = store.conn().execute(
         "UPDATE memories \
          SET archival_summary = ?1, \
@@ -930,7 +933,8 @@ fn attempt_one(
              archival_summary_version = ?3, \
              needs_archival_summary = 0, \
              in_progress_archival_summary_at = NULL, \
-             archival_claim_token = NULL \
+             archival_claim_token = NULL, \
+             last_too_large_at = NULL \
          WHERE id = ?4 \
            AND archival_claim_token = ?5 \
            AND updated_at = ?6 \
@@ -1017,6 +1021,14 @@ fn claim_batch(store: &SqliteStore, batch_size: usize) -> ReinResult<Vec<Claim>>
     let limit = batch_size.max(1) as i64;
 
     // Step 1: pick eligible ids (read-only scan).
+    //
+    // v0.27.5 R1 — too-large backoff: rows whose previous attempt returned
+    // `AttemptOutcome::TooLarge` get `last_too_large_at` stamped to now()
+    // and are sorted to the back of the queue so they don't reclaim every
+    // batch and starve newer eligible rows. Among too-large rows we still
+    // pick the one with the oldest stamp first (longest backoff elapsed),
+    // so an operator who later raises the input cap or chunks the row
+    // will see it retried before fresher too-large rows.
     let eligible_ids: Vec<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT m.id FROM memories m \
@@ -1028,7 +1040,10 @@ fn claim_batch(store: &SqliteStore, batch_size: usize) -> ReinResult<Vec<Claim>>
                    m.in_progress_archival_summary_at IS NULL \
                    OR m.in_progress_archival_summary_at < ?1 \
                ) \
-             ORDER BY COALESCE(m.updated_at, m.created_at) ASC \
+             ORDER BY \
+                 (m.last_too_large_at IS NULL) DESC, \
+                 m.last_too_large_at ASC, \
+                 COALESCE(m.updated_at, m.created_at) ASC \
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![&stale, limit], |row| {
@@ -1081,16 +1096,43 @@ fn release_claim(store: &SqliteStore, memory_id: &str, token: &str) -> ReinResul
     Ok(())
 }
 
+/// v0.27.5 R1 — release the claim AND stamp `last_too_large_at = now_unix`
+/// so `claim_batch` deprioritizes this row on subsequent passes. Both
+/// updates are predicated on the claim token so a stale worker can't
+/// stamp a row that a fresh owner is still processing.
+fn release_claim_too_large(
+    store: &SqliteStore,
+    memory_id: &str,
+    token: &str,
+    now_unix: i64,
+) -> ReinResult<()> {
+    store.conn().execute(
+        "UPDATE memories \
+         SET in_progress_archival_summary_at = NULL, \
+             archival_claim_token = NULL, \
+             last_too_large_at = ?3 \
+         WHERE id = ?1 AND archival_claim_token = ?2",
+        rusqlite::params![memory_id, token, now_unix],
+    )?;
+    Ok(())
+}
+
 /// Clear the flag (set to 0 = not needed) AND release the claim, **only
 /// if we still own it**. Used on degenerate-success exits (content
 /// already short, tier no longer cold). Predicate on token keeps a stale
 /// worker from clearing a fresh owner's claim.
 fn clear_flag_only(store: &SqliteStore, memory_id: &str, token: &str) -> ReinResult<()> {
+    // v0.27.5 R1 — also clear `last_too_large_at` on the degenerate-
+    // success path. The row no longer needs an archival summary
+    // (content is short / tier no longer cold), so the backoff stamp
+    // is no longer meaningful and shouldn't deprioritize the row on
+    // any future re-flagging.
     store.conn().execute(
         "UPDATE memories \
          SET needs_archival_summary = 0, \
              in_progress_archival_summary_at = NULL, \
-             archival_claim_token = NULL \
+             archival_claim_token = NULL, \
+             last_too_large_at = NULL \
          WHERE id = ?1 AND archival_claim_token = ?2",
         rusqlite::params![memory_id, token],
     )?;
@@ -1223,9 +1265,8 @@ fn refresh_one_for_handler_inner(
             }
         },
     };
-    let generator =
-        ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
-            .with_rein_config(std::sync::Arc::new(config.clone()));
+    let generator = ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
+        .with_rein_config(std::sync::Arc::new(config.clone()));
 
     // Manual refresh path doesn't go through claim_batch — operator-driven,
     // single-row, no contention model. We still write under the same
@@ -1246,6 +1287,12 @@ fn refresh_one_for_handler_inner(
     };
 
     let summary_chars = outcome.summary.chars().count();
+    // v0.27.5 R1 — clear `last_too_large_at` on manual refresh success
+    // for parity with the worker `process_one` success commit. Without
+    // this, a row that previously hit `AttemptOutcome::TooLarge` and
+    // was later fixed by the operator (e.g. raised the input cap and
+    // ran `archive_summary_refresh`) would still be deprioritized in
+    // future `claim_batch` passes, defeating the manual fix.
     let now = Utc::now().timestamp();
     let affected = store.conn().execute(
         "UPDATE memories \
@@ -1254,7 +1301,8 @@ fn refresh_one_for_handler_inner(
              archival_summary_version = ?3, \
              needs_archival_summary = 0, \
              in_progress_archival_summary_at = NULL, \
-             archival_claim_token = NULL \
+             archival_claim_token = NULL, \
+             last_too_large_at = NULL \
          WHERE id = ?4 \
            AND status IN ('active', 'updated') \
            AND tier = 'cold'",
@@ -1695,7 +1743,11 @@ mod tests {
 
             // Extractor called exactly once.
             if let ExtractorKind::Mock(mock) = &*extractor {
-                assert_eq!(mock.call_count(), 1, "extractor must be called exactly once");
+                assert_eq!(
+                    mock.call_count(),
+                    1,
+                    "extractor must be called exactly once"
+                );
             }
 
             // The user-prompt text captured by the probe must contain at most
@@ -2120,6 +2172,132 @@ mod tests {
             assert!(saved.is_some(), "summary persisted post-fallback");
             assert_eq!(version, Some(ARCHIVAL_SUMMARY_VERSION as i64));
             assert_eq!(flag, 0, "needs_archival_summary cleared on success");
+        }
+
+        /// v0.27.5 R1 — too-large backoff: rows whose previous attempt
+        /// stamped `last_too_large_at` MUST sort to the back of the
+        /// `claim_batch` queue so they don't reclaim every pass and
+        /// starve newer eligible rows. A NULL stamp (= never marked
+        /// too-large) is highest priority; among stamped rows the
+        /// oldest is tried first so an operator who later raises the
+        /// input cap retries the longest-deferred row first.
+        #[test]
+        fn claim_batch_deprioritizes_rows_with_last_too_large_at() {
+            let (config, _tmp) = fresh_store();
+            let store = config.open_store().expect("open store");
+
+            // Three eligible rows. `seed_cold_flagged` already sets
+            // `needs_archival_summary = 1`, `tier = 'cold'`, `status =
+            // 'active'`, `last_too_large_at = NULL`.
+            seed_cold_flagged(&store, "fresh1", "fresh content 1", "2026-04-01T00:00:00Z");
+            seed_cold_flagged(
+                &store,
+                "older_oversized",
+                "old oversized content",
+                "2026-04-02T00:00:00Z",
+            );
+            seed_cold_flagged(
+                &store,
+                "newer_oversized",
+                "newer oversized content",
+                "2026-04-03T00:00:00Z",
+            );
+
+            // Stamp the two "oversized" rows with `last_too_large_at` to
+            // simulate a prior `AttemptOutcome::TooLarge`. The "older_oversized"
+            // row was deferred earlier (smaller stamp) so it should be retried
+            // before "newer_oversized" once we look past the NULL-stamped row.
+            store
+                .conn()
+                .execute(
+                    "UPDATE memories SET last_too_large_at = 1700000000 WHERE id = 'older_oversized'",
+                    [],
+                )
+                .expect("stamp older_oversized");
+            store
+                .conn()
+                .execute(
+                    "UPDATE memories SET last_too_large_at = 1800000000 WHERE id = 'newer_oversized'",
+                    [],
+                )
+                .expect("stamp newer_oversized");
+
+            // Claim batch of 3 — order must be: NULL-stamp first, then
+            // oldest stamp, then newest stamp.
+            let claims = claim_batch(&store, 3).expect("claim_batch ok");
+            let ids: Vec<String> = claims.into_iter().map(|c| c.memory_id).collect();
+            assert_eq!(
+                ids,
+                vec![
+                    "fresh1".to_string(),
+                    "older_oversized".to_string(),
+                    "newer_oversized".to_string(),
+                ],
+                "claim_batch must order: NULL last_too_large_at first, then \
+                 oldest stamp, then newer stamp"
+            );
+        }
+
+        /// v0.27.5 R1 — `release_claim_too_large` stamps
+        /// `last_too_large_at = now()` AND clears the claim, both
+        /// predicated on token match so a stale worker can't clobber
+        /// a fresh owner.
+        #[test]
+        fn release_claim_too_large_stamps_and_clears_only_on_token_match() {
+            let (config, _tmp) = fresh_store();
+            let store = config.open_store().expect("open store");
+
+            seed_cold_flagged(&store, "row1", "content", "2026-04-01T00:00:00Z");
+            // Stamp a fake claim token so the test exercises the predicate.
+            store
+                .conn()
+                .execute(
+                    "UPDATE memories SET archival_claim_token = 'TOKEN_OWNED', \
+                     in_progress_archival_summary_at = '2026-04-01T01:00:00Z' \
+                     WHERE id = 'row1'",
+                    [],
+                )
+                .expect("stamp claim");
+
+            // Wrong-token release is a no-op.
+            release_claim_too_large(&store, "row1", "TOKEN_STALE", 1900000000)
+                .expect("release with wrong token must be Ok no-op");
+            let still_owned: String = store
+                .conn()
+                .query_row(
+                    "SELECT archival_claim_token FROM memories WHERE id = 'row1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read token");
+            assert_eq!(
+                still_owned, "TOKEN_OWNED",
+                "wrong-token release must not clear claim"
+            );
+            let stamp: Option<i64> = store
+                .conn()
+                .query_row(
+                    "SELECT last_too_large_at FROM memories WHERE id = 'row1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read stamp");
+            assert!(stamp.is_none(), "wrong-token release must not stamp");
+
+            // Right-token release clears claim and stamps.
+            release_claim_too_large(&store, "row1", "TOKEN_OWNED", 1900000000)
+                .expect("release with correct token");
+            let (claim_token, stamp): (Option<String>, Option<i64>) = store
+                .conn()
+                .query_row(
+                    "SELECT archival_claim_token, last_too_large_at \
+                     FROM memories WHERE id = 'row1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read row");
+            assert!(claim_token.is_none(), "right-token release clears claim");
+            assert_eq!(stamp, Some(1900000000), "right-token release stamps now");
         }
     }
 }

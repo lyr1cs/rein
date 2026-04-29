@@ -595,6 +595,67 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     // violations are absorbed in the cron emit path as no-ops.
     migrate_offlinecron_dedup_index(conn)?;
 
+    // v0.27.5 R3: pre-LLM cron claim row. Closes the v0.27.4 R9 P2
+    // residual race — two concurrent cron passes can both clear the
+    // `cron_event_already_emitted` LIKE check, both `reserve_call`
+    // burns of `daily_call_cap`, both pay for an LLM call, with the
+    // second eventually losing on the F4 A3 UNIQUE index. The
+    // `cron_claims` row inserted via INSERT OR IGNORE BEFORE
+    // `reserve_call` makes the dedup atomic and pre-LLM, so only the
+    // claim winner pays.
+    migrate_cron_claims(conn)?;
+
+    Ok(())
+}
+
+/// v0.27.5 R3 — pre-LLM cron claim table. PRIMARY KEY on
+/// `(event_type, surface_id, stamp_hash)` lets `INSERT OR IGNORE`
+/// atomically arbitrate between concurrent cron workers: only the
+/// first writer to claim a tuple proceeds to `reserve_call`/LLM/emit;
+/// the loser sees `INSERT OR IGNORE` affect 0 rows and short-circuits
+/// to `SkippedDuplicate` without burning any `daily_call_cap` quota.
+///
+/// `claim_token` (Codex R3 P2 fix) makes `release_cron_claim` safe
+/// after stale-claim takeover: every successful claim mints a fresh
+/// ULID, takeover overwrites the token, and DELETE predicates on the
+/// caller's token so a slow original cron whose claim was stolen by
+/// a fresh peer can't accidentally clear the new owner's row.
+///
+/// Idempotent. Safe to call on fresh DBs and DBs that already have the
+/// table (the `claim_token` ALTER is gated on a `pragma_table_info`
+/// check so re-runs are no-ops).
+pub fn migrate_cron_claims(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS cron_claims (
+            event_type TEXT NOT NULL,
+            surface_id TEXT NOT NULL,
+            stamp_hash TEXT NOT NULL,
+            claim_token TEXT NOT NULL DEFAULT '',
+            claimed_at INTEGER NOT NULL,
+            PRIMARY KEY (event_type, surface_id, stamp_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cron_claims_claimed_at
+            ON cron_claims(claimed_at);
+        ",
+    )?;
+    // Idempotent ALTER for any DB that landed on the v0.27.5 pre-codex-R3
+    // schema (no `claim_token` column). `pragma_table_info` guards prevent
+    // re-running the ALTER on already-migrated DBs.
+    let has_claim_token: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('cron_claims') WHERE name='claim_token'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_claim_token {
+        conn.execute_batch(
+            "ALTER TABLE cron_claims ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''",
+        )
+        .ok();
+    }
     Ok(())
 }
 
@@ -808,6 +869,23 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
              ALTER TABLE memories ADD COLUMN archival_claim_token TEXT;",
         )
         .ok();
+    }
+    // v0.27.5 R1: too-large backoff — `claim_batch` deprioritizes rows whose
+    // last attempt returned `AttemptOutcome::TooLarge` so a permanently
+    // oversized row doesn't starve newer eligible rows. Unix epoch seconds;
+    // NULL means "never marked too-large" and sorts first in the claim
+    // ORDER BY (highest priority).
+    let has_last_too_large: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='last_too_large_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_last_too_large {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN last_too_large_at INTEGER")
+            .ok();
     }
     // No backfill: existing cold rows stay NULL until run_tiering re-flags them.
     Ok(())

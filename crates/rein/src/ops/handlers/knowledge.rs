@@ -1103,9 +1103,7 @@ impl OpsRuntime {
                         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                             .unwrap_or_default();
                     let synthetic_cid =
-                        crate::ops::concept_summary::synthetic_cluster_id_for_concept(
-                            &concept.id,
-                        );
+                        crate::ops::concept_summary::synthetic_cluster_id_for_concept(&concept.id);
                     match crate::ops::concept_summary::decide_concept_summary_quality(
                         global_enabled,
                         Some(synthetic_cid),

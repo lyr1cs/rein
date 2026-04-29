@@ -508,6 +508,13 @@ impl SqliteStore {
                     // the row stays invisible to the vector channel until
                     // some other event re-flags it. Mirrors the
                     // resummarize path (`ops/resummerize.rs::apply_resummerize`).
+                    // v0.27.5 R1 — also clear `last_too_large_at` on this
+                    // raw refine path. Mirrors the `update()` semantic-
+                    // change clear added in R1; without it, a row that
+                    // previously hit `AttemptOutcome::TooLarge` and is
+                    // then rewritten via `apply_evolution` would keep
+                    // the stale stamp and `claim_batch` would still
+                    // deprioritize the (now potentially smaller) content.
                     self.conn.execute(
                         "UPDATE memories SET content = ?1, summary = ?2, \
                                               updated_at = ?3, status = 'updated', \
@@ -517,7 +524,8 @@ impl SqliteStore {
                                               archival_summary_version = NULL, \
                                               needs_archival_summary = 1, \
                                               in_progress_archival_summary_at = NULL, \
-                                              archival_claim_token = NULL \
+                                              archival_claim_token = NULL, \
+                                              last_too_large_at = NULL \
                          WHERE id = ?4",
                         rusqlite::params![
                             refined_content,

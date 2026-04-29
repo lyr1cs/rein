@@ -279,10 +279,12 @@ pub fn dispatch_one(
             ceiling = JUDGE_DISPATCH_CEILING,
             "judge worker: payload exceeds dispatch ceiling; dropped pre-reservation"
         );
-        return Ok(DispatchResult::Dropped(DropReason::ContractViolation(format!(
-            "judge job payload too large at dispatch ({} chars > ceiling {})",
-            combined_len, JUDGE_DISPATCH_CEILING
-        ))));
+        return Ok(DispatchResult::Dropped(DropReason::ContractViolation(
+            format!(
+                "judge job payload too large at dispatch ({} chars > ceiling {})",
+                combined_len, JUDGE_DISPATCH_CEILING
+            ),
+        )));
     }
 
     // J2 atomic reservation — runs `BEGIN IMMEDIATE` so concurrent
@@ -463,11 +465,9 @@ fn cache_has_id_and_stamp(
     // F4 A4 — delegate the cache scan + TTL filter to the shared
     // helper so the worker and manual MCP path agree on stale-row
     // semantics. Then layer the stamp_hash predicate on top.
-    crate::ops::handlers::judge::read_cache_entries_within_ttl(
-        path, id_field, id_value, ttl_secs,
-    )
-    .iter()
-    .any(|value| value.get("stamp_hash").and_then(|v| v.as_str()) == Some(stamp_hash))
+    crate::ops::handlers::judge::read_cache_entries_within_ttl(path, id_field, id_value, ttl_secs)
+        .iter()
+        .any(|value| value.get("stamp_hash").and_then(|v| v.as_str()) == Some(stamp_hash))
 }
 
 fn concept_summary_target_exists(
