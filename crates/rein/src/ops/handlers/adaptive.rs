@@ -384,7 +384,8 @@ impl OpsRuntime {
         rest(method = "GET", path = "/api/adaptive")
     )]
     pub fn adaptive_status(&self) -> ReinResult<AdaptiveStatusOutput> {
-        let value = self.with_store(|s| Ok(crate::ops::adaptive_status(s)))?;
+        let config = self.config.clone();
+        let value = self.with_store(|s| Ok(crate::ops::adaptive_status_with_config(s, &config)))?;
         Ok(AdaptiveStatusOutput(value))
     }
 }
