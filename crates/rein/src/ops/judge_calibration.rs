@@ -24,10 +24,10 @@
 //!    filter, applied-prefix bump, replay-drain, CAS merge.
 //!
 //! 3. **`bootstrap_priors_from_corpus`** ([`bootstrap_priors_from_corpus`]):
-//!    v0.28 forward-compat hook (§16.2). v0.27.1 returns
-//!    [`BootstrapPriors::const_defaults`] — pure const, no I/O, no LLM. Locks
-//!    the function signature so v0.28 implementation slots in without
-//!    changing caller signatures.
+//!    v0.28 forward-compat hook (§16.2). Default-off returns
+//!    [`BootstrapPriors::const_defaults`] — pure const, no I/O, no LLM. When
+//!    `[ars.acceleration].enabled=true`, it may read a DB-scoped prior
+//!    snapshot before later corpus/replay slices are wired in.
 //!
 //! ## Cron is emit-only (§7 step 5; Codex R6 P2)
 //!
@@ -57,8 +57,9 @@ use crate::config::ReinConfig;
 use crate::eval::llm_judge::kappa_runtime_vs_offline;
 use crate::store::adaptive::{
     commit_offset, emit_event, peek_events, AdaptiveState,
-    ConceptSummaryLlmJudgeOfflineCronPayload, EventType, FeedbackEvent, JudgeCalibrationState,
-    JudgeMetadata, SynthesisLlmJudgeOfflineCronPayload, JUDGE_DRIFT_MIN_PAIRS,
+    ConceptSummaryLlmJudgeOfflineCronPayload, ConceptSummaryLlmJudgePayload, EventType,
+    FeedbackEvent, JudgeCalibrationState, JudgeMetadata, SignalHint,
+    SynthesisLlmJudgeOfflineCronPayload, SynthesisLlmJudgePayload, JUDGE_DRIFT_MIN_PAIRS,
     JUDGE_DRIFT_THRESHOLD, JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
 };
 use crate::store::SqliteStore;
@@ -91,16 +92,53 @@ const PEEK_BATCH_LIMIT: usize = 50_000;
 ///    W_VIEW / W_CLICK / W_THUMB / W_REQ / useful_rate threshold
 /// 3. Apply hierarchical shrinkage (S2 brainstorm: topic → cluster →
 ///    memory) so cold clusters borrow same-topic prior
-/// 4. Write to `~/.rein/judge_priors.json` snapshot — adaptive engine reads
-///    on boot and uses as Bayesian prior; production feedback updates the
-///    posterior
+/// 4. Write to DB-scoped
+///    `<resolve_buffer_dir>/queue/<db_hash>/bootstrap_priors.json` snapshot —
+///    adaptive engine reads on boot and uses as Bayesian prior; production
+///    feedback updates the posterior
 ///
-/// **v0.27.1**: returns `BootstrapPriors::const_defaults()`. NO file I/O.
-/// NO LLM calls. The `_config` parameter is intentionally unused and kept
-/// only to lock the v0.28 signature.
-pub fn bootstrap_priors_from_corpus(_config: &ReinConfig) -> ReinResult<BootstrapPriors> {
-    // v0.27.1 stub: return const defaults. NO file I/O, NO LLM calls.
-    Ok(BootstrapPriors::const_defaults())
+/// **v0.28.0**: default config still performs no file I/O and no LLM calls.
+/// `[ars.acceleration].enabled=true` opts into reading a DB-scoped
+/// `bootstrap_priors.json` snapshot. Missing/corrupt snapshots fall back to
+/// const defaults through the finite-prior derivation path with an empty
+/// corpus until a later slice wires fixtures/replay into this helper.
+pub fn bootstrap_priors_from_corpus(config: &ReinConfig) -> ReinResult<BootstrapPriors> {
+    if !config.ars.acceleration.enabled {
+        return Ok(BootstrapPriors::const_defaults());
+    }
+    if let Some(priors) = load_bootstrap_priors_snapshot(config) {
+        return Ok(priors);
+    }
+    Ok(derive_priors_from_signal_hints(&[]))
+}
+
+/// Opt-in v0.28 replay bootstrap from already-durable runtime judge events.
+///
+/// Default-off is deliberately pure with respect to the database: callers can
+/// pass an unopened/missing schema test connection and still receive constants.
+/// When enabled, a valid DB-scoped snapshot wins; otherwise this scans a bounded
+/// recent window for explicit `signal_hint` labels.
+pub fn bootstrap_priors_from_replay(
+    config: &ReinConfig,
+    conn: &Connection,
+) -> ReinResult<BootstrapPriors> {
+    if !config.ars.acceleration.enabled {
+        return Ok(BootstrapPriors::const_defaults());
+    }
+    if let Some(priors) = load_bootstrap_priors_snapshot(config) {
+        return Ok(priors);
+    }
+    let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
+    let hints = load_signal_hints_from_feedback_events(conn, cutoff, 50_000)?;
+    Ok(derive_priors_from_signal_hints(&hints))
+}
+
+/// DB-scoped prior snapshot path for v0.28 acceleration bootstrap.
+///
+/// Kept under the same queue namespace as cron archives so multiple Rein
+/// databases using the same `buffer_dir` do not share learned priors.
+pub fn bootstrap_priors_snapshot_path(config: &ReinConfig) -> PathBuf {
+    db_scoped_queue_dir(config, true).join("bootstrap_priors.json")
 }
 
 /// Bootstrap priors snapshot. v0.27.1 = const defaults; v0.28+ = posterior-
@@ -131,6 +169,168 @@ impl BootstrapPriors {
             weight_decay_rate: 0.3,
             prior_confidence: 0.0,
         }
+    }
+}
+
+fn derive_priors_from_signal_hints(hints: &[SignalHint]) -> BootstrapPriors {
+    let defaults = BootstrapPriors::const_defaults();
+    let mut view = PriorAccumulator::default();
+    let mut click = PriorAccumulator::default();
+    let mut thumb = PriorAccumulator::default();
+    let mut req = PriorAccumulator::default();
+    let mut ci = PriorAccumulator::default();
+
+    for hint in hints {
+        view.push_nonnegative(hint.inferred_w_view);
+        click.push_nonnegative(hint.inferred_w_click);
+        thumb.push_nonnegative(hint.inferred_w_thumb);
+        req.push_nonnegative(hint.inferred_w_req);
+        ci.push_unit(hint.useful_rate_ci_width);
+    }
+
+    let confidence = view
+        .count
+        .max(click.count)
+        .max(thumb.count)
+        .max(req.count)
+        .max(ci.count) as f64;
+    if confidence == 0.0 {
+        return defaults;
+    }
+
+    let useful_rate_threshold = ci
+        .mean()
+        .map(|width| (defaults.useful_rate_threshold + (width - 0.5) * 0.2).clamp(0.1, 0.9))
+        .unwrap_or(defaults.useful_rate_threshold);
+
+    BootstrapPriors {
+        w_view: view.mean().unwrap_or(defaults.w_view),
+        w_click: click.mean().unwrap_or(defaults.w_click),
+        w_thumb: thumb.mean().unwrap_or(defaults.w_thumb),
+        w_req: req.mean().unwrap_or(defaults.w_req),
+        useful_rate_threshold,
+        weight_decay_rate: defaults.weight_decay_rate,
+        prior_confidence: confidence,
+    }
+}
+
+fn extract_signal_hint_from_judge_event(event_type: &str, payload: &str) -> Option<SignalHint> {
+    match event_type {
+        "synthesis_llm_judge" => serde_json::from_str::<SynthesisLlmJudgePayload>(payload)
+            .ok()
+            .and_then(|p| p.signal_hint),
+        "concept_summary_llm_judge" => {
+            serde_json::from_str::<ConceptSummaryLlmJudgePayload>(payload)
+                .ok()
+                .and_then(|p| p.signal_hint)
+        }
+        _ => None,
+    }
+}
+
+fn load_signal_hints_from_feedback_events(
+    conn: &Connection,
+    cutoff_unix_ts: i64,
+    limit: usize,
+) -> ReinResult<Vec<SignalHint>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let capped_limit = limit.min(50_000) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT event_type, payload FROM feedback_events
+         WHERE event_type IN ('synthesis_llm_judge', 'concept_summary_llm_judge')
+           AND payload IS NOT NULL
+           AND ts > datetime(?1, 'unixepoch')
+         ORDER BY id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cutoff_unix_ts, capped_limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut hints = Vec::new();
+    for row in rows {
+        let (event_type, payload) = row?;
+        let Some(payload) = payload else { continue };
+        if let Some(hint) = extract_signal_hint_from_judge_event(&event_type, &payload) {
+            hints.push(hint);
+        }
+    }
+    Ok(hints)
+}
+
+fn load_bootstrap_priors_snapshot(config: &ReinConfig) -> Option<BootstrapPriors> {
+    let raw = std::fs::read_to_string(bootstrap_priors_snapshot_read_path(config)).ok()?;
+    let priors = serde_json::from_str::<BootstrapPriors>(&raw).ok()?;
+    sanitize_bootstrap_priors(priors)
+}
+
+fn bootstrap_priors_snapshot_read_path(config: &ReinConfig) -> PathBuf {
+    db_scoped_queue_dir(config, false).join("bootstrap_priors.json")
+}
+
+fn sanitize_bootstrap_priors(priors: BootstrapPriors) -> Option<BootstrapPriors> {
+    let BootstrapPriors {
+        w_view,
+        w_click,
+        w_thumb,
+        w_req,
+        useful_rate_threshold,
+        weight_decay_rate,
+        prior_confidence,
+    } = priors;
+    if [w_view, w_click, w_thumb, w_req, prior_confidence]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return None;
+    }
+    if !useful_rate_threshold.is_finite() || !(0.0..=1.0).contains(&useful_rate_threshold) {
+        return None;
+    }
+    if !weight_decay_rate.is_finite() || !(0.0..=1.0).contains(&weight_decay_rate) {
+        return None;
+    }
+    Some(BootstrapPriors {
+        w_view,
+        w_click,
+        w_thumb,
+        w_req,
+        useful_rate_threshold,
+        weight_decay_rate,
+        prior_confidence,
+    })
+}
+
+#[derive(Default)]
+struct PriorAccumulator {
+    sum: f64,
+    count: u64,
+}
+
+impl PriorAccumulator {
+    fn push_nonnegative(&mut self, value: Option<f64>) {
+        let Some(value) = value else {
+            return;
+        };
+        if value.is_finite() && value >= 0.0 {
+            self.sum += value;
+            self.count = self.count.saturating_add(1);
+        }
+    }
+
+    fn push_unit(&mut self, value: Option<f64>) {
+        let Some(value) = value else {
+            return;
+        };
+        if value.is_finite() {
+            self.sum += value.clamp(0.0, 1.0);
+            self.count = self.count.saturating_add(1);
+        }
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.count > 0).then_some(self.sum / self.count as f64)
     }
 }
 
@@ -188,6 +388,12 @@ pub fn should_archive_for_cron(synthesis_id: &str, rate: f64) -> bool {
 /// across both queue families. If `extract::hooks::queue` ever exposes the
 /// helper publicly, this should switch to it (TODO Wave-1.5).
 pub fn cron_archive_path(config: &ReinConfig, date: chrono::NaiveDate, shard: u32) -> PathBuf {
+    let queue_dir = db_scoped_queue_dir(config, true);
+    let date_str = date.format("%Y%m%d").to_string();
+    queue_dir.join(format!("synthesis_cron_archive_{date_str}_{shard}.jsonl"))
+}
+
+fn db_scoped_queue_dir(config: &ReinConfig, create: bool) -> PathBuf {
     let base = crate::extract::hooks::buffer::resolve_buffer_dir(config);
     let db_tag = {
         use std::hash::{Hash, Hasher};
@@ -196,9 +402,10 @@ pub fn cron_archive_path(config: &ReinConfig, date: chrono::NaiveDate, shard: u3
         format!("{:016x}", h.finish())
     };
     let queue_dir = base.join("queue").join(&db_tag);
-    let _ = std::fs::create_dir_all(&queue_dir);
-    let date_str = date.format("%Y%m%d").to_string();
-    queue_dir.join(format!("synthesis_cron_archive_{date_str}_{shard}.jsonl"))
+    if create {
+        let _ = std::fs::create_dir_all(&queue_dir);
+    }
+    queue_dir
 }
 
 // ── M1 consumer — `judge_calibration` ───────────────────────────────────────
@@ -1499,6 +1706,69 @@ mod tests {
         .unwrap()
     }
 
+    fn emit_runtime_synth_with_hint(
+        conn: &Connection,
+        synthesis_id: &str,
+        hint: SignalHint,
+    ) -> i64 {
+        let payload = SynthesisLlmJudgePayload {
+            synthesis_id: synthesis_id.to_string(),
+            judge_model: "model-r".into(),
+            hit: true,
+            reason: "useful".into(),
+            stamp_hash: "deadbeef".into(),
+            source: crate::store::adaptive::JudgeSource::AutoSampled,
+            metadata: None,
+            signal_hint: Some(hint),
+        };
+        super::emit_event(
+            conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::to_value(&payload).unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
+    fn emit_runtime_concept_with_hint(
+        conn: &Connection,
+        concept_summary_id: &str,
+        hint: SignalHint,
+    ) -> i64 {
+        let payload = ConceptSummaryLlmJudgePayload {
+            concept_summary_id: concept_summary_id.to_string(),
+            concept_id: "concept-1".into(),
+            judge_model: "model-r".into(),
+            hit: true,
+            reason: "good summary".into(),
+            stamp_hash: "cafebabe".into(),
+            source: crate::store::adaptive::JudgeSource::AutoSampled,
+            metadata: None,
+            signal_hint: Some(hint),
+        };
+        super::emit_event(
+            conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: Some("concept-1".into()),
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::to_value(&payload).unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn bootstrap_priors_stub_returns_const_defaults() {
         // §16.2 contract — v0.27.1 stub MUST return BootstrapPriors::const_defaults
@@ -1508,6 +1778,298 @@ mod tests {
         let defaults = BootstrapPriors::const_defaults();
         assert_eq!(priors, defaults);
         assert_eq!(priors.prior_confidence, 0.0);
+    }
+
+    #[test]
+    fn bootstrap_priors_enabled_without_corpus_returns_const_defaults() {
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+
+        let priors = bootstrap_priors_from_corpus(&config).expect("empty corpus never errors");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+    }
+
+    #[test]
+    fn bootstrap_priors_default_off_does_not_create_snapshot_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+
+        let priors = bootstrap_priors_from_corpus(&config).expect("default path");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+        assert!(
+            !tmp.path().join("buffers").exists(),
+            "default-off prior bootstrap must not create queue/snapshot directories"
+        );
+    }
+
+    #[test]
+    fn bootstrap_priors_enabled_missing_snapshot_does_not_create_snapshot_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+
+        let priors = bootstrap_priors_from_corpus(&config).expect("missing snapshot falls back");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+        assert!(
+            !tmp.path().join("buffers").exists(),
+            "missing snapshot read path must not create queue/snapshot directories"
+        );
+    }
+
+    #[test]
+    fn bootstrap_priors_loads_valid_snapshot_when_acceleration_enabled() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        let snapshot = BootstrapPriors {
+            w_view: 1.2,
+            w_click: 1.4,
+            w_thumb: 2.2,
+            w_req: 0.8,
+            useful_rate_threshold: 0.61,
+            weight_decay_rate: 0.25,
+            prior_confidence: 11.0,
+        };
+        std::fs::write(
+            bootstrap_priors_snapshot_path(&config),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let priors = bootstrap_priors_from_corpus(&config).expect("snapshot should load");
+
+        assert_eq!(priors, snapshot);
+    }
+
+    #[test]
+    fn bootstrap_priors_ignores_corrupt_snapshot() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        std::fs::write(bootstrap_priors_snapshot_path(&config), "{not json").unwrap();
+
+        let priors = bootstrap_priors_from_corpus(&config).expect("corrupt snapshot falls back");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+    }
+
+    #[test]
+    fn bootstrap_priors_from_replay_default_off_does_not_read_db() {
+        let config = crate::config::ReinConfig::default();
+        let conn = Connection::open_in_memory().unwrap();
+
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("default-off path");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+    }
+
+    #[test]
+    fn bootstrap_priors_from_replay_prefers_valid_snapshot() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        let snapshot = BootstrapPriors {
+            w_view: 1.25,
+            w_click: 1.75,
+            w_thumb: 2.25,
+            w_req: 1.1,
+            useful_rate_threshold: 0.55,
+            weight_decay_rate: 0.2,
+            prior_confidence: 9.0,
+        };
+        std::fs::write(
+            bootstrap_priors_snapshot_path(&config),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("snapshot path");
+
+        assert_eq!(priors, snapshot);
+    }
+
+    #[test]
+    fn bootstrap_priors_from_replay_derives_from_runtime_signal_hints() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        let conn = setup_db();
+        emit_runtime_synth_with_hint(
+            &conn,
+            "synth-1",
+            SignalHint {
+                inferred_w_view: Some(1.4),
+                inferred_w_click: Some(2.0),
+                inferred_w_thumb: Some(2.6),
+                inferred_w_req: Some(0.8),
+                useful_rate_ci_width: Some(0.25),
+            },
+        );
+        emit_runtime_concept_with_hint(
+            &conn,
+            "summary-1",
+            SignalHint {
+                inferred_w_view: Some(0.6),
+                inferred_w_click: Some(1.0),
+                inferred_w_thumb: Some(1.4),
+                inferred_w_req: Some(2.2),
+                useful_rate_ci_width: Some(0.75),
+            },
+        );
+
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("replay path");
+
+        assert!((priors.w_view - 1.0).abs() < f64::EPSILON);
+        assert!((priors.w_click - 1.5).abs() < f64::EPSILON);
+        assert!((priors.w_thumb - 2.0).abs() < f64::EPSILON);
+        assert!((priors.w_req - 1.5).abs() < f64::EPSILON);
+        assert_eq!(priors.prior_confidence, 2.0);
+    }
+
+    #[test]
+    fn extract_signal_hint_accepts_only_runtime_judge_events() {
+        let hint = SignalHint {
+            inferred_w_view: Some(1.4),
+            inferred_w_click: Some(1.6),
+            inferred_w_thumb: Some(2.2),
+            inferred_w_req: Some(0.9),
+            useful_rate_ci_width: Some(0.4),
+        };
+        let payload = SynthesisLlmJudgePayload {
+            synthesis_id: "synth-1".into(),
+            judge_model: "model-r".into(),
+            hit: true,
+            reason: "useful".into(),
+            stamp_hash: "deadbeef".into(),
+            source: crate::store::adaptive::JudgeSource::AutoSampled,
+            metadata: None,
+            signal_hint: Some(hint.clone()),
+        };
+        let raw = serde_json::to_string(&payload).unwrap();
+
+        assert_eq!(
+            extract_signal_hint_from_judge_event("synthesis_llm_judge", &raw),
+            Some(hint)
+        );
+        assert_eq!(
+            extract_signal_hint_from_judge_event("synthesis_llm_judge_offline_cron", &raw),
+            None
+        );
+        assert_eq!(
+            extract_signal_hint_from_judge_event("synthesis_llm_judge", "{not json"),
+            None
+        );
+    }
+
+    #[test]
+    fn load_signal_hints_from_feedback_events_honors_limit() {
+        let conn = setup_db();
+        emit_runtime_synth_with_hint(
+            &conn,
+            "synth-1",
+            SignalHint {
+                inferred_w_view: Some(1.0),
+                inferred_w_click: None,
+                inferred_w_thumb: None,
+                inferred_w_req: None,
+                useful_rate_ci_width: None,
+            },
+        );
+        emit_runtime_synth_with_hint(
+            &conn,
+            "synth-2",
+            SignalHint {
+                inferred_w_view: Some(2.0),
+                inferred_w_click: None,
+                inferred_w_thumb: None,
+                inferred_w_req: None,
+                useful_rate_ci_width: None,
+            },
+        );
+
+        let hints = load_signal_hints_from_feedback_events(&conn, 0, 1).expect("load hints");
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].inferred_w_view, Some(2.0));
+    }
+
+    #[test]
+    fn derive_priors_from_signal_hints_uses_finite_hints() {
+        let hints = vec![
+            SignalHint {
+                inferred_w_view: Some(1.2),
+                inferred_w_click: Some(1.8),
+                inferred_w_thumb: Some(2.4),
+                inferred_w_req: Some(1.0),
+                useful_rate_ci_width: Some(0.25),
+            },
+            SignalHint {
+                inferred_w_view: Some(0.8),
+                inferred_w_click: Some(1.2),
+                inferred_w_thumb: Some(1.6),
+                inferred_w_req: Some(2.0),
+                useful_rate_ci_width: Some(0.75),
+            },
+        ];
+
+        let priors = derive_priors_from_signal_hints(&hints);
+
+        assert!((priors.w_view - 1.0).abs() < f64::EPSILON);
+        assert!((priors.w_click - 1.5).abs() < f64::EPSILON);
+        assert!((priors.w_thumb - 2.0).abs() < f64::EPSILON);
+        assert!((priors.w_req - 1.5).abs() < f64::EPSILON);
+        assert_eq!(priors.useful_rate_threshold, 0.5);
+        assert_eq!(
+            priors.weight_decay_rate,
+            BootstrapPriors::const_defaults().weight_decay_rate
+        );
+        assert_eq!(priors.prior_confidence, 2.0);
+    }
+
+    #[test]
+    fn derive_priors_from_signal_hints_ignores_invalid_values_per_field() {
+        let defaults = BootstrapPriors::const_defaults();
+        let hints = vec![
+            SignalHint {
+                inferred_w_view: Some(f64::NAN),
+                inferred_w_click: Some(-1.0),
+                inferred_w_thumb: Some(f64::INFINITY),
+                inferred_w_req: Some(3.0),
+                useful_rate_ci_width: Some(2.0),
+            },
+            SignalHint {
+                inferred_w_view: None,
+                inferred_w_click: None,
+                inferred_w_thumb: None,
+                inferred_w_req: None,
+                useful_rate_ci_width: None,
+            },
+        ];
+
+        let priors = derive_priors_from_signal_hints(&hints);
+
+        assert_eq!(priors.w_view, defaults.w_view);
+        assert_eq!(priors.w_click, defaults.w_click);
+        assert_eq!(priors.w_thumb, defaults.w_thumb);
+        assert_eq!(priors.w_req, 3.0);
+        assert!((0.1..=0.9).contains(&priors.useful_rate_threshold));
+        assert_eq!(priors.prior_confidence, 1.0);
     }
 
     #[test]

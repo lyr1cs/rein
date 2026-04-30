@@ -85,6 +85,14 @@ impl OpsRuntime {
         let aligned_metadata = match &params.metadata {
             Some(meta) => {
                 let mut m = meta.clone();
+                if m.route_context.is_none() {
+                    m.route_context = Some(crate::store::adaptive::RecallRouteContext {
+                        request_id: Some(params.recall_id.clone()),
+                        query_type: meta.query_type.clone(),
+                        cluster_id: meta.cluster_id,
+                        cluster_version: None,
+                    });
+                }
                 m.cluster_id = Some(synthetic_cid);
                 m.query_type = Some(
                     crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH.to_string(),
@@ -185,6 +193,7 @@ mod tests {
                 cluster_id: Some(42),
                 concept_chars: Some(800),
                 revision_version: Some(3),
+                route_context: None,
             }),
         };
         let json = serde_json::to_string(&p).unwrap();
@@ -244,5 +253,70 @@ mod tests {
             serde_json::from_value(json).expect("missing metadata must parse to None");
         assert_eq!(parsed.concept_id, "con-x");
         assert!(parsed.metadata.is_none());
+    }
+
+    #[test]
+    fn feedback_concept_summary_promotes_real_route_to_shadow_and_keeps_synthetic_metadata() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = crate::ops::OpsRuntime::for_rest(std::sync::Arc::new(config));
+        let concept_id = "concept-route-shadow".to_string();
+        let synthetic_cid =
+            crate::ops::concept_summary::synthetic_cluster_id_for_concept(&concept_id);
+
+        let out = runtime
+            .feedback_concept_summary(ConceptSummaryFeedbackParams {
+                concept_id: concept_id.clone(),
+                concept_summary_id: Some("cs-route-shadow".into()),
+                living_summary_id: None,
+                recall_id: "rec-route-shadow".into(),
+                interaction: crate::store::adaptive::ConceptSummaryInteractionKind::Viewed {
+                    dwell_ms: 4200,
+                },
+                metadata: Some(crate::store::adaptive::ConceptSummaryMetadata {
+                    query_type: Some("Exploratory".into()),
+                    cluster_id: Some(7),
+                    concept_chars: Some(800),
+                    revision_version: Some(3),
+                    route_context: None,
+                }),
+            })
+            .expect("feedback should emit");
+        assert_eq!(out.emitted, 1);
+
+        runtime
+            .with_store(|store| {
+                let (query_type, payload): (Option<String>, String) = store.conn().query_row(
+                    "SELECT query_type, payload FROM feedback_events \
+                     WHERE event_type = 'concept_summary_interaction'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let payload: crate::store::adaptive::ConceptSummaryInteractionPayload =
+                    serde_json::from_str(&payload).unwrap();
+                let metadata = payload.metadata.expect("metadata should be present");
+                assert_eq!(
+                    query_type.as_deref(),
+                    Some(crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH)
+                );
+                assert_eq!(
+                    metadata.query_type.as_deref(),
+                    Some(crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH)
+                );
+                assert_eq!(metadata.cluster_id, Some(synthetic_cid));
+                let route = metadata
+                    .route_context
+                    .expect("real route should be preserved as shadow context");
+                assert_eq!(route.request_id.as_deref(), Some("rec-route-shadow"));
+                assert_eq!(route.query_type.as_deref(), Some("Exploratory"));
+                assert_eq!(route.cluster_id, Some(7));
+                Ok(())
+            })
+            .unwrap();
     }
 }

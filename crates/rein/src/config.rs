@@ -311,6 +311,13 @@ pub struct ArsConfig {
     /// via `validate_ars_llm_judge`.
     #[serde(default)]
     pub llm_judge: ArsLlmJudgeConfig,
+    // ── v0.28 ARS acceleration controller ──────────────────────────────────
+    /// `[ars.acceleration]` sub-table — default-off controller for shadow
+    /// acceleration work. `shadow_only=true` keeps production recall and
+    /// summary behavior on the existing path while new priors/weights are
+    /// learned or replayed in tests and logs.
+    #[serde(default)]
+    pub acceleration: ArsAccelerationConfig,
 }
 
 fn default_ars_backend() -> String {
@@ -361,6 +368,8 @@ impl Default for ArsConfig {
             cold_archive_batch_size: default_cold_archive_batch_size(),
             // v0.27.1 Track 1 — opt-in runtime LLM judge
             llm_judge: ArsLlmJudgeConfig::default(),
+            // v0.28 — opt-in shadow acceleration
+            acceleration: ArsAccelerationConfig::default(),
         }
     }
 }
@@ -372,6 +381,33 @@ impl ArsConfig {
             "omlx" | "local" => Provider::Omlx,
             "none" => Provider::None,
             _ => fallback_extract_provider,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.28 — `[ars.acceleration]` shadow acceleration config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArsAccelerationConfig {
+    /// Master feature flag. Default `false`: no extra I/O, no learned prior
+    /// snapshot reads, and no recall scoring changes.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Keep acceleration in shadow mode. Default `true`; production behavior
+    /// must remain on the existing scalar-alpha path until an explicit later
+    /// activation slice changes this.
+    #[serde(default = "default_true")]
+    pub shadow_only: bool,
+}
+
+impl Default for ArsAccelerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            shadow_only: true,
         }
     }
 }
@@ -908,6 +944,16 @@ pub struct ServerConfig {
     pub sse_enabled: bool,
     pub sse_port: u16,
     pub sse_bind: String,
+    /// Run background warmup/side-index repair when service surfaces start.
+    #[serde(default = "default_server_background_warmup")]
+    pub background_warmup: bool,
+    /// Opt stdio MCP startup into background warmup.
+    ///
+    /// Default false because MCP clients such as Codex may start one stdio
+    /// process per subagent, and each background warmup can contend on local
+    /// side-index writer locks.
+    #[serde(default)]
+    pub stdio_background_warmup: bool,
     #[serde(default)]
     pub gui_enabled: bool,
     #[serde(default)]
@@ -971,12 +1017,16 @@ fn default_buffer_flush_threshold() -> usize {
     50000 // ~12K-25K tokens, triggers ~2-4 times in a long session
 }
 
+fn default_server_background_warmup() -> bool {
+    true
+}
+
 fn default_codex_guardrails_enabled() -> bool {
     true
 }
 
 fn default_codex_max_additional_context_chars() -> usize {
-    4000
+    1200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1220,6 +1270,8 @@ impl Default for ServerConfig {
             sse_enabled: false,
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
+            background_warmup: default_server_background_warmup(),
+            stdio_background_warmup: false,
             gui_enabled: false,
             // v0.27.3 F5/C1: default-deny. Operators must opt in to
             // unauthenticated loopback or set REIN_HTTP_TOKEN. The doctor
@@ -1389,7 +1441,7 @@ impl Default for AsyncMemoryConfig {
             spawn_cooldown_ms: 1_500,
             max_working_set_items: 40,
             max_always_on_items: 24,
-            selection_limit: 5,
+            selection_limit: 2,
             fingerprint_window_ms: 120_000,
             recent_event_cache_size: 256,
         }
@@ -1710,6 +1762,11 @@ impl ReinConfig {
         }
         if self.ars.batch_size == 0 {
             anyhow::bail!("ars.batch_size must be >= 1");
+        }
+        if !self.ars.acceleration.shadow_only {
+            anyhow::bail!(
+                "ars.acceleration.shadow_only=false is not supported in v0.28.x; production activation is deferred"
+            );
         }
 
         // v0.27.1 J6 invariant — `weight_decay_rate` must be finite + in
@@ -2852,6 +2909,8 @@ mod tests {
         assert!((cfg.search.rrf_k - 60.0).abs() < f64::EPSILON);
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);
+        assert!(cfg.server.background_warmup);
+        assert!(!cfg.server.stdio_background_warmup);
         assert_eq!(cfg.database.path, "auto");
         assert_eq!(cfg.embedding.provider, "google");
         assert_eq!(cfg.chunking.max_tokens, 512);
@@ -2859,7 +2918,10 @@ mod tests {
         assert!(!cfg.hooks.codex.inject_prompt_context);
         assert!(!cfg.hooks.codex.inject_session_context);
         assert!(cfg.hooks.codex.guardrails_enabled);
-        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 4000);
+        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 1200);
+        assert_eq!(cfg.async_memory.selection_limit, 2);
+        assert!(!cfg.ars.acceleration.enabled);
+        assert!(cfg.ars.acceleration.shadow_only);
     }
 
     #[test]
@@ -2885,6 +2947,60 @@ max_additional_context_chars = 1024
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);
         assert_eq!(cfg.database.path, "auto");
+    }
+
+    #[test]
+    fn test_load_from_toml_preserves_compact_hook_defaults_when_omitted() {
+        let toml_str = r#"
+[search]
+rrf_k = 30.0
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 1200);
+        assert_eq!(cfg.async_memory.selection_limit, 2);
+        assert!(cfg.server.background_warmup);
+        assert!(!cfg.server.stdio_background_warmup);
+    }
+
+    #[test]
+    fn test_load_from_toml_parses_server_background_warmup_policy() {
+        let toml_str = r#"
+[server]
+background_warmup = false
+stdio_background_warmup = true
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(!cfg.server.background_warmup);
+        assert!(cfg.server.stdio_background_warmup);
+    }
+
+    #[test]
+    fn test_load_from_toml_parses_ars_acceleration() {
+        let toml_str = r#"
+[ars.acceleration]
+enabled = true
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(cfg.ars.acceleration.shadow_only);
+    }
+
+    #[test]
+    fn test_load_from_toml_rejects_non_shadow_acceleration() {
+        let toml_str = r#"
+[ars.acceleration]
+enabled = true
+shadow_only = false
+"#;
+        let err = ReinConfig::load_from_str(toml_str).unwrap_err();
+
+        assert!(
+            err.to_string().contains("ars.acceleration.shadow_only"),
+            "unexpected error: {err}"
+        );
     }
 
     /// RAII guard: remember the current env var value and restore it on drop,

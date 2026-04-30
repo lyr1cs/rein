@@ -84,6 +84,11 @@ than maintaining a separate hand-written tool router. Each request opens its
 own store connection through config, relying on SQLite serialized mode and WAL
 for concurrency.
 
+HTTP/GUI startup may spawn one background warmup for side-index repair and
+embedding precomputation. Stdio MCP startup skips that by default because
+multi-agent clients can start many short-lived `rein serve` processes; operators
+can opt back in with `[server].stdio_background_warmup = true`.
+
 `crates/rein/src/mcp/rest.rs` serves the GUI API and inventory-backed REST
 routes. It progressively caps request body size, resolves exact and templated
 routes from `OpsRestEntry`, applies the entry auth policy, and emits JSON

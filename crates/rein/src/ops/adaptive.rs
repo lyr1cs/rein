@@ -1317,6 +1317,177 @@ fn compute_counterfactual_alphas(
     }
 }
 
+#[derive(Debug, Default)]
+struct ShadowFusionReplayReport {
+    global: Option<crate::search::alpha_optimizer::LearnedShadowWeights>,
+    by_query_type: Vec<(String, crate::search::alpha_optimizer::LearnedShadowWeights)>,
+    by_cluster: Vec<(
+        (String, u32),
+        crate::search::alpha_optimizer::LearnedShadowWeights,
+    )>,
+}
+
+fn compute_shadow_fusion_weight_replay(
+    events_with_access: &[crate::search::alpha_optimizer::RecallEvent],
+    stored_events: &[crate::store::adaptive::StoredEvent],
+    state: &crate::store::adaptive::AdaptiveState,
+    config: &ReinConfig,
+) -> Option<ShadowFusionReplayReport> {
+    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+        return None;
+    }
+    if events_with_access.len() < config.adaptive.min_samples_alpha {
+        return None;
+    }
+
+    let decay_lambda = 0.06;
+    let parent = crate::search::alpha_optimizer::ShadowFusionWeights::default();
+    let n_prior = config.adaptive.shrinkage_prior;
+    let mut report = ShadowFusionReplayReport {
+        global: crate::search::alpha_optimizer::optimize_shadow_weights(
+            events_with_access,
+            decay_lambda,
+            parent,
+            n_prior,
+        ),
+        ..Default::default()
+    };
+
+    let qt_map: std::collections::HashMap<&str, &str> = stored_events
+        .iter()
+        .filter_map(|se| se.request_id.as_deref().zip(se.query_type.as_deref()))
+        .collect();
+
+    for qt in &[
+        "episodic",
+        "temporal",
+        "preference",
+        "exact",
+        "semantic",
+        "exploratory",
+    ] {
+        let qt_events: Vec<_> = events_with_access
+            .iter()
+            .filter(|e| qt_map.get(e.request_id.as_str()).copied() == Some(qt))
+            .cloned()
+            .collect();
+        if qt_events.len() < config.adaptive.min_samples_alpha {
+            continue;
+        }
+        let parent_weights = report
+            .global
+            .as_ref()
+            .map(|learned| learned.weights)
+            .unwrap_or(parent);
+        if let Some(learned) = crate::search::alpha_optimizer::optimize_shadow_weights(
+            &qt_events,
+            decay_lambda,
+            parent_weights,
+            n_prior,
+        ) {
+            report.by_query_type.push(((*qt).to_string(), learned));
+        }
+    }
+
+    let mut cluster_buckets: std::collections::HashMap<
+        (String, u32),
+        Vec<crate::search::alpha_optimizer::RecallEvent>,
+    > = std::collections::HashMap::new();
+    for event in events_with_access {
+        let qt = qt_map
+            .get(event.request_id.as_str())
+            .copied()
+            .unwrap_or("semantic");
+        let mut votes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for id in &event.accessed_ids {
+            if let Some(&cid) = state.memory_clusters.get(id) {
+                *votes.entry(cid).or_default() += 1;
+            }
+        }
+        if let Some((&cid, _)) = votes.iter().max_by_key(|(_, &count)| count) {
+            cluster_buckets
+                .entry((qt.to_string(), cid))
+                .or_default()
+                .push(event.clone());
+        }
+    }
+
+    for ((qt, cluster_id), events) in cluster_buckets {
+        if events.len() < config.adaptive.min_samples_alpha {
+            continue;
+        }
+        let parent_weights = report
+            .by_query_type
+            .iter()
+            .find(|(query_type, _)| query_type == &qt)
+            .map(|(_, learned)| learned.weights)
+            .or_else(|| report.global.as_ref().map(|learned| learned.weights))
+            .unwrap_or(parent);
+        if let Some(learned) = crate::search::alpha_optimizer::optimize_shadow_weights(
+            &events,
+            decay_lambda,
+            parent_weights,
+            n_prior,
+        ) {
+            report.by_cluster.push(((qt, cluster_id), learned));
+        }
+    }
+
+    if report.global.is_none() && report.by_query_type.is_empty() && report.by_cluster.is_empty() {
+        None
+    } else {
+        Some(report)
+    }
+}
+
+fn log_shadow_fusion_weight_replay(report: &ShadowFusionReplayReport) {
+    if let Some(global) = &report.global {
+        tracing::info!(
+            target: "rein::ars.acceleration",
+            scope = "global",
+            sample_count = global.sample_count,
+            bm25 = global.weights.bm25,
+            vec = global.weights.vec,
+            kg = global.weights.kg,
+            episode = global.weights.episode,
+            support = global.weights.support,
+            diversity = global.weights.diversity,
+            "S3 shadow fusion weights"
+        );
+    }
+    for (query_type, learned) in &report.by_query_type {
+        tracing::info!(
+            target: "rein::ars.acceleration",
+            scope = "query_type",
+            query_type = %query_type,
+            sample_count = learned.sample_count,
+            bm25 = learned.weights.bm25,
+            vec = learned.weights.vec,
+            kg = learned.weights.kg,
+            episode = learned.weights.episode,
+            support = learned.weights.support,
+            diversity = learned.weights.diversity,
+            "S3 shadow fusion weights"
+        );
+    }
+    for ((query_type, cluster_id), learned) in &report.by_cluster {
+        tracing::info!(
+            target: "rein::ars.acceleration",
+            scope = "query_type_cluster",
+            query_type = %query_type,
+            cluster_id = *cluster_id,
+            sample_count = learned.sample_count,
+            bm25 = learned.weights.bm25,
+            vec = learned.weights.vec,
+            kg = learned.weights.kg,
+            episode = learned.weights.episode,
+            support = learned.weights.support,
+            diversity = learned.weights.diversity,
+            "S3 shadow fusion weights"
+        );
+    }
+}
+
 /// Main orchestrator for M2 alpha learning.
 ///
 /// Peeks at recall events, parses candidates, advances both consumer offsets
@@ -1506,6 +1677,11 @@ fn run_alpha_learning(
     }
 
     compute_counterfactual_alphas(&events_with_access, &events, state, config);
+    if let Some(report) =
+        compute_shadow_fusion_weight_replay(&events_with_access, &events, state, config)
+    {
+        log_shadow_fusion_weight_replay(&report);
+    }
     if pending.is_empty() {
         None
     } else {
@@ -2515,6 +2691,56 @@ mod tests {
         adaptive::emit_event(store.conn(), event).unwrap()
     }
 
+    fn shadow_replay_event(
+        request_id: &str,
+        accessed_id: &str,
+    ) -> crate::search::alpha_optimizer::RecallEvent {
+        crate::search::alpha_optimizer::RecallEvent {
+            request_id: request_id.to_string(),
+            candidates: vec![
+                crate::search::alpha_optimizer::CandidateLog {
+                    memory_id: accessed_id.to_string(),
+                    bm25_norm: 0.2,
+                    vec_norm: 0.2,
+                    kg_norm: 1.0,
+                    episode_norm: 0.1,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                crate::search::alpha_optimizer::CandidateLog {
+                    memory_id: format!("unused-{request_id}"),
+                    bm25_norm: 0.9,
+                    vec_norm: 0.9,
+                    kg_norm: 0.0,
+                    episode_norm: 0.1,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec![accessed_id.to_string()],
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn stored_recall_event(
+        id: i64,
+        request_id: &str,
+        query_type: &str,
+    ) -> crate::store::adaptive::StoredEvent {
+        crate::store::adaptive::StoredEvent {
+            id,
+            ts: Utc::now().to_rfc3339(),
+            event_type: "recall_complete".into(),
+            request_id: Some(request_id.to_string()),
+            memory_id: None,
+            concept_id: None,
+            query: Some("query".into()),
+            query_type: Some(query_type.to_string()),
+            topic: None,
+            payload: None,
+        }
+    }
+
     // ── Test 1: run_tiering assigns tiers ────────────────────────────────────
 
     #[test]
@@ -3510,6 +3736,148 @@ mod tests {
             global.value
         );
         assert!(global.sample_count > 0, "sample_count should be positive");
+    }
+
+    #[test]
+    fn counterfactual_cluster_alpha_shrinks_toward_query_type_parent() {
+        let mut config = ReinConfig::default();
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.alpha_max_step = 1.0;
+        config.adaptive.shrinkage_prior = 5.0;
+
+        let mut recall_events = Vec::new();
+        let mut stored_events = Vec::new();
+        for i in 0..12 {
+            let target = format!("mem-target-{i}");
+            let decoy = format!("mem-decoy-{i}");
+            recall_events.push(crate::search::alpha_optimizer::RecallEvent {
+                request_id: format!("req-{i}"),
+                candidates: vec![
+                    crate::search::alpha_optimizer::CandidateLog {
+                        memory_id: target.clone(),
+                        bm25_norm: 0.0,
+                        vec_norm: 1.0,
+                        kg_norm: 0.0,
+                        episode_norm: 0.0,
+                        support_count: 1,
+                        source_diversity: 1.0,
+                    },
+                    crate::search::alpha_optimizer::CandidateLog {
+                        memory_id: decoy,
+                        bm25_norm: 1.0,
+                        vec_norm: 0.0,
+                        kg_norm: 0.0,
+                        episode_norm: 0.0,
+                        support_count: 1,
+                        source_diversity: 1.0,
+                    },
+                ],
+                accessed_ids: vec![target.clone()],
+                timestamp: Utc::now() - chrono::Duration::minutes(i as i64),
+            });
+            stored_events.push(adaptive::StoredEvent {
+                id: (i + 1) as i64,
+                ts: (Utc::now() - chrono::Duration::minutes(i as i64)).to_rfc3339(),
+                event_type: "recall_complete".into(),
+                request_id: Some(format!("req-{i}")),
+                memory_id: None,
+                concept_id: None,
+                query: Some("test".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: None,
+            });
+        }
+
+        let mut state = AdaptiveState::default();
+        state.learned_alpha.insert(
+            "global".to_string(),
+            crate::store::adaptive::LearnedAlphaEntry {
+                value: 0.9,
+                sample_count: 100,
+                last_updated: Utc::now().to_rfc3339(),
+            },
+        );
+        state.learned_alpha.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedAlphaEntry {
+                value: 0.2,
+                sample_count: 100,
+                last_updated: Utc::now().to_rfc3339(),
+            },
+        );
+        for i in 0..12 {
+            state.memory_clusters.insert(format!("mem-target-{i}"), 7);
+        }
+
+        compute_counterfactual_alphas(&recall_events, &stored_events, &mut state, &config);
+
+        let cluster_key = crate::store::adaptive::AdaptiveState::bucket_key("semantic", Some(7));
+        let cluster = state
+            .learned_alpha
+            .get(&cluster_key)
+            .expect("cluster alpha should be learned");
+        let parent = state
+            .learned_alpha
+            .get("semantic")
+            .expect("query-type parent should be present");
+        let global = state.learned_alpha.get("global").expect("global alpha");
+
+        assert!(
+            (cluster.value - parent.value).abs() < (cluster.value - global.value).abs(),
+            "cluster alpha should shrink toward query-type parent, not global: cluster={}, parent={}, global={}",
+            cluster.value,
+            parent.value,
+            global.value
+        );
+    }
+
+    #[test]
+    fn shadow_fusion_replay_is_default_off() {
+        let config = ReinConfig::default();
+        let state = AdaptiveState::default();
+        let recall_events = vec![shadow_replay_event("req-1", "mem-1")];
+        let stored_events = vec![stored_recall_event(1, "req-1", "semantic")];
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config);
+
+        assert!(report.is_none());
+    }
+
+    #[test]
+    fn shadow_fusion_replay_computes_global_query_and_cluster_weights() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+        let recall_events = vec![
+            shadow_replay_event("req-1", "mem-1"),
+            shadow_replay_event("req-2", "mem-2"),
+        ];
+        let stored_events = vec![
+            stored_recall_event(1, "req-1", "semantic"),
+            stored_recall_event(2, "req-2", "semantic"),
+        ];
+        let mut state = AdaptiveState::default();
+        state.memory_clusters.insert("mem-1".into(), 7);
+        state.memory_clusters.insert("mem-2".into(), 7);
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config)
+                .expect("shadow replay should produce weights");
+
+        let global = report.global.expect("global weights");
+        assert_eq!(global.sample_count, 2);
+        assert!(
+            global.weights.kg > 0.5,
+            "fixture should prefer kg-heavy shadow weights, got {:?}",
+            global.weights
+        );
+        assert_eq!(report.by_query_type.len(), 1);
+        assert_eq!(report.by_query_type[0].0, "semantic");
+        assert_eq!(report.by_cluster.len(), 1);
+        assert_eq!(report.by_cluster[0].0, ("semantic".to_string(), 7));
     }
 
     // ── Test 7: run_m6_threshold_learning ────────────────────────────────────

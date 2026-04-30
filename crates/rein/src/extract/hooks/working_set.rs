@@ -377,7 +377,7 @@ fn merge_items(mut items: Vec<WorkingSetItem>, max_items: usize) -> Vec<WorkingS
     let mut merged: Vec<WorkingSetItem> = Vec::new();
     'outer: for item in items {
         for existing in &mut merged {
-            if existing.kind == item.kind
+            if item_kind_family(&existing.kind) == item_kind_family(&item.kind)
                 && existing.agent_label == item.agent_label
                 && existing.is_subagent == item.is_subagent
                 && (crate::extract::similarity(&existing.detail, &item.detail) > 0.85
@@ -395,6 +395,15 @@ fn merge_items(mut items: Vec<WorkingSetItem>, max_items: usize) -> Vec<WorkingS
         }
     }
     merged
+}
+
+fn item_kind_family(kind: &str) -> &str {
+    match kind {
+        "memory" | "always_on_memory" => "memory",
+        "concept" | "always_on_concept" => "concept",
+        "episode" | "always_on_episode" => "episode",
+        other => other,
+    }
 }
 
 fn memory_score(memory: &ExtractedMemory) -> f32 {
@@ -493,5 +502,37 @@ mod tests {
         let merged = merge_items(items, 40);
         assert_eq!(merged.len(), 1);
         assert!((merged[0].score - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn merge_dedups_working_and_always_on_memory_surfaces() {
+        let now = Utc::now();
+        let items = vec![
+            WorkingSetItem {
+                kind: "memory".into(),
+                topic: "query-type-bucket-labels".into(),
+                summary: "QueryType enum provides distinct labels for Display and synthesis buckets.".into(),
+                detail: "Drift between QueryType::synthesis_bucket_label and canonical strings misses per-query gates.".into(),
+                agent_label: "codex".into(),
+                is_subagent: false,
+                score: 0.7,
+                updated_at: now,
+            },
+            WorkingSetItem {
+                kind: "always_on_memory".into(),
+                topic: "query-type-bucket-labels".into(),
+                summary: "QueryType enum provides distinct labels for Display and synthesis buckets.".into(),
+                detail: "Drift between QueryType::synthesis_bucket_label and canonical strings misses per-query gates.".into(),
+                agent_label: "codex".into(),
+                is_subagent: false,
+                score: 0.9,
+                updated_at: now,
+            },
+        ];
+
+        let merged = merge_items(items, 40);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].kind, "always_on_memory");
     }
 }
