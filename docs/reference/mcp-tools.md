@@ -1,6 +1,6 @@
 # MCP Tools
 
-Updated for Rein v0.27.5. Rein exposes 38 production MCP tools through the
+Updated for Rein v0.27.6. Rein exposes 38 production MCP tools through the
 operation inventory. Test-only tools and `/api/test_path_template/*` routes are
 not part of this reference.
 
