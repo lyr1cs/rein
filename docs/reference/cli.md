@@ -19,9 +19,12 @@ commands and inventory-backed operation commands.
 | `rein worker cleanup` | topic selectors, `--all`, `--exact-topics`, `--dry-run` | Run a detached cleanup pass. |
 | `rein worker cleanup-queue` | none | Drain queued cleanup jobs. |
 | `rein worker merge-refinement-queue` | none | Drain queued post-merge refinement jobs. |
+| `rein hook session-start` | Codex `SessionStart` payload on stdin | Optionally inject bounded project memory context. |
+| `rein hook pre` | Codex `PreToolUse` payload on stdin | Run deny-only conservative guardrails before tool execution. |
+| `rein hook permission` | Codex `PermissionRequest` payload on stdin | Run deny-only conservative guardrails for permission prompts. |
 | `rein hook post` | hook payload on stdin | Extract facts from tool output. |
 | `rein hook compact` | hook payload on stdin | Extract context before compaction. |
-| `rein hook prompt` | hook payload on stdin | Compatibility no-op for prompt hooks. |
+| `rein hook prompt` | Codex `UserPromptSubmit` payload on stdin | Optionally inject bounded relevant memory context. |
 | `rein hook stop` | hook payload on stdin | Persist session summary at conversation end. |
 | `rein dashboard` | none | Print local service status. |
 | `rein gui on/off` | `on`, `off` | Manage the GUI service. |

@@ -146,9 +146,12 @@ rein serve
 | `dedup-concepts` | Merge duplicate concepts (case/separator variants) | `rein dedup-concepts` |
 | `resummerize` | Run LLM-driven canonical recompression (v0.23) | `rein resummerize [--dry-run] [--canonical-id ID]` |
 | `upgrade` | Upgrade old memories to knowledge graph | `rein upgrade [--topic X] [--dry-run]` |
+| `hook session-start` | Optional Codex project context injection | `rein hook session-start` |
+| `hook pre` | Codex deny-only PreToolUse guardrails | `rein hook pre` |
+| `hook permission` | Codex deny-only PermissionRequest guardrails | `rein hook permission` |
 | `hook post` | Extract facts from tool output | `rein hook post` |
 | `hook compact` | Save context before compaction | `rein hook compact` |
-| `hook prompt` | Compatibility no-op for UserPromptSubmit | `rein hook prompt` |
+| `hook prompt` | Optional Codex UserPromptSubmit memory context injection | `rein hook prompt` |
 | `hook stop` | Full knowledge extraction on session end | `rein hook stop` |
 | `worker memory` | Drain the async memory queue | `rein worker memory` |
 | `worker dedup-queue` | Drain queued store-time dedup jobs | `rein worker dedup-queue` |
@@ -265,7 +268,8 @@ rein uses LLM (Gemini 3.1 Flash Lite or local models via OMLX) for structured me
 - `hook_post` — local pattern extraction (crash safety net) + buffer to session file
 - `hook_compact` — record compact context for async extraction
 - `hook_stop` — queue full session distillation: memories + concepts + links + episode summary
-- `hook_prompt` — compatibility no-op (automatic prompt injection removed)
+- `hook_session_start` / `hook_prompt` — optional Codex additionalContext injection from Rein's working surfaces
+- `hook_pre_tool_use` / `hook_permission_request` — deny-only Codex guardrails for obviously destructive shell commands
 
 **Upgrade old memories:**
 ```bash
@@ -576,12 +580,91 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
 }
 ```
 
-**Hook behavior (3 active hooks + 1 compatibility hook):**
+**Hook behavior:**
 
 - `PostToolUse` -- local pattern extraction (crash safety net) + buffers for session-end batch processing
 - `PreCompact` -- records compact context for the async memory pipeline
-- `UserPromptSubmit` -- compatibility no-op; rein no longer auto-injects prompt context
 - `Stop` -- queues full knowledge extraction: memories + concepts + links + episode summary via async worker
+
+### Hook Setup for Codex CLI
+
+Codex CLI hooks require `codex_hooks = true` and either `~/.codex/hooks.json`
+or inline `[hooks]` tables in `~/.codex/config.toml`.
+
+`rein init` now configures the Codex MCP entry and installs the Rein hooks:
+
+```toml
+[features]
+codex_hooks = true
+```
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "REIN_AGENT_LABEL=codex rein hook session-start", "timeout": 5 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "REIN_AGENT_LABEL=codex rein hook pre", "timeout": 5 }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "REIN_AGENT_LABEL=codex rein hook permission", "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "REIN_AGENT_LABEL=codex rein hook post", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "REIN_AGENT_LABEL=codex rein hook prompt", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "REIN_AGENT_LABEL=codex rein hook stop", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The Codex hook payload differs from Claude Code's payload. Rein understands the
+official Codex fields (`hook_event_name`, `tool_input`, `tool_response`,
+`prompt`, `last_assistant_message`, and `transcript_path`). `PostToolUse` and
+`Stop` feed the same async memory pipeline used by Claude Code hooks.
+`PreToolUse` and `PermissionRequest` are deny-only guardrails. `SessionStart`
+and `UserPromptSubmit` can emit official Codex `additionalContext` JSON when
+explicitly enabled:
+
+```toml
+[hooks.codex]
+inject_prompt_context = true
+inject_session_context = true
+max_additional_context_chars = 4000
+```
 
 ### Remote Access via HTTP/SSE
 
@@ -1071,9 +1154,12 @@ rein serve
 | `canonicals` | 查看 canonical memory 列表 | `rein canonicals [-l 20]` |
 | `evidence` | 查看某个 canonical 的 evidence 快照 | `rein evidence <canonical_id> [-l 20]` |
 | `dedup-log` | 查看最近的 dedup 决策日志 | `rein dedup-log [--canonical ID] [-l 20]` |
+| `hook session-start` | 可选注入 Codex 项目记忆上下文 | `rein hook session-start` |
+| `hook pre` | Codex PreToolUse deny-only guardrail | `rein hook pre` |
+| `hook permission` | Codex PermissionRequest deny-only guardrail | `rein hook permission` |
 | `hook post` | 从工具输出提取事实 | `rein hook post` |
 | `hook compact` | 压缩前保存上下文 | `rein hook compact` |
-| `hook prompt` | UserPromptSubmit 兼容性空操作 | `rein hook prompt` |
+| `hook prompt` | 可选注入 Codex UserPromptSubmit 相关记忆上下文 | `rein hook prompt` |
 | `hook stop` | 会话结束时完整知识提取 | `rein hook stop` |
 | `recent` | 显示最近记忆 | `rein recent [-l 20]` |
 | `gc` | 垃圾回收弱 STM 记忆 | `rein gc [--dry-run]` |
@@ -1158,7 +1244,8 @@ rein 使用 LLM（Gemini 3.1 Flash Lite 或本地模型）进行结构化记忆�
 - `hook_post` — 本地模式提取（崩溃安全网）+ 缓冲到 session 文件
 - `hook_compact` — 记录 compact 上下文，交给异步 memory worker 提炼
 - `hook_stop` — 完整知识提取：记忆 + 概念 + 关系 + 会话摘要（异步 worker）
-- `hook_prompt` — 兼容性空操作（已取消自动注入）
+- `hook_session_start` / `hook_prompt` — 可选使用 Codex additionalContext 注入 Rein working surface
+- `hook_pre_tool_use` / `hook_permission_request` — deny-only Codex guardrail，用于拦截明显危险的 shell 命令
 
 **升级旧记忆：**
 ```bash
@@ -1311,12 +1398,38 @@ sse_bind = "127.0.0.1"
 }
 ```
 
-**Hook 行为说明（3 个活跃 Hook + 1 个兼容 Hook）：**
+**Hook 行为说明：**
 
 - `PostToolUse` -- 本地模式提取（崩溃安全网）+ 缓冲到 session 文件
 - `PreCompact` -- 记录重要上下文并交给异步 memory worker
-- `UserPromptSubmit` -- 兼容性空操作；不再自动注入提示词
 - `Stop` -- 完整知识提取：记忆 + 概念 + 关系 + 会话摘要（通过异步 worker）
+
+### Codex CLI Hook 设置
+
+Codex CLI 需要启用 `codex_hooks = true`，并在 `~/.codex/hooks.json` 或
+`~/.codex/config.toml` 的 `[hooks]` 表中声明 hook。`rein init` 会配置 Codex
+MCP entry，并安装以下 hook：
+
+- `SessionStart` -> `REIN_AGENT_LABEL=codex rein hook session-start`
+- `PreToolUse` -> `REIN_AGENT_LABEL=codex rein hook pre`
+- `PermissionRequest` -> `REIN_AGENT_LABEL=codex rein hook permission`
+- `PostToolUse` -> `REIN_AGENT_LABEL=codex rein hook post`
+- `UserPromptSubmit` -> `REIN_AGENT_LABEL=codex rein hook prompt`
+- `Stop` -> `REIN_AGENT_LABEL=codex rein hook stop`
+
+Codex 的 hook payload 和 Claude Code 不完全相同。Rein 会识别
+`hook_event_name`、`tool_input`、`tool_response`、`prompt`、
+`last_assistant_message` 和 `transcript_path`。其中 `PostToolUse` 和 `Stop`
+接入同一套异步记忆管线；`PreToolUse` 和 `PermissionRequest` 是 deny-only
+guardrail。`SessionStart` 与 `UserPromptSubmit` 可在显式启用后输出 Codex
+官方 `additionalContext` JSON：
+
+```toml
+[hooks.codex]
+inject_prompt_context = true
+inject_session_context = true
+max_additional_context_chars = 4000
+```
 
 ### 通过 HTTP/SSE 远程访问
 

@@ -168,11 +168,18 @@ enum ServiceAction {
 
 #[derive(Subcommand)]
 enum HookAction {
+    /// Add optional project context at Codex SessionStart
+    #[command(name = "session-start")]
+    SessionStart,
+    /// Conservative guardrails before Codex tool execution (PreToolUse)
+    Pre,
+    /// Conservative guardrails for Codex permission prompts (PermissionRequest)
+    Permission,
     /// Extract facts from tool output (PostToolUse)
     Post,
     /// Extract context before compaction (PreCompact)
     Compact,
-    /// UserPromptSubmit compatibility hook (currently a no-op)
+    /// Add optional memory context at Codex UserPromptSubmit
     Prompt,
     /// Save session summary on conversation end (Stop)
     Stop,
@@ -307,6 +314,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Hook { action }) => {
             let action_str = match action {
+                HookAction::SessionStart => "session-start",
+                HookAction::Pre => "pre",
+                HookAction::Permission => "permission",
                 HookAction::Post => "post",
                 HookAction::Compact => "compact",
                 HookAction::Prompt => "prompt",

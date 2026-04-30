@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -105,6 +106,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_supermemory(config));
     checks.push(check_http_auth(config));
     checks.push(check_proxy_auth(config));
+    checks.push(check_codex_hooks());
     checks.push(check_gui_runtime(config));
     checks.push(check_proxy_runtime(config));
     checks.push(check_overview_version());
@@ -498,6 +500,141 @@ fn count_rest_operations_in_source(source: &str) -> usize {
         .lines()
         .filter(|line| line.trim_start().starts_with("(&Method::"))
         .count()
+}
+
+fn check_codex_hooks() -> DoctorCheck {
+    let Some(codex_dir) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|p| p.join(".codex"))
+    else {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "codex_hooks",
+            "HOME not set; skipping Codex hook checks",
+        );
+    };
+    check_codex_hooks_at(&codex_dir)
+}
+
+fn check_codex_hooks_at(codex_dir: &Path) -> DoctorCheck {
+    let config_path = codex_dir.join("config.toml");
+    if !config_path.exists() {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "codex_hooks",
+            "Codex config not found; skipping Codex hook checks",
+        );
+    }
+
+    let feature_enabled = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
+        .and_then(|root| {
+            root.get("features")
+                .and_then(|features| features.get("codex_hooks"))
+                .and_then(|enabled| enabled.as_bool())
+        })
+        == Some(true);
+    if !feature_enabled {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_hooks",
+            "[features].codex_hooks = true is not configured",
+            "run rein init",
+        );
+    }
+
+    let hooks_path = codex_dir.join("hooks.json");
+    let root = match std::fs::read_to_string(&hooks_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(value) => value,
+            Err(_) => {
+                return warn_with_hint(
+                    DoctorCategory::Configuration,
+                    "codex_hooks",
+                    "Codex hooks.json is not valid JSON",
+                    "run rein init",
+                );
+            }
+        },
+        Err(_) => {
+            return warn_with_hint(
+                DoctorCategory::Configuration,
+                "codex_hooks",
+                "Codex hooks.json not found",
+                "run rein init",
+            );
+        }
+    };
+
+    let Some(root_obj) = root.as_object() else {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_hooks",
+            "Codex hooks.json is not a JSON object",
+            "run rein init",
+        );
+    };
+    let hooks = root_obj
+        .get("hooks")
+        .and_then(|hooks| hooks.as_object())
+        .unwrap_or(root_obj);
+
+    let missing = expected_codex_hook_commands()
+        .iter()
+        .filter_map(|(event, command)| {
+            if codex_event_has_command(hooks.get(*event), command) {
+                None
+            } else {
+                Some(*event)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        ok_in(
+            DoctorCategory::Configuration,
+            "codex_hooks",
+            "six hooks configured",
+        )
+    } else {
+        warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_hooks",
+            format!("missing Codex Rein hook events: {}", missing.join(", ")),
+            "run rein init",
+        )
+    }
+}
+
+fn expected_codex_hook_commands() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "SessionStart",
+            "REIN_AGENT_LABEL=codex rein hook session-start",
+        ),
+        ("PreToolUse", "REIN_AGENT_LABEL=codex rein hook pre"),
+        (
+            "PermissionRequest",
+            "REIN_AGENT_LABEL=codex rein hook permission",
+        ),
+        ("PostToolUse", "REIN_AGENT_LABEL=codex rein hook post"),
+        (
+            "UserPromptSubmit",
+            "REIN_AGENT_LABEL=codex rein hook prompt",
+        ),
+        ("Stop", "REIN_AGENT_LABEL=codex rein hook stop"),
+    ]
+}
+
+fn codex_event_has_command(event_hooks: Option<&serde_json::Value>, command: &str) -> bool {
+    event_hooks
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(|hooks| hooks.as_array()))
+        .flatten()
+        .any(|handler| handler.get("command").and_then(|value| value.as_str()) == Some(command))
 }
 
 fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
@@ -1834,6 +1971,43 @@ provider = "inherit"
         port
     }
 
+    fn write_codex_config(codex_dir: &Path, enabled: bool) {
+        std::fs::create_dir_all(codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            format!("[features]\ncodex_hooks = {enabled}\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_codex_hooks(codex_dir: &Path, omit_event: Option<&str>) {
+        let mut hooks = serde_json::Map::new();
+        for (event, command) in expected_codex_hook_commands() {
+            if omit_event == Some(event) {
+                continue;
+            }
+            hooks.insert(
+                event.to_string(),
+                serde_json::json!([
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command
+                            }
+                        ]
+                    }
+                ]),
+            );
+        }
+        let root = serde_json::json!({ "hooks": hooks });
+        std::fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&root).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// Async mutex so env-var tests can await safely without tripping
     /// `clippy::await_holding_lock`. All three doctor tests are `#[tokio::test]`.
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1853,6 +2027,62 @@ provider = "inherit"
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_hooks_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config(dir.path(), true);
+        write_codex_hooks(dir.path(), None);
+
+        let check = check_codex_hooks_at(dir.path());
+
+        assert_eq!(check.name, "codex_hooks");
+        assert_eq!(check.category, DoctorCategory::Configuration);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("six hooks configured"));
+        assert_eq!(check.repair_hint, None);
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_hooks_feature_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config(dir.path(), false);
+        write_codex_hooks(dir.path(), None);
+
+        let check = check_codex_hooks_at(dir.path());
+
+        assert_eq!(check.name, "codex_hooks");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.repair_hint.as_deref(), Some("run rein init"));
+        assert!(check.message.contains("codex_hooks"));
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_hooks_missing_hooks_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config(dir.path(), true);
+
+        let check = check_codex_hooks_at(dir.path());
+
+        assert_eq!(check.name, "codex_hooks");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.repair_hint.as_deref(), Some("run rein init"));
+        assert!(check.message.contains("hooks.json"));
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_hooks_missing_one_event() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config(dir.path(), true);
+        write_codex_hooks(dir.path(), Some("Stop"));
+
+        let check = check_codex_hooks_at(dir.path());
+
+        assert_eq!(check.name, "codex_hooks");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.repair_hint.as_deref(), Some("run rein init"));
+        assert!(check.message.contains("Stop"));
     }
 
     #[test]

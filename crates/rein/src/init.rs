@@ -44,7 +44,12 @@ pub fn auto_configure(dry_run: bool) -> anyhow::Result<()> {
             if dry_run {
                 println!("[dry-run] Would configure {name} at {}", path.display());
             } else {
-                match configure_client(path, format) {
+                let result = if *name == "Codex" {
+                    configure_codex_client(path)
+                } else {
+                    configure_client(path, format)
+                };
+                match result {
                     Ok(()) => println!("Configured {name}"),
                     Err(e) => println!("Failed to configure {name}: {e}"),
                 }
@@ -472,25 +477,197 @@ fn configure_toml_client(path: &Path) -> anyhow::Result<()> {
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[mcp] is not a table"))?;
 
+    let mut modified = false;
     if mcp_tbl.contains_key("rein") {
         println!("  (rein already configured, skipping)");
+    } else {
+        let mut rein_tbl = toml::map::Map::new();
+        rein_tbl.insert(
+            "command".to_string(),
+            toml::Value::String("rein".to_string()),
+        );
+        rein_tbl.insert(
+            "args".to_string(),
+            toml::Value::Array(vec![toml::Value::String("serve".to_string())]),
+        );
+        mcp_tbl.insert("rein".to_string(), toml::Value::Table(rein_tbl));
+        modified = true;
+    }
+
+    if modified {
+        let formatted = toml::to_string_pretty(&root)?;
+        std::fs::write(path, formatted)?;
+    }
+    Ok(())
+}
+
+fn configure_codex_client(path: &Path) -> anyhow::Result<()> {
+    configure_toml_client(path)?;
+    enable_codex_hooks_feature(path)?;
+    configure_codex_hooks_file(path)?;
+    Ok(())
+}
+
+fn enable_codex_hooks_feature(path: &Path) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    // Create a backup before modifying
+    let backup = path.with_extension("toml.bak");
+    std::fs::copy(path, &backup).ok();
+    let mut root: toml::Value = if content.is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root_tbl = root
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config is not a TOML table"))?;
+    let features = root_tbl
+        .entry("features")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let features_tbl = features
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[features] is not a table"))?;
+    if features_tbl.get("codex_hooks").and_then(|v| v.as_bool()) == Some(true) {
         return Ok(());
     }
 
-    let mut rein_tbl = toml::map::Map::new();
-    rein_tbl.insert(
-        "command".to_string(),
-        toml::Value::String("rein".to_string()),
-    );
-    rein_tbl.insert(
-        "args".to_string(),
-        toml::Value::Array(vec![toml::Value::String("serve".to_string())]),
-    );
-    mcp_tbl.insert("rein".to_string(), toml::Value::Table(rein_tbl));
-
+    features_tbl.insert("codex_hooks".to_string(), toml::Value::Boolean(true));
     let formatted = toml::to_string_pretty(&root)?;
     std::fs::write(path, formatted)?;
     Ok(())
+}
+
+fn configure_codex_hooks_file(config_path: &Path) -> anyhow::Result<()> {
+    let Some(config_dir) = config_path.parent() else {
+        anyhow::bail!("Codex config path has no parent directory");
+    };
+    let hooks_path = config_dir.join("hooks.json");
+    let mut root = if hooks_path.exists() {
+        let content = std::fs::read_to_string(&hooks_path)?;
+        serde_json::from_str::<serde_json::Value>(&content)?
+    } else {
+        serde_json::json!({})
+    };
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Codex hooks file is not a JSON object"))?;
+    let hooks = root_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Codex hooks section is not a JSON object"))?;
+
+    let mut modified = false;
+    modified |= ensure_codex_hook(
+        hooks_obj,
+        "SessionStart",
+        Some("*"),
+        "REIN_AGENT_LABEL=codex rein hook session-start",
+        5,
+        Some("Loading Rein project context"),
+    );
+    modified |= ensure_codex_hook(
+        hooks_obj,
+        "PreToolUse",
+        Some("*"),
+        "REIN_AGENT_LABEL=codex rein hook pre",
+        5,
+        None,
+    );
+    modified |= ensure_codex_hook(
+        hooks_obj,
+        "PermissionRequest",
+        Some("*"),
+        "REIN_AGENT_LABEL=codex rein hook permission",
+        5,
+        None,
+    );
+    modified |= ensure_codex_hook(
+        hooks_obj,
+        "PostToolUse",
+        Some("*"),
+        "REIN_AGENT_LABEL=codex rein hook post",
+        10,
+        Some("Recording tool output in Rein"),
+    );
+    modified |= ensure_codex_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        None,
+        "REIN_AGENT_LABEL=codex rein hook prompt",
+        5,
+        None,
+    );
+    modified |= ensure_codex_hook(
+        hooks_obj,
+        "Stop",
+        None,
+        "REIN_AGENT_LABEL=codex rein hook stop",
+        30,
+        Some("Summarizing Codex session in Rein"),
+    );
+
+    if modified {
+        if hooks_path.exists() {
+            let backup = hooks_path.with_extension("json.bak");
+            std::fs::copy(&hooks_path, &backup).ok();
+        }
+        let formatted = serde_json::to_string_pretty(&root)?;
+        std::fs::write(hooks_path, format!("{formatted}\n"))?;
+    }
+    Ok(())
+}
+
+fn ensure_codex_hook(
+    hooks_obj: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+    timeout: u64,
+    status_message: Option<&str>,
+) -> bool {
+    if event_has_command(hooks_obj.get(event), command) {
+        return false;
+    }
+
+    let mut handler = serde_json::json!({
+        "type": "command",
+        "command": command,
+        "timeout": timeout
+    });
+    if let Some(message) = status_message {
+        handler["statusMessage"] = serde_json::Value::String(message.to_string());
+    }
+
+    let mut group = serde_json::json!({
+        "hooks": [handler]
+    });
+    if let Some(matcher) = matcher {
+        group["matcher"] = serde_json::Value::String(matcher.to_string());
+    }
+
+    let entry = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(groups) = entry.as_array_mut() {
+        groups.push(group);
+    } else {
+        *entry = serde_json::json!([group]);
+    }
+    true
+}
+
+fn event_has_command(event_hooks: Option<&serde_json::Value>, command: &str) -> bool {
+    event_hooks
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(|v| v.as_array()))
+        .flatten()
+        .any(|handler| handler.get("command").and_then(|v| v.as_str()) == Some(command))
 }
 
 #[cfg(test)]
@@ -590,5 +767,56 @@ mod tests {
         assert!(doc.contains("route_resolution_support_matrix"));
         assert!(doc.contains("proxy_returns_426_when_codex_websocket_upstream_is_unavailable"));
         assert!(doc.contains("codexsubp"));
+    }
+
+    #[test]
+    fn generic_toml_configuration_only_installs_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        configure_toml_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("[mcp.rein]"));
+        assert!(!config.contains("codex_hooks"));
+        assert!(!dir.path().join("hooks.json").exists());
+    }
+
+    #[test]
+    fn codex_configuration_installs_rein_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("codex_hooks = true"));
+
+        let hooks_path = dir.path().join("hooks.json");
+        let hooks = std::fs::read_to_string(&hooks_path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&hooks).unwrap();
+
+        let expected = [
+            (
+                "SessionStart",
+                "REIN_AGENT_LABEL=codex rein hook session-start",
+            ),
+            ("PreToolUse", "REIN_AGENT_LABEL=codex rein hook pre"),
+            (
+                "PermissionRequest",
+                "REIN_AGENT_LABEL=codex rein hook permission",
+            ),
+            ("PostToolUse", "REIN_AGENT_LABEL=codex rein hook post"),
+            (
+                "UserPromptSubmit",
+                "REIN_AGENT_LABEL=codex rein hook prompt",
+            ),
+            ("Stop", "REIN_AGENT_LABEL=codex rein hook stop"),
+        ];
+        for (event, command) in expected {
+            assert_eq!(root["hooks"][event][0]["hooks"][0]["command"], command);
+        }
     }
 }

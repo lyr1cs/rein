@@ -212,7 +212,7 @@ docker-compose.yml   # One-command deployment
 - Auto-link creates bidirectional related_ids on store
 - `max_input_chars=0` only allowed for known 1M-token Gemini models (safety fallback to 16K)
 - Beta values read from `MemoryLayer::beta()`, not hardcoded
-- hook_prompt is kept as a compatibility no-op; rein no longer auto-injects prompt memory
+- Codex hooks use official stdout JSON only: SessionStart/UserPromptSubmit context injection is opt-in via `[hooks.codex]`, PreToolUse/PermissionRequest guardrails are deny-only, and diagnostic logs must go to stderr.
 - Post-store processing (auto_link, evolve) only runs on newly created memories, not merges
 - postprocess enriches keywords only — caller-supplied topic/importance are authoritative
 - `/api/memories/:id` is backward-compatible: top-level memory fields remain, plus nested `memory` and `evidence`

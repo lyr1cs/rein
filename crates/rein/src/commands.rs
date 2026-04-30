@@ -357,6 +357,9 @@ pub async fn handle_worker_cleanup(
 
 pub async fn handle_hook(config: &ReinConfig, action: &str) -> anyhow::Result<()> {
     match action {
+        "session-start" => extract::hooks::hook_session_start(config).await?,
+        "pre" => extract::hooks::hook_pre_tool_use(config).await?,
+        "permission" => extract::hooks::hook_permission_request(config).await?,
         "post" => extract::hooks::hook_post(config).await?,
         "compact" => extract::hooks::hook_compact(config).await?,
         "prompt" => extract::hooks::hook_prompt(config).await?,

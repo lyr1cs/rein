@@ -22,6 +22,7 @@ fn config_for_test() -> (Arc<ReinConfig>, tempfile::TempDir) {
         .join("memories.db")
         .to_string_lossy()
         .into_owned();
+    config.proxy.allow_unauthenticated_loopback = true;
     (Arc::new(config), tmp)
 }
 
