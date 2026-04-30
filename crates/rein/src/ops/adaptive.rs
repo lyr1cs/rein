@@ -445,17 +445,7 @@ fn ars_parameter_policy_allows_runtime(
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
 ) -> bool {
-    if !config.adaptive.enabled
-        || !config.ars.acceleration.enabled
-        || config.ars.acceleration.shadow_only
-    {
-        return false;
-    }
-    let loaded = crate::store::ars_parameter_policy::load_parameter_policy(conn);
-    matches!(
-        loaded.status,
-        crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
-    ) && loaded.policy.allows_runtime_adoption(state.version)
+    crate::ops::ars_tuning::parameter_policy_allows_runtime(conn, config, state)
 }
 
 // ===========================================================================

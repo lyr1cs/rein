@@ -66,10 +66,12 @@ Test-support-only route families are intentionally excluded.
 ## `/api/adaptive` ARS Acceleration Shape
 
 v0.28 exposes ARS acceleration status, replay-learned fusion weights, and the
-v0.28.2 dynamic-parameter activation policy. Production recall remains
-unchanged by default; explicit non-shadow canary mode can consume eligible
-snapshot weights only when `ars_parameter_policy` is loaded and allows runtime
-adoption. Synthesis behavior remains on the existing path.
+dynamic-parameter activation policy. Production recall remains unchanged by
+default; explicit non-shadow canary mode can consume eligible snapshot weights
+only when `ars_parameter_policy` is loaded and allows runtime adoption. v0.28.3
+uses the same policy gate for synthesis/concept scalar parameters and judge
+sample-rate adaptation, while default installs remain on static configured
+values.
 
 `GET /api/adaptive` includes:
 

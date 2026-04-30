@@ -39,6 +39,20 @@ Counterfactual alpha learning still optimizes a single CC alpha, but candidate s
 
 High-evidence accessed events also receive higher event weight.
 
+Shadow ARS acceleration also replays six-dimensional fusion weights over
+BM25/vector/KG/episode/support/diversity signals. v0.28.3 evaluates one-hot
+dimensions, deterministic pairwise simplex blends, accessed centroids, and
+accessed-vs-other feature gaps, then averages tied winners before applying the
+normal parent-prior shrinkage.
+
+## ARS scalar policy
+
+When `[ars.acceleration]` is explicitly in canary mode and
+`ars_parameter_policy` is healthy, synthesis/concept cold-start thresholds,
+useful-rate thresholds, LLM judge sample rates, and LLM judge weight decay can
+move from static config toward calibrated feedback. Missing policy, drift
+alerts, or insufficient calibration keep the static values.
+
 ## Admission and promotion
 
 - admission can shift by cluster strength and cluster novelty context

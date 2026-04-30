@@ -124,10 +124,19 @@ fn run_concept_summary_inner(
         },
     };
 
+    let ars_parameter_policy_canary =
+        crate::ops::ars_tuning::parameter_policy_allows_runtime(store.conn(), config, &state);
     let batch_cap = config.ars.batch_size.max(1);
     for concept in eligible.into_iter().take(batch_cap) {
         outcome.attempted += 1;
-        match summarize_one(store, &extractor, &concept, config, &state) {
+        match summarize_one(
+            store,
+            &extractor,
+            &concept,
+            config,
+            &state,
+            ars_parameter_policy_canary,
+        ) {
             Ok(summary_id) => {
                 outcome.succeeded += 1;
                 if !summary_id.is_empty() {
@@ -208,6 +217,7 @@ fn summarize_one(
     concept: &Concept,
     config: &ReinConfig,
     adaptive_state: &AdaptiveState,
+    ars_parameter_policy_canary: bool,
 ) -> Result<String, SummaryError> {
     // Codex R2 P2 fix — return the minted `living_summary_id` so
     // `run_concept_summary_inner` can surface it on `ConceptSummaryOutcome`.
@@ -296,6 +306,7 @@ fn summarize_one(
             &concept.id,
             &prompt,
             summary,
+            ars_parameter_policy_canary,
         );
     }
 
@@ -654,6 +665,27 @@ pub fn decide_concept_summary_quality(
     // suppressing summary refresh despite zero judge influence intent.
     judge_weight_decay_rate: f64,
 ) -> ConceptSummaryDecision {
+    decide_concept_summary_quality_with_threshold(
+        global_enabled,
+        cluster_id,
+        query_type,
+        adaptive_state,
+        cold_start_n,
+        judge_weight_decay_rate,
+        CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decide_concept_summary_quality_with_threshold(
+    global_enabled: bool,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    adaptive_state: Option<&AdaptiveState>,
+    cold_start_n: u64,
+    judge_weight_decay_rate: f64,
+    useful_rate_threshold: f64,
+) -> ConceptSummaryDecision {
     // Operator override wins. Even with rich adaptive data, if the operator
     // disabled the global flag, the Cap-A surface is off.
     if !global_enabled {
@@ -716,11 +748,52 @@ pub fn decide_concept_summary_quality(
     // Per-cluster gate: skip if learned useful_rate is below the bootstrap
     // threshold (cluster has acquired enough events to disagree with the
     // global default).
-    if cluster.useful_rate >= CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD {
+    if cluster.useful_rate >= useful_rate_threshold {
         ConceptSummaryDecision::Yes
     } else {
         ConceptSummaryDecision::Skip(ConceptSummarySkipReason::AdaptiveDecision)
     }
+}
+
+pub fn effective_concept_summary_gate_parameters(
+    config: &ReinConfig,
+    adaptive_state: Option<&AdaptiveState>,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    ars_parameter_policy_canary: bool,
+) -> (u64, f64) {
+    let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
+    let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n(
+        config.ars.concept_summary_cold_start_n,
+        calibration,
+        ars_parameter_policy_canary,
+    );
+    let Some(cid) = cluster_id else {
+        return (cold_start_n, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
+    };
+    let bucket = adaptive_state
+        .and_then(|state| state.concept_summary_feedback_stats.as_ref())
+        .and_then(|stats| {
+            stats
+                .by_cluster
+                .get(&concept_summary_bucket_key(Some(cid), query_type))
+        });
+    let Some(bucket) = bucket else {
+        return (cold_start_n, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
+    };
+    let human_count = bucket
+        .viewed_count
+        .saturating_add(bucket.explicit_up)
+        .saturating_add(bucket.explicit_down);
+    let useful_rate_threshold = crate::ops::ars_tuning::effective_useful_rate_threshold(
+        CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        bucket.useful_rate,
+        human_count,
+        bucket.llm_judge_count,
+        calibration,
+        ars_parameter_policy_canary,
+    );
+    (cold_start_n, useful_rate_threshold)
 }
 
 // ─── v0.27.1 E direction — Cap A mirror of recall_synthesis judge wiring ────
@@ -728,9 +801,24 @@ pub fn decide_concept_summary_quality(
 /// Cap A mirror of [`crate::ops::recall_synthesis::current_sample_rate`] —
 /// reads the per-bucket human-signal aggregate off
 /// `ConceptSummaryFeedbackState`. Pure function, testable in isolation.
+#[allow(dead_code)]
 fn current_sample_rate_concept_summary(
     bucket: Option<&ClusterConceptSummaryStats>,
     cfg: &crate::config::ArsLlmJudgeConfig,
+) -> f64 {
+    current_sample_rate_concept_summary_with_rates(
+        bucket,
+        cfg.human_signal_threshold,
+        cfg.sample_rate_cold_start,
+        cfg.sample_rate_warm,
+    )
+}
+
+fn current_sample_rate_concept_summary_with_rates(
+    bucket: Option<&ClusterConceptSummaryStats>,
+    human_signal_threshold: u64,
+    cold_start_rate: f64,
+    warm_rate: f64,
 ) -> f64 {
     let human_count = bucket
         .map(|s| {
@@ -739,11 +827,43 @@ fn current_sample_rate_concept_summary(
                 .saturating_add(s.viewed_count)
         })
         .unwrap_or(0);
-    if human_count >= cfg.human_signal_threshold {
-        cfg.sample_rate_warm
+    if human_count >= human_signal_threshold {
+        warm_rate
     } else {
-        cfg.sample_rate_cold_start
+        cold_start_rate
     }
+}
+
+fn signal_hint_for_concept_summary_job(
+    config: &ReinConfig,
+    bucket: Option<&ClusterConceptSummaryStats>,
+) -> Option<serde_json::Value> {
+    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+        return None;
+    }
+    let total_signal = bucket
+        .map(|s| {
+            s.viewed_count
+                .saturating_add(s.clicked_source_count)
+                .saturating_add(s.immediate_requery_count)
+                .saturating_add(s.explicit_up)
+                .saturating_add(s.explicit_down)
+                .saturating_add(s.llm_judge_count)
+        })
+        .unwrap_or(0);
+    let useful_rate_ci_width = if total_signal > 0 {
+        Some((1.0 / (total_signal as f64).sqrt()).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    serde_json::to_value(crate::store::adaptive::SignalHint {
+        inferred_w_view: Some(1.0),
+        inferred_w_click: Some(1.5),
+        inferred_w_thumb: Some(2.0),
+        inferred_w_req: Some(1.5),
+        useful_rate_ci_width,
+    })
+    .ok()
 }
 
 /// Bernoulli sample matching the `recall_synthesis` impl. Kept private to
@@ -823,6 +943,7 @@ fn enqueue_judge_for_concept_summary(
     concept_id: &str,
     prompt: &str,
     candidate: &str,
+    ars_parameter_policy_canary: bool,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, concept_summary_cache_path_for_config, judge_queue_path_for_config,
@@ -873,6 +994,16 @@ fn enqueue_judge_for_concept_summary(
     let candidate = candidate_capped.as_str();
 
     let stamp_hash = JudgeJob::compute_stamp_hash(query, prompt, candidate);
+    let bucket = adaptive_state
+        .concept_summary_feedback_stats
+        .as_ref()
+        .and_then(|sfs| {
+            sfs.by_cluster.get(&concept_summary_bucket_key(
+                Some(synthetic_cid),
+                routing_query_type,
+            ))
+        });
+    let signal_hint = signal_hint_for_concept_summary_job(config, bucket);
     let cache_entry = serde_json::json!({
         "concept_summary_id": summary_id,
         "concept_id": concept_id,
@@ -883,6 +1014,7 @@ fn enqueue_judge_for_concept_summary(
         "query_type": routing_query_type,
         "cluster_id": synthetic_cid,
         "source_count": 0u32,
+        "signal_hint": signal_hint,
         "stamped_at": chrono::Utc::now().to_rfc3339(),
     });
 
@@ -903,16 +1035,26 @@ fn enqueue_judge_for_concept_summary(
     // so the warm-ladder graduation actually fires once judge events
     // accumulate. Pre-v0.27.4 this looked up `(None, "unknown")`, which
     // was where ZERO Cap A judge events ever landed.
-    let bucket = adaptive_state
-        .concept_summary_feedback_stats
-        .as_ref()
-        .and_then(|sfs| {
-            sfs.by_cluster.get(&concept_summary_bucket_key(
-                Some(synthetic_cid),
-                routing_query_type,
-            ))
-        });
-    let rate = current_sample_rate_concept_summary(bucket, &config.ars.llm_judge);
+    let calibration = adaptive_state.judge_calibration_state.as_ref();
+    let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate(
+        config.ars.llm_judge.sample_rate_cold_start,
+        calibration,
+        ars_parameter_policy_canary,
+        true,
+    );
+    let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate(
+        config.ars.llm_judge.sample_rate_warm,
+        calibration,
+        ars_parameter_policy_canary,
+        false,
+    )
+    .min(cold_rate);
+    let rate = current_sample_rate_concept_summary_with_rates(
+        bucket,
+        config.ars.llm_judge.human_signal_threshold,
+        cold_rate,
+        warm_rate,
+    );
     if bernoulli_fire_concept_summary(rate, summary_id) {
         let job = serde_json::json!({
             "kind": "concept_summary",
@@ -926,6 +1068,7 @@ fn enqueue_judge_for_concept_summary(
             "query_type": routing_query_type,
             "cluster_id": synthetic_cid,
             "source_count": 0u32,
+            "signal_hint": signal_hint,
         });
         let queue_path = judge_queue_path_for_config(config);
         if let Err(e) = append_jsonl_line(&queue_path, &job) {
@@ -1437,6 +1580,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decide_concept_summary_ignores_llm_signal_when_judge_weight_is_zero() {
+        let state = cs_state_with_bucket(
+            42,
+            "Semantic",
+            ClusterConceptSummaryStats {
+                viewed_count: 0,
+                llm_judge_count: CONCEPT_SUMMARY_COLD_START_N + 10,
+                useful_rate: CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD - 0.1,
+                ..ClusterConceptSummaryStats::default()
+            },
+        );
+
+        assert_eq!(
+            decide_concept_summary_quality(
+                true,
+                Some(42),
+                "Semantic",
+                Some(&state),
+                CONCEPT_SUMMARY_COLD_START_N,
+                0.0,
+            ),
+            ConceptSummaryDecision::Yes
+        );
+        assert_eq!(
+            decide_concept_summary_quality(
+                true,
+                Some(42),
+                "Semantic",
+                Some(&state),
+                CONCEPT_SUMMARY_COLD_START_N,
+                0.3,
+            ),
+            ConceptSummaryDecision::Skip(ConceptSummarySkipReason::AdaptiveDecision)
+        );
+    }
+
     // ── v0.27.4 D1/D2 — synthetic per-concept routing ────────────────────────
 
     /// The synthetic cluster id derived from a concept_id must be stable
@@ -1496,6 +1676,7 @@ mod tests {
             concept_id,
             prompt,
             candidate,
+            false,
         );
 
         // Read the cache jsonl line back and assert the routing fields.
@@ -1520,5 +1701,31 @@ mod tests {
             "cache query_type must equal CONCEPT_SUMMARY_QUERY_TYPE_REFRESH sentinel; \
              got {parsed}",
         );
+    }
+
+    #[test]
+    fn signal_hint_for_concept_summary_job_is_shadow_only() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        let bucket = ClusterConceptSummaryStats {
+            viewed_count: 4,
+            explicit_up: 2,
+            llm_judge_count: 3,
+            useful_rate: 0.8,
+            ..ClusterConceptSummaryStats::default()
+        };
+
+        let hint = signal_hint_for_concept_summary_job(&config, Some(&bucket))
+            .expect("shadow acceleration should emit signal hint");
+
+        assert_eq!(hint["inferred_w_view"], 1.0);
+        assert_eq!(hint["inferred_w_click"], 1.5);
+        assert_eq!(hint["inferred_w_thumb"], 2.0);
+        assert_eq!(hint["inferred_w_req"], 1.5);
+        assert!(hint["useful_rate_ci_width"].as_f64().unwrap() < 1.0);
+
+        config.ars.acceleration.shadow_only = false;
+        assert!(signal_hint_for_concept_summary_job(&config, Some(&bucket)).is_none());
     }
 }

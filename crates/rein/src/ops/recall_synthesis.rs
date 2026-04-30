@@ -221,6 +221,27 @@ pub fn decide_synthesize(
     // operator. Caller passes `config.ars.llm_judge.weight_decay_rate`.
     judge_weight_decay_rate: f64,
 ) -> SynthesizeDecision {
+    decide_synthesize_with_threshold(
+        global_enabled,
+        cluster_id,
+        query_type,
+        adaptive_state,
+        cold_start_n,
+        judge_weight_decay_rate,
+        SYNTHESIS_USEFUL_RATE_THRESHOLD,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decide_synthesize_with_threshold(
+    global_enabled: bool,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    adaptive_state: Option<&AdaptiveState>,
+    cold_start_n: u64,
+    judge_weight_decay_rate: f64,
+    useful_rate_threshold: f64,
+) -> SynthesizeDecision {
     // Operator override wins. Even with rich adaptive data, if the operator
     // disabled the global flag, the synthesis path is off.
     if !global_enabled {
@@ -279,11 +300,52 @@ pub fn decide_synthesize(
     // Per-cluster gate: skip if learned useful_rate is below the bootstrap
     // threshold (cluster has acquired enough events to disagree with the
     // global default).
-    if cluster.useful_rate >= SYNTHESIS_USEFUL_RATE_THRESHOLD {
+    if cluster.useful_rate >= useful_rate_threshold {
         SynthesizeDecision::Yes
     } else {
         SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)
     }
+}
+
+fn effective_synthesis_gate_parameters(
+    config: &ReinConfig,
+    adaptive_state: Option<&AdaptiveState>,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    ars_parameter_policy_canary: bool,
+) -> (u64, f64) {
+    let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
+    let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n(
+        config.ars.synthesis_cold_start_n,
+        calibration,
+        ars_parameter_policy_canary,
+    );
+    let Some(cid) = cluster_id else {
+        return (cold_start_n, SYNTHESIS_USEFUL_RATE_THRESHOLD);
+    };
+    let bucket = adaptive_state
+        .and_then(|state| state.synthesis_feedback_stats.as_ref())
+        .and_then(|stats| {
+            stats
+                .by_cluster
+                .get(&synthesis_bucket_key(Some(cid), query_type))
+        });
+    let Some(bucket) = bucket else {
+        return (cold_start_n, SYNTHESIS_USEFUL_RATE_THRESHOLD);
+    };
+    let human_count = bucket
+        .viewed_count
+        .saturating_add(bucket.explicit_up)
+        .saturating_add(bucket.explicit_down);
+    let useful_rate_threshold = crate::ops::ars_tuning::effective_useful_rate_threshold(
+        SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        bucket.useful_rate,
+        human_count,
+        bucket.llm_judge_count,
+        calibration,
+        ars_parameter_policy_canary,
+    );
+    (cold_start_n, useful_rate_threshold)
 }
 
 /// Run recall-time synthesis over `results` for `query`.
@@ -318,6 +380,29 @@ pub fn run_recall_synthesis(
     query_type: &str,
     adaptive_state: Option<&AdaptiveState>,
     extractor_override: Option<ExtractorKind>,
+) -> Option<RecallSynthesisOutcome> {
+    run_recall_synthesis_with_policy(
+        results,
+        query,
+        config,
+        synthesize,
+        query_type,
+        adaptive_state,
+        extractor_override,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_recall_synthesis_with_policy(
+    results: &[RecallResult],
+    query: &str,
+    config: &ReinConfig,
+    synthesize: Option<bool>,
+    query_type: &str,
+    adaptive_state: Option<&AdaptiveState>,
+    extractor_override: Option<ExtractorKind>,
+    ars_parameter_policy_canary: bool,
 ) -> Option<RecallSynthesisOutcome> {
     if synthesize != Some(true) {
         return None;
@@ -376,13 +461,28 @@ pub fn run_recall_synthesis(
         query_type: query_type.to_string(),
         cluster_id,
     };
-    match decide_synthesize(
+    let (effective_cold_start_n, effective_useful_rate_threshold) =
+        effective_synthesis_gate_parameters(
+            config,
+            adaptive_state,
+            cluster_id,
+            query_type,
+            ars_parameter_policy_canary,
+        );
+    let effective_judge_weight_decay_rate =
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+            config.ars.llm_judge.weight_decay_rate,
+            adaptive_state.and_then(|state| state.judge_calibration_state.as_ref()),
+            ars_parameter_policy_canary,
+        );
+    match decide_synthesize_with_threshold(
         config.ars.recall_synthesis_enabled,
         cluster_id,
         query_type,
         adaptive_state,
-        config.ars.synthesis_cold_start_n,
-        config.ars.llm_judge.weight_decay_rate,
+        effective_cold_start_n,
+        effective_judge_weight_decay_rate,
+        effective_useful_rate_threshold,
     ) {
         SynthesizeDecision::Yes => { /* fall through to synthesis path */ }
         SynthesizeDecision::Skip(SkipReason::OperatorDisabled) => {
@@ -493,6 +593,7 @@ pub fn run_recall_synthesis(
                             &prompt,
                             &clean,
                             included_count,
+                            ars_parameter_policy_canary,
                         );
                     }
                 }
@@ -803,9 +904,24 @@ pub fn call_synthesis_llm_sync(extractor: &ExtractorKind, prompt: &str) -> ReinR
 ///
 /// Reads `human_count = explicit_up + explicit_down + viewed_count` off the
 /// matching bucket; if absent, treats `human_count = 0` → cold-start rate.
+#[allow(dead_code)]
 fn current_sample_rate(
     bucket: Option<&ClusterSynthesisStats>,
     cfg: &crate::config::ArsLlmJudgeConfig,
+) -> f64 {
+    current_sample_rate_with_rates(
+        bucket,
+        cfg.human_signal_threshold,
+        cfg.sample_rate_cold_start,
+        cfg.sample_rate_warm,
+    )
+}
+
+fn current_sample_rate_with_rates(
+    bucket: Option<&ClusterSynthesisStats>,
+    human_signal_threshold: u64,
+    cold_start_rate: f64,
+    warm_rate: f64,
 ) -> f64 {
     let human_count = bucket
         .map(|s| {
@@ -814,11 +930,43 @@ fn current_sample_rate(
                 .saturating_add(s.viewed_count)
         })
         .unwrap_or(0);
-    if human_count >= cfg.human_signal_threshold {
-        cfg.sample_rate_warm
+    if human_count >= human_signal_threshold {
+        warm_rate
     } else {
-        cfg.sample_rate_cold_start
+        cold_start_rate
     }
+}
+
+fn signal_hint_for_synthesis_job(
+    config: &ReinConfig,
+    bucket: Option<&ClusterSynthesisStats>,
+) -> Option<serde_json::Value> {
+    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+        return None;
+    }
+    let total_signal = bucket
+        .map(|s| {
+            s.viewed_count
+                .saturating_add(s.clicked_source_count)
+                .saturating_add(s.immediate_requery_count)
+                .saturating_add(s.explicit_up)
+                .saturating_add(s.explicit_down)
+                .saturating_add(s.llm_judge_count)
+        })
+        .unwrap_or(0);
+    let useful_rate_ci_width = if total_signal > 0 {
+        Some((1.0 / (total_signal as f64).sqrt()).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    serde_json::to_value(crate::store::adaptive::SignalHint {
+        inferred_w_view: Some(1.0),
+        inferred_w_click: Some(1.5),
+        inferred_w_thumb: Some(2.0),
+        inferred_w_req: Some(1.5),
+        useful_rate_ci_width,
+    })
+    .ok()
 }
 
 /// Bernoulli sample with the same xorshift-style nanos+id mix used elsewhere
@@ -869,6 +1017,7 @@ fn enqueue_judge_for_synthesis(
     prompt: &str,
     candidate: &str,
     source_count: usize,
+    ars_parameter_policy_canary: bool,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, judge_queue_path_for_config, synthesis_cache_path_for_config,
@@ -901,6 +1050,13 @@ fn enqueue_judge_for_synthesis(
     let candidate = candidate_capped.as_str();
 
     let stamp_hash = JudgeJob::compute_stamp_hash(query, prompt, candidate);
+    let bucket = adaptive_state
+        .and_then(|s| s.synthesis_feedback_stats.as_ref())
+        .and_then(|sfs| {
+            sfs.by_cluster
+                .get(&synthesis_bucket_key(cluster_id, query_type))
+        });
+    let signal_hint = signal_hint_for_synthesis_job(config, bucket);
     let cache_entry = serde_json::json!({
         "synthesis_id": synthesis_id,
         "query": query,
@@ -910,6 +1066,7 @@ fn enqueue_judge_for_synthesis(
         "query_type": query_type,
         "cluster_id": cluster_id,
         "source_count": source_count as u32,
+        "signal_hint": signal_hint,
         "stamped_at": chrono::Utc::now().to_rfc3339(),
     });
 
@@ -925,13 +1082,26 @@ fn enqueue_judge_for_synthesis(
     }
 
     // (2) Sample-rate Bernoulli → judge worker queue.
-    let bucket = adaptive_state
-        .and_then(|s| s.synthesis_feedback_stats.as_ref())
-        .and_then(|sfs| {
-            sfs.by_cluster
-                .get(&synthesis_bucket_key(cluster_id, query_type))
-        });
-    let rate = current_sample_rate(bucket, &config.ars.llm_judge);
+    let calibration = adaptive_state.and_then(|s| s.judge_calibration_state.as_ref());
+    let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate(
+        config.ars.llm_judge.sample_rate_cold_start,
+        calibration,
+        ars_parameter_policy_canary,
+        true,
+    );
+    let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate(
+        config.ars.llm_judge.sample_rate_warm,
+        calibration,
+        ars_parameter_policy_canary,
+        false,
+    )
+    .min(cold_rate);
+    let rate = current_sample_rate_with_rates(
+        bucket,
+        config.ars.llm_judge.human_signal_threshold,
+        cold_rate,
+        warm_rate,
+    );
     if bernoulli_fire(rate, synthesis_id) {
         let job = serde_json::json!({
             "kind": "synthesis",
@@ -945,6 +1115,7 @@ fn enqueue_judge_for_synthesis(
             "query_type": query_type,
             "cluster_id": cluster_id,
             "source_count": source_count as u32,
+            "signal_hint": signal_hint,
         });
         let queue_path = judge_queue_path_for_config(config);
         if let Err(e) = append_jsonl_line(&queue_path, &job) {
@@ -1843,6 +2014,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decide_synthesize_ignores_llm_signal_when_judge_weight_is_zero() {
+        let mut stats = cluster_stats(0, SYNTHESIS_USEFUL_RATE_THRESHOLD - 0.1);
+        stats.llm_judge_count = SYNTHESIS_COLD_START_N + 10;
+        let state = state_with_bucket(&synthesis_bucket_key(Some(42), "Semantic"), stats);
+
+        assert_eq!(
+            decide_synthesize(
+                true,
+                Some(42),
+                "Semantic",
+                Some(&state),
+                SYNTHESIS_COLD_START_N,
+                0.0,
+            ),
+            SynthesizeDecision::Yes
+        );
+        assert_eq!(
+            decide_synthesize(
+                true,
+                Some(42),
+                "Semantic",
+                Some(&state),
+                SYNTHESIS_COLD_START_N,
+                0.3,
+            ),
+            SynthesizeDecision::Skip(SkipReason::AdaptiveDecision)
+        );
+    }
+
     // ── RecallSynthesisOutcome serde — synthesis_id + skipped_adaptive_decision ──
 
     /// Round-trip: a populated `synthesis_id` survives JSON serialization
@@ -2483,5 +2684,31 @@ mod tests {
             outcome.synthesis_id.is_none(),
             "whitespace-only post-strip → synthesis_id MUST stay None; got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn signal_hint_for_synthesis_job_is_shadow_only_and_uses_bucket_confidence() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        let bucket = ClusterSynthesisStats {
+            viewed_count: 9,
+            explicit_up: 1,
+            llm_judge_count: 6,
+            useful_rate: 0.75,
+            ..ClusterSynthesisStats::default()
+        };
+
+        let hint = signal_hint_for_synthesis_job(&config, Some(&bucket))
+            .expect("shadow acceleration should emit signal hint");
+
+        assert_eq!(hint["inferred_w_view"], 1.0);
+        assert_eq!(hint["inferred_w_click"], 1.5);
+        assert_eq!(hint["inferred_w_thumb"], 2.0);
+        assert_eq!(hint["inferred_w_req"], 1.5);
+        assert!(hint["useful_rate_ci_width"].as_f64().unwrap() < 1.0);
+
+        config.ars.acceleration.shadow_only = false;
+        assert!(signal_hint_for_synthesis_job(&config, Some(&bucket)).is_none());
     }
 }
