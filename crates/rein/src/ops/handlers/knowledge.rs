@@ -1030,7 +1030,6 @@ impl OpsRuntime {
         // forward-compatible if v0.28+ rethreads it.
         let _caller_cluster_id = params.cluster_id;
         let global_enabled = self.config.ars.concept_summary_enabled;
-        let cold_start_n = self.config.ars.concept_summary_cold_start_n;
         self.with_store(|store| {
             let concept = store
                 .get_concept_by_id(&concept_id)?
@@ -1102,15 +1101,36 @@ impl OpsRuntime {
                     let adaptive_state =
                         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                             .unwrap_or_default();
+                    let ars_parameter_policy_canary =
+                        crate::ops::ars_tuning::parameter_policy_allows_runtime(
+                            store.conn(),
+                            self.config(),
+                            &adaptive_state,
+                        );
                     let synthetic_cid =
                         crate::ops::concept_summary::synthetic_cluster_id_for_concept(&concept.id);
-                    match crate::ops::concept_summary::decide_concept_summary_quality(
+                    let (cold_start_n, useful_rate_threshold) =
+                        crate::ops::concept_summary::effective_concept_summary_gate_parameters(
+                            self.config(),
+                            Some(&adaptive_state),
+                            Some(synthetic_cid),
+                            crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
+                            ars_parameter_policy_canary,
+                        );
+                    let judge_weight_decay_rate =
+                        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+                            self.config().ars.llm_judge.weight_decay_rate,
+                            adaptive_state.judge_calibration_state.as_ref(),
+                            ars_parameter_policy_canary,
+                        );
+                    match crate::ops::concept_summary::decide_concept_summary_quality_with_threshold(
                         global_enabled,
                         Some(synthetic_cid),
                         crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
                         Some(&adaptive_state),
                         cold_start_n,
-                        self.config().ars.llm_judge.weight_decay_rate,
+                        judge_weight_decay_rate,
+                        useful_rate_threshold,
                     ) {
                         crate::ops::concept_summary::ConceptSummaryDecision::Yes => {
                             (concept.living_summary.clone(), false)

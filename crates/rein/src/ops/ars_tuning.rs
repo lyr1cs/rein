@@ -74,9 +74,14 @@ pub fn effective_scalar(
 ) -> f64 {
     let min = finite_or(bounds.min, 0.0);
     let max = finite_or(bounds.max, min).max(min);
-    let static_prior = finite_or(static_prior, min).clamp(min, max);
-    let learned_value = finite_or(learned_value, static_prior).clamp(min, max);
+    let static_prior_raw = finite_or(static_prior, min);
     let trust = dynamic_trust(inputs);
+    if trust <= f64::EPSILON {
+        return static_prior_raw;
+    }
+
+    let static_prior = static_prior_raw.clamp(min, max);
+    let learned_value = finite_or(learned_value, static_prior).clamp(min, max);
     let blended = static_prior.mul_add(1.0 - trust, learned_value * trust);
     let stepped = match previous_effective {
         Some(previous) if bounds.max_step.is_finite() && bounds.max_step >= 0.0 => {
@@ -167,6 +172,162 @@ pub fn effective_judge_weight_decay_rate(
     )
 }
 
+pub fn effective_judge_sample_rate(
+    static_rate: f64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+    cold_start: bool,
+) -> f64 {
+    let max_rate = if cold_start { 1.0 } else { 0.5 };
+    let static_rate = finite_non_negative(static_rate).min(max_rate);
+    if !production_canary || static_rate <= f64::EPSILON {
+        return static_rate;
+    }
+
+    let drift_alert = calibration
+        .map(|cal| cal.judge_drift_alert > 0)
+        .unwrap_or(false);
+    if drift_alert {
+        return 0.0;
+    }
+    let reliability = llm_feedback_reliability(calibration);
+    let pair_count = calibration_pair_count(calibration);
+    let learned_rate = if cold_start {
+        static_rate * (1.0 - 0.5 * reliability)
+    } else {
+        static_rate * (1.0 - reliability)
+    };
+    effective_scalar(
+        static_rate,
+        learned_rate,
+        None,
+        ScalarBounds {
+            min: 0.0,
+            max: max_rate,
+            max_step: if cold_start { 0.10 } else { 0.05 },
+        },
+        TrustInputs {
+            enabled: true,
+            production_canary,
+            human_count: pair_count,
+            llm_count: 0,
+            llm_reliability: 0.0,
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert,
+            prior_strength: 30.0,
+            max_trust: 0.75,
+        },
+    )
+}
+
+pub fn effective_cold_start_n(
+    static_n: u64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+) -> u64 {
+    let drift_alert = calibration
+        .map(|cal| cal.judge_drift_alert > 0)
+        .unwrap_or(false);
+    if !production_canary || drift_alert || static_n == 0 {
+        return static_n;
+    }
+
+    let reliability = llm_feedback_reliability(calibration);
+    let learned_n = (static_n as f64 * (1.0 - 0.7 * reliability)).round();
+    effective_scalar(
+        static_n as f64,
+        learned_n,
+        None,
+        ScalarBounds {
+            min: (static_n as f64).min(3.0),
+            max: 50.0,
+            max_step: 2.0,
+        },
+        TrustInputs {
+            enabled: true,
+            production_canary,
+            human_count: calibration_pair_count(calibration),
+            llm_count: 0,
+            llm_reliability: 0.0,
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert,
+            prior_strength: 20.0,
+            max_trust: 0.75,
+        },
+    )
+    .round()
+    .clamp((static_n as f64).min(3.0), 50.0) as u64
+}
+
+pub fn effective_useful_rate_threshold(
+    static_threshold: f64,
+    observed_useful_rate: f64,
+    human_count: u64,
+    llm_count: u64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+) -> f64 {
+    let static_threshold = clamp01(finite_or(static_threshold, 0.0));
+    let drift_alert = calibration
+        .map(|cal| cal.judge_drift_alert > 0)
+        .unwrap_or(false);
+    if !production_canary || drift_alert {
+        return static_threshold;
+    }
+
+    effective_scalar(
+        static_threshold,
+        observed_useful_rate.clamp(0.35, 0.75),
+        None,
+        bounds01(0.05),
+        TrustInputs {
+            enabled: true,
+            production_canary,
+            human_count,
+            llm_count,
+            llm_reliability: llm_feedback_reliability(calibration),
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert,
+            prior_strength: 20.0,
+            max_trust: 0.75,
+        },
+    )
+}
+
+pub fn parameter_policy_allows_runtime(
+    conn: &rusqlite::Connection,
+    config: &crate::config::ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) -> bool {
+    if !config.adaptive.enabled
+        || !config.ars.acceleration.enabled
+        || config.ars.acceleration.shadow_only
+    {
+        return false;
+    }
+    let loaded = crate::store::ars_parameter_policy::load_parameter_policy(conn);
+    matches!(
+        loaded.status,
+        crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+    ) && loaded.policy.allows_runtime_adoption(state.version)
+}
+
+fn calibration_pair_count(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+) -> u64 {
+    calibration
+        .map(|cal| {
+            cal.recent_pairs_synthesis
+                .len()
+                .saturating_add(cal.recent_pairs_concept.len())
+                .saturating_add(cal.recent_pairs_runtime_vs_offline.len()) as u64
+        })
+        .unwrap_or(0)
+}
+
 fn normalize_simplex(values: [f64; 6]) -> Option<[f64; 6]> {
     let mut sanitized = [0.0; 6];
     for (idx, value) in values.into_iter().enumerate() {
@@ -223,6 +384,37 @@ mod tests {
 
         assert_eq!(dynamic_trust(inputs), 0.0);
         assert_eq!(effective_scalar(0.5, 0.9, None, bounds01(0.1), inputs), 0.5);
+    }
+
+    #[test]
+    fn scalar_effective_value_preserves_out_of_bounds_static_when_trust_is_zero() {
+        let inputs = TrustInputs {
+            enabled: true,
+            production_canary: false,
+            human_count: 100,
+            llm_count: 0,
+            llm_reliability: 0.0,
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert: false,
+            prior_strength: 20.0,
+            max_trust: 1.0,
+        };
+
+        assert_eq!(
+            effective_scalar(
+                0.0,
+                0.9,
+                None,
+                ScalarBounds {
+                    min: 0.1,
+                    max: 1.0,
+                    max_step: 0.1
+                },
+                inputs
+            ),
+            0.0
+        );
     }
 
     #[test]
@@ -348,5 +540,103 @@ mod tests {
 
         assert_eq!(llm_feedback_reliability(Some(&calibration)), 0.0);
         assert!(effective_judge_weight_decay_rate(0.3, Some(&calibration), true) < 0.3);
+    }
+
+    #[test]
+    fn judge_sample_rate_reduces_warm_rate_when_reliable() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.8,
+            runtime_vs_offline_kappa: 0.8,
+            ..Default::default()
+        };
+        for idx in 0..40 {
+            calibration
+                .recent_pairs_runtime_vs_offline
+                .push_back((true, true, idx));
+        }
+
+        let effective = effective_judge_sample_rate(0.2, Some(&calibration), true, false);
+
+        assert!(effective < 0.2);
+        assert!(effective >= 0.05);
+    }
+
+    #[test]
+    fn judge_sample_rate_returns_static_without_policy_canary() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.9,
+            ..Default::default()
+        };
+        for idx in 0..12 {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((true, true, idx));
+        }
+
+        assert_eq!(
+            effective_judge_sample_rate(1.0, Some(&calibration), false, true),
+            1.0
+        );
+        assert_eq!(
+            effective_judge_sample_rate(0.0, Some(&calibration), false, true),
+            0.0
+        );
+        assert_eq!(
+            effective_judge_sample_rate(0.0, Some(&calibration), true, false),
+            0.0
+        );
+    }
+
+    #[test]
+    fn cold_start_n_returns_static_without_policy_canary() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.9,
+            ..Default::default()
+        };
+        for idx in 0..12 {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((true, true, idx));
+        }
+
+        assert_eq!(effective_cold_start_n(1, Some(&calibration), false), 1);
+        assert_eq!(effective_cold_start_n(0, Some(&calibration), true), 0);
+    }
+
+    #[test]
+    fn cold_start_n_moves_down_with_reliable_feedback() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.9,
+            ..Default::default()
+        };
+        for idx in 0..20 {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((true, true, idx));
+        }
+
+        let effective = effective_cold_start_n(10, Some(&calibration), true);
+
+        assert!(effective < 10);
+        assert!(effective >= 3);
+    }
+
+    #[test]
+    fn useful_rate_threshold_blends_toward_observed_rate() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.8,
+            ..Default::default()
+        };
+        for idx in 0..12 {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((true, true, idx));
+        }
+
+        let effective =
+            effective_useful_rate_threshold(0.5, 0.35, 20, 40, Some(&calibration), true);
+
+        assert!(effective < 0.5);
+        assert!(effective >= 0.35);
     }
 }

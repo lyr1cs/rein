@@ -685,7 +685,7 @@ impl OpsRuntime {
         // (a) needs no DB access and (b) wraps a `block_in_place` call to
         // drive the LLM that should not be nested inside any store
         // transaction guard.
-        let (results, adaptive_state) = self.with_store(|store| {
+        let (results, adaptive_state, ars_parameter_policy_canary) = self.with_store(|store| {
             let results = crate::search::recall::recall_temporal_with_request_id(
                 store,
                 &self.config,
@@ -709,7 +709,13 @@ impl OpsRuntime {
             let adaptive_state =
                 crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                     .unwrap_or_default();
-            Ok((results, adaptive_state))
+            let ars_parameter_policy_canary =
+                crate::ops::ars_tuning::parameter_policy_allows_runtime(
+                    store.conn(),
+                    &self.config,
+                    &adaptive_state,
+                );
+            Ok((results, adaptive_state, ars_parameter_policy_canary))
         })?;
 
         // Phase 2: optional synthesis (Cap B / v0.26 D direction). Returns
@@ -725,7 +731,7 @@ impl OpsRuntime {
         // the same per-cluster bucket the M1 consumer writes into. v0.26.0
         // hardcoded "Semantic" inside `run_recall_synthesis`, which silently
         // misrouted every non-Semantic query.
-        let synthesis = crate::ops::recall_synthesis::run_recall_synthesis(
+        let synthesis = crate::ops::recall_synthesis::run_recall_synthesis_with_policy(
             &results,
             &query,
             &self.config,
@@ -733,6 +739,7 @@ impl OpsRuntime {
             route.query_type.synthesis_bucket_label(),
             Some(&adaptive_state),
             None,
+            ars_parameter_policy_canary,
         );
 
         Ok(RecallMemoryOutput {

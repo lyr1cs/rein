@@ -275,9 +275,10 @@ pub fn score_candidate_with_shadow_weights(
 
 /// Find the per-event shadow weight vector that best ranks accessed memories.
 ///
-/// The first v0.28 slice keeps this intentionally conservative: evaluate the
-/// six one-hot signal dimensions and average tied winners. Later slices can
-/// replace this with a continuous optimizer without changing the caller shape.
+/// This stays intentionally conservative for v0.28: evaluate a deterministic
+/// simplex candidate set, then average tied winners. It is broad enough to
+/// learn basic blended weights without introducing stochastic optimization or
+/// changing online recall behavior.
 pub fn optimal_shadow_weights_for_event(event: &RecallEvent) -> Option<ShadowFusionWeights> {
     if event.candidates.is_empty() || event.accessed_ids.is_empty() {
         return None;
@@ -286,17 +287,15 @@ pub fn optimal_shadow_weights_for_event(event: &RecallEvent) -> Option<ShadowFus
         return None;
     }
 
-    let mut scores = [0.0_f64; SHADOW_DIMENSIONS];
+    let candidates = shadow_weight_candidates_for_event(event);
     let mut best = f64::NEG_INFINITY;
     let mut worst = f64::INFINITY;
-    for dimension in 0..SHADOW_DIMENSIONS {
-        let mut values = [0.0_f64; SHADOW_DIMENSIONS];
-        values[dimension] = 1.0;
-        let weights = ShadowFusionWeights::from_array(values);
+    let mut scored = Vec::with_capacity(candidates.len());
+    for weights in candidates {
         let mrr = shadow_reciprocal_rank_sum(event, weights);
-        scores[dimension] = mrr;
         best = best.max(mrr);
         worst = worst.min(mrr);
+        scored.push((weights, mrr));
     }
 
     if !best.is_finite() || (best - worst).abs() < 1e-12 {
@@ -304,12 +303,132 @@ pub fn optimal_shadow_weights_for_event(event: &RecallEvent) -> Option<ShadowFus
     }
 
     let mut winners = [0.0_f64; SHADOW_DIMENSIONS];
-    for (idx, score) in scores.iter().enumerate() {
-        if (*score - best).abs() < 1e-12 {
-            winners[idx] = 1.0;
+    let mut winner_count = 0_usize;
+    for (weights, score) in scored {
+        if (score - best).abs() < 1e-12 {
+            for (target, value) in winners.iter_mut().zip(weights.as_array()) {
+                *target += value;
+            }
+            winner_count += 1;
         }
     }
+    if winner_count == 0 {
+        return None;
+    }
     Some(ShadowFusionWeights::from_array(winners).normalized_or_default())
+}
+
+fn shadow_weight_candidates_for_event(event: &RecallEvent) -> Vec<ShadowFusionWeights> {
+    let mut candidates = Vec::new();
+    push_shadow_weight_candidate(&mut candidates, ShadowFusionWeights::default());
+
+    for dimension in 0..SHADOW_DIMENSIONS {
+        let mut values = [0.0_f64; SHADOW_DIMENSIONS];
+        values[dimension] = 1.0;
+        push_shadow_weight_candidate(&mut candidates, ShadowFusionWeights::from_array(values));
+    }
+
+    for left in 0..SHADOW_DIMENSIONS {
+        for right in (left + 1)..SHADOW_DIMENSIONS {
+            for left_weight in [0.25_f64, 0.5_f64, 0.75_f64] {
+                let mut values = [0.0_f64; SHADOW_DIMENSIONS];
+                values[left] = left_weight;
+                values[right] = 1.0 - left_weight;
+                push_shadow_weight_candidate(
+                    &mut candidates,
+                    ShadowFusionWeights::from_array(values),
+                );
+            }
+        }
+    }
+
+    if let Some(weights) = accessed_centroid_shadow_candidate(event) {
+        push_shadow_weight_candidate(&mut candidates, weights);
+    }
+    if let Some(weights) = accessed_gap_shadow_candidate(event) {
+        push_shadow_weight_candidate(&mut candidates, weights);
+    }
+
+    candidates
+}
+
+fn push_shadow_weight_candidate(
+    candidates: &mut Vec<ShadowFusionWeights>,
+    weights: ShadowFusionWeights,
+) {
+    let weights = weights.normalized_or_default();
+    let values = weights.as_array();
+    if candidates
+        .iter()
+        .any(|existing| arrays_almost_equal(existing.as_array(), values))
+    {
+        return;
+    }
+    candidates.push(weights);
+}
+
+fn accessed_centroid_shadow_candidate(event: &RecallEvent) -> Option<ShadowFusionWeights> {
+    let mut values = [0.0_f64; SHADOW_DIMENSIONS];
+    let mut count = 0_usize;
+    for candidate in &event.candidates {
+        if event.accessed_ids.contains(&candidate.memory_id) {
+            for (target, feature) in values.iter_mut().zip(shadow_features(candidate)) {
+                *target += feature;
+            }
+            count += 1;
+        }
+    }
+    if count == 0 || !values.iter().any(|value| *value > f64::EPSILON) {
+        return None;
+    }
+    Some(ShadowFusionWeights::from_array(values).normalized_or_default())
+}
+
+fn accessed_gap_shadow_candidate(event: &RecallEvent) -> Option<ShadowFusionWeights> {
+    let mut accessed = [0.0_f64; SHADOW_DIMENSIONS];
+    let mut other = [0.0_f64; SHADOW_DIMENSIONS];
+    let mut accessed_count = 0_usize;
+    let mut other_count = 0_usize;
+
+    for candidate in &event.candidates {
+        if event.accessed_ids.contains(&candidate.memory_id) {
+            for (target, feature) in accessed.iter_mut().zip(shadow_features(candidate)) {
+                *target += feature;
+            }
+            accessed_count += 1;
+        } else {
+            for (target, feature) in other.iter_mut().zip(shadow_features(candidate)) {
+                *target += feature;
+            }
+            other_count += 1;
+        }
+    }
+
+    if accessed_count == 0 || other_count == 0 {
+        return None;
+    }
+
+    for value in &mut accessed {
+        *value /= accessed_count as f64;
+    }
+    for value in &mut other {
+        *value /= other_count as f64;
+    }
+
+    let mut gap = [0.0_f64; SHADOW_DIMENSIONS];
+    for idx in 0..SHADOW_DIMENSIONS {
+        gap[idx] = (accessed[idx] - other[idx]).max(0.0);
+    }
+    if !gap.iter().any(|value| *value > f64::EPSILON) {
+        return None;
+    }
+    Some(ShadowFusionWeights::from_array(gap).normalized_or_default())
+}
+
+fn arrays_almost_equal(left: [f64; SHADOW_DIMENSIONS], right: [f64; SHADOW_DIMENSIONS]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .all(|(a, b)| (a - b).abs() < 1e-12)
 }
 
 /// Compute a time-weighted shadow weight vector and shrink it toward a parent
@@ -1007,6 +1126,50 @@ mod tests {
             "small-sample shadow weights should stay closer to parent than raw event optimum"
         );
         assert_eq!(learned.sample_count, 1);
+    }
+
+    #[test]
+    fn optimal_shadow_weights_considers_continuous_simplex_candidates() {
+        let event = RecallEvent {
+            request_id: "blend_needed".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "target".to_string(),
+                    bm25_norm: 0.6,
+                    vec_norm: 0.6,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "bm25_noise".to_string(),
+                    bm25_norm: 1.0,
+                    vec_norm: 0.0,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "vec_noise".to_string(),
+                    bm25_norm: 0.0,
+                    vec_norm: 1.0,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["target".to_string()],
+            timestamp: Utc::now(),
+        };
+
+        let learned = optimal_shadow_weights_for_event(&event).unwrap();
+
+        assert_eq!(shadow_reciprocal_rank_sum(&event, learned), 1.0);
+        assert!(learned.bm25 > 0.0);
+        assert!(learned.vec > 0.0);
     }
 
     #[test]
