@@ -9,6 +9,7 @@ bench/results*.jsonl
 bench/results*.jsonl.*
 __pycache__/
 .superpowers/
+docs/superpowers/
 gui/dist/
 gui/node_modules/
 
