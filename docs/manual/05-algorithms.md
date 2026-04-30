@@ -80,7 +80,7 @@ Hook and async-worker ingestion use a multi-factor admission score in
 For an extracted item `m`, Rein computes:
 
 $$
-A(m) = \operatorname{clip}(0.45Q + 0.25N + 0.15P + 0.15R - C, 0, 1)
+A(m) = \mathrm{clip}(0.45Q + 0.25N + 0.15P + 0.15R - C, 0, 1)
 $$
 
 where:
@@ -98,13 +98,13 @@ Novelty is computed as one minus the maximum lexical similarity against a
 bounded comparison set:
 
 $$
-N_{\text{topic}} = 1 - \max_{d \in D_{\text{topic}}} \operatorname{sim}(m, d)
+N_{\text{topic}} = 1 - \max_{d \in D_{\text{topic}}} \mathrm{sim}(m, d)
 $$
 
 When cluster context exists, topic novelty and cluster novelty are blended:
 
 $$
-\rho = \operatorname{clip}\left(\frac{|D_{\text{cluster}}|}{8}, 0, 1\right)
+\rho = \mathrm{clip}\left(\frac{|D_{\text{cluster}}|}{8}, 0, 1\right)
 $$
 
 $$
@@ -136,7 +136,7 @@ $$
 with `b = 0.20`. For clustered memories, Rein computes:
 
 $$
-\theta_c = \operatorname{clip}\left(
+\theta_c = \mathrm{clip}\left(
 \theta_g \cdot \frac{\bar{s}_{recent}}{\max(\bar{s}_{cluster}, 0.1)},
 0.15,
 0.60
@@ -146,7 +146,7 @@ $$
 and blends the global and cluster thresholds:
 
 $$
-\theta = \operatorname{clip}((1 - \rho)\theta_g + \rho\theta_c, 0.15, 0.60)
+\theta = \mathrm{clip}((1 - \rho)\theta_g + \rho\theta_c, 0.15, 0.60)
 $$
 
 The item is stored only when `A(m) >= theta`, after secret filtering and other
@@ -165,11 +165,11 @@ BM25 follows the probabilistic relevance family described by Robertson and
 Zaragoza [5]. In standard notation:
 
 $$
-\operatorname{BM25}(d, q) =
+\mathrm{BM25}(d, q) =
 \sum_{t \in q}
-\operatorname{IDF}(t)
+\mathrm{IDF}(t)
 \frac{f(t,d)(k_1 + 1)}
-{f(t,d) + k_1\left(1 - b + b\frac{|d|}{\operatorname{avgdl}}\right)}
+{f(t,d) + k_1\left(1 - b + b\frac{|d|}{\mathrm{avgdl}}\right)}
 $$
 
 where `f(t,d)` is term frequency in document `d`, `|d|` is document length, and
@@ -201,7 +201,7 @@ graph family described by Malkov and Yashunin [7].
 Cosine similarity is the relevant dense signal:
 
 $$
-\operatorname{cos}(a,b) =
+\mathrm{cos}(a,b) =
 \frac{E(a) \cdot E(b)}
 {\|E(a)\|_2 \|E(b)\|_2}
 $$
@@ -209,7 +209,7 @@ $$
 and cosine distance is:
 
 $$
-d_{\cos}(a,b) = 1 - \operatorname{cos}(a,b)
+d_{\cos}(a,b) = 1 - \mathrm{cos}(a,b)
 $$
 
 The HNSW index is rebuildable. SQLite and sqlite-vec remain the durable
@@ -224,19 +224,19 @@ with breadth-first traversal over concept links.
 A temporal edge is usable at time `tau` only when:
 
 $$
-\operatorname{valid\_from}(e) \le \tau
+\text{valid_from}(e) \le \tau
 $$
 
 and either:
 
 $$
-\operatorname{valid\_until}(e) \text{ is null}
+\text{valid_until}(e) \text{ is null}
 $$
 
 or:
 
 $$
-\tau < \operatorname{valid\_until}(e)
+\tau < \text{valid_until}(e)
 $$
 
 The graph channel contributes candidate memory IDs and contextual scores. It is
@@ -308,9 +308,9 @@ $$
 d^* =
 \arg\max_{d \in C \setminus S}
 \left[
-\lambda \operatorname{rel}(d)
+\lambda \mathrm{rel}(d)
 -
-(1 - \lambda)\max_{s \in S}\operatorname{sim}(d,s)
+(1 - \lambda)\max_{s \in S}\mathrm{sim}(d,s)
 \right]
 $$
 
@@ -328,7 +328,7 @@ signals.
 `search/scoring.rs` computes memory strength. Critical memories do not decay:
 
 $$
-\operatorname{strength}(d,t) = 1
+\mathrm{strength}(d,t) = 1
 $$
 
 for `importance = critical`.
@@ -354,7 +354,7 @@ The final retrieval score after strength weighting is:
 $$
 S_{\text{weighted}}(d) =
 S_{\text{retrieval}}(d)
-\cdot \operatorname{strength}(d,t)
+\cdot \mathrm{strength}(d,t)
 \cdot (1 + 0.2a)
 \cdot B_{\text{recent}}(d)
 $$
@@ -398,7 +398,7 @@ $$
 Cold-start blending keeps sparse data from overpowering the fallback:
 
 $$
-\operatorname{strength}(t) =
+\mathrm{strength}(t) =
 \begin{cases}
 E(t), & n < 20 \\
 (1-\gamma)E(t) + \gamma\hat{S}(t), & 20 \le n < 50 \\
@@ -416,8 +416,8 @@ If a curve has no uncensored event evidence, Rein uses the Ebbinghaus fallback.
 The STM-to-LTM promotion threshold is derived from median survival:
 
 $$
-\operatorname{promotion\_accesses} =
-\operatorname{clip}\left(\left\lceil\frac{m}{7}\right\rceil + 1, 2, 8\right)
+\text{promotion_accesses} =
+\mathrm{clip}\left(\left\lceil\frac{m}{7}\right\rceil + 1, 2, 8\right)
 $$
 
 where `m` is median survival in days, defaulting to `28` when unavailable.
@@ -433,14 +433,14 @@ For point `p`, the core distance is the distance to its `k`-th nearest
 neighbor:
 
 $$
-\operatorname{core}_k(p) = d(p, \operatorname{kNN}_k(p))
+\mathrm{core}_k(p) = d(p, \mathrm{kNN}_k(p))
 $$
 
 Mutual reachability distance is:
 
 $$
 d_{\text{mreach}}(a,b) =
-\max(\operatorname{core}_k(a), \operatorname{core}_k(b), d_{\cos}(a,b))
+\max(\mathrm{core}_k(a), \mathrm{core}_k(b), d_{\cos}(a,b))
 $$
 
 Rein builds an MST over this mutual-reachability graph, converts it into a
@@ -454,7 +454,7 @@ $$
 Cluster stability is computed as accumulated lifetime in density space:
 
 $$
-\operatorname{stab}(C) =
+\mathrm{stab}(C) =
 \sum_{p \in C}
 (\lambda_p - \lambda_{\text{birth}}(C))
 $$
@@ -511,7 +511,7 @@ scoring adds small context bonuses:
 
 $$
 S_{\text{dedup}} =
-\operatorname{clip}(L + 0.05I_{\text{topic-variant}} + 0.05I_{\text{cluster}}, 0, 1)
+\mathrm{clip}(L + 0.05I_{\text{topic-variant}} + 0.05I_{\text{cluster}}, 0, 1)
 $$
 
 where `I` is `1` when the condition is true and `0` otherwise.
@@ -594,7 +594,7 @@ Store-time dedup usually uses the active threshold. M6 explores it on a small
 fraction of calls by applying an offset:
 
 $$
-\theta' = \operatorname{clip}(\theta + \delta, 0.30, 0.95)
+\theta' = \mathrm{clip}(\theta + \delta, 0.30, 0.95)
 $$
 
 with `delta` sampled from approximately `[-0.10, 0.10]` by a deterministic
@@ -607,9 +607,9 @@ For cluster `c`:
 
 $$
 \theta_c =
-\operatorname{clip}
+\mathrm{clip}
 \left(
-\operatorname{P90}\{L(d_i,d_j): d_i,d_j \in c, i < j\},
+\mathrm{P90}\{L(d_i,d_j): d_i,d_j \in c, i < j\},
 0.40,
 0.90
 \right)
