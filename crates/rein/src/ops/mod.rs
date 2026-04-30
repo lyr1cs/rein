@@ -8,6 +8,7 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 pub mod adaptive;
+pub mod ars_tuning;
 pub mod cold_archive_summary;
 pub mod concept_summary;
 pub mod consolidation;
@@ -1648,9 +1649,11 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
     // shape per implementation-contract §4.3.
     let synthesis = project_synthesis_status(state.synthesis_feedback_stats.as_ref());
     let shadow_fusion = crate::ops::adaptive::shadow_fusion_status(store, config);
+    let parameter_policy = crate::store::ars_parameter_policy::load_parameter_policy(conn);
     let ars_acceleration = serde_json::json!({
         "enabled": config.ars.acceleration.enabled,
         "shadow_only": config.ars.acceleration.shadow_only,
+        "parameter_policy": parameter_policy,
         "shadow_fusion_replay": shadow_fusion,
     });
 

@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.1`** (2026-04-30) — default-off ARS acceleration with shadow replay snapshots and an explicit recall canary. `[ars.acceleration].enabled = false` and `shadow_only = true` remain the defaults; setting `enabled = true` plus `shadow_only = false` lets recall consume eligible learned six-dimensional fusion weights. ARS synthesis behavior remains on the existing path. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.1 progression.
+**Current release: `v0.28.2`** (2026-05-01) — metadata-backed ARS parameter policy plus trust-weighted dynamic adoption. Defaults remain `[ars.acceleration].enabled = false` and `shadow_only = true`; explicit canary mode now also requires a healthy `ars_parameter_policy` row before recall can consume learned six-dimensional fusion weights. LLM judge `weight_decay_rate` can move toward κ-calibrated reliability only under that policy gate. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.2 progression.
 
 For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
 
@@ -377,10 +377,11 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.28.1 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+The v0.21 → v0.28.2 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.28.2** (2026-05-01) | ARS dynamic parameter policy | Adds `ars_parameter_policy` metadata activation, trust-weighted static-to-learned fusion adoption, κ/drift-gated LLM judge `weight_decay_rate`, `/api/adaptive` policy status, and `rein doctor` policy health checks. |
 | **v0.28.1** (2026-04-30) | ARS recall canary activation | Persists replay-learned global/query-type/cluster six-dimensional fusion weights in `AdaptiveState.learned_shadow_fusion`. Defaults remain `enabled = false`, `shadow_only = true`; setting `enabled = true` plus `shadow_only = false` lets recall rescore live-filtered candidates with learned BM25/vector/KG/episode/support/diversity weights. |
 | **v0.28.0** (2026-04-30) | ARS acceleration groundwork | Default-off, shadow-first acceleration controller. `[ars.acceleration].enabled = false` by default; `/api/adaptive` exposes `ars_acceleration.shadow_fusion_replay` with bounded `enabled`, `shadow_only`, `status`, `replay_limit`, `eligible_samples`, `min_samples`, `global`, `by_query_type`, and `by_cluster` preview fields. Production recall scoring and ARS behavior were unchanged in this release. |
 | **v0.27.6** (2026-04-30) | Codex hook parity + deployment hardening | Adds Codex `session-start`, `pre`, and `permission` hook commands alongside existing `post`, `compact`, `prompt`, and `stop`; emits official `hookSpecificOutput.additionalContext` for opted-in session/prompt context; applies conservative deny-only shell guardrails; teaches `rein init` and `rein doctor` to configure and validate all six Codex events. Deployed to Mac mini with launchd `zsh -l -c` wrappers and Homebrew Rust toolchain. |
@@ -1035,7 +1036,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.28.1`**（2026-04-30）— 默认关闭的 ARS acceleration，带 shadow replay snapshot 与显式 recall canary。`[ars.acceleration].enabled = false`、`shadow_only = true` 仍是默认；显式设置 `enabled = true` 且 `shadow_only = false` 后，recall 会消费满足样本门槛的六维动态融合权重。ARS synthesis 行为仍走既有路径。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.28.2`**（2026-05-01）— 新增 metadata-backed ARS parameter policy 与 trust-weighted 动态采用机制。默认仍是 `[ars.acceleration].enabled = false`、`shadow_only = true`；显式 canary 现在还需要健康的 `ars_parameter_policy` 行，recall 才会消费六维动态融合权重。LLM judge `weight_decay_rate` 只会在该 policy gate 下滑向 κ 校准后的可靠性。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1585,10 +1586,11 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.28.1 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+v0.21 → v0.28.2 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.28.2** (2026-05-01) | ARS dynamic parameter policy | 新增 `ars_parameter_policy` metadata 激活层、static-to-learned trust 加权融合、κ/漂移门控的 LLM judge `weight_decay_rate`、`/api/adaptive` policy 状态和 `rein doctor` policy 健康检查。 |
 | **v0.28.1** (2026-04-30) | ARS recall canary activation | replay 学到的 global/query-type/cluster 六维融合权重会持久化到 `AdaptiveState.learned_shadow_fusion`。默认仍是 `enabled = false`、`shadow_only = true`；显式设置 `enabled = true` 且 `shadow_only = false` 后，recall 会用 BM25/vector/KG/episode/support/diversity 动态权重重排 live-filter 后的候选。 |
 | **v0.28.0** (2026-04-30) | ARS acceleration groundwork | 默认关闭、shadow-first 的 acceleration controller。`[ars.acceleration].enabled = false`；`/api/adaptive` 暴露 `ars_acceleration.shadow_fusion_replay`，字段范围固定为 `enabled`、`shadow_only`、`status`、`replay_limit`、`eligible_samples`、`min_samples`、`global`、`by_query_type`、`by_cluster` 等预览数据。该 release 的生产 recall scoring 和 ARS 行为不变。 |
 | **v0.27.6** (2026-04-30) | Codex hook parity + 部署加固 | 新增 Codex `session-start`、`pre`、`permission` hook 命令，补齐既有 `post`、`compact`、`prompt`、`stop`；为 opt-in 的 session/prompt context 输出官方 `hookSpecificOutput.additionalContext`；加入保守 deny-only shell guardrails；`rein init` / `rein doctor` 可配置并校验六个 Codex 事件。Mac mini 部署已切到 launchd `zsh -l -c` wrapper，并补齐 Homebrew Rust toolchain。 |

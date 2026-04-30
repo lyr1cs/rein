@@ -146,6 +146,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(hnsw_check);
                             checks.push(check_resummerize(&store));
                             checks.push(check_pool_saturation(config));
+                            checks.push(check_ars_parameter_policy(&store, config));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -1715,6 +1716,66 @@ fn recover_inflight_file(
 }
 
 // ── v0.27.x judge checks ───────────────────────────────────────────────────
+
+/// v0.28.x — report the ARS dynamic-parameter activation policy separately
+/// from the large AdaptiveState snapshot so rollback/corruption is visible.
+fn check_ars_parameter_policy(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    use crate::store::ars_parameter_policy::{
+        load_parameter_policy, ArsParameterPolicyLoadStatus, ArsParameterPolicyMode,
+    };
+
+    let loaded = load_parameter_policy(store.conn());
+    match loaded.status {
+        ArsParameterPolicyLoadStatus::Missing => ok_in(
+            DoctorCategory::Configuration,
+            "ars_parameter_policy",
+            "missing policy row; dynamic ARS parameters disabled".to_string(),
+        ),
+        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError => {
+            warn_in(
+                DoctorCategory::Storage,
+                "ars_parameter_policy",
+                format!(
+                    "policy row unhealthy; dynamic ARS parameters disabled ({})",
+                    loaded.error.unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+        }
+        ArsParameterPolicyLoadStatus::Loaded => {
+            let policy = loaded.policy;
+            let state = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+                .unwrap_or_default();
+            let live_allowed = config.adaptive.enabled
+                && config.ars.acceleration.enabled
+                && !config.ars.acceleration.shadow_only
+                && policy.allows_runtime_adoption(state.version);
+            let message = format!(
+                "mode={:?} revision={} source_adaptive_version={} current_adaptive_version={} live_allowed={}",
+                policy.mode,
+                policy.revision,
+                policy.source_adaptive_version,
+                state.version,
+                live_allowed,
+            );
+            if matches!(policy.mode, ArsParameterPolicyMode::Canary) && !live_allowed {
+                warn_in(
+                    DoctorCategory::Configuration,
+                    "ars_parameter_policy",
+                    message,
+                )
+            } else {
+                ok_in(
+                    DoctorCategory::Configuration,
+                    "ars_parameter_policy",
+                    message,
+                )
+            }
+        }
+    }
+}
 
 /// v0.27.1 — surface `JudgeCalibrationState` stats so operators know
 /// the runtime LLM judge is producing usable signal. Reports κ values,

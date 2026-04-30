@@ -65,10 +65,11 @@ Test-support-only route families are intentionally excluded.
 
 ## `/api/adaptive` ARS Acceleration Shape
 
-v0.28 exposes ARS acceleration status and replay-learned fusion weights.
-Production recall remains unchanged by default; explicit non-shadow canary mode
-can consume eligible snapshot weights. Synthesis behavior remains on the
-existing path.
+v0.28 exposes ARS acceleration status, replay-learned fusion weights, and the
+v0.28.2 dynamic-parameter activation policy. Production recall remains
+unchanged by default; explicit non-shadow canary mode can consume eligible
+snapshot weights only when `ars_parameter_policy` is loaded and allows runtime
+adoption. Synthesis behavior remains on the existing path.
 
 `GET /api/adaptive` includes:
 
@@ -77,6 +78,18 @@ existing path.
   "ars_acceleration": {
     "enabled": false,
     "shadow_only": true,
+    "parameter_policy": {
+      "policy": {
+        "schema_version": 1,
+        "revision": 0,
+        "mode": "disabled",
+        "disabled_reason": "missing policy row",
+        "source_adaptive_version": 0,
+        "last_event_id": 0,
+        "last_updated": ""
+      },
+      "status": "missing"
+    },
     "shadow_fusion_replay": {
       "enabled": false,
       "shadow_only": true,
@@ -108,5 +121,7 @@ replay weights:
 `weights` is a normalized object with `bm25`, `vec`, `kg`, `episode`,
 `support`, and `diversity` numbers. With the default `shadow_only = true`,
 these remain observability-only. With explicit `enabled = true` and
-`shadow_only = false`, recall canary mode consumes eligible persisted weights
+`shadow_only = false`, recall canary mode still requires
+`parameter_policy.status = "loaded"`, `policy.mode = "canary"`, and a
+compatible `source_adaptive_version` before consuming eligible persisted weights
 from `AdaptiveState.learned_shadow_fusion`.
