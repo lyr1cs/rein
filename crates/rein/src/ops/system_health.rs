@@ -25,6 +25,9 @@ pub struct IndexStatus {
     /// `.rebuilding` marker present — a warmup/rebuild is in progress.
     #[serde(default)]
     pub rebuilding: bool,
+    /// A rebuild marker exists without a live owner lock.
+    #[serde(default)]
+    pub stale_rebuild_marker: bool,
     /// Index file (HNSW) or directory (Tantivy) exists on disk.
     pub index_exists: bool,
 }
@@ -129,6 +132,7 @@ fn probe_hnsw(db_path: &Path) -> IndexStatus {
     IndexStatus {
         dirty,
         rebuilding,
+        stale_rebuild_marker: false,
         index_exists: index_file.exists(),
     }
 }
@@ -136,9 +140,11 @@ fn probe_hnsw(db_path: &Path) -> IndexStatus {
 fn probe_tantivy(db_path: &Path) -> IndexStatus {
     let index_dir = db_path.with_extension("tantivy");
     let dirty = warmup::tantivy_dirty_path(db_path).exists();
+    let rebuild_state = warmup::tantivy_rebuild_state(db_path);
     IndexStatus {
         dirty,
-        rebuilding: false,
+        rebuilding: matches!(rebuild_state, warmup::TantivyRebuildState::Running),
+        stale_rebuild_marker: matches!(rebuild_state, warmup::TantivyRebuildState::StaleMarker),
         index_exists: index_dir.exists(),
     }
 }
@@ -163,8 +169,17 @@ fn derive_status(
     if indexes.hnsw.dirty {
         issues.push("hnsw index dirty".to_string());
     }
+    if indexes.hnsw.rebuilding {
+        issues.push("hnsw index rebuilding".to_string());
+    }
     if indexes.tantivy.dirty {
         issues.push("tantivy index dirty".to_string());
+    }
+    if indexes.tantivy.rebuilding {
+        issues.push("tantivy index rebuilding".to_string());
+    }
+    if indexes.tantivy.stale_rebuild_marker {
+        issues.push("tantivy rebuild marker stale".to_string());
     }
 
     let dead_letters = queues.memory.dead_letters
@@ -192,6 +207,22 @@ mod tests {
     use crate::config::ReinConfig;
     use crate::store::SqliteStore;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn hold_file_lock(path: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test failed to acquire advisory lock");
+        file
+    }
 
     fn test_store() -> (tempfile::TempDir, SqliteStore, ReinConfig) {
         let dir = tempdir().unwrap();
@@ -251,5 +282,54 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.contains("tantivy index dirty")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tantivy_running_rebuild_surfaces_issue() {
+        let (_dir, store, config) = test_store();
+        let lock_path = warmup::tantivy_rebuild_lock_path(store.db_path());
+        let _lock = hold_file_lock(&lock_path);
+        std::fs::write(
+            warmup::tantivy_rebuilding_path(store.db_path()),
+            b"rebuilding",
+        )
+        .unwrap();
+
+        let snap = collect(&store, &config);
+
+        assert!(snap.indexes.tantivy.rebuilding);
+        assert!(!snap.status.ok);
+        assert!(snap
+            .status
+            .issues
+            .iter()
+            .any(|i| i.contains("tantivy index rebuilding")));
+    }
+
+    #[test]
+    fn tantivy_stale_rebuild_marker_surfaces_distinct_issue() {
+        let (_dir, store, config) = test_store();
+        std::fs::write(
+            warmup::tantivy_rebuilding_path(store.db_path()),
+            b"rebuilding",
+        )
+        .unwrap();
+
+        let snap = collect(&store, &config);
+
+        assert!(!snap.indexes.tantivy.rebuilding);
+        assert!(snap.indexes.tantivy.stale_rebuild_marker);
+        assert!(!snap.status.ok);
+        assert!(snap
+            .status
+            .issues
+            .iter()
+            .any(|i| i.contains("tantivy rebuild marker stale")));
+        assert!(!snap
+            .status
+            .issues
+            .iter()
+            .any(|i| i.contains("tantivy index rebuilding")));
     }
 }

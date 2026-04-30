@@ -1217,6 +1217,36 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
     let db_path = store.db_path();
     let index_path = db_path.with_extension("tantivy");
     let dirty = warmup::tantivy_dirty_path(db_path).exists();
+    let rebuild_state = warmup::tantivy_rebuild_state(db_path);
+
+    if matches!(rebuild_state, warmup::TantivyRebuildState::Running) {
+        return warn_with_hint(
+            DoctorCategory::Index,
+            "tantivy",
+            format!(
+                "index rebuild in progress at {}{}",
+                index_path.display(),
+                if dirty {
+                    "; dirty marker is present"
+                } else {
+                    ""
+                }
+            ),
+            "wait for the rebuild owner to finish, then rerun `rein doctor`",
+        );
+    }
+
+    if matches!(rebuild_state, warmup::TantivyRebuildState::StaleMarker) {
+        return warn_with_hint(
+            DoctorCategory::Index,
+            "tantivy",
+            format!(
+                "stale rebuild marker is present at {}",
+                warmup::tantivy_rebuilding_path(db_path).display()
+            ),
+            "run `rein doctor --fix` or `rein warmup` to refresh the index",
+        );
+    }
 
     if active_memories == 0 && !index_path.exists() {
         return ok_in(
@@ -1582,12 +1612,35 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
 
     let tantivy_path = store.db_path().with_extension("tantivy");
     let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
-    if !tantivy_path.exists() || tantivy_dirty.exists() {
-        warmup::populate_tantivy(store);
-        fixes.push(format!(
-            "triggered Tantivy rebuild at {}",
-            tantivy_path.display()
-        ));
+    let tantivy_rebuild_state = warmup::tantivy_rebuild_state(store.db_path());
+    if !tantivy_path.exists()
+        || tantivy_dirty.exists()
+        || matches!(
+            tantivy_rebuild_state,
+            warmup::TantivyRebuildState::StaleMarker
+        )
+    {
+        match warmup::try_populate_tantivy(store) {
+            warmup::TantivyRebuildOutcome::Rebuilt { indexed, errors } => {
+                fixes.push(format!(
+                    "rebuilt Tantivy index at {} ({indexed} indexed, {errors} errors)",
+                    tantivy_path.display()
+                ));
+            }
+            warmup::TantivyRebuildOutcome::AlreadyRunning { lock_path } => {
+                fixes.push(format!(
+                    "Tantivy rebuild already in progress at {}",
+                    lock_path.display()
+                ));
+            }
+            warmup::TantivyRebuildOutcome::Failed { reason } => {
+                fixes.push(format!(
+                    "Tantivy rebuild failed at {}: {reason}",
+                    tantivy_path.display()
+                ));
+            }
+            warmup::TantivyRebuildOutcome::SkippedInMemory => {}
+        }
     }
 
     let hnsw_base = store.db_path().with_extension("");
@@ -1958,6 +2011,22 @@ provider = "inherit"
         std::fs::write(path, format!("{body}\n")).unwrap();
     }
 
+    #[cfg(unix)]
+    fn hold_file_lock(path: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test failed to acquire advisory lock");
+        file
+    }
+
     fn spawn_http_server(response: String) -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2279,6 +2348,99 @@ provider = "inherit"
             );
         }
         assert_eq!(report.status, ReportStatus::Degraded);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial(global_state)]
+    async fn test_doctor_fix_reports_tantivy_rebuild_in_progress() {
+        let _guard = env_lock().lock().await;
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        std::env::set_var("REIN_PROXY_TOKEN", "doctor-test-token");
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        store
+            .store(test_memory("doctor", "doctor memory", "doctor content"))
+            .unwrap();
+        let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(tantivy_dirty.parent().unwrap()).unwrap();
+        std::fs::write(&tantivy_dirty, b"dirty").unwrap();
+        let lock_path = warmup::tantivy_rebuild_lock_path(store.db_path());
+        let _lock = hold_file_lock(&lock_path);
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("Tantivy rebuild already in progress")));
+        assert!(!report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("triggered Tantivy rebuild")));
+        let tantivy = report.checks.iter().find(|c| c.name == "tantivy").unwrap();
+        assert_eq!(tantivy.status, CheckStatus::Warn);
+        assert!(tantivy.message.contains("rebuild in progress"));
+        assert!(tantivy_dirty.exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn test_doctor_fix_repairs_stale_tantivy_rebuild_marker() {
+        let _guard = env_lock().lock().await;
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        std::env::set_var("REIN_PROXY_TOKEN", "doctor-test-token");
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        TantivyFts::open(&store.db_path().with_extension("tantivy")).unwrap();
+        let rebuilding = warmup::tantivy_rebuilding_path(store.db_path());
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("rebuilt Tantivy index")));
+        assert!(
+            !rebuilding.exists(),
+            "doctor --fix should clear stale Tantivy rebuild marker"
+        );
+        let tantivy = report.checks.iter().find(|c| c.name == "tantivy").unwrap();
+        assert_ne!(tantivy.status, CheckStatus::Warn);
+        assert!(!tantivy.message.contains("stale rebuild marker"));
     }
 
     #[tokio::test]

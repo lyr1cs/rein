@@ -1,0 +1,33 @@
+[
+  {
+    "id": "ars-bootstrap-fixture-1",
+    "signal_hint": {
+      "inferred_w_view": 1.6,
+      "inferred_w_click": 2.0,
+      "inferred_w_thumb": 2.6,
+      "inferred_w_req": 1.0,
+      "useful_rate_ci_width": 0.25
+    }
+  },
+  {
+    "id": "ars-bootstrap-fixture-2",
+    "signal_hint": {
+      "inferred_w_view": 1.8,
+      "inferred_w_click": 2.2,
+      "inferred_w_thumb": 3.0,
+      "inferred_w_req": 1.2,
+      "useful_rate_ci_width": 0.35
+    }
+  },
+  {
+    "id": "ars-bootstrap-invalid-fields",
+    "signal_hint": {
+      "inferred_w_view": "ignore invalid type",
+      "inferred_w_click": -4.0,
+      "useful_rate_ci_width": null
+    }
+  },
+  {
+    "id": "ars-bootstrap-missing-hint"
+  }
+]

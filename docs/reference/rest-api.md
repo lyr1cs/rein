@@ -31,7 +31,7 @@ mutating routes also require `x-rein-action: 1`. Protected reads accept
 | `GET` | `/api/episodes` | Server auth | Episode records. |
 | `GET` | `/api/activity` | Server auth | Recent activity summary for the GUI. |
 | `GET` | `/api/stats` | Public read | Store counts, layers, and tiers. |
-| `GET` | `/api/health` | Public read | Topic health, index lag, queue lag, and status. |
+| `GET` | `/api/health` | Public read | Topic health, index lag, queue lag, and status; index snapshots include `dirty`, `rebuilding`, `stale_rebuild_marker`, and `index_exists`. |
 | `GET` | `/api/doctor` | Public read | Diagnostic report; `fix=true` is rejected on GET. |
 | `POST` | `/api/doctor` | Mutation marker | Diagnostic report; JSON body controls `network` and `fix`. |
 | `GET` | `/api/version` | Protected read | `{ version }`. |
@@ -62,3 +62,48 @@ mutating routes also require `x-rein-action: 1`. Protected reads accept
 | `GET` | `/api/artifacts/{id}` | Protected read | Artifact detail; `include_transcript=true` can return raw transcript data. |
 
 Test-support-only route families are intentionally excluded.
+
+## `/api/adaptive` ARS Acceleration Shape
+
+v0.28 exposes ARS acceleration as observability only. Production recall fusion
+and synthesis behavior remain on the existing path.
+
+`GET /api/adaptive` includes:
+
+```json
+{
+  "ars_acceleration": {
+    "enabled": false,
+    "shadow_only": true,
+    "shadow_fusion_replay": {
+      "enabled": false,
+      "shadow_only": true,
+      "status": "disabled",
+      "replay_limit": 500,
+      "eligible_samples": 0,
+      "min_samples": 10,
+      "global": null,
+      "by_query_type": [],
+      "by_cluster": []
+    }
+  }
+}
+```
+
+`shadow_fusion_replay.status` is bounded to the current v0.28 shadow states:
+`disabled`, `insufficient_samples`, `ready`, `no_learnable_signal`, or
+`non_shadow_mode`. The default install reports `disabled` with
+`eligible_samples: 0`, `global: null`, and empty `by_query_type` /
+`by_cluster` arrays.
+
+When `[ars.acceleration].enabled = true`, v0.28 still requires
+`shadow_only = true`. In that mode, `ready` responses preview learned replay
+weights without changing production scoring:
+
+- `global`: `null` or `{ sample_count, last_updated, weights }`
+- `by_query_type`: array of `{ query_type, sample_count, last_updated, weights }`
+- `by_cluster`: array of `{ query_type, cluster_id, sample_count, last_updated, weights }`
+
+`weights` is a normalized object with `bm25`, `vec`, `kg`, `episode`,
+`support`, and `diversity` numbers. These are shadow previews only; non-shadow
+production activation is deferred.
