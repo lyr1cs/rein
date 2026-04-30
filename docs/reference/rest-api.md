@@ -65,8 +65,10 @@ Test-support-only route families are intentionally excluded.
 
 ## `/api/adaptive` ARS Acceleration Shape
 
-v0.28 exposes ARS acceleration as observability only. Production recall fusion
-and synthesis behavior remain on the existing path.
+v0.28 exposes ARS acceleration status and replay-learned fusion weights.
+Production recall remains unchanged by default; explicit non-shadow canary mode
+can consume eligible snapshot weights. Synthesis behavior remains on the
+existing path.
 
 `GET /api/adaptive` includes:
 
@@ -90,20 +92,21 @@ and synthesis behavior remain on the existing path.
 }
 ```
 
-`shadow_fusion_replay.status` is bounded to the current v0.28 shadow states:
-`disabled`, `insufficient_samples`, `ready`, `no_learnable_signal`, or
-`non_shadow_mode`. The default install reports `disabled` with
+`shadow_fusion_replay.status` is bounded to the current v0.28 states:
+`disabled`, `insufficient_samples`, `ready`, or `no_learnable_signal`.
+The default install reports `disabled` with
 `eligible_samples: 0`, `global: null`, and empty `by_query_type` /
 `by_cluster` arrays.
 
-When `[ars.acceleration].enabled = true`, v0.28 still requires
-`shadow_only = true`. In that mode, `ready` responses preview learned replay
-weights without changing production scoring:
+When `[ars.acceleration].enabled = true`, `ready` responses include learned
+replay weights:
 
 - `global`: `null` or `{ sample_count, last_updated, weights }`
 - `by_query_type`: array of `{ query_type, sample_count, last_updated, weights }`
 - `by_cluster`: array of `{ query_type, cluster_id, sample_count, last_updated, weights }`
 
 `weights` is a normalized object with `bm25`, `vec`, `kg`, `episode`,
-`support`, and `diversity` numbers. These are shadow previews only; non-shadow
-production activation is deferred.
+`support`, and `diversity` numbers. With the default `shadow_only = true`,
+these remain observability-only. With explicit `enabled = true` and
+`shadow_only = false`, recall canary mode consumes eligible persisted weights
+from `AdaptiveState.learned_shadow_fusion`.

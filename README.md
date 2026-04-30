@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.0`** (2026-04-30) — default-off, shadow-only ARS acceleration groundwork. Adds `[ars.acceleration]` with `enabled = false` by default and enforced `shadow_only = true`, plus `/api/adaptive` shadow fusion replay observability. Production recall fusion and ARS synthesis behavior remain on the existing path; production acceleration is deferred. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.0 progression.
+**Current release: `v0.28.1`** (2026-04-30) — default-off ARS acceleration with shadow replay snapshots and an explicit recall canary. `[ars.acceleration].enabled = false` and `shadow_only = true` remain the defaults; setting `enabled = true` plus `shadow_only = false` lets recall consume eligible learned six-dimensional fusion weights. ARS synthesis behavior remains on the existing path. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.1 progression.
 
 For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
 
@@ -377,11 +377,12 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.28.0 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+The v0.21 → v0.28.1 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
 
 | Version | Theme | Highlights |
 |---|---|---|
-| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | Default-off, shadow-only acceleration controller. `[ars.acceleration].enabled = false` by default; `shadow_only = true` is enforced and non-shadow mode is rejected in v0.28.x. `/api/adaptive` exposes `ars_acceleration.shadow_fusion_replay` with bounded `enabled`, `shadow_only`, `status`, `replay_limit`, `eligible_samples`, `min_samples`, `global`, `by_query_type`, and `by_cluster` preview fields. Production recall scoring and ARS behavior are unchanged; production activation is deferred. |
+| **v0.28.1** (2026-04-30) | ARS recall canary activation | Persists replay-learned global/query-type/cluster six-dimensional fusion weights in `AdaptiveState.learned_shadow_fusion`. Defaults remain `enabled = false`, `shadow_only = true`; setting `enabled = true` plus `shadow_only = false` lets recall rescore live-filtered candidates with learned BM25/vector/KG/episode/support/diversity weights. |
+| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | Default-off, shadow-first acceleration controller. `[ars.acceleration].enabled = false` by default; `/api/adaptive` exposes `ars_acceleration.shadow_fusion_replay` with bounded `enabled`, `shadow_only`, `status`, `replay_limit`, `eligible_samples`, `min_samples`, `global`, `by_query_type`, and `by_cluster` preview fields. Production recall scoring and ARS behavior were unchanged in this release. |
 | **v0.27.6** (2026-04-30) | Codex hook parity + deployment hardening | Adds Codex `session-start`, `pre`, and `permission` hook commands alongside existing `post`, `compact`, `prompt`, and `stop`; emits official `hookSpecificOutput.additionalContext` for opted-in session/prompt context; applies conservative deny-only shell guardrails; teaches `rein init` and `rein doctor` to configure and validate all six Codex events. Deployed to Mac mini with launchd `zsh -l -c` wrappers and Homebrew Rust toolchain. |
 | **v0.27.5** (2026-04-29) | R10-residual cleanup | Cold archive too-large backoff (`last_too_large_at` + claim_batch ORDER BY); Cap A 4096-bucket LRU eviction; cron `cron_claims` pre-LLM dedup with claim_token ownership + 5-min stale takeover + post-claim TOCTOU re-check + post-emit-crash reaper. **10 codex review rounds saturated (R6 + R10 fully clean).** 1035 lib tests / 0 clippy / 0 fmt. |
 | **v0.27.4** (2026-04-29) | audit-team remediation | 5-agent disjoint-slice fan-out closed 1 CRIT + 8 HIGH + 9 MED + 5 LOW from a v0.27.3 audit, then 10 codex rounds drove P1 to 0. Headline: **C1** `[server,proxy].allow_unauthenticated_loopback` default flipped `true → false`; **E2** M5 strip post-COMMIT side-index discipline; **D1+D2** SHA-256-prefix synthetic `cluster_id` for Cap A bucket alignment. 1265 tests. |
@@ -1034,7 +1035,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.28.0`**（2026-04-30）— 默认关闭、仅 shadow 的 ARS acceleration groundwork。新增 `[ars.acceleration]`，默认 `enabled = false`，并强制 `shadow_only = true`；`/api/adaptive` 增加 shadow fusion replay 可观测面。生产 recall fusion 和 ARS synthesis 行为仍走既有路径；生产加速激活延后。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.28.1`**（2026-04-30）— 默认关闭的 ARS acceleration，带 shadow replay snapshot 与显式 recall canary。`[ars.acceleration].enabled = false`、`shadow_only = true` 仍是默认；显式设置 `enabled = true` 且 `shadow_only = false` 后，recall 会消费满足样本门槛的六维动态融合权重。ARS synthesis 行为仍走既有路径。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1584,11 +1585,12 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.28.0 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+v0.21 → v0.28.1 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
-| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | 默认关闭、仅 shadow 的 acceleration controller。`[ars.acceleration].enabled = false`，`shadow_only = true` 被强制，v0.28.x 拒绝 non-shadow mode。`/api/adaptive` 暴露 `ars_acceleration.shadow_fusion_replay`，字段范围固定为 `enabled`、`shadow_only`、`status`、`replay_limit`、`eligible_samples`、`min_samples`、`global`、`by_query_type`、`by_cluster` 等预览数据。生产 recall scoring 和 ARS 行为不变；生产激活延后。 |
+| **v0.28.1** (2026-04-30) | ARS recall canary activation | replay 学到的 global/query-type/cluster 六维融合权重会持久化到 `AdaptiveState.learned_shadow_fusion`。默认仍是 `enabled = false`、`shadow_only = true`；显式设置 `enabled = true` 且 `shadow_only = false` 后，recall 会用 BM25/vector/KG/episode/support/diversity 动态权重重排 live-filter 后的候选。 |
+| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | 默认关闭、shadow-first 的 acceleration controller。`[ars.acceleration].enabled = false`；`/api/adaptive` 暴露 `ars_acceleration.shadow_fusion_replay`，字段范围固定为 `enabled`、`shadow_only`、`status`、`replay_limit`、`eligible_samples`、`min_samples`、`global`、`by_query_type`、`by_cluster` 等预览数据。该 release 的生产 recall scoring 和 ARS 行为不变。 |
 | **v0.27.6** (2026-04-30) | Codex hook parity + 部署加固 | 新增 Codex `session-start`、`pre`、`permission` hook 命令，补齐既有 `post`、`compact`、`prompt`、`stop`；为 opt-in 的 session/prompt context 输出官方 `hookSpecificOutput.additionalContext`；加入保守 deny-only shell guardrails；`rein init` / `rein doctor` 可配置并校验六个 Codex 事件。Mac mini 部署已切到 launchd `zsh -l -c` wrapper，并补齐 Homebrew Rust toolchain。 |
 | **v0.27.5** (2026-04-29) | R10-residual 清理 | Cold archive 太大行 backoff（`last_too_large_at` + claim_batch ORDER BY）；Cap A 4096-bucket LRU 驱逐；cron `cron_claims` pre-LLM 去重，含 claim_token 所有权 + 5 分钟 stale 接管 + post-claim TOCTOU 复检 + post-emit-crash 清理。**10 轮 codex review 收敛（R6 + R10 全清）**。1035 lib tests。 |
 | **v0.27.4** (2026-04-29) | agent-team 修复 | 5 agent 分片 fan-out 修 v0.27.3 audit (1 CRIT + 8 HIGH + 9 MED + 5 LOW)，再跑 10 轮 codex 把 P1 打到 0。**C1** 默认 deny-loopback；**E2** M5 strip post-COMMIT 边索引纪律；**D1+D2** SHA-256 prefix 合成 `cluster_id` 修 Cap A bucket 对齐。1265 tests。 |
