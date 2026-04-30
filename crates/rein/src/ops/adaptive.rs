@@ -1335,7 +1335,7 @@ fn compute_shadow_fusion_weight_replay(
     state: &crate::store::adaptive::AdaptiveState,
     config: &ReinConfig,
 ) -> Option<ShadowFusionReplayReport> {
-    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+    if !config.ars.acceleration.enabled {
         return None;
     }
     if events_with_access.len() < config.adaptive.min_samples_alpha {
@@ -1461,10 +1461,6 @@ pub fn shadow_fusion_status(store: &SqliteStore, config: &ReinConfig) -> serde_j
     if !config.ars.acceleration.enabled {
         return base("disabled", 0, serde_json::Value::Null);
     }
-    if !config.ars.acceleration.shadow_only {
-        return base("non_shadow_mode", 0, serde_json::Value::Null);
-    }
-
     let conn = store.conn();
     let recall_events = recent_events_by_type(
         conn,
@@ -1625,6 +1621,47 @@ fn project_learned_shadow_weights(
             "diversity": weights.diversity,
         }
     })
+}
+
+fn learned_shadow_fusion_entry(
+    learned: &crate::search::alpha_optimizer::LearnedShadowWeights,
+) -> crate::store::adaptive::LearnedShadowFusionEntry {
+    let weights = learned.weights.normalized_or_default();
+    crate::store::adaptive::LearnedShadowFusionEntry {
+        weights: crate::store::adaptive::ShadowFusionWeightEntry {
+            bm25: weights.bm25,
+            vec: weights.vec,
+            kg: weights.kg,
+            episode: weights.episode,
+            support: weights.support,
+            diversity: weights.diversity,
+        },
+        sample_count: learned.sample_count,
+        last_updated: learned.last_updated.to_rfc3339(),
+    }
+}
+
+fn commit_shadow_fusion_weight_replay(
+    state: &mut crate::store::adaptive::AdaptiveState,
+    report: &ShadowFusionReplayReport,
+) {
+    if let Some(global) = &report.global {
+        state
+            .learned_shadow_fusion
+            .insert("global".into(), learned_shadow_fusion_entry(global));
+    }
+    for (query_type, learned) in &report.by_query_type {
+        state.learned_shadow_fusion.insert(
+            crate::store::adaptive::AdaptiveState::bucket_key(query_type, None),
+            learned_shadow_fusion_entry(learned),
+        );
+    }
+    for ((query_type, cluster_id), learned) in &report.by_cluster {
+        state.learned_shadow_fusion.insert(
+            crate::store::adaptive::AdaptiveState::bucket_key(query_type, Some(*cluster_id)),
+            learned_shadow_fusion_entry(learned),
+        );
+    }
 }
 
 fn log_shadow_fusion_weight_replay(report: &ShadowFusionReplayReport) {
@@ -1872,6 +1909,7 @@ fn run_alpha_learning(
     if let Some(report) =
         compute_shadow_fusion_weight_replay(&events_with_access, &events, state, config)
     {
+        commit_shadow_fusion_weight_replay(state, &report);
         log_shadow_fusion_weight_replay(&report);
     }
     if pending.is_empty() {
@@ -4150,6 +4188,26 @@ mod tests {
     }
 
     #[test]
+    fn shadow_fusion_replay_computes_in_non_shadow_mode() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+        let state = AdaptiveState::default();
+        let recall_events = vec![shadow_replay_event("req-1", "mem-1")];
+        let stored_events = vec![stored_recall_event(1, "req-1", "semantic")];
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config);
+
+        assert!(
+            report.is_some(),
+            "production mode should keep learning replay weights for future snapshots"
+        );
+    }
+
+    #[test]
     fn shadow_fusion_replay_computes_global_query_and_cluster_weights() {
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
@@ -4182,6 +4240,41 @@ mod tests {
         assert_eq!(report.by_query_type[0].0, "semantic");
         assert_eq!(report.by_cluster.len(), 1);
         assert_eq!(report.by_cluster[0].0, ("semantic".to_string(), 7));
+    }
+
+    #[test]
+    fn shadow_fusion_replay_snapshot_commit_writes_bucket_weights() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+        let recall_events = vec![
+            shadow_replay_event("req-1", "mem-1"),
+            shadow_replay_event("req-2", "mem-2"),
+        ];
+        let stored_events = vec![
+            stored_recall_event(1, "req-1", "semantic"),
+            stored_recall_event(2, "req-2", "semantic"),
+        ];
+        let mut state = AdaptiveState::default();
+        state.memory_clusters.insert("mem-1".into(), 7);
+        state.memory_clusters.insert("mem-2".into(), 7);
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config)
+                .expect("shadow replay should produce weights");
+        commit_shadow_fusion_weight_replay(&mut state, &report);
+
+        assert!(state.learned_shadow_fusion.contains_key("global"));
+        assert!(state.learned_shadow_fusion.contains_key("semantic"));
+        assert!(state.learned_shadow_fusion.contains_key("semantic:7"));
+        let cluster = state.learned_shadow_fusion.get("semantic:7").unwrap();
+        assert_eq!(cluster.sample_count, 2);
+        assert!(
+            cluster.weights.kg > 0.5,
+            "fixture should persist kg-heavy shadow weights, got {:?}",
+            cluster.weights
+        );
     }
 
     fn emit_shadow_replay_feedback_pair(store: &SqliteStore, request_id: &str, accessed_id: &str) {

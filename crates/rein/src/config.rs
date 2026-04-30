@@ -396,9 +396,9 @@ pub struct ArsAccelerationConfig {
     /// snapshot reads, and no recall scoring changes.
     #[serde(default)]
     pub enabled: bool,
-    /// Keep acceleration in shadow mode. Default `true`; production behavior
-    /// must remain on the existing scalar-alpha path until an explicit later
-    /// activation slice changes this.
+    /// Keep acceleration in shadow mode. Default `true`; `false` is an
+    /// explicit production canary that lets recall consume eligible learned
+    /// six-dimensional fusion weights from `AdaptiveState`.
     #[serde(default = "default_true")]
     pub shadow_only: bool,
 }
@@ -1763,12 +1763,6 @@ impl ReinConfig {
         if self.ars.batch_size == 0 {
             anyhow::bail!("ars.batch_size must be >= 1");
         }
-        if !self.ars.acceleration.shadow_only {
-            anyhow::bail!(
-                "ars.acceleration.shadow_only=false is not supported in v0.28.x; production activation is deferred"
-            );
-        }
-
         // v0.27.1 J6 invariant — `weight_decay_rate` must be finite + in
         // [0.0, 1.0] so `w_llm = w_thumb × weight_decay_rate` enforces both
         // ordering (`w_llm ≤ w_thumb`) and non-negativity (`w_llm ≥ 0`).
@@ -2989,18 +2983,16 @@ enabled = true
     }
 
     #[test]
-    fn test_load_from_toml_rejects_non_shadow_acceleration() {
+    fn test_load_from_toml_parses_non_shadow_acceleration() {
         let toml_str = r#"
 [ars.acceleration]
 enabled = true
 shadow_only = false
 "#;
-        let err = ReinConfig::load_from_str(toml_str).unwrap_err();
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
 
-        assert!(
-            err.to_string().contains("ars.acceleration.shadow_only"),
-            "unexpected error: {err}"
-        );
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(!cfg.ars.acceleration.shadow_only);
     }
 
     /// RAII guard: remember the current env var value and restore it on drop,

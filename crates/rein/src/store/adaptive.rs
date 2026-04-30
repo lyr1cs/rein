@@ -448,6 +448,12 @@ pub struct AdaptiveState {
     /// Key format: "query_type" or "query_type:cluster_id"
     pub learned_alpha: HashMap<String, LearnedAlphaEntry>,
 
+    /// v0.28 ARS acceleration: learned six-dimensional fusion weights per
+    /// bucket. Key format mirrors [`Self::learned_alpha`]: "global",
+    /// "query_type", or "query_type:cluster_id".
+    #[serde(default)]
+    pub learned_shadow_fusion: HashMap<String, LearnedShadowFusionEntry>,
+
     /// M4: Current cluster version (incremented on each reclustering).
     pub cluster_version: u64,
 
@@ -616,6 +622,25 @@ pub struct LearnedAlphaEntry {
     pub last_updated: String, // RFC3339
 }
 
+/// Six-dimensional ARS fusion weights persisted in [`AdaptiveState`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ShadowFusionWeightEntry {
+    pub bm25: f64,
+    pub vec: f64,
+    pub kg: f64,
+    pub episode: f64,
+    pub support: f64,
+    pub diversity: f64,
+}
+
+/// Learned shadow/production acceleration weights with evidence metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LearnedShadowFusionEntry {
+    pub weights: ShadowFusionWeightEntry,
+    pub sample_count: usize,
+    pub last_updated: String, // RFC3339
+}
+
 /// Per-cluster (and global) canonical content length percentiles (v0.23).
 ///
 /// Drives adaptive `target_bytes` for resummerize compression.
@@ -705,6 +730,41 @@ impl AdaptiveState {
             }
         }
         None
+    }
+
+    /// Get learned six-dimensional ARS fusion weights with the same fallback
+    /// chain as scalar alpha: cluster → query type → global.
+    pub fn get_shadow_fusion_weights(
+        &self,
+        query_type: &str,
+        cluster_id: Option<u32>,
+        min_sample_count: usize,
+    ) -> Option<&LearnedShadowFusionEntry> {
+        let eligible = |entry: &&LearnedShadowFusionEntry| entry.sample_count >= min_sample_count;
+        let legacy_key = query_type.to_string();
+        if let Some(cluster) = cluster_id {
+            let key = Self::bucket_key(query_type, Some(cluster));
+            if let Some(entry) = self.learned_shadow_fusion.get(&key).filter(eligible) {
+                return Some(entry);
+            }
+            let legacy_cluster_key = format!("{legacy_key}:{cluster}");
+            if let Some(entry) = self
+                .learned_shadow_fusion
+                .get(&legacy_cluster_key)
+                .filter(eligible)
+            {
+                return Some(entry);
+            }
+        }
+
+        let key = Self::bucket_key(query_type, None);
+        if let Some(entry) = self.learned_shadow_fusion.get(&key).filter(eligible) {
+            return Some(entry);
+        }
+        if let Some(entry) = self.learned_shadow_fusion.get(&legacy_key).filter(eligible) {
+            return Some(entry);
+        }
+        self.learned_shadow_fusion.get("global").filter(eligible)
     }
 
     /// Get dedup threshold for a cluster, with fallback to global threshold.
@@ -824,6 +884,16 @@ impl AdaptiveState {
                                 current.learned_alpha.insert(key.clone(), entry.clone());
                             }
                         }
+                        current
+                            .learned_shadow_fusion
+                            .retain(|k, _| !k.contains(':'));
+                        for (key, entry) in &self.learned_shadow_fusion {
+                            if key.contains(':') {
+                                current
+                                    .learned_shadow_fusion
+                                    .insert(key.clone(), entry.clone());
+                            }
+                        }
                     } else {
                         // Additive merge for memory_clusters and dedup_thresholds
                         for (mid, &cid) in &self.memory_clusters {
@@ -839,6 +909,23 @@ impl AdaptiveState {
                         for (&cid, stats) in &self.canonical_length_stats {
                             current.canonical_length_stats.insert(cid, stats.clone());
                         }
+                        for (key, our_entry) in &self.learned_shadow_fusion {
+                            if !key.contains(':') {
+                                continue;
+                            }
+                            let dominated =
+                                current
+                                    .learned_shadow_fusion
+                                    .get(key)
+                                    .is_some_and(|theirs| {
+                                        theirs.last_updated >= our_entry.last_updated
+                                    });
+                            if !dominated {
+                                current
+                                    .learned_shadow_fusion
+                                    .insert(key.clone(), our_entry.clone());
+                            }
+                        }
                     }
 
                     // Merge learned_alpha (non-cluster keys): prefer newer timestamp
@@ -852,6 +939,22 @@ impl AdaptiveState {
                             .is_some_and(|theirs| theirs.last_updated >= our_entry.last_updated);
                         if !dominated {
                             current.learned_alpha.insert(key.clone(), our_entry.clone());
+                        }
+                    }
+                    // Merge ARS six-dimensional fusion weights (non-cluster
+                    // keys): prefer newer timestamp, mirroring learned_alpha.
+                    for (key, our_entry) in &self.learned_shadow_fusion {
+                        if key.contains(':') {
+                            continue; // handled above based on cluster_version
+                        }
+                        let dominated = current
+                            .learned_shadow_fusion
+                            .get(key)
+                            .is_some_and(|theirs| theirs.last_updated >= our_entry.last_updated);
+                        if !dominated {
+                            current
+                                .learned_shadow_fusion
+                                .insert(key.clone(), our_entry.clone());
                         }
                     }
 
@@ -4231,6 +4334,93 @@ mod tests {
         );
         let alpha = state.get_alpha("Temporal", None).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn shadow_fusion_weights_fallback_chain_respects_min_samples() {
+        let mut state = AdaptiveState::default();
+        assert!(
+            state
+                .get_shadow_fusion_weights("semantic", Some(7), 10)
+                .is_none(),
+            "fresh state should not return acceleration weights"
+        );
+
+        state.learned_shadow_fusion.insert(
+            "global".into(),
+            LearnedShadowFusionEntry {
+                weights: ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.9,
+                    kg: 0.0,
+                    episode: 0.0,
+                    support: 0.0,
+                    diversity: 0.0,
+                },
+                sample_count: 20,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+        state.learned_shadow_fusion.insert(
+            "semantic:7".into(),
+            LearnedShadowFusionEntry {
+                weights: ShadowFusionWeightEntry {
+                    bm25: 0.0,
+                    vec: 0.0,
+                    kg: 1.0,
+                    episode: 0.0,
+                    support: 0.0,
+                    diversity: 0.0,
+                },
+                sample_count: 3,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+
+        let weights = state
+            .get_shadow_fusion_weights("semantic", Some(7), 10)
+            .expect("global fallback should satisfy sample gate");
+        assert!((weights.weights.vec - 0.9).abs() < f64::EPSILON);
+
+        state
+            .learned_shadow_fusion
+            .get_mut("semantic:7")
+            .unwrap()
+            .sample_count = 10;
+        let weights = state
+            .get_shadow_fusion_weights("semantic", Some(7), 10)
+            .expect("cluster weights should satisfy sample gate");
+        assert!((weights.weights.kg - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_state_snapshot_round_trips_shadow_fusion_weights() {
+        let conn = setup_db();
+        let mut state = AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            LearnedShadowFusionEntry {
+                weights: ShadowFusionWeightEntry {
+                    bm25: 0.2,
+                    vec: 0.3,
+                    kg: 0.1,
+                    episode: 0.1,
+                    support: 0.2,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+        state.version = 1;
+
+        state.save_snapshot(&conn).unwrap();
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        let weights = restored
+            .get_shadow_fusion_weights("semantic", None, 10)
+            .expect("shadow fusion weights should round-trip through snapshot");
+        assert!((weights.weights.support - 0.2).abs() < f64::EPSILON);
+        assert_eq!(weights.sample_count, 12);
     }
 
     #[test]

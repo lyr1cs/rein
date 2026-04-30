@@ -238,7 +238,7 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
     Some(best_alpha)
 }
 
-fn support_signal(support_count: u32) -> f64 {
+pub(crate) fn support_signal(support_count: u32) -> f64 {
     if support_count > 1 {
         (support_count - 1) as f64 / support_count as f64
     } else {
@@ -246,7 +246,7 @@ fn support_signal(support_count: u32) -> f64 {
     }
 }
 
-fn diversity_signal(source_diversity: f32) -> f64 {
+pub(crate) fn diversity_signal(source_diversity: f32) -> f64 {
     let diversity = source_diversity as f64;
     if diversity.is_finite() && diversity > 1.0 {
         (diversity - 1.0) / diversity
