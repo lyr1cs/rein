@@ -224,19 +224,19 @@ with breadth-first traversal over concept links.
 A temporal edge is usable at time `tau` only when:
 
 $$
-\text{valid_from}(e) \le \tau
+\mathrm{validFrom}(e) \le \tau
 $$
 
 and either:
 
 $$
-\text{valid_until}(e) \text{ is null}
+\mathrm{validUntil}(e) = \mathrm{NULL}
 $$
 
 or:
 
 $$
-\tau < \text{valid_until}(e)
+\tau < \mathrm{validUntil}(e)
 $$
 
 The graph channel contributes candidate memory IDs and contextual scores. It is
@@ -416,7 +416,7 @@ If a curve has no uncensored event evidence, Rein uses the Ebbinghaus fallback.
 The STM-to-LTM promotion threshold is derived from median survival:
 
 $$
-\text{promotion_accesses} =
+\mathrm{promotionAccesses} =
 \mathrm{clip}\left(\left\lceil\frac{m}{7}\right\rceil + 1, 2, 8\right)
 $$
 
