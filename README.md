@@ -14,6 +14,8 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 
 **Current release: `v0.27.5`** (2026-04-29) — released + deployed. Tag `v0.27.5` pushed, GitHub Release with 18.2 MB GUI binary, 1035 lib tests / 0 clippy / 0 fmt. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.27.5 progression.
 
+For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
+
 ### Features
 
 | Feature | Description |
@@ -41,7 +43,7 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 | **RRF / CC fusion** | Reciprocal Rank Fusion or Convex Combination (Bruch 2023), with learned alpha weights |
 | **Multi-factor admission** | A-MAC 2026 inspired: llm_conf + novelty + type_prior + recency scoring |
 | **Semantic chunking** | Heading / paragraph / sentence splitting with metadata-prefixed embeddings |
-| **FTS5 unicode61 tokenizer** | Full-text search with CJK support, sub-millisecond latency |
+| **Tantivy + FTS5 text search** | Tantivy BM25 side index with SQLite FTS5 fallback; CJK lexical handling is covered by jieba-rs plus character bigrams |
 | **Hybrid CJK dedup tokenization** | jieba-rs word segmentation plus character bigrams for Chinese/Japanese/Korean lexical dedup |
 | **Cluster-aware admission** | admission threshold and novelty scoring incorporate cluster strength, cluster novelty, and cold-start blending |
 | **Evidence second-stage rerank** | low-confidence / single-source recall results can be boosted by matching evidence content |
@@ -51,7 +53,7 @@ rein is a self-adaptive memory system for AI coding agents. It stores, recalls, 
 | **Supermemory v4 API** | Hybrid search via `api.supermemory.ai/v4/search` for cross-validation |
 | **Zero local models** | No GPU required by default; optional OMLX local backend |
 | **~2-5 MB footprint** | Single SQLite file with FTS5 + sqlite-vec |
-| **gemini-embedding-001** | MTEB #1 model (68.32), 3072 dimensions |
+| **gemini-embedding-001** | Default Google embedding model, 3072 dimensions; benchmark claims are documented as dated provider references |
 | **20+ CLI commands** | Everything the MCP tools do, plus init, config, migrate, hooks, recent, gc, organize, upgrade |
 | **Auto-configure** | `rein init` detects and configures 8 MCP clients automatically |
 | **Remote access** | HTTP / SSE transport with bearer token authentication |
@@ -65,10 +67,11 @@ git clone https://github.com/lyr1cs/rein.git
 cd rein
 
 # Standard build (CLI + MCP server only)
-cargo install --path crates/rein
+cargo install --path crates/rein --locked
 
 # Full build with Neural Wiki GUI (recommended)
-cargo install --path crates/rein --features gui
+cd crates/rein/gui && npm ci && npm run build && cd ../../..
+cargo install --path crates/rein --locked --features gui
 ```
 
 Or use the install script:
@@ -130,7 +133,7 @@ rein serve
 | `health` | Check topic health | `rein health [topic]` |
 | `consolidate` | Merge one or many topics into consolidated memories | `rein consolidate --pattern 'rmcp*' --merge-variants --dry-run` |
 | `dedup` | Scan / remove duplicates, optionally across topic variants | `rein dedup [--dry-run] [--merge-variants]` |
-| `cleanup` | One-click consolidation + dedup + adaptive refresh | `rein cleanup [--pattern 'rmcp*'] [--dry-run] [--async]` |
+| `cleanup` | One-click consolidation + dedup + adaptive refresh | `rein cleanup [topic] [--pattern 'rmcp*'] [--all] [--dry-run]` |
 | `migrate` | Import from QMD / reindex | `rein migrate [--from-qmd path] [--reindex]` |
 | `init` | Auto-configure MCP clients | `rein init [--dry-run]` |
 | `config` | Show current configuration | `rein config` |
@@ -170,14 +173,14 @@ Every merge decision is logged in the `dedup_decisions` append-only ledger with 
 # Preview what cleanup would do (safe)
 rein cleanup --all --dry-run
 
-# Run cleanup on specific topics
-rein cleanup --topic "docker-deployment"
+# Run cleanup on a specific topic
+rein cleanup "docker-deployment"
 
 # Full store cleanup
 rein cleanup --all
 
-# Queue cleanup for background processing
-rein cleanup --all --async
+# Run cleanup through the worker entrypoint
+rein worker cleanup --all
 ```
 
 `consolidate` keeps the old `rein consolidate <topic> -s "summary"` flow, but also supports:
@@ -190,10 +193,10 @@ rein cleanup --all --async
 Batch consolidation fans out LLM synthesis asynchronously and in parallel, then commits SQLite writes sequentially. Cleanup actions also emit adaptive feedback and refresh M1-M6 state after the batch completes.
 
 Cleanup is now scoped-first:
-- `rein cleanup --topic X`, `--topics ...`, or `--pattern ...` only deduplicates the selected groups
-- `rein cleanup` with no scope still runs across the whole store
+- `rein cleanup X`, `rein cleanup --topics ...`, or `rein cleanup --pattern ...` only deduplicates the selected groups
+- destructive full-store cleanup requires `rein cleanup --all`
 - `rein cleanup --dry-run` previews the scope
-- `rein cleanup --async` queues a durable cleanup job and wakes a background cleanup worker
+- background-style cleanup is handled by `rein worker cleanup ...`, `rein worker cleanup-queue`, and the cleanup queue worker
 
 Store-time gray-zone dedup now also uses a dedicated async queue:
 - hot-path store creates the new memory without blocking on remote LLM verdicts
@@ -237,59 +240,18 @@ Operator inspection commands:
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), 32 tools are exposed.
+When running as an MCP server (`rein serve`), Rein exposes 38 production MCP
+tools through the operation inventory. The authoritative list is maintained in
+[docs/reference/mcp-tools.md](docs/reference/mcp-tools.md), grouped as:
 
-#### Core Tools (17)
-
-| Tool | Parameters | Description |
-|------|-----------|-------------|
-| `rein_recall` | `query`, `topic?`, `keyword?`, `limit?`, `from?`, `to?` | Semantic search with optional time range |
-| `rein_store` | `topic`, `content`, `importance?`, `keywords?` | Store a new memory (auto-dedup) |
-| `rein_update` | `id`, `content`, `importance?` | Update an existing memory |
-| `rein_forget` | `id` | Delete a memory by ID |
-| `rein_list_topics` | *(none)* | List all memory topics |
-| `rein_stats` | *(none)* | Total count, LTM/STM breakdown, avg strength |
-| `rein_health` | `topic?` | Stale count, avg strength, consolidation hints |
-| `rein_consolidate` | `topic?`, `topics?`, `pattern?`, `all?`, `merge_variants?`, `summary?`, `dry_run?` | Consolidate one or many topics, optionally grouping topic variants first |
-| `rein_dedup` | `dry_run?`, `merge_variants?` | Scan for and remove duplicate memories, optionally across topic variants |
-| `rein_cleanup` | `topic?`, `topics?`, `pattern?`, `all?`, `exact_topics?`, `dry_run?` | One-click cleanup: consolidate fragmented topics, deduplicate, and refresh adaptive state |
-| `rein_recent` | `limit?` | List most recently created memories |
-| `rein_gc` | `dry_run?` | Garbage collect weak STM memories |
-| `rein_organize` | `max_links?` | Auto-link related memories |
-| `rein_canonicals` | `limit?` | List canonical memories with support count, merge count, source diversity, and dedup confidence |
-| `rein_evidence` | `canonical_id`, `limit?` | List evidence snapshots absorbed into a canonical memory |
-| `rein_dedup_concepts` | *(none)* | Merge duplicate concepts in the knowledge graph (same normalized name within each memoir) |
-| `rein_resummerize` | `canonical_id?`, `dry_run?` | Run LLM-driven canonical recompression on `needs_resummerize` rows, gated by the Lossless Compression Contract (v0.23) |
-
-#### Knowledge Graph Tools (10)
-
-| Tool | Parameters | Description |
-|------|-----------|-------------|
-| `rein_memoir_create` | `name`, `description?` | Create a knowledge container |
-| `rein_memoir_list` | *(none)* | List all memoirs |
-| `rein_memoir_show` | `name` | Show memoir details + concepts |
-| `rein_memoir_add_concept` | `memoir`, `name`, `definition`, `labels?` | Add a knowledge node |
-| `rein_memoir_refine` | `memoir`, `name`, `definition` | Update concept, boost confidence |
-| `rein_memoir_search` | `memoir`, `query`, `limit?` | FTS search within a memoir |
-| `rein_memoir_search_all` | `query`, `limit?` | Search across all memoirs |
-| `rein_memoir_link` | `memoir`, `from`, `to`, `relation` | Link two concepts |
-| `rein_memoir_inspect` | `memoir`, `name`, `depth?` | BFS neighborhood traversal |
-| `rein_memoir_export` | `memoir`, `format?` | Export graph (json / ascii / dot) |
-
-#### Temporal Tools (2)
-
-| Tool | Parameters | Description |
-|------|-----------|-------------|
-| `rein_timeline` | `from?`, `to?`, `limit?` | Chronological timeline of episodes, concept changes, and memory events |
-| `rein_concept_history` | `memoir`, `name`, `limit?` | Revision history of a concept: when/how it changed over time |
-
-#### Adaptive & Session Tools (3)
-
-| Tool | Parameters | Description |
-|------|-----------|-------------|
-| `rein_adaptive_status` | *(none)* | Inspect learned alpha weights, cluster profiles, dedup thresholds, survival curve stats |
-| `rein_feedback` | `memory_ids`, `request_id?`, `query?`, `helpful?` | Report which recalled memories were used — drives M1 event sourcing and future recall quality |
-| `rein_ingest_session` | `content?`, `turns?`, `title?`, `session_id?` | Ingest a full session transcript through the full extraction pipeline (memories + concepts + episode) |
+- Core memory: store, recall, update, forget, recent, topics, canonicals,
+  evidence, stats, and health.
+- Maintenance: GC, dedup, concept dedup, organize, consolidate, cleanup,
+  resummerize, and archive summary refresh.
+- Knowledge graph and temporal: memoir tools, concept state, concept summary
+  refresh, timeline, and concept history.
+- Adaptive, session, ARS, and judge: feedback, adaptive status, session ingest,
+  synthesis judge, and concept-summary judge.
 
 #### Knowledge Graph Relation Types
 
@@ -386,11 +348,11 @@ rein automatically classifies queries and routes them to the optimal search stra
 | **Semantic** | "memory management strategies" | Vector dominant (alpha=0.3) |
 | **Exploratory** | "what do I know about rein?" | Balanced (alpha=0.5), 2x result limit |
 
-Classification is rule-based (zero LLM calls, sub-microsecond). MCP responses include `[route: type]` prefix for transparency. Based on TA-Mem 2026 and MemR3 2025.
+Classification is rule-based (zero LLM calls, sub-microsecond). MCP responses include `[route: type]` prefix for transparency. TA-Mem 2026 and MemR3 2025 are tracked as related memory-retrieval background, not as implemented retrieval controllers.
 
 ### Adaptive Engine (v0.6.0+)
 
-rein's core philosophy: **zero subjective parameters** — all parameters are data-driven and self-adaptive. The adaptive engine runs during GC in a slow channel (zero recall latency impact).
+rein's core philosophy is to minimize fixed parameters through data-driven adaptation. Bootstrap defaults still exist for cold start and safety, but the adaptive engine moves fusion, decay, tiering, and threshold behavior toward observed feedback in the slow channel.
 
 **Pipeline: M4 → A1 → M3 → M5 → M2 → M6**
 
@@ -401,7 +363,7 @@ rein's core philosophy: **zero subjective parameters** — all parameters are da
 | **M3** Survival Analysis | Per-cluster decay curves + **global cold-start prior** | Kaplan-Meier estimator; global prior (capped at blend-zone) for new clusters |
 | **M4** HDBSCAN Clustering | Semantic neighborhoods | Pure Rust HDBSCAN (dendrogram → condensed tree → EOMBST); centroid reassignment on recluster |
 | **M5** Tiering | Hot/Warm/Cold boundaries | Streaming quantile estimator (P25/P75) + cold_archive migration |
-| **M6** Threshold Explorer | Dedup thresholds | Randomized A/B exploration + causal inference + co-recall signal |
+| **M6** Threshold Explorer | Dedup thresholds | Randomized threshold exploration + comparative outcome rates + co-recall signal |
 | **A1** Per-cluster dedup thresholds | Similarity cutoffs per cluster | P90 of intra-cluster pairwise similarity; full pipeline (store, batch, vec dedup) |
 
 **Also:**
@@ -773,7 +735,8 @@ rein includes a built-in web GUI for visual exploration of your memory system. T
 
 ```bash
 # Build with GUI support
-cargo install --path crates/rein --features gui
+cd crates/rein/gui && npm ci && npm run build && cd ../../..
+cargo install --path crates/rein --locked --features gui
 
 # Start the server with GUI enabled (implies --sse)
 rein serve --gui
@@ -827,7 +790,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 flowchart TD
     U[User / AI Agent]
     CLI[CLI\n20+ commands]
-    MCP[MCP Server\n32 tools · stdio / HTTP / SSE]
+    MCP[MCP Server\n38 tools · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[Proxy\nClaude · Codex subscription · record-only]
 
@@ -839,7 +802,7 @@ flowchart TD
     CORE[rein core]
     CLI --> CORE
     MCP --> CORE
-    GUI -->|REST 21 endpoints| CORE
+    GUI -->|inventory-backed REST API| CORE
     PXY -.->|async queue| CORE
 
     REC[Recall Pipeline\n3-channel + RRF/CC + rerank + canonical-first]
@@ -855,8 +818,8 @@ flowchart TD
     CORE --> KG
 
     DB[(SQLite memories.db\nmemories · FTS5 · sqlite-vec)]
-    TN[[Tantivy BM25 side index]]
-    US[[usearch HNSW side index]]
+    TN[Tantivy BM25 side index]
+    US[usearch HNSW side index]
 
     REC --> DB
     ST --> DB
@@ -896,7 +859,7 @@ Two independent search paths run in parallel, then merge:
 
 rein uses an `EmbedderKind` enum dispatch to support multiple embedding backends:
 
-- **Google** (`gemini-embedding-001`) -- default, 3072 dimensions, MTEB #1 (68.32)
+- **Google** (`gemini-embedding-001`) -- default, 3072 dimensions; provider benchmark details are documented in `docs/reference/bibliography.md`
 - **OMLX** -- local embedding via OpenAI-compatible API endpoint
 
 Set `[embedding] provider` to `"google"`, `"omlx"`, or `"none"` in config.
@@ -984,9 +947,11 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 ### 项目简介
 
-rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，核心理念是**零主观参数** — 所有参数由数据驱动、自动学习，不需要人工调参。
+rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
 **当前版本：`v0.27.5`**（2026-04-29）— 已发布并部署。tag `v0.27.5` 已推送，GitHub Release 含 18.2 MB GUI binary，1035 lib tests / 0 clippy / 0 fmt。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+
+完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
 ### 核心特性
 
@@ -1011,11 +976,11 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 | **多源交叉验证** | 3 个来源（本地、Hook 提取、Supermemory）+ 置信度评分 |
 | **多因子准入控制** | A-MAC 2026：llm_conf + novelty + type_prior + recency 评分 |
 | **语义分块** | 按标题/段落/句子分割，嵌入时附加元数据前缀 |
-| **FTS5 unicode61 分词器** | 全文搜索，支持 CJK，亚毫秒级延迟 |
+| **Tantivy + FTS5 文本搜索** | Tantivy BM25 旁路索引 + SQLite FTS5 兜底；CJK 词法路径由 jieba-rs + 字符 bigrams 覆盖 |
 | **Supermemory v4 API** | 通过 `api.supermemory.ai/v4/search` 进行混合搜索交叉验证 |
 | **零本地模型** | 默认无需 GPU（可选 OMLX 本地后端） |
 | **~2-5 MB 占用** | 单个 SQLite 文件 + FTS5 + sqlite-vec |
-| **gemini-embedding-001** | MTEB 排名第一（68.32），3072 维 |
+| **gemini-embedding-001** | 默认 Google embedding 模型，3072 维；benchmark 说法按 provider 文档和 bibliography 标注 |
 | **20+ CLI 命令** | MCP 工具的全部功能，另加 init、config、migrate、hooks、recent、gc、organize、upgrade |
 | **自动配置** | `rein init` 自动检测并配置 8 个 MCP 客户端 |
 | **Neural Wiki GUI** | React + Tailwind Web 仪表盘：Brain View、Adaptive Engine、Knowledge Graph、Timeline 等 |
@@ -1038,10 +1003,11 @@ git clone https://github.com/lyr1cs/rein.git
 cd rein
 
 # 标准构建（CLI + MCP 服务）
-cargo install --path crates/rein
+cargo install --path crates/rein --locked
 
 # 完整构建（包含 Neural Wiki GUI，推荐）
-cargo install --path crates/rein --features gui
+cd crates/rein/gui && npm ci && npm run build && cd ../../..
+cargo install --path crates/rein --locked --features gui
 ```
 
 或使用安装脚本：
@@ -1098,7 +1064,7 @@ rein serve
 | `health` | 检查主题健康状态 | `rein health [topic]` |
 | `consolidate` | 将一个或多个主题批量合并为精简记忆 | `rein consolidate --pattern 'rmcp*' --merge-variants --dry-run` |
 | `dedup` | 扫描/移除重复项，可跨 topic 变体处理 | `rein dedup [--dry-run] [--merge-variants]` |
-| `cleanup` | 一键做 consolidate + dedup + adaptive refresh | `rein cleanup [--pattern 'rmcp*'] [--dry-run] [--async]` |
+| `cleanup` | 一键做 consolidate + dedup + adaptive refresh | `rein cleanup [topic] [--pattern 'rmcp*'] [--all] [--dry-run]` |
 | `migrate` | 从 QMD 导入 / 重建索引 | `rein migrate [--from-qmd path] [--reindex]` |
 | `init` | 自动配置 MCP 客户端 | `rein init [--dry-run]` |
 | `config` | 显示当前配置 | `rein config` |
@@ -1138,13 +1104,13 @@ rein 的清理管线是**保留溯源**的：永远不会硬删除信息。流�
 rein cleanup --all --dry-run
 
 # 对特定 topic 清理
-rein cleanup --topic "docker-deployment"
+rein cleanup "docker-deployment"
 
 # 全库清理
 rein cleanup --all
 
-# 排队后台清理
-rein cleanup --all --async
+# 通过 worker 入口执行清理
+rein worker cleanup --all
 ```
 
 `consolidate` 兼容旧用法 `rein consolidate <topic> -s "summary"`，同时新增：
@@ -1157,9 +1123,9 @@ rein cleanup --all --async
 批量 consolidate 会异步并行生成各 group 的 LLM summary/content，但 SQLite 写入仍按顺序事务提交。清理完成后还会写入 adaptive feedback，并刷新一轮 M1-M6 状态。
 
 如果你想完全在 terminal 里自己跑全库清理：
-- `rein cleanup` 默认处理整个库
+- destructive 全库清理使用 `rein cleanup --all`
 - `rein cleanup --dry-run` 先预览
-- `rein cleanup --async` 会先把 cleanup 任务持久化入队，再唤起后台 worker
+- 后台式清理由 `rein worker cleanup ...`、`rein worker cleanup-queue` 和 cleanup queue worker 承担
 
 store 热路径里的灰区 dedup 现在也会走专门异步队列：
 - 新记忆先正常入库，不阻塞等待远程 LLM
@@ -1173,59 +1139,12 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），共暴露 32 个工具。
+以 MCP 服务运行时（`rein serve`），Rein 通过 operation inventory 暴露 38 个 production MCP 工具。权威清单维护在 [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md)，分为：
 
-#### 核心工具（17 个）
-
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `rein_recall` | `query`, `topic?`, `keyword?`, `limit?` | 语义搜索记忆 |
-| `rein_store` | `topic`, `content`, `importance?`, `keywords?` | 存储新记忆（自动去重） |
-| `rein_update` | `id`, `content`, `importance?` | 更新已有记忆 |
-| `rein_forget` | `id` | 按 ID 删除记忆 |
-| `rein_list_topics` | *(无)* | 列出所有记忆主题 |
-| `rein_stats` | *(无)* | 总数、LTM/STM 分布、平均强度 |
-| `rein_health` | `topic?` | 陈旧计数、平均强度、合并建议 |
-| `rein_consolidate` | `topic?`, `topics?`, `pattern?`, `all?`, `merge_variants?`, `summary?`, `dry_run?` | 合并一个或多个 topic，可先自动归并 topic 变体 |
-| `rein_dedup` | `dry_run?`, `merge_variants?` | 扫描并移除重复记忆，可跨 topic 变体去重 |
-| `rein_cleanup` | `topic?`, `topics?`, `pattern?`, `all?`, `exact_topics?`, `dry_run?` | 一键做 consolidate + dedup + adaptive refresh |
-| `rein_recent` | `limit?` | 查看最近创建的记忆 |
-| `rein_gc` | `dry_run?` | 垃圾回收弱 STM 记忆 |
-| `rein_organize` | `max_links?` | 自动关联记忆 |
-| `rein_canonicals` | `limit?` | 列出 canonical 记忆，含 support count、merge count、来源多样性和去重置信度 |
-| `rein_evidence` | `canonical_id`, `limit?` | 列出某 canonical 吸收的 evidence 快照 |
-| `rein_dedup_concepts` | *(无)* | 合并知识图谱中同名重复概念（同一 memoir 内按最早创建保留） |
-| `rein_resummerize` | `canonical_id?`, `dry_run?` | 对 `needs_resummerize` 行执行 LLM 驱动的 canonical 重压缩，受 Lossless Compression Contract 约束（v0.23） |
-
-#### 知识图谱工具（10 个）
-
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `rein_memoir_create` | `name`, `description?` | 创建知识容器 |
-| `rein_memoir_list` | *(无)* | 列出所有 Memoir |
-| `rein_memoir_show` | `name` | 显示 Memoir 详情及概念 |
-| `rein_memoir_add_concept` | `memoir`, `name`, `definition`, `labels?` | 添加知识节点 |
-| `rein_memoir_refine` | `memoir`, `name`, `definition` | 更新概念，提升置信度 |
-| `rein_memoir_search` | `memoir`, `query`, `limit?` | 在 Memoir 内全文搜索 |
-| `rein_memoir_search_all` | `query`, `limit?` | 跨所有 Memoir 搜索 |
-| `rein_memoir_link` | `memoir`, `from`, `to`, `relation` | 链接两个概念 |
-| `rein_memoir_inspect` | `memoir`, `name`, `depth?` | BFS 邻域遍历 |
-| `rein_memoir_export` | `memoir`, `format?` | 导出图谱（json / ascii / dot） |
-
-#### 时序工具（2 个）
-
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `rein_timeline` | `from?`, `to?`, `limit?` | 按时间线浏览 Episode、概念变更、记忆事件 |
-| `rein_concept_history` | `memoir`, `name`, `limit?` | 查看概念定义的历史修订记录 |
-
-#### 自适应与会话工具（3 个）
-
-| 工具 | 参数 | 说明 |
-|------|------|------|
-| `rein_adaptive_status` | *(无)* | 查看学到的 alpha 权重、聚类 profile、去重阈值、生存曲线统计 |
-| `rein_feedback` | `memory_ids`, `request_id?`, `query?`, `helpful?` | 上报哪些记忆被采用 — 驱动 M1 事件溯源和后续 recall 质量 |
-| `rein_ingest_session` | `content?`, `turns?`, `title?`, `session_id?` | 将完整会话 transcript 送入提取管线（记忆 + 概念 + Episode） |
+- 核心记忆：store、recall、update、forget、recent、topics、canonicals、evidence、stats、health。
+- 维护：GC、dedup、concept dedup、organize、consolidate、cleanup、resummerize、archive summary refresh。
+- 知识图谱与时序：memoir 工具、concept state、concept summary refresh、timeline、concept history。
+- 自适应、会话、ARS 与 judge：feedback、adaptive status、session ingest、synthesis judge、concept-summary judge。
 
 #### 知识图谱关系类型
 
@@ -1521,7 +1440,8 @@ rein 内置 Web 图形界面，用于可视化探索记忆系统。GUI 通过 `r
 
 ```bash
 # 带 GUI 构建
-cargo install --path crates/rein --features gui
+cd crates/rein/gui && npm ci && npm run build && cd ../../..
+cargo install --path crates/rein --locked --features gui
 
 # 启动 GUI 服务（自动启用 SSE）
 rein serve --gui
@@ -1572,7 +1492,7 @@ v0.21 → v0.27.5 这一段重构围绕三条主线：统一 operation registry�
 
 ### 自适应引擎 (v0.6.0+)
 
-核心理念：**零主观参数** — 所有参数由数据驱动自动学习，不需要人工调参。自适应引擎在 GC 慢通道运行，对 recall 延迟零影响。
+核心理念是通过数据驱动自适应逐步减少固定参数。冷启动和安全边界仍保留 bootstrap 默认值，自适应引擎在慢通道把 fusion、decay、tiering、threshold 行为推向真实反馈。
 
 **管线顺序：M4 → A1 → M3 → M5 → M2 → M6**
 
@@ -1583,7 +1503,7 @@ v0.21 → v0.27.5 这一段重构围绕三条主线：统一 operation registry�
 | **M3** 生存分析 | Per-cluster 衰减曲线 + **全局冷启动先验** | Kaplan-Meier 估计器；全局先验（capped 在 blend zone）覆盖新聚类 |
 | **M4** HDBSCAN 聚类 | 语义邻域 | 纯 Rust HDBSCAN（dendrogram → 凝聚树 → EOMBST）；recluster 时基于质心重分配 |
 | **M5** 分层 | Hot/Warm/Cold 边界 | 流式分位数估计器（P25/P75）+ cold_archive 迁移 |
-| **M6** 阈值探索 | 去重阈值 | 随机化 A/B 探索 + 因果推断 + 共同召回信号 |
+| **M6** 阈值探索 | 去重阈值 | 随机阈值探索 + 结果率比较 + 共同召回信号 |
 | **A1** Per-cluster 去重阈值 | 每聚类相似度截止值 | 簇内 pairwise 相似度 P90；全链路落地（store / batch / vec dedup） |
 
 **另外：**
@@ -1662,7 +1582,7 @@ flowchart TD
 flowchart TD
     U[用户 / AI 智能体]
     CLI[CLI\n20+ 命令]
-    MCP[MCP 服务\n32 工具 · stdio / HTTP / SSE]
+    MCP[MCP 服务\n38 工具 · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[代理\nClaude · Codex 订阅 · record-only]
 
@@ -1674,7 +1594,7 @@ flowchart TD
     CORE[rein core]
     CLI --> CORE
     MCP --> CORE
-    GUI -->|REST 21 端点| CORE
+    GUI -->|inventory-backed REST API| CORE
     PXY -.->|异步队列| CORE
 
     REC[召回管线\n三通道 + RRF/CC + 重排 + canonical 优先]
@@ -1690,8 +1610,8 @@ flowchart TD
     CORE --> KG
 
     DB[(SQLite memories.db\nmemories · FTS5 · sqlite-vec)]
-    TN[[Tantivy BM25 旁路索引]]
-    US[[usearch HNSW 旁路索引]]
+    TN[Tantivy BM25 旁路索引]
+    US[usearch HNSW 旁路索引]
 
     REC --> DB
     ST --> DB
@@ -1723,7 +1643,7 @@ flowchart TD
 
 rein 使用 `EmbedderKind` 枚举分发支持多种嵌入后端：
 
-- **Google**（`gemini-embedding-001`）-- 默认，3072 维，MTEB 排名第一（68.32）
+- **Google**（`gemini-embedding-001`）-- 默认，3072 维；provider benchmark 细节见 `docs/reference/bibliography.md`
 - **OMLX** -- 通过 OpenAI 兼容 API 端点进行本地嵌入
 
 在配置中设置 `[embedding] provider` 为 `"google"`、`"omlx"` 或 `"none"`。
