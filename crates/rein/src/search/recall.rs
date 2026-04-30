@@ -136,10 +136,12 @@ fn ready_shadow_fusion_weights_for_recall(
     config: &ReinConfig,
     query_type: &str,
     cluster_id: Option<u32>,
+    parameter_policy_allows_canary: bool,
 ) -> Option<crate::search::alpha_optimizer::ShadowFusionWeights> {
     if !config.adaptive.enabled
         || !config.ars.acceleration.enabled
         || config.ars.acceleration.shadow_only
+        || !parameter_policy_allows_canary
     {
         return None;
     }
@@ -148,17 +150,45 @@ fn ready_shadow_fusion_weights_for_recall(
         cluster_id,
         config.adaptive.min_samples_alpha,
     )?;
-    Some(
-        crate::search::alpha_optimizer::ShadowFusionWeights {
-            bm25: entry.weights.bm25,
-            vec: entry.weights.vec,
-            kg: entry.weights.kg,
-            episode: entry.weights.episode,
-            support: entry.weights.support,
-            diversity: entry.weights.diversity,
-        }
-        .normalized_or_default(),
-    )
+    let static_prior = crate::search::alpha_optimizer::ShadowFusionWeights::default();
+    let effective = crate::ops::ars_tuning::effective_simplex(
+        [
+            static_prior.bm25,
+            static_prior.vec,
+            static_prior.kg,
+            static_prior.episode,
+            static_prior.support,
+            static_prior.diversity,
+        ],
+        [
+            entry.weights.bm25,
+            entry.weights.vec,
+            entry.weights.kg,
+            entry.weights.episode,
+            entry.weights.support,
+            entry.weights.diversity,
+        ],
+        crate::ops::ars_tuning::TrustInputs {
+            enabled: config.ars.acceleration.enabled,
+            production_canary: parameter_policy_allows_canary,
+            human_count: entry.sample_count as u64,
+            llm_count: 0,
+            llm_reliability: 0.0,
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert: false,
+            prior_strength: config.adaptive.shrinkage_prior,
+            max_trust: 0.85,
+        },
+    );
+    Some(crate::search::alpha_optimizer::ShadowFusionWeights {
+        bm25: effective[0],
+        vec: effective[1],
+        kg: effective[2],
+        episode: effective[3],
+        support: effective[4],
+        diversity: effective[5],
+    })
 }
 
 fn collapse_results_to_canonicals(
@@ -1047,8 +1077,22 @@ pub fn recall_temporal_with_request_id(
     let adaptive_alpha = adaptive_state_snapshot
         .as_ref()
         .and_then(|s| s.get_alpha(&query_type_label, query_cluster_id));
+    let parameter_policy_load =
+        crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
     let ars_dynamic_fusion_weights = adaptive_state_snapshot.as_ref().and_then(|s| {
-        ready_shadow_fusion_weights_for_recall(s, config, &query_type_label, query_cluster_id)
+        let parameter_policy_allows_canary = matches!(
+            parameter_policy_load.status,
+            crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+        ) && parameter_policy_load
+            .policy
+            .allows_runtime_adoption(s.version);
+        ready_shadow_fusion_weights_for_recall(
+            s,
+            config,
+            &query_type_label,
+            query_cluster_id,
+            parameter_policy_allows_canary,
+        )
     });
     let ars_dynamic_fusion_active = ars_dynamic_fusion_weights.is_some();
 
@@ -2358,12 +2402,42 @@ mod tests {
         );
 
         assert!(
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None).is_none()
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, true)
+                .is_none()
         );
     }
 
     #[test]
-    fn ars_dynamic_fusion_resolver_returns_weights_in_non_shadow_mode() {
+    fn ars_dynamic_fusion_resolver_requires_parameter_policy_canary() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 1;
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.2,
+                    kg: 0.3,
+                    episode: 0.1,
+                    support: 0.2,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+
+        assert!(
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_resolver_returns_effective_weights_with_policy_canary() {
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = false;
@@ -2385,8 +2459,9 @@ mod tests {
             },
         );
 
-        let weights = ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None)
-            .expect("non-shadow mode should expose eligible snapshot weights");
+        let weights =
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, true)
+                .expect("non-shadow mode should expose eligible snapshot weights");
         assert!((weights.sum() - 1.0).abs() < 1e-9);
         assert!(weights.bm25 > weights.support);
     }

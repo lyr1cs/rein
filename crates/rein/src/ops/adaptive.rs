@@ -100,12 +100,20 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // SynthesisLlmJudge events fold into `llm_judge_count` / hit_count
     // and the κ pair cache. Without this swap the new consumer is dead
     // code and judge events that landed past the offset are lost.
+    let ars_parameter_policy_canary =
+        ars_parameter_policy_allows_runtime(store.conn(), config, &state);
+    let effective_judge_weight_decay_rate =
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+            config.ars.llm_judge.weight_decay_rate,
+            state.judge_calibration_state.as_ref(),
+            ars_parameter_policy_canary,
+        );
     match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge(
         store.conn(),
         state.synthesis_feedback_stats.clone(),
         state.pending_kappa_half_pairs.clone(),
         state.judge_calibration_state.clone().unwrap_or_default(),
-        config.ars.llm_judge.weight_decay_rate,
+        effective_judge_weight_decay_rate,
     ) {
         Ok((stats, pairs, calibration, max_id)) => {
             state.synthesis_feedback_stats = Some(stats);
@@ -127,12 +135,18 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // recompute call above. Same shared pending_kappa_half_pairs cache
     // and judge_calibration_state are folded so concept-summary judge
     // events flow into useful_rate / κ pairs identically to synthesis.
+    let effective_judge_weight_decay_rate =
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+            config.ars.llm_judge.weight_decay_rate,
+            state.judge_calibration_state.as_ref(),
+            ars_parameter_policy_canary,
+        );
     match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge(
         store.conn(),
         state.concept_summary_feedback_stats.clone(),
         state.pending_kappa_half_pairs.clone(),
         state.judge_calibration_state.clone().unwrap_or_default(),
-        config.ars.llm_judge.weight_decay_rate,
+        effective_judge_weight_decay_rate,
     ) {
         Ok((stats, pairs, calibration, max_id)) => {
             state.concept_summary_feedback_stats = Some(stats);
@@ -267,6 +281,9 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
             false
         }
     };
+    if snapshot_saved {
+        refresh_ars_parameter_policy(store.conn(), config, &state);
+    }
 
     // Step 6b: Post-save offset commits. Honor the module invariant —
     // never advance a consumer's cursor unless the derived state change
@@ -339,6 +356,106 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
     }
+}
+
+fn refresh_ars_parameter_policy(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) {
+    use crate::store::ars_parameter_policy::{
+        load_parameter_policy, save_parameter_policy_cas, ArsParameterPolicy,
+        ArsParameterPolicyLoadStatus, ArsParameterPolicyMode,
+    };
+
+    let loaded = load_parameter_policy(conn);
+    if matches!(
+        loaded.status,
+        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError
+    ) {
+        tracing::warn!(
+            status = ?loaded.status,
+            error = ?loaded.error,
+            "ARS parameter policy not refreshed because the metadata row is unhealthy"
+        );
+        return;
+    }
+
+    let eligible_shadow_fusion = state
+        .learned_shadow_fusion
+        .values()
+        .any(|entry| entry.sample_count >= config.adaptive.min_samples_alpha);
+    let desired_mode = if !config.adaptive.enabled || !config.ars.acceleration.enabled {
+        ArsParameterPolicyMode::Disabled
+    } else if config.ars.acceleration.shadow_only || !eligible_shadow_fusion {
+        ArsParameterPolicyMode::Shadow
+    } else {
+        ArsParameterPolicyMode::Canary
+    };
+    if matches!(loaded.status, ArsParameterPolicyLoadStatus::Missing)
+        && matches!(desired_mode, ArsParameterPolicyMode::Disabled)
+    {
+        return;
+    }
+
+    let disabled_reason = match desired_mode {
+        ArsParameterPolicyMode::Disabled => Some("adaptive or ars acceleration disabled".into()),
+        ArsParameterPolicyMode::Shadow if config.ars.acceleration.shadow_only => {
+            Some("ars acceleration shadow_only=true".into())
+        }
+        ArsParameterPolicyMode::Shadow => Some("insufficient learned parameter evidence".into()),
+        ArsParameterPolicyMode::Canary => None,
+    };
+    let current = loaded.policy;
+    if current.mode == desired_mode
+        && current.source_adaptive_version == state.version
+        && current.disabled_reason == disabled_reason
+    {
+        return;
+    }
+
+    let policy = ArsParameterPolicy {
+        revision: current.revision.saturating_add(1),
+        mode: desired_mode,
+        disabled_reason,
+        source_adaptive_version: state.version,
+        last_event_id: state
+            .alpha_optimizer_last_id
+            .max(state.alpha_optimizer_access_last_id),
+        last_updated: chrono::Utc::now().to_rfc3339(),
+        ..ArsParameterPolicy::default()
+    };
+    match save_parameter_policy_cas(conn, &policy, current.revision) {
+        Ok(true) => tracing::debug!(
+            mode = ?policy.mode,
+            revision = policy.revision,
+            source_adaptive_version = policy.source_adaptive_version,
+            "ARS parameter policy refreshed"
+        ),
+        Ok(false) => tracing::warn!(
+            expected_revision = current.revision,
+            "ARS parameter policy CAS miss; keeping existing activation policy"
+        ),
+        Err(e) => tracing::warn!("failed to refresh ARS parameter policy: {e}"),
+    }
+}
+
+fn ars_parameter_policy_allows_runtime(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) -> bool {
+    if !config.adaptive.enabled
+        || !config.ars.acceleration.enabled
+        || config.ars.acceleration.shadow_only
+    {
+        return false;
+    }
+    let loaded = crate::store::ars_parameter_policy::load_parameter_policy(conn);
+    matches!(
+        loaded.status,
+        crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+    ) && loaded.policy.allows_runtime_adoption(state.version)
 }
 
 // ===========================================================================
@@ -2881,6 +2998,73 @@ mod tests {
     use crate::types::traits::MemoryStore;
     use crate::types::*;
     use chrono::Utc;
+
+    fn metadata_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn
+    }
+
+    fn eligible_shadow_state() -> AdaptiveState {
+        let mut state = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        state.learned_shadow_fusion.insert(
+            "global".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.2,
+                    vec: 0.2,
+                    kg: 0.2,
+                    episode: 0.2,
+                    support: 0.1,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_promotes_canary_only_for_non_shadow_eligible_state() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn);
+        assert_eq!(
+            loaded.policy.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert!(loaded.policy.allows_runtime_adoption(state.version));
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_records_shadow_for_shadow_only_config() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        let state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn);
+        assert_eq!(
+            loaded.policy.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow
+        );
+        assert!(!loaded.policy.allows_runtime_adoption(state.version));
+    }
 
     fn test_memory(topic: &str, summary: &str, access_count: u32) -> Memory {
         Memory {

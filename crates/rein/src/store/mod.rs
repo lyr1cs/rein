@@ -1,4 +1,5 @@
 pub mod adaptive;
+pub mod ars_parameter_policy;
 pub mod fts;
 pub mod hdbscan;
 pub mod hnsw;
