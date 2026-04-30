@@ -1327,6 +1327,8 @@ struct ShadowFusionReplayReport {
     )>,
 }
 
+const SHADOW_FUSION_STATUS_REPLAY_LIMIT: usize = 500;
+
 fn compute_shadow_fusion_weight_replay(
     events_with_access: &[crate::search::alpha_optimizer::RecallEvent],
     stored_events: &[crate::store::adaptive::StoredEvent],
@@ -1438,6 +1440,191 @@ fn compute_shadow_fusion_weight_replay(
     } else {
         Some(report)
     }
+}
+
+pub fn shadow_fusion_status(store: &SqliteStore, config: &ReinConfig) -> serde_json::Value {
+    let min_samples = config.adaptive.min_samples_alpha;
+    let base = |status: &str, eligible_samples: usize, global: serde_json::Value| {
+        serde_json::json!({
+            "enabled": config.ars.acceleration.enabled,
+            "shadow_only": config.ars.acceleration.shadow_only,
+            "status": status,
+            "replay_limit": SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+            "eligible_samples": eligible_samples,
+            "min_samples": min_samples,
+            "global": global,
+            "by_query_type": [],
+            "by_cluster": [],
+        })
+    };
+
+    if !config.ars.acceleration.enabled {
+        return base("disabled", 0, serde_json::Value::Null);
+    }
+    if !config.ars.acceleration.shadow_only {
+        return base("non_shadow_mode", 0, serde_json::Value::Null);
+    }
+
+    let conn = store.conn();
+    let recall_events = recent_events_by_type(
+        conn,
+        crate::store::adaptive::EventType::RecallComplete.as_str(),
+        SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+    );
+    let access_events = recent_events_by_type(
+        conn,
+        crate::store::adaptive::EventType::RecallAccess.as_str(),
+        SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+    );
+    let parsed_recall_events: Vec<crate::search::alpha_optimizer::RecallEvent> = recall_events
+        .iter()
+        .filter_map(|event| parse_candidates_from_event(event, &access_events))
+        .collect();
+    let events_with_access: Vec<_> = prefix_committed_events_with_access(
+        &recall_events,
+        parsed_recall_events
+            .iter()
+            .filter(|event| !event.accessed_ids.is_empty()),
+    );
+    let eligible_samples = events_with_access.len();
+    if eligible_samples < min_samples {
+        return base(
+            "insufficient_samples",
+            eligible_samples,
+            serde_json::Value::Null,
+        );
+    }
+
+    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(conn).unwrap_or_default();
+    match compute_shadow_fusion_weight_replay(&events_with_access, &recall_events, &state, config) {
+        Some(report) => project_shadow_fusion_report(report, config, eligible_samples),
+        None => base(
+            "no_learnable_signal",
+            eligible_samples,
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+fn recent_events_by_type(
+    conn: &rusqlite::Connection,
+    event_type: &str,
+    limit: usize,
+) -> Vec<crate::store::adaptive::StoredEvent> {
+    match conn.prepare(
+        "SELECT id, ts, event_type, request_id, memory_id, concept_id, query, query_type, topic, payload
+         FROM feedback_events WHERE event_type = ?1
+         ORDER BY id DESC LIMIT ?2",
+    ) {
+        Ok(mut stmt) => {
+            let mut events: Vec<_> = stmt
+                .query_map(rusqlite::params![event_type, limit as i64], |row| {
+                    Ok(crate::store::adaptive::StoredEvent {
+                        id: row.get(0)?,
+                        ts: row.get(1)?,
+                        event_type: row.get(2)?,
+                        request_id: row.get(3)?,
+                        memory_id: row.get(4)?,
+                        concept_id: row.get(5)?,
+                        query: row.get(6)?,
+                        query_type: row.get(7)?,
+                        topic: row.get(8)?,
+                        payload: row.get(9)?,
+                    })
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|row| row.ok()).collect())
+                .unwrap_or_default();
+            events.reverse();
+            events
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn prefix_committed_events_with_access<'a>(
+    stored_recall_events: &[crate::store::adaptive::StoredEvent],
+    events_with_access: impl Iterator<Item = &'a crate::search::alpha_optimizer::RecallEvent>,
+) -> Vec<crate::search::alpha_optimizer::RecallEvent> {
+    let events_with_access: Vec<_> = events_with_access.cloned().collect();
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let matched_request_ids: std::collections::HashSet<&str> = events_with_access
+        .iter()
+        .map(|event| event.request_id.as_str())
+        .collect();
+    let mut rids_we_advanced_through = std::collections::HashSet::new();
+    for event in stored_recall_events {
+        let rid = event.request_id.as_deref().unwrap_or("");
+        let is_matched = matched_request_ids.contains(rid);
+        let is_expired = chrono::DateTime::parse_from_rfc3339(&event.ts)
+            .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
+            .unwrap_or(false);
+
+        if is_matched || is_expired {
+            rids_we_advanced_through.insert(rid.to_string());
+        } else {
+            break;
+        }
+    }
+    events_with_access
+        .into_iter()
+        .filter(|event| rids_we_advanced_through.contains(event.request_id.as_str()))
+        .collect()
+}
+
+fn project_shadow_fusion_report(
+    report: ShadowFusionReplayReport,
+    config: &ReinConfig,
+    eligible_samples: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": config.ars.acceleration.enabled,
+        "shadow_only": config.ars.acceleration.shadow_only,
+        "status": "ready",
+        "replay_limit": SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+        "eligible_samples": eligible_samples,
+        "min_samples": config.adaptive.min_samples_alpha,
+        "global": report.global.map(project_learned_shadow_weights).unwrap_or(serde_json::Value::Null),
+        "by_query_type": report.by_query_type
+            .into_iter()
+            .map(|(query_type, learned)| {
+                let mut value = project_learned_shadow_weights(learned);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("query_type".into(), serde_json::Value::String(query_type));
+                }
+                value
+            })
+            .collect::<Vec<_>>(),
+        "by_cluster": report.by_cluster
+            .into_iter()
+            .map(|((query_type, cluster_id), learned)| {
+                let mut value = project_learned_shadow_weights(learned);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("query_type".into(), serde_json::Value::String(query_type));
+                    obj.insert("cluster_id".into(), serde_json::Value::from(cluster_id));
+                }
+                value
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn project_learned_shadow_weights(
+    learned: crate::search::alpha_optimizer::LearnedShadowWeights,
+) -> serde_json::Value {
+    let weights = learned.weights.normalized_or_default();
+    serde_json::json!({
+        "sample_count": learned.sample_count,
+        "last_updated": learned.last_updated.to_rfc3339(),
+        "weights": {
+            "bm25": weights.bm25,
+            "vec": weights.vec,
+            "kg": weights.kg,
+            "episode": weights.episode,
+            "support": weights.support,
+            "diversity": weights.diversity,
+        }
+    })
 }
 
 fn log_shadow_fusion_weight_replay(report: &ShadowFusionReplayReport) {
@@ -3995,6 +4182,114 @@ mod tests {
         assert_eq!(report.by_query_type[0].0, "semantic");
         assert_eq!(report.by_cluster.len(), 1);
         assert_eq!(report.by_cluster[0].0, ("semantic".to_string(), 7));
+    }
+
+    fn emit_shadow_replay_feedback_pair(store: &SqliteStore, request_id: &str, accessed_id: &str) {
+        emit(
+            store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some(request_id.to_string()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("shadow replay query".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [
+                        {
+                            "id": accessed_id,
+                            "bm25_norm": 0.2,
+                            "vec_norm": 0.2,
+                            "kg_norm": 1.0,
+                            "episode_norm": 0.1,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        },
+                        {
+                            "id": format!("unused-{request_id}"),
+                            "bm25_norm": 0.9,
+                            "vec_norm": 0.9,
+                            "kg_norm": 0.0,
+                            "episode_norm": 0.1,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        }
+                    ],
+                    "cc_alpha": 0.5
+                })),
+            },
+        );
+        emit(
+            store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some(request_id.to_string()),
+                memory_id: Some(accessed_id.to_string()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+    }
+
+    #[test]
+    fn shadow_fusion_status_is_default_off() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        let status = shadow_fusion_status(&store, &config);
+
+        assert_eq!(status["enabled"].as_bool(), Some(false));
+        assert_eq!(status["status"].as_str(), Some("disabled"));
+        assert_eq!(status["global"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn shadow_fusion_status_previews_without_committing_offsets() {
+        let store = SqliteStore::in_memory().unwrap();
+        emit_shadow_replay_feedback_pair(&store, "req-shadow-status", "mem-shadow-status");
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+
+        let status = shadow_fusion_status(&store, &config);
+
+        assert_eq!(status["enabled"].as_bool(), Some(true));
+        assert_eq!(status["shadow_only"].as_bool(), Some(true));
+        assert_eq!(status["status"].as_str(), Some("ready"));
+        assert_eq!(status["eligible_samples"].as_u64(), Some(1));
+        assert_eq!(status["min_samples"].as_u64(), Some(1));
+        assert_eq!(status["global"]["sample_count"].as_u64(), Some(1));
+        assert!(
+            status["global"]["weights"]["kg"].as_f64().unwrap() > 0.5,
+            "fixture should surface kg-heavy preview weights: {status}"
+        );
+        assert_eq!(read_offset(&store, "alpha_optimizer"), 0);
+        assert_eq!(read_offset(&store, "alpha_optimizer_access"), 0);
+    }
+
+    #[test]
+    fn shadow_fusion_status_reports_insufficient_samples_without_mutation() {
+        let store = SqliteStore::in_memory().unwrap();
+        emit_shadow_replay_feedback_pair(&store, "req-shadow-small", "mem-shadow-small");
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        config.adaptive.min_samples_alpha = 2;
+
+        let status = shadow_fusion_status(&store, &config);
+
+        assert_eq!(status["status"].as_str(), Some("insufficient_samples"));
+        assert_eq!(status["eligible_samples"].as_u64(), Some(1));
+        assert_eq!(status["min_samples"].as_u64(), Some(2));
+        assert!(status["global"].is_null());
+        assert_eq!(read_offset(&store, "alpha_optimizer"), 0);
+        assert_eq!(read_offset(&store, "alpha_optimizer_access"), 0);
     }
 
     // ── Test 7: run_m6_threshold_learning ────────────────────────────────────
