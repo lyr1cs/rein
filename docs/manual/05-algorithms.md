@@ -304,7 +304,7 @@ avoid unnecessary latency and cost.
 `search/mmr.rs` applies Maximal Marginal Relevance as a final diversity pass
 when enabled [6]. Given selected set `S`, the next result is:
 
-$$
+```math
 d^* =
 \arg\max_{d \in C \setminus S}
 \left[
@@ -312,7 +312,7 @@ d^* =
 -
 (1 - \lambda)\max_{s \in S}\mathrm{sim}(d,s)
 \right]
-$$
+```
 
 Rein approximates `sim(d,s)` without extra embedding calls:
 
