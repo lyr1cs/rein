@@ -1662,6 +1662,11 @@ fn run_alpha_learning(
         pending.push(("alpha_optimizer_access", off));
     }
 
+    let events_with_access: Vec<_> = events_with_access
+        .into_iter()
+        .filter(|event| rids_we_advanced_through.contains(event.request_id.as_str()))
+        .collect();
+
     if events_with_access.is_empty() {
         tracing::debug!(
             "M2: peeked {} events but none had access data yet (will retry)",
@@ -3407,6 +3412,118 @@ mod tests {
             offset_after > 0,
             "alpha_optimizer offset should have advanced after commit, got {offset_after}"
         );
+    }
+
+    #[test]
+    fn run_alpha_learning_does_not_learn_from_matched_event_behind_blocked_prefix() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.min_samples_alpha = 1;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+
+        // First recall has candidates but no access yet. Because it is live
+        // and unmatched, it must block the prefix watermark.
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some("req-prefix-gap".into()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("blocked query".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [
+                        {
+                            "id": "mem-gap-a",
+                            "bm25_norm": 1.0,
+                            "vec_norm": 0.0,
+                            "kg_norm": 0.0,
+                            "episode_norm": 0.0,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        },
+                        {
+                            "id": "mem-gap-b",
+                            "bm25_norm": 0.0,
+                            "vec_norm": 1.0,
+                            "kg_norm": 0.0,
+                            "episode_norm": 0.0,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        }
+                    ],
+                    "cc_alpha": 0.5
+                })),
+            },
+        );
+
+        let later_rid = "req-later-matched".to_string();
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some(later_rid.clone()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("later query".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [
+                        {
+                            "id": "mem-later-clicked",
+                            "bm25_norm": 1.0,
+                            "vec_norm": 0.0,
+                            "kg_norm": 1.0,
+                            "episode_norm": 0.0,
+                            "support_count": 2,
+                            "source_diversity": 2.0
+                        },
+                        {
+                            "id": "mem-later-other",
+                            "bm25_norm": 0.0,
+                            "vec_norm": 1.0,
+                            "kg_norm": 0.0,
+                            "episode_norm": 1.0,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        }
+                    ],
+                    "cc_alpha": 0.5
+                })),
+            },
+        );
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some(later_rid),
+                memory_id: Some("mem-later-clicked".into()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+
+        let mut state = AdaptiveState::default();
+        let pending = run_alpha_learning(&store, &mut state, &config);
+
+        assert_eq!(
+            pending, None,
+            "blocked recall prefix must not return offset advances"
+        );
+        assert!(
+            state.learned_alpha.is_empty(),
+            "later matched recall behind an unadvanced prefix gap must not mutate learned alpha: {:?}",
+            state.learned_alpha
+        );
+        assert_eq!(state.alpha_optimizer_last_id, 0);
+        assert_eq!(state.alpha_optimizer_access_last_id, 0);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::judge::contract::{
 };
 use crate::store::adaptive::{
     emit_event, ConceptSummaryLlmJudgePayload, EventType, FeedbackEvent, JudgeMetadata,
-    JudgeSource, SynthesisLlmJudgePayload,
+    JudgeSource, SignalHint, SynthesisLlmJudgePayload,
 };
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
@@ -97,6 +97,12 @@ pub struct JudgeJob {
     /// auto-sampled jsonl rows that pre-date this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_model_override: Option<String>,
+    /// v0.28 ARS acceleration: optional structured hint computed upstream.
+    ///
+    /// The worker only pass-throughs this when acceleration is explicitly
+    /// enabled and shadow-only. It does not infer hints from judge prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_hint: Option<SignalHint>,
 }
 
 impl JudgeJob {
@@ -347,6 +353,7 @@ pub fn dispatch_one(
         source_count: job.source_count,
         judge_latency_ms: None,
     };
+    let signal_hint = signal_hint_for_emit(config, &job);
 
     // Build the final payload + emit event.
     let event = match job.kind {
@@ -359,7 +366,7 @@ pub fn dispatch_one(
                 stamp_hash: computed_stamp,
                 source: job.source,
                 metadata: Some(metadata),
-                signal_hint: None,
+                signal_hint,
             };
             FeedbackEvent {
                 event_type: EventType::SynthesisLlmJudge,
@@ -382,7 +389,7 @@ pub fn dispatch_one(
                 stamp_hash: computed_stamp,
                 source: job.source,
                 metadata: Some(metadata),
-                signal_hint: None,
+                signal_hint,
             };
             FeedbackEvent {
                 event_type: EventType::ConceptSummaryLlmJudge,
@@ -407,6 +414,37 @@ pub fn dispatch_one(
     };
     let _ = ReservationToken::commit(&token, store.conn());
     Ok(DispatchResult::Emitted(event_id))
+}
+
+fn signal_hint_for_emit(config: &crate::config::ReinConfig, job: &JudgeJob) -> Option<SignalHint> {
+    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+        return None;
+    }
+
+    let mut hint = job.signal_hint.clone()?;
+    hint.inferred_w_view = finite_nonnegative(hint.inferred_w_view);
+    hint.inferred_w_click = finite_nonnegative(hint.inferred_w_click);
+    hint.inferred_w_thumb = finite_nonnegative(hint.inferred_w_thumb);
+    hint.inferred_w_req = finite_nonnegative(hint.inferred_w_req);
+    hint.useful_rate_ci_width = finite_unit(hint.useful_rate_ci_width);
+    if hint.inferred_w_view.is_none()
+        && hint.inferred_w_click.is_none()
+        && hint.inferred_w_thumb.is_none()
+        && hint.inferred_w_req.is_none()
+        && hint.useful_rate_ci_width.is_none()
+    {
+        None
+    } else {
+        Some(hint)
+    }
+}
+
+fn finite_nonnegative(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn finite_unit(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
 }
 
 fn verify_durable_judge_target(
@@ -1231,6 +1269,95 @@ mod tests {
         assert_ne!(h2, h3);
     }
 
+    fn base_synthesis_job() -> JudgeJob {
+        JudgeJob {
+            kind: JudgeJobKind::Synthesis,
+            surface_id: "syn-1".to_string(),
+            concept_id: None,
+            query: "q".to_string(),
+            prompt: "p".to_string(),
+            candidate: "c".to_string(),
+            stamp_hash: JudgeJob::compute_stamp_hash("q", "p", "c"),
+            source: JudgeSource::ManualMcp,
+            query_type: Some("semantic".into()),
+            cluster_id: Some(7),
+            source_count: Some(3),
+            judge_model_override: None,
+            signal_hint: None,
+        }
+    }
+
+    #[test]
+    fn judge_job_deserializes_legacy_rows_without_signal_hint() {
+        let raw = serde_json::json!({
+            "kind": "synthesis",
+            "surface_id": "syn-legacy",
+            "query": "q",
+            "prompt": "p",
+            "candidate": "c",
+            "stamp_hash": JudgeJob::compute_stamp_hash("q", "p", "c"),
+            "source": "ManualMcp",
+            "source_count": 1
+        });
+
+        let job: JudgeJob = serde_json::from_value(raw).expect("legacy job should parse");
+
+        assert!(job.signal_hint.is_none());
+    }
+
+    #[test]
+    fn signal_hint_for_emit_sanitizes_structured_queue_hint() {
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        let mut job = base_synthesis_job();
+        job.signal_hint = Some(crate::store::adaptive::SignalHint {
+            inferred_w_view: Some(-1.0),
+            inferred_w_click: Some(f64::NAN),
+            inferred_w_thumb: Some(2.25),
+            inferred_w_req: Some(0.75),
+            useful_rate_ci_width: Some(2.0),
+        });
+
+        let hint = signal_hint_for_emit(&config, &job).expect("valid fields should keep hint");
+
+        assert_eq!(hint.inferred_w_view, None);
+        assert_eq!(hint.inferred_w_click, None);
+        assert_eq!(hint.inferred_w_thumb, Some(2.25));
+        assert_eq!(hint.inferred_w_req, Some(0.75));
+        assert_eq!(hint.useful_rate_ci_width, None);
+    }
+
+    #[test]
+    fn signal_hint_for_emit_is_default_off_and_shadow_only() {
+        let mut job = base_synthesis_job();
+        job.signal_hint = Some(crate::store::adaptive::SignalHint {
+            inferred_w_view: Some(1.0),
+            inferred_w_click: None,
+            inferred_w_thumb: None,
+            inferred_w_req: None,
+            useful_rate_ci_width: None,
+        });
+
+        let default_config = crate::config::ReinConfig::default();
+        assert!(signal_hint_for_emit(&default_config, &job).is_none());
+
+        let mut production_config = crate::config::ReinConfig::default();
+        production_config.ars.acceleration.enabled = true;
+        production_config.ars.acceleration.shadow_only = false;
+        assert!(signal_hint_for_emit(&production_config, &job).is_none());
+
+        let mut shadow_config = crate::config::ReinConfig::default();
+        shadow_config.ars.acceleration.enabled = true;
+        shadow_config.ars.acceleration.shadow_only = true;
+        assert_eq!(
+            signal_hint_for_emit(&shadow_config, &job)
+                .unwrap()
+                .inferred_w_view,
+            Some(1.0)
+        );
+    }
+
     #[test]
     fn j5_rejects_synthesis_job_without_matching_cache_stamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -1249,6 +1376,7 @@ mod tests {
             cluster_id: None,
             source_count: Some(1),
             judge_model_override: None,
+            signal_hint: None,
         };
 
         assert!(
@@ -1307,6 +1435,7 @@ mod tests {
             cluster_id: None,
             source_count: Some(0),
             judge_model_override: None,
+            signal_hint: None,
         };
 
         assert!(
