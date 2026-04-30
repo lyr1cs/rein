@@ -1737,6 +1737,33 @@ mod tests {
         .unwrap()
     }
 
+    fn emit_runtime_synth_without_hint(conn: &Connection, synthesis_id: &str) -> i64 {
+        let payload = SynthesisLlmJudgePayload {
+            synthesis_id: synthesis_id.to_string(),
+            judge_model: "model-r".into(),
+            hit: true,
+            reason: "useful".into(),
+            stamp_hash: "deadbeef".into(),
+            source: crate::store::adaptive::JudgeSource::AutoSampled,
+            metadata: None,
+            signal_hint: None,
+        };
+        super::emit_event(
+            conn,
+            FeedbackEvent {
+                event_type: EventType::SynthesisLlmJudge,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::to_value(&payload).unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
     fn emit_runtime_concept_with_hint(
         conn: &Connection,
         concept_summary_id: &str,
@@ -1900,6 +1927,21 @@ mod tests {
         let priors = bootstrap_priors_from_replay(&config, &conn).expect("snapshot path");
 
         assert_eq!(priors, snapshot);
+    }
+
+    #[test]
+    fn bootstrap_priors_from_replay_enabled_ignores_hintless_runtime_events() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        let conn = setup_db();
+        emit_runtime_synth_without_hint(&conn, "synth-hintless");
+
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("replay path");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
     }
 
     #[test]
