@@ -120,6 +120,11 @@ command = "rein"
 args = ["serve"]
 ```
 
+Plain stdio MCP startup does not run background warmup by default. For Codex
+agent-team workflows this avoids one side-index rebuild per subagent; run
+`rein warmup` explicitly after bulk memory changes or keep the HTTP/GUI service
+enabled for service-level startup warmup.
+
 See the OpenAI Codex MCP documentation entry in
 `docs/reference/bibliography.md` for the upstream config format reference.
 

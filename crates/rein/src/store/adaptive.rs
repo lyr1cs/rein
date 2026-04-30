@@ -2593,6 +2593,21 @@ pub enum ConceptSummaryInteractionKind {
     ExplicitThumb { up: bool },
 }
 
+/// v0.28 ARS shadow route context. This preserves the caller's real recall
+/// route while Cap A continues to bucket production feedback through its
+/// synthetic per-concept route.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct RecallRouteContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_version: Option<u64>,
+}
+
 /// v0.27 ARS Cap A: optional context emitted alongside an interaction.
 /// `Default` is empty (all `None`) so callers can construct it without
 /// committing to every field.
@@ -2612,6 +2627,10 @@ pub struct ConceptSummaryMetadata {
     /// versioned, unlike Cap B synthesis (which is per-call ephemeral).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_version: Option<u32>,
+    /// Shadow-only route context. Production bucket selection still uses the
+    /// top-level `query_type` and `cluster_id` fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_context: Option<RecallRouteContext>,
 }
 
 // Bootstrap weights for `compute_concept_summary_useful_rate`. Marked
@@ -5645,6 +5664,7 @@ mod tests {
                 cluster_id,
                 concept_chars: None,
                 revision_version: None,
+                route_context: None,
             }),
         }
     }
@@ -5708,6 +5728,33 @@ mod tests {
             back.get("concept_summary_id").and_then(|v| v.as_str()),
             Some("cs-x")
         );
+    }
+
+    #[test]
+    fn concept_summary_metadata_preserves_shadow_route_context() {
+        let metadata = ConceptSummaryMetadata {
+            query_type: Some("concept_refresh".into()),
+            cluster_id: Some(123),
+            concept_chars: Some(900),
+            revision_version: Some(4),
+            route_context: Some(RecallRouteContext {
+                request_id: Some("recall-1".into()),
+                query_type: Some("Exploratory".into()),
+                cluster_id: Some(7),
+                cluster_version: Some(42),
+            }),
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let back: ConceptSummaryMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.query_type.as_deref(), Some("concept_refresh"));
+        assert_eq!(back.cluster_id, Some(123));
+        let route = back.route_context.expect("shadow route should round-trip");
+        assert_eq!(route.request_id.as_deref(), Some("recall-1"));
+        assert_eq!(route.query_type.as_deref(), Some("Exploratory"));
+        assert_eq!(route.cluster_id, Some(7));
+        assert_eq!(route.cluster_version, Some(42));
     }
 
     #[test]
@@ -6197,6 +6244,43 @@ mod tests {
     }
 
     #[test]
+    fn recompute_concept_summary_feedback_ignores_shadow_route_for_bucket() {
+        let conn = setup_db();
+        let synthetic_key = concept_summary_bucket_key(Some(123), "concept_refresh");
+        let real_key = concept_summary_bucket_key(Some(7), "Exploratory");
+        let payload = ConceptSummaryInteractionPayload {
+            concept_id: "con-shadow".into(),
+            concept_summary_id: Some("cs-shadow".into()),
+            recall_id: "rec-shadow".into(),
+            interaction: ConceptSummaryInteractionKind::Viewed { dwell_ms: 4000 },
+            metadata: Some(ConceptSummaryMetadata {
+                query_type: Some("concept_refresh".into()),
+                cluster_id: Some(123),
+                concept_chars: None,
+                revision_version: None,
+                route_context: Some(RecallRouteContext {
+                    request_id: Some("rec-shadow".into()),
+                    query_type: Some("Exploratory".into()),
+                    cluster_id: Some(7),
+                    cluster_version: Some(11),
+                }),
+            }),
+        };
+        emit_concept_summary_event(&conn, payload);
+
+        let (state, _) = recompute_concept_summary_feedback_stats(&conn, None).unwrap();
+
+        assert!(
+            state.by_cluster.contains_key(&synthetic_key),
+            "production synthetic bucket must receive the event"
+        );
+        assert!(
+            !state.by_cluster.contains_key(&real_key),
+            "shadow route context must not drive production bucket selection"
+        );
+    }
+
+    #[test]
     fn recompute_concept_summary_feedback_useful_rate_signal_directions() {
         // Required test #4: positive vs negative contributions to useful_rate.
         // Signal mix calibrated to land the positive bucket above the
@@ -6588,6 +6672,7 @@ mod tests {
                     cluster_id: Some(7),
                     concept_chars: None,
                     revision_version: None,
+                    route_context: None,
                 }),
             },
         );
@@ -6659,6 +6744,7 @@ mod tests {
                     cluster_id: Some(7),
                     concept_chars: None,
                     revision_version: None,
+                    route_context: None,
                 }),
             },
         );
@@ -6732,6 +6818,7 @@ mod tests {
                     cluster_id: Some(7),
                     concept_chars: None,
                     revision_version: None,
+                    route_context: None,
                 }),
             },
         );

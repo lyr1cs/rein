@@ -163,9 +163,10 @@ pub async fn hook_session_start(config: &ReinConfig) -> anyhow::Result<()> {
         items = working_set::load_working_set(config);
     }
     if let Some(context) = format_codex_context(
-        "Rein project memory context",
+        "Rein project memory",
         items,
         config.hooks.codex.max_additional_context_chars,
+        config.async_memory.selection_limit,
     ) {
         print_codex_json_output(&codex_additional_context_output("SessionStart", &context))?;
     }
@@ -215,9 +216,10 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     let prompt = json.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     let items = working_set::select_relevant_items(config, prompt);
     if let Some(context) = format_codex_context(
-        "Rein relevant memory context",
+        "Rein memory",
         items,
         config.hooks.codex.max_additional_context_chars,
+        config.async_memory.selection_limit,
     ) {
         print_codex_json_output(&codex_additional_context_output(
             "UserPromptSubmit",
@@ -444,40 +446,39 @@ fn codex_permission_request_deny(reason: &str) -> serde_json::Value {
     })
 }
 
-fn format_codex_context<I>(title: &str, items: I, max_chars: usize) -> Option<String>
+fn format_codex_context<I>(
+    title: &str,
+    items: I,
+    max_chars: usize,
+    max_items: usize,
+) -> Option<String>
 where
     I: IntoIterator<Item = WorkingSetItem>,
 {
-    if max_chars == 0 {
+    if max_chars == 0 || max_items == 0 {
         return None;
     }
 
-    let mut lines = vec![
-        title.to_string(),
-        "Use this as background memory only. Current user instructions and repository files take precedence.".to_string(),
-    ];
-    for item in items {
-        let topic = clean_codex_context_field(&item.topic);
-        let summary = clean_codex_context_field(&item.summary);
-        let detail = clean_codex_context_field(&item.detail);
+    let mut lines = vec![format!("{title} (background; user/repo instructions win):")];
+    for item in items.into_iter().take(max_items) {
+        let topic = cap_chars(&clean_codex_context_field(&item.topic), 48);
+        let summary = cap_chars(&clean_codex_context_field(&item.summary), 96);
+        let detail = cap_chars(&clean_codex_context_field(&item.detail), 160);
         if summary.is_empty() && detail.is_empty() {
             continue;
         }
-        lines.push(format!(
-            "- [{} | {}] {}{}{}",
-            item.kind,
-            topic,
-            summary,
-            if summary.is_empty() || detail.is_empty() {
-                ""
-            } else {
-                ": "
-            },
+        let label = if topic.is_empty() { "memory" } else { &topic };
+        let body = if summary.is_empty() || context_detail_is_redundant(&summary, &detail) {
             detail
-        ));
+        } else if detail.is_empty() {
+            summary
+        } else {
+            format!("{summary}; {detail}")
+        };
+        lines.push(format!("- {label}: {body}"));
     }
 
-    if lines.len() <= 2 {
+    if lines.len() <= 1 {
         return None;
     }
     Some(cap_chars(&lines.join("\n"), max_chars))
@@ -490,6 +491,19 @@ fn clean_codex_context_field(text: &str) -> String {
         .map(str::trim)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn context_detail_is_redundant(summary: &str, detail: &str) -> bool {
+    if summary.is_empty() || detail.is_empty() {
+        return false;
+    }
+    if summary.eq_ignore_ascii_case(detail) {
+        return true;
+    }
+    if summary.chars().count() < 24 {
+        return false;
+    }
+    detail.to_lowercase().contains(&summary.to_lowercase())
 }
 
 fn cap_chars(text: &str, max_chars: usize) -> String {
@@ -761,9 +775,49 @@ mod tests {
             "Use UserPromptSubmit for context. OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890",
         )];
 
-        let context = format_codex_context("Rein relevant memory context", items, 96).unwrap();
+        let context = format_codex_context("Rein relevant memory context", items, 96, 2).unwrap();
 
         assert!(context.chars().count() <= 96);
         assert!(!context.contains("sk-abcdefghijklmnopqrstuvwxyz1234567890"));
+    }
+
+    #[test]
+    fn codex_context_zero_cap_disables_output() {
+        let items = vec![sample_working_set_item(
+            "memory that would otherwise be emitted",
+        )];
+
+        assert!(format_codex_context("Rein memory", items, 0, 2).is_none());
+    }
+
+    #[test]
+    fn codex_context_uses_compact_header_and_lines() {
+        let items = vec![sample_working_set_item(
+            "Codex hook context should be concise and avoid repeated policy prose.",
+        )];
+
+        let context = format_codex_context("Rein memory", items, 1000, 2).unwrap();
+
+        assert!(context.starts_with("Rein memory (background; user/repo instructions win):\n"));
+        assert!(!context.contains("Use this as background memory only"));
+        assert!(!context.contains("[memory | codex]"));
+    }
+
+    #[test]
+    fn codex_context_limits_item_count() {
+        let mut items = Vec::new();
+        for idx in 0..4 {
+            let mut item = sample_working_set_item(&format!("detail {idx}"));
+            item.topic = format!("topic-{idx}");
+            item.summary = format!("summary {idx}");
+            items.push(item);
+        }
+
+        let context = format_codex_context("Rein project memory", items, 2000, 2).unwrap();
+
+        assert!(context.contains("detail 0"));
+        assert!(context.contains("detail 1"));
+        assert!(!context.contains("detail 2"));
+        assert!(!context.contains("detail 3"));
     }
 }

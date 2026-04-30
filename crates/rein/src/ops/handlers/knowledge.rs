@@ -1493,6 +1493,105 @@ mod tests {
     }
 
     #[test]
+    fn concept_state_ignores_real_route_bucket_for_cap_a_gate() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        config.ars.concept_summary_enabled = true;
+        config.ars.concept_summary_cold_start_n = 1;
+        let config = Arc::new(config);
+        let store = config.open_store().expect("open seeded store");
+        store
+            .create_memoir(crate::types::Memoir {
+                id: String::new(),
+                name: "ars-route-gate".to_string(),
+                description: "seeded memoir".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .expect("create memoir");
+        store
+            .add_concept(crate::types::Concept {
+                id: String::new(),
+                memoir_id: "ars-route-gate".to_string(),
+                name: "concept-alpha".to_string(),
+                definition: "seeded concept".to_string(),
+                labels: vec!["seed".to_string()],
+                source_memory_ids: vec![],
+                confidence: 0.9,
+                revision: 1,
+                last_episode_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                living_summary: Some("summary should remain visible".to_string()),
+                living_summary_updated_at: Some(chrono::Utc::now()),
+                living_summary_source_revision: Some(1),
+                living_summary_id: Some("cs-route-gate".to_string()),
+            })
+            .expect("add concept");
+        let concept_id = store
+            .get_concept("ars-route-gate", "concept-alpha")
+            .expect("lookup")
+            .expect("concept exists")
+            .id;
+        store
+            .conn()
+            .execute(
+                "UPDATE concepts SET living_summary = ?1, \
+                 living_summary_updated_at = ?2, living_summary_source_revision = ?3, \
+                 living_summary_id = ?4 WHERE id = ?5",
+                rusqlite::params![
+                    "summary should remain visible",
+                    "2026-04-30T12:00:00Z",
+                    1i64,
+                    "cs-route-gate",
+                    &concept_id,
+                ],
+            )
+            .expect("seed living summary");
+
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        let real_key = crate::store::adaptive::concept_summary_bucket_key(Some(7), "Exploratory");
+        let mut feedback = crate::store::adaptive::ConceptSummaryFeedbackState::default();
+        feedback.by_cluster.insert(
+            real_key,
+            crate::store::adaptive::ClusterConceptSummaryStats {
+                viewed_count: 1,
+                useful_rate: 0.0,
+                last_event_id: 1,
+                ..Default::default()
+            },
+        );
+        state.concept_summary_feedback_stats = Some(feedback);
+        state
+            .save_snapshot(store.conn())
+            .expect("save adaptive state");
+        drop(store);
+        let runtime = Arc::new(crate::ops::OpsRuntime::for_rest(config));
+
+        let out = runtime
+            .concept_state(ConceptStateParams {
+                concept_id,
+                query_type: Some("Exploratory".to_string()),
+                cluster_id: Some(7),
+            })
+            .expect("concept_state");
+
+        assert_eq!(
+            out.living_summary.as_deref(),
+            Some("summary should remain visible")
+        );
+        assert!(
+            !out.living_summary_suppressed,
+            "real-route shadow buckets must not suppress Cap A production output"
+        );
+    }
+
+    #[test]
     fn concept_state_returns_not_found_for_missing_id() {
         let (runtime, _tmp) = runtime_with_seeded_memoir("ars-404");
         let err = runtime

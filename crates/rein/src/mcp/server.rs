@@ -505,6 +505,22 @@ fn inventory_entry_to_tool(entry: &crate::ops::OpsMcpEntry) -> rmcp::model::Tool
     rmcp::model::Tool::new(entry.mcp_name, entry.description, obj)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSurface {
+    Stdio,
+    Http,
+}
+
+fn should_spawn_background_warmup(config: &ReinConfig, surface: StartupSurface) -> bool {
+    if !config.server.background_warmup {
+        return false;
+    }
+    match surface {
+        StartupSurface::Stdio => config.server.stdio_background_warmup,
+        StartupSurface::Http => true,
+    }
+}
+
 /// Spawn background warmup task for embedding cache pre-computation.
 fn spawn_background_warmup(config: &ReinConfig) {
     let warmup_config = config.clone();
@@ -544,7 +560,9 @@ fn spawn_background_warmup(config: &ReinConfig) {
 
 /// Start the MCP server over stdio.
 pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
-    spawn_background_warmup(&config);
+    if should_spawn_background_warmup(&config, StartupSurface::Stdio) {
+        spawn_background_warmup(&config);
+    }
 
     let server = ReinServer::new(config);
 
@@ -563,7 +581,9 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
 /// Start the MCP server over HTTP (Streamable HTTP / SSE).
 /// Accessible via Tailscale or LAN for remote memory queries.
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
-    spawn_background_warmup(&config);
+    if should_spawn_background_warmup(&config, StartupSurface::Http) {
+        spawn_background_warmup(&config);
+    }
 
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -815,6 +835,41 @@ mod tests {
         assert!(constant_time_eq("secret-token", "secret-token"));
         assert!(!constant_time_eq("secret-token", "secret"));
         assert!(!constant_time_eq("secret-token", "secret-token-longer"));
+    }
+
+    #[test]
+    fn stdio_startup_warmup_is_disabled_by_default() {
+        let config = ReinConfig::default();
+
+        assert!(!should_spawn_background_warmup(
+            &config,
+            StartupSurface::Stdio
+        ));
+        assert!(should_spawn_background_warmup(
+            &config,
+            StartupSurface::Http
+        ));
+    }
+
+    #[test]
+    fn stdio_startup_warmup_is_explicit_opt_in() {
+        let mut config = ReinConfig::default();
+        config.server.stdio_background_warmup = true;
+
+        assert!(should_spawn_background_warmup(
+            &config,
+            StartupSurface::Stdio
+        ));
+
+        config.server.background_warmup = false;
+        assert!(!should_spawn_background_warmup(
+            &config,
+            StartupSurface::Stdio
+        ));
+        assert!(!should_spawn_background_warmup(
+            &config,
+            StartupSurface::Http
+        ));
     }
 
     #[test]
