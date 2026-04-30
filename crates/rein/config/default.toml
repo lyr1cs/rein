@@ -82,6 +82,12 @@ signal_keywords = [
     "升级", "废弃", "流程", "发布",
 ]
 
+[hooks.codex]
+inject_prompt_context = false
+inject_session_context = false
+guardrails_enabled = true
+max_additional_context_chars = 4000
+
 [extract]
 provider = "google"
 inject_existing_context = false  # inject prior memory summaries into extraction prompts (opt-in)

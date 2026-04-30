@@ -11,7 +11,10 @@ pub use dedup::{
     check_dedup, containment_similarity, extract_keywords_from_text, jaccard_similarity,
     similarity, tokenize_for_fts, tokenize_for_search, topics_are_variants, DedupAction,
 };
-pub use hooks::{hook_compact, hook_post, hook_prompt, hook_stop};
+pub use hooks::{
+    hook_compact, hook_permission_request, hook_post, hook_pre_tool_use, hook_prompt,
+    hook_session_start, hook_stop,
+};
 #[cfg(feature = "test-support")]
 pub use llm::MockExtractor;
 pub use llm::{

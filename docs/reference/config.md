@@ -15,7 +15,7 @@ default TOML template is `crates/rein/config/default.toml`.
 | `[sync]` | Supermemory and auto-memory import settings. |
 | `[decay]` | Ebbinghaus-style decay constants, pruning threshold, and STM-to-LTM promotion count. |
 | `[server]` | HTTP/SSE bind, port, compact mode, GUI flag, loopback auth opt-in, and allowed hosts. |
-| `[hooks]` | Hook extraction thresholds, context window, buffer location, and signal keywords. |
+| `[hooks]`, `[hooks.codex]` | Hook extraction thresholds, context window, buffer location, signal keywords, and Codex hook policy. |
 | `[extract]`, `[extract.google]`, `[extract.omlx]` | LLM extraction provider, model, endpoint, prompt cap, and local thinking-mode toggle. |
 | `[query_expansion]`, provider subtables | Query expansion provider and maximum expansion count. |
 | `[proxy]` | Record-only proxy bind, upstreams, extraction thresholds, retry and buffer limits, and auth opt-in. |
@@ -58,6 +58,19 @@ ARS capabilities are opt-in by default:
 | `[ars.llm_judge].concept_summary_enabled` | `true` | Applies only after the master judge flag is enabled. |
 | `[ars.llm_judge].recall_ranking_enabled` | `false` | Deferred judge path. |
 | `[ars.llm_judge.nightly_cron].enabled` | `false` | Offline calibration cron is separately opt-in. |
+
+## Codex Hook Policy
+
+`rein init` installs Codex hook commands, but memory context injection is
+explicitly opt-in so fresh installs do not change Codex model context without an
+operator decision.
+
+| Setting | Default | Notes |
+|---|---:|---|
+| `[hooks.codex].inject_prompt_context` | `false` | When true, `UserPromptSubmit` emits bounded `additionalContext` selected from Rein's working set. |
+| `[hooks.codex].inject_session_context` | `false` | When true, `SessionStart` emits bounded project context from the always-on index, falling back to the working set. |
+| `[hooks.codex].guardrails_enabled` | `true` | Enables deny-only `PreToolUse` and `PermissionRequest` checks for obviously destructive shell commands. |
+| `[hooks.codex].max_additional_context_chars` | `4000` | Hard cap for any Codex `additionalContext` payload. Set `0` to disable context output even if injection flags are true. |
 
 ## Environment Variables
 

@@ -164,6 +164,40 @@ rein worker merge-refinement-queue
 Use `rein doctor` to inspect queue health, dead letters, provider readiness,
 database state, and side-index status.
 
+## Agent Hooks
+
+`rein init` configures supported MCP clients. For Codex CLI it also enables the
+Codex hook engine and installs `~/.codex/hooks.json` entries for:
+
+- `SessionStart` -> `REIN_AGENT_LABEL=codex rein hook session-start`
+- `PreToolUse` -> `REIN_AGENT_LABEL=codex rein hook pre`
+- `PermissionRequest` -> `REIN_AGENT_LABEL=codex rein hook permission`
+- `PostToolUse` -> `REIN_AGENT_LABEL=codex rein hook post`
+- `UserPromptSubmit` -> `REIN_AGENT_LABEL=codex rein hook prompt`
+- `Stop` -> `REIN_AGENT_LABEL=codex rein hook stop`
+
+Codex hook payloads are not identical to Claude Code payloads. Rein maps Codex
+fields such as `hook_event_name`, `tool_input`, `tool_response`, `prompt`,
+`last_assistant_message`, and `transcript_path`. `PostToolUse` and `Stop` feed
+the same extraction queue used by Claude Code hooks. `PreToolUse` and
+`PermissionRequest` are deny-only guardrail hooks for obviously destructive
+shell commands.
+
+Codex context injection is explicit opt-in:
+
+```toml
+[hooks.codex]
+inject_prompt_context = true
+inject_session_context = true
+max_additional_context_chars = 4000
+```
+
+When enabled, `SessionStart` emits bounded project context and
+`UserPromptSubmit` emits bounded relevant memory context using Codex's official
+`hookSpecificOutput.additionalContext` JSON shape. Hook diagnostics are written
+to stderr; stdout is kept empty unless Rein emits an official Codex hook JSON
+object.
+
 ## GUI Service Management
 
 The GUI requires a binary installed with `--features gui` and an HTTP token

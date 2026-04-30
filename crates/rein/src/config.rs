@@ -928,6 +928,8 @@ pub struct HooksConfig {
     pub context_before: usize,
     pub context_after: usize,
     pub max_items_per_session: usize,
+    #[serde(default)]
+    pub codex: CodexHooksConfig,
     #[serde(default = "default_signal_keywords")]
     pub signal_keywords: Vec<String>,
     #[serde(default = "default_buffer_dir")]
@@ -942,12 +944,39 @@ pub struct HooksConfig {
     pub buffer_flush_threshold: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexHooksConfig {
+    /// Add bounded Rein memory context to Codex UserPromptSubmit.
+    /// Default false because it changes model context.
+    #[serde(default)]
+    pub inject_prompt_context: bool,
+    /// Add bounded project context to Codex SessionStart.
+    /// Default false because it changes model context.
+    #[serde(default)]
+    pub inject_session_context: bool,
+    /// Enable conservative PreToolUse / PermissionRequest deny rules.
+    #[serde(default = "default_codex_guardrails_enabled")]
+    pub guardrails_enabled: bool,
+    /// Hard cap for injected additionalContext text.
+    #[serde(default = "default_codex_max_additional_context_chars")]
+    pub max_additional_context_chars: usize,
+}
+
 fn default_buffer_dir() -> String {
     "auto".to_string()
 }
 
 fn default_buffer_flush_threshold() -> usize {
     50000 // ~12K-25K tokens, triggers ~2-4 times in a long session
+}
+
+fn default_codex_guardrails_enabled() -> bool {
+    true
+}
+
+fn default_codex_max_additional_context_chars() -> usize {
+    4000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1260,9 +1289,21 @@ impl Default for HooksConfig {
             context_before: 3,
             context_after: 1,
             max_items_per_session: 10,
+            codex: CodexHooksConfig::default(),
             signal_keywords: default_signal_keywords(),
             buffer_dir: default_buffer_dir(),
             buffer_flush_threshold: default_buffer_flush_threshold(),
+        }
+    }
+}
+
+impl Default for CodexHooksConfig {
+    fn default() -> Self {
+        Self {
+            inject_prompt_context: false,
+            inject_session_context: false,
+            guardrails_enabled: default_codex_guardrails_enabled(),
+            max_additional_context_chars: default_codex_max_additional_context_chars(),
         }
     }
 }
@@ -2815,6 +2856,10 @@ mod tests {
         assert_eq!(cfg.embedding.provider, "google");
         assert_eq!(cfg.chunking.max_tokens, 512);
         assert!((cfg.decay.base_lambda - 0.06).abs() < f64::EPSILON);
+        assert!(!cfg.hooks.codex.inject_prompt_context);
+        assert!(!cfg.hooks.codex.inject_session_context);
+        assert!(cfg.hooks.codex.guardrails_enabled);
+        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 4000);
     }
 
     #[test]
@@ -2822,10 +2867,20 @@ mod tests {
         let toml_str = r#"
 [search]
 rrf_k = 30.0
+
+[hooks.codex]
+inject_prompt_context = true
+inject_session_context = true
+guardrails_enabled = false
+max_additional_context_chars = 1024
 "#;
         let cfg = ReinConfig::load_from_str(toml_str).unwrap();
         // Override applied
         assert!((cfg.search.rrf_k - 30.0).abs() < f64::EPSILON);
+        assert!(cfg.hooks.codex.inject_prompt_context);
+        assert!(cfg.hooks.codex.inject_session_context);
+        assert!(!cfg.hooks.codex.guardrails_enabled);
+        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 1024);
         // Other defaults preserved
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);

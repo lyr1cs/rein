@@ -1,4 +1,4 @@
-//! Payload parsing for Claude Code hook JSON formats.
+//! Payload parsing for Claude Code and Codex hook JSON formats.
 
 use regex::Regex;
 use std::collections::VecDeque;
@@ -178,6 +178,9 @@ pub fn extract_hook_text(input: &str) -> String {
         if let Some(output) = json.get("tool_output").and_then(|v| v.as_str()) {
             return output.to_string();
         }
+        if let Some(text) = extract_codex_hook_text(&json, false) {
+            return text;
+        }
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
             if let Some(reader) = open_transcript_reader(path, "extract_hook_text") {
                 return extract_transcript_text(reader);
@@ -200,6 +203,9 @@ pub fn extract_hook_text_for_llm(input: &str) -> String {
         if let Some(output) = json.get("tool_output").and_then(|v| v.as_str()) {
             return output.to_string();
         }
+        if let Some(text) = extract_codex_hook_text(&json, true) {
+            return text;
+        }
         if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
             if let Some(reader) = open_transcript_reader(path, "extract_hook_text_for_llm") {
                 return extract_transcript_text_for_llm(reader);
@@ -214,6 +220,128 @@ pub fn extract_hook_text_for_llm(input: &str) -> String {
         return String::new();
     }
     input.to_string()
+}
+
+fn extract_codex_hook_text(json: &serde_json::Value, prefer_transcript: bool) -> Option<String> {
+    let event = json.get("hook_event_name").and_then(|v| v.as_str())?;
+    match event {
+        "PreToolUse" | "PermissionRequest" | "PostToolUse" => codex_tool_hook_text(json, event),
+        "UserPromptSubmit" => non_empty_json_str(json, "prompt").map(str::to_string),
+        "Stop" => {
+            if prefer_transcript {
+                if let Some(text) = transcript_text_from_json(json, true) {
+                    return Some(text);
+                }
+            }
+            non_empty_json_str(json, "last_assistant_message")
+                .or_else(|| non_empty_json_str(json, "summary"))
+                .map(str::to_string)
+        }
+        "SessionStart" => None,
+        _ => None,
+    }
+}
+
+fn codex_tool_hook_text(json: &serde_json::Value, event: &str) -> Option<String> {
+    let mut parts = vec![format!("Codex {event}")];
+
+    if let Some(tool_name) = non_empty_json_str(json, "tool_name") {
+        parts.push(format!("Tool: {tool_name}"));
+    }
+
+    if let Some(input) = json.get("tool_input") {
+        let text = json_value_to_text(input);
+        if !text.trim().is_empty() {
+            parts.push(format!("Input:\n{text}"));
+        }
+    }
+
+    if let Some(response) = json.get("tool_response") {
+        let text = json_value_to_text(response);
+        if !text.trim().is_empty() {
+            parts.push(format!("Output:\n{text}"));
+        }
+    }
+
+    if parts.len() == 1 {
+        return None;
+    }
+    Some(redact_secrets(&parts.join("\n\n")))
+}
+
+fn transcript_text_from_json(json: &serde_json::Value, for_llm: bool) -> Option<String> {
+    let path = json.get("transcript_path").and_then(|v| v.as_str())?;
+    let reader = open_transcript_reader(
+        path,
+        if for_llm {
+            "extract_codex_hook_text_for_llm"
+        } else {
+            "extract_codex_hook_text"
+        },
+    )?;
+    let text = if for_llm {
+        extract_transcript_text_for_llm(reader)
+    } else {
+        extract_transcript_text(reader)
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn non_empty_json_str<'a>(json: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    json.get(key).and_then(|v| v.as_str()).and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn json_value_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(json_value_to_text)
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(map) => {
+            let preferred = [
+                "command",
+                "stdout",
+                "stderr",
+                "aggregated_output",
+                "output",
+                "content",
+                "text",
+                "message",
+                "error",
+                "exit_code",
+            ];
+            let mut parts = Vec::new();
+            for key in preferred {
+                if let Some(v) = map.get(key) {
+                    let text = json_value_to_text(v);
+                    if !text.trim().is_empty() {
+                        parts.push(format!("{key}: {text}"));
+                    }
+                }
+            }
+            if parts.is_empty() {
+                serde_json::to_string(value).unwrap_or_default()
+            } else {
+                parts.join("\n")
+            }
+        }
+    }
 }
 
 fn open_transcript_reader(path: &str, context: &str) -> Option<BufReader<std::fs::File>> {
@@ -534,5 +662,60 @@ mod tests {
         assert_eq!(extract_hook_text_for_llm(&payload), "fallback summary");
         assert_eq!(count_transcript_turns(&payload), 0);
         assert!(extract_hook_session_ingest(&payload).is_none());
+    }
+
+    #[test]
+    fn codex_post_tool_use_prefers_tool_response_over_transcript() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"old transcript"}}}}"#
+        )
+        .unwrap();
+
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "codex-session",
+            "turn_id": "codex-turn",
+            "cwd": "/tmp/project",
+            "model": "gpt-5.5",
+            "tool_name": "Bash",
+            "tool_input": { "command": "cargo test -p rein parsing" },
+            "tool_response": {
+                "stdout": "test result: ok",
+                "stderr": "warning: one warning",
+                "exit_code": 0
+            },
+            "transcript_path": path
+        })
+        .to_string();
+
+        let text = extract_hook_text(&payload);
+        assert!(text.contains("PostToolUse"));
+        assert!(text.contains("Bash"));
+        assert!(text.contains("cargo test -p rein parsing"));
+        assert!(text.contains("test result: ok"));
+        assert!(text.contains("warning: one warning"));
+        assert!(!text.contains("old transcript"));
+    }
+
+    #[test]
+    fn codex_stop_falls_back_to_last_assistant_message() {
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "codex-session",
+            "turn_id": "codex-turn",
+            "cwd": "/tmp/project",
+            "model": "gpt-5.5",
+            "last_assistant_message": "Implemented the requested hook diagnostics."
+        })
+        .to_string();
+
+        assert_eq!(
+            extract_hook_text_for_llm(&payload),
+            "Implemented the requested hook diagnostics."
+        );
     }
 }
