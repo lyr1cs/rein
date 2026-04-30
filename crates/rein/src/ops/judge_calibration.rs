@@ -1,6 +1,6 @@
 //! v0.27.1 E direction Layer 2 — nightly stricter offline calibration cron
 //! + `judge_calibration` M1 consumer + κ accumulator + drift alert
-//! + `bootstrap_priors_from_corpus` v0.28 stub.
+//! + `bootstrap_priors_from_corpus` v0.28 fixture bootstrap.
 //!
 //! Module owns three responsibilities:
 //!
@@ -24,10 +24,11 @@
 //!    filter, applied-prefix bump, replay-drain, CAS merge.
 //!
 //! 3. **`bootstrap_priors_from_corpus`** ([`bootstrap_priors_from_corpus`]):
-//!    v0.28 forward-compat hook (§16.2). Default-off returns
+//!    v0.28 fixture bootstrap (§16.2). Default-off returns
 //!    [`BootstrapPriors::const_defaults`] — pure const, no I/O, no LLM. When
-//!    `[ars.acceleration].enabled=true`, it may read a DB-scoped prior
-//!    snapshot before later corpus/replay slices are wired in.
+//!    `[ars.acceleration].enabled=true`, a valid DB-scoped prior snapshot wins;
+//!    otherwise an embedded S1 fixture corpus supplies explicit `signal_hint`
+//!    labels.
 //!
 //! ## Cron is emit-only (§7 step 5; Codex R6 P2)
 //!
@@ -77,31 +78,33 @@ pub const JUDGE_CALIBRATION_CONSUMER: &str = "judge_calibration";
 /// pathological upper-bound (50_000) — far above realistic per-pass volume.
 const PEEK_BATCH_LIMIT: usize = 50_000;
 
-// ── §16.2 v0.28 bootstrap_priors_from_corpus stub ────────────────────────────
+// ── §16.2 v0.28 bootstrap_priors_from_corpus ────────────────────────────────
 
 /// v0.28 entrypoint for offline Bayesian prior derivation from the fixture
-/// corpus + production replay events. v0.27.1 ships as a no-op stub returning
-/// hardcoded defaults — the call site exists so v0.28 implementation slots in
-/// without changing caller signatures.
+/// corpus + production replay events. S1 derives from a dedicated checked-in,
+/// compile-time embedded fixture corpus with explicit `signal_hint` labels;
+/// replay remains handled by [`bootstrap_priors_from_replay`].
 ///
-/// v0.28 will:
-/// 1. Load `crates/rein/tests/fixtures/recall_synthesis/*` + production
-///    replay events from `feedback_events` last 30d
-/// 2. Run multi-param logistic regression / Bayesian posterior inference on
+/// Current v0.28.0 ships the safe shadow foundation:
+/// 1. Snapshot precedence through a DB-scoped `bootstrap_priors.json`
+/// 2. Fixture bootstrap for deterministic cold-start priors
+/// 3. Separate bounded production replay via [`bootstrap_priors_from_replay`]
+///
+/// Later production activation can:
+/// 1. Run multi-param logistic regression / Bayesian posterior inference on
 ///    `signal_hint`-labeled events to estimate cluster-pooled priors for
 ///    W_VIEW / W_CLICK / W_THUMB / W_REQ / useful_rate threshold
-/// 3. Apply hierarchical shrinkage (S2 brainstorm: topic → cluster →
+/// 2. Apply hierarchical shrinkage (S2 brainstorm: topic → cluster →
 ///    memory) so cold clusters borrow same-topic prior
-/// 4. Write to DB-scoped
+/// 3. Write to DB-scoped
 ///    `<resolve_buffer_dir>/queue/<db_hash>/bootstrap_priors.json` snapshot —
 ///    adaptive engine reads on boot and uses as Bayesian prior; production
 ///    feedback updates the posterior
 ///
-/// **v0.28.0**: default config still performs no file I/O and no LLM calls.
+/// **v0.28.0 S1**: default config still performs no file I/O and no LLM calls.
 /// `[ars.acceleration].enabled=true` opts into reading a DB-scoped
-/// `bootstrap_priors.json` snapshot. Missing/corrupt snapshots fall back to
-/// const defaults through the finite-prior derivation path with an empty
-/// corpus until a later slice wires fixtures/replay into this helper.
+/// `bootstrap_priors.json` snapshot, then the embedded fixture corpus when no
+/// valid snapshot exists.
 pub fn bootstrap_priors_from_corpus(config: &ReinConfig) -> ReinResult<BootstrapPriors> {
     if !config.ars.acceleration.enabled {
         return Ok(BootstrapPriors::const_defaults());
@@ -109,7 +112,8 @@ pub fn bootstrap_priors_from_corpus(config: &ReinConfig) -> ReinResult<Bootstrap
     if let Some(priors) = load_bootstrap_priors_snapshot(config) {
         return Ok(priors);
     }
-    Ok(derive_priors_from_signal_hints(&[]))
+    let hints = load_signal_hints_from_fixture_corpus();
+    Ok(derive_priors_from_signal_hints(&hints))
 }
 
 /// Opt-in v0.28 replay bootstrap from already-durable runtime judge events.
@@ -141,8 +145,9 @@ pub fn bootstrap_priors_snapshot_path(config: &ReinConfig) -> PathBuf {
     db_scoped_queue_dir(config, true).join("bootstrap_priors.json")
 }
 
-/// Bootstrap priors snapshot. v0.27.1 = const defaults; v0.28+ = posterior-
-/// derived from corpus + production replay (see [`bootstrap_priors_from_corpus`]).
+/// Bootstrap priors snapshot. Default-off = const defaults; v0.28+ = posterior-
+/// derived from fixture corpus + production replay (see
+/// [`bootstrap_priors_from_corpus`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BootstrapPriors {
     pub w_view: f64,
@@ -152,13 +157,13 @@ pub struct BootstrapPriors {
     pub useful_rate_threshold: f64,
     pub weight_decay_rate: f64,
     /// Confidence in this prior (Bayesian: pseudo-observation count).
-    /// v0.27.1 stub returns 0.0 (no production-derived prior).
+    /// Default-off returns 0.0 (no production-derived prior).
     pub prior_confidence: f64,
 }
 
 impl BootstrapPriors {
-    /// v0.27.1 hardcoded defaults. v0.28 replaces with corpus-derived
-    /// posterior. Caller never branches on which path produced these.
+    /// Hardcoded defaults used when acceleration is off or no usable bootstrap
+    /// labels exist. Caller never branches on which path produced these.
     pub fn const_defaults() -> Self {
         Self {
             w_view: 1.0,
@@ -257,6 +262,33 @@ fn load_signal_hints_from_feedback_events(
         }
     }
     Ok(hints)
+}
+
+fn load_signal_hints_from_fixture_corpus() -> Vec<SignalHint> {
+    const ARS_BOOTSTRAP_SIGNAL_HINTS_JSON: &str =
+        include_str!("../../tests/fixtures/ars_bootstrap/signal_hints.json");
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(ARS_BOOTSTRAP_SIGNAL_HINTS_JSON)
+    else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|row| signal_hint_from_fixture_row(row.get("signal_hint")?))
+        .collect()
+}
+
+fn signal_hint_from_fixture_row(value: &serde_json::Value) -> Option<SignalHint> {
+    let object = value.as_object()?;
+    Some(SignalHint {
+        inferred_w_view: json_field_as_f64(object.get("inferred_w_view")),
+        inferred_w_click: json_field_as_f64(object.get("inferred_w_click")),
+        inferred_w_thumb: json_field_as_f64(object.get("inferred_w_thumb")),
+        inferred_w_req: json_field_as_f64(object.get("inferred_w_req")),
+        useful_rate_ci_width: json_field_as_f64(object.get("useful_rate_ci_width")),
+    })
+}
+
+fn json_field_as_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(serde_json::Value::as_f64)
 }
 
 fn load_bootstrap_priors_snapshot(config: &ReinConfig) -> Option<BootstrapPriors> {
@@ -1797,24 +1829,39 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_stub_returns_const_defaults() {
-        // §16.2 contract — v0.27.1 stub MUST return BootstrapPriors::const_defaults
-        // bit-for-bit. Caller cannot branch on which path produced these.
+    fn bootstrap_priors_default_off_returns_const_defaults() {
+        // §16.2 contract — default-off MUST return BootstrapPriors::const_defaults
+        // bit-for-bit without reading snapshots or fixture corpus.
         let config = crate::config::ReinConfig::default();
-        let priors = bootstrap_priors_from_corpus(&config).expect("stub never errors");
+        let priors = bootstrap_priors_from_corpus(&config).expect("default-off never errors");
         let defaults = BootstrapPriors::const_defaults();
         assert_eq!(priors, defaults);
         assert_eq!(priors.prior_confidence, 0.0);
     }
 
     #[test]
-    fn bootstrap_priors_enabled_without_corpus_returns_const_defaults() {
+    fn bootstrap_priors_enabled_derives_from_fixture_signal_hints() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = crate::config::ReinConfig::default();
         config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
 
-        let priors = bootstrap_priors_from_corpus(&config).expect("empty corpus never errors");
+        let priors = bootstrap_priors_from_corpus(&config).expect("fixture corpus path");
 
-        assert_eq!(priors, BootstrapPriors::const_defaults());
+        assert!((priors.w_view - 1.7).abs() < 1e-12, "got {priors:?}");
+        assert!((priors.w_click - 2.1).abs() < 1e-12, "got {priors:?}");
+        assert!((priors.w_thumb - 2.8).abs() < 1e-12, "got {priors:?}");
+        assert!((priors.w_req - 1.1).abs() < 1e-12, "got {priors:?}");
+        assert!(
+            (priors.useful_rate_threshold - 0.46).abs() < 1e-12,
+            "got {priors:?}"
+        );
+        assert_eq!(priors.prior_confidence, 2.0);
+        assert!(
+            !tmp.path().join("buffers").exists(),
+            "fixture bootstrap must not create queue/snapshot directories"
+        );
     }
 
     #[test]
@@ -1834,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_enabled_missing_snapshot_does_not_create_snapshot_dir() {
+    fn bootstrap_priors_enabled_missing_snapshot_reads_fixture_without_creating_snapshot_dir() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = crate::config::ReinConfig::default();
         config.ars.acceleration.enabled = true;
@@ -1843,7 +1890,7 @@ mod tests {
 
         let priors = bootstrap_priors_from_corpus(&config).expect("missing snapshot falls back");
 
-        assert_eq!(priors, BootstrapPriors::const_defaults());
+        assert_ne!(priors, BootstrapPriors::const_defaults());
         assert!(
             !tmp.path().join("buffers").exists(),
             "missing snapshot read path must not create queue/snapshot directories"
@@ -1878,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_ignores_corrupt_snapshot() {
+    fn bootstrap_priors_ignores_corrupt_snapshot_and_reads_fixture() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = crate::config::ReinConfig::default();
         config.ars.acceleration.enabled = true;
@@ -1888,7 +1935,7 @@ mod tests {
 
         let priors = bootstrap_priors_from_corpus(&config).expect("corrupt snapshot falls back");
 
-        assert_eq!(priors, BootstrapPriors::const_defaults());
+        assert_ne!(priors, BootstrapPriors::const_defaults());
     }
 
     #[test]

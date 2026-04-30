@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.27.6`** (2026-04-30) — Codex hook parity + deployment hardening. Adds six-hook Codex coverage, `SessionStart` / `UserPromptSubmit` `additionalContext` injection, conservative `PreToolUse` / `PermissionRequest` guardrails, and `rein init` / `rein doctor` validation for the full hook set. Released and deployed locally plus Mac mini. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.27.6 progression.
+**Current release: `v0.28.0`** (2026-04-30) — default-off, shadow-only ARS acceleration groundwork. Adds `[ars.acceleration]` with `enabled = false` by default and enforced `shadow_only = true`, plus `/api/adaptive` shadow fusion replay observability. Production recall fusion and ARS synthesis behavior remain on the existing path; production acceleration is deferred. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.0 progression.
 
 For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
 
@@ -377,10 +377,11 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.27.6 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+The v0.21 → v0.28.0 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | Default-off, shadow-only acceleration controller. `[ars.acceleration].enabled = false` by default; `shadow_only = true` is enforced and non-shadow mode is rejected in v0.28.x. `/api/adaptive` exposes `ars_acceleration.shadow_fusion_replay` with bounded `enabled`, `shadow_only`, `status`, `replay_limit`, `eligible_samples`, `min_samples`, `global`, `by_query_type`, and `by_cluster` preview fields. Production recall scoring and ARS behavior are unchanged; production activation is deferred. |
 | **v0.27.6** (2026-04-30) | Codex hook parity + deployment hardening | Adds Codex `session-start`, `pre`, and `permission` hook commands alongside existing `post`, `compact`, `prompt`, and `stop`; emits official `hookSpecificOutput.additionalContext` for opted-in session/prompt context; applies conservative deny-only shell guardrails; teaches `rein init` and `rein doctor` to configure and validate all six Codex events. Deployed to Mac mini with launchd `zsh -l -c` wrappers and Homebrew Rust toolchain. |
 | **v0.27.5** (2026-04-29) | R10-residual cleanup | Cold archive too-large backoff (`last_too_large_at` + claim_batch ORDER BY); Cap A 4096-bucket LRU eviction; cron `cron_claims` pre-LLM dedup with claim_token ownership + 5-min stale takeover + post-claim TOCTOU re-check + post-emit-crash reaper. **10 codex review rounds saturated (R6 + R10 fully clean).** 1035 lib tests / 0 clippy / 0 fmt. |
 | **v0.27.4** (2026-04-29) | audit-team remediation | 5-agent disjoint-slice fan-out closed 1 CRIT + 8 HIGH + 9 MED + 5 LOW from a v0.27.3 audit, then 10 codex rounds drove P1 to 0. Headline: **C1** `[server,proxy].allow_unauthenticated_loopback` default flipped `true → false`; **E2** M5 strip post-COMMIT side-index discipline; **D1+D2** SHA-256-prefix synthetic `cluster_id` for Cap A bucket alignment. 1265 tests. |
@@ -397,7 +398,7 @@ The v0.21 → v0.27.6 arc rebuilt rein around three axes: a unified operation re
 | **v0.22.0** (2026-04-22) | KG pool + service wiring + try_get fast-path | 675 tests / 7 codex audit rounds. |
 | **v0.21.0** (2026-04-20) | A1 Operation Registry | `#[op]` proc-macro: each operation authored **once** in source, dispatched via `inventory` to thin CLI / MCP / REST adapters. Eliminated three parallel hand-maintained registries. 625 tests. |
 
-All ARS features (`[ars].concept_summary_enabled`, `recall_synthesis_enabled`, `archive_summary_enabled`, `[ars.llm_judge].enabled`, `[resummerize].enabled`) ship **opt-in / default-off**. Operators get zero new disk activity until they explicitly turn a capability on.
+All ARS features (`[ars].concept_summary_enabled`, `recall_synthesis_enabled`, `cold_archive_enabled`, `[ars.llm_judge].enabled`, `[ars.acceleration].enabled`, `[resummerize].enabled`) ship **opt-in / default-off**. Operators get zero new disk activity until they explicitly turn a capability on.
 
 ### Architecture Diagrams
 
@@ -1033,7 +1034,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.27.6`**（2026-04-30）— Codex hook parity + 部署加固。新增完整 Codex hook 覆盖、`SessionStart` / `UserPromptSubmit` `additionalContext` 注入、保守的 `PreToolUse` / `PermissionRequest` guardrails，以及 `rein init` / `rein doctor` 六 hook 校验。已在本机和 Mac mini 部署。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.28.0`**（2026-04-30）— 默认关闭、仅 shadow 的 ARS acceleration groundwork。新增 `[ars.acceleration]`，默认 `enabled = false`，并强制 `shadow_only = true`；`/api/adaptive` 增加 shadow fusion replay 可观测面。生产 recall fusion 和 ARS synthesis 行为仍走既有路径；生产加速激活延后。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1583,10 +1584,11 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.27.6 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+v0.21 → v0.28.0 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | 默认关闭、仅 shadow 的 acceleration controller。`[ars.acceleration].enabled = false`，`shadow_only = true` 被强制，v0.28.x 拒绝 non-shadow mode。`/api/adaptive` 暴露 `ars_acceleration.shadow_fusion_replay`，字段范围固定为 `enabled`、`shadow_only`、`status`、`replay_limit`、`eligible_samples`、`min_samples`、`global`、`by_query_type`、`by_cluster` 等预览数据。生产 recall scoring 和 ARS 行为不变；生产激活延后。 |
 | **v0.27.6** (2026-04-30) | Codex hook parity + 部署加固 | 新增 Codex `session-start`、`pre`、`permission` hook 命令，补齐既有 `post`、`compact`、`prompt`、`stop`；为 opt-in 的 session/prompt context 输出官方 `hookSpecificOutput.additionalContext`；加入保守 deny-only shell guardrails；`rein init` / `rein doctor` 可配置并校验六个 Codex 事件。Mac mini 部署已切到 launchd `zsh -l -c` wrapper，并补齐 Homebrew Rust toolchain。 |
 | **v0.27.5** (2026-04-29) | R10-residual 清理 | Cold archive 太大行 backoff（`last_too_large_at` + claim_batch ORDER BY）；Cap A 4096-bucket LRU 驱逐；cron `cron_claims` pre-LLM 去重，含 claim_token 所有权 + 5 分钟 stale 接管 + post-claim TOCTOU 复检 + post-emit-crash 清理。**10 轮 codex review 收敛（R6 + R10 全清）**。1035 lib tests。 |
 | **v0.27.4** (2026-04-29) | agent-team 修复 | 5 agent 分片 fan-out 修 v0.27.3 audit (1 CRIT + 8 HIGH + 9 MED + 5 LOW)，再跑 10 轮 codex 把 P1 打到 0。**C1** 默认 deny-loopback；**E2** M5 strip post-COMMIT 边索引纪律；**D1+D2** SHA-256 prefix 合成 `cluster_id` 修 Cap A bucket 对齐。1265 tests。 |
@@ -1603,7 +1605,7 @@ v0.21 → v0.27.6 这一段重构围绕三条主线：统一 operation registry�
 | **v0.22.0** (2026-04-22) | KG pool + service 接线 + try_get fast-path | 675 tests / 7 轮 codex audit。 |
 | **v0.21.0** (2026-04-20) | A1 Operation Registry | `#[op]` proc-macro：每个操作在源码里**只写一次**，通过 `inventory` 派发到三个薄 CLI / MCP / REST 适配器。消灭三套手工维护的并行注册表。625 tests。 |
 
-所有 ARS 特性（`[ars].concept_summary_enabled`、`recall_synthesis_enabled`、`archive_summary_enabled`、`[ars.llm_judge].enabled`、`[resummerize].enabled`）默认**全部 opt-in / off**。operator 不显式打开就零新增磁盘活动。
+所有 ARS 特性（`[ars].concept_summary_enabled`、`recall_synthesis_enabled`、`cold_archive_enabled`、`[ars.llm_judge].enabled`、`[ars.acceleration].enabled`、`[resummerize].enabled`）默认**全部 opt-in / off**。operator 不显式打开就零新增磁盘活动。
 
 ### 自适应引擎 (v0.6.0+)
 

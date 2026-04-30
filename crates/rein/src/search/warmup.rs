@@ -8,6 +8,21 @@ use crate::store::SqliteStore;
 use crate::types::Embedder as _;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TantivyRebuildOutcome {
+    SkippedInMemory,
+    Rebuilt { indexed: usize, errors: usize },
+    AlreadyRunning { lock_path: PathBuf },
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TantivyRebuildState {
+    Idle,
+    Running,
+    StaleMarker,
+}
+
 /// Warm up the embedding cache by pre-computing embeddings for uncached memories.
 /// Returns (cached_count, error_count).
 pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) {
@@ -212,17 +227,33 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
 /// Clears the existing index first to remove stale entries.
 /// Uses a file lock to prevent concurrent rebuilds across processes.
 pub fn populate_tantivy(store: &SqliteStore) {
+    let _ = try_populate_tantivy(store);
+}
+
+/// Populate the Tantivy FTS index and report whether this process owned the rebuild.
+pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
     let db_path = store.db_path();
     if db_path.to_str() == Some(":memory:") {
-        return;
+        return TantivyRebuildOutcome::SkippedInMemory;
     }
     let tantivy_path = db_path.with_extension("tantivy");
-    let lock_path = db_path.with_extension("tantivy.rebuild.lock");
+    let lock_path = tantivy_rebuild_lock_path(db_path);
+    let rebuilding_path = tantivy_rebuilding_path(db_path);
 
     // Acquire exclusive file lock — skip if another process is rebuilding.
-    let lock_file = match std::fs::File::create(&lock_path) {
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
         Ok(f) => f,
-        Err(_) => return,
+        Err(e) => {
+            return TantivyRebuildOutcome::Failed {
+                reason: format!("failed to open rebuild lock {}: {e}", lock_path.display()),
+            }
+        }
     };
     #[cfg(unix)]
     {
@@ -231,18 +262,45 @@ pub fn populate_tantivy(store: &SqliteStore) {
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if ret != 0 {
             tracing::debug!("tantivy: another process is rebuilding, skipping");
-            return;
+            return TantivyRebuildOutcome::AlreadyRunning { lock_path };
         }
     }
 
+    if let Err(e) = std::fs::write(&rebuilding_path, b"rebuilding") {
+        unlock_tantivy_rebuild_lock(&lock_file);
+        return TantivyRebuildOutcome::Failed {
+            reason: format!(
+                "failed to write rebuild marker {}: {e}",
+                rebuilding_path.display()
+            ),
+        };
+    }
+
     // Clear stale index before rebuilding
-    let _ = std::fs::remove_dir_all(&tantivy_path);
+    if let Err(e) = std::fs::remove_dir_all(&tantivy_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            mark_tantivy_dirty(db_path);
+            let _ = std::fs::remove_file(&rebuilding_path);
+            unlock_tantivy_rebuild_lock(&lock_file);
+            return TantivyRebuildOutcome::Failed {
+                reason: format!(
+                    "failed to clear stale index {}: {e}",
+                    tantivy_path.display()
+                ),
+            };
+        }
+    }
 
     let tantivy = match crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("tantivy: failed to open index: {e}");
-            return;
+            mark_tantivy_dirty(db_path);
+            let _ = std::fs::remove_file(&rebuilding_path);
+            unlock_tantivy_rebuild_lock(&lock_file);
+            return TantivyRebuildOutcome::Failed {
+                reason: format!("failed to open index {}: {e}", tantivy_path.display()),
+            };
         }
     };
 
@@ -250,7 +308,12 @@ pub fn populate_tantivy(store: &SqliteStore) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("tantivy: failed to list memories: {e}");
-            return;
+            mark_tantivy_dirty(db_path);
+            let _ = std::fs::remove_file(&rebuilding_path);
+            unlock_tantivy_rebuild_lock(&lock_file);
+            return TantivyRebuildOutcome::Failed {
+                reason: format!("failed to list memories: {e}"),
+            };
         }
     };
 
@@ -258,7 +321,7 @@ pub fn populate_tantivy(store: &SqliteStore) {
     let mut errors = 0usize;
     for (id, topic, summary, content, keywords) in &memories {
         if tantivy
-            .insert(id, topic, summary, content, keywords)
+            .insert_strict(id, topic, summary, content, keywords)
             .is_ok()
         {
             indexed += 1;
@@ -271,21 +334,186 @@ pub fn populate_tantivy(store: &SqliteStore) {
         tracing::info!("tantivy: indexed {indexed} documents ({errors} errors)");
     }
 
-    // Only clear dirty marker if rebuild succeeded with actual data, or there are truly no memories
-    if errors == 0 && (indexed > 0 || memories.is_empty()) {
-        let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
-    } else if indexed == 0 && !memories.is_empty() {
-        tracing::debug!(
-            "tantivy: {} memories but 0 indexed, keeping dirty marker",
-            memories.len()
-        );
-    }
+    finish_tantivy_rebuild_markers(db_path, indexed, errors, memories.is_empty());
 
     // Lock released when lock_file is dropped.
+    let _ = std::fs::remove_file(&rebuilding_path);
+    unlock_tantivy_rebuild_lock(&lock_file);
     drop(lock_file);
-    let _ = std::fs::remove_file(&lock_path);
+    TantivyRebuildOutcome::Rebuilt { indexed, errors }
 }
 
 pub fn tantivy_dirty_path(db_path: &Path) -> PathBuf {
     db_path.with_extension("tantivy").join(".dirty")
+}
+
+pub fn tantivy_rebuild_lock_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("tantivy.rebuild.lock")
+}
+
+pub fn tantivy_rebuilding_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("tantivy.rebuilding")
+}
+
+pub fn tantivy_rebuild_state(db_path: &Path) -> TantivyRebuildState {
+    let marker_exists = tantivy_rebuilding_path(db_path).exists();
+    let lock_path = tantivy_rebuild_lock_path(db_path);
+    if lock_path.exists() && tantivy_rebuild_lock_is_held(&lock_path) {
+        TantivyRebuildState::Running
+    } else if marker_exists {
+        TantivyRebuildState::StaleMarker
+    } else {
+        TantivyRebuildState::Idle
+    }
+}
+
+fn mark_tantivy_dirty(db_path: &Path) {
+    let dirty_path = tantivy_dirty_path(db_path);
+    if let Some(parent) = dirty_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(dirty_path, b"dirty");
+}
+
+fn finish_tantivy_rebuild_markers(
+    db_path: &Path,
+    indexed: usize,
+    errors: usize,
+    memories_empty: bool,
+) {
+    // Only clear dirty marker if rebuild succeeded with actual data, or there
+    // are truly no memories. Any partial error must keep the marker so a later
+    // repair can pick up missing documents.
+    if errors == 0 && (indexed > 0 || memories_empty) {
+        let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
+    } else {
+        mark_tantivy_dirty(db_path);
+        if indexed == 0 && !memories_empty {
+            tracing::debug!("tantivy: non-empty store but 0 indexed, keeping dirty marker");
+        }
+    }
+}
+
+fn tantivy_rebuild_lock_is_held(lock_path: &Path) -> bool {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            return true;
+        }
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+
+    false
+}
+
+fn unlock_tantivy_rebuild_lock(lock_file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+
+    fn test_store() -> (tempfile::TempDir, SqliteStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = SqliteStore::new(&db_path, "text-embedding-3-small", 3072).unwrap();
+        (dir, store)
+    }
+
+    #[cfg(unix)]
+    fn hold_file_lock(path: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test failed to acquire advisory lock");
+        file
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn try_populate_tantivy_reports_already_running_when_rebuild_lock_held() {
+        let (_dir, store) = test_store();
+        let dirty = tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(dirty.parent().unwrap()).unwrap();
+        std::fs::write(&dirty, b"dirty").unwrap();
+        let lock_path = tantivy_rebuild_lock_path(store.db_path());
+        let _lock = hold_file_lock(&lock_path);
+
+        let outcome = try_populate_tantivy(&store);
+
+        assert_eq!(
+            outcome,
+            TantivyRebuildOutcome::AlreadyRunning {
+                lock_path: lock_path.clone()
+            }
+        );
+        assert!(
+            dirty.exists(),
+            "dirty marker must remain for the active owner"
+        );
+    }
+
+    #[test]
+    fn try_populate_tantivy_clears_dirty_and_rebuilding_marker_on_success() {
+        let (_dir, store) = test_store();
+        let dirty = tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(dirty.parent().unwrap()).unwrap();
+        std::fs::write(&dirty, b"dirty").unwrap();
+        let rebuilding = tantivy_rebuilding_path(store.db_path());
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        let outcome = try_populate_tantivy(&store);
+
+        assert_eq!(
+            outcome,
+            TantivyRebuildOutcome::Rebuilt {
+                indexed: 0,
+                errors: 0
+            }
+        );
+        assert!(!dirty.exists(), "clean rebuild should clear dirty marker");
+        assert!(
+            !rebuilding.exists(),
+            "successful rebuild should clear external rebuilding marker"
+        );
+    }
+
+    #[test]
+    fn finish_tantivy_rebuild_marks_dirty_after_partial_errors() {
+        let (_dir, store) = test_store();
+        let dirty = tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(dirty.parent().unwrap()).unwrap();
+        assert!(!dirty.exists());
+
+        finish_tantivy_rebuild_markers(store.db_path(), 1, 1, false);
+
+        assert!(
+            dirty.exists(),
+            "partial rebuild errors must keep Tantivy dirty for repair"
+        );
+    }
 }

@@ -134,12 +134,44 @@ impl TantivyFts {
         content: &str,
         keywords: &str,
     ) -> Result<(), tantivy::TantivyError> {
+        self.insert_with_lock_policy(id, topic, summary, content, keywords, true)
+    }
+
+    /// Index a memory document during a full rebuild.
+    ///
+    /// Unlike hot-path `insert`, writer-lock contention is returned as an
+    /// error so rebuild accounting does not count skipped documents as indexed.
+    pub fn insert_strict(
+        &self,
+        id: &str,
+        topic: &str,
+        summary: &str,
+        content: &str,
+        keywords: &str,
+    ) -> Result<(), tantivy::TantivyError> {
+        self.insert_with_lock_policy(id, topic, summary, content, keywords, false)
+    }
+
+    fn insert_with_lock_policy(
+        &self,
+        id: &str,
+        topic: &str,
+        summary: &str,
+        content: &str,
+        keywords: &str,
+        mark_dirty_on_lock: bool,
+    ) -> Result<(), tantivy::TantivyError> {
         let mut writer: IndexWriter = match self.index.writer(15_000_000) {
             Ok(w) => w,
-            Err(tantivy::TantivyError::LockFailure(..)) => {
-                self.mark_dirty();
-                tracing::debug!("tantivy writer locked by another process, marking index dirty");
-                return Ok(());
+            Err(e @ tantivy::TantivyError::LockFailure(..)) => {
+                if mark_dirty_on_lock {
+                    self.mark_dirty();
+                    tracing::debug!(
+                        "tantivy writer locked by another process, marking index dirty"
+                    );
+                    return Ok(());
+                }
+                return Err(e);
             }
             Err(e) => return Err(e),
         };
