@@ -40,10 +40,10 @@ Counterfactual alpha learning still optimizes a single CC alpha, but candidate s
 High-evidence accessed events also receive higher event weight.
 
 Shadow ARS acceleration also replays six-dimensional fusion weights over
-BM25/vector/KG/episode/support/diversity signals. v0.28.3 evaluates one-hot
-dimensions, deterministic pairwise simplex blends, accessed centroids, and
-accessed-vs-other feature gaps, then averages tied winners before applying the
-normal parent-prior shrinkage.
+BM25/vector/KG/episode/support/diversity signals. v0.28.4 evaluates one-hot
+dimensions, deterministic pairwise simplex blends, accessed centroids,
+accessed-vs-other feature gaps, and bounded GP+EI-style proposals, then
+averages tied winners before applying the normal parent-prior shrinkage.
 
 ## ARS scalar policy
 
@@ -52,6 +52,20 @@ When `[ars.acceleration]` is explicitly in canary mode and
 useful-rate thresholds, LLM judge sample rates, and LLM judge weight decay can
 move from static config toward calibrated feedback. Missing policy, drift
 alerts, or insufficient calibration keep the static values.
+
+SignalHint/bootstrap priors also feed the production useful-rate formulas under
+the same canary gate. The last effective scalar values are persisted in the
+adaptive snapshot so each slow-channel pass applies bounded max-step smoothing
+instead of jumping directly from static defaults.
+
+## ARS release/eval gate
+
+`rein ars-acceleration-gate`, `rein_ars_acceleration_gate`, and
+`GET /api/ars-acceleration-gate` expose a pure report over the existing ARS
+signals. The report answers whether the current explicit canary is allowed and
+why default-on remains blocked. It is observational only: it does not refresh
+`ars_parameter_policy`, set `shadow_only = false`, change defaults, or commit
+adaptive offsets.
 
 ## Admission and promotion
 

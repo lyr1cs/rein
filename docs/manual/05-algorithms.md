@@ -631,7 +631,7 @@ The runtime judge added in v0.27 is an optional feedback source for synthesis
 and concept-summary quality. It enqueues and consumes LLM judge events when the
 feature is enabled, compares runtime and offline judge streams for calibration,
 and feeds useful-rate style aggregates. It does not replace the durable memory
-model or make dedup decisions by itself. In v0.28.3, shadow judge jobs may carry
+model or make dedup decisions by itself. In v0.28.4, shadow judge jobs may carry
 bounded `signal_hint` evidence derived from already-recorded interaction stats;
 the hint does not create extra LLM calls or bypass the normal policy gates.
 

@@ -690,13 +690,19 @@ fn api_judge_calibration(config: &ReinConfig) -> BoxedResponse {
     let body = json!({
         "kappa": cal.kappa,
         "runtime_vs_offline_kappa": cal.runtime_vs_offline_kappa,
+        "runtime_vs_offline_kappa_synthesis": cal.runtime_vs_offline_kappa_synthesis,
+        "runtime_vs_offline_kappa_concept": cal.runtime_vs_offline_kappa_concept,
         "judge_drift_alert": cal.judge_drift_alert,
+        "judge_drift_alert_synthesis": cal.judge_drift_alert_synthesis,
+        "judge_drift_alert_concept": cal.judge_drift_alert_concept,
         "total_offline_cron_events": cal.total_offline_cron_events,
         "last_consumed_event_id_calibration": cal.last_consumed_event_id_calibration,
         "last_computed_at": cal.last_computed_at,
         "recent_pairs_synthesis_count": cal.recent_pairs_synthesis.len(),
         "recent_pairs_concept_count": cal.recent_pairs_concept.len(),
         "recent_pairs_runtime_vs_offline_count": cal.recent_pairs_runtime_vs_offline.len(),
+        "recent_pairs_runtime_vs_offline_synthesis_count": cal.recent_pairs_runtime_vs_offline_synthesis.len(),
+        "recent_pairs_runtime_vs_offline_concept_count": cal.recent_pairs_runtime_vs_offline_concept.len(),
     });
     json_response(StatusCode::OK, body)
 }

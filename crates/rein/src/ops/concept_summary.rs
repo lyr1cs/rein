@@ -763,13 +763,23 @@ pub fn effective_concept_summary_gate_parameters(
     ars_parameter_policy_canary: bool,
 ) -> (u64, f64) {
     let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
-    let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n(
+    let previous_cold_start = adaptive_state.and_then(|state| {
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N)
+    });
+    let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.concept_summary_cold_start_n,
         calibration,
         ars_parameter_policy_canary,
+        previous_cold_start,
     );
+    let previous_threshold = adaptive_state.and_then(|state| {
+        state.ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        )
+    });
+    let static_threshold = previous_threshold.unwrap_or(CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
     let Some(cid) = cluster_id else {
-        return (cold_start_n, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
+        return (cold_start_n, static_threshold);
     };
     let bucket = adaptive_state
         .and_then(|state| state.concept_summary_feedback_stats.as_ref())
@@ -779,20 +789,22 @@ pub fn effective_concept_summary_gate_parameters(
                 .get(&concept_summary_bucket_key(Some(cid), query_type))
         });
     let Some(bucket) = bucket else {
-        return (cold_start_n, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
+        return (cold_start_n, static_threshold);
     };
     let human_count = bucket
         .viewed_count
         .saturating_add(bucket.explicit_up)
         .saturating_add(bucket.explicit_down);
-    let useful_rate_threshold = crate::ops::ars_tuning::effective_useful_rate_threshold(
-        CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
-        bucket.useful_rate,
-        human_count,
-        bucket.llm_judge_count,
-        calibration,
-        ars_parameter_policy_canary,
-    );
+    let useful_rate_threshold =
+        crate::ops::ars_tuning::effective_useful_rate_threshold_with_previous(
+            static_threshold,
+            bucket.useful_rate,
+            human_count,
+            bucket.llm_judge_count,
+            calibration,
+            ars_parameter_policy_canary,
+            previous_threshold,
+        );
     (cold_start_n, useful_rate_threshold)
 }
 
@@ -975,21 +987,10 @@ fn enqueue_judge_for_concept_summary(
     let synthetic_cid = synthetic_cluster_id_for_concept(concept_id);
     let routing_query_type = CONCEPT_SUMMARY_QUERY_TYPE_REFRESH;
 
-    // Codex R7+R8 P2 fix — same combined-cap truncation as
-    // recall_synthesis (see that function for the algorithm + rationale).
-    use crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS;
-    const CANDIDATE_RESERVE_MAX: usize = 4_096;
-    const PROMPT_FLOOR: usize = 1_024;
-    let candidate_capped: String = candidate
-        .chars()
-        .take(CANDIDATE_RESERVE_MAX.min(JUDGE_MAX_INPUT_CHARS / 4))
-        .collect();
-    let joiner_overhead = "\n\nCandidate:\n".len();
-    let prompt_budget = JUDGE_MAX_INPUT_CHARS
-        .saturating_sub(candidate_capped.chars().count())
-        .saturating_sub(joiner_overhead)
-        .max(PROMPT_FLOOR);
-    let prompt_truncated: String = prompt.chars().take(prompt_budget).collect();
+    // Same resolved-cap truncation as recall_synthesis. This runs before
+    // stamp_hash so the hash describes the exact bytes the worker judges.
+    let (prompt_truncated, candidate_capped) =
+        crate::ops::llm_judge_worker::truncate_judge_inputs_for_config(config, prompt, candidate);
     let prompt = prompt_truncated.as_str();
     let candidate = candidate_capped.as_str();
 
@@ -1036,17 +1037,21 @@ fn enqueue_judge_for_concept_summary(
     // accumulate. Pre-v0.27.4 this looked up `(None, "unknown")`, which
     // was where ZERO Cap A judge events ever landed.
     let calibration = adaptive_state.judge_calibration_state.as_ref();
-    let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate(
+    let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
         ars_parameter_policy_canary,
         true,
+        adaptive_state
+            .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
     );
-    let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate(
+    let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
         calibration,
         ars_parameter_policy_canary,
         false,
+        adaptive_state
+            .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
     )
     .min(cold_rate);
     let rate = current_sample_rate_concept_summary_with_rates(
@@ -1699,7 +1704,60 @@ mod tests {
             parsed.get("query_type").and_then(|v| v.as_str()),
             Some(CONCEPT_SUMMARY_QUERY_TYPE_REFRESH),
             "cache query_type must equal CONCEPT_SUMMARY_QUERY_TYPE_REFRESH sentinel; \
-             got {parsed}",
+            got {parsed}",
+        );
+    }
+
+    #[test]
+    fn enqueue_judge_for_concept_summary_honors_resolved_llm_judge_input_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ReinConfig::default();
+        config.hooks.buffer_dir = dir.path().to_string_lossy().to_string();
+        config.database.path = dir.path().join("test.db").to_string_lossy().to_string();
+        config.llm.provider = "google".to_string();
+        config.llm.google.model = Some("gemini-test".to_string());
+        config.llm.google.max_input_chars = Some(128);
+        config.ars.llm_judge.sample_rate_cold_start = 0.0;
+        config.ars.llm_judge.sample_rate_warm = 0.0;
+        config.ars.llm_judge.nightly_cron.enabled = false;
+
+        let prompt = "p".repeat(300);
+        let candidate = "c".repeat(300);
+        enqueue_judge_for_concept_summary(
+            &config,
+            &AdaptiveState::default(),
+            "cs_cap_test",
+            "concept-cap-test",
+            &prompt,
+            &candidate,
+            false,
+        );
+
+        let cache_path =
+            crate::ops::handlers::judge::concept_summary_cache_path_for_config(&config);
+        let body = std::fs::read_to_string(&cache_path)
+            .expect("cache file written by enqueue_judge_for_concept_summary");
+        let parsed: serde_json::Value =
+            serde_json::from_str(body.lines().next().expect("cache line")).unwrap();
+        let stored_prompt = parsed.get("prompt").and_then(|v| v.as_str()).unwrap();
+        let stored_candidate = parsed.get("candidate").and_then(|v| v.as_str()).unwrap();
+        let joined_chars = stored_prompt.chars().count()
+            + "\n\nCandidate:\n".chars().count()
+            + stored_candidate.chars().count();
+
+        assert!(
+            joined_chars <= 128,
+            "cached judge input must honor resolved [ars.llm_judge] cap; got {joined_chars}"
+        );
+        let expected_stamp = crate::ops::llm_judge_worker::JudgeJob::compute_stamp_hash(
+            "",
+            stored_prompt,
+            stored_candidate,
+        );
+        assert_eq!(
+            parsed.get("stamp_hash").and_then(|v| v.as_str()),
+            Some(expected_stamp.as_str()),
+            "stamp_hash must describe the exact cached bytes"
         );
     }
 

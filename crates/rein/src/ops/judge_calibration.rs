@@ -59,7 +59,7 @@ use crate::eval::llm_judge::kappa_runtime_vs_offline;
 use crate::store::adaptive::{
     commit_offset, emit_event, peek_events, AdaptiveState,
     ConceptSummaryLlmJudgeOfflineCronPayload, ConceptSummaryLlmJudgePayload, EventType,
-    FeedbackEvent, JudgeCalibrationState, JudgeMetadata, SignalHint,
+    FeedbackEvent, JudgeCalibrationState, JudgeMetadata, JudgeSurface, SignalHint,
     SynthesisLlmJudgeOfflineCronPayload, SynthesisLlmJudgePayload, JUDGE_DRIFT_MIN_PAIRS,
     JUDGE_DRIFT_THRESHOLD, JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
 };
@@ -514,6 +514,8 @@ pub fn recompute_judge_calibration_state(
 
     let now = chrono::Utc::now().timestamp();
     let mut any_new_pair = false;
+    let mut any_new_synthesis_pair = false;
+    let mut any_new_concept_pair = false;
 
     for ev in events {
         if ev.id <= prior_high_water {
@@ -531,16 +533,10 @@ pub fn recompute_judge_calibration_state(
             }
         };
 
-        // Same `(runtime_hit, cron_hit)` extraction shape for both surfaces —
-        // the consumer doesn't differentiate at the κ level. Per-surface drift
-        // would require splitting `recent_pairs_runtime_vs_offline` into
-        // synthesis vs concept arms, deferred to v0.28+ (matches R9-K4 spirit
-        // for the J3 layer; v0.27.1 keeps Layer 2 single-window since only
-        // one drift alert exists).
-        let pair: Option<(bool, bool)> = match ev.event_type.as_str() {
+        let pair: Option<(JudgeSurface, bool, bool)> = match ev.event_type.as_str() {
             "synthesis_llm_judge_offline_cron" => {
                 match serde_json::from_str::<SynthesisLlmJudgeOfflineCronPayload>(payload_str) {
-                    Ok(p) => Some((p.runtime_hit, p.cron_hit)),
+                    Ok(p) => Some((JudgeSurface::Synthesis, p.runtime_hit, p.cron_hit)),
                     Err(e) => {
                         tracing::warn!(
                             event_id = ev.id,
@@ -554,7 +550,7 @@ pub fn recompute_judge_calibration_state(
             "concept_summary_llm_judge_offline_cron" => {
                 match serde_json::from_str::<ConceptSummaryLlmJudgeOfflineCronPayload>(payload_str)
                 {
-                    Ok(p) => Some((p.runtime_hit, p.cron_hit)),
+                    Ok(p) => Some((JudgeSurface::ConceptSummary, p.runtime_hit, p.cron_hit)),
                     Err(e) => {
                         tracing::warn!(
                             event_id = ev.id,
@@ -575,15 +571,38 @@ pub fn recompute_judge_calibration_state(
             }
         };
 
-        if let Some((runtime, cron)) = pair {
-            state.recent_pairs_runtime_vs_offline.push_back((
-                runtime,
-                cron,
-                ev.ts_to_unix().unwrap_or(now),
-            ));
+        if let Some((surface, runtime, cron)) = pair {
+            let ts = ev.ts_to_unix().unwrap_or(now);
+            state
+                .recent_pairs_runtime_vs_offline
+                .push_back((runtime, cron, ts));
             // FIFO-evict oldest pair if over cap.
             while state.recent_pairs_runtime_vs_offline.len() > JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP {
                 state.recent_pairs_runtime_vs_offline.pop_front();
+            }
+            match surface {
+                JudgeSurface::Synthesis => {
+                    state
+                        .recent_pairs_runtime_vs_offline_synthesis
+                        .push_back((runtime, cron, ts));
+                    while state.recent_pairs_runtime_vs_offline_synthesis.len()
+                        > JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP
+                    {
+                        state.recent_pairs_runtime_vs_offline_synthesis.pop_front();
+                    }
+                    any_new_synthesis_pair = true;
+                }
+                JudgeSurface::ConceptSummary => {
+                    state
+                        .recent_pairs_runtime_vs_offline_concept
+                        .push_back((runtime, cron, ts));
+                    while state.recent_pairs_runtime_vs_offline_concept.len()
+                        > JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP
+                    {
+                        state.recent_pairs_runtime_vs_offline_concept.pop_front();
+                    }
+                    any_new_concept_pair = true;
+                }
             }
             state.total_offline_cron_events = state.total_offline_cron_events.saturating_add(1);
             any_new_pair = true;
@@ -642,6 +661,62 @@ pub fn recompute_judge_calibration_state(
                 drift_alert_total = state.judge_drift_alert,
                 threshold = JUDGE_DRIFT_THRESHOLD,
                 "judge_calibration: drift alert — runtime vs offline κ dropped below threshold"
+            );
+        }
+    }
+
+    if any_new_synthesis_pair {
+        let pairs: Vec<(bool, bool)> = state
+            .recent_pairs_runtime_vs_offline_synthesis
+            .iter()
+            .map(|&(r, c, _)| (r, c))
+            .collect();
+        let new_kappa = kappa_runtime_vs_offline(&pairs).unwrap_or(0.0);
+        let prior_kappa = state.runtime_vs_offline_kappa_synthesis;
+        state.runtime_vs_offline_kappa_synthesis = new_kappa;
+        let pair_count = state.recent_pairs_runtime_vs_offline_synthesis.len();
+        let first_below = state.judge_drift_alert_synthesis == 0
+            && prior_kappa < JUDGE_DRIFT_THRESHOLD
+            && new_kappa < JUDGE_DRIFT_THRESHOLD;
+        let edge_crossing =
+            new_kappa < JUDGE_DRIFT_THRESHOLD && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
+        if pair_count >= JUDGE_DRIFT_MIN_PAIRS && (edge_crossing || first_below) {
+            state.judge_drift_alert_synthesis = state.judge_drift_alert_synthesis.saturating_add(1);
+            tracing::warn!(
+                runtime_vs_offline_kappa_synthesis = new_kappa,
+                prior_kappa,
+                pair_count,
+                drift_alert_total = state.judge_drift_alert_synthesis,
+                threshold = JUDGE_DRIFT_THRESHOLD,
+                "judge_calibration: synthesis runtime vs offline κ dropped below threshold"
+            );
+        }
+    }
+
+    if any_new_concept_pair {
+        let pairs: Vec<(bool, bool)> = state
+            .recent_pairs_runtime_vs_offline_concept
+            .iter()
+            .map(|&(r, c, _)| (r, c))
+            .collect();
+        let new_kappa = kappa_runtime_vs_offline(&pairs).unwrap_or(0.0);
+        let prior_kappa = state.runtime_vs_offline_kappa_concept;
+        state.runtime_vs_offline_kappa_concept = new_kappa;
+        let pair_count = state.recent_pairs_runtime_vs_offline_concept.len();
+        let first_below = state.judge_drift_alert_concept == 0
+            && prior_kappa < JUDGE_DRIFT_THRESHOLD
+            && new_kappa < JUDGE_DRIFT_THRESHOLD;
+        let edge_crossing =
+            new_kappa < JUDGE_DRIFT_THRESHOLD && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
+        if pair_count >= JUDGE_DRIFT_MIN_PAIRS && (edge_crossing || first_below) {
+            state.judge_drift_alert_concept = state.judge_drift_alert_concept.saturating_add(1);
+            tracing::warn!(
+                runtime_vs_offline_kappa_concept = new_kappa,
+                prior_kappa,
+                pair_count,
+                drift_alert_total = state.judge_drift_alert_concept,
+                threshold = JUDGE_DRIFT_THRESHOLD,
+                "judge_calibration: concept-summary runtime vs offline κ dropped below threshold"
             );
         }
     }
@@ -1738,6 +1813,39 @@ mod tests {
         .unwrap()
     }
 
+    fn emit_offline_cron_concept(
+        conn: &Connection,
+        summary_id: &str,
+        runtime: bool,
+        cron: bool,
+    ) -> i64 {
+        let payload = ConceptSummaryLlmJudgeOfflineCronPayload {
+            concept_summary_id: summary_id.to_string(),
+            concept_id: format!("concept-{summary_id}"),
+            stamp_hash: "deadbeef".into(),
+            runtime_hit: runtime,
+            runtime_judge_model: "model-r".into(),
+            cron_hit: cron,
+            cron_judge_model: "model-c".into(),
+            cron_reason: "test".into(),
+            metadata: None,
+        };
+        super::emit_event(
+            conn,
+            FeedbackEvent {
+                event_type: EventType::ConceptSummaryLlmJudgeOfflineCron,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::to_value(&payload).unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
     fn emit_runtime_synth_with_hint(
         conn: &Connection,
         synthesis_id: &str,
@@ -2243,6 +2351,26 @@ mod tests {
         // so kappa is well-defined). Whatever the value, advancing the
         // applied-prefix is the contract.
         assert!(state.last_consumed_event_id_calibration >= 4);
+    }
+
+    #[test]
+    fn consumer_tracks_runtime_vs_offline_per_surface() {
+        let conn = setup_db();
+        for i in 0..30 {
+            emit_offline_cron_synth(&conn, &format!("s{i}"), true, true);
+            emit_offline_cron_concept(&conn, &format!("c{i}"), true, false);
+        }
+
+        let (state, max_id) = recompute_judge_calibration_state(&conn, None, None).unwrap();
+
+        assert_eq!(max_id, Some(60));
+        assert_eq!(state.recent_pairs_runtime_vs_offline.len(), 60);
+        assert_eq!(state.recent_pairs_runtime_vs_offline_synthesis.len(), 30);
+        assert_eq!(state.recent_pairs_runtime_vs_offline_concept.len(), 30);
+        assert!(state.runtime_vs_offline_kappa_synthesis >= 0.99);
+        assert!(state.runtime_vs_offline_kappa_concept < JUDGE_DRIFT_THRESHOLD);
+        assert_eq!(state.judge_drift_alert_synthesis, 0);
+        assert_eq!(state.judge_drift_alert_concept, 1);
     }
 
     #[test]

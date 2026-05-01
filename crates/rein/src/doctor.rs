@@ -1810,17 +1810,26 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
     };
     let synth_pairs = cal.recent_pairs_synthesis.len();
     let concept_pairs = cal.recent_pairs_concept.len();
+    let total_drift_alerts = cal
+        .judge_drift_alert
+        .saturating_add(cal.judge_drift_alert_synthesis)
+        .saturating_add(cal.judge_drift_alert_concept);
     let summary = format!(
-        "kappa={:.2} runtime_vs_offline_kappa={:.2} drift_alerts={} synth_pairs={} \
-         concept_pairs={} total_offline={}",
+        "kappa={:.2} runtime_vs_offline_kappa={:.2} synth_runtime_kappa={:.2} \
+         concept_runtime_kappa={:.2} drift_alerts={} synth_drift_alerts={} \
+         concept_drift_alerts={} synth_pairs={} concept_pairs={} total_offline={}",
         cal.kappa,
         cal.runtime_vs_offline_kappa,
+        cal.runtime_vs_offline_kappa_synthesis,
+        cal.runtime_vs_offline_kappa_concept,
         cal.judge_drift_alert,
+        cal.judge_drift_alert_synthesis,
+        cal.judge_drift_alert_concept,
         synth_pairs,
         concept_pairs,
         cal.total_offline_cron_events,
     );
-    if cal.judge_drift_alert > 0 {
+    if total_drift_alerts > 0 {
         warn_in(
             DoctorCategory::Configuration,
             "judge_calibration",

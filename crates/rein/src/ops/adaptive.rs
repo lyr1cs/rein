@@ -7,6 +7,115 @@ use crate::types::traits::MemoryStore;
 
 use super::dedup::run_vec_dedup;
 
+fn persist_ars_effective_scalars(
+    state: &mut crate::store::adaptive::AdaptiveState,
+    config: &ReinConfig,
+    priors: &crate::ops::judge_calibration::BootstrapPriors,
+    ars_parameter_policy_canary: bool,
+) {
+    let calibration_snapshot = state.judge_calibration_state.clone();
+    let calibration = calibration_snapshot.as_ref();
+    let drift_alert = calibration
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
+        .unwrap_or(false);
+    let prior_count = if priors.prior_confidence.is_finite() && priors.prior_confidence > 0.0 {
+        priors.prior_confidence.round() as u64
+    } else {
+        0
+    };
+
+    let synthesis_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
+        config.ars.synthesis_cold_start_n,
+        calibration,
+        ars_parameter_policy_canary,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N,
+        synthesis_cold_start as f64,
+    );
+
+    let concept_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
+        config.ars.concept_summary_cold_start_n,
+        calibration,
+        ars_parameter_policy_canary,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N),
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N,
+        concept_cold_start as f64,
+    );
+
+    let judge_sample_rate_cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
+        config.ars.llm_judge.sample_rate_cold_start,
+        calibration,
+        ars_parameter_policy_canary,
+        true,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+        judge_sample_rate_cold,
+    );
+
+    let judge_sample_rate_warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
+        config.ars.llm_judge.sample_rate_warm,
+        calibration,
+        ars_parameter_policy_canary,
+        false,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
+    )
+    .min(judge_sample_rate_cold);
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+        judge_sample_rate_warm,
+    );
+
+    let threshold_inputs = crate::ops::ars_tuning::TrustInputs {
+        enabled: config.ars.acceleration.enabled,
+        production_canary: ars_parameter_policy_canary,
+        human_count: prior_count,
+        llm_count: 0,
+        llm_reliability: 0.0,
+        calibration: 1.0,
+        stability: 1.0,
+        drift_alert,
+        prior_strength: 20.0,
+        max_trust: 0.50,
+    };
+    let synthesis_threshold = crate::ops::ars_tuning::effective_scalar(
+        crate::store::adaptive::SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        priors.useful_rate_threshold,
+        state.ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        ),
+        crate::ops::ars_tuning::bounds01(0.05),
+        threshold_inputs,
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        synthesis_threshold,
+    );
+
+    let concept_threshold = crate::ops::ars_tuning::effective_scalar(
+        crate::store::adaptive::CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        priors.useful_rate_threshold,
+        state.ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        ),
+        crate::ops::ars_tuning::bounds01(0.05),
+        threshold_inputs,
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        concept_threshold,
+    );
+}
+
 /// Run the adaptive engine slow-channel pipeline after GC.
 /// Order: M4 (HDBSCAN) → M3 (Survival) → M5 (Tiering) → M2 (Alpha) → persist.
 /// Each step is gated by readiness checks; failures skip subsequent steps.
@@ -102,18 +211,53 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // code and judge events that landed past the offset are lost.
     let ars_parameter_policy_canary =
         ars_parameter_policy_allows_runtime(store.conn(), config, &state);
+    let bootstrap_priors =
+        match crate::ops::judge_calibration::bootstrap_priors_from_replay(config, store.conn()) {
+            Ok(priors) => priors,
+            Err(e) => {
+                tracing::warn!("failed to derive ARS bootstrap priors from replay: {e}");
+                crate::ops::judge_calibration::BootstrapPriors::const_defaults()
+            }
+        };
+    let synthesis_useful_rate_weights = crate::store::adaptive::UsefulRateWeights::from_priors(
+        crate::store::adaptive::UsefulRateWeights::synthesis_bootstrap(),
+        bootstrap_priors.w_view,
+        bootstrap_priors.w_click,
+        bootstrap_priors.w_thumb,
+        bootstrap_priors.w_req,
+    );
+    let concept_summary_useful_rate_weights =
+        crate::store::adaptive::UsefulRateWeights::from_priors(
+            crate::store::adaptive::UsefulRateWeights::concept_summary_bootstrap(),
+            bootstrap_priors.w_view,
+            bootstrap_priors.w_click,
+            bootstrap_priors.w_thumb,
+            bootstrap_priors.w_req,
+        );
+    persist_ars_effective_scalars(
+        &mut state,
+        config,
+        &bootstrap_priors,
+        ars_parameter_policy_canary,
+    );
     let effective_judge_weight_decay_rate =
-        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
             ars_parameter_policy_canary,
+            state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
         );
-    match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge(
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
+        effective_judge_weight_decay_rate,
+    );
+    match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge_and_weights(
         store.conn(),
         state.synthesis_feedback_stats.clone(),
         state.pending_kappa_half_pairs.clone(),
         state.judge_calibration_state.clone().unwrap_or_default(),
         effective_judge_weight_decay_rate,
+        synthesis_useful_rate_weights,
     ) {
         Ok((stats, pairs, calibration, max_id)) => {
             state.synthesis_feedback_stats = Some(stats);
@@ -136,17 +280,23 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // and judge_calibration_state are folded so concept-summary judge
     // events flow into useful_rate / κ pairs identically to synthesis.
     let effective_judge_weight_decay_rate =
-        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
             ars_parameter_policy_canary,
+            state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
         );
-    match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge(
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
+        effective_judge_weight_decay_rate,
+    );
+    match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge_and_weights(
         store.conn(),
         state.concept_summary_feedback_stats.clone(),
         state.pending_kappa_half_pairs.clone(),
         state.judge_calibration_state.clone().unwrap_or_default(),
         effective_judge_weight_decay_rate,
+        concept_summary_useful_rate_weights,
     ) {
         Ok((stats, pairs, calibration, max_id)) => {
             state.concept_summary_feedback_stats = Some(stats);
