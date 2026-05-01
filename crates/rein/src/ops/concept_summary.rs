@@ -124,8 +124,11 @@ fn run_concept_summary_inner(
         },
     };
 
-    let ars_parameter_policy_canary =
-        crate::ops::ars_tuning::parameter_policy_allows_runtime(store.conn(), config, &state);
+    let runtime_adoption_weight = crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
+        store.conn(),
+        config,
+        &state,
+    );
     let batch_cap = config.ars.batch_size.max(1);
     for concept in eligible.into_iter().take(batch_cap) {
         outcome.attempted += 1;
@@ -135,7 +138,7 @@ fn run_concept_summary_inner(
             &concept,
             config,
             &state,
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
         ) {
             Ok(summary_id) => {
                 outcome.succeeded += 1;
@@ -217,7 +220,7 @@ fn summarize_one(
     concept: &Concept,
     config: &ReinConfig,
     adaptive_state: &AdaptiveState,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) -> Result<String, SummaryError> {
     // Codex R2 P2 fix — return the minted `living_summary_id` so
     // `run_concept_summary_inner` can surface it on `ConceptSummaryOutcome`.
@@ -306,7 +309,7 @@ fn summarize_one(
             &concept.id,
             &prompt,
             summary,
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
         );
     }
 
@@ -760,7 +763,7 @@ pub fn effective_concept_summary_gate_parameters(
     adaptive_state: Option<&AdaptiveState>,
     cluster_id: Option<i64>,
     query_type: &str,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) -> (u64, f64) {
     let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
     let previous_cold_start = adaptive_state.and_then(|state| {
@@ -769,7 +772,7 @@ pub fn effective_concept_summary_gate_parameters(
     let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.concept_summary_cold_start_n,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         previous_cold_start,
     );
     let previous_threshold = adaptive_state.and_then(|state| {
@@ -802,7 +805,7 @@ pub fn effective_concept_summary_gate_parameters(
             human_count,
             bucket.llm_judge_count,
             calibration,
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
             previous_threshold,
         );
     (cold_start_n, useful_rate_threshold)
@@ -955,7 +958,7 @@ fn enqueue_judge_for_concept_summary(
     concept_id: &str,
     prompt: &str,
     candidate: &str,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, concept_summary_cache_path_for_config, judge_queue_path_for_config,
@@ -1040,7 +1043,7 @@ fn enqueue_judge_for_concept_summary(
     let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         true,
         adaptive_state
             .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
@@ -1048,7 +1051,7 @@ fn enqueue_judge_for_concept_summary(
     let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         false,
         adaptive_state
             .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
@@ -1681,7 +1684,7 @@ mod tests {
             concept_id,
             prompt,
             candidate,
-            false,
+            0.0,
         );
 
         // Read the cache jsonl line back and assert the routing fields.
@@ -1730,7 +1733,7 @@ mod tests {
             "concept-cap-test",
             &prompt,
             &candidate,
-            false,
+            0.0,
         );
 
         let cache_path =

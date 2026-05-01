@@ -872,15 +872,18 @@ fn api_clear_session() -> BoxedResponse {
 
 fn recall_synthesis_adaptive_state(
     config: &ReinConfig,
-) -> (Option<crate::store::adaptive::AdaptiveState>, bool) {
+) -> (Option<crate::store::adaptive::AdaptiveState>, f64) {
     let Some(store) = config.open_store().ok() else {
-        return (None, false);
+        return (None, 0.0);
     };
     let state =
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
-    let ars_parameter_policy_canary =
-        crate::ops::ars_tuning::parameter_policy_allows_runtime(store.conn(), config, &state);
-    (Some(state), ars_parameter_policy_canary)
+    let runtime_adoption_weight = crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
+        store.conn(),
+        config,
+        &state,
+    );
+    (Some(state), runtime_adoption_weight)
 }
 
 fn api_recall(
@@ -900,8 +903,7 @@ fn api_recall(
             // the per-cluster `useful_rate` signal is invisible to REST
             // recalls — the very deployments most likely to feed back
             // `synthesis_interaction` events via the GUI. Codex round 1 F-6.
-            let (adaptive_state, ars_parameter_policy_canary) =
-                recall_synthesis_adaptive_state(config);
+            let (adaptive_state, runtime_adoption_weight) = recall_synthesis_adaptive_state(config);
             // v0.26.1: classify the original query so the synthesis gate
             // reads the matching per-cluster bucket (parity with the
             // MCP/CLI path in `ops/handlers/memory.rs:673` which already
@@ -918,7 +920,7 @@ fn api_recall(
                 route.query_type.synthesis_bucket_label(),
                 adaptive_state.as_ref(),
                 None,
-                ars_parameter_policy_canary,
+                runtime_adoption_weight,
             );
             recall_results_response(results, 0, None, &request_id, synthesis)
         }
@@ -2179,13 +2181,13 @@ mod tests {
         state.save_snapshot(store.conn()).unwrap();
         drop(store);
 
-        let (loaded, ars_parameter_policy_canary) = {
+        let (loaded, runtime_adoption_weight) = {
             let _cwd = CurrentDirGuard::change_to(dir.path());
             recall_synthesis_adaptive_state(&config)
         };
         let loaded = loaded.expect("adaptive state must load from the resolved auto DB");
         assert!(
-            !ars_parameter_policy_canary,
+            runtime_adoption_weight <= f64::EPSILON,
             "fresh test DB has no ARS parameter policy and must fail closed"
         );
         let loaded_synthesis = loaded

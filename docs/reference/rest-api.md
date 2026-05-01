@@ -69,10 +69,12 @@ Test-support-only route families are intentionally excluded.
 v0.28 exposes ARS acceleration status, replay-learned fusion weights, and the
 dynamic-parameter activation policy. Production recall remains unchanged by
 default; explicit non-shadow canary mode can consume eligible snapshot weights
-only when `ars_parameter_policy` is loaded and allows runtime adoption. v0.28.4
+only when `ars_parameter_policy` is loaded and allows runtime adoption. v0.28.5
 uses the same policy gate for synthesis/concept scalar parameters, judge
 sample-rate adaptation, SignalHint-derived useful-rate priors, and release-gate
-reporting, while default installs remain on static configured values.
+reporting. Runtime adoption is gradual: `runtime_adoption_weight` multiplies
+dynamic trust, so default installs remain on static configured values and live
+canaries slide toward learned values over successive adaptive snapshots.
 
 `GET /api/adaptive` includes:
 
@@ -88,6 +90,7 @@ reporting, while default installs remain on static configured values.
         "mode": "disabled",
         "disabled_reason": "missing policy row",
         "source_adaptive_version": 0,
+        "runtime_adoption_weight": 0.0,
         "last_event_id": 0,
         "last_updated": ""
       },
@@ -126,8 +129,9 @@ replay weights:
 these remain observability-only. With explicit `enabled = true` and
 `shadow_only = false`, recall canary mode still requires
 `parameter_policy.status = "loaded"`, `policy.mode = "canary"`, and a
-compatible `source_adaptive_version` before consuming eligible persisted weights
-from `AdaptiveState.learned_shadow_fusion`.
+compatible `source_adaptive_version` with positive `runtime_adoption_weight`
+before consuming eligible persisted weights from
+`AdaptiveState.learned_shadow_fusion`.
 
 ## `/api/ars-acceleration-gate`
 
@@ -155,6 +159,7 @@ defines ship criteria.
     "policy_status": "missing",
     "policy_mode": "disabled",
     "policy_allows_runtime": false,
+    "runtime_adoption_weight": 0.0,
     "shadow_fusion_status": "disabled",
     "judge_drift_alert": false
   },

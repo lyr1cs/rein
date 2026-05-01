@@ -50,8 +50,11 @@ averages tied winners before applying the normal parent-prior shrinkage.
 When `[ars.acceleration]` is explicitly in canary mode and
 `ars_parameter_policy` is healthy, synthesis/concept cold-start thresholds,
 useful-rate thresholds, LLM judge sample rates, and LLM judge weight decay can
-move from static config toward calibrated feedback. Missing policy, drift
-alerts, or insufficient calibration keep the static values.
+move from static config toward calibrated feedback. v0.28.5 adds
+`runtime_adoption_weight` to the policy row; every dynamic trust calculation is
+multiplied by that weight so rollout slides from static priors toward learned
+values. Missing policy, zero adoption weight, drift alerts, or insufficient
+calibration keep the static values.
 
 SignalHint/bootstrap priors also feed the production useful-rate formulas under
 the same canary gate. The last effective scalar values are persisted in the

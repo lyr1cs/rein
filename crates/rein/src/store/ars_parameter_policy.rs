@@ -15,7 +15,7 @@ pub enum ArsParameterPolicyMode {
     Canary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArsParameterPolicy {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -27,6 +27,12 @@ pub struct ArsParameterPolicy {
     pub disabled_reason: Option<String>,
     #[serde(default)]
     pub source_adaptive_version: u64,
+    /// Runtime adoption cap in `[0, 1]`. This is the rollout-side weight
+    /// multiplied into dynamic trust, so canary activation slides gradually
+    /// from static priors toward learned values instead of acting as a binary
+    /// switch.
+    #[serde(default)]
+    pub runtime_adoption_weight: f64,
     #[serde(default)]
     pub last_event_id: i64,
     #[serde(default)]
@@ -41,6 +47,7 @@ impl Default for ArsParameterPolicy {
             mode: ArsParameterPolicyMode::Disabled,
             disabled_reason: Some("missing policy row".to_string()),
             source_adaptive_version: 0,
+            runtime_adoption_weight: 0.0,
             last_event_id: 0,
             last_updated: String::new(),
         }
@@ -56,6 +63,17 @@ impl ArsParameterPolicy {
     }
 
     pub fn allows_runtime_adoption(&self, adaptive_version: u64) -> bool {
+        self.runtime_adoption_weight(adaptive_version) > f64::EPSILON
+    }
+
+    pub fn runtime_adoption_weight(&self, adaptive_version: u64) -> f64 {
+        if !self.can_adopt_runtime(adaptive_version) {
+            return 0.0;
+        }
+        clamp01(self.runtime_adoption_weight)
+    }
+
+    fn can_adopt_runtime(&self, adaptive_version: u64) -> bool {
         self.schema_version == ARS_PARAMETER_POLICY_SCHEMA_VERSION
             && matches!(self.mode, ArsParameterPolicyMode::Canary)
             && self.source_adaptive_version <= adaptive_version
@@ -71,7 +89,7 @@ pub enum ArsParameterPolicyLoadStatus {
     StorageError,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ArsParameterPolicyLoad {
     pub policy: ArsParameterPolicy,
     pub status: ArsParameterPolicyLoadStatus,
@@ -107,7 +125,8 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
     };
 
     match serde_json::from_str::<ArsParameterPolicy>(&raw) {
-        Ok(policy) if policy.schema_version == ARS_PARAMETER_POLICY_SCHEMA_VERSION => {
+        Ok(mut policy) if policy.schema_version == ARS_PARAMETER_POLICY_SCHEMA_VERSION => {
+            policy.runtime_adoption_weight = clamp01(policy.runtime_adoption_weight);
             ArsParameterPolicyLoad {
                 policy,
                 status: ArsParameterPolicyLoadStatus::Loaded,
@@ -133,7 +152,9 @@ pub fn save_parameter_policy_cas(
     policy: &ArsParameterPolicy,
     expected_revision: u64,
 ) -> rusqlite::Result<bool> {
-    let json = serde_json::to_string(policy)
+    let mut policy = policy.clone();
+    policy.runtime_adoption_weight = clamp01(policy.runtime_adoption_weight);
+    let json = serde_json::to_string(&policy)
         .expect("ArsParameterPolicy serialization cannot fail for finite fields");
 
     let updated = conn.execute(
@@ -183,6 +204,14 @@ fn default_schema_version() -> u32 {
     ARS_PARAMETER_POLICY_SCHEMA_VERSION
 }
 
+fn clamp01(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +234,7 @@ mod tests {
             mode: ArsParameterPolicyMode::Canary,
             disabled_reason: None,
             source_adaptive_version: 7,
+            runtime_adoption_weight: 1.0,
             last_event_id: 99,
             last_updated: "2026-05-01T00:00:00Z".to_string(),
         }
@@ -241,6 +271,38 @@ mod tests {
         assert_eq!(loaded.policy.revision, 1);
         assert!(save_parameter_policy_cas(&conn, &stale, 1).unwrap());
         assert_eq!(load_parameter_policy(&conn).policy.revision, 2);
+    }
+
+    #[test]
+    fn canary_policy_requires_positive_runtime_adoption_weight() {
+        let mut policy = canary_policy(1);
+        policy.runtime_adoption_weight = 0.0;
+        assert_eq!(policy.runtime_adoption_weight(7), 0.0);
+        assert!(!policy.allows_runtime_adoption(7));
+
+        policy.runtime_adoption_weight = 0.25;
+        assert_eq!(policy.runtime_adoption_weight(7), 0.25);
+        assert!(policy.allows_runtime_adoption(7));
+    }
+
+    #[test]
+    fn parameter_policy_load_clamps_runtime_adoption_weight() {
+        let conn = conn();
+        let mut policy = canary_policy(1);
+        policy.runtime_adoption_weight = 2.5;
+        assert!(save_parameter_policy_cas(&conn, &policy, 0).unwrap());
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.policy.runtime_adoption_weight, 1.0);
+
+        let mut policy = loaded.policy;
+        policy.revision += 1;
+        policy.runtime_adoption_weight = f64::NAN;
+        assert!(save_parameter_policy_cas(&conn, &policy, 1).unwrap());
+        assert_eq!(
+            load_parameter_policy(&conn).policy.runtime_adoption_weight,
+            0.0
+        );
     }
 
     #[test]

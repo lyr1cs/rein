@@ -1094,8 +1094,8 @@ impl OpsRuntime {
                     let adaptive_state =
                         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                             .unwrap_or_default();
-                    let ars_parameter_policy_canary =
-                        crate::ops::ars_tuning::parameter_policy_allows_runtime(
+                    let runtime_adoption_weight =
+                        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
                             store.conn(),
                             self.config(),
                             &adaptive_state,
@@ -1108,7 +1108,7 @@ impl OpsRuntime {
                             Some(&adaptive_state),
                             effective_cluster_id,
                             qtype,
-                            ars_parameter_policy_canary,
+                            runtime_adoption_weight,
                         );
                     let route_key = crate::store::adaptive::concept_summary_bucket_key(
                         effective_cluster_id,
@@ -1142,7 +1142,7 @@ impl OpsRuntime {
                                     Some(&adaptive_state),
                                     Some(synthetic_cid),
                                     crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
-                                    ars_parameter_policy_canary,
+                                    runtime_adoption_weight,
                                 );
                             (
                                 Some(synthetic_cid),
@@ -1155,7 +1155,7 @@ impl OpsRuntime {
                         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
                             self.config().ars.llm_judge.weight_decay_rate,
                             adaptive_state.judge_calibration_state.as_ref(),
-                            ars_parameter_policy_canary,
+                            runtime_adoption_weight,
                             adaptive_state.ars_effective_scalar(
                                 crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
                             ),

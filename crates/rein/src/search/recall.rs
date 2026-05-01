@@ -136,12 +136,13 @@ fn ready_shadow_fusion_weights_for_recall(
     config: &ReinConfig,
     query_type: &str,
     cluster_id: Option<u32>,
-    parameter_policy_allows_canary: bool,
+    runtime_adoption_weight: f64,
 ) -> Option<crate::search::alpha_optimizer::ShadowFusionWeights> {
+    let production_canary = runtime_adoption_weight > f64::EPSILON;
     if !config.adaptive.enabled
         || !config.ars.acceleration.enabled
         || config.ars.acceleration.shadow_only
-        || !parameter_policy_allows_canary
+        || !production_canary
     {
         return None;
     }
@@ -170,7 +171,8 @@ fn ready_shadow_fusion_weights_for_recall(
         ],
         crate::ops::ars_tuning::TrustInputs {
             enabled: config.ars.acceleration.enabled,
-            production_canary: parameter_policy_allows_canary,
+            production_canary,
+            runtime_adoption_weight,
             human_count: entry.sample_count as u64,
             llm_count: 0,
             llm_reliability: 0.0,
@@ -1077,21 +1079,19 @@ pub fn recall_temporal_with_request_id(
     let adaptive_alpha = adaptive_state_snapshot
         .as_ref()
         .and_then(|s| s.get_alpha(&query_type_label, query_cluster_id));
-    let parameter_policy_load =
-        crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
     let ars_dynamic_fusion_weights = adaptive_state_snapshot.as_ref().and_then(|s| {
-        let parameter_policy_allows_canary = matches!(
-            parameter_policy_load.status,
-            crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
-        ) && parameter_policy_load
-            .policy
-            .allows_runtime_adoption(s.version);
+        let runtime_adoption_weight =
+            crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
+                store.conn(),
+                config,
+                s,
+            );
         ready_shadow_fusion_weights_for_recall(
             s,
             config,
             &query_type_label,
             query_cluster_id,
-            parameter_policy_allows_canary,
+            runtime_adoption_weight,
         )
     });
     let ars_dynamic_fusion_active = ars_dynamic_fusion_weights.is_some();
@@ -2402,7 +2402,7 @@ mod tests {
         );
 
         assert!(
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, true)
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 1.0)
                 .is_none()
         );
     }
@@ -2431,7 +2431,7 @@ mod tests {
         );
 
         assert!(
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, false)
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 0.0)
                 .is_none()
         );
     }
@@ -2460,7 +2460,7 @@ mod tests {
         );
 
         let weights =
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, true)
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 1.0)
                 .expect("non-shadow mode should expose eligible snapshot weights");
         assert!((weights.sum() - 1.0).abs() < 1e-9);
         assert!(weights.bm25 > weights.support);

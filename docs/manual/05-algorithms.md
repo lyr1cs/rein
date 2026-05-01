@@ -633,7 +633,9 @@ feature is enabled, compares runtime and offline judge streams for calibration,
 and feeds useful-rate style aggregates. It does not replace the durable memory
 model or make dedup decisions by itself. In v0.28.4, shadow judge jobs may carry
 bounded `signal_hint` evidence derived from already-recorded interaction stats;
-the hint does not create extra LLM calls or bypass the normal policy gates.
+the hint does not create extra LLM calls or bypass the normal policy gates. In
+v0.28.5, those policy gates include `runtime_adoption_weight`, so LLM feedback
+accelerates tuning gradually instead of replacing static ARS parameters at once.
 
 ## Background Research
 

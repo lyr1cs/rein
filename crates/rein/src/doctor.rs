@@ -1748,17 +1748,23 @@ fn check_ars_parameter_policy(
             let policy = loaded.policy;
             let state = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                 .unwrap_or_default();
-            let live_allowed = config.adaptive.enabled
+            let runtime_adoption_weight = if config.adaptive.enabled
                 && config.ars.acceleration.enabled
                 && !config.ars.acceleration.shadow_only
-                && policy.allows_runtime_adoption(state.version);
+            {
+                policy.runtime_adoption_weight(state.version)
+            } else {
+                0.0
+            };
+            let live_allowed = runtime_adoption_weight > f64::EPSILON;
             let message = format!(
-                "mode={:?} revision={} source_adaptive_version={} current_adaptive_version={} live_allowed={}",
+                "mode={:?} revision={} source_adaptive_version={} current_adaptive_version={} live_allowed={} runtime_adoption_weight={:.3}",
                 policy.mode,
                 policy.revision,
                 policy.source_adaptive_version,
                 state.version,
                 live_allowed,
+                runtime_adoption_weight,
             );
             if matches!(policy.mode, ArsParameterPolicyMode::Canary) && !live_allowed {
                 warn_in(

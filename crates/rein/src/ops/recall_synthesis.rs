@@ -312,7 +312,7 @@ fn effective_synthesis_gate_parameters(
     adaptive_state: Option<&AdaptiveState>,
     cluster_id: Option<i64>,
     query_type: &str,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) -> (u64, f64) {
     let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
     let previous_cold_start = adaptive_state.and_then(|state| {
@@ -321,7 +321,7 @@ fn effective_synthesis_gate_parameters(
     let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.synthesis_cold_start_n,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         previous_cold_start,
     );
     let previous_threshold = adaptive_state.and_then(|state| {
@@ -354,7 +354,7 @@ fn effective_synthesis_gate_parameters(
             human_count,
             bucket.llm_judge_count,
             calibration,
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
             previous_threshold,
         );
     (cold_start_n, useful_rate_threshold)
@@ -401,7 +401,7 @@ pub fn run_recall_synthesis(
         query_type,
         adaptive_state,
         extractor_override,
-        false,
+        0.0,
     )
 }
 
@@ -414,7 +414,7 @@ pub fn run_recall_synthesis_with_policy(
     query_type: &str,
     adaptive_state: Option<&AdaptiveState>,
     extractor_override: Option<ExtractorKind>,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) -> Option<RecallSynthesisOutcome> {
     if synthesize != Some(true) {
         return None;
@@ -479,13 +479,18 @@ pub fn run_recall_synthesis_with_policy(
             adaptive_state,
             cluster_id,
             query_type,
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
         );
     let effective_judge_weight_decay_rate =
-        crate::ops::ars_tuning::effective_judge_weight_decay_rate(
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             adaptive_state.and_then(|state| state.judge_calibration_state.as_ref()),
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
+            adaptive_state.and_then(|state| {
+                state.ars_effective_scalar(
+                    crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
+                )
+            }),
         );
     match decide_synthesize_with_threshold(
         config.ars.recall_synthesis_enabled,
@@ -605,7 +610,7 @@ pub fn run_recall_synthesis_with_policy(
                             &prompt,
                             &clean,
                             included_count,
-                            ars_parameter_policy_canary,
+                            runtime_adoption_weight,
                         );
                     }
                 }
@@ -1029,7 +1034,7 @@ fn enqueue_judge_for_synthesis(
     prompt: &str,
     candidate: &str,
     source_count: usize,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, judge_queue_path_for_config, synthesis_cache_path_for_config,
@@ -1080,7 +1085,7 @@ fn enqueue_judge_for_synthesis(
     let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         true,
         adaptive_state.and_then(|state| {
             state.ars_effective_scalar(
@@ -1091,7 +1096,7 @@ fn enqueue_judge_for_synthesis(
     let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         false,
         adaptive_state.and_then(|state| {
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM)
@@ -1717,7 +1722,7 @@ mod tests {
             &prompt,
             &candidate,
             3,
-            false,
+            0.0,
         );
 
         let cache_path = crate::ops::handlers::judge::synthesis_cache_path_for_config(&config);
