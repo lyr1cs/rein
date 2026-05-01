@@ -578,6 +578,47 @@ one-hot dimensions, pairwise blends, accessed-candidate centroids, and
 accessed-vs-other feature gaps. They remain shadow-only unless explicit canary
 policy enables runtime adoption.
 
+### ARS Dynamic Parameter Rollout
+
+ARS acceleration keeps static configuration as the anchor. Learned values only
+affect runtime behavior when `[ars.acceleration]` is explicitly enabled,
+`shadow_only = false`, the `ars_parameter_policy` row is healthy, and
+`runtime_adoption_weight > 0`.
+
+For scalar parameters, Rein computes a dynamic trust value:
+
+$$
+\tau =
+\frac{e}{e + p}
+\cdot c
+\cdot s
+\cdot m
+\cdot w
+$$
+
+where `e` is effective evidence count, `p` is prior strength, `c` is calibration
+quality, `s` is recent stability, `m` is a per-parameter trust cap, and `w` is
+`runtime_adoption_weight`. Drift alerts or disabled canary mode set `tau` to
+zero.
+
+The effective runtime value is then a bounded blend:
+
+$$
+x_{\mathrm{effective}} =
+\mathrm{clip}\left((1-\tau)x_{\mathrm{static}} + \tau x_{\mathrm{learned}},
+x_{\min}, x_{\max}\right)
+$$
+
+For parameters with stored previous effective values, each adaptive pass also
+applies a per-parameter max step before committing the new snapshot. The same
+principle is used for six-dimensional recall fusion weights, except the blend
+is normalized back onto the simplex after combining static and learned weights.
+
+This rollout layer is deliberately gradual. `runtime_adoption_weight` moves by
+at most `0.05` per durable adaptive snapshot and resets to zero outside canary
+mode. It gates recall fusion, synthesis and concept-summary gates, LLM judge
+sample rates, LLM judge decay, and SignalHint-derived useful-rate priors.
+
 ### M5 Tiering
 
 Tiering computes access-rate distributions and assigns hot, warm, and cold
