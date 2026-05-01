@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.4`** (2026-05-01) — completes the v0.28 ARS acceleration pass with SignalHint-derived useful-rate priors in production formulas, persisted dynamic scalar smoothing, per-surface judge drift windows, configurable judge input caps, Cap A real recall-context feedback threading, a read-only release gate, and shadow GP+EI fusion proposals. Defaults remain `[ars.acceleration].enabled = false` and `shadow_only = true`; explicit canary mode still requires a healthy `ars_parameter_policy` row. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.4 progression.
+**Current release: `v0.28.5`** (2026-05-01) — adds gradual `runtime_adoption_weight` rollout for ARS runtime parameters so canary adoption moves from static priors toward learned values instead of flipping abruptly. Defaults remain `[ars.acceleration].enabled = false` and `shadow_only = true`; live adoption still requires a healthy `ars_parameter_policy` row with positive adoption weight. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.5 progression.
 
 For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
 
@@ -377,10 +377,11 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.28.4 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+The v0.21 → v0.28.5 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.28.5** (2026-05-01) | Gradual ARS runtime adoption | Adds `runtime_adoption_weight` to `ars_parameter_policy`, moves the adoption weight by at most 0.05 per durable snapshot, and gates recall fusion, synthesis/concept gates, judge sample rates, LLM feedback decay, and SignalHint-derived useful-rate priors through that weight. |
 | **v0.28.4** (2026-05-01) | ARS acceleration full pass | Wires SignalHint/bootstrap priors into useful-rate formulas, persists smoothed dynamic scalars, splits judge drift by surface, makes judge input caps configurable, folds Cap A GUI feedback into real recall-context buckets while preserving synthetic judge alignment, adds a read-only release/eval gate, and adds shadow GP+EI fusion proposals. |
 | **v0.28.3** (2026-05-01) | ARS dynamic scalar expansion | Extends policy-gated dynamic adoption beyond recall fusion: synthesis/concept cold-start and useful-rate thresholds can move from static values toward calibrated feedback, judge sample rates adapt under the same policy gate, shadow judge jobs carry deterministic `signal_hint` evidence, and shadow replay evaluates blended simplex candidates instead of one-hot-only weights. |
 | **v0.28.2** (2026-05-01) | ARS dynamic parameter policy | Adds `ars_parameter_policy` metadata activation, trust-weighted static-to-learned fusion adoption, κ/drift-gated LLM judge `weight_decay_rate`, `/api/adaptive` policy status, and `rein doctor` policy health checks. |
@@ -1038,7 +1039,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.28.4`**（2026-05-01）— 完成 v0.28 ARS acceleration 收口：SignalHint/bootstrap priors 接入 production useful-rate 公式，动态 scalar 持久化平滑，judge drift 按 surface 拆分，judge input cap 可配置，Cap A GUI feedback 同时进入真实 recall-context bucket 与 synthetic judge bucket，新增只读 release gate，并加入 shadow GP+EI fusion proposals。默认仍是 `[ars.acceleration].enabled = false`、`shadow_only = true`；显式 canary 仍要求健康的 `ars_parameter_policy` 行。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.28.5`**（2026-05-01）— 新增 ARS runtime 参数的渐进 `runtime_adoption_weight` rollout，让 canary 从 static priors 平滑滑向 learned values，而不是一次性翻转。默认仍是 `[ars.acceleration].enabled = false`、`shadow_only = true`；live adoption 仍要求健康 `ars_parameter_policy` 行且 adoption weight 为正。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1588,10 +1589,11 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.28.4 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+v0.21 → v0.28.5 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.28.5** (2026-05-01) | Gradual ARS runtime adoption | `ars_parameter_policy` 新增 `runtime_adoption_weight`，每次 durable snapshot 最多移动 0.05；recall fusion、synthesis/concept gate、judge sample rate、LLM feedback decay、SignalHint-derived useful-rate priors 都经由这个权重渐进采用。 |
 | **v0.28.4** (2026-05-01) | ARS acceleration full pass | SignalHint/bootstrap priors 接入 useful-rate 公式；动态 scalar 持久化平滑；judge drift 按 surface 拆分；judge input cap 可配置；Cap A GUI feedback 同时写入真实 recall-context bucket 与 synthetic judge bucket；新增只读 release/eval gate；shadow fusion 加入 GP+EI proposals。 |
 | **v0.28.3** (2026-05-01) | ARS dynamic scalar expansion | 将 policy-gated 动态采用从 recall fusion 扩到 synthesis/concept cold-start、useful-rate threshold 与 judge sample rate；shadow judge job 携带确定性的 `signal_hint` 证据；shadow replay 开始评估 blended simplex 候选，不再只从 one-hot 权重里选。 |
 | **v0.28.2** (2026-05-01) | ARS dynamic parameter policy | 新增 `ars_parameter_policy` metadata 激活层、static-to-learned trust 加权融合、κ/漂移门控的 LLM judge `weight_decay_rate`、`/api/adaptive` policy 状态和 `rein doctor` policy 健康检查。 |
