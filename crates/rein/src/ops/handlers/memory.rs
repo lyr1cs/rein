@@ -685,7 +685,7 @@ impl OpsRuntime {
         // (a) needs no DB access and (b) wraps a `block_in_place` call to
         // drive the LLM that should not be nested inside any store
         // transaction guard.
-        let (results, adaptive_state, runtime_adoption_weight) = self.with_store(|store| {
+        let (results, adaptive_state, runtime_adoption) = self.with_store(|store| {
             let results = crate::search::recall::recall_temporal_with_request_id(
                 store,
                 &self.config,
@@ -709,13 +709,30 @@ impl OpsRuntime {
             let adaptive_state =
                 crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                     .unwrap_or_default();
-            let runtime_adoption_weight =
-                crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
-                    store.conn(),
-                    &self.config,
-                    &adaptive_state,
-                );
-            Ok((results, adaptive_state, runtime_adoption_weight))
+            let runtime_adoption = crate::ops::recall_synthesis::RecallSynthesisRuntimeAdoption {
+                synthesis_gate:
+                    crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+                        store.conn(),
+                        &self.config,
+                        &adaptive_state,
+                        "synthesis_gate",
+                    ),
+                judge_sample_rate:
+                    crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+                        store.conn(),
+                        &self.config,
+                        &adaptive_state,
+                        "judge_sample_rate",
+                    ),
+                llm_feedback_decay:
+                    crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+                        store.conn(),
+                        &self.config,
+                        &adaptive_state,
+                        "llm_feedback_decay",
+                    ),
+            };
+            Ok((results, adaptive_state, runtime_adoption))
         })?;
 
         // Phase 2: optional synthesis (Cap B / v0.26 D direction). Returns
@@ -739,7 +756,7 @@ impl OpsRuntime {
             route.query_type.synthesis_bucket_label(),
             Some(&adaptive_state),
             None,
-            runtime_adoption_weight,
+            runtime_adoption,
         );
 
         Ok(RecallMemoryOutput {

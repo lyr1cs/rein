@@ -137,8 +137,8 @@ pub struct JudgeJob {
     pub judge_model_override: Option<String>,
     /// v0.28 ARS acceleration: optional structured hint computed upstream.
     ///
-    /// The worker only pass-throughs this when acceleration is explicitly
-    /// enabled and shadow-only. It does not infer hints from judge prose.
+    /// The worker only pass-throughs this when acceleration is enabled. It
+    /// does not infer hints from judge prose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_hint: Option<SignalHint>,
 }
@@ -468,7 +468,7 @@ pub fn dispatch_one(
 }
 
 fn signal_hint_for_emit(config: &crate::config::ReinConfig, job: &JudgeJob) -> Option<SignalHint> {
-    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+    if !config.ars.acceleration.enabled {
         return None;
     }
 
@@ -816,7 +816,7 @@ pub struct DrainStats {
 /// Reads the per-shard JSONL queue at
 /// `<resolve_buffer_dir>/queue/<db_hash>/judge_queue.jsonl`, parses each
 /// line as a [`JudgeJob`], and dispatches one-by-one through
-/// [`dispatch_one`]. Default-off when `[ars.llm_judge].enabled = false`
+/// [`dispatch_one`]. Opt-out when `[ars.llm_judge].enabled = false`
 /// (no queue file is ever written under that flag, so no-op fast).
 ///
 /// Atomic file rotation: `judge_queue.jsonl` → `judge_queue.jsonl.processing`
@@ -838,7 +838,7 @@ pub struct DrainStats {
 /// reaper keeps only rows within the configured
 /// `[ars.llm_judge].cache_ttl_secs` window.
 ///
-/// Default-off (`enabled = false` short-circuits before the reaper
+/// Disabled config (`enabled = false`) short-circuits before the reaper
 /// touches disk/SQL). Best-effort: any IO/DB error is logged and
 /// ignored — the manual lookup TTL guard remains the correctness
 /// boundary.
@@ -1077,7 +1077,7 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
 
     if !config.ars.llm_judge.enabled {
         // Codex C234 P2 fix — fast no-op when judge is disabled. Don't
-        // touch the queue dir at all; default-off must mean zero new
+        // touch the queue dir at all; explicit opt-out must mean zero new
         // disk writes.
         return DrainStats::default();
     }
@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_hint_for_emit_is_default_off_and_shadow_only() {
+    fn signal_hint_for_emit_requires_acceleration_but_not_shadow_only() {
         let mut job = base_synthesis_job();
         job.signal_hint = Some(crate::store::adaptive::SignalHint {
             inferred_w_view: Some(1.0),
@@ -1400,12 +1400,26 @@ mod tests {
         });
 
         let default_config = crate::config::ReinConfig::default();
-        assert!(signal_hint_for_emit(&default_config, &job).is_none());
+        assert_eq!(
+            signal_hint_for_emit(&default_config, &job)
+                .unwrap()
+                .inferred_w_view,
+            Some(1.0)
+        );
+
+        let mut disabled_config = crate::config::ReinConfig::default();
+        disabled_config.ars.acceleration.enabled = false;
+        assert!(signal_hint_for_emit(&disabled_config, &job).is_none());
 
         let mut production_config = crate::config::ReinConfig::default();
         production_config.ars.acceleration.enabled = true;
         production_config.ars.acceleration.shadow_only = false;
-        assert!(signal_hint_for_emit(&production_config, &job).is_none());
+        assert_eq!(
+            signal_hint_for_emit(&production_config, &job)
+                .unwrap()
+                .inferred_w_view,
+            Some(1.0)
+        );
 
         let mut shadow_config = crate::config::ReinConfig::default();
         shadow_config.ars.acceleration.enabled = true;
@@ -1453,7 +1467,7 @@ mod tests {
         );
         assert_eq!(
             stats.dropped, 1,
-            "default-off recall-ranking jobs must be dropped"
+            "unsupported recall-ranking jobs must be dropped"
         );
         assert_eq!(stats.emitted, 0);
         assert_eq!(stats.errors, 0);

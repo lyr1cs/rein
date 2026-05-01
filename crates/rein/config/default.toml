@@ -91,8 +91,14 @@ guardrails_enabled = true
 max_additional_context_chars = 1200
 
 [ars.acceleration]
-enabled = false
-shadow_only = true
+enabled = true
+shadow_only = false
+
+[ars.llm_judge]
+enabled = true
+
+[ars.llm_judge.nightly_cron]
+enabled = true
 
 [extract]
 provider = "google"

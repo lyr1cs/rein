@@ -1094,11 +1094,19 @@ impl OpsRuntime {
                     let adaptive_state =
                         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                             .unwrap_or_default();
-                    let runtime_adoption_weight =
-                        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
+                    let concept_summary_gate_adoption_weight =
+                        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
                             store.conn(),
                             self.config(),
                             &adaptive_state,
+                            "concept_summary_gate",
+                        );
+                    let llm_feedback_decay_adoption_weight =
+                        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+                            store.conn(),
+                            self.config(),
+                            &adaptive_state,
+                            "llm_feedback_decay",
                         );
                     let synthetic_cid =
                         crate::ops::concept_summary::synthetic_cluster_id_for_concept(&concept.id);
@@ -1108,7 +1116,7 @@ impl OpsRuntime {
                             Some(&adaptive_state),
                             effective_cluster_id,
                             qtype,
-                            runtime_adoption_weight,
+                            concept_summary_gate_adoption_weight,
                         );
                     let route_key = crate::store::adaptive::concept_summary_bucket_key(
                         effective_cluster_id,
@@ -1142,7 +1150,7 @@ impl OpsRuntime {
                                     Some(&adaptive_state),
                                     Some(synthetic_cid),
                                     crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
-                                    runtime_adoption_weight,
+                                    concept_summary_gate_adoption_weight,
                                 );
                             (
                                 Some(synthetic_cid),
@@ -1155,7 +1163,7 @@ impl OpsRuntime {
                         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
                             self.config().ars.llm_judge.weight_decay_rate,
                             adaptive_state.judge_calibration_state.as_ref(),
-                            runtime_adoption_weight,
+                            llm_feedback_decay_adoption_weight,
                             adaptive_state.ars_effective_scalar(
                                 crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
                             ),

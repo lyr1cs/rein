@@ -872,18 +872,39 @@ fn api_clear_session() -> BoxedResponse {
 
 fn recall_synthesis_adaptive_state(
     config: &ReinConfig,
-) -> (Option<crate::store::adaptive::AdaptiveState>, f64) {
+) -> (
+    Option<crate::store::adaptive::AdaptiveState>,
+    crate::ops::recall_synthesis::RecallSynthesisRuntimeAdoption,
+) {
     let Some(store) = config.open_store().ok() else {
-        return (None, 0.0);
+        return (
+            None,
+            crate::ops::recall_synthesis::RecallSynthesisRuntimeAdoption::uniform(0.0),
+        );
     };
     let state =
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
-    let runtime_adoption_weight = crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
-        store.conn(),
-        config,
-        &state,
-    );
-    (Some(state), runtime_adoption_weight)
+    let runtime_adoption = crate::ops::recall_synthesis::RecallSynthesisRuntimeAdoption {
+        synthesis_gate: crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "synthesis_gate",
+        ),
+        judge_sample_rate: crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "judge_sample_rate",
+        ),
+        llm_feedback_decay: crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "llm_feedback_decay",
+        ),
+    };
+    (Some(state), runtime_adoption)
 }
 
 fn api_recall(
@@ -903,7 +924,7 @@ fn api_recall(
             // the per-cluster `useful_rate` signal is invisible to REST
             // recalls — the very deployments most likely to feed back
             // `synthesis_interaction` events via the GUI. Codex round 1 F-6.
-            let (adaptive_state, runtime_adoption_weight) = recall_synthesis_adaptive_state(config);
+            let (adaptive_state, runtime_adoption) = recall_synthesis_adaptive_state(config);
             // v0.26.1: classify the original query so the synthesis gate
             // reads the matching per-cluster bucket (parity with the
             // MCP/CLI path in `ops/handlers/memory.rs:673` which already
@@ -920,7 +941,7 @@ fn api_recall(
                 route.query_type.synthesis_bucket_label(),
                 adaptive_state.as_ref(),
                 None,
-                runtime_adoption_weight,
+                runtime_adoption,
             );
             recall_results_response(results, 0, None, &request_id, synthesis)
         }
@@ -2187,7 +2208,9 @@ mod tests {
         };
         let loaded = loaded.expect("adaptive state must load from the resolved auto DB");
         assert!(
-            runtime_adoption_weight <= f64::EPSILON,
+            runtime_adoption_weight.synthesis_gate <= f64::EPSILON
+                && runtime_adoption_weight.judge_sample_rate <= f64::EPSILON
+                && runtime_adoption_weight.llm_feedback_decay <= f64::EPSILON,
             "fresh test DB has no ARS parameter policy and must fail closed"
         );
         let loaded_synthesis = loaded

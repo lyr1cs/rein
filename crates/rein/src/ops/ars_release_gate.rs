@@ -5,6 +5,7 @@
 //! offsets, or change runtime defaults.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::config::ReinConfig;
 use crate::store::adaptive::AdaptiveState;
@@ -45,6 +46,7 @@ pub struct ReleaseGateSignals {
     pub policy_source_adaptive_version: u64,
     pub policy_allows_runtime: bool,
     pub runtime_adoption_weight: f64,
+    pub runtime_adoption_weights: BTreeMap<String, f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +112,27 @@ pub fn evaluate_ars_acceleration_release_gate(
     } else {
         0.0
     };
+    let runtime_adoption_weights = if config.adaptive.enabled
+        && config.ars.acceleration.enabled
+        && !config.ars.acceleration.shadow_only
+        && matches!(policy.status, ArsParameterPolicyLoadStatus::Loaded)
+    {
+        policy
+            .policy
+            .adoption_weights
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    policy
+                        .policy
+                        .runtime_adoption_weight_for(state.version, key),
+                )
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let policy_allows_runtime = runtime_adoption_weight > f64::EPSILON;
     let judge_drift_alert = state
         .judge_calibration_state
@@ -160,6 +183,7 @@ pub fn evaluate_ars_acceleration_release_gate(
         policy_source_adaptive_version: policy.policy.source_adaptive_version,
         policy_allows_runtime,
         runtime_adoption_weight,
+        runtime_adoption_weights,
         policy_error: policy.error.clone(),
         shadow_fusion_status: shadow_status.clone(),
         shadow_fusion_eligible_samples: json_u64(input.shadow_fusion_status, "eligible_samples"),
@@ -354,7 +378,15 @@ mod tests {
         config.ars.acceleration.shadow_only = false;
         config.adaptive.min_samples_alpha = 10;
         let state = eligible_state();
-        let policy = loaded_canary_policy(0.25);
+        let mut policy = loaded_canary_policy(0.25);
+        policy
+            .policy
+            .adoption_weights
+            .insert("recall_fusion:semantic".to_string(), 0.40);
+        policy
+            .policy
+            .adoption_weights
+            .insert("synthesis_gate".to_string(), 0.35);
         let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
             config: &config,
             state: &state,
@@ -367,6 +399,14 @@ mod tests {
         });
 
         assert_eq!(report.signals.runtime_adoption_weight, 0.25);
+        assert_eq!(
+            report.signals.runtime_adoption_weights["recall_fusion:semantic"],
+            0.40
+        );
+        assert_eq!(
+            report.signals.runtime_adoption_weights["synthesis_gate"],
+            0.35
+        );
         assert!(report.signals.policy_allows_runtime);
         assert!(report.canary.allowed);
     }

@@ -1081,10 +1081,12 @@ pub fn recall_temporal_with_request_id(
         .and_then(|s| s.get_alpha(&query_type_label, query_cluster_id));
     let ars_dynamic_fusion_weights = adaptive_state_snapshot.as_ref().and_then(|s| {
         let runtime_adoption_weight =
-            crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
+            crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
                 store.conn(),
                 config,
                 s,
+                &query_type_label,
+                query_cluster_id,
             );
         ready_shadow_fusion_weights_for_recall(
             s,

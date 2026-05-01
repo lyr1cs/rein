@@ -101,8 +101,8 @@ const PEEK_BATCH_LIMIT: usize = 50_000;
 ///    adaptive engine reads on boot and uses as Bayesian prior; production
 ///    feedback updates the posterior
 ///
-/// **v0.28.0 S1**: default config still performs no file I/O and no LLM calls.
-/// `[ars.acceleration].enabled=true` opts into reading a DB-scoped
+/// **v0.28.6 S1**: default config enables ARS acceleration but still performs
+/// no LLM calls. It may read a DB-scoped
 /// `bootstrap_priors.json` snapshot, then the embedded fixture corpus when no
 /// valid snapshot exists.
 pub fn bootstrap_priors_from_corpus(config: &ReinConfig) -> ReinResult<BootstrapPriors> {
@@ -118,10 +118,10 @@ pub fn bootstrap_priors_from_corpus(config: &ReinConfig) -> ReinResult<Bootstrap
 
 /// Opt-in v0.28 replay bootstrap from already-durable runtime judge events.
 ///
-/// Default-off is deliberately pure with respect to the database: callers can
-/// pass an unopened/missing schema test connection and still receive constants.
-/// When enabled, a valid DB-scoped snapshot wins; otherwise this scans a bounded
-/// recent window for explicit `signal_hint` labels.
+/// Missing-schema cold starts are deliberately fail-closed: callers can pass a
+/// fresh/migration-light connection and still receive constants. When enabled,
+/// a valid DB-scoped snapshot wins; otherwise this scans a bounded recent
+/// window for explicit `signal_hint` labels.
 pub fn bootstrap_priors_from_replay(
     config: &ReinConfig,
     conn: &Connection,
@@ -132,9 +132,21 @@ pub fn bootstrap_priors_from_replay(
     if let Some(priors) = load_bootstrap_priors_snapshot(config) {
         return Ok(priors);
     }
+    if !feedback_events_table_exists(conn) {
+        return Ok(BootstrapPriors::const_defaults());
+    }
     let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
     let hints = load_signal_hints_from_feedback_events(conn, cutoff, 50_000)?;
     Ok(derive_priors_from_signal_hints(&hints))
+}
+
+fn feedback_events_table_exists(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'feedback_events'",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 /// DB-scoped prior snapshot path for v0.28 acceleration bootstrap.
@@ -832,8 +844,8 @@ pub struct CronReport {
 /// slot via `judge::contract::reserve_call(conn)` — same pattern as the
 /// runtime worker. v0.27.1 leaves this as a `// TODO Wave-1.5` because
 /// A_JUDGE_CORE owns `reserve_call`; if A's path isn't ready, the cron
-/// proceeds without reservation. Default-off (`enabled = false` AND
-/// `nightly_cron.enabled = false`) mitigates production blast radius.
+/// proceeds without reservation. v0.28.6 defaults both flags on, but this
+/// command still honors either opt-out flag before touching disk or LLMs.
 pub fn run_judge_calibration_cron(
     store: &SqliteStore,
     config: &ReinConfig,
@@ -844,7 +856,7 @@ pub fn run_judge_calibration_cron(
     // Without this gate, an operator who flips `nightly_cron.enabled =
     // false` but still has a stale archive on disk would have
     // `rein judge-calibrate-cron` re-judge + emit, defeating the
-    // default-off/cost-control intent.
+    // opt-out/cost-control intent.
     if !config.ars.llm_judge.enabled || !config.ars.llm_judge.nightly_cron.enabled {
         tracing::info!(
             ars_llm_judge_enabled = config.ars.llm_judge.enabled,
@@ -1937,14 +1949,15 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_default_off_returns_const_defaults() {
-        // §16.2 contract — default-off MUST return BootstrapPriors::const_defaults
-        // bit-for-bit without reading snapshots or fixture corpus.
+    fn bootstrap_priors_default_on_derives_from_fixture_signal_hints() {
         let config = crate::config::ReinConfig::default();
-        let priors = bootstrap_priors_from_corpus(&config).expect("default-off never errors");
-        let defaults = BootstrapPriors::const_defaults();
-        assert_eq!(priors, defaults);
-        assert_eq!(priors.prior_confidence, 0.0);
+        let priors = bootstrap_priors_from_corpus(&config).expect("default path");
+
+        assert!((priors.w_view - 1.7).abs() < 1e-12, "got {priors:?}");
+        assert!((priors.w_click - 2.1).abs() < 1e-12, "got {priors:?}");
+        assert!((priors.w_thumb - 2.8).abs() < 1e-12, "got {priors:?}");
+        assert!((priors.w_req - 1.1).abs() < 1e-12, "got {priors:?}");
+        assert_eq!(priors.prior_confidence, 2.0);
     }
 
     #[test]
@@ -1973,9 +1986,10 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_default_off_does_not_create_snapshot_dir() {
+    fn bootstrap_priors_disabled_does_not_create_snapshot_dir() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = false;
         config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
         config.database.path = tmp.path().join("memories.db").display().to_string();
 
@@ -1984,7 +1998,7 @@ mod tests {
         assert_eq!(priors, BootstrapPriors::const_defaults());
         assert!(
             !tmp.path().join("buffers").exists(),
-            "default-off prior bootstrap must not create queue/snapshot directories"
+            "disabled prior bootstrap must not create queue/snapshot directories"
         );
     }
 
@@ -2047,11 +2061,22 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_from_replay_default_off_does_not_read_db() {
+    fn bootstrap_priors_from_replay_disabled_does_not_read_db() {
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = false;
+        let conn = Connection::open_in_memory().unwrap();
+
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("disabled path");
+
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+    }
+
+    #[test]
+    fn bootstrap_priors_from_replay_default_on_missing_schema_fails_closed() {
         let config = crate::config::ReinConfig::default();
         let conn = Connection::open_in_memory().unwrap();
 
-        let priors = bootstrap_priors_from_replay(&config, &conn).expect("default-off path");
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("missing schema path");
 
         assert_eq!(priors, BootstrapPriors::const_defaults());
     }
@@ -2663,31 +2688,20 @@ mod tests {
 
     #[test]
     fn cron_run_with_empty_archive_returns_zero_report() {
-        let config = crate::config::ReinConfig::default();
-        // Open a fresh in-memory store (no archive files in scope).
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
         let store = SqliteStore::new(
             &config.resolve_db_path(),
             &config.embedding_model(),
             crate::config::ReinConfig::default().embedding.dimensions,
         )
-        .or_else(|_| {
-            // fallback: if the resolved DB doesn't exist on disk, create
-            // a tempfile path
-            let tmp = std::env::temp_dir().join(format!(
-                "rein_test_{}.db",
-                chrono::Utc::now().timestamp_millis()
-            ));
-            SqliteStore::new(
-                &tmp,
-                &config.embedding_model(),
-                crate::config::ReinConfig::default().embedding.dimensions,
-            )
-        });
-        if let Ok(store) = store {
-            let report =
-                run_judge_calibration_cron(&store, &config).expect("empty archive must succeed");
-            assert_eq!(report.considered, 0);
-            assert_eq!(report.emitted, 0);
-        }
+        .expect("fresh test store");
+
+        let report =
+            run_judge_calibration_cron(&store, &config).expect("empty archive must succeed");
+        assert_eq!(report.considered, 0);
+        assert_eq!(report.emitted, 0);
     }
 }

@@ -100,9 +100,9 @@ fn default_config_blocks_canary_and_default_on_without_mutating_defaults() {
     let state = AdaptiveState::default();
     let policy = missing_policy();
     let shadow_fusion_status = serde_json::json!({
-        "enabled": false,
-        "shadow_only": true,
-        "status": "disabled",
+        "enabled": true,
+        "shadow_only": false,
+        "status": "insufficient_samples",
         "eligible_samples": 0,
         "min_samples": 10,
         "global": null,
@@ -122,7 +122,7 @@ fn default_config_blocks_canary_and_default_on_without_mutating_defaults() {
         .canary
         .blockers
         .iter()
-        .any(|b| b == "ars_acceleration_disabled"));
+        .any(|b| b == "ars_parameter_policy_missing"));
     assert!(!report.default_on.allowed);
     assert!(report
         .default_on
@@ -130,8 +130,8 @@ fn default_config_blocks_canary_and_default_on_without_mutating_defaults() {
         .iter()
         .any(|b| b == "default_on_requires_release_evaluation"));
 
-    assert!(!config.ars.acceleration.enabled);
-    assert!(config.ars.acceleration.shadow_only);
+    assert!(config.ars.acceleration.enabled);
+    assert!(!config.ars.acceleration.shadow_only);
 }
 
 #[test]

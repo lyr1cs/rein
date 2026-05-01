@@ -1,6 +1,6 @@
 # Rein Manual
 
-Updated for Rein v0.28.5.
+Updated for Rein v0.28.6.
 
 Rein is a local-first, self-adaptive memory system for AI agents. It provides a
 single Rust binary with CLI, MCP, REST, GUI, hook, and record-only proxy
