@@ -8,6 +8,7 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 pub mod adaptive;
+pub mod ars_release_gate;
 pub mod ars_tuning;
 pub mod cold_archive_summary;
 pub mod concept_summary;

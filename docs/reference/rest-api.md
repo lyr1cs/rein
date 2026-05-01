@@ -39,6 +39,7 @@ mutating routes also require `x-rein-action: 1`. Protected reads accept
 | `DELETE` | `/api/session` | Mutation marker | Clears GUI session cookie. |
 | `POST` | `/api/feedback` | Mutation marker | Emits memory-access or synthesis-interaction feedback events. |
 | `GET` | `/api/adaptive` | Public read | Adaptive alphas, reranker weights, clusters, tiers, event counts, and synthesis stats. |
+| `GET` | `/api/ars-acceleration-gate` | Public read | Read-only ARS acceleration canary/default-on gate report. |
 | `GET` | `/api/dedup_decisions` | Public read | Recent dedup decisions, optionally filtered. |
 | `GET` | `/api/intelligent_merge_metrics` | Server auth | Intelligent-merge metrics summary. |
 | `GET` | `/api/judge/calibration` | Server auth | Runtime-vs-offline judge calibration state. |
@@ -68,10 +69,10 @@ Test-support-only route families are intentionally excluded.
 v0.28 exposes ARS acceleration status, replay-learned fusion weights, and the
 dynamic-parameter activation policy. Production recall remains unchanged by
 default; explicit non-shadow canary mode can consume eligible snapshot weights
-only when `ars_parameter_policy` is loaded and allows runtime adoption. v0.28.3
-uses the same policy gate for synthesis/concept scalar parameters and judge
-sample-rate adaptation, while default installs remain on static configured
-values.
+only when `ars_parameter_policy` is loaded and allows runtime adoption. v0.28.4
+uses the same policy gate for synthesis/concept scalar parameters, judge
+sample-rate adaptation, SignalHint-derived useful-rate priors, and release-gate
+reporting, while default installs remain on static configured values.
 
 `GET /api/adaptive` includes:
 
@@ -127,3 +128,45 @@ these remain observability-only. With explicit `enabled = true` and
 `parameter_policy.status = "loaded"`, `policy.mode = "canary"`, and a
 compatible `source_adaptive_version` before consuming eligible persisted weights
 from `AdaptiveState.learned_shadow_fusion`.
+
+## `/api/ars-acceleration-gate`
+
+`GET /api/ars-acceleration-gate` is a read-only release/eval report for ARS
+acceleration rollout decisions. It evaluates the same existing signals that are
+already visible through config, `/api/adaptive`, and `rein doctor`: adaptive
+enablement, `[ars.acceleration]`, `ars_parameter_policy`, learned shadow-fusion
+evidence, replay status, adaptive version, and judge drift status.
+
+The report does not refresh the policy row, flip defaults, or enable canary
+mode. `canary.allowed` means the current explicit canary configuration is
+healthy enough for runtime adoption. `default_on.allowed` is intentionally
+`false` in this skeleton and includes
+`default_on_requires_release_evaluation` until a separate release evaluation
+defines ship criteria.
+
+```json
+{
+  "schema_version": 1,
+  "purpose": "read_only_release_eval_gate_for_ars_acceleration",
+  "signals": {
+    "adaptive_enabled": true,
+    "ars_acceleration_enabled": false,
+    "ars_acceleration_shadow_only": true,
+    "policy_status": "missing",
+    "policy_mode": "disabled",
+    "policy_allows_runtime": false,
+    "shadow_fusion_status": "disabled",
+    "judge_drift_alert": false
+  },
+  "canary": {
+    "allowed": false,
+    "blockers": ["ars_acceleration_disabled"],
+    "warnings": ["shadow_fusion_replay_not_ready:disabled"]
+  },
+  "default_on": {
+    "allowed": false,
+    "blockers": ["default_on_requires_release_evaluation", "canary_not_allowed"],
+    "warnings": ["default_on_gate_is_report_only_and_does_not_change_runtime_defaults"]
+  }
+}
+```

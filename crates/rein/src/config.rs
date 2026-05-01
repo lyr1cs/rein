@@ -440,6 +440,11 @@ pub struct ArsLlmJudgeConfig {
     /// Recall-ranking judge — deferred to v0.27.2+.
     #[serde(default)]
     pub recall_ranking_enabled: bool,
+    /// Optional section-level judge input cap. When set, this overrides
+    /// the resolved `[llm.{provider}].max_input_chars` for the runtime
+    /// judge enqueue path.
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
     /// Sample-rate when cluster human-signal count is below
     /// `human_signal_threshold` (cold start). Default 1.0 (100%).
     #[serde(default = "default_judge_sample_rate_cold_start")]
@@ -523,6 +528,7 @@ impl Default for ArsLlmJudgeConfig {
             synthesis_enabled: true,
             concept_summary_enabled: true,
             recall_ranking_enabled: false,
+            max_input_chars: None,
             sample_rate_cold_start: default_judge_sample_rate_cold_start(),
             sample_rate_warm: default_judge_sample_rate_warm(),
             human_signal_threshold: default_judge_human_signal_threshold(),
@@ -2094,6 +2100,8 @@ struct SectionExplicit<'a> {
     provider: Option<&'a str>,
     /// Whether `provider == "inherit"` — slow-channel "fall through" hint.
     inherit: bool,
+    /// Section-level, provider-agnostic max input override.
+    max_input_chars: Option<usize>,
     /// Section's own provider sub-tables (legacy v0.26.x shape).
     google_model: Option<&'a str>,
     google_api_key_env: Option<&'static str>,
@@ -2109,6 +2117,7 @@ impl<'a> SectionExplicit<'a> {
         Self {
             provider: None,
             inherit: false,
+            max_input_chars: None,
             google_model: None,
             google_api_key_env: None,
             google_endpoint: None,
@@ -2153,6 +2162,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 Some(cfg.extract.provider.as_str())
             },
             inherit: extract_inherit,
+            max_input_chars: None,
             google_model: nonempty(&cfg.extract.google.model),
             google_api_key_env: Some("GEMINI_API_KEY"),
             google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2174,6 +2184,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.async_memory.provider.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 // No async-memory-specific provider sub-table; reuse
                 // `[extract.{provider}]` (matches the v0.26.x semantic
                 // implemented in `extract/llm.rs::create_memory_worker_extractor`).
@@ -2200,6 +2211,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.intelligent_merge.provider.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.intelligent_merge.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.intelligent_merge.google.endpoint),
@@ -2222,6 +2234,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 Some(cfg.query_expansion.provider.as_str())
             },
             inherit: query_expansion_inherit,
+            max_input_chars: None,
             google_model: nonempty(&cfg.query_expansion.google.model),
             google_api_key_env: Some("GEMINI_API_KEY"),
             google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
@@ -2242,6 +2255,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.search.llm_reranker.as_str())
                 },
                 inherit: reranker_inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.query_expansion.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
@@ -2265,6 +2279,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.ars.llm_backend.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.extract.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2284,6 +2299,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.resummerize.llm_backend.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.extract.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2293,13 +2309,14 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 omlx_max_input_chars: Some(cfg.extract.omlx.max_input_chars),
             }
         }
-        ArsLlmJudge | ArsLlmJudgeNightlyCron => {
-            // New-in-v0.27.1 sections — no level-1 explicit shape.
-            // Resolver walks to level 2 (parent section provider for the
-            // nightly cron variant) → level 3 (`[llm]`) → level 4
-            // (hardcoded).
-            SectionExplicit::empty()
-        }
+        ArsLlmJudge | ArsLlmJudgeNightlyCron => SectionExplicit {
+            // New-in-v0.27.1 sections — no level-1 provider shape.
+            // `max_input_chars` is intentionally section-local, so it
+            // can override the global `[llm.{provider}]` cap once a
+            // provider is resolved at level 3.
+            max_input_chars: cfg.ars.llm_judge.max_input_chars,
+            ..SectionExplicit::empty()
+        },
     }
 }
 
@@ -2529,7 +2546,9 @@ fn build_resolved_for_provider(
             (_, _) => default_google_endpoint(),
         });
 
-    let max_input_chars = l1_max_input_chars
+    let max_input_chars = explicit
+        .max_input_chars
+        .or(l1_max_input_chars)
         .or(l3_max_input_chars)
         .or(l_legacy_max_input_chars)
         .unwrap_or(match chosen {
@@ -2993,6 +3012,28 @@ shadow_only = false
 
         assert!(cfg.ars.acceleration.enabled);
         assert!(!cfg.ars.acceleration.shadow_only);
+    }
+
+    #[test]
+    fn test_ars_llm_judge_max_input_chars_overrides_resolved_llm_default() {
+        let toml_str = r#"
+[llm]
+provider = "google"
+
+[llm.google]
+model = "gemini-test"
+max_input_chars = 4096
+
+[ars.llm_judge]
+max_input_chars = 512
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str)
+            .expect("ars.llm_judge.max_input_chars should be accepted");
+        let resolved = cfg
+            .resolve_llm_for("ars.llm_judge")
+            .expect("ars.llm_judge should resolve via [llm]");
+
+        assert_eq!(resolved.max_input_chars, 512);
     }
 
     /// RAII guard: remember the current env var value and restore it on drop,

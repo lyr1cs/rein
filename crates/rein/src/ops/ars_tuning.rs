@@ -115,7 +115,10 @@ pub fn llm_feedback_reliability(
     let Some(calibration) = calibration else {
         return 0.0;
     };
-    if calibration.judge_drift_alert > 0 {
+    if calibration.judge_drift_alert > 0
+        || calibration.judge_drift_alert_synthesis > 0
+        || calibration.judge_drift_alert_concept > 0
+    {
         return 0.0;
     }
 
@@ -125,6 +128,12 @@ pub fn llm_feedback_reliability(
     }
     if calibration.recent_pairs_runtime_vs_offline.len() >= 30 {
         parts.push(clamp01(calibration.runtime_vs_offline_kappa));
+    }
+    if calibration.recent_pairs_runtime_vs_offline_synthesis.len() >= 30 {
+        parts.push(clamp01(calibration.runtime_vs_offline_kappa_synthesis));
+    }
+    if calibration.recent_pairs_runtime_vs_offline_concept.len() >= 30 {
+        parts.push(clamp01(calibration.runtime_vs_offline_kappa_concept));
     }
     if parts.is_empty() {
         0.0
@@ -138,16 +147,36 @@ pub fn effective_judge_weight_decay_rate(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     production_canary: bool,
 ) -> f64 {
+    effective_judge_weight_decay_rate_with_previous(
+        static_rate,
+        calibration,
+        production_canary,
+        None,
+    )
+}
+
+pub fn effective_judge_weight_decay_rate_with_previous(
+    static_rate: f64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+    previous_effective: Option<f64>,
+) -> f64 {
     let pair_count = calibration
         .map(|cal| {
             cal.recent_pairs_synthesis
                 .len()
                 .saturating_add(cal.recent_pairs_concept.len())
                 .saturating_add(cal.recent_pairs_runtime_vs_offline.len())
+                .saturating_add(cal.recent_pairs_runtime_vs_offline_synthesis.len())
+                .saturating_add(cal.recent_pairs_runtime_vs_offline_concept.len())
         })
         .unwrap_or(0) as u64;
     let drift_alert = calibration
-        .map(|cal| cal.judge_drift_alert > 0)
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
         .unwrap_or(false);
     if production_canary && drift_alert {
         return 0.0;
@@ -155,7 +184,7 @@ pub fn effective_judge_weight_decay_rate(
     effective_scalar(
         static_rate,
         llm_feedback_reliability(calibration),
-        None,
+        previous_effective,
         bounds01(0.10),
         TrustInputs {
             enabled: true,
@@ -178,6 +207,22 @@ pub fn effective_judge_sample_rate(
     production_canary: bool,
     cold_start: bool,
 ) -> f64 {
+    effective_judge_sample_rate_with_previous(
+        static_rate,
+        calibration,
+        production_canary,
+        cold_start,
+        None,
+    )
+}
+
+pub fn effective_judge_sample_rate_with_previous(
+    static_rate: f64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+    cold_start: bool,
+    previous_effective: Option<f64>,
+) -> f64 {
     let max_rate = if cold_start { 1.0 } else { 0.5 };
     let static_rate = finite_non_negative(static_rate).min(max_rate);
     if !production_canary || static_rate <= f64::EPSILON {
@@ -185,7 +230,11 @@ pub fn effective_judge_sample_rate(
     }
 
     let drift_alert = calibration
-        .map(|cal| cal.judge_drift_alert > 0)
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
         .unwrap_or(false);
     if drift_alert {
         return 0.0;
@@ -200,7 +249,7 @@ pub fn effective_judge_sample_rate(
     effective_scalar(
         static_rate,
         learned_rate,
-        None,
+        previous_effective,
         ScalarBounds {
             min: 0.0,
             max: max_rate,
@@ -226,8 +275,21 @@ pub fn effective_cold_start_n(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     production_canary: bool,
 ) -> u64 {
+    effective_cold_start_n_with_previous(static_n, calibration, production_canary, None)
+}
+
+pub fn effective_cold_start_n_with_previous(
+    static_n: u64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+    previous_effective: Option<f64>,
+) -> u64 {
     let drift_alert = calibration
-        .map(|cal| cal.judge_drift_alert > 0)
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
         .unwrap_or(false);
     if !production_canary || drift_alert || static_n == 0 {
         return static_n;
@@ -238,7 +300,7 @@ pub fn effective_cold_start_n(
     effective_scalar(
         static_n as f64,
         learned_n,
-        None,
+        previous_effective,
         ScalarBounds {
             min: (static_n as f64).min(3.0),
             max: 50.0,
@@ -269,9 +331,34 @@ pub fn effective_useful_rate_threshold(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     production_canary: bool,
 ) -> f64 {
+    effective_useful_rate_threshold_with_previous(
+        static_threshold,
+        observed_useful_rate,
+        human_count,
+        llm_count,
+        calibration,
+        production_canary,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn effective_useful_rate_threshold_with_previous(
+    static_threshold: f64,
+    observed_useful_rate: f64,
+    human_count: u64,
+    llm_count: u64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    production_canary: bool,
+    previous_effective: Option<f64>,
+) -> f64 {
     let static_threshold = clamp01(finite_or(static_threshold, 0.0));
     let drift_alert = calibration
-        .map(|cal| cal.judge_drift_alert > 0)
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
         .unwrap_or(false);
     if !production_canary || drift_alert {
         return static_threshold;
@@ -280,7 +367,7 @@ pub fn effective_useful_rate_threshold(
     effective_scalar(
         static_threshold,
         observed_useful_rate.clamp(0.35, 0.75),
-        None,
+        previous_effective,
         bounds01(0.05),
         TrustInputs {
             enabled: true,
@@ -323,7 +410,10 @@ fn calibration_pair_count(
             cal.recent_pairs_synthesis
                 .len()
                 .saturating_add(cal.recent_pairs_concept.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline.len()) as u64
+                .saturating_add(cal.recent_pairs_runtime_vs_offline.len())
+                .saturating_add(cal.recent_pairs_runtime_vs_offline_synthesis.len())
+                .saturating_add(cal.recent_pairs_runtime_vs_offline_concept.len())
+                as u64
         })
         .unwrap_or(0)
 }

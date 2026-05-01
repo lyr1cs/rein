@@ -454,6 +454,14 @@ pub struct AdaptiveState {
     #[serde(default)]
     pub learned_shadow_fusion: HashMap<String, LearnedShadowFusionEntry>,
 
+    /// v0.28 ARS acceleration: persisted effective scalar parameters.
+    /// The dynamic policy computes a bounded blend from static config toward
+    /// learned priors; persisting the last effective value lets the next pass
+    /// apply `max_step` smoothing instead of jumping directly from the static
+    /// bootstrap.
+    #[serde(default)]
+    pub ars_effective_scalars: HashMap<String, ArsEffectiveScalarEntry>,
+
     /// M4: Current cluster version (incremented on each reclustering).
     pub cluster_version: u64,
 
@@ -641,6 +649,22 @@ pub struct LearnedShadowFusionEntry {
     pub last_updated: String, // RFC3339
 }
 
+/// Persisted dynamic scalar with timestamp metadata for CAS merge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArsEffectiveScalarEntry {
+    pub value: f64,
+    pub last_updated: String, // RFC3339
+}
+
+pub const ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE: &str = "judge_weight_decay_rate";
+pub const ARS_SCALAR_SYNTHESIS_COLD_START_N: &str = "synthesis_cold_start_n";
+pub const ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N: &str = "concept_summary_cold_start_n";
+pub const ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START: &str = "judge_sample_rate_cold_start";
+pub const ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM: &str = "judge_sample_rate_warm";
+pub const ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD: &str = "synthesis_useful_rate_threshold";
+pub const ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD: &str =
+    "concept_summary_useful_rate_threshold";
+
 /// Per-cluster (and global) canonical content length percentiles (v0.23).
 ///
 /// Drives adaptive `target_bytes` for resummerize compression.
@@ -685,6 +709,29 @@ impl CanonicalLengthStats {
 }
 
 impl AdaptiveState {
+    pub fn ars_effective_scalar(&self, key: &str) -> Option<f64> {
+        self.ars_effective_scalars.get(key).and_then(|entry| {
+            if entry.value.is_finite() {
+                Some(entry.value)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn set_ars_effective_scalar(&mut self, key: impl Into<String>, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.ars_effective_scalars.insert(
+            key.into(),
+            ArsEffectiveScalarEntry {
+                value,
+                last_updated: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+
     /// Build bucket key from query_type and optional cluster_id.
     pub fn bucket_key(query_type: &str, cluster_id: Option<u32>) -> String {
         let query_type = query_type.to_lowercase();
@@ -1134,12 +1181,23 @@ impl AdaptiveState {
                                     > theirs.last_consumed_event_id_calibration
                                 {
                                     out.runtime_vs_offline_kappa = mine.runtime_vs_offline_kappa;
+                                    out.runtime_vs_offline_kappa_synthesis =
+                                        mine.runtime_vs_offline_kappa_synthesis;
+                                    out.runtime_vs_offline_kappa_concept =
+                                        mine.runtime_vs_offline_kappa_concept;
                                     out.last_consumed_event_id_calibration =
                                         mine.last_consumed_event_id_calibration;
                                     out.recent_pairs_runtime_vs_offline =
                                         mine.recent_pairs_runtime_vs_offline.clone();
+                                    out.recent_pairs_runtime_vs_offline_synthesis =
+                                        mine.recent_pairs_runtime_vs_offline_synthesis.clone();
+                                    out.recent_pairs_runtime_vs_offline_concept =
+                                        mine.recent_pairs_runtime_vs_offline_concept.clone();
                                     out.total_offline_cron_events = mine.total_offline_cron_events;
                                     out.judge_drift_alert = mine.judge_drift_alert;
+                                    out.judge_drift_alert_synthesis =
+                                        mine.judge_drift_alert_synthesis;
+                                    out.judge_drift_alert_concept = mine.judge_drift_alert_concept;
                                     out.last_computed_at = mine.last_computed_at;
                                 }
                                 Some(out)
@@ -1189,6 +1247,22 @@ impl AdaptiveState {
                         if mine_max > theirs_max {
                             current.pending_kappa_half_pairs =
                                 self.pending_kappa_half_pairs.clone();
+                        }
+                    }
+                    // v0.28 ARS acceleration: scalar smoothing state is keyed
+                    // independently of event consumers. Merge per key by
+                    // RFC3339 timestamp so unrelated scalar updates from two
+                    // writers do not clobber each other.
+                    for (key, mine) in &self.ars_effective_scalars {
+                        let replace = current
+                            .ars_effective_scalars
+                            .get(key)
+                            .map(|theirs| mine.last_updated > theirs.last_updated)
+                            .unwrap_or(true);
+                        if replace {
+                            current
+                                .ars_effective_scalars
+                                .insert(key.clone(), mine.clone());
                         }
                     }
                     current.version = db_version + 1;
@@ -1841,6 +1915,65 @@ pub const SYNTHESIS_COLD_START_N: u64 = 10;
 /// `useful_rate` ablation lands.
 pub const SYNTHESIS_USEFUL_RATE_THRESHOLD: f64 = 0.5; // bootstrap; v0.26.1 → adaptive
 
+/// Dynamic useful-rate weights for Cap B synthesis and Cap A concept-summary
+/// feedback. The historical constants remain the default, but v0.28 can now
+/// thread bootstrap priors / replay-derived SignalHint labels through the
+/// production formulas without changing the persisted bucket schema.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct UsefulRateWeights {
+    pub view: f64,
+    pub click: f64,
+    pub thumb: f64,
+    pub requery: f64,
+}
+
+impl UsefulRateWeights {
+    pub const fn synthesis_bootstrap() -> Self {
+        Self {
+            view: SYNTHESIS_W_VIEW,
+            click: SYNTHESIS_W_CLICK,
+            thumb: SYNTHESIS_W_THUMB,
+            requery: SYNTHESIS_W_REQUERY,
+        }
+    }
+
+    pub const fn concept_summary_bootstrap() -> Self {
+        Self {
+            view: CONCEPT_SUMMARY_W_VIEW,
+            click: CONCEPT_SUMMARY_W_CLICK,
+            thumb: CONCEPT_SUMMARY_W_THUMB,
+            requery: CONCEPT_SUMMARY_W_REQUERY,
+        }
+    }
+
+    /// Build weights from prior/posterior labels. Invalid fields fall back to
+    /// the supplied baseline; at least one positive finite weight is required.
+    pub fn from_priors(baseline: Self, view: f64, click: f64, thumb: f64, requery: f64) -> Self {
+        let sanitize = |value: f64, fallback: f64| {
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                fallback
+            }
+        };
+        let candidate = Self {
+            view: sanitize(view, baseline.view),
+            click: sanitize(click, baseline.click),
+            thumb: sanitize(thumb, baseline.thumb),
+            requery: sanitize(requery, baseline.requery),
+        };
+        if candidate.denominator() > 0.0 {
+            candidate
+        } else {
+            baseline
+        }
+    }
+
+    fn denominator(self) -> f64 {
+        self.view + self.click + self.thumb + self.requery
+    }
+}
+
 /// Per-bucket key used by [`SynthesisFeedbackState::by_cluster`]. Bucket
 /// is `(cluster_id, query_type)` — both can be unknown, in which case
 /// the consumer routes events to the global bucket key
@@ -1888,6 +2021,10 @@ pub struct ClusterSynthesisStats {
     pub llm_judge_hit_count: u64,
     /// Derived metric, recomputed on every consumer pass.
     pub useful_rate: f64,
+    /// v0.28 — LRU eviction key. Highest `feedback_events.id` folded into
+    /// this bucket. Mirrors [`ClusterConceptSummaryStats::last_event_id`].
+    #[serde(default)]
+    pub last_event_id: i64,
 }
 
 /// v0.26 D direction: per-synthesis_id stats with bounded LRU semantics.
@@ -1939,6 +2076,32 @@ pub struct SynthesisFeedbackState {
     pub total_events: u64,
 }
 
+/// v0.28 — LRU eviction for the synthesis `by_cluster` map. Older releases
+/// dropped new buckets once [`SYNTHESIS_BY_CLUSTER_CAP`] was reached, which
+/// meant a saturated vault silently ignored fresh production signal. This
+/// mirrors the Cap A concept-summary LRU behavior.
+fn evict_synthesis_lru_if_at_cap(
+    by_cluster: &mut HashMap<String, ClusterSynthesisStats>,
+    new_key: &str,
+) {
+    if by_cluster.contains_key(new_key) || by_cluster.len() < SYNTHESIS_BY_CLUSTER_CAP {
+        return;
+    }
+    let victim_key = by_cluster
+        .iter()
+        .min_by_key(|(_, b)| b.last_event_id)
+        .map(|(k, _)| k.clone());
+    if let Some(victim) = victim_key {
+        tracing::warn!(
+            evicted_bucket = %victim,
+            new_bucket = %new_key,
+            cap = SYNTHESIS_BY_CLUSTER_CAP,
+            "synthesis_feedback: by_cluster cap reached; evicting LRU bucket"
+        );
+        by_cluster.remove(&victim);
+    }
+}
+
 /// Pure function — testable in isolation. Computes a `[0.0, 1.0]`
 /// usefulness rate from a single bucket's aggregate counters.
 ///
@@ -1958,6 +2121,13 @@ pub struct SynthesisFeedbackState {
 /// weights are documented above; v0.26.1 will derive them from a
 /// SemDeDup-style ablation.
 pub fn compute_useful_rate(stats: &ClusterSynthesisStats) -> f64 {
+    compute_useful_rate_with_weights(stats, UsefulRateWeights::synthesis_bootstrap())
+}
+
+pub fn compute_useful_rate_with_weights(
+    stats: &ClusterSynthesisStats,
+    weights: UsefulRateWeights,
+) -> f64 {
     let total_views = stats.viewed_count.max(1) as f64;
     let dwell_pct = if stats.dwell_samples.is_empty() {
         0.0
@@ -1974,11 +2144,13 @@ pub fn compute_useful_rate(stats: &ClusterSynthesisStats) -> f64 {
         stats.explicit_up as f64 / (stats.explicit_up + stats.explicit_down + 1) as f64;
     let requery_rate = stats.immediate_requery_count as f64 / total_views;
 
-    let numerator = SYNTHESIS_W_VIEW * dwell_pct
-        + SYNTHESIS_W_CLICK * click_rate
-        + SYNTHESIS_W_THUMB * thumb_rate
-        - SYNTHESIS_W_REQUERY * requery_rate;
-    let denom = SYNTHESIS_W_VIEW + SYNTHESIS_W_CLICK + SYNTHESIS_W_THUMB + SYNTHESIS_W_REQUERY;
+    let numerator =
+        weights.view * dwell_pct + weights.click * click_rate + weights.thumb * thumb_rate
+            - weights.requery * requery_rate;
+    let denom = weights.denominator();
+    if denom <= 0.0 || !denom.is_finite() {
+        return 0.0;
+    }
     (numerator / denom).clamp(0.0, 1.0)
 }
 
@@ -2107,26 +2279,11 @@ pub fn recompute_synthesis_feedback_stats(
         };
         let bucket_key = synthesis_bucket_key(cluster_id, &query_type);
 
-        // F-11 hard cap: drop event if creating a new bucket would push
-        // by_cluster past the cap. Existing buckets continue to receive
-        // updates so legitimate signal isn't lost.
-        if !state.by_cluster.contains_key(&bucket_key)
-            && state.by_cluster.len() >= SYNTHESIS_BY_CLUSTER_CAP
-        {
-            tracing::warn!(
-                cluster_id = ?cluster_id,
-                query_type = %query_type,
-                cap = SYNTHESIS_BY_CLUSTER_CAP,
-                "synthesis_feedback: by_cluster cap reached; dropping new bucket event"
-            );
-            // Still bump total_events so the consumer offset advances and
-            // we don't replay this event forever.
-            state.total_events = state.total_events.saturating_add(1);
-            continue;
-        }
+        evict_synthesis_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
 
         // Per-bucket fold.
         let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+        bucket.last_event_id = bucket.last_event_id.max(ev.id);
         match &payload.interaction {
             SynthesisInteractionKind::Viewed { dwell_ms } => {
                 bucket.viewed_count = bucket.viewed_count.saturating_add(1);
@@ -2281,6 +2438,34 @@ pub fn recompute_synthesis_feedback_stats_with_judge(
     JudgeCalibrationState,
     Option<i64>,
 )> {
+    recompute_synthesis_feedback_stats_with_judge_and_weights(
+        conn,
+        prior,
+        pending_pairs_prior,
+        calibration_prior,
+        weight_decay_rate,
+        UsefulRateWeights::synthesis_bootstrap(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recompute_synthesis_feedback_stats_with_judge_and_weights(
+    conn: &Connection,
+    prior: Option<SynthesisFeedbackState>,
+    pending_pairs_prior: HashMap<String, HalfPair>,
+    calibration_prior: JudgeCalibrationState,
+    // Codex R2 P2 fix — operator-tunable LLM signal weight (default 0.3
+    // per spec §6.4). Caller threads `[ars.llm_judge].weight_decay_rate`
+    // here so `useful_rate = 0.0` lets operators keep judge events for
+    // observability while disabling their effect on `decide_synthesize`.
+    weight_decay_rate: f64,
+    useful_rate_weights: UsefulRateWeights,
+) -> ReinResult<(
+    SynthesisFeedbackState,
+    HashMap<String, HalfPair>,
+    JudgeCalibrationState,
+    Option<i64>,
+)> {
     let mut state = prior.unwrap_or_default();
     let mut pending_pairs = pending_pairs_prior;
     let mut calibration = calibration_prior;
@@ -2347,6 +2532,7 @@ pub fn recompute_synthesis_feedback_stats_with_judge(
                     &mut calibration,
                     &mut touched_buckets,
                     &payload,
+                    ev.id,
                 );
             }
             "synthesis_llm_judge" => {
@@ -2367,6 +2553,7 @@ pub fn recompute_synthesis_feedback_stats_with_judge(
                     &mut calibration,
                     &mut touched_buckets,
                     &payload,
+                    ev.id,
                 );
             }
             other => {
@@ -2389,10 +2576,14 @@ pub fn recompute_synthesis_feedback_stats_with_judge(
             // human-only buckets keep their previously-computed values
             // bit-identical (avoids invalidating in-flight A/B tests).
             bucket.useful_rate = if bucket.llm_judge_count > 0 {
-                compute_useful_rate_with_judge(bucket, weight_decay_rate)
-                    .unwrap_or_else(|| compute_useful_rate(bucket))
+                compute_useful_rate_with_judge_and_weights(
+                    bucket,
+                    weight_decay_rate,
+                    useful_rate_weights,
+                )
+                .unwrap_or_else(|| compute_useful_rate_with_weights(bucket, useful_rate_weights))
             } else {
-                compute_useful_rate(bucket)
+                compute_useful_rate_with_weights(bucket, useful_rate_weights)
             };
         }
     }
@@ -2427,6 +2618,7 @@ fn fold_synthesis_interaction(
     calibration: &mut JudgeCalibrationState,
     touched_buckets: &mut std::collections::HashSet<String>,
     payload: &SynthesisInteractionPayload,
+    event_id: i64,
 ) {
     let metadata = payload.metadata.clone().unwrap_or_default();
     let cluster_id = metadata.cluster_id;
@@ -2438,21 +2630,10 @@ fn fold_synthesis_interaction(
     };
     let bucket_key = synthesis_bucket_key(cluster_id, &query_type);
 
-    // Hard cap.
-    if !state.by_cluster.contains_key(&bucket_key)
-        && state.by_cluster.len() >= SYNTHESIS_BY_CLUSTER_CAP
-    {
-        tracing::warn!(
-            cluster_id = ?cluster_id,
-            query_type = %query_type,
-            cap = SYNTHESIS_BY_CLUSTER_CAP,
-            "synthesis_feedback: by_cluster cap reached; dropping new bucket event"
-        );
-        state.total_events = state.total_events.saturating_add(1);
-        return;
-    }
+    evict_synthesis_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
 
     let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    bucket.last_event_id = bucket.last_event_id.max(event_id);
     match &payload.interaction {
         SynthesisInteractionKind::Viewed { dwell_ms } => {
             bucket.viewed_count = bucket.viewed_count.saturating_add(1);
@@ -2555,6 +2736,7 @@ fn fold_synthesis_llm_judge(
     calibration: &mut JudgeCalibrationState,
     touched_buckets: &mut std::collections::HashSet<String>,
     payload: &SynthesisLlmJudgePayload,
+    event_id: i64,
 ) {
     let metadata = payload.metadata.clone().unwrap_or_default();
     let cluster_id = metadata.cluster_id;
@@ -2566,20 +2748,10 @@ fn fold_synthesis_llm_judge(
     };
     let bucket_key = synthesis_bucket_key(cluster_id, &query_type);
 
-    if !state.by_cluster.contains_key(&bucket_key)
-        && state.by_cluster.len() >= SYNTHESIS_BY_CLUSTER_CAP
-    {
-        tracing::warn!(
-            cluster_id = ?cluster_id,
-            query_type = %query_type,
-            cap = SYNTHESIS_BY_CLUSTER_CAP,
-            "synthesis_feedback: by_cluster cap reached; dropping new judge event"
-        );
-        state.total_events = state.total_events.saturating_add(1);
-        return;
-    }
+    evict_synthesis_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
 
     let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    bucket.last_event_id = bucket.last_event_id.max(event_id);
     bucket.llm_judge_count = bucket.llm_judge_count.saturating_add(1);
     if payload.hit {
         bucket.llm_judge_hit_count = bucket.llm_judge_hit_count.saturating_add(1);
@@ -2945,6 +3117,70 @@ fn evict_concept_summary_lru_if_at_cap(
     }
 }
 
+fn normalize_concept_summary_query_type(raw_qtype: &str) -> String {
+    if CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
+        raw_qtype.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn concept_summary_bucket_keys_from_metadata(metadata: &ConceptSummaryMetadata) -> Vec<String> {
+    let primary_query_type =
+        normalize_concept_summary_query_type(metadata.query_type.as_deref().unwrap_or(""));
+    let primary = concept_summary_bucket_key(metadata.cluster_id, &primary_query_type);
+    let mut keys = vec![primary.clone()];
+
+    if let Some(route) = metadata.route_context.as_ref() {
+        if route.query_type.is_some() || route.cluster_id.is_some() {
+            let route_query_type =
+                normalize_concept_summary_query_type(route.query_type.as_deref().unwrap_or(""));
+            let route_key = concept_summary_bucket_key(route.cluster_id, &route_query_type);
+            if route_key != primary {
+                keys.push(route_key);
+            }
+        }
+    }
+
+    keys
+}
+
+fn fold_concept_summary_interaction_bucket(
+    state: &mut ConceptSummaryFeedbackState,
+    bucket_key: &str,
+    interaction: &ConceptSummaryInteractionKind,
+    event_id: i64,
+) {
+    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, bucket_key);
+
+    let bucket = state.by_cluster.entry(bucket_key.to_string()).or_default();
+    bucket.last_event_id = bucket.last_event_id.max(event_id);
+    match interaction {
+        ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
+            bucket.viewed_count = bucket.viewed_count.saturating_add(1);
+            bucket.viewed_dwell_total_ms = bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
+            bucket.dwell_samples.push(*dwell_ms);
+            if bucket.dwell_samples.len() > CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP {
+                let overflow = bucket.dwell_samples.len() - CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP;
+                bucket.dwell_samples.drain(0..overflow);
+            }
+        }
+        ConceptSummaryInteractionKind::ClickedSource { source_index: _ } => {
+            bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
+        }
+        ConceptSummaryInteractionKind::ImmediateRequery { gap_ms: _ } => {
+            bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
+        }
+        ConceptSummaryInteractionKind::ExplicitThumb { up } => {
+            if *up {
+                bucket.explicit_up = bucket.explicit_up.saturating_add(1);
+            } else {
+                bucket.explicit_down = bucket.explicit_down.saturating_add(1);
+            }
+        }
+    }
+}
+
 /// Pure function — testable in isolation. Computes a `[0.0, 1.0]`
 /// usefulness rate from a single bucket's aggregate counters.
 /// Mirrors [`compute_useful_rate`] for the concept-summary surface.
@@ -2965,6 +3201,16 @@ fn evict_concept_summary_lru_if_at_cap(
 /// weights are documented above; v0.27.1 will derive them from a
 /// SemDeDup-style ablation.
 pub fn compute_concept_summary_useful_rate(stats: &ClusterConceptSummaryStats) -> f64 {
+    compute_concept_summary_useful_rate_with_weights(
+        stats,
+        UsefulRateWeights::concept_summary_bootstrap(),
+    )
+}
+
+pub fn compute_concept_summary_useful_rate_with_weights(
+    stats: &ClusterConceptSummaryStats,
+    weights: UsefulRateWeights,
+) -> f64 {
     let total_views = stats.viewed_count.max(1) as f64;
     let dwell_pct = if stats.dwell_samples.is_empty() {
         0.0
@@ -2981,14 +3227,13 @@ pub fn compute_concept_summary_useful_rate(stats: &ClusterConceptSummaryStats) -
         stats.explicit_up as f64 / (stats.explicit_up + stats.explicit_down + 1) as f64;
     let requery_rate = stats.immediate_requery_count as f64 / total_views;
 
-    let numerator = CONCEPT_SUMMARY_W_VIEW * dwell_pct
-        + CONCEPT_SUMMARY_W_CLICK * click_rate
-        + CONCEPT_SUMMARY_W_THUMB * thumb_rate
-        - CONCEPT_SUMMARY_W_REQUERY * requery_rate;
-    let denom = CONCEPT_SUMMARY_W_VIEW
-        + CONCEPT_SUMMARY_W_CLICK
-        + CONCEPT_SUMMARY_W_THUMB
-        + CONCEPT_SUMMARY_W_REQUERY;
+    let numerator =
+        weights.view * dwell_pct + weights.click * click_rate + weights.thumb * thumb_rate
+            - weights.requery * requery_rate;
+    let denom = weights.denominator();
+    if denom <= 0.0 || !denom.is_finite() {
+        return 0.0;
+    }
     (numerator / denom).clamp(0.0, 1.0)
 }
 
@@ -3093,51 +3338,15 @@ pub fn recompute_concept_summary_feedback_stats(
         };
 
         let metadata = payload.metadata.clone().unwrap_or_default();
-        let cluster_id = metadata.cluster_id;
-        let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
-        // Whitelist normalize: clamp non-allowed query_types to "unknown" so
-        // malicious clients can't multiplicatively grow the bucket space.
-        let query_type = if CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
-            raw_qtype.to_string()
-        } else {
-            "unknown".to_string()
-        };
-        let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
-
-        // v0.27.5 R2 — LRU eviction at cap. New events keep the cap
-        // tight by evicting the least-recently-active bucket (lowest
-        // `last_event_id`). Existing buckets are untouched.
-        evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
-
-        // Per-bucket fold.
-        let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
-        bucket.last_event_id = bucket.last_event_id.max(ev.id);
-        match &payload.interaction {
-            ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
-                bucket.viewed_count = bucket.viewed_count.saturating_add(1);
-                bucket.viewed_dwell_total_ms =
-                    bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
-                bucket.dwell_samples.push(*dwell_ms);
-                if bucket.dwell_samples.len() > CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP {
-                    let overflow = bucket.dwell_samples.len() - CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP;
-                    bucket.dwell_samples.drain(0..overflow);
-                }
-            }
-            ConceptSummaryInteractionKind::ClickedSource { source_index: _ } => {
-                bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
-            }
-            ConceptSummaryInteractionKind::ImmediateRequery { gap_ms: _ } => {
-                bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
-            }
-            ConceptSummaryInteractionKind::ExplicitThumb { up } => {
-                if *up {
-                    bucket.explicit_up = bucket.explicit_up.saturating_add(1);
-                } else {
-                    bucket.explicit_down = bucket.explicit_down.saturating_add(1);
-                }
-            }
+        for bucket_key in concept_summary_bucket_keys_from_metadata(&metadata) {
+            fold_concept_summary_interaction_bucket(
+                &mut state,
+                &bucket_key,
+                &payload.interaction,
+                ev.id,
+            );
+            touched_buckets.insert(bucket_key);
         }
-        touched_buckets.insert(bucket_key);
 
         // Per-concept_id LRU fold. HashMap update + side-vec FIFO must
         // happen together; failure to dual-update leaks orphan keys.
@@ -3230,6 +3439,31 @@ pub fn recompute_concept_summary_feedback_stats_with_judge(
     calibration_prior: JudgeCalibrationState,
     // Codex R2 P2 fix — same threading as synthesis variant.
     weight_decay_rate: f64,
+) -> ReinResult<(
+    ConceptSummaryFeedbackState,
+    HashMap<String, HalfPair>,
+    JudgeCalibrationState,
+    Option<i64>,
+)> {
+    recompute_concept_summary_feedback_stats_with_judge_and_weights(
+        conn,
+        prior,
+        pending_pairs_prior,
+        calibration_prior,
+        weight_decay_rate,
+        UsefulRateWeights::concept_summary_bootstrap(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recompute_concept_summary_feedback_stats_with_judge_and_weights(
+    conn: &Connection,
+    prior: Option<ConceptSummaryFeedbackState>,
+    pending_pairs_prior: HashMap<String, HalfPair>,
+    calibration_prior: JudgeCalibrationState,
+    // Codex R2 P2 fix — same threading as synthesis variant.
+    weight_decay_rate: f64,
+    useful_rate_weights: UsefulRateWeights,
 ) -> ReinResult<(
     ConceptSummaryFeedbackState,
     HashMap<String, HalfPair>,
@@ -3339,10 +3573,16 @@ pub fn recompute_concept_summary_feedback_stats_with_judge(
         if let Some(bucket) = state.by_cluster.get_mut(&key) {
             bucket.viewed_dwell_p50_ms = concept_summary_dwell_p50_ms(&bucket.dwell_samples);
             bucket.useful_rate = if bucket.llm_judge_count > 0 {
-                compute_concept_summary_useful_rate_with_judge(bucket, weight_decay_rate)
-                    .unwrap_or_else(|| compute_concept_summary_useful_rate(bucket))
+                compute_concept_summary_useful_rate_with_judge_and_weights(
+                    bucket,
+                    weight_decay_rate,
+                    useful_rate_weights,
+                )
+                .unwrap_or_else(|| {
+                    compute_concept_summary_useful_rate_with_weights(bucket, useful_rate_weights)
+                })
             } else {
-                compute_concept_summary_useful_rate(bucket)
+                compute_concept_summary_useful_rate_with_weights(bucket, useful_rate_weights)
             };
         }
     }
@@ -3371,69 +3611,29 @@ fn fold_concept_summary_interaction(
     event_id: i64,
 ) {
     let metadata = payload.metadata.clone().unwrap_or_default();
-    let cluster_id = metadata.cluster_id;
-    let raw_qtype = metadata.query_type.as_deref().unwrap_or("");
-    let query_type = if CONCEPT_SUMMARY_ALLOWED_QUERY_TYPES.contains(&raw_qtype) {
-        raw_qtype.to_string()
-    } else {
-        "unknown".to_string()
-    };
-    let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
+    for bucket_key in concept_summary_bucket_keys_from_metadata(&metadata) {
+        fold_concept_summary_interaction_bucket(state, &bucket_key, &payload.interaction, event_id);
+        touched_buckets.insert(bucket_key);
+    }
 
-    // v0.27.5 R2 — LRU eviction at cap (replaces v0.27.4 drop-new-bucket).
-    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
-
-    let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
-    bucket.last_event_id = bucket.last_event_id.max(event_id);
-    match &payload.interaction {
-        ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
-            bucket.viewed_count = bucket.viewed_count.saturating_add(1);
-            bucket.viewed_dwell_total_ms = bucket.viewed_dwell_total_ms.saturating_add(*dwell_ms);
-            bucket.dwell_samples.push(*dwell_ms);
-            if bucket.dwell_samples.len() > CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP {
-                let overflow = bucket.dwell_samples.len() - CONCEPT_SUMMARY_DWELL_RESERVOIR_CAP;
-                bucket.dwell_samples.drain(0..overflow);
-            }
-        }
-        ConceptSummaryInteractionKind::ClickedSource { .. } => {
-            bucket.clicked_source_count = bucket.clicked_source_count.saturating_add(1);
-        }
-        ConceptSummaryInteractionKind::ImmediateRequery { .. } => {
-            bucket.immediate_requery_count = bucket.immediate_requery_count.saturating_add(1);
-        }
-        ConceptSummaryInteractionKind::ExplicitThumb { up } => {
-            if *up {
-                bucket.explicit_up = bucket.explicit_up.saturating_add(1);
-            } else {
-                bucket.explicit_down = bucket.explicit_down.saturating_add(1);
-            }
-            // κ-pair join (spec §6.2.1 Cap A mirror). New clients key by
-            // per-refresh `concept_summary_id` so a thumb cannot pair with a
-            // judge verdict for another summary instance. Older clients omit
-            // the field and keep the legacy concept_id key.
-            let now_ts = chrono::Utc::now().timestamp();
-            let key = payload
-                .concept_summary_id
-                .as_ref()
-                .unwrap_or(&payload.concept_id)
-                .clone();
-            if let Some(half) = pending_pairs.remove(&key) {
-                if let HalfPair::Judge {
-                    hit, ts, surface, ..
-                } = &half
-                {
-                    remove_half_pair_alias(pending_pairs, &key, &half);
-                    calibration.push_pair(*surface, *hit, *up, *ts);
-                } else {
-                    pending_pairs.insert(
-                        key,
-                        HalfPair::Thumb {
-                            up: *up,
-                            ts: now_ts,
-                            surface: JudgeSurface::ConceptSummary,
-                        },
-                    );
-                }
+    if let ConceptSummaryInteractionKind::ExplicitThumb { up } = &payload.interaction {
+        // κ-pair join (spec §6.2.1 Cap A mirror). New clients key by
+        // per-refresh `concept_summary_id` so a thumb cannot pair with a
+        // judge verdict for another summary instance. Older clients omit
+        // the field and keep the legacy concept_id key.
+        let now_ts = chrono::Utc::now().timestamp();
+        let key = payload
+            .concept_summary_id
+            .as_ref()
+            .unwrap_or(&payload.concept_id)
+            .clone();
+        if let Some(half) = pending_pairs.remove(&key) {
+            if let HalfPair::Judge {
+                hit, ts, surface, ..
+            } = &half
+            {
+                remove_half_pair_alias(pending_pairs, &key, &half);
+                calibration.push_pair(*surface, *hit, *up, *ts);
             } else {
                 pending_pairs.insert(
                     key,
@@ -3444,9 +3644,17 @@ fn fold_concept_summary_interaction(
                     },
                 );
             }
+        } else {
+            pending_pairs.insert(
+                key,
+                HalfPair::Thumb {
+                    up: *up,
+                    ts: now_ts,
+                    surface: JudgeSurface::ConceptSummary,
+                },
+            );
         }
     }
-    touched_buckets.insert(bucket_key);
 
     let cid_str = payload.concept_id.clone();
     let existed = state.by_concept.contains_key(&cid_str);
@@ -3931,6 +4139,12 @@ pub struct JudgeCalibrationState {
     /// `0.0` when undefined.
     #[serde(default)]
     pub runtime_vs_offline_kappa: f64,
+    /// Per-surface runtime-vs-offline drift κ for synthesis judge events.
+    #[serde(default)]
+    pub runtime_vs_offline_kappa_synthesis: f64,
+    /// Per-surface runtime-vs-offline drift κ for concept-summary judge events.
+    #[serde(default)]
+    pub runtime_vs_offline_kappa_concept: f64,
     /// Durable watermark for `judge_calibration` consumer.
     /// Without this, if `save_snapshot` succeeds and
     /// `commit_offset('judge_calibration')` fails, the same OfflineCron
@@ -3943,6 +4157,12 @@ pub struct JudgeCalibrationState {
     /// FIFO-evict oldest on overflow.
     #[serde(default)]
     pub recent_pairs_runtime_vs_offline: std::collections::VecDeque<(bool, bool, i64)>,
+    /// Synthesis-only runtime-vs-offline pair window.
+    #[serde(default)]
+    pub recent_pairs_runtime_vs_offline_synthesis: std::collections::VecDeque<(bool, bool, i64)>,
+    /// Concept-summary-only runtime-vs-offline pair window.
+    #[serde(default)]
+    pub recent_pairs_runtime_vs_offline_concept: std::collections::VecDeque<(bool, bool, i64)>,
     /// Total Layer 2 events the consumer has processed (replay-counted once).
     /// Useful for `/api/judge/calibration` exposure of drift coverage.
     #[serde(default)]
@@ -3954,6 +4174,12 @@ pub struct JudgeCalibrationState {
     /// disable runtime judge.
     #[serde(default)]
     pub judge_drift_alert: u64,
+    /// Synthesis-only drift alert count.
+    #[serde(default)]
+    pub judge_drift_alert_synthesis: u64,
+    /// Concept-summary-only drift alert count.
+    #[serde(default)]
+    pub judge_drift_alert_concept: u64,
     /// Unix timestamp (seconds) of the last `runtime_vs_offline_kappa`
     /// recomputation. Diagnostic — surfaced by doctor / `/api/judge/calibration`.
     #[serde(default)]
@@ -4075,6 +4301,18 @@ pub fn compute_useful_rate_with_judge(
     stats: &ClusterSynthesisStats,
     weight_decay_rate: f64,
 ) -> Option<f64> {
+    compute_useful_rate_with_judge_and_weights(
+        stats,
+        weight_decay_rate,
+        UsefulRateWeights::synthesis_bootstrap(),
+    )
+}
+
+pub fn compute_useful_rate_with_judge_and_weights(
+    stats: &ClusterSynthesisStats,
+    weight_decay_rate: f64,
+    weights: UsefulRateWeights,
+) -> Option<f64> {
     let total_views = stats.viewed_count;
     let explicit_total = stats.explicit_up + stats.explicit_down;
     let llm_total = stats.llm_judge_count;
@@ -4096,22 +4334,22 @@ pub fn compute_useful_rate_with_judge(
         };
         let click_signal = (stats.clicked_source_count as f64 / total_views as f64).min(1.0);
         let requery_signal = (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
-        numerator += SYNTHESIS_W_VIEW * viewed_signal + SYNTHESIS_W_CLICK * click_signal
-            - SYNTHESIS_W_REQUERY * requery_signal;
-        denominator += SYNTHESIS_W_VIEW + SYNTHESIS_W_CLICK + SYNTHESIS_W_REQUERY;
+        numerator += weights.view * viewed_signal + weights.click * click_signal
+            - weights.requery * requery_signal;
+        denominator += weights.view + weights.click + weights.requery;
     }
 
     // Explicit thumb — only active when any thumb exists.
     if explicit_total > 0 {
         let thumb_signal = stats.explicit_up as f64 / explicit_total as f64;
-        numerator += SYNTHESIS_W_THUMB * thumb_signal;
-        denominator += SYNTHESIS_W_THUMB;
+        numerator += weights.thumb * thumb_signal;
+        denominator += weights.thumb;
     }
 
     // LLM judge — only active when any judge event exists. Weight is
     // strictly ≤ W_THUMB by J6 (config-validated weight_decay_rate ≤ 1.0).
     if llm_total > 0 {
-        let w_llm = SYNTHESIS_W_THUMB * weight_decay_rate;
+        let w_llm = weights.thumb * weight_decay_rate;
         let llm_signal = stats.llm_judge_hit_count as f64 / llm_total as f64;
         numerator += w_llm * llm_signal;
         denominator += w_llm;
@@ -4129,6 +4367,18 @@ pub fn compute_useful_rate_with_judge(
 pub fn compute_concept_summary_useful_rate_with_judge(
     stats: &ClusterConceptSummaryStats,
     weight_decay_rate: f64,
+) -> Option<f64> {
+    compute_concept_summary_useful_rate_with_judge_and_weights(
+        stats,
+        weight_decay_rate,
+        UsefulRateWeights::concept_summary_bootstrap(),
+    )
+}
+
+pub fn compute_concept_summary_useful_rate_with_judge_and_weights(
+    stats: &ClusterConceptSummaryStats,
+    weight_decay_rate: f64,
+    weights: UsefulRateWeights,
 ) -> Option<f64> {
     let total_views = stats.viewed_count;
     let explicit_total = stats.explicit_up + stats.explicit_down;
@@ -4150,20 +4400,19 @@ pub fn compute_concept_summary_useful_rate_with_judge(
         };
         let click_signal = (stats.clicked_source_count as f64 / total_views as f64).min(1.0);
         let requery_signal = (stats.immediate_requery_count as f64 / total_views as f64).min(1.0);
-        numerator += CONCEPT_SUMMARY_W_VIEW * viewed_signal
-            + CONCEPT_SUMMARY_W_CLICK * click_signal
-            - CONCEPT_SUMMARY_W_REQUERY * requery_signal;
-        denominator += CONCEPT_SUMMARY_W_VIEW + CONCEPT_SUMMARY_W_CLICK + CONCEPT_SUMMARY_W_REQUERY;
+        numerator += weights.view * viewed_signal + weights.click * click_signal
+            - weights.requery * requery_signal;
+        denominator += weights.view + weights.click + weights.requery;
     }
 
     if explicit_total > 0 {
         let thumb_signal = stats.explicit_up as f64 / explicit_total as f64;
-        numerator += CONCEPT_SUMMARY_W_THUMB * thumb_signal;
-        denominator += CONCEPT_SUMMARY_W_THUMB;
+        numerator += weights.thumb * thumb_signal;
+        denominator += weights.thumb;
     }
 
     if llm_total > 0 {
-        let w_llm = CONCEPT_SUMMARY_W_THUMB * weight_decay_rate;
+        let w_llm = weights.thumb * weight_decay_rate;
         let llm_signal = stats.llm_judge_hit_count as f64 / llm_total as f64;
         numerator += w_llm * llm_signal;
         denominator += w_llm;
@@ -5186,6 +5435,79 @@ mod tests {
         assert!(
             bad_rate < 0.5,
             "bad path useful_rate={bad_rate} should fall below 0.5"
+        );
+    }
+
+    #[test]
+    fn dynamic_useful_rate_weights_affect_synthesis_formula() {
+        let stats = ClusterSynthesisStats {
+            viewed_count: 10,
+            viewed_dwell_total_ms: 10 * 5000,
+            dwell_samples: vec![5000; 10],
+            viewed_dwell_p50_ms: Some(5000),
+            clicked_source_count: 5,
+            immediate_requery_count: 4,
+            explicit_up: 1,
+            explicit_down: 0,
+            useful_rate: 0.0,
+            ..Default::default()
+        };
+        let baseline = compute_useful_rate(&stats);
+        let prior_weights = UsefulRateWeights::from_priors(
+            UsefulRateWeights::synthesis_bootstrap(),
+            0.1,
+            0.1,
+            3.0,
+            0.1,
+        );
+        let dynamic = compute_useful_rate_with_weights(&stats, prior_weights);
+
+        assert!(
+            dynamic > baseline,
+            "SignalHint-derived priors should be able to move the production formula"
+        );
+    }
+
+    #[test]
+    fn synthesis_by_cluster_cap_evicts_lru_bucket() {
+        let mut by_cluster = HashMap::new();
+        by_cluster.insert(
+            "oldest".to_string(),
+            ClusterSynthesisStats {
+                last_event_id: 1,
+                ..Default::default()
+            },
+        );
+        for idx in 1..SYNTHESIS_BY_CLUSTER_CAP {
+            by_cluster.insert(
+                format!("bucket-{idx}"),
+                ClusterSynthesisStats {
+                    last_event_id: (idx as i64) + 10,
+                    ..Default::default()
+                },
+            );
+        }
+
+        evict_synthesis_lru_if_at_cap(&mut by_cluster, "new-bucket");
+
+        assert_eq!(by_cluster.len(), SYNTHESIS_BY_CLUSTER_CAP - 1);
+        assert!(!by_cluster.contains_key("oldest"));
+    }
+
+    #[test]
+    fn ars_effective_scalar_round_trips_through_adaptive_state() {
+        let mut state = AdaptiveState::default();
+        assert!(state
+            .ars_effective_scalar(ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD)
+            .is_none());
+
+        state.set_ars_effective_scalar(ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD, 0.42);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: AdaptiveState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.ars_effective_scalar(ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD),
+            Some(0.42)
         );
     }
 
@@ -6434,7 +6756,7 @@ mod tests {
     }
 
     #[test]
-    fn recompute_concept_summary_feedback_ignores_shadow_route_for_bucket() {
+    fn recompute_concept_summary_feedback_folds_route_context_bucket() {
         let conn = setup_db();
         let synthetic_key = concept_summary_bucket_key(Some(123), "concept_refresh");
         let real_key = concept_summary_bucket_key(Some(7), "Exploratory");
@@ -6465,9 +6787,14 @@ mod tests {
             "production synthetic bucket must receive the event"
         );
         assert!(
-            !state.by_cluster.contains_key(&real_key),
-            "shadow route context must not drive production bucket selection"
+            state.by_cluster.contains_key(&real_key),
+            "real recall route context must also receive human feedback"
         );
+        assert_eq!(
+            state.by_cluster.get(&synthetic_key).unwrap().viewed_count,
+            1
+        );
+        assert_eq!(state.by_cluster.get(&real_key).unwrap().viewed_count, 1);
     }
 
     #[test]

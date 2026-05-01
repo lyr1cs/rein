@@ -138,6 +138,11 @@ const EPISODE_BLEND: f64 = 0.12;
 const SUPPORT_BLEND: f64 = 0.05;
 const DIVERSITY_BLEND: f64 = 0.05;
 const SHADOW_DIMENSIONS: usize = 6;
+const SHADOW_GP_EI_SIMPLEX_STEPS: usize = 10;
+const SHADOW_GP_EI_CANDIDATE_LIMIT: usize = 16;
+const SHADOW_GP_EI_LENGTH_SCALE: f64 = 0.30;
+const SHADOW_GP_EI_OBSERVATION_NOISE: f64 = 0.02;
+const SHADOW_GP_EI_SOFT_RANK_SCALE: f64 = 0.05;
 
 /// Find the alpha that maximizes the rank of accessed memories.
 ///
@@ -275,10 +280,10 @@ pub fn score_candidate_with_shadow_weights(
 
 /// Find the per-event shadow weight vector that best ranks accessed memories.
 ///
-/// This stays intentionally conservative for v0.28: evaluate a deterministic
-/// simplex candidate set, then average tied winners. It is broad enough to
-/// learn basic blended weights without introducing stochastic optimization or
-/// changing online recall behavior.
+/// This stays intentionally conservative for v0.28: evaluate deterministic
+/// simplex candidates, add a bounded deterministic GP/EI-style shadow proposal
+/// path, then average tied winners. It is broad enough to learn basic blended
+/// weights without stochastic optimization or changing online recall behavior.
 pub fn optimal_shadow_weights_for_event(event: &RecallEvent) -> Option<ShadowFusionWeights> {
     if event.candidates.is_empty() || event.accessed_ids.is_empty() {
         return None;
@@ -348,6 +353,8 @@ fn shadow_weight_candidates_for_event(event: &RecallEvent) -> Vec<ShadowFusionWe
     if let Some(weights) = accessed_gap_shadow_candidate(event) {
         push_shadow_weight_candidate(&mut candidates, weights);
     }
+
+    push_shadow_gp_ei_weight_candidates(event, &mut candidates);
 
     candidates
 }
@@ -429,6 +436,272 @@ fn arrays_almost_equal(left: [f64; SHADOW_DIMENSIONS], right: [f64; SHADOW_DIMEN
     left.iter()
         .zip(right.iter())
         .all(|(a, b)| (a - b).abs() < 1e-12)
+}
+
+fn push_shadow_gp_ei_weight_candidates(
+    event: &RecallEvent,
+    candidates: &mut Vec<ShadowFusionWeights>,
+) {
+    let observations: Vec<(ShadowFusionWeights, f64)> = candidates
+        .iter()
+        .copied()
+        .map(|weights| (weights, shadow_soft_rank_score(event, weights)))
+        .filter(|(_weights, score)| score.is_finite())
+        .collect();
+    if observations.len() < 2 {
+        return;
+    }
+
+    let best_observed = observations
+        .iter()
+        .map(|(_weights, score)| *score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !best_observed.is_finite() {
+        return;
+    }
+
+    let observed_mean = observations
+        .iter()
+        .map(|(_weights, score)| *score)
+        .sum::<f64>()
+        / observations.len() as f64;
+    let observed_variance = observations
+        .iter()
+        .map(|(_weights, score)| {
+            let delta = score - observed_mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / observations.len() as f64;
+    let observed_variance = observed_variance.max(1e-6);
+
+    let mut proposals = Vec::new();
+    let mut grid = [0_usize; SHADOW_DIMENSIONS];
+    collect_shadow_gp_ei_simplex_proposals(
+        0,
+        SHADOW_GP_EI_SIMPLEX_STEPS,
+        &mut grid,
+        &observations,
+        best_observed,
+        observed_mean,
+        observed_variance,
+        candidates,
+        &mut proposals,
+    );
+
+    proposals.sort_by(compare_shadow_gp_ei_proposals);
+    for (_acquisition, _mean, weights) in proposals.into_iter().take(SHADOW_GP_EI_CANDIDATE_LIMIT) {
+        push_shadow_weight_candidate(candidates, weights);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_shadow_gp_ei_simplex_proposals(
+    dimension: usize,
+    remaining: usize,
+    grid: &mut [usize; SHADOW_DIMENSIONS],
+    observations: &[(ShadowFusionWeights, f64)],
+    best_observed: f64,
+    observed_mean: f64,
+    observed_variance: f64,
+    existing: &[ShadowFusionWeights],
+    proposals: &mut Vec<(f64, f64, ShadowFusionWeights)>,
+) {
+    if dimension == SHADOW_DIMENSIONS - 1 {
+        grid[dimension] = remaining;
+        let weights = shadow_weights_from_simplex_grid(*grid);
+        let values = weights.as_array();
+        if existing
+            .iter()
+            .any(|candidate| arrays_almost_equal(candidate.as_array(), values))
+        {
+            return;
+        }
+
+        let (predicted_mean, predicted_stddev) =
+            shadow_gp_predict(weights, observations, observed_mean, observed_variance);
+        let acquisition = expected_improvement(predicted_mean, predicted_stddev, best_observed);
+        if acquisition.is_finite() && acquisition > 0.0 && predicted_mean.is_finite() {
+            proposals.push((acquisition, predicted_mean, weights));
+        }
+        return;
+    }
+
+    for value in 0..=remaining {
+        grid[dimension] = value;
+        collect_shadow_gp_ei_simplex_proposals(
+            dimension + 1,
+            remaining - value,
+            grid,
+            observations,
+            best_observed,
+            observed_mean,
+            observed_variance,
+            existing,
+            proposals,
+        );
+    }
+}
+
+fn shadow_weights_from_simplex_grid(grid: [usize; SHADOW_DIMENSIONS]) -> ShadowFusionWeights {
+    let mut values = [0.0_f64; SHADOW_DIMENSIONS];
+    for (target, count) in values.iter_mut().zip(grid) {
+        *target = count as f64 / SHADOW_GP_EI_SIMPLEX_STEPS as f64;
+    }
+    ShadowFusionWeights::from_array(values).normalized_or_default()
+}
+
+fn compare_shadow_gp_ei_proposals(
+    left: &(f64, f64, ShadowFusionWeights),
+    right: &(f64, f64, ShadowFusionWeights),
+) -> std::cmp::Ordering {
+    right
+        .0
+        .partial_cmp(&left.0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| compare_shadow_weights_lexicographic(left.2, right.2))
+}
+
+fn compare_shadow_weights_lexicographic(
+    left: ShadowFusionWeights,
+    right: ShadowFusionWeights,
+) -> std::cmp::Ordering {
+    for (left_value, right_value) in left.as_array().iter().zip(right.as_array().iter()) {
+        match left_value
+            .partial_cmp(right_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+        {
+            std::cmp::Ordering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn shadow_gp_predict(
+    weights: ShadowFusionWeights,
+    observations: &[(ShadowFusionWeights, f64)],
+    observed_mean: f64,
+    observed_variance: f64,
+) -> (f64, f64) {
+    let mut kernel_sum = 0.0_f64;
+    let mut weighted_sum = 0.0_f64;
+    let mut max_kernel = 0.0_f64;
+    let weights = weights.as_array();
+    for (observed_weights, score) in observations {
+        let kernel = rbf_kernel(weights, observed_weights.as_array());
+        kernel_sum += kernel;
+        weighted_sum += kernel * score;
+        max_kernel = max_kernel.max(kernel);
+    }
+
+    let mean = if kernel_sum > f64::EPSILON {
+        weighted_sum / kernel_sum
+    } else {
+        observed_mean
+    };
+    let novelty = 1.0 - max_kernel / (max_kernel + SHADOW_GP_EI_OBSERVATION_NOISE);
+    let variance = observed_variance * novelty.clamp(0.0, 1.0);
+    (mean, variance.max(1e-12).sqrt())
+}
+
+fn rbf_kernel(left: [f64; SHADOW_DIMENSIONS], right: [f64; SHADOW_DIMENSIONS]) -> f64 {
+    let squared_distance = left
+        .iter()
+        .zip(right.iter())
+        .map(|(a, b)| {
+            let delta = a - b;
+            delta * delta
+        })
+        .sum::<f64>();
+    (-squared_distance / (2.0 * SHADOW_GP_EI_LENGTH_SCALE * SHADOW_GP_EI_LENGTH_SCALE)).exp()
+}
+
+fn expected_improvement(mean: f64, stddev: f64, best_observed: f64) -> f64 {
+    if !mean.is_finite() || !stddev.is_finite() || !best_observed.is_finite() {
+        return 0.0;
+    }
+    let improvement = mean - best_observed;
+    if stddev <= 1e-12 {
+        return improvement.max(0.0);
+    }
+
+    let z = improvement / stddev;
+    let ei = improvement * standard_normal_cdf(z) + stddev * standard_normal_pdf(z);
+    if ei.is_finite() && ei > 0.0 {
+        ei
+    } else {
+        0.0
+    }
+}
+
+fn standard_normal_pdf(value: f64) -> f64 {
+    (-0.5 * value * value).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+fn standard_normal_cdf(value: f64) -> f64 {
+    if value <= -8.0 {
+        return 0.0;
+    }
+    if value >= 8.0 {
+        return 1.0;
+    }
+    0.5 * (1.0 + erf_approx(value / std::f64::consts::SQRT_2))
+}
+
+fn erf_approx(value: f64) -> f64 {
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let x = value.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let polynomial =
+        (((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t)
+            * (-x * x).exp();
+    sign * (1.0 - polynomial)
+}
+
+fn shadow_soft_rank_score(event: &RecallEvent, weights: ShadowFusionWeights) -> f64 {
+    let weights = weights.normalized_or_default();
+    let mut scored = Vec::with_capacity(event.candidates.len());
+    for candidate in &event.candidates {
+        scored.push(score_candidate_with_shadow_weights(candidate, weights));
+    }
+
+    let mut total = 0.0_f64;
+    for (idx, candidate) in event.candidates.iter().enumerate() {
+        if !event.accessed_ids.contains(&candidate.memory_id) {
+            continue;
+        }
+
+        let accessed_score = scored[idx];
+        let mut expected_outrankers = 0.0_f64;
+        for (other_idx, other_score) in scored.iter().enumerate() {
+            if other_idx == idx {
+                continue;
+            }
+            expected_outrankers +=
+                sigmoid((other_score - accessed_score) / SHADOW_GP_EI_SOFT_RANK_SCALE);
+        }
+        total += 1.0 / (1.0 + expected_outrankers);
+    }
+    total
+}
+
+fn sigmoid(value: f64) -> f64 {
+    if value >= 40.0 {
+        1.0
+    } else if value <= -40.0 {
+        0.0
+    } else {
+        1.0 / (1.0 + (-value).exp())
+    }
 }
 
 /// Compute a time-weighted shadow weight vector and shrink it toward a parent
@@ -1170,6 +1443,61 @@ mod tests {
         assert_eq!(shadow_reciprocal_rank_sum(&event, learned), 1.0);
         assert!(learned.bm25 > 0.0);
         assert!(learned.vec > 0.0);
+    }
+
+    #[test]
+    fn optimal_shadow_weights_uses_gp_ei_candidate_for_off_grid_blend() {
+        let event = RecallEvent {
+            request_id: "gp_ei_blend_needed".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "target".to_string(),
+                    bm25_norm: 0.1,
+                    vec_norm: 0.5,
+                    kg_norm: 0.5,
+                    episode_norm: 0.05,
+                    support_count: 4,
+                    source_diversity: 1.0526316,
+                },
+                CandidateLog {
+                    memory_id: "broad_noise".to_string(),
+                    bm25_norm: 1.0,
+                    vec_norm: 0.7,
+                    kg_norm: 0.4,
+                    episode_norm: 0.4,
+                    support_count: 3,
+                    source_diversity: 1.4285715,
+                },
+                CandidateLog {
+                    memory_id: "support_noise".to_string(),
+                    bm25_norm: 0.1,
+                    vec_norm: 0.15,
+                    kg_norm: 0.3,
+                    episode_norm: 1.0,
+                    support_count: 1000,
+                    source_diversity: 1.1764706,
+                },
+                CandidateLog {
+                    memory_id: "kg_noise".to_string(),
+                    bm25_norm: 0.3,
+                    vec_norm: 0.6,
+                    kg_norm: 0.8,
+                    episode_norm: 0.05,
+                    support_count: 1,
+                    source_diversity: 1.0526316,
+                },
+            ],
+            accessed_ids: vec!["target".to_string()],
+            timestamp: Utc::now(),
+        };
+
+        let learned = optimal_shadow_weights_for_event(&event).unwrap();
+
+        assert_eq!(shadow_reciprocal_rank_sum(&event, learned), 1.0);
+        assert!(learned.kg > 0.0);
+        assert!(learned.support > 0.0);
+        assert!(learned.sum().is_finite());
+        assert!((learned.sum() - 1.0).abs() < 1e-12);
     }
 
     #[test]

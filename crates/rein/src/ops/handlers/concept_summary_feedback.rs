@@ -65,21 +65,12 @@ impl OpsRuntime {
         &self,
         params: ConceptSummaryFeedbackParams,
     ) -> ReinResult<FeedbackOutput> {
-        // codex R1 P2 (D1/D2 follow-up): rewrite the interaction's
-        // `(cluster_id, query_type)` to the SAME synthetic per-concept
-        // bucket the writer (`enqueue_judge_for_concept_summary`) and
-        // gate reader (`decide_concept_summary_quality` from
-        // `concept_state`) use. GUI clients still POST with their real
-        // recall-context metadata (e.g. `query_type = "Exploratory"`,
-        // `cluster_id = 7`), but Cap A pools all auto-judge events under
-        // `(synthetic_hash(concept_id), "concept_refresh")`. Without
-        // this override, human thumbs/dwell from GUI traffic accumulate
-        // in `(7, "Exploratory")` and never influence the gate that
-        // reads from the synthetic bucket — the per-concept feedback
-        // loop is dead code for current clients. Per spec §15 R7-#1,
-        // proper recall-context routing is v0.28+ work; until then,
-        // unifying both writers under the synthetic key keeps the loop
-        // closed.
+        // Keep the top-level routing aligned with the synthetic per-concept
+        // bucket the judge writer uses, while preserving caller-supplied
+        // recall context in `route_context`. The consumer dual-folds into
+        // both buckets in v0.28: synthetic keeps judge/human alignment, real
+        // recall context lets production gates learn route-specific Cap A
+        // quality once enough GUI feedback exists.
         let synthetic_cid =
             crate::ops::concept_summary::synthetic_cluster_id_for_concept(&params.concept_id);
         let aligned_metadata = match &params.metadata {
