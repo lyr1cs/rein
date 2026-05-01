@@ -23,6 +23,7 @@ fn loaded_canary_policy(source_adaptive_version: u64) -> ArsParameterPolicyLoad 
             mode: ArsParameterPolicyMode::Canary,
             disabled_reason: None,
             source_adaptive_version,
+            runtime_adoption_weight: 1.0,
             last_event_id: 42,
             last_updated: "2026-05-01T00:00:00Z".to_string(),
             ..ArsParameterPolicy::default()

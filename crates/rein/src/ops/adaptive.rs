@@ -7,11 +7,13 @@ use crate::types::traits::MemoryStore;
 
 use super::dedup::run_vec_dedup;
 
+const ARS_POLICY_ADOPTION_MAX_STEP: f64 = 0.05;
+
 fn persist_ars_effective_scalars(
     state: &mut crate::store::adaptive::AdaptiveState,
     config: &ReinConfig,
     priors: &crate::ops::judge_calibration::BootstrapPriors,
-    ars_parameter_policy_canary: bool,
+    runtime_adoption_weight: f64,
 ) {
     let calibration_snapshot = state.judge_calibration_state.clone();
     let calibration = calibration_snapshot.as_ref();
@@ -31,7 +33,7 @@ fn persist_ars_effective_scalars(
     let synthesis_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.synthesis_cold_start_n,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
     );
     state.set_ars_effective_scalar(
@@ -42,7 +44,7 @@ fn persist_ars_effective_scalars(
     let concept_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.concept_summary_cold_start_n,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N),
     );
     state.set_ars_effective_scalar(
@@ -53,7 +55,7 @@ fn persist_ars_effective_scalars(
     let judge_sample_rate_cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         true,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
     );
@@ -65,7 +67,7 @@ fn persist_ars_effective_scalars(
     let judge_sample_rate_warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
         calibration,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
         false,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
     )
@@ -77,7 +79,8 @@ fn persist_ars_effective_scalars(
 
     let threshold_inputs = crate::ops::ars_tuning::TrustInputs {
         enabled: config.ars.acceleration.enabled,
-        production_canary: ars_parameter_policy_canary,
+        production_canary: runtime_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight,
         human_count: prior_count,
         llm_count: 0,
         llm_reliability: 0.0,
@@ -209,8 +212,8 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // SynthesisLlmJudge events fold into `llm_judge_count` / hit_count
     // and the κ pair cache. Without this swap the new consumer is dead
     // code and judge events that landed past the offset are lost.
-    let ars_parameter_policy_canary =
-        ars_parameter_policy_allows_runtime(store.conn(), config, &state);
+    let runtime_adoption_weight =
+        ars_parameter_policy_runtime_adoption_weight(store.conn(), config, &state);
     let bootstrap_priors =
         match crate::ops::judge_calibration::bootstrap_priors_from_replay(config, store.conn()) {
             Ok(priors) => priors,
@@ -238,13 +241,13 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         &mut state,
         config,
         &bootstrap_priors,
-        ars_parameter_policy_canary,
+        runtime_adoption_weight,
     );
     let effective_judge_weight_decay_rate =
         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
         );
     state.set_ars_effective_scalar(
@@ -283,7 +286,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
-            ars_parameter_policy_canary,
+            runtime_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
         );
     state.set_ars_effective_scalar(
@@ -557,9 +560,12 @@ fn refresh_ars_parameter_policy(
         ArsParameterPolicyMode::Canary => None,
     };
     let current = loaded.policy;
+    let runtime_adoption_weight =
+        next_runtime_adoption_weight(config, state, desired_mode, current.runtime_adoption_weight);
     if current.mode == desired_mode
         && current.source_adaptive_version == state.version
         && current.disabled_reason == disabled_reason
+        && (current.runtime_adoption_weight - runtime_adoption_weight).abs() <= f64::EPSILON
     {
         return;
     }
@@ -569,6 +575,7 @@ fn refresh_ars_parameter_policy(
         mode: desired_mode,
         disabled_reason,
         source_adaptive_version: state.version,
+        runtime_adoption_weight,
         last_event_id: state
             .alpha_optimizer_last_id
             .max(state.alpha_optimizer_access_last_id),
@@ -580,6 +587,7 @@ fn refresh_ars_parameter_policy(
             mode = ?policy.mode,
             revision = policy.revision,
             source_adaptive_version = policy.source_adaptive_version,
+            runtime_adoption_weight = %format!("{:.3}", policy.runtime_adoption_weight),
             "ARS parameter policy refreshed"
         ),
         Ok(false) => tracing::warn!(
@@ -590,12 +598,47 @@ fn refresh_ars_parameter_policy(
     }
 }
 
-fn ars_parameter_policy_allows_runtime(
+fn next_runtime_adoption_weight(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    desired_mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode,
+    current_weight: f64,
+) -> f64 {
+    if !matches!(
+        desired_mode,
+        crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+    ) {
+        return 0.0;
+    }
+    let max_samples = state
+        .learned_shadow_fusion
+        .values()
+        .filter(|entry| entry.sample_count >= config.adaptive.min_samples_alpha)
+        .map(|entry| entry.sample_count as f64)
+        .fold(0.0, f64::max);
+    if max_samples <= 0.0 || !max_samples.is_finite() {
+        return 0.0;
+    }
+    let prior = config.adaptive.shrinkage_prior.max(1.0);
+    let target = (max_samples / (max_samples + prior)).clamp(ARS_POLICY_ADOPTION_MAX_STEP, 1.0);
+    let current = if current_weight.is_finite() {
+        current_weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if target >= current {
+        (current + ARS_POLICY_ADOPTION_MAX_STEP).min(target)
+    } else {
+        (current - ARS_POLICY_ADOPTION_MAX_STEP).max(target)
+    }
+}
+
+fn ars_parameter_policy_runtime_adoption_weight(
     conn: &rusqlite::Connection,
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
-) -> bool {
-    crate::ops::ars_tuning::parameter_policy_allows_runtime(conn, config, state)
+) -> f64 {
+    crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(conn, config, state)
 }
 
 // ===========================================================================
@@ -3186,6 +3229,25 @@ mod tests {
             crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
         );
         assert!(loaded.policy.allows_runtime_adoption(state.version));
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_rolls_canary_adoption_weight_gradually() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let first = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert!((first.runtime_adoption_weight - 0.05).abs() < 1e-12);
+
+        state.version += 1;
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let second = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert!((second.runtime_adoption_weight - 0.10).abs() < 1e-12);
     }
 
     #[test]

@@ -9,6 +9,9 @@ pub struct TrustInputs {
     /// Runtime adoption gate. Shadow-only acceleration still learns, but does
     /// not affect live decisions.
     pub production_canary: bool,
+    /// Rollout-side weight in `[0, 1]`; this makes canary adoption gradual
+    /// instead of a binary jump from static priors to dynamic parameters.
+    pub runtime_adoption_weight: f64,
     /// Human feedback count for the bucket.
     pub human_count: u64,
     /// LLM feedback count for the bucket.
@@ -46,6 +49,10 @@ pub fn dynamic_trust(inputs: TrustInputs) -> f64 {
     if !inputs.enabled || !inputs.production_canary || inputs.drift_alert {
         return 0.0;
     }
+    let runtime_adoption_weight = clamp01(inputs.runtime_adoption_weight);
+    if runtime_adoption_weight <= f64::EPSILON {
+        return 0.0;
+    }
 
     let llm_reliability = clamp01(inputs.llm_reliability);
     let evidence = inputs.human_count as f64 + inputs.llm_count as f64 * llm_reliability;
@@ -63,6 +70,7 @@ pub fn dynamic_trust(inputs: TrustInputs) -> f64 {
         * clamp01(inputs.calibration)
         * clamp01(inputs.stability)
         * clamp01(inputs.max_trust)
+        * runtime_adoption_weight
 }
 
 pub fn effective_scalar(
@@ -150,7 +158,7 @@ pub fn effective_judge_weight_decay_rate(
     effective_judge_weight_decay_rate_with_previous(
         static_rate,
         calibration,
-        production_canary,
+        adoption_weight_from_canary(production_canary),
         None,
     )
 }
@@ -158,9 +166,10 @@ pub fn effective_judge_weight_decay_rate(
 pub fn effective_judge_weight_decay_rate_with_previous(
     static_rate: f64,
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
-    production_canary: bool,
+    runtime_adoption_weight: f64,
     previous_effective: Option<f64>,
 ) -> f64 {
+    let production_canary = runtime_adoption_weight > f64::EPSILON;
     let pair_count = calibration
         .map(|cal| {
             cal.recent_pairs_synthesis
@@ -189,6 +198,7 @@ pub fn effective_judge_weight_decay_rate_with_previous(
         TrustInputs {
             enabled: true,
             production_canary,
+            runtime_adoption_weight,
             human_count: pair_count,
             llm_count: 0,
             llm_reliability: 0.0,
@@ -210,7 +220,7 @@ pub fn effective_judge_sample_rate(
     effective_judge_sample_rate_with_previous(
         static_rate,
         calibration,
-        production_canary,
+        adoption_weight_from_canary(production_canary),
         cold_start,
         None,
     )
@@ -219,12 +229,13 @@ pub fn effective_judge_sample_rate(
 pub fn effective_judge_sample_rate_with_previous(
     static_rate: f64,
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
-    production_canary: bool,
+    runtime_adoption_weight: f64,
     cold_start: bool,
     previous_effective: Option<f64>,
 ) -> f64 {
     let max_rate = if cold_start { 1.0 } else { 0.5 };
     let static_rate = finite_non_negative(static_rate).min(max_rate);
+    let production_canary = runtime_adoption_weight > f64::EPSILON;
     if !production_canary || static_rate <= f64::EPSILON {
         return static_rate;
     }
@@ -258,6 +269,7 @@ pub fn effective_judge_sample_rate_with_previous(
         TrustInputs {
             enabled: true,
             production_canary,
+            runtime_adoption_weight,
             human_count: pair_count,
             llm_count: 0,
             llm_reliability: 0.0,
@@ -275,15 +287,21 @@ pub fn effective_cold_start_n(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     production_canary: bool,
 ) -> u64 {
-    effective_cold_start_n_with_previous(static_n, calibration, production_canary, None)
+    effective_cold_start_n_with_previous(
+        static_n,
+        calibration,
+        adoption_weight_from_canary(production_canary),
+        None,
+    )
 }
 
 pub fn effective_cold_start_n_with_previous(
     static_n: u64,
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
-    production_canary: bool,
+    runtime_adoption_weight: f64,
     previous_effective: Option<f64>,
 ) -> u64 {
+    let production_canary = runtime_adoption_weight > f64::EPSILON;
     let drift_alert = calibration
         .map(|cal| {
             cal.judge_drift_alert > 0
@@ -309,6 +327,7 @@ pub fn effective_cold_start_n_with_previous(
         TrustInputs {
             enabled: true,
             production_canary,
+            runtime_adoption_weight,
             human_count: calibration_pair_count(calibration),
             llm_count: 0,
             llm_reliability: 0.0,
@@ -337,7 +356,7 @@ pub fn effective_useful_rate_threshold(
         human_count,
         llm_count,
         calibration,
-        production_canary,
+        adoption_weight_from_canary(production_canary),
         None,
     )
 }
@@ -349,10 +368,11 @@ pub fn effective_useful_rate_threshold_with_previous(
     human_count: u64,
     llm_count: u64,
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
-    production_canary: bool,
+    runtime_adoption_weight: f64,
     previous_effective: Option<f64>,
 ) -> f64 {
     let static_threshold = clamp01(finite_or(static_threshold, 0.0));
+    let production_canary = runtime_adoption_weight > f64::EPSILON;
     let drift_alert = calibration
         .map(|cal| {
             cal.judge_drift_alert > 0
@@ -372,6 +392,7 @@ pub fn effective_useful_rate_threshold_with_previous(
         TrustInputs {
             enabled: true,
             production_canary,
+            runtime_adoption_weight,
             human_count,
             llm_count,
             llm_reliability: llm_feedback_reliability(calibration),
@@ -384,22 +405,41 @@ pub fn effective_useful_rate_threshold_with_previous(
     )
 }
 
+pub fn parameter_policy_runtime_adoption_weight(
+    conn: &rusqlite::Connection,
+    config: &crate::config::ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) -> f64 {
+    if !config.adaptive.enabled
+        || !config.ars.acceleration.enabled
+        || config.ars.acceleration.shadow_only
+    {
+        return 0.0;
+    }
+    let loaded = crate::store::ars_parameter_policy::load_parameter_policy(conn);
+    if !matches!(
+        loaded.status,
+        crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+    ) {
+        return 0.0;
+    }
+    loaded.policy.runtime_adoption_weight(state.version)
+}
+
 pub fn parameter_policy_allows_runtime(
     conn: &rusqlite::Connection,
     config: &crate::config::ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
 ) -> bool {
-    if !config.adaptive.enabled
-        || !config.ars.acceleration.enabled
-        || config.ars.acceleration.shadow_only
-    {
-        return false;
+    parameter_policy_runtime_adoption_weight(conn, config, state) > f64::EPSILON
+}
+
+fn adoption_weight_from_canary(production_canary: bool) -> f64 {
+    if production_canary {
+        1.0
+    } else {
+        0.0
     }
-    let loaded = crate::store::ars_parameter_policy::load_parameter_policy(conn);
-    matches!(
-        loaded.status,
-        crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
-    ) && loaded.policy.allows_runtime_adoption(state.version)
 }
 
 fn calibration_pair_count(
@@ -462,6 +502,7 @@ mod tests {
         let inputs = TrustInputs {
             enabled: true,
             production_canary: false,
+            runtime_adoption_weight: 0.0,
             human_count: 100,
             llm_count: 100,
             llm_reliability: 0.8,
@@ -481,6 +522,7 @@ mod tests {
         let inputs = TrustInputs {
             enabled: true,
             production_canary: false,
+            runtime_adoption_weight: 0.0,
             human_count: 100,
             llm_count: 0,
             llm_reliability: 0.0,
@@ -512,6 +554,7 @@ mod tests {
         let inputs = TrustInputs {
             enabled: true,
             production_canary: true,
+            runtime_adoption_weight: 0.25,
             human_count: 10,
             llm_count: 90,
             llm_reliability: 0.25,
@@ -524,8 +567,35 @@ mod tests {
 
         let trust = dynamic_trust(inputs);
         let expected_evidence = 10.0 + 90.0 * 0.25;
-        let expected = (expected_evidence / (expected_evidence + 20.0)) * 0.5 * 0.8;
+        let expected = (expected_evidence / (expected_evidence + 20.0)) * 0.5 * 0.8 * 0.25;
         assert!((trust - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn runtime_adoption_weight_slides_dynamic_trust_between_static_and_dynamic() {
+        let base = TrustInputs {
+            enabled: true,
+            production_canary: true,
+            runtime_adoption_weight: 0.0,
+            human_count: 100,
+            llm_count: 0,
+            llm_reliability: 0.0,
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert: false,
+            prior_strength: 0.0,
+            max_trust: 1.0,
+        };
+
+        assert_eq!(dynamic_trust(base), 0.0);
+        assert_eq!(effective_scalar(0.2, 0.8, None, bounds01(1.0), base), 0.2);
+
+        let quarter = TrustInputs {
+            runtime_adoption_weight: 0.25,
+            ..base
+        };
+        assert_eq!(dynamic_trust(quarter), 0.25);
+        assert!((effective_scalar(0.2, 0.8, None, bounds01(1.0), quarter) - 0.35).abs() < 1e-12);
     }
 
     #[test]
@@ -533,6 +603,7 @@ mod tests {
         let inputs = TrustInputs {
             enabled: true,
             production_canary: true,
+            runtime_adoption_weight: 1.0,
             human_count: 80,
             llm_count: 0,
             llm_reliability: 0.0,
@@ -553,6 +624,7 @@ mod tests {
         let inputs = TrustInputs {
             enabled: true,
             production_canary: true,
+            runtime_adoption_weight: 1.0,
             human_count: 80,
             llm_count: 0,
             llm_reliability: 0.0,

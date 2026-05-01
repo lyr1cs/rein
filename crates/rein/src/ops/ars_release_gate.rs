@@ -29,7 +29,7 @@ pub struct ReleaseGateDecision {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ReleaseGateSignals {
     pub adaptive_enabled: bool,
     pub ars_acceleration_enabled: bool,
@@ -44,6 +44,7 @@ pub struct ReleaseGateSignals {
     pub policy_revision: u64,
     pub policy_source_adaptive_version: u64,
     pub policy_allows_runtime: bool,
+    pub runtime_adoption_weight: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,7 +59,7 @@ pub struct ReleaseGateSignals {
     pub doctor_ars_parameter_policy_message: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ArsAccelerationReleaseGateReport {
     pub schema_version: u32,
     pub purpose: String,
@@ -95,8 +96,21 @@ pub fn evaluate_ars_acceleration_release_gate(
         .values()
         .filter(|entry| entry.sample_count >= min_samples)
         .count();
-    let policy_allows_runtime = matches!(policy.status, ArsParameterPolicyLoadStatus::Loaded)
-        && policy.policy.allows_runtime_adoption(state.version);
+    let policy_row_adoption_weight =
+        if matches!(policy.status, ArsParameterPolicyLoadStatus::Loaded) {
+            policy.policy.runtime_adoption_weight(state.version)
+        } else {
+            0.0
+        };
+    let runtime_adoption_weight = if config.adaptive.enabled
+        && config.ars.acceleration.enabled
+        && !config.ars.acceleration.shadow_only
+    {
+        policy_row_adoption_weight
+    } else {
+        0.0
+    };
+    let policy_allows_runtime = runtime_adoption_weight > f64::EPSILON;
     let judge_drift_alert = state
         .judge_calibration_state
         .as_ref()
@@ -124,7 +138,8 @@ pub fn evaluate_ars_acceleration_release_gate(
         && config.ars.acceleration.enabled
         && !config.ars.acceleration.shadow_only
         && policy_allows_runtime;
-    let (doctor_level, doctor_message) = doctor_policy_signal(policy, state, live_allowed);
+    let (doctor_level, doctor_message) =
+        doctor_policy_signal(policy, state, live_allowed, runtime_adoption_weight);
     let shadow_status = input
         .shadow_fusion_status
         .get("status")
@@ -144,6 +159,7 @@ pub fn evaluate_ars_acceleration_release_gate(
         policy_revision: policy.policy.revision,
         policy_source_adaptive_version: policy.policy.source_adaptive_version,
         policy_allows_runtime,
+        runtime_adoption_weight,
         policy_error: policy.error.clone(),
         shadow_fusion_status: shadow_status.clone(),
         shadow_fusion_eligible_samples: json_u64(input.shadow_fusion_status, "eligible_samples"),
@@ -175,8 +191,11 @@ pub fn evaluate_ars_acceleration_release_gate(
             if !matches!(policy.policy.mode, ArsParameterPolicyMode::Canary) {
                 canary_blockers.push("ars_parameter_policy_not_canary".to_string());
             }
-            if !policy_allows_runtime {
+            if policy.policy.source_adaptive_version > state.version {
                 canary_blockers.push("ars_parameter_policy_not_current".to_string());
+            }
+            if policy_row_adoption_weight <= f64::EPSILON {
+                canary_blockers.push("ars_parameter_policy_adoption_weight_zero".to_string());
             }
         }
     }
@@ -225,6 +244,7 @@ fn doctor_policy_signal(
     policy: &ArsParameterPolicyLoad,
     state: &AdaptiveState,
     live_allowed: bool,
+    runtime_adoption_weight: f64,
 ) -> (&'static str, String) {
     match policy.status {
         ArsParameterPolicyLoadStatus::Missing => (
@@ -243,12 +263,13 @@ fn doctor_policy_signal(
         ),
         ArsParameterPolicyLoadStatus::Loaded => {
             let message = format!(
-                "mode={:?} revision={} source_adaptive_version={} current_adaptive_version={} live_allowed={}",
+                "mode={:?} revision={} source_adaptive_version={} current_adaptive_version={} live_allowed={} runtime_adoption_weight={:.3}",
                 policy.policy.mode,
                 policy.policy.revision,
                 policy.policy.source_adaptive_version,
                 state.version,
                 live_allowed,
+                runtime_adoption_weight,
             );
             if matches!(policy.policy.mode, ArsParameterPolicyMode::Canary) && !live_allowed {
                 ("warn", message)
@@ -278,4 +299,98 @@ fn policy_mode_name(mode: ArsParameterPolicyMode) -> &'static str {
 
 fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
     value.get(key).and_then(serde_json::Value::as_u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loaded_canary_policy(
+        weight: f64,
+    ) -> crate::store::ars_parameter_policy::ArsParameterPolicyLoad {
+        crate::store::ars_parameter_policy::ArsParameterPolicyLoad {
+            policy: crate::store::ars_parameter_policy::ArsParameterPolicy {
+                revision: 1,
+                mode: ArsParameterPolicyMode::Canary,
+                disabled_reason: None,
+                source_adaptive_version: 7,
+                runtime_adoption_weight: weight,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+                ..Default::default()
+            },
+            status: ArsParameterPolicyLoadStatus::Loaded,
+            error: None,
+        }
+    }
+
+    fn eligible_state() -> AdaptiveState {
+        let mut state = AdaptiveState {
+            version: 7,
+            ..Default::default()
+        };
+        state.learned_shadow_fusion.insert(
+            "global".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.45,
+                    kg: 0.04,
+                    episode: 0.03,
+                    support: 0.02,
+                    diversity: 0.01,
+                },
+                sample_count: 12,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn release_gate_reports_runtime_adoption_weight() {
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_state();
+        let policy = loaded_canary_policy(0.25);
+        let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+            config: &config,
+            state: &state,
+            policy: &policy,
+            shadow_fusion_status: &serde_json::json!({
+                "status": "ready",
+                "eligible_samples": 12,
+                "min_samples": 10
+            }),
+        });
+
+        assert_eq!(report.signals.runtime_adoption_weight, 0.25);
+        assert!(report.signals.policy_allows_runtime);
+        assert!(report.canary.allowed);
+    }
+
+    #[test]
+    fn release_gate_blocks_zero_runtime_adoption_weight() {
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_state();
+        let policy = loaded_canary_policy(0.0);
+        let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+            config: &config,
+            state: &state,
+            policy: &policy,
+            shadow_fusion_status: &serde_json::json!({ "status": "ready" }),
+        });
+
+        assert!(!report.canary.allowed);
+        assert!(report
+            .canary
+            .blockers
+            .contains(&"ars_parameter_policy_adoption_weight_zero".to_string()));
+    }
 }
