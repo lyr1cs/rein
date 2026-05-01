@@ -189,7 +189,7 @@ Codex context injection is explicit opt-in:
 [hooks.codex]
 inject_prompt_context = true
 inject_session_context = true
-max_additional_context_chars = 4000
+max_additional_context_chars = 1200
 ```
 
 When enabled, `SessionStart` emits bounded project context and

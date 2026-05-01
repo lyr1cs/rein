@@ -2,7 +2,51 @@
 
 ## Overview
 
-rein v0.27.6 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 38 MCP tools (v0.27.1 adds `rein_judge_synthesis` + `rein_judge_concept_summary` for the runtime LLM judge; v0.27.0 added `rein_feedback_concept_summary` Cap A mirror; v0.26 adds `rein_archive_summary_refresh` for ARS Capability C cold-tier archival summary; v0.25 extends `rein_recall` with opt-in `synthesize=true` for ARS Capability B; v0.24 added `rein_concept_state` + `rein_concept_summary_refresh` for ARS Capability A). Verified live via `python3` over `#[op(... mcp(name = "..."))]` attributes — `total=47 mcp-visible=38`. v0.27.6 adds Codex hook parity: six-event hook install/doctor coverage, `SessionStart` / `UserPromptSubmit` `additionalContext`, and conservative deny-only shell guardrails for `PreToolUse` / `PermissionRequest`. v0.27.5 closes the v0.27.4 R10 P2 residuals: cold_archive too-large backoff, Cap A 4096-bucket LRU eviction, and `cron_claims` pre-LLM dedup table — 10 serial `codex review --uncommitted` rounds saturated at 0 P1 / 0 P2 / 0 P3 (R6 + R10 fully clean). Runtime LLM judge ships opt-in via `[ars.llm_judge].enabled` and hooks at synthesis/concept-summary mint time; default-off deployments produce no extra disk writes. Unified operation registry (CLI / MCP / REST authored once via `#[op]` macro — Phase 2.6 closed the last legacy handler, Phase 3 deleted the hand-maintained registry middleman). Self-adaptive engine (M1-M6). 3-channel retrieval (FTS + Vector + KG) with query expansion, LLM reranking, and parallel pipeline. Transparent LLM proxy (record-only) including **Codex subscription loopback proxy** with first-party WebSocket mirror, `permessage-deflate` decoding, ChatGPT backend helper routing (`/wham/*`, `/connectors/*`, `/authenticate_app_v2`, `/codex/safety/arc`), and `ArtifactMirrorOnly` recording gate. Async memory pipeline with file-based queue and background worker. Unified dedup architecture (canonical/evidence/ledger). Canonical-first read model, evidence-aware recall, hybrid CJK tokenization (`jieba-rs` + character bigrams) across Tantivy/FTS/dedup/classify, cluster-aware admission, embedding cross-topic dedup, ANN fallback for large unclustered dedup buckets, survival-driven STM promotion, session chunking for long-text extraction, and context-aware extraction with existing-memory injection. Service management (dashboard, gui on/off, proxy on/off). Neural Wiki GUI (React + Tailwind, embedded via rust-embed) with `/api/artifacts` readback panel.
+rein v0.28.6 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 40 MCP tools (v0.28.6 adds `rein_trust_measurement`; v0.28.4 adds `rein_ars_acceleration_gate`). v0.28.6 completes ARS acceleration rollout: `[ars.acceleration]`, runtime LLM judge, and nightly calibration default on, while live learned parameters still fail closed behind a healthy canary `ars_parameter_policy` row and positive scoped adoption weights. Runtime adoption is now scoped per parameter, surface, query type, and cluster; SignalHint feedback remains active outside shadow mode; release-gate output exposes scoped weights; and Trust & Measurement reports release gate, eval gates, index consistency, background observability, and active-learning status. Unified operation registry (CLI / MCP / REST authored once via `#[op]` macro). Self-adaptive engine (M1-M6), 3-channel retrieval (FTS + Vector + KG), transparent LLM proxy, async memory pipeline, unified dedup architecture, canonical-first read model, evidence-aware recall, hybrid CJK tokenization, cluster-aware admission, service management, and Neural Wiki GUI remain core surfaces.
+
+## v0.28.6 release (2026-05-02)
+
+- **Default-on, fail-closed ARS acceleration**: `[ars.acceleration]`, `[ars.llm_judge]`, and `[ars.llm_judge.nightly_cron]` now default on, but runtime adoption still requires a healthy canary parameter policy and positive scoped weights.
+- **Scoped dynamic adoption**: `ars_parameter_policy.adoption_weights` covers recall fusion global/query/cluster keys plus `synthesis_gate`, `concept_summary_gate`, `judge_sample_rate`, `llm_feedback_decay`, and `signal_hint_priors`.
+- **Auto promote / rollback**: adaptive refresh promotes eligible evidence to Canary with gradual scoped weights and rolls back to Shadow with zero weights when evidence, config, or policy health stops allowing runtime adoption.
+- **Trust & Measurement**: `rein_trust_measurement` / `rein trust-measurement` / `/api/trust-measurement` reports release-gate state, eval gates, index consistency, background observability, and active-learning status.
+
+## v0.28.5 release (2026-05-01)
+
+- **Gradual ARS runtime adoption**: `ars_parameter_policy` now stores `runtime_adoption_weight` in `[0, 1]`; adaptive refresh moves it by at most 0.05 per durable snapshot toward the evidence-backed target and resets it to 0 outside live canary mode.
+- **Weight-gated dynamic tuning**: recall fusion, synthesis/concept gates, judge sample rates, LLM feedback decay, and SignalHint-derived useful-rate priors multiply dynamic trust by `runtime_adoption_weight`, so static configured values remain the anchor throughout rollout.
+- **Observability**: `rein doctor` and `rein ars-acceleration-gate` report the adoption weight alongside `live_allowed`, making stale rows, missing rows, and partial canaries visible without changing runtime defaults.
+
+## v0.28.4 release (2026-05-01)
+
+- **ARS acceleration full pass**: SignalHint/bootstrap priors now feed useful-rate formulas, dynamic scalar values persist for smoothing, and judge drift calibration tracks synthesis vs concept-summary separately.
+- **Cap A recall-context production threading**: concept-summary GUI feedback dual-folds into the synthetic judge-aligned bucket and the real recall route bucket; `concept_state` prefers warmed real route buckets before falling back to synthetic.
+- **Release/eval and optimizer groundwork**: `rein_ars_acceleration_gate` reports canary/default-on readiness without writing config or policy, judge input caps are configurable, recall-ranking judge jobs are safely recognized and dropped while default-off, and shadow fusion replay includes deterministic GP+EI proposals.
+
+## v0.28.3 release (2026-05-01)
+
+- **Dynamic ARS scalar gates**: synthesis and concept-summary cold-start/useful-rate gates now resolve effective values from static config plus calibrated adaptive evidence. Runtime adoption is fail-closed behind `ars_parameter_policy`, canary mode, calibration, and drift checks.
+- **LLM acceleration hints**: synthesis and concept-summary judge jobs preserve shadow-only `signal_hint` payloads through cache enqueue and manual rehydrate, giving the worker bounded deterministic evidence without new LLM calls.
+- **Shadow optimizer expansion**: `search/alpha_optimizer.rs` evaluates deterministic simplex candidates, accessed centroids, and accessed-vs-other gaps for six-dimensional fusion replay, so blended BM25/vector/KG/episode/support/diversity weights can be learned in shadow mode.
+
+## v0.28.2 release (2026-05-01)
+
+- **ARS parameter policy**: live ARS acceleration now requires a healthy metadata-backed `ars_parameter_policy` activation row. Missing/corrupt policy rows fail closed to disabled, `rein doctor` reports policy health, and `/api/adaptive` exposes the policy status.
+- **Dynamic adoption weights**: learned fusion weights are blended from static priors through a trust function instead of replacing static values abruptly. Trust is driven by evidence count, calibration, drift state, prior strength, and canary mode.
+- **LLM feedback acceleration**: the LLM judge `weight_decay_rate` can move from the static config value toward calibrated κ reliability only under policy-gated canary mode. Drift alerts zero the LLM contribution.
+
+## v0.28.1 release (2026-04-30)
+
+- **ARS recall canary activation**: `shadow_only=false` is now accepted as an explicit canary mode. Recall reads eligible six-dimensional fusion weights from `AdaptiveState.learned_shadow_fusion` and applies them only after live-row filtering, before cold-tier filtering and take/limit.
+- **Snapshot-backed dynamic weights**: shadow replay now persists global, query-type, and query-type+cluster weights through the normal adaptive snapshot save path. Default `enabled=false` and shadow mode still leave production ranking unchanged.
+- **Unchanged**: synthesis gates, concept summary behavior, and default deployments remain on the existing shipped path.
+
+## v0.28.0 release (2026-04-30)
+
+- **ARS acceleration groundwork**: `[ars.acceleration].enabled = false` by default and `shadow_only = true` was the safe default. v0.28.0 production recall fusion, synthesis gates, and summary behavior remained on the existing shipped path.
+- **Shadow fusion replay observability**: `/api/adaptive` now includes `ars_acceleration.shadow_fusion_replay` with bounded preview fields: `enabled`, `shadow_only`, `status`, `replay_limit`, `eligible_samples`, `min_samples`, `global`, `by_query_type`, and `by_cluster`. Disabled/default installs report `status: "disabled"`, zero eligible samples, `global: null`, and empty bucket arrays.
+- **R7-#1 shipped as shadow-first groundwork**: recall event replay can preview global, query-type, and cluster-scoped fusion weights from committed recall/access signals without committing adaptive offsets or altering production scoring.
+- **Deferred at v0.28.0**: production activation of accelerated fusion, non-shadow mode, and any default-on ARS acceleration remained out of scope until the v0.28.1 canary slice.
 
 ## v0.27.6 release (2026-04-30)
 

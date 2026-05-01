@@ -29,7 +29,8 @@ commands and inventory-backed operation commands.
 | `rein dashboard` | none | Print local service status. |
 | `rein gui on/off` | `on`, `off` | Manage the GUI service. |
 | `rein proxy on/off` | `on`, `off` | Manage the record-only proxy service. |
-| `rein judge-calibrate-cron` | `--verbose` | Run the default-off judge calibration cron. |
+| `rein judge-calibrate-cron` | `--verbose` | Run the judge calibration cron over archived samples. |
+| `rein trust-measurement` | none | Show ARS release gate, eval gates, index consistency, background observability, and active-learning status. |
 
 ## Inventory-Backed Commands
 

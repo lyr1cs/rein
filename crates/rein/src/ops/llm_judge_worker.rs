@@ -26,7 +26,7 @@ use crate::judge::contract::{
 };
 use crate::store::adaptive::{
     emit_event, ConceptSummaryLlmJudgePayload, EventType, FeedbackEvent, JudgeMetadata,
-    JudgeSource, SynthesisLlmJudgePayload,
+    JudgeSource, SignalHint, SynthesisLlmJudgePayload,
 };
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
@@ -39,21 +39,59 @@ use sha2::{Digest, Sha256};
 /// truncation point is visible in one place.
 pub const JUDGE_REASON_MAX_CHARS: usize = 280;
 
-/// Maximum input bytes the worker hands to the judge LLM. Mirrors the
-/// 16K safety fallback used by `extract::llm::resolve_max_input_chars`
-/// for non-1M-token Gemini families. Operators can override via
-/// `[ars.llm_judge].max_input_chars`. For now this is a bootstrap const.
+/// Safety fallback for the maximum prompt+candidate characters the
+/// worker hands to the judge LLM when no resolved judge cap is set.
 pub const JUDGE_MAX_INPUT_CHARS: usize = 16_384;
+
+const JUDGE_INPUT_JOINER: &str = "\n\nCandidate:\n";
+
+pub(crate) fn resolve_judge_max_input_chars(config: &crate::config::ReinConfig) -> usize {
+    if let Some(max) = config.ars.llm_judge.max_input_chars.filter(|max| *max > 0) {
+        return max;
+    }
+    config
+        .resolve_llm_for("ars.llm_judge")
+        .ok()
+        .map(|resolved| resolved.max_input_chars)
+        .filter(|max| *max > 0)
+        .unwrap_or(JUDGE_MAX_INPUT_CHARS)
+}
+
+pub(crate) fn judge_input_chars(prompt: &str, candidate: &str) -> usize {
+    prompt.chars().count() + JUDGE_INPUT_JOINER.chars().count() + candidate.chars().count()
+}
+
+pub(crate) fn truncate_judge_inputs_for_config(
+    config: &crate::config::ReinConfig,
+    prompt: &str,
+    candidate: &str,
+) -> (String, String) {
+    truncate_judge_inputs(prompt, candidate, resolve_judge_max_input_chars(config))
+}
+
+fn truncate_judge_inputs(prompt: &str, candidate: &str, max_chars: usize) -> (String, String) {
+    const CANDIDATE_RESERVE_MAX: usize = 4_096;
+
+    let joiner_chars = JUDGE_INPUT_JOINER.chars().count();
+    let body_budget = max_chars.saturating_sub(joiner_chars);
+    let candidate_budget = CANDIDATE_RESERVE_MAX.min(max_chars / 4).min(body_budget);
+    let candidate_capped: String = candidate.chars().take(candidate_budget).collect();
+    let prompt_budget = body_budget.saturating_sub(candidate_capped.chars().count());
+    let prompt_truncated: String = prompt.chars().take(prompt_budget).collect();
+    (prompt_truncated, candidate_capped)
+}
 
 /// v0.27.1 E direction — surface kind discriminator carried by every
 /// queue payload (spec §3.1). `Synthesis` jobs map to
 /// `EventType::SynthesisLlmJudge`; `ConceptSummary` jobs map to
-/// `EventType::ConceptSummaryLlmJudge`.
+/// `EventType::ConceptSummaryLlmJudge`. `RecallRanking` is queue-only
+/// groundwork until a dedicated feedback event exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JudgeJobKind {
     Synthesis,
     ConceptSummary,
+    RecallRanking,
 }
 
 /// v0.27.1 E direction — one row of the judge job queue
@@ -97,6 +135,12 @@ pub struct JudgeJob {
     /// auto-sampled jsonl rows that pre-date this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_model_override: Option<String>,
+    /// v0.28 ARS acceleration: optional structured hint computed upstream.
+    ///
+    /// The worker only pass-throughs this when acceleration is enabled. It
+    /// does not infer hints from judge prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_hint: Option<SignalHint>,
 }
 
 impl JudgeJob {
@@ -174,6 +218,17 @@ pub fn dispatch_one(
     job: JudgeJob,
     daily_cap: u64,
 ) -> ReinResult<DispatchResult> {
+    if matches!(job.kind, JudgeJobKind::RecallRanking) {
+        let reason = if config.ars.llm_judge.recall_ranking_enabled {
+            "recall-ranking judge queue support is present, but feedback event emission is not wired"
+        } else {
+            "recall-ranking judge is disabled"
+        };
+        return Ok(DispatchResult::Dropped(DropReason::ContractViolation(
+            reason.to_string(),
+        )));
+    }
+
     // J5 + J7 (link-present + stamp-hash) — defense-in-depth: the queue
     // payload is supposed to be well-formed, but a corrupt jsonl line
     // shouldn't bypass invariants.
@@ -223,6 +278,7 @@ pub fn dispatch_one(
             };
             JudgePayload::ConceptSummary(&pre_concept)
         }
+        JudgeJobKind::RecallRanking => unreachable!("recall-ranking returned before dispatch"),
     };
     if let Err(v) = contract::validate_pre_emit(&ctx, &pre_payload) {
         tracing::warn!(violation = %v, "judge worker: pre-emit invariant violated, dropping");
@@ -263,26 +319,26 @@ pub fn dispatch_one(
     // blocking legitimate judge work for the rolling 24h window even
     // though no HTTP call was made.
     //
-    // Ceiling = `JUDGE_MAX_INPUT_CHARS` exactly (NOT 4×): the enqueue
-    // path always truncates at this const, so any payload above it is
-    // by construction stale/manual. Earlier 4× headroom let
+    // Ceiling = the same resolved cap the enqueue path uses (NOT 4×), so
+    // any payload above it is by construction stale/manual. Earlier 4×
+    // headroom let
     // 16K-65K-byte stale lines burn `daily_call_cap` AND reach
     // `call_judge_sync` (which no longer truncates → R1 J7 fix), so
     // the LLM saw the untruncated bytes.
-    const JUDGE_DISPATCH_CEILING: usize = JUDGE_MAX_INPUT_CHARS;
-    let combined_len = job.prompt.chars().count() + job.candidate.chars().count();
-    if combined_len > JUDGE_DISPATCH_CEILING {
+    let dispatch_ceiling = resolve_judge_max_input_chars(config);
+    let combined_len = judge_input_chars(&job.prompt, &job.candidate);
+    if combined_len > dispatch_ceiling {
         tracing::warn!(
             surface = ?job.kind,
             surface_id = %job.surface_id,
             combined_chars = combined_len,
-            ceiling = JUDGE_DISPATCH_CEILING,
+            ceiling = dispatch_ceiling,
             "judge worker: payload exceeds dispatch ceiling; dropped pre-reservation"
         );
         return Ok(DispatchResult::Dropped(DropReason::ContractViolation(
             format!(
                 "judge job payload too large at dispatch ({} chars > ceiling {})",
-                combined_len, JUDGE_DISPATCH_CEILING
+                combined_len, dispatch_ceiling
             ),
         )));
     }
@@ -347,6 +403,7 @@ pub fn dispatch_one(
         source_count: job.source_count,
         judge_latency_ms: None,
     };
+    let signal_hint = signal_hint_for_emit(config, &job);
 
     // Build the final payload + emit event.
     let event = match job.kind {
@@ -359,7 +416,7 @@ pub fn dispatch_one(
                 stamp_hash: computed_stamp,
                 source: job.source,
                 metadata: Some(metadata),
-                signal_hint: None,
+                signal_hint,
             };
             FeedbackEvent {
                 event_type: EventType::SynthesisLlmJudge,
@@ -382,7 +439,7 @@ pub fn dispatch_one(
                 stamp_hash: computed_stamp,
                 source: job.source,
                 metadata: Some(metadata),
-                signal_hint: None,
+                signal_hint,
             };
             FeedbackEvent {
                 event_type: EventType::ConceptSummaryLlmJudge,
@@ -395,6 +452,7 @@ pub fn dispatch_one(
                 payload: Some(serde_json::to_value(&payload).map_err(ReinError::Serialization)?),
             }
         }
+        JudgeJobKind::RecallRanking => unreachable!("recall-ranking returned before emit"),
     };
 
     let event_id = match emit_event(store.conn(), event) {
@@ -407,6 +465,37 @@ pub fn dispatch_one(
     };
     let _ = ReservationToken::commit(&token, store.conn());
     Ok(DispatchResult::Emitted(event_id))
+}
+
+fn signal_hint_for_emit(config: &crate::config::ReinConfig, job: &JudgeJob) -> Option<SignalHint> {
+    if !config.ars.acceleration.enabled {
+        return None;
+    }
+
+    let mut hint = job.signal_hint.clone()?;
+    hint.inferred_w_view = finite_nonnegative(hint.inferred_w_view);
+    hint.inferred_w_click = finite_nonnegative(hint.inferred_w_click);
+    hint.inferred_w_thumb = finite_nonnegative(hint.inferred_w_thumb);
+    hint.inferred_w_req = finite_nonnegative(hint.inferred_w_req);
+    hint.useful_rate_ci_width = finite_unit(hint.useful_rate_ci_width);
+    if hint.inferred_w_view.is_none()
+        && hint.inferred_w_click.is_none()
+        && hint.inferred_w_thumb.is_none()
+        && hint.inferred_w_req.is_none()
+        && hint.useful_rate_ci_width.is_none()
+    {
+        None
+    } else {
+        Some(hint)
+    }
+}
+
+fn finite_nonnegative(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn finite_unit(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
 }
 
 fn verify_durable_judge_target(
@@ -452,6 +541,7 @@ fn verify_durable_judge_target(
             };
             concept_summary_target_exists(store, &job.surface_id, concept_id)
         }
+        JudgeJobKind::RecallRanking => Ok(false),
     }
 }
 
@@ -521,6 +611,12 @@ pub fn write_test_judge_cache_entry(
             crate::ops::handlers::judge::concept_summary_cache_path_for_config(config),
             "concept_summary_id",
         ),
+        JudgeJobKind::RecallRanking => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "recall-ranking judge cache is not wired",
+            ));
+        }
     };
     let mut entry = serde_json::json!({
         "query": &job.query,
@@ -627,24 +723,19 @@ pub fn call_judge_sync(
     prompt: &str,
     candidate: &str,
 ) -> ReinResult<String> {
-    // codex R1 P2 (J7 fix): the queued payload was already truncated at
-    // enqueue time using `JUDGE_MAX_INPUT_CHARS`, and `compute_stamp_hash`
-    // ran over those exact bytes. Re-truncating here with a smaller
-    // operator-resolved cap (e.g. `[ars.llm_judge].max_input_chars =
-    // 4_000`) would change the bytes the LLM actually sees while leaving
-    // the stamped hash unchanged, breaking the J7 invariant ("stamp_hash
-    // identifies the exact bytes judged"). The fix: do NOT re-truncate
-    // at dispatch. Honoring a smaller operator cap correctly requires
-    // resolving at enqueue time so the hash matches; that needs the
-    // extractor available at the enqueue call site (deferred to v0.27.5).
-    // Until then, the effective cap is the enqueue-time const.
+    // J7 fix: the queued payload was already truncated at enqueue time
+    // using the resolved judge cap, and `compute_stamp_hash` ran over
+    // those exact bytes. Re-truncating here would change the bytes the
+    // LLM actually sees while leaving the stamped hash unchanged,
+    // breaking the invariant that `stamp_hash` identifies the exact
+    // bytes judged.
     // CJK-safe via `.chars()` truncation upstream per pitfall doc.
     // codex R3 P2: dispatch ceiling check moved to `dispatch_one` so
     // oversized stale queue lines don't burn `daily_call_cap` via
     // `reserve_call` + `token.fail()`. By the time we reach this fn the
     // payload has been validated.
     let _ = (config, extractor); // reserved for future extractor-aware path
-    let user = format!("{prompt}\n\nCandidate:\n{candidate}");
+    let user = format!("{prompt}{JUDGE_INPUT_JOINER}{candidate}");
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
@@ -725,7 +816,7 @@ pub struct DrainStats {
 /// Reads the per-shard JSONL queue at
 /// `<resolve_buffer_dir>/queue/<db_hash>/judge_queue.jsonl`, parses each
 /// line as a [`JudgeJob`], and dispatches one-by-one through
-/// [`dispatch_one`]. Default-off when `[ars.llm_judge].enabled = false`
+/// [`dispatch_one`]. Opt-out when `[ars.llm_judge].enabled = false`
 /// (no queue file is ever written under that flag, so no-op fast).
 ///
 /// Atomic file rotation: `judge_queue.jsonl` → `judge_queue.jsonl.processing`
@@ -747,7 +838,7 @@ pub struct DrainStats {
 /// reaper keeps only rows within the configured
 /// `[ars.llm_judge].cache_ttl_secs` window.
 ///
-/// Default-off (`enabled = false` short-circuits before the reaper
+/// Disabled config (`enabled = false`) short-circuits before the reaper
 /// touches disk/SQL). Best-effort: any IO/DB error is logged and
 /// ignored — the manual lookup TTL guard remains the correctness
 /// boundary.
@@ -986,7 +1077,7 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
 
     if !config.ars.llm_judge.enabled {
         // Codex C234 P2 fix — fast no-op when judge is disabled. Don't
-        // touch the queue dir at all; default-off must mean zero new
+        // touch the queue dir at all; explicit opt-out must mean zero new
         // disk writes.
         return DrainStats::default();
     }
@@ -1123,6 +1214,13 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
                 continue;
             }
         };
+        if matches!(job.kind, JudgeJobKind::RecallRanking)
+            && !config.ars.llm_judge.recall_ranking_enabled
+        {
+            tracing::debug!("judge drain: recall-ranking job dropped because surface is disabled");
+            stats.dropped += 1;
+            continue;
+        }
         match dispatch_one(store, config, &extractor, job, daily_cap) {
             Ok(DispatchResult::Emitted(_)) => stats.emitted += 1,
             Ok(DispatchResult::Dropped(reason)) => {
@@ -1231,6 +1329,150 @@ mod tests {
         assert_ne!(h2, h3);
     }
 
+    fn base_synthesis_job() -> JudgeJob {
+        JudgeJob {
+            kind: JudgeJobKind::Synthesis,
+            surface_id: "syn-1".to_string(),
+            concept_id: None,
+            query: "q".to_string(),
+            prompt: "p".to_string(),
+            candidate: "c".to_string(),
+            stamp_hash: JudgeJob::compute_stamp_hash("q", "p", "c"),
+            source: JudgeSource::ManualMcp,
+            query_type: Some("semantic".into()),
+            cluster_id: Some(7),
+            source_count: Some(3),
+            judge_model_override: None,
+            signal_hint: None,
+        }
+    }
+
+    #[test]
+    fn judge_job_deserializes_legacy_rows_without_signal_hint() {
+        let raw = serde_json::json!({
+            "kind": "synthesis",
+            "surface_id": "syn-legacy",
+            "query": "q",
+            "prompt": "p",
+            "candidate": "c",
+            "stamp_hash": JudgeJob::compute_stamp_hash("q", "p", "c"),
+            "source": "ManualMcp",
+            "source_count": 1
+        });
+
+        let job: JudgeJob = serde_json::from_value(raw).expect("legacy job should parse");
+
+        assert!(job.signal_hint.is_none());
+    }
+
+    #[test]
+    fn signal_hint_for_emit_sanitizes_structured_queue_hint() {
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        let mut job = base_synthesis_job();
+        job.signal_hint = Some(crate::store::adaptive::SignalHint {
+            inferred_w_view: Some(-1.0),
+            inferred_w_click: Some(f64::NAN),
+            inferred_w_thumb: Some(2.25),
+            inferred_w_req: Some(0.75),
+            useful_rate_ci_width: Some(2.0),
+        });
+
+        let hint = signal_hint_for_emit(&config, &job).expect("valid fields should keep hint");
+
+        assert_eq!(hint.inferred_w_view, None);
+        assert_eq!(hint.inferred_w_click, None);
+        assert_eq!(hint.inferred_w_thumb, Some(2.25));
+        assert_eq!(hint.inferred_w_req, Some(0.75));
+        assert_eq!(hint.useful_rate_ci_width, None);
+    }
+
+    #[test]
+    fn signal_hint_for_emit_requires_acceleration_but_not_shadow_only() {
+        let mut job = base_synthesis_job();
+        job.signal_hint = Some(crate::store::adaptive::SignalHint {
+            inferred_w_view: Some(1.0),
+            inferred_w_click: None,
+            inferred_w_thumb: None,
+            inferred_w_req: None,
+            useful_rate_ci_width: None,
+        });
+
+        let default_config = crate::config::ReinConfig::default();
+        assert_eq!(
+            signal_hint_for_emit(&default_config, &job)
+                .unwrap()
+                .inferred_w_view,
+            Some(1.0)
+        );
+
+        let mut disabled_config = crate::config::ReinConfig::default();
+        disabled_config.ars.acceleration.enabled = false;
+        assert!(signal_hint_for_emit(&disabled_config, &job).is_none());
+
+        let mut production_config = crate::config::ReinConfig::default();
+        production_config.ars.acceleration.enabled = true;
+        production_config.ars.acceleration.shadow_only = false;
+        assert_eq!(
+            signal_hint_for_emit(&production_config, &job)
+                .unwrap()
+                .inferred_w_view,
+            Some(1.0)
+        );
+
+        let mut shadow_config = crate::config::ReinConfig::default();
+        shadow_config.ars.acceleration.enabled = true;
+        shadow_config.ars.acceleration.shadow_only = true;
+        assert_eq!(
+            signal_hint_for_emit(&shadow_config, &job)
+                .unwrap()
+                .inferred_w_view,
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn drain_queue_drops_recall_ranking_jobs_while_surface_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = temp_judge_config(&dir);
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-test".to_string());
+
+        let query = "q";
+        let prompt = "ranking evidence";
+        let candidate = "ranked candidates";
+        let job = serde_json::json!({
+            "kind": "recall_ranking",
+            "surface_id": "rank-job-1",
+            "concept_id": serde_json::Value::Null,
+            "query": query,
+            "prompt": prompt,
+            "candidate": candidate,
+            "stamp_hash": JudgeJob::compute_stamp_hash(query, prompt, candidate),
+            "source": "AutoSampled",
+            "query_type": "Semantic",
+            "cluster_id": serde_json::Value::Null,
+            "source_count": 3u32,
+        });
+        let queue_path = crate::ops::handlers::judge::judge_queue_path_for_config(&config);
+        crate::ops::handlers::judge::append_jsonl_line(&queue_path, &job).unwrap();
+
+        let store = SqliteStore::in_memory().unwrap();
+        let stats = drain_queue(&store, &config);
+
+        assert_eq!(
+            stats.malformed, 0,
+            "recall-ranking rows are a known queue surface"
+        );
+        assert_eq!(
+            stats.dropped, 1,
+            "unsupported recall-ranking jobs must be dropped"
+        );
+        assert_eq!(stats.emitted, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
     #[test]
     fn j5_rejects_synthesis_job_without_matching_cache_stamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -1249,6 +1491,7 @@ mod tests {
             cluster_id: None,
             source_count: Some(1),
             judge_model_override: None,
+            signal_hint: None,
         };
 
         assert!(
@@ -1307,6 +1550,7 @@ mod tests {
             cluster_id: None,
             source_count: Some(0),
             judge_model_override: None,
+            signal_hint: None,
         };
 
         assert!(

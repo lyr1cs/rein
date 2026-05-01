@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use rein_macros::op;
 
 use crate::doctor::{self, DoctorOptions, DoctorReport};
+use crate::ops::render::render_value_as_markdown;
 use crate::ops::system_health::{
     self, GrayzoneSnapshot, IndexesSnapshot, QueuesSnapshot, SystemStatus,
 };
@@ -126,6 +127,45 @@ impl IntoMarkdown for VersionOutput {
 impl IntoCliText for VersionOutput {
     fn to_cli_text(&self) -> String {
         self.to_markdown()
+    }
+}
+
+/// Unified Trust & Measurement report for ARS rollout operations.
+#[derive(Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct TrustMeasurementOutput(pub crate::ops::trust_measurement::TrustMeasurementReport);
+
+impl IntoJson for TrustMeasurementOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.0).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for TrustMeasurementOutput {
+    fn to_markdown(&self) -> String {
+        render_value_as_markdown(&self.to_json(), 0)
+    }
+}
+
+impl IntoCliText for TrustMeasurementOutput {
+    fn to_cli_text(&self) -> String {
+        serde_json::to_string_pretty(&self.to_json()).unwrap_or_else(|e| format!("Error: {e}"))
+    }
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "trust_measurement",
+        category = "diagnostics",
+        description = "Unified Trust & Measurement snapshot for ARS rollout: release gate, eval gates, index consistency, background observability, and LLM active-learning status.",
+        cli(name = "trust-measurement"),
+        mcp(name = "rein_trust_measurement"),
+        rest(method = "GET", path = "/api/trust-measurement")
+    )]
+    pub fn trust_measurement(&self) -> ReinResult<TrustMeasurementOutput> {
+        let config = self.config.clone();
+        let report = self.with_store(|s| Ok(crate::ops::trust_measurement::collect(s, &config)))?;
+        Ok(TrustMeasurementOutput(report))
     }
 }
 

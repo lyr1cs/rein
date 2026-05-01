@@ -4,8 +4,164 @@
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
+use std::collections::HashMap;
 
 use super::dedup::run_vec_dedup;
+
+const ARS_POLICY_ADOPTION_MAX_STEP: f64 = 0.05;
+
+fn persist_ars_effective_scalars(
+    state: &mut crate::store::adaptive::AdaptiveState,
+    config: &ReinConfig,
+    priors: &crate::ops::judge_calibration::BootstrapPriors,
+    synthesis_gate_adoption_weight: f64,
+    concept_summary_gate_adoption_weight: f64,
+    judge_sample_rate_adoption_weight: f64,
+) {
+    let calibration_snapshot = state.judge_calibration_state.clone();
+    let calibration = calibration_snapshot.as_ref();
+    let drift_alert = calibration
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
+        .unwrap_or(false);
+    let prior_count = if priors.prior_confidence.is_finite() && priors.prior_confidence > 0.0 {
+        priors.prior_confidence.round() as u64
+    } else {
+        0
+    };
+
+    let synthesis_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
+        config.ars.synthesis_cold_start_n,
+        calibration,
+        synthesis_gate_adoption_weight,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N,
+        synthesis_cold_start as f64,
+    );
+
+    let concept_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
+        config.ars.concept_summary_cold_start_n,
+        calibration,
+        concept_summary_gate_adoption_weight,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N),
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N,
+        concept_cold_start as f64,
+    );
+
+    let judge_sample_rate_cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
+        config.ars.llm_judge.sample_rate_cold_start,
+        calibration,
+        judge_sample_rate_adoption_weight,
+        true,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+        judge_sample_rate_cold,
+    );
+
+    let judge_sample_rate_warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
+        config.ars.llm_judge.sample_rate_warm,
+        calibration,
+        judge_sample_rate_adoption_weight,
+        false,
+        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
+    )
+    .min(judge_sample_rate_cold);
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+        judge_sample_rate_warm,
+    );
+
+    let threshold_inputs = crate::ops::ars_tuning::TrustInputs {
+        enabled: config.ars.acceleration.enabled,
+        production_canary: synthesis_gate_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight: synthesis_gate_adoption_weight,
+        human_count: prior_count,
+        llm_count: 0,
+        llm_reliability: 0.0,
+        calibration: 1.0,
+        stability: 1.0,
+        drift_alert,
+        prior_strength: 20.0,
+        max_trust: 0.50,
+    };
+    let synthesis_threshold = crate::ops::ars_tuning::effective_scalar(
+        crate::store::adaptive::SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        priors.useful_rate_threshold,
+        state.ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        ),
+        crate::ops::ars_tuning::bounds01(0.05),
+        threshold_inputs,
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+        synthesis_threshold,
+    );
+
+    let concept_threshold_inputs = crate::ops::ars_tuning::TrustInputs {
+        production_canary: concept_summary_gate_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight: concept_summary_gate_adoption_weight,
+        ..threshold_inputs
+    };
+    let concept_threshold = crate::ops::ars_tuning::effective_scalar(
+        crate::store::adaptive::CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        priors.useful_rate_threshold,
+        state.ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        ),
+        crate::ops::ars_tuning::bounds01(0.05),
+        concept_threshold_inputs,
+    );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+        concept_threshold,
+    );
+}
+
+fn useful_rate_weights_from_signal_hint_priors(
+    baseline: crate::store::adaptive::UsefulRateWeights,
+    priors: &crate::ops::judge_calibration::BootstrapPriors,
+    adoption_weight: f64,
+) -> crate::store::adaptive::UsefulRateWeights {
+    let adoption_weight = if adoption_weight.is_finite() {
+        adoption_weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if adoption_weight <= f64::EPSILON {
+        return baseline;
+    }
+    let learned = crate::store::adaptive::UsefulRateWeights::from_priors(
+        baseline,
+        priors.w_view,
+        priors.w_click,
+        priors.w_thumb,
+        priors.w_req,
+    );
+    crate::store::adaptive::UsefulRateWeights {
+        view: baseline
+            .view
+            .mul_add(1.0 - adoption_weight, learned.view * adoption_weight),
+        click: baseline
+            .click
+            .mul_add(1.0 - adoption_weight, learned.click * adoption_weight),
+        thumb: baseline
+            .thumb
+            .mul_add(1.0 - adoption_weight, learned.thumb * adoption_weight),
+        requery: baseline
+            .requery
+            .mul_add(1.0 - adoption_weight, learned.requery * adoption_weight),
+    }
+}
 
 /// Run the adaptive engine slow-channel pipeline after GC.
 /// Order: M4 (HDBSCAN) → M3 (Survival) → M5 (Tiering) → M2 (Alpha) → persist.
@@ -100,12 +256,85 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // SynthesisLlmJudge events fold into `llm_judge_count` / hit_count
     // and the κ pair cache. Without this swap the new consumer is dead
     // code and judge events that landed past the offset are lost.
-    match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge(
+    let synthesis_gate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "synthesis_gate",
+        );
+    let concept_summary_gate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "concept_summary_gate",
+        );
+    let judge_sample_rate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "judge_sample_rate",
+        );
+    let llm_feedback_decay_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "llm_feedback_decay",
+        );
+    let signal_hint_priors_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "signal_hint_priors",
+        );
+    let bootstrap_priors =
+        match crate::ops::judge_calibration::bootstrap_priors_from_replay(config, store.conn()) {
+            Ok(priors) => priors,
+            Err(e) => {
+                tracing::warn!("failed to derive ARS bootstrap priors from replay: {e}");
+                crate::ops::judge_calibration::BootstrapPriors::const_defaults()
+            }
+        };
+    let synthesis_useful_rate_weights = useful_rate_weights_from_signal_hint_priors(
+        crate::store::adaptive::UsefulRateWeights::synthesis_bootstrap(),
+        &bootstrap_priors,
+        signal_hint_priors_adoption_weight,
+    );
+    let concept_summary_useful_rate_weights = useful_rate_weights_from_signal_hint_priors(
+        crate::store::adaptive::UsefulRateWeights::concept_summary_bootstrap(),
+        &bootstrap_priors,
+        signal_hint_priors_adoption_weight,
+    );
+    persist_ars_effective_scalars(
+        &mut state,
+        config,
+        &bootstrap_priors,
+        synthesis_gate_adoption_weight,
+        concept_summary_gate_adoption_weight,
+        judge_sample_rate_adoption_weight,
+    );
+    let effective_judge_weight_decay_rate =
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+            config.ars.llm_judge.weight_decay_rate,
+            state.judge_calibration_state.as_ref(),
+            llm_feedback_decay_adoption_weight,
+            state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
+        );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
+        effective_judge_weight_decay_rate,
+    );
+    match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge_and_weights(
         store.conn(),
         state.synthesis_feedback_stats.clone(),
         state.pending_kappa_half_pairs.clone(),
         state.judge_calibration_state.clone().unwrap_or_default(),
-        config.ars.llm_judge.weight_decay_rate,
+        effective_judge_weight_decay_rate,
+        synthesis_useful_rate_weights,
     ) {
         Ok((stats, pairs, calibration, max_id)) => {
             state.synthesis_feedback_stats = Some(stats);
@@ -127,12 +356,24 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // recompute call above. Same shared pending_kappa_half_pairs cache
     // and judge_calibration_state are folded so concept-summary judge
     // events flow into useful_rate / κ pairs identically to synthesis.
-    match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge(
+    let effective_judge_weight_decay_rate =
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+            config.ars.llm_judge.weight_decay_rate,
+            state.judge_calibration_state.as_ref(),
+            llm_feedback_decay_adoption_weight,
+            state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
+        );
+    state.set_ars_effective_scalar(
+        crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
+        effective_judge_weight_decay_rate,
+    );
+    match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge_and_weights(
         store.conn(),
         state.concept_summary_feedback_stats.clone(),
         state.pending_kappa_half_pairs.clone(),
         state.judge_calibration_state.clone().unwrap_or_default(),
-        config.ars.llm_judge.weight_decay_rate,
+        effective_judge_weight_decay_rate,
+        concept_summary_useful_rate_weights,
     ) {
         Ok((stats, pairs, calibration, max_id)) => {
             state.concept_summary_feedback_stats = Some(stats);
@@ -151,9 +392,8 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // this drain, the queue grew indefinitely and no
     // `synthesis_llm_judge` / `concept_summary_llm_judge` events ever
     // reached `feedback_events`, making the entire judge feedback loop
-    // dead code in production. Default-off when
-    // `[ars.llm_judge].enabled = false` (no queue file is ever written
-    // under that flag, so the drain is a fast no-op).
+    // dead code in production. When `[ars.llm_judge].enabled = false`,
+    // no queue file is written, so the drain is a fast no-op.
     let drain_stats = crate::ops::llm_judge_worker::drain_queue(store, config);
     if drain_stats.emitted > 0
         || drain_stats.dropped > 0
@@ -267,6 +507,9 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
             false
         }
     };
+    if snapshot_saved {
+        refresh_ars_parameter_policy(store.conn(), config, &state);
+    }
 
     // Step 6b: Post-save offset commits. Honor the module invariant —
     // never advance a consumer's cursor unless the derived state change
@@ -338,6 +581,208 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     .unwrap_or(0);
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
+    }
+}
+
+fn refresh_ars_parameter_policy(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) {
+    use crate::store::ars_parameter_policy::{
+        load_parameter_policy, save_parameter_policy_cas, ArsParameterPolicy,
+        ArsParameterPolicyLoadStatus, ArsParameterPolicyMode,
+    };
+
+    let loaded = load_parameter_policy(conn);
+    if matches!(
+        loaded.status,
+        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError
+    ) {
+        tracing::warn!(
+            status = ?loaded.status,
+            error = ?loaded.error,
+            "ARS parameter policy not refreshed because the metadata row is unhealthy"
+        );
+        return;
+    }
+
+    let eligible_shadow_fusion = state
+        .learned_shadow_fusion
+        .values()
+        .any(|entry| entry.sample_count >= config.adaptive.min_samples_alpha);
+    let desired_mode = if !config.adaptive.enabled || !config.ars.acceleration.enabled {
+        ArsParameterPolicyMode::Disabled
+    } else if config.ars.acceleration.shadow_only || !eligible_shadow_fusion {
+        ArsParameterPolicyMode::Shadow
+    } else {
+        ArsParameterPolicyMode::Canary
+    };
+    if matches!(loaded.status, ArsParameterPolicyLoadStatus::Missing)
+        && matches!(desired_mode, ArsParameterPolicyMode::Disabled)
+    {
+        return;
+    }
+
+    let disabled_reason = match desired_mode {
+        ArsParameterPolicyMode::Disabled => Some("adaptive or ars acceleration disabled".into()),
+        ArsParameterPolicyMode::Shadow if config.ars.acceleration.shadow_only => {
+            Some("ars acceleration shadow_only=true".into())
+        }
+        ArsParameterPolicyMode::Shadow => Some("insufficient learned parameter evidence".into()),
+        ArsParameterPolicyMode::Canary => None,
+    };
+    let current = loaded.policy;
+    let runtime_adoption_weight =
+        next_runtime_adoption_weight(config, state, desired_mode, current.runtime_adoption_weight);
+    let adoption_weights =
+        next_scoped_adoption_weights(config, state, desired_mode, &current.adoption_weights);
+    if current.mode == desired_mode
+        && current.source_adaptive_version == state.version
+        && current.disabled_reason == disabled_reason
+        && (current.runtime_adoption_weight - runtime_adoption_weight).abs() <= f64::EPSILON
+        && current.adoption_weights == adoption_weights
+    {
+        return;
+    }
+
+    let policy = ArsParameterPolicy {
+        revision: current.revision.saturating_add(1),
+        mode: desired_mode,
+        disabled_reason,
+        source_adaptive_version: state.version,
+        runtime_adoption_weight,
+        adoption_weights,
+        last_event_id: state
+            .alpha_optimizer_last_id
+            .max(state.alpha_optimizer_access_last_id),
+        last_updated: chrono::Utc::now().to_rfc3339(),
+        ..ArsParameterPolicy::default()
+    };
+    match save_parameter_policy_cas(conn, &policy, current.revision) {
+        Ok(true) => tracing::debug!(
+            mode = ?policy.mode,
+            revision = policy.revision,
+            source_adaptive_version = policy.source_adaptive_version,
+            runtime_adoption_weight = %format!("{:.3}", policy.runtime_adoption_weight),
+            "ARS parameter policy refreshed"
+        ),
+        Ok(false) => tracing::warn!(
+            expected_revision = current.revision,
+            "ARS parameter policy CAS miss; keeping existing activation policy"
+        ),
+        Err(e) => tracing::warn!("failed to refresh ARS parameter policy: {e}"),
+    }
+}
+
+fn next_runtime_adoption_weight(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    desired_mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode,
+    current_weight: f64,
+) -> f64 {
+    if !matches!(
+        desired_mode,
+        crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+    ) {
+        return 0.0;
+    }
+    let Some(target) = max_runtime_adoption_target(config, state) else {
+        return 0.0;
+    };
+    step_runtime_adoption_weight(current_weight, target)
+}
+
+fn next_scoped_adoption_weights(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    desired_mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode,
+    current_weights: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    if !matches!(
+        desired_mode,
+        crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+    ) {
+        return HashMap::new();
+    }
+
+    let mut weights = HashMap::new();
+    for (bucket, entry) in &state.learned_shadow_fusion {
+        let Some(target) = runtime_adoption_target(config, entry.sample_count) else {
+            continue;
+        };
+        let key = recall_fusion_adoption_key(bucket);
+        let current = current_weights.get(&key).copied().unwrap_or(0.0);
+        weights.insert(key, step_runtime_adoption_weight(current, target));
+    }
+
+    if let Some(target) = max_runtime_adoption_target(config, state) {
+        for key in [
+            "synthesis_gate",
+            "concept_summary_gate",
+            "judge_sample_rate",
+            "llm_feedback_decay",
+            "signal_hint_priors",
+        ] {
+            let current = current_weights.get(key).copied().unwrap_or(0.0);
+            weights.insert(
+                key.to_string(),
+                step_runtime_adoption_weight(current, target),
+            );
+        }
+    }
+
+    weights
+}
+
+fn max_runtime_adoption_target(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) -> Option<f64> {
+    let max_samples = state
+        .learned_shadow_fusion
+        .values()
+        .filter(|entry| entry.sample_count >= config.adaptive.min_samples_alpha)
+        .map(|entry| entry.sample_count)
+        .max()?;
+    runtime_adoption_target(config, max_samples)
+}
+
+fn runtime_adoption_target(config: &ReinConfig, sample_count: usize) -> Option<f64> {
+    if sample_count < config.adaptive.min_samples_alpha {
+        return None;
+    }
+    let samples = sample_count as f64;
+    if samples <= 0.0 || !samples.is_finite() {
+        return None;
+    }
+    let prior = config.adaptive.shrinkage_prior.max(1.0);
+    Some((samples / (samples + prior)).clamp(ARS_POLICY_ADOPTION_MAX_STEP, 1.0))
+}
+
+fn step_runtime_adoption_weight(current_weight: f64, target: f64) -> f64 {
+    let target = if target.is_finite() {
+        target.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let current = if current_weight.is_finite() {
+        current_weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if target >= current {
+        (current + ARS_POLICY_ADOPTION_MAX_STEP).min(target)
+    } else {
+        (current - ARS_POLICY_ADOPTION_MAX_STEP).max(target)
+    }
+}
+
+fn recall_fusion_adoption_key(bucket: &str) -> String {
+    if bucket == "global" {
+        "recall_fusion:global".to_string()
+    } else {
+        format!("recall_fusion:{bucket}")
     }
 }
 
@@ -1317,6 +1762,401 @@ fn compute_counterfactual_alphas(
     }
 }
 
+#[derive(Debug, Default)]
+struct ShadowFusionReplayReport {
+    global: Option<crate::search::alpha_optimizer::LearnedShadowWeights>,
+    by_query_type: Vec<(String, crate::search::alpha_optimizer::LearnedShadowWeights)>,
+    by_cluster: Vec<(
+        (String, u32),
+        crate::search::alpha_optimizer::LearnedShadowWeights,
+    )>,
+}
+
+const SHADOW_FUSION_STATUS_REPLAY_LIMIT: usize = 500;
+
+fn compute_shadow_fusion_weight_replay(
+    events_with_access: &[crate::search::alpha_optimizer::RecallEvent],
+    stored_events: &[crate::store::adaptive::StoredEvent],
+    state: &crate::store::adaptive::AdaptiveState,
+    config: &ReinConfig,
+) -> Option<ShadowFusionReplayReport> {
+    if !config.ars.acceleration.enabled {
+        return None;
+    }
+    if events_with_access.len() < config.adaptive.min_samples_alpha {
+        return None;
+    }
+
+    let decay_lambda = 0.06;
+    let parent = crate::search::alpha_optimizer::ShadowFusionWeights::default();
+    let n_prior = config.adaptive.shrinkage_prior;
+    let mut report = ShadowFusionReplayReport {
+        global: crate::search::alpha_optimizer::optimize_shadow_weights(
+            events_with_access,
+            decay_lambda,
+            parent,
+            n_prior,
+        ),
+        ..Default::default()
+    };
+
+    let qt_map: std::collections::HashMap<&str, &str> = stored_events
+        .iter()
+        .filter_map(|se| se.request_id.as_deref().zip(se.query_type.as_deref()))
+        .collect();
+
+    for qt in &[
+        "episodic",
+        "temporal",
+        "preference",
+        "exact",
+        "semantic",
+        "exploratory",
+    ] {
+        let qt_events: Vec<_> = events_with_access
+            .iter()
+            .filter(|e| qt_map.get(e.request_id.as_str()).copied() == Some(qt))
+            .cloned()
+            .collect();
+        if qt_events.len() < config.adaptive.min_samples_alpha {
+            continue;
+        }
+        let parent_weights = report
+            .global
+            .as_ref()
+            .map(|learned| learned.weights)
+            .unwrap_or(parent);
+        if let Some(learned) = crate::search::alpha_optimizer::optimize_shadow_weights(
+            &qt_events,
+            decay_lambda,
+            parent_weights,
+            n_prior,
+        ) {
+            report.by_query_type.push(((*qt).to_string(), learned));
+        }
+    }
+
+    let mut cluster_buckets: std::collections::HashMap<
+        (String, u32),
+        Vec<crate::search::alpha_optimizer::RecallEvent>,
+    > = std::collections::HashMap::new();
+    for event in events_with_access {
+        let qt = qt_map
+            .get(event.request_id.as_str())
+            .copied()
+            .unwrap_or("semantic");
+        let mut votes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for id in &event.accessed_ids {
+            if let Some(&cid) = state.memory_clusters.get(id) {
+                *votes.entry(cid).or_default() += 1;
+            }
+        }
+        if let Some((&cid, _)) = votes.iter().max_by_key(|(_, &count)| count) {
+            cluster_buckets
+                .entry((qt.to_string(), cid))
+                .or_default()
+                .push(event.clone());
+        }
+    }
+
+    for ((qt, cluster_id), events) in cluster_buckets {
+        if events.len() < config.adaptive.min_samples_alpha {
+            continue;
+        }
+        let parent_weights = report
+            .by_query_type
+            .iter()
+            .find(|(query_type, _)| query_type == &qt)
+            .map(|(_, learned)| learned.weights)
+            .or_else(|| report.global.as_ref().map(|learned| learned.weights))
+            .unwrap_or(parent);
+        if let Some(learned) = crate::search::alpha_optimizer::optimize_shadow_weights(
+            &events,
+            decay_lambda,
+            parent_weights,
+            n_prior,
+        ) {
+            report.by_cluster.push(((qt, cluster_id), learned));
+        }
+    }
+
+    if report.global.is_none() && report.by_query_type.is_empty() && report.by_cluster.is_empty() {
+        None
+    } else {
+        Some(report)
+    }
+}
+
+pub fn shadow_fusion_status(store: &SqliteStore, config: &ReinConfig) -> serde_json::Value {
+    let min_samples = config.adaptive.min_samples_alpha;
+    let base = |status: &str, eligible_samples: usize, global: serde_json::Value| {
+        serde_json::json!({
+            "enabled": config.ars.acceleration.enabled,
+            "shadow_only": config.ars.acceleration.shadow_only,
+            "status": status,
+            "replay_limit": SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+            "eligible_samples": eligible_samples,
+            "min_samples": min_samples,
+            "global": global,
+            "by_query_type": [],
+            "by_cluster": [],
+        })
+    };
+
+    if !config.ars.acceleration.enabled {
+        return base("disabled", 0, serde_json::Value::Null);
+    }
+    let conn = store.conn();
+    let recall_events = recent_events_by_type(
+        conn,
+        crate::store::adaptive::EventType::RecallComplete.as_str(),
+        SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+    );
+    let access_events = recent_events_by_type(
+        conn,
+        crate::store::adaptive::EventType::RecallAccess.as_str(),
+        SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+    );
+    let parsed_recall_events: Vec<crate::search::alpha_optimizer::RecallEvent> = recall_events
+        .iter()
+        .filter_map(|event| parse_candidates_from_event(event, &access_events))
+        .collect();
+    let events_with_access: Vec<_> = prefix_committed_events_with_access(
+        &recall_events,
+        parsed_recall_events
+            .iter()
+            .filter(|event| !event.accessed_ids.is_empty()),
+    );
+    let eligible_samples = events_with_access.len();
+    if eligible_samples < min_samples {
+        return base(
+            "insufficient_samples",
+            eligible_samples,
+            serde_json::Value::Null,
+        );
+    }
+
+    let state = crate::store::adaptive::AdaptiveState::restore_snapshot(conn).unwrap_or_default();
+    match compute_shadow_fusion_weight_replay(&events_with_access, &recall_events, &state, config) {
+        Some(report) => project_shadow_fusion_report(report, config, eligible_samples),
+        None => base(
+            "no_learnable_signal",
+            eligible_samples,
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+fn recent_events_by_type(
+    conn: &rusqlite::Connection,
+    event_type: &str,
+    limit: usize,
+) -> Vec<crate::store::adaptive::StoredEvent> {
+    match conn.prepare(
+        "SELECT id, ts, event_type, request_id, memory_id, concept_id, query, query_type, topic, payload
+         FROM feedback_events WHERE event_type = ?1
+         ORDER BY id DESC LIMIT ?2",
+    ) {
+        Ok(mut stmt) => {
+            let mut events: Vec<_> = stmt
+                .query_map(rusqlite::params![event_type, limit as i64], |row| {
+                    Ok(crate::store::adaptive::StoredEvent {
+                        id: row.get(0)?,
+                        ts: row.get(1)?,
+                        event_type: row.get(2)?,
+                        request_id: row.get(3)?,
+                        memory_id: row.get(4)?,
+                        concept_id: row.get(5)?,
+                        query: row.get(6)?,
+                        query_type: row.get(7)?,
+                        topic: row.get(8)?,
+                        payload: row.get(9)?,
+                    })
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|row| row.ok()).collect())
+                .unwrap_or_default();
+            events.reverse();
+            events
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn prefix_committed_events_with_access<'a>(
+    stored_recall_events: &[crate::store::adaptive::StoredEvent],
+    events_with_access: impl Iterator<Item = &'a crate::search::alpha_optimizer::RecallEvent>,
+) -> Vec<crate::search::alpha_optimizer::RecallEvent> {
+    let events_with_access: Vec<_> = events_with_access.cloned().collect();
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let matched_request_ids: std::collections::HashSet<&str> = events_with_access
+        .iter()
+        .map(|event| event.request_id.as_str())
+        .collect();
+    let mut rids_we_advanced_through = std::collections::HashSet::new();
+    for event in stored_recall_events {
+        let rid = event.request_id.as_deref().unwrap_or("");
+        let is_matched = matched_request_ids.contains(rid);
+        let is_expired = chrono::DateTime::parse_from_rfc3339(&event.ts)
+            .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
+            .unwrap_or(false);
+
+        if is_matched || is_expired {
+            rids_we_advanced_through.insert(rid.to_string());
+        } else {
+            break;
+        }
+    }
+    events_with_access
+        .into_iter()
+        .filter(|event| rids_we_advanced_through.contains(event.request_id.as_str()))
+        .collect()
+}
+
+fn project_shadow_fusion_report(
+    report: ShadowFusionReplayReport,
+    config: &ReinConfig,
+    eligible_samples: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": config.ars.acceleration.enabled,
+        "shadow_only": config.ars.acceleration.shadow_only,
+        "status": "ready",
+        "replay_limit": SHADOW_FUSION_STATUS_REPLAY_LIMIT,
+        "eligible_samples": eligible_samples,
+        "min_samples": config.adaptive.min_samples_alpha,
+        "global": report.global.map(project_learned_shadow_weights).unwrap_or(serde_json::Value::Null),
+        "by_query_type": report.by_query_type
+            .into_iter()
+            .map(|(query_type, learned)| {
+                let mut value = project_learned_shadow_weights(learned);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("query_type".into(), serde_json::Value::String(query_type));
+                }
+                value
+            })
+            .collect::<Vec<_>>(),
+        "by_cluster": report.by_cluster
+            .into_iter()
+            .map(|((query_type, cluster_id), learned)| {
+                let mut value = project_learned_shadow_weights(learned);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("query_type".into(), serde_json::Value::String(query_type));
+                    obj.insert("cluster_id".into(), serde_json::Value::from(cluster_id));
+                }
+                value
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn project_learned_shadow_weights(
+    learned: crate::search::alpha_optimizer::LearnedShadowWeights,
+) -> serde_json::Value {
+    let weights = learned.weights.normalized_or_default();
+    serde_json::json!({
+        "sample_count": learned.sample_count,
+        "last_updated": learned.last_updated.to_rfc3339(),
+        "weights": {
+            "bm25": weights.bm25,
+            "vec": weights.vec,
+            "kg": weights.kg,
+            "episode": weights.episode,
+            "support": weights.support,
+            "diversity": weights.diversity,
+        }
+    })
+}
+
+fn learned_shadow_fusion_entry(
+    learned: &crate::search::alpha_optimizer::LearnedShadowWeights,
+) -> crate::store::adaptive::LearnedShadowFusionEntry {
+    let weights = learned.weights.normalized_or_default();
+    crate::store::adaptive::LearnedShadowFusionEntry {
+        weights: crate::store::adaptive::ShadowFusionWeightEntry {
+            bm25: weights.bm25,
+            vec: weights.vec,
+            kg: weights.kg,
+            episode: weights.episode,
+            support: weights.support,
+            diversity: weights.diversity,
+        },
+        sample_count: learned.sample_count,
+        last_updated: learned.last_updated.to_rfc3339(),
+    }
+}
+
+fn commit_shadow_fusion_weight_replay(
+    state: &mut crate::store::adaptive::AdaptiveState,
+    report: &ShadowFusionReplayReport,
+) {
+    if let Some(global) = &report.global {
+        state
+            .learned_shadow_fusion
+            .insert("global".into(), learned_shadow_fusion_entry(global));
+    }
+    for (query_type, learned) in &report.by_query_type {
+        state.learned_shadow_fusion.insert(
+            crate::store::adaptive::AdaptiveState::bucket_key(query_type, None),
+            learned_shadow_fusion_entry(learned),
+        );
+    }
+    for ((query_type, cluster_id), learned) in &report.by_cluster {
+        state.learned_shadow_fusion.insert(
+            crate::store::adaptive::AdaptiveState::bucket_key(query_type, Some(*cluster_id)),
+            learned_shadow_fusion_entry(learned),
+        );
+    }
+}
+
+fn log_shadow_fusion_weight_replay(report: &ShadowFusionReplayReport) {
+    if let Some(global) = &report.global {
+        tracing::info!(
+            target: "rein::ars.acceleration",
+            scope = "global",
+            sample_count = global.sample_count,
+            bm25 = global.weights.bm25,
+            vec = global.weights.vec,
+            kg = global.weights.kg,
+            episode = global.weights.episode,
+            support = global.weights.support,
+            diversity = global.weights.diversity,
+            "S3 shadow fusion weights"
+        );
+    }
+    for (query_type, learned) in &report.by_query_type {
+        tracing::info!(
+            target: "rein::ars.acceleration",
+            scope = "query_type",
+            query_type = %query_type,
+            sample_count = learned.sample_count,
+            bm25 = learned.weights.bm25,
+            vec = learned.weights.vec,
+            kg = learned.weights.kg,
+            episode = learned.weights.episode,
+            support = learned.weights.support,
+            diversity = learned.weights.diversity,
+            "S3 shadow fusion weights"
+        );
+    }
+    for ((query_type, cluster_id), learned) in &report.by_cluster {
+        tracing::info!(
+            target: "rein::ars.acceleration",
+            scope = "query_type_cluster",
+            query_type = %query_type,
+            cluster_id = *cluster_id,
+            sample_count = learned.sample_count,
+            bm25 = learned.weights.bm25,
+            vec = learned.weights.vec,
+            kg = learned.weights.kg,
+            episode = learned.weights.episode,
+            support = learned.weights.support,
+            diversity = learned.weights.diversity,
+            "S3 shadow fusion weights"
+        );
+    }
+}
+
 /// Main orchestrator for M2 alpha learning.
 ///
 /// Peeks at recall events, parses candidates, advances both consumer offsets
@@ -1491,6 +2331,11 @@ fn run_alpha_learning(
         pending.push(("alpha_optimizer_access", off));
     }
 
+    let events_with_access: Vec<_> = events_with_access
+        .into_iter()
+        .filter(|event| rids_we_advanced_through.contains(event.request_id.as_str()))
+        .collect();
+
     if events_with_access.is_empty() {
         tracing::debug!(
             "M2: peeked {} events but none had access data yet (will retry)",
@@ -1506,6 +2351,12 @@ fn run_alpha_learning(
     }
 
     compute_counterfactual_alphas(&events_with_access, &events, state, config);
+    if let Some(report) =
+        compute_shadow_fusion_weight_replay(&events_with_access, &events, state, config)
+    {
+        commit_shadow_fusion_weight_replay(state, &report);
+        log_shadow_fusion_weight_replay(&report);
+    }
     if pending.is_empty() {
         None
     } else {
@@ -2476,6 +3327,221 @@ mod tests {
     use crate::types::*;
     use chrono::Utc;
 
+    fn metadata_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn
+    }
+
+    fn eligible_shadow_state() -> AdaptiveState {
+        let mut state = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        state.learned_shadow_fusion.insert(
+            "global".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.2,
+                    vec: 0.2,
+                    kg: 0.2,
+                    episode: 0.2,
+                    support: 0.1,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_promotes_canary_only_for_non_shadow_eligible_state() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn);
+        assert_eq!(
+            loaded.policy.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert!(loaded.policy.allows_runtime_adoption(state.version));
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_rolls_canary_adoption_weight_gradually() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let first = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert!((first.runtime_adoption_weight - 0.05).abs() < 1e-12);
+
+        state.version += 1;
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let second = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert!((second.runtime_adoption_weight - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_records_scoped_adoption_weights() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.3,
+                    kg: 0.2,
+                    episode: 0.2,
+                    support: 0.1,
+                    diversity: 0.1,
+                },
+                sample_count: 14,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+        state.learned_shadow_fusion.insert(
+            "semantic:7".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.4,
+                    kg: 0.1,
+                    episode: 0.2,
+                    support: 0.1,
+                    diversity: 0.1,
+                },
+                sample_count: 16,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            loaded.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert_eq!(
+            loaded.adoption_weights["recall_fusion:global"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(loaded.adoption_weights["recall_fusion:semantic"], 0.05);
+        assert_eq!(loaded.adoption_weights["recall_fusion:semantic:7"], 0.05);
+        assert_eq!(
+            loaded.adoption_weights["synthesis_gate"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["concept_summary_gate"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["judge_sample_rate"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["llm_feedback_decay"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["signal_hint_priors"],
+            loaded.runtime_adoption_weight
+        );
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_rolls_back_to_shadow_and_clears_scoped_weights() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let promoted = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            promoted.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert!(!promoted.adoption_weights.is_empty());
+
+        state.version += 1;
+        for entry in state.learned_shadow_fusion.values_mut() {
+            entry.sample_count = 1;
+        }
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let rolled_back = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            rolled_back.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow
+        );
+        assert_eq!(rolled_back.runtime_adoption_weight, 0.0);
+        assert!(rolled_back.adoption_weights.is_empty());
+    }
+
+    #[test]
+    fn ars_signal_hint_priors_blend_is_scoped_by_adoption_weight() {
+        let baseline = crate::store::adaptive::UsefulRateWeights::synthesis_bootstrap();
+        let priors = crate::ops::judge_calibration::BootstrapPriors {
+            w_view: baseline.view + 1.0,
+            w_click: baseline.click + 1.0,
+            w_thumb: baseline.thumb + 1.0,
+            w_req: baseline.requery + 1.0,
+            ..crate::ops::judge_calibration::BootstrapPriors::const_defaults()
+        };
+
+        assert_eq!(
+            useful_rate_weights_from_signal_hint_priors(baseline, &priors, 0.0),
+            baseline
+        );
+
+        let blended = useful_rate_weights_from_signal_hint_priors(baseline, &priors, 0.5);
+        assert!((blended.view - (baseline.view + 0.5)).abs() < 1e-12);
+        assert!((blended.click - (baseline.click + 0.5)).abs() < 1e-12);
+        assert!((blended.thumb - (baseline.thumb + 0.5)).abs() < 1e-12);
+        assert!((blended.requery - (baseline.requery + 0.5)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_records_shadow_for_shadow_only_config() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        let state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn);
+        assert_eq!(
+            loaded.policy.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow
+        );
+        assert!(!loaded.policy.allows_runtime_adoption(state.version));
+    }
+
     fn test_memory(topic: &str, summary: &str, access_count: u32) -> Memory {
         Memory {
             id: ulid::Ulid::new().to_string(),
@@ -2513,6 +3579,56 @@ mod tests {
 
     fn emit(store: &SqliteStore, event: FeedbackEvent) -> i64 {
         adaptive::emit_event(store.conn(), event).unwrap()
+    }
+
+    fn shadow_replay_event(
+        request_id: &str,
+        accessed_id: &str,
+    ) -> crate::search::alpha_optimizer::RecallEvent {
+        crate::search::alpha_optimizer::RecallEvent {
+            request_id: request_id.to_string(),
+            candidates: vec![
+                crate::search::alpha_optimizer::CandidateLog {
+                    memory_id: accessed_id.to_string(),
+                    bm25_norm: 0.2,
+                    vec_norm: 0.2,
+                    kg_norm: 1.0,
+                    episode_norm: 0.1,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                crate::search::alpha_optimizer::CandidateLog {
+                    memory_id: format!("unused-{request_id}"),
+                    bm25_norm: 0.9,
+                    vec_norm: 0.9,
+                    kg_norm: 0.0,
+                    episode_norm: 0.1,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec![accessed_id.to_string()],
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn stored_recall_event(
+        id: i64,
+        request_id: &str,
+        query_type: &str,
+    ) -> crate::store::adaptive::StoredEvent {
+        crate::store::adaptive::StoredEvent {
+            id,
+            ts: Utc::now().to_rfc3339(),
+            event_type: "recall_complete".into(),
+            request_id: Some(request_id.to_string()),
+            memory_id: None,
+            concept_id: None,
+            query: Some("query".into()),
+            query_type: Some(query_type.to_string()),
+            topic: None,
+            payload: None,
+        }
     }
 
     // ── Test 1: run_tiering assigns tiers ────────────────────────────────────
@@ -3184,6 +4300,118 @@ mod tests {
     }
 
     #[test]
+    fn run_alpha_learning_does_not_learn_from_matched_event_behind_blocked_prefix() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.min_samples_alpha = 1;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+
+        // First recall has candidates but no access yet. Because it is live
+        // and unmatched, it must block the prefix watermark.
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some("req-prefix-gap".into()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("blocked query".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [
+                        {
+                            "id": "mem-gap-a",
+                            "bm25_norm": 1.0,
+                            "vec_norm": 0.0,
+                            "kg_norm": 0.0,
+                            "episode_norm": 0.0,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        },
+                        {
+                            "id": "mem-gap-b",
+                            "bm25_norm": 0.0,
+                            "vec_norm": 1.0,
+                            "kg_norm": 0.0,
+                            "episode_norm": 0.0,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        }
+                    ],
+                    "cc_alpha": 0.5
+                })),
+            },
+        );
+
+        let later_rid = "req-later-matched".to_string();
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some(later_rid.clone()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("later query".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [
+                        {
+                            "id": "mem-later-clicked",
+                            "bm25_norm": 1.0,
+                            "vec_norm": 0.0,
+                            "kg_norm": 1.0,
+                            "episode_norm": 0.0,
+                            "support_count": 2,
+                            "source_diversity": 2.0
+                        },
+                        {
+                            "id": "mem-later-other",
+                            "bm25_norm": 0.0,
+                            "vec_norm": 1.0,
+                            "kg_norm": 0.0,
+                            "episode_norm": 1.0,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        }
+                    ],
+                    "cc_alpha": 0.5
+                })),
+            },
+        );
+        emit(
+            &store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some(later_rid),
+                memory_id: Some("mem-later-clicked".into()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+
+        let mut state = AdaptiveState::default();
+        let pending = run_alpha_learning(&store, &mut state, &config);
+
+        assert_eq!(
+            pending, None,
+            "blocked recall prefix must not return offset advances"
+        );
+        assert!(
+            state.learned_alpha.is_empty(),
+            "later matched recall behind an unadvanced prefix gap must not mutate learned alpha: {:?}",
+            state.learned_alpha
+        );
+        assert_eq!(state.alpha_optimizer_last_id, 0);
+        assert_eq!(state.alpha_optimizer_access_last_id, 0);
+    }
+
+    #[test]
     fn test_reranker_weight_learning_uses_canonical_features() {
         let store = SqliteStore::in_memory().unwrap();
         let before = crate::search::rerank::load_weights(store.conn());
@@ -3510,6 +4738,312 @@ mod tests {
             global.value
         );
         assert!(global.sample_count > 0, "sample_count should be positive");
+    }
+
+    #[test]
+    fn counterfactual_cluster_alpha_shrinks_toward_query_type_parent() {
+        let mut config = ReinConfig::default();
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.alpha_max_step = 1.0;
+        config.adaptive.shrinkage_prior = 5.0;
+
+        let mut recall_events = Vec::new();
+        let mut stored_events = Vec::new();
+        for i in 0..12 {
+            let target = format!("mem-target-{i}");
+            let decoy = format!("mem-decoy-{i}");
+            recall_events.push(crate::search::alpha_optimizer::RecallEvent {
+                request_id: format!("req-{i}"),
+                candidates: vec![
+                    crate::search::alpha_optimizer::CandidateLog {
+                        memory_id: target.clone(),
+                        bm25_norm: 0.0,
+                        vec_norm: 1.0,
+                        kg_norm: 0.0,
+                        episode_norm: 0.0,
+                        support_count: 1,
+                        source_diversity: 1.0,
+                    },
+                    crate::search::alpha_optimizer::CandidateLog {
+                        memory_id: decoy,
+                        bm25_norm: 1.0,
+                        vec_norm: 0.0,
+                        kg_norm: 0.0,
+                        episode_norm: 0.0,
+                        support_count: 1,
+                        source_diversity: 1.0,
+                    },
+                ],
+                accessed_ids: vec![target.clone()],
+                timestamp: Utc::now() - chrono::Duration::minutes(i as i64),
+            });
+            stored_events.push(adaptive::StoredEvent {
+                id: (i + 1) as i64,
+                ts: (Utc::now() - chrono::Duration::minutes(i as i64)).to_rfc3339(),
+                event_type: "recall_complete".into(),
+                request_id: Some(format!("req-{i}")),
+                memory_id: None,
+                concept_id: None,
+                query: Some("test".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: None,
+            });
+        }
+
+        let mut state = AdaptiveState::default();
+        state.learned_alpha.insert(
+            "global".to_string(),
+            crate::store::adaptive::LearnedAlphaEntry {
+                value: 0.9,
+                sample_count: 100,
+                last_updated: Utc::now().to_rfc3339(),
+            },
+        );
+        state.learned_alpha.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedAlphaEntry {
+                value: 0.2,
+                sample_count: 100,
+                last_updated: Utc::now().to_rfc3339(),
+            },
+        );
+        for i in 0..12 {
+            state.memory_clusters.insert(format!("mem-target-{i}"), 7);
+        }
+
+        compute_counterfactual_alphas(&recall_events, &stored_events, &mut state, &config);
+
+        let cluster_key = crate::store::adaptive::AdaptiveState::bucket_key("semantic", Some(7));
+        let cluster = state
+            .learned_alpha
+            .get(&cluster_key)
+            .expect("cluster alpha should be learned");
+        let parent = state
+            .learned_alpha
+            .get("semantic")
+            .expect("query-type parent should be present");
+        let global = state.learned_alpha.get("global").expect("global alpha");
+
+        assert!(
+            (cluster.value - parent.value).abs() < (cluster.value - global.value).abs(),
+            "cluster alpha should shrink toward query-type parent, not global: cluster={}, parent={}, global={}",
+            cluster.value,
+            parent.value,
+            global.value
+        );
+    }
+
+    #[test]
+    fn shadow_fusion_replay_is_default_off() {
+        let config = ReinConfig::default();
+        let state = AdaptiveState::default();
+        let recall_events = vec![shadow_replay_event("req-1", "mem-1")];
+        let stored_events = vec![stored_recall_event(1, "req-1", "semantic")];
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config);
+
+        assert!(report.is_none());
+    }
+
+    #[test]
+    fn shadow_fusion_replay_computes_in_non_shadow_mode() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+        let state = AdaptiveState::default();
+        let recall_events = vec![shadow_replay_event("req-1", "mem-1")];
+        let stored_events = vec![stored_recall_event(1, "req-1", "semantic")];
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config);
+
+        assert!(
+            report.is_some(),
+            "production mode should keep learning replay weights for future snapshots"
+        );
+    }
+
+    #[test]
+    fn shadow_fusion_replay_computes_global_query_and_cluster_weights() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+        let recall_events = vec![
+            shadow_replay_event("req-1", "mem-1"),
+            shadow_replay_event("req-2", "mem-2"),
+        ];
+        let stored_events = vec![
+            stored_recall_event(1, "req-1", "semantic"),
+            stored_recall_event(2, "req-2", "semantic"),
+        ];
+        let mut state = AdaptiveState::default();
+        state.memory_clusters.insert("mem-1".into(), 7);
+        state.memory_clusters.insert("mem-2".into(), 7);
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config)
+                .expect("shadow replay should produce weights");
+
+        let global = report.global.expect("global weights");
+        assert_eq!(global.sample_count, 2);
+        assert!(
+            global.weights.kg > 0.5,
+            "fixture should prefer kg-heavy shadow weights, got {:?}",
+            global.weights
+        );
+        assert_eq!(report.by_query_type.len(), 1);
+        assert_eq!(report.by_query_type[0].0, "semantic");
+        assert_eq!(report.by_cluster.len(), 1);
+        assert_eq!(report.by_cluster[0].0, ("semantic".to_string(), 7));
+    }
+
+    #[test]
+    fn shadow_fusion_replay_snapshot_commit_writes_bucket_weights() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+        let recall_events = vec![
+            shadow_replay_event("req-1", "mem-1"),
+            shadow_replay_event("req-2", "mem-2"),
+        ];
+        let stored_events = vec![
+            stored_recall_event(1, "req-1", "semantic"),
+            stored_recall_event(2, "req-2", "semantic"),
+        ];
+        let mut state = AdaptiveState::default();
+        state.memory_clusters.insert("mem-1".into(), 7);
+        state.memory_clusters.insert("mem-2".into(), 7);
+
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config)
+                .expect("shadow replay should produce weights");
+        commit_shadow_fusion_weight_replay(&mut state, &report);
+
+        assert!(state.learned_shadow_fusion.contains_key("global"));
+        assert!(state.learned_shadow_fusion.contains_key("semantic"));
+        assert!(state.learned_shadow_fusion.contains_key("semantic:7"));
+        let cluster = state.learned_shadow_fusion.get("semantic:7").unwrap();
+        assert_eq!(cluster.sample_count, 2);
+        assert!(
+            cluster.weights.kg > 0.5,
+            "fixture should persist kg-heavy shadow weights, got {:?}",
+            cluster.weights
+        );
+    }
+
+    fn emit_shadow_replay_feedback_pair(store: &SqliteStore, request_id: &str, accessed_id: &str) {
+        emit(
+            store,
+            FeedbackEvent {
+                event_type: EventType::RecallComplete,
+                request_id: Some(request_id.to_string()),
+                memory_id: None,
+                concept_id: None,
+                query: Some("shadow replay query".into()),
+                query_type: Some("semantic".into()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "candidates": [
+                        {
+                            "id": accessed_id,
+                            "bm25_norm": 0.2,
+                            "vec_norm": 0.2,
+                            "kg_norm": 1.0,
+                            "episode_norm": 0.1,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        },
+                        {
+                            "id": format!("unused-{request_id}"),
+                            "bm25_norm": 0.9,
+                            "vec_norm": 0.9,
+                            "kg_norm": 0.0,
+                            "episode_norm": 0.1,
+                            "support_count": 1,
+                            "source_diversity": 1.0
+                        }
+                    ],
+                    "cc_alpha": 0.5
+                })),
+            },
+        );
+        emit(
+            store,
+            FeedbackEvent {
+                event_type: EventType::RecallAccess,
+                request_id: Some(request_id.to_string()),
+                memory_id: Some(accessed_id.to_string()),
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        );
+    }
+
+    #[test]
+    fn shadow_fusion_status_is_default_on_but_waits_for_samples() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        let status = shadow_fusion_status(&store, &config);
+
+        assert_eq!(status["enabled"].as_bool(), Some(true));
+        assert_eq!(status["shadow_only"].as_bool(), Some(false));
+        assert_eq!(status["status"].as_str(), Some("insufficient_samples"));
+        assert_eq!(status["global"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn shadow_fusion_status_previews_without_committing_offsets() {
+        let store = SqliteStore::in_memory().unwrap();
+        emit_shadow_replay_feedback_pair(&store, "req-shadow-status", "mem-shadow-status");
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        config.adaptive.min_samples_alpha = 1;
+        config.adaptive.shrinkage_prior = 0.0;
+
+        let status = shadow_fusion_status(&store, &config);
+
+        assert_eq!(status["enabled"].as_bool(), Some(true));
+        assert_eq!(status["shadow_only"].as_bool(), Some(true));
+        assert_eq!(status["status"].as_str(), Some("ready"));
+        assert_eq!(status["eligible_samples"].as_u64(), Some(1));
+        assert_eq!(status["min_samples"].as_u64(), Some(1));
+        assert_eq!(status["global"]["sample_count"].as_u64(), Some(1));
+        assert!(
+            status["global"]["weights"]["kg"].as_f64().unwrap() > 0.5,
+            "fixture should surface kg-heavy preview weights: {status}"
+        );
+        assert_eq!(read_offset(&store, "alpha_optimizer"), 0);
+        assert_eq!(read_offset(&store, "alpha_optimizer_access"), 0);
+    }
+
+    #[test]
+    fn shadow_fusion_status_reports_insufficient_samples_without_mutation() {
+        let store = SqliteStore::in_memory().unwrap();
+        emit_shadow_replay_feedback_pair(&store, "req-shadow-small", "mem-shadow-small");
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        config.adaptive.min_samples_alpha = 2;
+
+        let status = shadow_fusion_status(&store, &config);
+
+        assert_eq!(status["status"].as_str(), Some("insufficient_samples"));
+        assert_eq!(status["eligible_samples"].as_u64(), Some(1));
+        assert_eq!(status["min_samples"].as_u64(), Some(2));
+        assert!(status["global"].is_null());
+        assert_eq!(read_offset(&store, "alpha_optimizer"), 0);
+        assert_eq!(read_offset(&store, "alpha_optimizer_access"), 0);
     }
 
     // ── Test 7: run_m6_threshold_learning ────────────────────────────────────

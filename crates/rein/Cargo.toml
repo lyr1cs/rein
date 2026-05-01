@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "0.27.6"
+version = "0.28.6"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
 license = "AGPL-3.0-or-later"

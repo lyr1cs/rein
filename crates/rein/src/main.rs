@@ -150,7 +150,8 @@ enum Commands {
     /// next adaptive-pipeline pass and recomputes `runtime_vs_offline_kappa`
     /// + bumps `judge_drift_alert` when κ falls below threshold.
     ///
-    /// Default-off in v0.27.1 (`[ars.llm_judge.nightly_cron].enabled = false`).
+    /// Default-on in v0.28.6, but still skipped when either judge flag is
+    /// disabled by config.
     #[command(name = "judge-calibrate-cron")]
     JudgeCalibrateCron {
         /// Print verbose per-entry processing logs. Default false (only the

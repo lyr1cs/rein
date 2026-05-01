@@ -84,6 +84,115 @@ fn sort_recall_results(results: &mut [RecallResult]) {
     });
 }
 
+fn apply_ars_dynamic_fusion_scores(
+    fused: Vec<(String, f32)>,
+    fts_norm_log: &std::collections::HashMap<String, f32>,
+    vec_norm_log: &std::collections::HashMap<String, f32>,
+    kg_norm_log: &std::collections::HashMap<String, f32>,
+    episode_norm_log: &std::collections::HashMap<String, f32>,
+    memory_map: &std::collections::HashMap<String, Memory>,
+    weights: Option<crate::search::alpha_optimizer::ShadowFusionWeights>,
+) -> Vec<(String, f32)> {
+    let Some(weights) = weights.map(|w| w.normalized_or_default()) else {
+        return fused;
+    };
+
+    let mut rescored: Vec<(String, f32, usize)> = fused
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (id, legacy_score))| {
+            let Some(memory) = memory_map.get(&id) else {
+                return (id, legacy_score, idx);
+            };
+            let score = weights.bm25 * fts_norm_log.get(&id).copied().unwrap_or(0.0) as f64
+                + weights.vec * vec_norm_log.get(&id).copied().unwrap_or(0.0) as f64
+                + weights.kg * kg_norm_log.get(&id).copied().unwrap_or(0.0) as f64
+                + weights.episode * episode_norm_log.get(&id).copied().unwrap_or(0.0) as f64
+                + weights.support
+                    * crate::search::alpha_optimizer::support_signal(memory.support_count)
+                + weights.diversity
+                    * crate::search::alpha_optimizer::diversity_signal(memory.source_diversity);
+            let score = if score.is_finite() {
+                score as f32
+            } else {
+                legacy_score
+            };
+            (id, score, idx)
+        })
+        .collect();
+    rescored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    rescored
+        .into_iter()
+        .map(|(id, score, _idx)| (id, score))
+        .collect()
+}
+
+fn ready_shadow_fusion_weights_for_recall(
+    state: &crate::store::adaptive::AdaptiveState,
+    config: &ReinConfig,
+    query_type: &str,
+    cluster_id: Option<u32>,
+    runtime_adoption_weight: f64,
+) -> Option<crate::search::alpha_optimizer::ShadowFusionWeights> {
+    let production_canary = runtime_adoption_weight > f64::EPSILON;
+    if !config.adaptive.enabled
+        || !config.ars.acceleration.enabled
+        || config.ars.acceleration.shadow_only
+        || !production_canary
+    {
+        return None;
+    }
+    let entry = state.get_shadow_fusion_weights(
+        query_type,
+        cluster_id,
+        config.adaptive.min_samples_alpha,
+    )?;
+    let static_prior = crate::search::alpha_optimizer::ShadowFusionWeights::default();
+    let effective = crate::ops::ars_tuning::effective_simplex(
+        [
+            static_prior.bm25,
+            static_prior.vec,
+            static_prior.kg,
+            static_prior.episode,
+            static_prior.support,
+            static_prior.diversity,
+        ],
+        [
+            entry.weights.bm25,
+            entry.weights.vec,
+            entry.weights.kg,
+            entry.weights.episode,
+            entry.weights.support,
+            entry.weights.diversity,
+        ],
+        crate::ops::ars_tuning::TrustInputs {
+            enabled: config.ars.acceleration.enabled,
+            production_canary,
+            runtime_adoption_weight,
+            human_count: entry.sample_count as u64,
+            llm_count: 0,
+            llm_reliability: 0.0,
+            calibration: 1.0,
+            stability: 1.0,
+            drift_alert: false,
+            prior_strength: config.adaptive.shrinkage_prior,
+            max_trust: 0.85,
+        },
+    );
+    Some(crate::search::alpha_optimizer::ShadowFusionWeights {
+        bm25: effective[0],
+        vec: effective[1],
+        kg: effective[2],
+        episode: effective[3],
+        support: effective[4],
+        diversity: effective[5],
+    })
+}
+
 fn collapse_results_to_canonicals(
     store: &SqliteStore,
     results: Vec<RecallResult>,
@@ -961,14 +1070,33 @@ pub fn recall_temporal_with_request_id(
             .ok()
             .flatten()
     });
-    let adaptive_alpha = if config.adaptive.enabled {
-        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).and_then(|s| {
-            let qt = format!("{}", strategy.query_type);
-            s.get_alpha(&qt, query_cluster_id)
-        })
+    let adaptive_state_snapshot = if config.adaptive.enabled {
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
     } else {
         None
     };
+    let query_type_label = format!("{}", strategy.query_type);
+    let adaptive_alpha = adaptive_state_snapshot
+        .as_ref()
+        .and_then(|s| s.get_alpha(&query_type_label, query_cluster_id));
+    let ars_dynamic_fusion_weights = adaptive_state_snapshot.as_ref().and_then(|s| {
+        let runtime_adoption_weight =
+            crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
+                store.conn(),
+                config,
+                s,
+                &query_type_label,
+                query_cluster_id,
+            );
+        ready_shadow_fusion_weights_for_recall(
+            s,
+            config,
+            &query_type_label,
+            query_cluster_id,
+            runtime_adoption_weight,
+        )
+    });
+    let ars_dynamic_fusion_active = ars_dynamic_fusion_weights.is_some();
 
     // Capture per-channel scores for reranking and M2 logging.
     // Clamp negatives (rank sentinels like -1,-2) to positive via 1/(1+|rank|),
@@ -1228,6 +1356,15 @@ pub fn recall_temporal_with_request_id(
         .into_iter()
         .filter(|(id, _)| memory_map.contains_key(id))
         .collect();
+    let fused = apply_ars_dynamic_fusion_scores(
+        fused,
+        &fts_norm_log,
+        &vec_norm_log,
+        &kg_norm_log,
+        &episode_norm_log,
+        &memory_map,
+        ars_dynamic_fusion_weights,
+    );
 
     // Apply strength weighting (Ebbinghaus or KM survival curve) + temporal filter
     // Load cached per-cluster survival curves from M3 (if available)
@@ -1650,6 +1787,7 @@ pub fn recall_temporal_with_request_id(
                 "candidates": candidates,
                 "episode_matches": episode_matches,
                 "alpha_used": alpha_used,
+                "ars_dynamic_fusion": ars_dynamic_fusion_active,
                 "fusion_method": &config.search.fusion_method,
                 "result_count": results.len(),
                 })),
@@ -2182,6 +2320,152 @@ mod tests {
 
         sort_recall_results(&mut results);
         assert_eq!(results[0].memory.id, "high");
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_default_off_preserves_legacy_scores_and_order() {
+        let fused = vec![
+            ("legacy-top".to_string(), 0.9),
+            ("legacy-low".to_string(), 0.1),
+        ];
+        let memory_map = std::collections::HashMap::from([
+            ("legacy-top".to_string(), test_memory("legacy-top", 1, 1.0)),
+            ("legacy-low".to_string(), test_memory("legacy-low", 9, 9.0)),
+        ]);
+
+        let actual = apply_ars_dynamic_fusion_scores(
+            fused.clone(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &memory_map,
+            None,
+        );
+
+        assert_eq!(actual, fused);
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_canary_uses_support_and_diversity_dimensions() {
+        let fused = vec![
+            ("bm25-only".to_string(), 0.9),
+            ("supported".to_string(), 0.1),
+        ];
+        let fts_norm_log = std::collections::HashMap::from([("bm25-only".to_string(), 1.0)]);
+        let memory_map = std::collections::HashMap::from([
+            ("bm25-only".to_string(), test_memory("bm25-only", 0, 0.0)),
+            ("supported".to_string(), test_memory("supported", 9, 9.0)),
+        ]);
+        let weights = crate::search::alpha_optimizer::ShadowFusionWeights {
+            bm25: 0.0,
+            vec: 0.0,
+            kg: 0.0,
+            episode: 0.0,
+            support: 0.6,
+            diversity: 0.4,
+        };
+
+        let actual = apply_ars_dynamic_fusion_scores(
+            fused,
+            &fts_norm_log,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &memory_map,
+            Some(weights),
+        );
+
+        assert_eq!(actual[0].0, "supported");
+        assert!(actual[0].1 > actual[1].1);
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_resolver_is_shadow_only_by_default() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = true;
+        config.adaptive.min_samples_alpha = 1;
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.2,
+                    kg: 0.3,
+                    episode: 0.1,
+                    support: 0.2,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+
+        assert!(
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 1.0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_resolver_requires_parameter_policy_canary() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 1;
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.2,
+                    kg: 0.3,
+                    episode: 0.1,
+                    support: 0.2,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+
+        assert!(
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 0.0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_resolver_returns_effective_weights_with_policy_canary() {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 1;
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 2.0,
+                    vec: 2.0,
+                    kg: 2.0,
+                    episode: 2.0,
+                    support: 1.0,
+                    diversity: 1.0,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+
+        let weights =
+            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 1.0)
+                .expect("non-shadow mode should expose eligible snapshot weights");
+        assert!((weights.sum() - 1.0).abs() < 1e-9);
+        assert!(weights.bm25 > weights.support);
     }
 
     #[test]

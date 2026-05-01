@@ -1024,13 +1024,8 @@ impl OpsRuntime {
     pub fn concept_state(&self, params: ConceptStateParams) -> ReinResult<ConceptStateOutput> {
         let concept_id = params.concept_id.clone();
         let query_type = params.query_type.clone();
-        // v0.27.4 D1/D2 — caller-supplied cluster_id is intentionally
-        // unused for the Cap A gate (synthetic per-concept routing). It
-        // still flows through the request shape so the param remains
-        // forward-compatible if v0.28+ rethreads it.
-        let _caller_cluster_id = params.cluster_id;
+        let caller_cluster_id = params.cluster_id;
         let global_enabled = self.config.ars.concept_summary_enabled;
-        let cold_start_n = self.config.ars.concept_summary_cold_start_n;
         self.with_store(|store| {
             let concept = store
                 .get_concept_by_id(&concept_id)?
@@ -1087,30 +1082,100 @@ impl OpsRuntime {
             // concepts could render summaries that the operator turned
             // off globally. None cluster_id falls into the gate's
             // cold-start `Yes` branch when global is true.
-            // v0.27.4 D1/D2 — drop cluster_id reliance for the Cap A gate.
-            // The recall-derived `representative_cluster_id` still surfaces
-            // back to the GUI on `ConceptStateOutput.cluster_id` below (so
-            // callers see the concept's representative cluster), but the
-            // gate ITSELF routes via the same per-concept synthetic key
-            // the writer (`enqueue_judge_for_concept_summary`) uses. Real
-            // recall cluster/query_type buckets accumulate human signal
-            // that never overlaps with Cap A judge writes; pre-v0.27.4 the
-            // gate read those orphan buckets and ignored every judge event.
-            // v0.28+ refactor revisits when recall→refresh threading lands.
+            // v0.28 — prefer warmed real recall-context buckets when the GUI
+            // supplied query context, then fall back to the synthetic
+            // per-concept bucket that judge events use. The feedback consumer
+            // dual-folds GUI interactions into both buckets via
+            // `ConceptSummaryMetadata.route_context`, so Cap A can now learn
+            // from recall route feedback without losing judge alignment.
+            let effective_cluster_id = caller_cluster_id.or(representative_cluster_id);
             let (living_summary, suppressed) = match &query_type {
-                Some(_qtype) => {
+                Some(qtype) => {
                     let adaptive_state =
                         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
                             .unwrap_or_default();
+                    let concept_summary_gate_adoption_weight =
+                        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+                            store.conn(),
+                            self.config(),
+                            &adaptive_state,
+                            "concept_summary_gate",
+                        );
+                    let llm_feedback_decay_adoption_weight =
+                        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+                            store.conn(),
+                            self.config(),
+                            &adaptive_state,
+                            "llm_feedback_decay",
+                        );
                     let synthetic_cid =
                         crate::ops::concept_summary::synthetic_cluster_id_for_concept(&concept.id);
-                    match crate::ops::concept_summary::decide_concept_summary_quality(
+                    let (route_cold_start_n, route_useful_rate_threshold) =
+                        crate::ops::concept_summary::effective_concept_summary_gate_parameters(
+                            self.config(),
+                            Some(&adaptive_state),
+                            effective_cluster_id,
+                            qtype,
+                            concept_summary_gate_adoption_weight,
+                        );
+                    let route_key = crate::store::adaptive::concept_summary_bucket_key(
+                        effective_cluster_id,
+                        qtype,
+                    );
+                    let route_bucket_ready = adaptive_state
+                        .concept_summary_feedback_stats
+                        .as_ref()
+                        .and_then(|stats| stats.by_cluster.get(&route_key))
+                        .map(|bucket| {
+                            bucket
+                                .viewed_count
+                                .saturating_add(bucket.explicit_up)
+                                .saturating_add(bucket.explicit_down)
+                                .saturating_add(bucket.llm_judge_count)
+                                >= route_cold_start_n
+                        })
+                        .unwrap_or(false);
+                    let (gate_cluster_id, gate_query_type, cold_start_n, useful_rate_threshold) =
+                        if route_bucket_ready {
+                            (
+                                effective_cluster_id,
+                                qtype.as_str(),
+                                route_cold_start_n,
+                                route_useful_rate_threshold,
+                            )
+                        } else {
+                            let (synthetic_cold_start_n, synthetic_useful_rate_threshold) =
+                                crate::ops::concept_summary::effective_concept_summary_gate_parameters(
+                                    self.config(),
+                                    Some(&adaptive_state),
+                                    Some(synthetic_cid),
+                                    crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
+                                    concept_summary_gate_adoption_weight,
+                                );
+                            (
+                                Some(synthetic_cid),
+                                crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
+                                synthetic_cold_start_n,
+                                synthetic_useful_rate_threshold,
+                            )
+                        };
+                    let judge_weight_decay_rate =
+                        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+                            self.config().ars.llm_judge.weight_decay_rate,
+                            adaptive_state.judge_calibration_state.as_ref(),
+                            llm_feedback_decay_adoption_weight,
+                            adaptive_state.ars_effective_scalar(
+                                crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
+                            ),
+                        );
+                    match crate::ops::concept_summary::decide_concept_summary_quality_with_threshold(
                         global_enabled,
-                        Some(synthetic_cid),
-                        crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
+                        gate_cluster_id,
+                        gate_query_type,
                         Some(&adaptive_state),
                         cold_start_n,
-                        self.config().ars.llm_judge.weight_decay_rate,
+                        judge_weight_decay_rate,
+                        useful_rate_threshold,
                     ) {
                         crate::ops::concept_summary::ConceptSummaryDecision::Yes => {
                             (concept.living_summary.clone(), false)
@@ -1490,6 +1555,102 @@ mod tests {
         assert!(out.living_summary.is_none());
         assert!(out.living_summary_updated_at.is_none());
         assert!(out.living_summary_source_revision.is_none());
+    }
+
+    #[test]
+    fn concept_state_uses_warm_real_route_bucket_for_cap_a_gate() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        config.ars.concept_summary_enabled = true;
+        config.ars.concept_summary_cold_start_n = 1;
+        let config = Arc::new(config);
+        let store = config.open_store().expect("open seeded store");
+        store
+            .create_memoir(crate::types::Memoir {
+                id: String::new(),
+                name: "ars-route-gate".to_string(),
+                description: "seeded memoir".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .expect("create memoir");
+        store
+            .add_concept(crate::types::Concept {
+                id: String::new(),
+                memoir_id: "ars-route-gate".to_string(),
+                name: "concept-alpha".to_string(),
+                definition: "seeded concept".to_string(),
+                labels: vec!["seed".to_string()],
+                source_memory_ids: vec![],
+                confidence: 0.9,
+                revision: 1,
+                last_episode_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                living_summary: Some("summary should remain visible".to_string()),
+                living_summary_updated_at: Some(chrono::Utc::now()),
+                living_summary_source_revision: Some(1),
+                living_summary_id: Some("cs-route-gate".to_string()),
+            })
+            .expect("add concept");
+        let concept_id = store
+            .get_concept("ars-route-gate", "concept-alpha")
+            .expect("lookup")
+            .expect("concept exists")
+            .id;
+        store
+            .conn()
+            .execute(
+                "UPDATE concepts SET living_summary = ?1, \
+                 living_summary_updated_at = ?2, living_summary_source_revision = ?3, \
+                 living_summary_id = ?4 WHERE id = ?5",
+                rusqlite::params![
+                    "summary should remain visible",
+                    "2026-04-30T12:00:00Z",
+                    1i64,
+                    "cs-route-gate",
+                    &concept_id,
+                ],
+            )
+            .expect("seed living summary");
+
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        let real_key = crate::store::adaptive::concept_summary_bucket_key(Some(7), "Exploratory");
+        let mut feedback = crate::store::adaptive::ConceptSummaryFeedbackState::default();
+        feedback.by_cluster.insert(
+            real_key,
+            crate::store::adaptive::ClusterConceptSummaryStats {
+                viewed_count: 1,
+                useful_rate: 0.0,
+                last_event_id: 1,
+                ..Default::default()
+            },
+        );
+        state.concept_summary_feedback_stats = Some(feedback);
+        state
+            .save_snapshot(store.conn())
+            .expect("save adaptive state");
+        drop(store);
+        let runtime = Arc::new(crate::ops::OpsRuntime::for_rest(config));
+
+        let out = runtime
+            .concept_state(ConceptStateParams {
+                concept_id,
+                query_type: Some("Exploratory".to_string()),
+                cluster_id: Some(7),
+            })
+            .expect("concept_state");
+
+        assert_eq!(out.living_summary.as_deref(), None);
+        assert!(
+            out.living_summary_suppressed,
+            "warm real-route buckets should be able to suppress Cap A production output"
+        );
     }
 
     #[test]

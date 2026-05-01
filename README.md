@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.27.6`** (2026-04-30) — Codex hook parity + deployment hardening. Adds six-hook Codex coverage, `SessionStart` / `UserPromptSubmit` `additionalContext` injection, conservative `PreToolUse` / `PermissionRequest` guardrails, and `rein init` / `rein doctor` validation for the full hook set. Released and deployed locally plus Mac mini. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.27.6 progression.
+**Current release: `v0.28.6`** (2026-05-02) — completes v28 ARS acceleration rollout: acceleration and LLM judge are default-on but fail closed behind the parameter policy, runtime adoption weights are scoped per parameter/surface/query/cluster, SignalHint feedback remains active in canary mode, and `rein_trust_measurement` provides a unified Trust & Measurement snapshot. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.6 progression.
 
 For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
 
@@ -20,7 +20,7 @@ For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README
 
 | Feature | Description |
 |---------|-------------|
-| **38 MCP tools** | core memory ops, knowledge graph, temporal recall, adaptive maintenance, ARS feedback (Cap A mirror, Cap B synthesis, Cap C archival summary), and runtime LLM judge enqueue. All authored once via `#[op]` macro (v0.21+) and exposed through CLI / MCP / REST simultaneously. |
+| **40 MCP tools** | core memory ops, knowledge graph, temporal recall, adaptive maintenance, ARS feedback (Cap A mirror, Cap B synthesis, Cap C archival summary), runtime LLM judge enqueue, ARS acceleration release-gate inspection, and Trust & Measurement reporting. All authored once via `#[op]` macro (v0.21+) and exposed through CLI / MCP / REST simultaneously. |
 | **Unified operation registry** | One `#[op]` declaration drives CLI / MCP / REST surfaces (v0.21, A1). Inventory-based dispatch; zero hand-maintained lists. |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
@@ -243,7 +243,7 @@ Operator inspection commands:
 
 ### MCP Tools
 
-When running as an MCP server (`rein serve`), Rein exposes 38 production MCP
+When running as an MCP server (`rein serve`), Rein exposes 40 production MCP
 tools through the operation inventory. The authoritative list is maintained in
 [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md), grouped as:
 
@@ -377,10 +377,17 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.27.6 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+The v0.21 → v0.28.6 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.28.6** (2026-05-02) | ARS default-on + Trust & Measurement | Enables `[ars.acceleration]`, runtime LLM judge, and nightly calibration by default while keeping runtime adoption fail-closed behind `ars_parameter_policy`; adds scoped adoption weights for recall fusion/query/cluster and scalar surfaces, keeps SignalHint feedback active outside shadow mode, exposes scoped weights in release-gate output, and adds `rein_trust_measurement` / `rein trust-measurement` / `/api/trust-measurement`. |
+| **v0.28.5** (2026-05-01) | Gradual ARS runtime adoption | Adds `runtime_adoption_weight` to `ars_parameter_policy`, moves the adoption weight by at most 0.05 per durable snapshot, and gates recall fusion, synthesis/concept gates, judge sample rates, LLM feedback decay, and SignalHint-derived useful-rate priors through that weight. |
+| **v0.28.4** (2026-05-01) | ARS acceleration full pass | Wires SignalHint/bootstrap priors into useful-rate formulas, persists smoothed dynamic scalars, splits judge drift by surface, makes judge input caps configurable, folds Cap A GUI feedback into real recall-context buckets while preserving synthetic judge alignment, adds a read-only release/eval gate, and adds shadow GP+EI fusion proposals. |
+| **v0.28.3** (2026-05-01) | ARS dynamic scalar expansion | Extends policy-gated dynamic adoption beyond recall fusion: synthesis/concept cold-start and useful-rate thresholds can move from static values toward calibrated feedback, judge sample rates adapt under the same policy gate, shadow judge jobs carry deterministic `signal_hint` evidence, and shadow replay evaluates blended simplex candidates instead of one-hot-only weights. |
+| **v0.28.2** (2026-05-01) | ARS dynamic parameter policy | Adds `ars_parameter_policy` metadata activation, trust-weighted static-to-learned fusion adoption, κ/drift-gated LLM judge `weight_decay_rate`, `/api/adaptive` policy status, and `rein doctor` policy health checks. |
+| **v0.28.1** (2026-04-30) | ARS recall canary activation | Persists replay-learned global/query-type/cluster six-dimensional fusion weights in `AdaptiveState.learned_shadow_fusion`. Defaults remain `enabled = false`, `shadow_only = true`; setting `enabled = true` plus `shadow_only = false` lets recall rescore live-filtered candidates with learned BM25/vector/KG/episode/support/diversity weights. |
+| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | Default-off, shadow-first acceleration controller. `[ars.acceleration].enabled = false` by default; `/api/adaptive` exposes `ars_acceleration.shadow_fusion_replay` with bounded `enabled`, `shadow_only`, `status`, `replay_limit`, `eligible_samples`, `min_samples`, `global`, `by_query_type`, and `by_cluster` preview fields. Production recall scoring and ARS behavior were unchanged in this release. |
 | **v0.27.6** (2026-04-30) | Codex hook parity + deployment hardening | Adds Codex `session-start`, `pre`, and `permission` hook commands alongside existing `post`, `compact`, `prompt`, and `stop`; emits official `hookSpecificOutput.additionalContext` for opted-in session/prompt context; applies conservative deny-only shell guardrails; teaches `rein init` and `rein doctor` to configure and validate all six Codex events. Deployed to Mac mini with launchd `zsh -l -c` wrappers and Homebrew Rust toolchain. |
 | **v0.27.5** (2026-04-29) | R10-residual cleanup | Cold archive too-large backoff (`last_too_large_at` + claim_batch ORDER BY); Cap A 4096-bucket LRU eviction; cron `cron_claims` pre-LLM dedup with claim_token ownership + 5-min stale takeover + post-claim TOCTOU re-check + post-emit-crash reaper. **10 codex review rounds saturated (R6 + R10 fully clean).** 1035 lib tests / 0 clippy / 0 fmt. |
 | **v0.27.4** (2026-04-29) | audit-team remediation | 5-agent disjoint-slice fan-out closed 1 CRIT + 8 HIGH + 9 MED + 5 LOW from a v0.27.3 audit, then 10 codex rounds drove P1 to 0. Headline: **C1** `[server,proxy].allow_unauthenticated_loopback` default flipped `true → false`; **E2** M5 strip post-COMMIT side-index discipline; **D1+D2** SHA-256-prefix synthetic `cluster_id` for Cap A bucket alignment. 1265 tests. |
@@ -397,7 +404,7 @@ The v0.21 → v0.27.6 arc rebuilt rein around three axes: a unified operation re
 | **v0.22.0** (2026-04-22) | KG pool + service wiring + try_get fast-path | 675 tests / 7 codex audit rounds. |
 | **v0.21.0** (2026-04-20) | A1 Operation Registry | `#[op]` proc-macro: each operation authored **once** in source, dispatched via `inventory` to thin CLI / MCP / REST adapters. Eliminated three parallel hand-maintained registries. 625 tests. |
 
-All ARS features (`[ars].concept_summary_enabled`, `recall_synthesis_enabled`, `archive_summary_enabled`, `[ars.llm_judge].enabled`, `[resummerize].enabled`) ship **opt-in / default-off**. Operators get zero new disk activity until they explicitly turn a capability on.
+ARS acceleration and LLM judge ship **default-on but fail-closed** in v0.28.6: learned parameters do not affect runtime until a healthy `ars_parameter_policy` promotes a canary with positive scoped adoption weights. ARS content-generation features (`[ars].concept_summary_enabled`, `recall_synthesis_enabled`, `cold_archive_enabled`) and `[resummerize].enabled` remain operator-controlled.
 
 ### Architecture Diagrams
 
@@ -874,7 +881,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 flowchart TD
     U[User / AI Agent]
     CLI[CLI\n20+ commands]
-    MCP[MCP Server\n38 tools · stdio / HTTP / SSE]
+    MCP[MCP Server\n39 tools · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[Proxy\nClaude · Codex subscription · record-only]
 
@@ -1033,7 +1040,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.27.6`**（2026-04-30）— Codex hook parity + 部署加固。新增完整 Codex hook 覆盖、`SessionStart` / `UserPromptSubmit` `additionalContext` 注入、保守的 `PreToolUse` / `PermissionRequest` guardrails，以及 `rein init` / `rein doctor` 六 hook 校验。已在本机和 Mac mini 部署。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.28.6`**（2026-05-02）— 完成 v28 ARS acceleration rollout：acceleration 与 LLM judge 默认开启，但仍由 parameter policy fail-closed；runtime adoption weight 已按参数、surface、query type、cluster 细粒度化；SignalHint feedback 在 canary 模式继续生效；新增统一 Trust & Measurement 报告。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1041,7 +1048,7 @@ rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨�
 
 | 特性 | 说明 |
 |------|------|
-| **38 个 MCP 工具** | 核心记忆操作、知识图谱、时序召回、自适应维护、ARS 反馈（Cap A 镜像、Cap B 合成、Cap C 归档摘要）、runtime LLM judge 入队。所有操作通过 `#[op]` 宏（v0.21+）单点声明，CLI / MCP / REST 三端共用。 |
+| **40 个 MCP 工具** | 核心记忆操作、知识图谱、时序召回、自适应维护、ARS 反馈（Cap A 镜像、Cap B 合成、Cap C 归档摘要）、runtime LLM judge 入队、ARS acceleration release-gate 检查，以及 Trust & Measurement 报告。所有操作通过 `#[op]` 宏（v0.21+）单点声明，CLI / MCP / REST 三端共用。 |
 | **自适应引擎** | M1-M6 + A1：事件溯源 → 反事实 alpha 学习 → KM 生存曲线 → HDBSCAN 聚类 → 三层分级 → 阈值探索 |
 | **反事实 Alpha 优化** | 回放历史 recall，学习全局 / 按查询类型 / **按聚类** 的最优 CC 融合权重（M2） |
 | **Per-cluster KM 衰减 + 全局先验** | Kaplan-Meier 生存曲线替代固定遗忘曲线；全局先验曲线覆盖冷启动新聚类（M3） |
@@ -1226,7 +1233,7 @@ store 热路径里的灰区 dedup 现在也会走专门异步队列：
 
 ### MCP 工具
 
-以 MCP 服务运行时（`rein serve`），Rein 通过 operation inventory 暴露 38 个 production MCP 工具。权威清单维护在 [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md)，分为：
+以 MCP 服务运行时（`rein serve`），Rein 通过 operation inventory 暴露 40 个 production MCP 工具。权威清单维护在 [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md)，分为：
 
 - 核心记忆：store、recall、update、forget、recent、topics、canonicals、evidence、stats、health。
 - 维护：GC、dedup、concept dedup、organize、consolidate、cleanup、resummerize、archive summary refresh。
@@ -1583,10 +1590,17 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.27.6 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+v0.21 → v0.28.6 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.28.6** (2026-05-02) | ARS default-on + Trust & Measurement | `[ars.acceleration]`、runtime LLM judge、nightly calibration 默认开启，但 runtime adoption 仍由健康 `ars_parameter_policy` fail-closed；recall fusion/query/cluster 与 scalar surfaces 获得 scoped adoption weights；SignalHint feedback 不再仅限 shadow；release-gate 输出 scoped weights；新增 `rein_trust_measurement` / `rein trust-measurement` / `/api/trust-measurement`。 |
+| **v0.28.5** (2026-05-01) | Gradual ARS runtime adoption | `ars_parameter_policy` 新增 `runtime_adoption_weight`，每次 durable snapshot 最多移动 0.05；recall fusion、synthesis/concept gate、judge sample rate、LLM feedback decay、SignalHint-derived useful-rate priors 都经由这个权重渐进采用。 |
+| **v0.28.4** (2026-05-01) | ARS acceleration full pass | SignalHint/bootstrap priors 接入 useful-rate 公式；动态 scalar 持久化平滑；judge drift 按 surface 拆分；judge input cap 可配置；Cap A GUI feedback 同时写入真实 recall-context bucket 与 synthetic judge bucket；新增只读 release/eval gate；shadow fusion 加入 GP+EI proposals。 |
+| **v0.28.3** (2026-05-01) | ARS dynamic scalar expansion | 将 policy-gated 动态采用从 recall fusion 扩到 synthesis/concept cold-start、useful-rate threshold 与 judge sample rate；shadow judge job 携带确定性的 `signal_hint` 证据；shadow replay 开始评估 blended simplex 候选，不再只从 one-hot 权重里选。 |
+| **v0.28.2** (2026-05-01) | ARS dynamic parameter policy | 新增 `ars_parameter_policy` metadata 激活层、static-to-learned trust 加权融合、κ/漂移门控的 LLM judge `weight_decay_rate`、`/api/adaptive` policy 状态和 `rein doctor` policy 健康检查。 |
+| **v0.28.1** (2026-04-30) | ARS recall canary activation | replay 学到的 global/query-type/cluster 六维融合权重会持久化到 `AdaptiveState.learned_shadow_fusion`。默认仍是 `enabled = false`、`shadow_only = true`；显式设置 `enabled = true` 且 `shadow_only = false` 后，recall 会用 BM25/vector/KG/episode/support/diversity 动态权重重排 live-filter 后的候选。 |
+| **v0.28.0** (2026-04-30) | ARS acceleration groundwork | 默认关闭、shadow-first 的 acceleration controller。`[ars.acceleration].enabled = false`；`/api/adaptive` 暴露 `ars_acceleration.shadow_fusion_replay`，字段范围固定为 `enabled`、`shadow_only`、`status`、`replay_limit`、`eligible_samples`、`min_samples`、`global`、`by_query_type`、`by_cluster` 等预览数据。该 release 的生产 recall scoring 和 ARS 行为不变。 |
 | **v0.27.6** (2026-04-30) | Codex hook parity + 部署加固 | 新增 Codex `session-start`、`pre`、`permission` hook 命令，补齐既有 `post`、`compact`、`prompt`、`stop`；为 opt-in 的 session/prompt context 输出官方 `hookSpecificOutput.additionalContext`；加入保守 deny-only shell guardrails；`rein init` / `rein doctor` 可配置并校验六个 Codex 事件。Mac mini 部署已切到 launchd `zsh -l -c` wrapper，并补齐 Homebrew Rust toolchain。 |
 | **v0.27.5** (2026-04-29) | R10-residual 清理 | Cold archive 太大行 backoff（`last_too_large_at` + claim_batch ORDER BY）；Cap A 4096-bucket LRU 驱逐；cron `cron_claims` pre-LLM 去重，含 claim_token 所有权 + 5 分钟 stale 接管 + post-claim TOCTOU 复检 + post-emit-crash 清理。**10 轮 codex review 收敛（R6 + R10 全清）**。1035 lib tests。 |
 | **v0.27.4** (2026-04-29) | agent-team 修复 | 5 agent 分片 fan-out 修 v0.27.3 audit (1 CRIT + 8 HIGH + 9 MED + 5 LOW)，再跑 10 轮 codex 把 P1 打到 0。**C1** 默认 deny-loopback；**E2** M5 strip post-COMMIT 边索引纪律；**D1+D2** SHA-256 prefix 合成 `cluster_id` 修 Cap A bucket 对齐。1265 tests。 |
@@ -1603,7 +1617,7 @@ v0.21 → v0.27.6 这一段重构围绕三条主线：统一 operation registry�
 | **v0.22.0** (2026-04-22) | KG pool + service 接线 + try_get fast-path | 675 tests / 7 轮 codex audit。 |
 | **v0.21.0** (2026-04-20) | A1 Operation Registry | `#[op]` proc-macro：每个操作在源码里**只写一次**，通过 `inventory` 派发到三个薄 CLI / MCP / REST 适配器。消灭三套手工维护的并行注册表。625 tests。 |
 
-所有 ARS 特性（`[ars].concept_summary_enabled`、`recall_synthesis_enabled`、`archive_summary_enabled`、`[ars.llm_judge].enabled`、`[resummerize].enabled`）默认**全部 opt-in / off**。operator 不显式打开就零新增磁盘活动。
+v0.28.6 起，ARS acceleration 与 runtime LLM judge 默认开启但 fail-closed：没有健康 `ars_parameter_policy` canary 与正向 scoped adoption weight 时，learned 参数不影响 runtime。ARS 内容生成能力（`[ars].concept_summary_enabled`、`recall_synthesis_enabled`、`cold_archive_enabled`）和 `[resummerize].enabled` 仍由 operator 显式控制。
 
 ### 自适应引擎 (v0.6.0+)
 

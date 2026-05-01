@@ -305,12 +305,19 @@ pub struct ArsConfig {
     #[serde(default = "default_cold_archive_batch_size")]
     pub cold_archive_batch_size: usize,
     // ── v0.27.1 Track 1 — runtime LLM judge ──────────────────────────────────
-    /// `[ars.llm_judge]` sub-table — opt-in runtime LLM judge worker for
-    /// auto-feedback on synthesis / concept-summary outputs. Default off.
+    /// `[ars.llm_judge]` sub-table — default-on runtime LLM judge worker for
+    /// auto-feedback on synthesis / concept-summary outputs, bounded by
+    /// provider resolution, sample rates, and daily caps.
     /// J6 invariant `weight_decay_rate ∈ [0.0, 1.0]` is validated at boot
     /// via `validate_ars_llm_judge`.
     #[serde(default)]
     pub llm_judge: ArsLlmJudgeConfig,
+    // ── v0.28 ARS acceleration controller ──────────────────────────────────
+    /// `[ars.acceleration]` sub-table — default-on controller for ARS
+    /// acceleration work. Runtime decisions still fail closed through the
+    /// parameter-policy row, evidence gates, and drift checks.
+    #[serde(default)]
+    pub acceleration: ArsAccelerationConfig,
 }
 
 fn default_ars_backend() -> String {
@@ -359,8 +366,10 @@ impl Default for ArsConfig {
             cold_archive_enabled: false,
             cold_archive_target_chars: default_cold_archive_target_chars(),
             cold_archive_batch_size: default_cold_archive_batch_size(),
-            // v0.27.1 Track 1 — opt-in runtime LLM judge
+            // v0.27.1 Track 1 / v0.28.6 default-on runtime LLM judge
             llm_judge: ArsLlmJudgeConfig::default(),
+            // v0.28.6 — default-on, policy-gated acceleration
+            acceleration: ArsAccelerationConfig::default(),
         }
     }
 }
@@ -377,10 +386,37 @@ impl ArsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// v0.28 — `[ars.acceleration]` shadow acceleration config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArsAccelerationConfig {
+    /// Master feature flag. Default `true`: acceleration signals are collected
+    /// and the policy gate can promote eligible runtime parameters.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Keep acceleration in shadow mode. Default `false`; runtime adoption is
+    /// still blocked until `ars_parameter_policy` reaches Canary mode with a
+    /// positive adoption weight.
+    #[serde(default)]
+    pub shadow_only: bool,
+}
+
+impl Default for ArsAccelerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shadow_only: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // v0.27.1 Track 1 — `[ars.llm_judge]` runtime LLM judge config
 // ---------------------------------------------------------------------------
 
-/// `[ars.llm_judge]` config block — opt-in runtime LLM judge worker for
+/// `[ars.llm_judge]` config block — default-on runtime LLM judge worker for
 /// auto-feedback on synthesis (Cap B) and concept-summary (Cap A) outputs.
 ///
 /// Provider/model fields are NOT stored here; they resolve via
@@ -390,9 +426,9 @@ impl ArsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsLlmJudgeConfig {
-    /// Master feature flag. Default `false` per
-    /// [[feedback_no_early_deploy]].
-    #[serde(default)]
+    /// Master feature flag. Default `true`; provider resolution, sample rates,
+    /// daily caps, and policy gates still prevent unbounded judge traffic.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Judge Cap B (synthesis) outputs. Default `true` once master is on.
     #[serde(default = "default_true")]
@@ -404,6 +440,11 @@ pub struct ArsLlmJudgeConfig {
     /// Recall-ranking judge — deferred to v0.27.2+.
     #[serde(default)]
     pub recall_ranking_enabled: bool,
+    /// Optional section-level judge input cap. When set, this overrides
+    /// the resolved `[llm.{provider}].max_input_chars` for the runtime
+    /// judge enqueue path.
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
     /// Sample-rate when cluster human-signal count is below
     /// `human_signal_threshold` (cold start). Default 1.0 (100%).
     #[serde(default = "default_judge_sample_rate_cold_start")]
@@ -439,17 +480,26 @@ pub struct ArsLlmJudgeConfig {
 /// triangle. Re-judges a sampled subset of the last 24h synthesis events
 /// with a (potentially stricter) LLM regime, and accumulates κ vs the
 /// runtime judge.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsLlmJudgeNightlyCronConfig {
-    /// Master cron flag. Default `false` (gated separately from
+    /// Master cron flag. Default `true` (gated separately from
     /// `[ars.llm_judge].enabled`).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Fraction of the last 24h synthesis events to re-judge. Default
     /// 0.2 (20%).
     #[serde(default = "default_judge_cron_sample_rate")]
     pub sample_rate: f64,
+}
+
+impl Default for ArsLlmJudgeNightlyCronConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: default_judge_cron_sample_rate(),
+        }
+    }
 }
 
 fn default_judge_sample_rate_cold_start() -> f64 {
@@ -483,17 +533,21 @@ fn default_judge_cron_sample_rate() -> f64 {
 impl Default for ArsLlmJudgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             synthesis_enabled: true,
             concept_summary_enabled: true,
             recall_ranking_enabled: false,
+            max_input_chars: None,
             sample_rate_cold_start: default_judge_sample_rate_cold_start(),
             sample_rate_warm: default_judge_sample_rate_warm(),
             human_signal_threshold: default_judge_human_signal_threshold(),
             weight_decay_rate: default_judge_weight_decay_rate(),
             daily_call_cap: default_judge_daily_call_cap(),
             cache_ttl_secs: default_judge_cache_ttl_secs(),
-            nightly_cron: ArsLlmJudgeNightlyCronConfig::default(),
+            nightly_cron: ArsLlmJudgeNightlyCronConfig {
+                enabled: true,
+                ..ArsLlmJudgeNightlyCronConfig::default()
+            },
         }
     }
 }
@@ -908,6 +962,16 @@ pub struct ServerConfig {
     pub sse_enabled: bool,
     pub sse_port: u16,
     pub sse_bind: String,
+    /// Run background warmup/side-index repair when service surfaces start.
+    #[serde(default = "default_server_background_warmup")]
+    pub background_warmup: bool,
+    /// Opt stdio MCP startup into background warmup.
+    ///
+    /// Default false because MCP clients such as Codex may start one stdio
+    /// process per subagent, and each background warmup can contend on local
+    /// side-index writer locks.
+    #[serde(default)]
+    pub stdio_background_warmup: bool,
     #[serde(default)]
     pub gui_enabled: bool,
     #[serde(default)]
@@ -971,12 +1035,16 @@ fn default_buffer_flush_threshold() -> usize {
     50000 // ~12K-25K tokens, triggers ~2-4 times in a long session
 }
 
+fn default_server_background_warmup() -> bool {
+    true
+}
+
 fn default_codex_guardrails_enabled() -> bool {
     true
 }
 
 fn default_codex_max_additional_context_chars() -> usize {
-    4000
+    1200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1220,6 +1288,8 @@ impl Default for ServerConfig {
             sse_enabled: false,
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
+            background_warmup: default_server_background_warmup(),
+            stdio_background_warmup: false,
             gui_enabled: false,
             // v0.27.3 F5/C1: default-deny. Operators must opt in to
             // unauthenticated loopback or set REIN_HTTP_TOKEN. The doctor
@@ -1389,7 +1459,7 @@ impl Default for AsyncMemoryConfig {
             spawn_cooldown_ms: 1_500,
             max_working_set_items: 40,
             max_always_on_items: 24,
-            selection_limit: 5,
+            selection_limit: 2,
             fingerprint_window_ms: 120_000,
             recent_event_cache_size: 256,
         }
@@ -1711,7 +1781,6 @@ impl ReinConfig {
         if self.ars.batch_size == 0 {
             anyhow::bail!("ars.batch_size must be >= 1");
         }
-
         // v0.27.1 J6 invariant — `weight_decay_rate` must be finite + in
         // [0.0, 1.0] so `w_llm = w_thumb × weight_decay_rate` enforces both
         // ordering (`w_llm ≤ w_thumb`) and non-negativity (`w_llm ≥ 0`).
@@ -2043,6 +2112,8 @@ struct SectionExplicit<'a> {
     provider: Option<&'a str>,
     /// Whether `provider == "inherit"` — slow-channel "fall through" hint.
     inherit: bool,
+    /// Section-level, provider-agnostic max input override.
+    max_input_chars: Option<usize>,
     /// Section's own provider sub-tables (legacy v0.26.x shape).
     google_model: Option<&'a str>,
     google_api_key_env: Option<&'static str>,
@@ -2058,6 +2129,7 @@ impl<'a> SectionExplicit<'a> {
         Self {
             provider: None,
             inherit: false,
+            max_input_chars: None,
             google_model: None,
             google_api_key_env: None,
             google_endpoint: None,
@@ -2102,6 +2174,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 Some(cfg.extract.provider.as_str())
             },
             inherit: extract_inherit,
+            max_input_chars: None,
             google_model: nonempty(&cfg.extract.google.model),
             google_api_key_env: Some("GEMINI_API_KEY"),
             google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2123,6 +2196,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.async_memory.provider.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 // No async-memory-specific provider sub-table; reuse
                 // `[extract.{provider}]` (matches the v0.26.x semantic
                 // implemented in `extract/llm.rs::create_memory_worker_extractor`).
@@ -2149,6 +2223,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.intelligent_merge.provider.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.intelligent_merge.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.intelligent_merge.google.endpoint),
@@ -2171,6 +2246,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 Some(cfg.query_expansion.provider.as_str())
             },
             inherit: query_expansion_inherit,
+            max_input_chars: None,
             google_model: nonempty(&cfg.query_expansion.google.model),
             google_api_key_env: Some("GEMINI_API_KEY"),
             google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
@@ -2191,6 +2267,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.search.llm_reranker.as_str())
                 },
                 inherit: reranker_inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.query_expansion.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
@@ -2214,6 +2291,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.ars.llm_backend.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.extract.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2233,6 +2311,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                     Some(cfg.resummerize.llm_backend.as_str())
                 },
                 inherit,
+                max_input_chars: None,
                 google_model: nonempty(&cfg.extract.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2242,13 +2321,14 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 omlx_max_input_chars: Some(cfg.extract.omlx.max_input_chars),
             }
         }
-        ArsLlmJudge | ArsLlmJudgeNightlyCron => {
-            // New-in-v0.27.1 sections — no level-1 explicit shape.
-            // Resolver walks to level 2 (parent section provider for the
-            // nightly cron variant) → level 3 (`[llm]`) → level 4
-            // (hardcoded).
-            SectionExplicit::empty()
-        }
+        ArsLlmJudge | ArsLlmJudgeNightlyCron => SectionExplicit {
+            // New-in-v0.27.1 sections — no level-1 provider shape.
+            // `max_input_chars` is intentionally section-local, so it
+            // can override the global `[llm.{provider}]` cap once a
+            // provider is resolved at level 3.
+            max_input_chars: cfg.ars.llm_judge.max_input_chars,
+            ..SectionExplicit::empty()
+        },
     }
 }
 
@@ -2478,7 +2558,9 @@ fn build_resolved_for_provider(
             (_, _) => default_google_endpoint(),
         });
 
-    let max_input_chars = l1_max_input_chars
+    let max_input_chars = explicit
+        .max_input_chars
+        .or(l1_max_input_chars)
         .or(l3_max_input_chars)
         .or(l_legacy_max_input_chars)
         .unwrap_or(match chosen {
@@ -2852,6 +2934,8 @@ mod tests {
         assert!((cfg.search.rrf_k - 60.0).abs() < f64::EPSILON);
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);
+        assert!(cfg.server.background_warmup);
+        assert!(!cfg.server.stdio_background_warmup);
         assert_eq!(cfg.database.path, "auto");
         assert_eq!(cfg.embedding.provider, "google");
         assert_eq!(cfg.chunking.max_tokens, 512);
@@ -2859,7 +2943,12 @@ mod tests {
         assert!(!cfg.hooks.codex.inject_prompt_context);
         assert!(!cfg.hooks.codex.inject_session_context);
         assert!(cfg.hooks.codex.guardrails_enabled);
-        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 4000);
+        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 1200);
+        assert_eq!(cfg.async_memory.selection_limit, 2);
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(!cfg.ars.acceleration.shadow_only);
+        assert!(cfg.ars.llm_judge.enabled);
+        assert!(cfg.ars.llm_judge.nightly_cron.enabled);
     }
 
     #[test]
@@ -2885,6 +2974,94 @@ max_additional_context_chars = 1024
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);
         assert_eq!(cfg.database.path, "auto");
+        assert!(cfg.ars.llm_judge.nightly_cron.enabled);
+    }
+
+    #[test]
+    fn test_load_from_toml_preserves_compact_hook_defaults_when_omitted() {
+        let toml_str = r#"
+[search]
+rrf_k = 30.0
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert_eq!(cfg.hooks.codex.max_additional_context_chars, 1200);
+        assert_eq!(cfg.async_memory.selection_limit, 2);
+        assert!(cfg.server.background_warmup);
+        assert!(!cfg.server.stdio_background_warmup);
+    }
+
+    #[test]
+    fn test_load_from_toml_parses_server_background_warmup_policy() {
+        let toml_str = r#"
+[server]
+background_warmup = false
+stdio_background_warmup = true
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(!cfg.server.background_warmup);
+        assert!(cfg.server.stdio_background_warmup);
+    }
+
+    #[test]
+    fn test_load_from_toml_parses_ars_acceleration() {
+        let toml_str = r#"
+[ars.acceleration]
+enabled = true
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(!cfg.ars.acceleration.shadow_only);
+    }
+
+    #[test]
+    fn test_load_from_toml_preserves_explicit_shadow_acceleration() {
+        let toml_str = r#"
+[ars.acceleration]
+enabled = true
+shadow_only = true
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(cfg.ars.acceleration.shadow_only);
+    }
+
+    #[test]
+    fn test_load_from_toml_parses_non_shadow_acceleration() {
+        let toml_str = r#"
+[ars.acceleration]
+enabled = true
+shadow_only = false
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(!cfg.ars.acceleration.shadow_only);
+    }
+
+    #[test]
+    fn test_ars_llm_judge_max_input_chars_overrides_resolved_llm_default() {
+        let toml_str = r#"
+[llm]
+provider = "google"
+
+[llm.google]
+model = "gemini-test"
+max_input_chars = 4096
+
+[ars.llm_judge]
+max_input_chars = 512
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str)
+            .expect("ars.llm_judge.max_input_chars should be accepted");
+        let resolved = cfg
+            .resolve_llm_for("ars.llm_judge")
+            .expect("ars.llm_judge should resolve via [llm]");
+
+        assert_eq!(resolved.max_input_chars, 512);
     }
 
     /// RAII guard: remember the current env var value and restore it on drop,

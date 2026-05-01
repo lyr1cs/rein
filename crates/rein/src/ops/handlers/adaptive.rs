@@ -33,6 +33,72 @@ impl IntoCliText for AdaptiveStatusOutput {
     }
 }
 
+/// Read-only release/eval gate report for ARS acceleration rollout decisions.
+#[derive(Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct ArsAccelerationReleaseGateOutput(
+    pub crate::ops::ars_release_gate::ArsAccelerationReleaseGateReport,
+);
+
+impl IntoJson for ArsAccelerationReleaseGateOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.0).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ArsAccelerationReleaseGateOutput {
+    fn to_markdown(&self) -> String {
+        let report = &self.0;
+        let mut lines = vec![
+            "ARS acceleration release gate".to_string(),
+            format!(
+                "canary: {}",
+                if report.canary.allowed {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            ),
+            format!(
+                "default-on: {}",
+                if report.default_on.allowed {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            ),
+        ];
+        if !report.canary.blockers.is_empty() {
+            lines.push(format!(
+                "canary blockers: {}",
+                report.canary.blockers.join(", ")
+            ));
+        }
+        if !report.default_on.blockers.is_empty() {
+            lines.push(format!(
+                "default-on blockers: {}",
+                report.default_on.blockers.join(", ")
+            ));
+        }
+        if !report.canary.warnings.is_empty() {
+            lines.push(format!("warnings: {}", report.canary.warnings.join(", ")));
+        }
+        lines.push(format!(
+            "policy: status={} mode={} live_allowed={}",
+            report.signals.policy_status,
+            report.signals.policy_mode.as_deref().unwrap_or("unknown"),
+            report.signals.policy_allows_runtime,
+        ));
+        lines.join("\n")
+    }
+}
+
+impl IntoCliText for ArsAccelerationReleaseGateOutput {
+    fn to_cli_text(&self) -> String {
+        IntoMarkdown::to_markdown(self)
+    }
+}
+
 // ── feedback ─────────────────────────────────────────────────────────────────
 
 /// Pre-v0.26 access-feedback shape. Existing callers POST this without a `kind`
@@ -384,8 +450,25 @@ impl OpsRuntime {
         rest(method = "GET", path = "/api/adaptive")
     )]
     pub fn adaptive_status(&self) -> ReinResult<AdaptiveStatusOutput> {
-        let value = self.with_store(|s| Ok(crate::ops::adaptive_status(s)))?;
+        let config = self.config.clone();
+        let value = self.with_store(|s| Ok(crate::ops::adaptive_status_with_config(s, &config)))?;
         Ok(AdaptiveStatusOutput(value))
+    }
+
+    #[op(
+        name = "ars_acceleration_release_gate",
+        category = "adaptive",
+        description = "Read-only release/eval gate report for ARS acceleration canary and default-on decisions. Uses existing config, adaptive snapshot, parameter-policy, and adaptive-status signals; never flips defaults or writes policy.",
+        cli(name = "ars-acceleration-gate"),
+        mcp(name = "rein_ars_acceleration_gate"),
+        rest(method = "GET", path = "/api/ars-acceleration-gate")
+    )]
+    pub fn ars_acceleration_release_gate(&self) -> ReinResult<ArsAccelerationReleaseGateOutput> {
+        let config = self.config.clone();
+        let report = self.with_store(|s| {
+            Ok(crate::ops::ars_release_gate::ars_acceleration_release_gate_report(s, &config))
+        })?;
+        Ok(ArsAccelerationReleaseGateOutput(report))
     }
 }
 

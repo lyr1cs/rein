@@ -571,6 +571,63 @@ higher. Learned values are bucketed by global, query type, and cluster context
 when enough samples exist. Updates are damped by `alpha_max_step` to avoid
 large jumps after a small feedback batch.
 
+The ARS acceleration path also maintains shadow six-dimensional fusion weights
+for BM25, vector, graph, episode, support, and diversity signals. These weights
+are learned by deterministic replay over a bounded simplex candidate set:
+one-hot dimensions, pairwise blends, accessed-candidate centroids, and
+accessed-vs-other feature gaps. They stay observational until an explicit
+canary policy enables runtime adoption.
+
+### ARS Dynamic Parameter Rollout
+
+ARS acceleration keeps static configuration as the anchor. In v0.28.6 the
+acceleration, runtime judge, and nightly calibration switches are default-on,
+but learned values only affect runtime behavior when `ars_parameter_policy`
+is healthy, in canary mode, and has a positive adoption weight for the relevant
+scope.
+
+The policy row has two rollout layers:
+
+- `runtime_adoption_weight`: global fallback cap.
+- `adoption_weights`: scoped caps such as `recall_fusion:global`,
+  `recall_fusion:<query_type>`, `recall_fusion:<query_type>:<cluster_id>`,
+  `synthesis_gate`, `concept_summary_gate`, `judge_sample_rate`,
+  `llm_feedback_decay`, and `signal_hint_priors`.
+
+For scalar parameters, Rein computes a dynamic trust value:
+
+$$
+\tau =
+\frac{e}{e + p}
+\cdot c
+\cdot s
+\cdot m
+\cdot w
+$$
+
+where `e` is effective evidence count, `p` is prior strength, `c` is calibration
+quality, `s` is recent stability, `m` is a per-parameter trust cap, and `w` is
+the relevant scoped adoption weight. Drift alerts or disabled canary mode set
+`tau` to zero.
+
+The effective runtime value is then a bounded blend:
+
+$$
+x_{\mathrm{effective}} =
+\mathrm{clip}\left((1-\tau)x_{\mathrm{static}} + \tau x_{\mathrm{learned}},
+x_{\min}, x_{\max}\right)
+$$
+
+For parameters with stored previous effective values, each adaptive pass also
+applies a per-parameter max step before committing the new snapshot. The same
+principle is used for six-dimensional recall fusion weights, except the blend
+is normalized back onto the simplex after combining static and learned weights.
+
+This rollout layer is deliberately gradual. Global and scoped adoption weights
+move by at most `0.05` per durable adaptive snapshot and reset to zero outside
+canary mode. They gate recall fusion, synthesis and concept-summary gates, LLM
+judge sample rates, LLM judge decay, and SignalHint-derived useful-rate priors.
+
 ### M5 Tiering
 
 Tiering computes access-rate distributions and assigns hot, warm, and cold
@@ -624,7 +681,11 @@ The runtime judge added in v0.27 is an optional feedback source for synthesis
 and concept-summary quality. It enqueues and consumes LLM judge events when the
 feature is enabled, compares runtime and offline judge streams for calibration,
 and feeds useful-rate style aggregates. It does not replace the durable memory
-model or make dedup decisions by itself.
+model or make dedup decisions by itself. In v0.28.4, shadow judge jobs may carry
+bounded `signal_hint` evidence derived from already-recorded interaction stats;
+the hint does not create extra LLM calls or bypass the normal policy gates. In
+v0.28.6, those policy gates include scoped adoption weights, so LLM feedback
+accelerates tuning gradually instead of replacing static ARS parameters at once.
 
 ## Background Research
 

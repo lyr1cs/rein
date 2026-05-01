@@ -640,6 +640,10 @@ fn build_synthesis_judge_job(
         .get("source_count")
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
+    let signal_hint = cache_entry
+        .get("signal_hint")
+        .filter(|v| !v.is_null())
+        .cloned();
     Some(serde_json::json!({
         "kind": "synthesis",
         "surface_id": synthesis_id,
@@ -655,6 +659,7 @@ fn build_synthesis_judge_job(
         // None at serialize time → field omitted (back-compat with rows
         // emitted before v0.27.1 added the override).
         "judge_model_override": judge_model_override,
+        "signal_hint": signal_hint,
     }))
 }
 
@@ -684,6 +689,10 @@ fn build_concept_summary_judge_job(
         .get("source_count")
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
+    let signal_hint = cache_entry
+        .get("signal_hint")
+        .filter(|v| !v.is_null())
+        .cloned();
     Some(serde_json::json!({
         "kind": "concept_summary",
         "surface_id": concept_summary_id,
@@ -697,6 +706,7 @@ fn build_concept_summary_judge_job(
         "cluster_id": cluster_id,
         "source_count": source_count,
         "judge_model_override": judge_model_override,
+        "signal_hint": signal_hint,
     }))
 }
 
@@ -864,5 +874,46 @@ mod tests {
         assert_eq!(p2, 2);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn manual_synthesis_job_preserves_cached_signal_hint() {
+        let cache = serde_json::json!({
+            "synthesis_id": "s1",
+            "query": "q",
+            "prompt": "p",
+            "candidate": "c",
+            "stamp_hash": "h",
+            "signal_hint": {
+                "inferred_w_view": 1.0,
+                "useful_rate_ci_width": 0.25
+            }
+        });
+
+        let job = build_synthesis_judge_job(&cache, "ManualMcp", None).unwrap();
+
+        assert_eq!(job["signal_hint"]["inferred_w_view"], 1.0);
+        assert_eq!(job["signal_hint"]["useful_rate_ci_width"], 0.25);
+    }
+
+    #[test]
+    fn manual_concept_summary_job_preserves_cached_signal_hint() {
+        let cache = serde_json::json!({
+            "concept_summary_id": "cs1",
+            "concept_id": "c1",
+            "query": "",
+            "prompt": "p",
+            "candidate": "c",
+            "stamp_hash": "h",
+            "signal_hint": {
+                "inferred_w_thumb": 2.0,
+                "useful_rate_ci_width": 0.5
+            }
+        });
+
+        let job = build_concept_summary_judge_job(&cache, "ManualMcp", None).unwrap();
+
+        assert_eq!(job["signal_hint"]["inferred_w_thumb"], 2.0);
+        assert_eq!(job["signal_hint"]["useful_rate_ci_width"], 0.5);
     }
 }

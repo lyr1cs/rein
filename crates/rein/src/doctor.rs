@@ -146,6 +146,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(hnsw_check);
                             checks.push(check_resummerize(&store));
                             checks.push(check_pool_saturation(config));
+                            checks.push(check_ars_parameter_policy(&store, config));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -1217,6 +1218,36 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
     let db_path = store.db_path();
     let index_path = db_path.with_extension("tantivy");
     let dirty = warmup::tantivy_dirty_path(db_path).exists();
+    let rebuild_state = warmup::tantivy_rebuild_state(db_path);
+
+    if matches!(rebuild_state, warmup::TantivyRebuildState::Running) {
+        return warn_with_hint(
+            DoctorCategory::Index,
+            "tantivy",
+            format!(
+                "index rebuild in progress at {}{}",
+                index_path.display(),
+                if dirty {
+                    "; dirty marker is present"
+                } else {
+                    ""
+                }
+            ),
+            "wait for the rebuild owner to finish, then rerun `rein doctor`",
+        );
+    }
+
+    if matches!(rebuild_state, warmup::TantivyRebuildState::StaleMarker) {
+        return warn_with_hint(
+            DoctorCategory::Index,
+            "tantivy",
+            format!(
+                "stale rebuild marker is present at {}",
+                warmup::tantivy_rebuilding_path(db_path).display()
+            ),
+            "run `rein doctor --fix` or `rein warmup` to refresh the index",
+        );
+    }
 
     if active_memories == 0 && !index_path.exists() {
         return ok_in(
@@ -1582,12 +1613,35 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
 
     let tantivy_path = store.db_path().with_extension("tantivy");
     let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
-    if !tantivy_path.exists() || tantivy_dirty.exists() {
-        warmup::populate_tantivy(store);
-        fixes.push(format!(
-            "triggered Tantivy rebuild at {}",
-            tantivy_path.display()
-        ));
+    let tantivy_rebuild_state = warmup::tantivy_rebuild_state(store.db_path());
+    if !tantivy_path.exists()
+        || tantivy_dirty.exists()
+        || matches!(
+            tantivy_rebuild_state,
+            warmup::TantivyRebuildState::StaleMarker
+        )
+    {
+        match warmup::try_populate_tantivy(store) {
+            warmup::TantivyRebuildOutcome::Rebuilt { indexed, errors } => {
+                fixes.push(format!(
+                    "rebuilt Tantivy index at {} ({indexed} indexed, {errors} errors)",
+                    tantivy_path.display()
+                ));
+            }
+            warmup::TantivyRebuildOutcome::AlreadyRunning { lock_path } => {
+                fixes.push(format!(
+                    "Tantivy rebuild already in progress at {}",
+                    lock_path.display()
+                ));
+            }
+            warmup::TantivyRebuildOutcome::Failed { reason } => {
+                fixes.push(format!(
+                    "Tantivy rebuild failed at {}: {reason}",
+                    tantivy_path.display()
+                ));
+            }
+            warmup::TantivyRebuildOutcome::SkippedInMemory => {}
+        }
     }
 
     let hnsw_base = store.db_path().with_extension("");
@@ -1663,6 +1717,72 @@ fn recover_inflight_file(
 
 // ── v0.27.x judge checks ───────────────────────────────────────────────────
 
+/// v0.28.x — report the ARS dynamic-parameter activation policy separately
+/// from the large AdaptiveState snapshot so rollback/corruption is visible.
+fn check_ars_parameter_policy(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    use crate::store::ars_parameter_policy::{
+        load_parameter_policy, ArsParameterPolicyLoadStatus, ArsParameterPolicyMode,
+    };
+
+    let loaded = load_parameter_policy(store.conn());
+    match loaded.status {
+        ArsParameterPolicyLoadStatus::Missing => ok_in(
+            DoctorCategory::Configuration,
+            "ars_parameter_policy",
+            "missing policy row; dynamic ARS parameters disabled".to_string(),
+        ),
+        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError => {
+            warn_in(
+                DoctorCategory::Storage,
+                "ars_parameter_policy",
+                format!(
+                    "policy row unhealthy; dynamic ARS parameters disabled ({})",
+                    loaded.error.unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+        }
+        ArsParameterPolicyLoadStatus::Loaded => {
+            let policy = loaded.policy;
+            let state = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+                .unwrap_or_default();
+            let runtime_adoption_weight = if config.adaptive.enabled
+                && config.ars.acceleration.enabled
+                && !config.ars.acceleration.shadow_only
+            {
+                policy.runtime_adoption_weight(state.version)
+            } else {
+                0.0
+            };
+            let live_allowed = runtime_adoption_weight > f64::EPSILON;
+            let message = format!(
+                "mode={:?} revision={} source_adaptive_version={} current_adaptive_version={} live_allowed={} runtime_adoption_weight={:.3}",
+                policy.mode,
+                policy.revision,
+                policy.source_adaptive_version,
+                state.version,
+                live_allowed,
+                runtime_adoption_weight,
+            );
+            if matches!(policy.mode, ArsParameterPolicyMode::Canary) && !live_allowed {
+                warn_in(
+                    DoctorCategory::Configuration,
+                    "ars_parameter_policy",
+                    message,
+                )
+            } else {
+                ok_in(
+                    DoctorCategory::Configuration,
+                    "ars_parameter_policy",
+                    message,
+                )
+            }
+        }
+    }
+}
+
 /// v0.27.1 — surface `JudgeCalibrationState` stats so operators know
 /// the runtime LLM judge is producing usable signal. Reports κ values,
 /// pair counts, drift alert count, and last-computed timestamp.
@@ -1671,7 +1791,7 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
         return ok_in(
             DoctorCategory::Configuration,
             "judge_calibration",
-            "[ars.llm_judge].enabled = false (default-off)".to_string(),
+            "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
     let state = match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
@@ -1696,17 +1816,26 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
     };
     let synth_pairs = cal.recent_pairs_synthesis.len();
     let concept_pairs = cal.recent_pairs_concept.len();
+    let total_drift_alerts = cal
+        .judge_drift_alert
+        .saturating_add(cal.judge_drift_alert_synthesis)
+        .saturating_add(cal.judge_drift_alert_concept);
     let summary = format!(
-        "kappa={:.2} runtime_vs_offline_kappa={:.2} drift_alerts={} synth_pairs={} \
-         concept_pairs={} total_offline={}",
+        "kappa={:.2} runtime_vs_offline_kappa={:.2} synth_runtime_kappa={:.2} \
+         concept_runtime_kappa={:.2} drift_alerts={} synth_drift_alerts={} \
+         concept_drift_alerts={} synth_pairs={} concept_pairs={} total_offline={}",
         cal.kappa,
         cal.runtime_vs_offline_kappa,
+        cal.runtime_vs_offline_kappa_synthesis,
+        cal.runtime_vs_offline_kappa_concept,
         cal.judge_drift_alert,
+        cal.judge_drift_alert_synthesis,
+        cal.judge_drift_alert_concept,
         synth_pairs,
         concept_pairs,
         cal.total_offline_cron_events,
     );
-    if cal.judge_drift_alert > 0 {
+    if total_drift_alerts > 0 {
         warn_in(
             DoctorCategory::Configuration,
             "judge_calibration",
@@ -1723,7 +1852,7 @@ fn check_judge_call_ledger(store: &crate::store::SqliteStore, config: &ReinConfi
         return ok_in(
             DoctorCategory::Configuration,
             "judge_call_ledger",
-            "[ars.llm_judge].enabled = false".to_string(),
+            "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
     let cap = config.ars.llm_judge.daily_call_cap;
@@ -1783,7 +1912,7 @@ fn check_judge_cache_size(config: &ReinConfig) -> DoctorCheck {
         return ok_in(
             DoctorCategory::Storage,
             "judge_cache_size",
-            "[ars.llm_judge].enabled = false".to_string(),
+            "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
     let synth = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);
@@ -1956,6 +2085,22 @@ provider = "inherit"
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let body = (0..count).map(|_| "{}").collect::<Vec<_>>().join("\n");
         std::fs::write(path, format!("{body}\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn hold_file_lock(path: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test failed to acquire advisory lock");
+        file
     }
 
     fn spawn_http_server(response: String) -> u16 {
@@ -2279,6 +2424,99 @@ provider = "inherit"
             );
         }
         assert_eq!(report.status, ReportStatus::Degraded);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial(global_state)]
+    async fn test_doctor_fix_reports_tantivy_rebuild_in_progress() {
+        let _guard = env_lock().lock().await;
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        std::env::set_var("REIN_PROXY_TOKEN", "doctor-test-token");
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        store
+            .store(test_memory("doctor", "doctor memory", "doctor content"))
+            .unwrap();
+        let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(tantivy_dirty.parent().unwrap()).unwrap();
+        std::fs::write(&tantivy_dirty, b"dirty").unwrap();
+        let lock_path = warmup::tantivy_rebuild_lock_path(store.db_path());
+        let _lock = hold_file_lock(&lock_path);
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("Tantivy rebuild already in progress")));
+        assert!(!report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("triggered Tantivy rebuild")));
+        let tantivy = report.checks.iter().find(|c| c.name == "tantivy").unwrap();
+        assert_eq!(tantivy.status, CheckStatus::Warn);
+        assert!(tantivy.message.contains("rebuild in progress"));
+        assert!(tantivy_dirty.exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn test_doctor_fix_repairs_stale_tantivy_rebuild_marker() {
+        let _guard = env_lock().lock().await;
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        std::env::set_var("REIN_PROXY_TOKEN", "doctor-test-token");
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        TantivyFts::open(&store.db_path().with_extension("tantivy")).unwrap();
+        let rebuilding = warmup::tantivy_rebuilding_path(store.db_path());
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(report
+            .fixes_applied
+            .iter()
+            .any(|item| item.contains("rebuilt Tantivy index")));
+        assert!(
+            !rebuilding.exists(),
+            "doctor --fix should clear stale Tantivy rebuild marker"
+        );
+        let tantivy = report.checks.iter().find(|c| c.name == "tantivy").unwrap();
+        assert_ne!(tantivy.status, CheckStatus::Warn);
+        assert!(!tantivy.message.contains("stale rebuild marker"));
     }
 
     #[tokio::test]

@@ -19,8 +19,8 @@ use rein::ops::llm_judge_worker::{
     JudgeJob, JudgeJobKind,
 };
 use rein::store::adaptive::{
-    peek_events, EventType, JudgeSource, SynthesisLlmJudgePayload, LLM_JUDGE_J3_MIN_PAIRS,
-    LLM_JUDGE_KAPPA_FLOOR,
+    peek_events, EventType, JudgeSource, SignalHint, SynthesisLlmJudgePayload,
+    LLM_JUDGE_J3_MIN_PAIRS, LLM_JUDGE_KAPPA_FLOOR,
 };
 use rein::store::SqliteStore;
 
@@ -61,6 +61,7 @@ fn make_job(
         cluster_id: Some(7),
         source_count: Some(3),
         judge_model_override: None,
+        signal_hint: None,
     }
 }
 
@@ -136,6 +137,107 @@ fn dispatch_emits_synthesis_judge_event_on_hit() {
         payload.reason.contains("evidence"),
         "reason preserved verbatim from mock"
     );
+}
+
+#[test]
+fn dispatch_strips_signal_hint_when_acceleration_is_disabled() {
+    let (store, mut config, _tmp) = temp_store();
+    config.ars.acceleration.enabled = false;
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+        "HIT: yes\nWHY: synthesis cites every evidence id.",
+    ));
+    let mut job = make_job(
+        JudgeJobKind::Synthesis,
+        "syn_hint_disabled",
+        None,
+        "q",
+        "p",
+        "c",
+    );
+    job.signal_hint = Some(SignalHint {
+        inferred_w_view: Some(1.0),
+        inferred_w_click: Some(1.5),
+        inferred_w_thumb: Some(2.0),
+        inferred_w_req: Some(0.75),
+        useful_rate_ci_width: Some(0.25),
+    });
+    prepare_j5_target(&store, &config, &job);
+
+    let result = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    );
+
+    assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
+    let events = peek_events(
+        store.conn(),
+        "test-signal-hint-disabled",
+        &[EventType::SynthesisLlmJudge.as_str()],
+        10,
+    )
+    .expect("peek");
+    let payload: SynthesisLlmJudgePayload =
+        serde_json::from_str(events[0].payload.as_ref().unwrap()).expect("parse payload");
+    assert!(
+        payload.signal_hint.is_none(),
+        "disabled acceleration must strip queued signal hints"
+    );
+}
+
+#[test]
+fn dispatch_emits_sanitized_signal_hint_when_acceleration_is_enabled() {
+    let (store, mut config, _tmp) = temp_store();
+    config.ars.acceleration.enabled = true;
+    config.ars.acceleration.shadow_only = false;
+    let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+        "HIT: yes\nWHY: synthesis cites every evidence id.",
+    ));
+    let mut job = make_job(
+        JudgeJobKind::Synthesis,
+        "syn_hint_shadow",
+        None,
+        "q",
+        "p",
+        "c",
+    );
+    job.signal_hint = Some(SignalHint {
+        inferred_w_view: Some(f64::NEG_INFINITY),
+        inferred_w_click: Some(-0.1),
+        inferred_w_thumb: Some(2.25),
+        inferred_w_req: Some(0.75),
+        useful_rate_ci_width: Some(1.25),
+    });
+    prepare_j5_target(&store, &config, &job);
+
+    let result = dispatch_one(
+        &store,
+        &config,
+        &extractor,
+        job,
+        LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
+    );
+
+    assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
+    let events = peek_events(
+        store.conn(),
+        "test-signal-hint-shadow",
+        &[EventType::SynthesisLlmJudge.as_str()],
+        10,
+    )
+    .expect("peek");
+    let payload: SynthesisLlmJudgePayload =
+        serde_json::from_str(events[0].payload.as_ref().unwrap()).expect("parse payload");
+    let hint = payload
+        .signal_hint
+        .expect("enabled acceleration keeps valid hint fields");
+    assert_eq!(hint.inferred_w_view, None);
+    assert_eq!(hint.inferred_w_click, None);
+    assert_eq!(hint.inferred_w_thumb, Some(2.25));
+    assert_eq!(hint.inferred_w_req, Some(0.75));
+    assert_eq!(hint.useful_rate_ci_width, None);
 }
 
 #[test]

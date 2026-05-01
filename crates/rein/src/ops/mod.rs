@@ -8,6 +8,8 @@ use crate::store::SqliteStore;
 use crate::types::*;
 
 pub mod adaptive;
+pub mod ars_release_gate;
+pub mod ars_tuning;
 pub mod cold_archive_summary;
 pub mod concept_summary;
 pub mod consolidation;
@@ -17,6 +19,7 @@ pub mod llm_judge_worker;
 pub mod recall_synthesis;
 pub mod resummerize;
 pub mod system_health;
+pub mod trust_measurement;
 
 // v0.21 A1 unified-ops infrastructure. Handlers populated incrementally.
 pub mod error;
@@ -1464,6 +1467,12 @@ pub fn run_gc_adaptive(
 /// Return adaptive engine status as a JSON value for inspection.
 /// Queries AdaptiveState, reranker weights, event counts, survival curves.
 pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
+    adaptive_status_with_config(store, &ReinConfig::default())
+}
+
+/// Return adaptive engine status using the live operator config for opt-in
+/// v0.28 shadow observability surfaces.
+pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> serde_json::Value {
     let conn = store.conn();
 
     // Learned alphas from AdaptiveState
@@ -1641,6 +1650,14 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
     // such field and `Option::None` after restore) returns the empty/null
     // shape per implementation-contract §4.3.
     let synthesis = project_synthesis_status(state.synthesis_feedback_stats.as_ref());
+    let shadow_fusion = crate::ops::adaptive::shadow_fusion_status(store, config);
+    let parameter_policy = crate::store::ars_parameter_policy::load_parameter_policy(conn);
+    let ars_acceleration = serde_json::json!({
+        "enabled": config.ars.acceleration.enabled,
+        "shadow_only": config.ars.acceleration.shadow_only,
+        "parameter_policy": parameter_policy,
+        "shadow_fusion_replay": shadow_fusion,
+    });
 
     serde_json::json!({
         "learned_alphas": learned_alphas,
@@ -1652,6 +1669,7 @@ pub fn adaptive_status(store: &SqliteStore) -> serde_json::Value {
         "dedup_thresholds": dedup_thresholds,
         "cluster_profiles": cluster_profiles,
         "synthesis": synthesis,
+        "ars_acceleration": ars_acceleration,
     })
 }
 
@@ -2481,5 +2499,24 @@ mod tests {
             }),
             "cold-start synthesis projection mismatch"
         );
+    }
+
+    #[test]
+    fn adaptive_status_includes_shadow_fusion_key_on_cold_start() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let value = adaptive_status_with_config(&store, &config);
+
+        let acceleration = value
+            .get("ars_acceleration")
+            .expect("adaptive_status() output must include `ars_acceleration` key");
+        assert_eq!(acceleration["enabled"].as_bool(), Some(true));
+        assert_eq!(acceleration["shadow_only"].as_bool(), Some(false));
+        let shadow = acceleration
+            .get("shadow_fusion_replay")
+            .expect("ars_acceleration must include `shadow_fusion_replay`");
+        assert_eq!(shadow["enabled"].as_bool(), Some(true));
+        assert_eq!(shadow["status"].as_str(), Some("insufficient_samples"));
+        assert!(shadow["global"].is_null());
     }
 }

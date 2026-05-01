@@ -50,6 +50,8 @@ compact = false
 sse_enabled = false
 sse_port = 8680
 sse_bind = "127.0.0.1"    # use 0.0.0.0 for Tailscale/LAN access
+background_warmup = true  # HTTP/GUI service startup may repair side indexes
+stdio_background_warmup = false  # avoid per-agent MCP stdio index rebuilds
 # v0.27.4 F5/C1: default-deny. Operators must opt in to unauthenticated
 # loopback or set REIN_HTTP_TOKEN. Existing fresh-install and
 # file-backed configs that omit this field also resolve to false via
@@ -86,7 +88,17 @@ signal_keywords = [
 inject_prompt_context = false
 inject_session_context = false
 guardrails_enabled = true
-max_additional_context_chars = 4000
+max_additional_context_chars = 1200
+
+[ars.acceleration]
+enabled = true
+shadow_only = false
+
+[ars.llm_judge]
+enabled = true
+
+[ars.llm_judge.nightly_cron]
+enabled = true
 
 [extract]
 provider = "google"
@@ -146,7 +158,7 @@ batch_size = 8             # ready jobs processed per batch
 spawn_cooldown_ms = 1500   # avoid spawn storms when many events arrive together
 max_working_set_items = 40 # cap the per-project session working surface
 max_always_on_items = 24   # cap the per-project stable always-on surface
-selection_limit = 5        # max injected items selected across both surfaces
+selection_limit = 2        # max injected items selected across both surfaces
 fingerprint_window_ms = 120000 # suppress near-duplicate queued events for 2 minutes
 recent_event_cache_size = 256  # number of recent event fingerprints tracked per project
 
