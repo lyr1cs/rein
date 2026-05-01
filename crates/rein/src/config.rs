@@ -305,17 +305,17 @@ pub struct ArsConfig {
     #[serde(default = "default_cold_archive_batch_size")]
     pub cold_archive_batch_size: usize,
     // ── v0.27.1 Track 1 — runtime LLM judge ──────────────────────────────────
-    /// `[ars.llm_judge]` sub-table — opt-in runtime LLM judge worker for
-    /// auto-feedback on synthesis / concept-summary outputs. Default off.
+    /// `[ars.llm_judge]` sub-table — default-on runtime LLM judge worker for
+    /// auto-feedback on synthesis / concept-summary outputs, bounded by
+    /// provider resolution, sample rates, and daily caps.
     /// J6 invariant `weight_decay_rate ∈ [0.0, 1.0]` is validated at boot
     /// via `validate_ars_llm_judge`.
     #[serde(default)]
     pub llm_judge: ArsLlmJudgeConfig,
     // ── v0.28 ARS acceleration controller ──────────────────────────────────
-    /// `[ars.acceleration]` sub-table — default-off controller for shadow
-    /// acceleration work. `shadow_only=true` keeps production recall and
-    /// summary behavior on the existing path while new priors/weights are
-    /// learned or replayed in tests and logs.
+    /// `[ars.acceleration]` sub-table — default-on controller for ARS
+    /// acceleration work. Runtime decisions still fail closed through the
+    /// parameter-policy row, evidence gates, and drift checks.
     #[serde(default)]
     pub acceleration: ArsAccelerationConfig,
 }
@@ -366,9 +366,9 @@ impl Default for ArsConfig {
             cold_archive_enabled: false,
             cold_archive_target_chars: default_cold_archive_target_chars(),
             cold_archive_batch_size: default_cold_archive_batch_size(),
-            // v0.27.1 Track 1 — opt-in runtime LLM judge
+            // v0.27.1 Track 1 / v0.28.6 default-on runtime LLM judge
             llm_judge: ArsLlmJudgeConfig::default(),
-            // v0.28 — opt-in shadow acceleration
+            // v0.28.6 — default-on, policy-gated acceleration
             acceleration: ArsAccelerationConfig::default(),
         }
     }
@@ -392,22 +392,22 @@ impl ArsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsAccelerationConfig {
-    /// Master feature flag. Default `false`: no extra I/O, no learned prior
-    /// snapshot reads, and no recall scoring changes.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Keep acceleration in shadow mode. Default `true`; `false` is an
-    /// explicit production canary that lets recall consume eligible learned
-    /// six-dimensional fusion weights from `AdaptiveState`.
+    /// Master feature flag. Default `true`: acceleration signals are collected
+    /// and the policy gate can promote eligible runtime parameters.
     #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Keep acceleration in shadow mode. Default `false`; runtime adoption is
+    /// still blocked until `ars_parameter_policy` reaches Canary mode with a
+    /// positive adoption weight.
+    #[serde(default)]
     pub shadow_only: bool,
 }
 
 impl Default for ArsAccelerationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            shadow_only: true,
+            enabled: true,
+            shadow_only: false,
         }
     }
 }
@@ -416,7 +416,7 @@ impl Default for ArsAccelerationConfig {
 // v0.27.1 Track 1 — `[ars.llm_judge]` runtime LLM judge config
 // ---------------------------------------------------------------------------
 
-/// `[ars.llm_judge]` config block — opt-in runtime LLM judge worker for
+/// `[ars.llm_judge]` config block — default-on runtime LLM judge worker for
 /// auto-feedback on synthesis (Cap B) and concept-summary (Cap A) outputs.
 ///
 /// Provider/model fields are NOT stored here; they resolve via
@@ -426,9 +426,9 @@ impl Default for ArsAccelerationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsLlmJudgeConfig {
-    /// Master feature flag. Default `false` per
-    /// [[feedback_no_early_deploy]].
-    #[serde(default)]
+    /// Master feature flag. Default `true`; provider resolution, sample rates,
+    /// daily caps, and policy gates still prevent unbounded judge traffic.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Judge Cap B (synthesis) outputs. Default `true` once master is on.
     #[serde(default = "default_true")]
@@ -480,17 +480,26 @@ pub struct ArsLlmJudgeConfig {
 /// triangle. Re-judges a sampled subset of the last 24h synthesis events
 /// with a (potentially stricter) LLM regime, and accumulates κ vs the
 /// runtime judge.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsLlmJudgeNightlyCronConfig {
-    /// Master cron flag. Default `false` (gated separately from
+    /// Master cron flag. Default `true` (gated separately from
     /// `[ars.llm_judge].enabled`).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Fraction of the last 24h synthesis events to re-judge. Default
     /// 0.2 (20%).
     #[serde(default = "default_judge_cron_sample_rate")]
     pub sample_rate: f64,
+}
+
+impl Default for ArsLlmJudgeNightlyCronConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: default_judge_cron_sample_rate(),
+        }
+    }
 }
 
 fn default_judge_sample_rate_cold_start() -> f64 {
@@ -524,7 +533,7 @@ fn default_judge_cron_sample_rate() -> f64 {
 impl Default for ArsLlmJudgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             synthesis_enabled: true,
             concept_summary_enabled: true,
             recall_ranking_enabled: false,
@@ -535,7 +544,10 @@ impl Default for ArsLlmJudgeConfig {
             weight_decay_rate: default_judge_weight_decay_rate(),
             daily_call_cap: default_judge_daily_call_cap(),
             cache_ttl_secs: default_judge_cache_ttl_secs(),
-            nightly_cron: ArsLlmJudgeNightlyCronConfig::default(),
+            nightly_cron: ArsLlmJudgeNightlyCronConfig {
+                enabled: true,
+                ..ArsLlmJudgeNightlyCronConfig::default()
+            },
         }
     }
 }
@@ -2933,8 +2945,10 @@ mod tests {
         assert!(cfg.hooks.codex.guardrails_enabled);
         assert_eq!(cfg.hooks.codex.max_additional_context_chars, 1200);
         assert_eq!(cfg.async_memory.selection_limit, 2);
-        assert!(!cfg.ars.acceleration.enabled);
-        assert!(cfg.ars.acceleration.shadow_only);
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(!cfg.ars.acceleration.shadow_only);
+        assert!(cfg.ars.llm_judge.enabled);
+        assert!(cfg.ars.llm_judge.nightly_cron.enabled);
     }
 
     #[test]
@@ -2960,6 +2974,7 @@ max_additional_context_chars = 1024
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);
         assert_eq!(cfg.database.path, "auto");
+        assert!(cfg.ars.llm_judge.nightly_cron.enabled);
     }
 
     #[test]
@@ -2994,6 +3009,19 @@ stdio_background_warmup = true
         let toml_str = r#"
 [ars.acceleration]
 enabled = true
+"#;
+        let cfg = ReinConfig::load_from_str(toml_str).unwrap();
+
+        assert!(cfg.ars.acceleration.enabled);
+        assert!(!cfg.ars.acceleration.shadow_only);
+    }
+
+    #[test]
+    fn test_load_from_toml_preserves_explicit_shadow_acceleration() {
+        let toml_str = r#"
+[ars.acceleration]
+enabled = true
+shadow_only = true
 "#;
         let cfg = ReinConfig::load_from_str(toml_str).unwrap();
 

@@ -140,14 +140,15 @@ fn dispatch_emits_synthesis_judge_event_on_hit() {
 }
 
 #[test]
-fn dispatch_strips_signal_hint_when_acceleration_is_default_off() {
-    let (store, config, _tmp) = temp_store();
+fn dispatch_strips_signal_hint_when_acceleration_is_disabled() {
+    let (store, mut config, _tmp) = temp_store();
+    config.ars.acceleration.enabled = false;
     let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
         "HIT: yes\nWHY: synthesis cites every evidence id.",
     ));
     let mut job = make_job(
         JudgeJobKind::Synthesis,
-        "syn_hint_default_off",
+        "syn_hint_disabled",
         None,
         "q",
         "p",
@@ -173,7 +174,7 @@ fn dispatch_strips_signal_hint_when_acceleration_is_default_off() {
     assert!(matches!(result, Ok(DispatchResult::Emitted(_))));
     let events = peek_events(
         store.conn(),
-        "test-signal-hint-default-off",
+        "test-signal-hint-disabled",
         &[EventType::SynthesisLlmJudge.as_str()],
         10,
     )
@@ -182,15 +183,15 @@ fn dispatch_strips_signal_hint_when_acceleration_is_default_off() {
         serde_json::from_str(events[0].payload.as_ref().unwrap()).expect("parse payload");
     assert!(
         payload.signal_hint.is_none(),
-        "default-off acceleration must strip queued signal hints"
+        "disabled acceleration must strip queued signal hints"
     );
 }
 
 #[test]
-fn dispatch_emits_sanitized_signal_hint_only_in_shadow_mode() {
+fn dispatch_emits_sanitized_signal_hint_when_acceleration_is_enabled() {
     let (store, mut config, _tmp) = temp_store();
     config.ars.acceleration.enabled = true;
-    config.ars.acceleration.shadow_only = true;
+    config.ars.acceleration.shadow_only = false;
     let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
         "HIT: yes\nWHY: synthesis cites every evidence id.",
     ));
@@ -231,7 +232,7 @@ fn dispatch_emits_sanitized_signal_hint_only_in_shadow_mode() {
         serde_json::from_str(events[0].payload.as_ref().unwrap()).expect("parse payload");
     let hint = payload
         .signal_hint
-        .expect("shadow mode keeps valid hint fields");
+        .expect("enabled acceleration keeps valid hint fields");
     assert_eq!(hint.inferred_w_view, None);
     assert_eq!(hint.inferred_w_click, None);
     assert_eq!(hint.inferred_w_thumb, Some(2.25));

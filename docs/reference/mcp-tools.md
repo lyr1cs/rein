@@ -1,6 +1,6 @@
 # MCP Tools
 
-Updated for Rein v0.28.5. Rein exposes 39 production MCP tools through the
+Updated for Rein v0.28.6. Rein exposes 40 production MCP tools through the
 operation inventory. Test-only tools and `/api/test_path_template/*` routes are
 not part of this reference.
 
@@ -61,3 +61,5 @@ not part of this reference.
 | 36 | `rein_ingest_session` | Ingest a transcript into memories, concepts, links, and an episode. |
 | 37 | `rein_judge_synthesis` | Manually run the LLM judge for a prior synthesis output. |
 | 38 | `rein_judge_concept_summary` | Manually run the LLM judge for a prior concept-summary output. |
+| 39 | `rein_ars_acceleration_gate` | Inspect read-only ARS acceleration canary/default-on release-gate state. |
+| 40 | `rein_trust_measurement` | Inspect release gate, eval gates, index consistency, background observability, and active-learning status. |

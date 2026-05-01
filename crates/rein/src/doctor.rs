@@ -1791,7 +1791,7 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
         return ok_in(
             DoctorCategory::Configuration,
             "judge_calibration",
-            "[ars.llm_judge].enabled = false (default-off)".to_string(),
+            "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
     let state = match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
@@ -1852,7 +1852,7 @@ fn check_judge_call_ledger(store: &crate::store::SqliteStore, config: &ReinConfi
         return ok_in(
             DoctorCategory::Configuration,
             "judge_call_ledger",
-            "[ars.llm_judge].enabled = false".to_string(),
+            "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
     let cap = config.ars.llm_judge.daily_call_cap;
@@ -1912,7 +1912,7 @@ fn check_judge_cache_size(config: &ReinConfig) -> DoctorCheck {
         return ok_in(
             DoctorCategory::Storage,
             "judge_cache_size",
-            "[ars.llm_judge].enabled = false".to_string(),
+            "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
     let synth = crate::ops::handlers::judge::synthesis_cache_path_for_config(config);

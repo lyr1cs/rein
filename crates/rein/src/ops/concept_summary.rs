@@ -124,11 +124,13 @@ fn run_concept_summary_inner(
         },
     };
 
-    let runtime_adoption_weight = crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(
-        store.conn(),
-        config,
-        &state,
-    );
+    let judge_sample_rate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "judge_sample_rate",
+        );
     let batch_cap = config.ars.batch_size.max(1);
     for concept in eligible.into_iter().take(batch_cap) {
         outcome.attempted += 1;
@@ -138,7 +140,7 @@ fn run_concept_summary_inner(
             &concept,
             config,
             &state,
-            runtime_adoption_weight,
+            judge_sample_rate_adoption_weight,
         ) {
             Ok(summary_id) => {
                 outcome.succeeded += 1;
@@ -220,7 +222,7 @@ fn summarize_one(
     concept: &Concept,
     config: &ReinConfig,
     adaptive_state: &AdaptiveState,
-    runtime_adoption_weight: f64,
+    judge_sample_rate_adoption_weight: f64,
 ) -> Result<String, SummaryError> {
     // Codex R2 P2 fix — return the minted `living_summary_id` so
     // `run_concept_summary_inner` can surface it on `ConceptSummaryOutcome`.
@@ -309,7 +311,7 @@ fn summarize_one(
             &concept.id,
             &prompt,
             summary,
-            runtime_adoption_weight,
+            judge_sample_rate_adoption_weight,
         );
     }
 
@@ -853,7 +855,7 @@ fn signal_hint_for_concept_summary_job(
     config: &ReinConfig,
     bucket: Option<&ClusterConceptSummaryStats>,
 ) -> Option<serde_json::Value> {
-    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+    if !config.ars.acceleration.enabled {
         return None;
     }
     let total_signal = bucket
@@ -958,7 +960,7 @@ fn enqueue_judge_for_concept_summary(
     concept_id: &str,
     prompt: &str,
     candidate: &str,
-    runtime_adoption_weight: f64,
+    judge_sample_rate_adoption_weight: f64,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, concept_summary_cache_path_for_config, judge_queue_path_for_config,
@@ -1043,7 +1045,7 @@ fn enqueue_judge_for_concept_summary(
     let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
-        runtime_adoption_weight,
+        judge_sample_rate_adoption_weight,
         true,
         adaptive_state
             .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
@@ -1051,7 +1053,7 @@ fn enqueue_judge_for_concept_summary(
     let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
         calibration,
-        runtime_adoption_weight,
+        judge_sample_rate_adoption_weight,
         false,
         adaptive_state
             .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
@@ -1765,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_hint_for_concept_summary_job_is_shadow_only() {
+    fn signal_hint_for_concept_summary_job_requires_acceleration() {
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = true;
@@ -1787,6 +1789,9 @@ mod tests {
         assert!(hint["useful_rate_ci_width"].as_f64().unwrap() < 1.0);
 
         config.ars.acceleration.shadow_only = false;
+        assert!(signal_hint_for_concept_summary_job(&config, Some(&bucket)).is_some());
+
+        config.ars.acceleration.enabled = false;
         assert!(signal_hint_for_concept_summary_job(&config, Some(&bucket)).is_none());
     }
 }

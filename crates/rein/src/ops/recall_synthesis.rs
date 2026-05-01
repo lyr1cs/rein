@@ -360,6 +360,23 @@ fn effective_synthesis_gate_parameters(
     (cold_start_n, useful_rate_threshold)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallSynthesisRuntimeAdoption {
+    pub synthesis_gate: f64,
+    pub judge_sample_rate: f64,
+    pub llm_feedback_decay: f64,
+}
+
+impl RecallSynthesisRuntimeAdoption {
+    pub const fn uniform(weight: f64) -> Self {
+        Self {
+            synthesis_gate: weight,
+            judge_sample_rate: weight,
+            llm_feedback_decay: weight,
+        }
+    }
+}
+
 /// Run recall-time synthesis over `results` for `query`.
 ///
 /// Returns `None` when synthesis was not requested (`synthesize` is `None` or
@@ -401,7 +418,7 @@ pub fn run_recall_synthesis(
         query_type,
         adaptive_state,
         extractor_override,
-        0.0,
+        RecallSynthesisRuntimeAdoption::uniform(0.0),
     )
 }
 
@@ -414,7 +431,7 @@ pub fn run_recall_synthesis_with_policy(
     query_type: &str,
     adaptive_state: Option<&AdaptiveState>,
     extractor_override: Option<ExtractorKind>,
-    runtime_adoption_weight: f64,
+    runtime_adoption: RecallSynthesisRuntimeAdoption,
 ) -> Option<RecallSynthesisOutcome> {
     if synthesize != Some(true) {
         return None;
@@ -479,13 +496,13 @@ pub fn run_recall_synthesis_with_policy(
             adaptive_state,
             cluster_id,
             query_type,
-            runtime_adoption_weight,
+            runtime_adoption.synthesis_gate,
         );
     let effective_judge_weight_decay_rate =
         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             adaptive_state.and_then(|state| state.judge_calibration_state.as_ref()),
-            runtime_adoption_weight,
+            runtime_adoption.llm_feedback_decay,
             adaptive_state.and_then(|state| {
                 state.ars_effective_scalar(
                     crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
@@ -610,7 +627,7 @@ pub fn run_recall_synthesis_with_policy(
                             &prompt,
                             &clean,
                             included_count,
-                            runtime_adoption_weight,
+                            runtime_adoption.judge_sample_rate,
                         );
                     }
                 }
@@ -958,7 +975,7 @@ fn signal_hint_for_synthesis_job(
     config: &ReinConfig,
     bucket: Option<&ClusterSynthesisStats>,
 ) -> Option<serde_json::Value> {
-    if !config.ars.acceleration.enabled || !config.ars.acceleration.shadow_only {
+    if !config.ars.acceleration.enabled {
         return None;
     }
     let total_signal = bucket
@@ -2749,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_hint_for_synthesis_job_is_shadow_only_and_uses_bucket_confidence() {
+    fn signal_hint_for_synthesis_job_requires_acceleration_and_uses_bucket_confidence() {
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = true;
@@ -2771,6 +2788,9 @@ mod tests {
         assert!(hint["useful_rate_ci_width"].as_f64().unwrap() < 1.0);
 
         config.ars.acceleration.shadow_only = false;
+        assert!(signal_hint_for_synthesis_job(&config, Some(&bucket)).is_some());
+
+        config.ars.acceleration.enabled = false;
         assert!(signal_hint_for_synthesis_job(&config, Some(&bucket)).is_none());
     }
 }

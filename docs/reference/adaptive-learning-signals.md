@@ -47,14 +47,13 @@ averages tied winners before applying the normal parent-prior shrinkage.
 
 ## ARS scalar policy
 
-When `[ars.acceleration]` is explicitly in canary mode and
-`ars_parameter_policy` is healthy, synthesis/concept cold-start thresholds,
-useful-rate thresholds, LLM judge sample rates, and LLM judge weight decay can
-move from static config toward calibrated feedback. v0.28.5 adds
-`runtime_adoption_weight` to the policy row; every dynamic trust calculation is
-multiplied by that weight so rollout slides from static priors toward learned
-values. Missing policy, zero adoption weight, drift alerts, or insufficient
-calibration keep the static values.
+When `[ars.acceleration]` is enabled and `ars_parameter_policy` is healthy in
+canary mode, synthesis/concept cold-start thresholds, useful-rate thresholds,
+LLM judge sample rates, and LLM judge weight decay can move from static config
+toward calibrated feedback. v0.28.6 keeps the global
+`runtime_adoption_weight` and adds scoped `adoption_weights` for recall
+fusion/query/cluster and scalar surfaces. Missing policy, zero scoped adoption
+weight, drift alerts, or insufficient calibration keep the static values.
 
 SignalHint/bootstrap priors also feed the production useful-rate formulas under
 the same canary gate. The last effective scalar values are persisted in the
@@ -69,6 +68,11 @@ signals. The report answers whether the current explicit canary is allowed and
 why default-on remains blocked. It is observational only: it does not refresh
 `ars_parameter_policy`, set `shadow_only = false`, change defaults, or commit
 adaptive offsets.
+
+`rein trust-measurement`, `rein_trust_measurement`, and
+`GET /api/trust-measurement` add the broader measurement layer: release gate,
+recall/dedup/admission/latency eval gates, index consistency counts,
+background queue/grayzone observability, and active-learning status.
 
 ## Admission and promotion
 

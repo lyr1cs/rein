@@ -2,6 +2,7 @@
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const ARS_PARAMETER_POLICY_METADATA_KEY: &str = "ars_parameter_policy";
 const ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -33,6 +34,12 @@ pub struct ArsParameterPolicy {
     /// switch.
     #[serde(default)]
     pub runtime_adoption_weight: f64,
+    /// Optional scoped rollout weights. Keys are stable policy surfaces such as
+    /// `recall_fusion:semantic`, `recall_fusion:semantic:7`, or
+    /// `judge_sample_rate`. Missing scopes fall back to
+    /// `runtime_adoption_weight`.
+    #[serde(default)]
+    pub adoption_weights: HashMap<String, f64>,
     #[serde(default)]
     pub last_event_id: i64,
     #[serde(default)]
@@ -48,6 +55,7 @@ impl Default for ArsParameterPolicy {
             disabled_reason: Some("missing policy row".to_string()),
             source_adaptive_version: 0,
             runtime_adoption_weight: 0.0,
+            adoption_weights: HashMap::new(),
             last_event_id: 0,
             last_updated: String::new(),
         }
@@ -71,6 +79,17 @@ impl ArsParameterPolicy {
             return 0.0;
         }
         clamp01(self.runtime_adoption_weight)
+    }
+
+    pub fn runtime_adoption_weight_for(&self, adaptive_version: u64, key: &str) -> f64 {
+        if !self.can_adopt_runtime(adaptive_version) {
+            return 0.0;
+        }
+        self.adoption_weights
+            .get(key)
+            .copied()
+            .map(clamp01)
+            .unwrap_or_else(|| self.runtime_adoption_weight(adaptive_version))
     }
 
     fn can_adopt_runtime(&self, adaptive_version: u64) -> bool {
@@ -126,7 +145,7 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
 
     match serde_json::from_str::<ArsParameterPolicy>(&raw) {
         Ok(mut policy) if policy.schema_version == ARS_PARAMETER_POLICY_SCHEMA_VERSION => {
-            policy.runtime_adoption_weight = clamp01(policy.runtime_adoption_weight);
+            clamp_policy_weights(&mut policy);
             ArsParameterPolicyLoad {
                 policy,
                 status: ArsParameterPolicyLoadStatus::Loaded,
@@ -153,7 +172,7 @@ pub fn save_parameter_policy_cas(
     expected_revision: u64,
 ) -> rusqlite::Result<bool> {
     let mut policy = policy.clone();
-    policy.runtime_adoption_weight = clamp01(policy.runtime_adoption_weight);
+    clamp_policy_weights(&mut policy);
     let json = serde_json::to_string(&policy)
         .expect("ArsParameterPolicy serialization cannot fail for finite fields");
 
@@ -212,6 +231,13 @@ fn clamp01(value: f64) -> f64 {
     }
 }
 
+fn clamp_policy_weights(policy: &mut ArsParameterPolicy) {
+    policy.runtime_adoption_weight = clamp01(policy.runtime_adoption_weight);
+    for value in policy.adoption_weights.values_mut() {
+        *value = clamp01(*value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +261,7 @@ mod tests {
             disabled_reason: None,
             source_adaptive_version: 7,
             runtime_adoption_weight: 1.0,
+            adoption_weights: HashMap::new(),
             last_event_id: 99,
             last_updated: "2026-05-01T00:00:00Z".to_string(),
         }
@@ -286,6 +313,35 @@ mod tests {
     }
 
     #[test]
+    fn canary_policy_uses_scoped_runtime_adoption_weights_with_global_fallback() {
+        let mut policy = canary_policy(1);
+        policy.runtime_adoption_weight = 0.25;
+        policy
+            .adoption_weights
+            .insert("recall_fusion:semantic".to_string(), 0.40);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:semantic:7".to_string(), 0.65);
+
+        assert_eq!(
+            policy.runtime_adoption_weight_for(7, "recall_fusion:semantic"),
+            0.40
+        );
+        assert_eq!(
+            policy.runtime_adoption_weight_for(7, "recall_fusion:semantic:7"),
+            0.65
+        );
+        assert_eq!(
+            policy.runtime_adoption_weight_for(7, "concept_summary_gate"),
+            0.25
+        );
+        assert_eq!(
+            policy.runtime_adoption_weight_for(6, "recall_fusion:semantic"),
+            0.0
+        );
+    }
+
+    #[test]
     fn parameter_policy_load_clamps_runtime_adoption_weight() {
         let conn = conn();
         let mut policy = canary_policy(1);
@@ -298,11 +354,17 @@ mod tests {
         let mut policy = loaded.policy;
         policy.revision += 1;
         policy.runtime_adoption_weight = f64::NAN;
+        policy
+            .adoption_weights
+            .insert("judge_sample_rate".to_string(), 2.0);
+        policy
+            .adoption_weights
+            .insert("llm_feedback_decay".to_string(), f64::NAN);
         assert!(save_parameter_policy_cas(&conn, &policy, 1).unwrap());
-        assert_eq!(
-            load_parameter_policy(&conn).policy.runtime_adoption_weight,
-            0.0
-        );
+        let loaded = load_parameter_policy(&conn).policy;
+        assert_eq!(loaded.runtime_adoption_weight, 0.0);
+        assert_eq!(loaded.adoption_weights["judge_sample_rate"], 1.0);
+        assert_eq!(loaded.adoption_weights["llm_feedback_decay"], 0.0);
     }
 
     #[test]

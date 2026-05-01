@@ -40,6 +40,7 @@ mutating routes also require `x-rein-action: 1`. Protected reads accept
 | `POST` | `/api/feedback` | Mutation marker | Emits memory-access or synthesis-interaction feedback events. |
 | `GET` | `/api/adaptive` | Public read | Adaptive alphas, reranker weights, clusters, tiers, event counts, and synthesis stats. |
 | `GET` | `/api/ars-acceleration-gate` | Public read | Read-only ARS acceleration canary/default-on gate report. |
+| `GET` | `/api/trust-measurement` | Public read | Unified release gate, eval gate, index consistency, background observability, and active-learning report. |
 | `GET` | `/api/dedup_decisions` | Public read | Recent dedup decisions, optionally filtered. |
 | `GET` | `/api/intelligent_merge_metrics` | Server auth | Intelligent-merge metrics summary. |
 | `GET` | `/api/judge/calibration` | Server auth | Runtime-vs-offline judge calibration state. |
@@ -67,22 +68,20 @@ Test-support-only route families are intentionally excluded.
 ## `/api/adaptive` ARS Acceleration Shape
 
 v0.28 exposes ARS acceleration status, replay-learned fusion weights, and the
-dynamic-parameter activation policy. Production recall remains unchanged by
-default; explicit non-shadow canary mode can consume eligible snapshot weights
-only when `ars_parameter_policy` is loaded and allows runtime adoption. v0.28.5
-uses the same policy gate for synthesis/concept scalar parameters, judge
-sample-rate adaptation, SignalHint-derived useful-rate priors, and release-gate
-reporting. Runtime adoption is gradual: `runtime_adoption_weight` multiplies
-dynamic trust, so default installs remain on static configured values and live
-canaries slide toward learned values over successive adaptive snapshots.
+dynamic-parameter activation policy. v0.28.6 makes acceleration default-on, but
+runtime adoption still fails closed unless `ars_parameter_policy` is loaded,
+in canary mode, and has positive scoped adoption weights. The same policy gate
+covers recall fusion, synthesis/concept scalar parameters, judge sample-rate
+adaptation, LLM feedback decay, SignalHint-derived useful-rate priors, and
+release-gate reporting.
 
 `GET /api/adaptive` includes:
 
 ```json
 {
   "ars_acceleration": {
-    "enabled": false,
-    "shadow_only": true,
+    "enabled": true,
+    "shadow_only": false,
     "parameter_policy": {
       "policy": {
         "schema_version": 1,
@@ -91,15 +90,16 @@ canaries slide toward learned values over successive adaptive snapshots.
         "disabled_reason": "missing policy row",
         "source_adaptive_version": 0,
         "runtime_adoption_weight": 0.0,
+        "adoption_weights": {},
         "last_event_id": 0,
         "last_updated": ""
       },
       "status": "missing"
     },
     "shadow_fusion_replay": {
-      "enabled": false,
-      "shadow_only": true,
-      "status": "disabled",
+      "enabled": true,
+      "shadow_only": false,
+      "status": "insufficient_samples",
       "replay_limit": 500,
       "eligible_samples": 0,
       "min_samples": 10,
@@ -113,7 +113,7 @@ canaries slide toward learned values over successive adaptive snapshots.
 
 `shadow_fusion_replay.status` is bounded to the current v0.28 states:
 `disabled`, `insufficient_samples`, `ready`, or `no_learnable_signal`.
-The default install reports `disabled` with
+The default install reports `insufficient_samples` with
 `eligible_samples: 0`, `global: null`, and empty `by_query_type` /
 `by_cluster` arrays.
 
@@ -125,12 +125,10 @@ replay weights:
 - `by_cluster`: array of `{ query_type, cluster_id, sample_count, last_updated, weights }`
 
 `weights` is a normalized object with `bm25`, `vec`, `kg`, `episode`,
-`support`, and `diversity` numbers. With the default `shadow_only = true`,
-these remain observability-only. With explicit `enabled = true` and
-`shadow_only = false`, recall canary mode still requires
+`support`, and `diversity` numbers. Runtime recall canary mode still requires
 `parameter_policy.status = "loaded"`, `policy.mode = "canary"`, and a
-compatible `source_adaptive_version` with positive `runtime_adoption_weight`
-before consuming eligible persisted weights from
+compatible `source_adaptive_version` with positive global or scoped adoption
+weight before consuming eligible persisted weights from
 `AdaptiveState.learned_shadow_fusion`.
 
 ## `/api/ars-acceleration-gate`
@@ -154,19 +152,20 @@ defines ship criteria.
   "purpose": "read_only_release_eval_gate_for_ars_acceleration",
   "signals": {
     "adaptive_enabled": true,
-    "ars_acceleration_enabled": false,
-    "ars_acceleration_shadow_only": true,
+    "ars_acceleration_enabled": true,
+    "ars_acceleration_shadow_only": false,
     "policy_status": "missing",
     "policy_mode": "disabled",
     "policy_allows_runtime": false,
     "runtime_adoption_weight": 0.0,
-    "shadow_fusion_status": "disabled",
+    "runtime_adoption_weights": {},
+    "shadow_fusion_status": "insufficient_samples",
     "judge_drift_alert": false
   },
   "canary": {
     "allowed": false,
-    "blockers": ["ars_acceleration_disabled"],
-    "warnings": ["shadow_fusion_replay_not_ready:disabled"]
+    "blockers": ["ars_parameter_policy_missing"],
+    "warnings": ["shadow_fusion_replay_not_ready:insufficient_samples"]
   },
   "default_on": {
     "allowed": false,
@@ -175,3 +174,11 @@ defines ship criteria.
   }
 }
 ```
+
+## `/api/trust-measurement`
+
+`GET /api/trust-measurement` returns the unified Trust & Measurement snapshot
+also exposed as `rein trust-measurement` and `rein_trust_measurement`. It
+combines the ARS release gate, recall/dedup/admission/latency eval gate
+inventory, SQLite/vector index consistency counts, background queue/grayzone
+observability, and LLM active-learning status.

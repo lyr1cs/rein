@@ -4,6 +4,7 @@
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
+use std::collections::HashMap;
 
 use super::dedup::run_vec_dedup;
 
@@ -13,7 +14,9 @@ fn persist_ars_effective_scalars(
     state: &mut crate::store::adaptive::AdaptiveState,
     config: &ReinConfig,
     priors: &crate::ops::judge_calibration::BootstrapPriors,
-    runtime_adoption_weight: f64,
+    synthesis_gate_adoption_weight: f64,
+    concept_summary_gate_adoption_weight: f64,
+    judge_sample_rate_adoption_weight: f64,
 ) {
     let calibration_snapshot = state.judge_calibration_state.clone();
     let calibration = calibration_snapshot.as_ref();
@@ -33,7 +36,7 @@ fn persist_ars_effective_scalars(
     let synthesis_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.synthesis_cold_start_n,
         calibration,
-        runtime_adoption_weight,
+        synthesis_gate_adoption_weight,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
     );
     state.set_ars_effective_scalar(
@@ -44,7 +47,7 @@ fn persist_ars_effective_scalars(
     let concept_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
         config.ars.concept_summary_cold_start_n,
         calibration,
-        runtime_adoption_weight,
+        concept_summary_gate_adoption_weight,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N),
     );
     state.set_ars_effective_scalar(
@@ -55,7 +58,7 @@ fn persist_ars_effective_scalars(
     let judge_sample_rate_cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
-        runtime_adoption_weight,
+        judge_sample_rate_adoption_weight,
         true,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
     );
@@ -67,7 +70,7 @@ fn persist_ars_effective_scalars(
     let judge_sample_rate_warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
         calibration,
-        runtime_adoption_weight,
+        judge_sample_rate_adoption_weight,
         false,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
     )
@@ -79,8 +82,8 @@ fn persist_ars_effective_scalars(
 
     let threshold_inputs = crate::ops::ars_tuning::TrustInputs {
         enabled: config.ars.acceleration.enabled,
-        production_canary: runtime_adoption_weight > f64::EPSILON,
-        runtime_adoption_weight,
+        production_canary: synthesis_gate_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight: synthesis_gate_adoption_weight,
         human_count: prior_count,
         llm_count: 0,
         llm_reliability: 0.0,
@@ -104,6 +107,11 @@ fn persist_ars_effective_scalars(
         synthesis_threshold,
     );
 
+    let concept_threshold_inputs = crate::ops::ars_tuning::TrustInputs {
+        production_canary: concept_summary_gate_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight: concept_summary_gate_adoption_weight,
+        ..threshold_inputs
+    };
     let concept_threshold = crate::ops::ars_tuning::effective_scalar(
         crate::store::adaptive::CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
         priors.useful_rate_threshold,
@@ -111,12 +119,48 @@ fn persist_ars_effective_scalars(
             crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
         ),
         crate::ops::ars_tuning::bounds01(0.05),
-        threshold_inputs,
+        concept_threshold_inputs,
     );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
         concept_threshold,
     );
+}
+
+fn useful_rate_weights_from_signal_hint_priors(
+    baseline: crate::store::adaptive::UsefulRateWeights,
+    priors: &crate::ops::judge_calibration::BootstrapPriors,
+    adoption_weight: f64,
+) -> crate::store::adaptive::UsefulRateWeights {
+    let adoption_weight = if adoption_weight.is_finite() {
+        adoption_weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if adoption_weight <= f64::EPSILON {
+        return baseline;
+    }
+    let learned = crate::store::adaptive::UsefulRateWeights::from_priors(
+        baseline,
+        priors.w_view,
+        priors.w_click,
+        priors.w_thumb,
+        priors.w_req,
+    );
+    crate::store::adaptive::UsefulRateWeights {
+        view: baseline
+            .view
+            .mul_add(1.0 - adoption_weight, learned.view * adoption_weight),
+        click: baseline
+            .click
+            .mul_add(1.0 - adoption_weight, learned.click * adoption_weight),
+        thumb: baseline
+            .thumb
+            .mul_add(1.0 - adoption_weight, learned.thumb * adoption_weight),
+        requery: baseline
+            .requery
+            .mul_add(1.0 - adoption_weight, learned.requery * adoption_weight),
+    }
 }
 
 /// Run the adaptive engine slow-channel pipeline after GC.
@@ -212,8 +256,41 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // SynthesisLlmJudge events fold into `llm_judge_count` / hit_count
     // and the κ pair cache. Without this swap the new consumer is dead
     // code and judge events that landed past the offset are lost.
-    let runtime_adoption_weight =
-        ars_parameter_policy_runtime_adoption_weight(store.conn(), config, &state);
+    let synthesis_gate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "synthesis_gate",
+        );
+    let concept_summary_gate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "concept_summary_gate",
+        );
+    let judge_sample_rate_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "judge_sample_rate",
+        );
+    let llm_feedback_decay_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "llm_feedback_decay",
+        );
+    let signal_hint_priors_adoption_weight =
+        crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight_for(
+            store.conn(),
+            config,
+            &state,
+            "signal_hint_priors",
+        );
     let bootstrap_priors =
         match crate::ops::judge_calibration::bootstrap_priors_from_replay(config, store.conn()) {
             Ok(priors) => priors,
@@ -222,32 +299,29 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
                 crate::ops::judge_calibration::BootstrapPriors::const_defaults()
             }
         };
-    let synthesis_useful_rate_weights = crate::store::adaptive::UsefulRateWeights::from_priors(
+    let synthesis_useful_rate_weights = useful_rate_weights_from_signal_hint_priors(
         crate::store::adaptive::UsefulRateWeights::synthesis_bootstrap(),
-        bootstrap_priors.w_view,
-        bootstrap_priors.w_click,
-        bootstrap_priors.w_thumb,
-        bootstrap_priors.w_req,
+        &bootstrap_priors,
+        signal_hint_priors_adoption_weight,
     );
-    let concept_summary_useful_rate_weights =
-        crate::store::adaptive::UsefulRateWeights::from_priors(
-            crate::store::adaptive::UsefulRateWeights::concept_summary_bootstrap(),
-            bootstrap_priors.w_view,
-            bootstrap_priors.w_click,
-            bootstrap_priors.w_thumb,
-            bootstrap_priors.w_req,
-        );
+    let concept_summary_useful_rate_weights = useful_rate_weights_from_signal_hint_priors(
+        crate::store::adaptive::UsefulRateWeights::concept_summary_bootstrap(),
+        &bootstrap_priors,
+        signal_hint_priors_adoption_weight,
+    );
     persist_ars_effective_scalars(
         &mut state,
         config,
         &bootstrap_priors,
-        runtime_adoption_weight,
+        synthesis_gate_adoption_weight,
+        concept_summary_gate_adoption_weight,
+        judge_sample_rate_adoption_weight,
     );
     let effective_judge_weight_decay_rate =
         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
-            runtime_adoption_weight,
+            llm_feedback_decay_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
         );
     state.set_ars_effective_scalar(
@@ -286,7 +360,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
-            runtime_adoption_weight,
+            llm_feedback_decay_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
         );
     state.set_ars_effective_scalar(
@@ -318,9 +392,8 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // this drain, the queue grew indefinitely and no
     // `synthesis_llm_judge` / `concept_summary_llm_judge` events ever
     // reached `feedback_events`, making the entire judge feedback loop
-    // dead code in production. Default-off when
-    // `[ars.llm_judge].enabled = false` (no queue file is ever written
-    // under that flag, so the drain is a fast no-op).
+    // dead code in production. When `[ars.llm_judge].enabled = false`,
+    // no queue file is written, so the drain is a fast no-op.
     let drain_stats = crate::ops::llm_judge_worker::drain_queue(store, config);
     if drain_stats.emitted > 0
         || drain_stats.dropped > 0
@@ -562,10 +635,13 @@ fn refresh_ars_parameter_policy(
     let current = loaded.policy;
     let runtime_adoption_weight =
         next_runtime_adoption_weight(config, state, desired_mode, current.runtime_adoption_weight);
+    let adoption_weights =
+        next_scoped_adoption_weights(config, state, desired_mode, &current.adoption_weights);
     if current.mode == desired_mode
         && current.source_adaptive_version == state.version
         && current.disabled_reason == disabled_reason
         && (current.runtime_adoption_weight - runtime_adoption_weight).abs() <= f64::EPSILON
+        && current.adoption_weights == adoption_weights
     {
         return;
     }
@@ -576,6 +652,7 @@ fn refresh_ars_parameter_policy(
         disabled_reason,
         source_adaptive_version: state.version,
         runtime_adoption_weight,
+        adoption_weights,
         last_event_id: state
             .alpha_optimizer_last_id
             .max(state.alpha_optimizer_access_last_id),
@@ -610,17 +687,85 @@ fn next_runtime_adoption_weight(
     ) {
         return 0.0;
     }
+    let Some(target) = max_runtime_adoption_target(config, state) else {
+        return 0.0;
+    };
+    step_runtime_adoption_weight(current_weight, target)
+}
+
+fn next_scoped_adoption_weights(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    desired_mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode,
+    current_weights: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    if !matches!(
+        desired_mode,
+        crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+    ) {
+        return HashMap::new();
+    }
+
+    let mut weights = HashMap::new();
+    for (bucket, entry) in &state.learned_shadow_fusion {
+        let Some(target) = runtime_adoption_target(config, entry.sample_count) else {
+            continue;
+        };
+        let key = recall_fusion_adoption_key(bucket);
+        let current = current_weights.get(&key).copied().unwrap_or(0.0);
+        weights.insert(key, step_runtime_adoption_weight(current, target));
+    }
+
+    if let Some(target) = max_runtime_adoption_target(config, state) {
+        for key in [
+            "synthesis_gate",
+            "concept_summary_gate",
+            "judge_sample_rate",
+            "llm_feedback_decay",
+            "signal_hint_priors",
+        ] {
+            let current = current_weights.get(key).copied().unwrap_or(0.0);
+            weights.insert(
+                key.to_string(),
+                step_runtime_adoption_weight(current, target),
+            );
+        }
+    }
+
+    weights
+}
+
+fn max_runtime_adoption_target(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) -> Option<f64> {
     let max_samples = state
         .learned_shadow_fusion
         .values()
         .filter(|entry| entry.sample_count >= config.adaptive.min_samples_alpha)
-        .map(|entry| entry.sample_count as f64)
-        .fold(0.0, f64::max);
-    if max_samples <= 0.0 || !max_samples.is_finite() {
-        return 0.0;
+        .map(|entry| entry.sample_count)
+        .max()?;
+    runtime_adoption_target(config, max_samples)
+}
+
+fn runtime_adoption_target(config: &ReinConfig, sample_count: usize) -> Option<f64> {
+    if sample_count < config.adaptive.min_samples_alpha {
+        return None;
+    }
+    let samples = sample_count as f64;
+    if samples <= 0.0 || !samples.is_finite() {
+        return None;
     }
     let prior = config.adaptive.shrinkage_prior.max(1.0);
-    let target = (max_samples / (max_samples + prior)).clamp(ARS_POLICY_ADOPTION_MAX_STEP, 1.0);
+    Some((samples / (samples + prior)).clamp(ARS_POLICY_ADOPTION_MAX_STEP, 1.0))
+}
+
+fn step_runtime_adoption_weight(current_weight: f64, target: f64) -> f64 {
+    let target = if target.is_finite() {
+        target.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let current = if current_weight.is_finite() {
         current_weight.clamp(0.0, 1.0)
     } else {
@@ -633,12 +778,12 @@ fn next_runtime_adoption_weight(
     }
 }
 
-fn ars_parameter_policy_runtime_adoption_weight(
-    conn: &rusqlite::Connection,
-    config: &ReinConfig,
-    state: &crate::store::adaptive::AdaptiveState,
-) -> f64 {
-    crate::ops::ars_tuning::parameter_policy_runtime_adoption_weight(conn, config, state)
+fn recall_fusion_adoption_key(bucket: &str) -> String {
+    if bucket == "global" {
+        "recall_fusion:global".to_string()
+    } else {
+        format!("recall_fusion:{bucket}")
+    }
 }
 
 // ===========================================================================
@@ -3251,6 +3396,135 @@ mod tests {
     }
 
     #[test]
+    fn ars_parameter_policy_refresh_records_scoped_adoption_weights() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.3,
+                    kg: 0.2,
+                    episode: 0.2,
+                    support: 0.1,
+                    diversity: 0.1,
+                },
+                sample_count: 14,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+        state.learned_shadow_fusion.insert(
+            "semantic:7".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.4,
+                    kg: 0.1,
+                    episode: 0.2,
+                    support: 0.1,
+                    diversity: 0.1,
+                },
+                sample_count: 16,
+                last_updated: "2026-05-01T00:00:00Z".to_string(),
+            },
+        );
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            loaded.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert_eq!(
+            loaded.adoption_weights["recall_fusion:global"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(loaded.adoption_weights["recall_fusion:semantic"], 0.05);
+        assert_eq!(loaded.adoption_weights["recall_fusion:semantic:7"], 0.05);
+        assert_eq!(
+            loaded.adoption_weights["synthesis_gate"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["concept_summary_gate"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["judge_sample_rate"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["llm_feedback_decay"],
+            loaded.runtime_adoption_weight
+        );
+        assert_eq!(
+            loaded.adoption_weights["signal_hint_priors"],
+            loaded.runtime_adoption_weight
+        );
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_rolls_back_to_shadow_and_clears_scoped_weights() {
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = eligible_shadow_state();
+
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let promoted = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            promoted.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert!(!promoted.adoption_weights.is_empty());
+
+        state.version += 1;
+        for entry in state.learned_shadow_fusion.values_mut() {
+            entry.sample_count = 1;
+        }
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let rolled_back = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            rolled_back.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow
+        );
+        assert_eq!(rolled_back.runtime_adoption_weight, 0.0);
+        assert!(rolled_back.adoption_weights.is_empty());
+    }
+
+    #[test]
+    fn ars_signal_hint_priors_blend_is_scoped_by_adoption_weight() {
+        let baseline = crate::store::adaptive::UsefulRateWeights::synthesis_bootstrap();
+        let priors = crate::ops::judge_calibration::BootstrapPriors {
+            w_view: baseline.view + 1.0,
+            w_click: baseline.click + 1.0,
+            w_thumb: baseline.thumb + 1.0,
+            w_req: baseline.requery + 1.0,
+            ..crate::ops::judge_calibration::BootstrapPriors::const_defaults()
+        };
+
+        assert_eq!(
+            useful_rate_weights_from_signal_hint_priors(baseline, &priors, 0.0),
+            baseline
+        );
+
+        let blended = useful_rate_weights_from_signal_hint_priors(baseline, &priors, 0.5);
+        assert!((blended.view - (baseline.view + 0.5)).abs() < 1e-12);
+        assert!((blended.click - (baseline.click + 0.5)).abs() < 1e-12);
+        assert!((blended.thumb - (baseline.thumb + 0.5)).abs() < 1e-12);
+        assert!((blended.requery - (baseline.requery + 0.5)).abs() < 1e-12);
+    }
+
+    #[test]
     fn ars_parameter_policy_refresh_records_shadow_for_shadow_only_config() {
         let conn = metadata_conn();
         let mut config = ReinConfig::default();
@@ -4715,14 +4989,15 @@ mod tests {
     }
 
     #[test]
-    fn shadow_fusion_status_is_default_off() {
+    fn shadow_fusion_status_is_default_on_but_waits_for_samples() {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
 
         let status = shadow_fusion_status(&store, &config);
 
-        assert_eq!(status["enabled"].as_bool(), Some(false));
-        assert_eq!(status["status"].as_str(), Some("disabled"));
+        assert_eq!(status["enabled"].as_bool(), Some(true));
+        assert_eq!(status["shadow_only"].as_bool(), Some(false));
+        assert_eq!(status["status"].as_str(), Some("insufficient_samples"));
         assert_eq!(status["global"], serde_json::Value::Null);
     }
 

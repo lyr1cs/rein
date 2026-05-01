@@ -19,6 +19,7 @@ pub mod llm_judge_worker;
 pub mod recall_synthesis;
 pub mod resummerize;
 pub mod system_health;
+pub mod trust_measurement;
 
 // v0.21 A1 unified-ops infrastructure. Handlers populated incrementally.
 pub mod error;
@@ -2509,13 +2510,13 @@ mod tests {
         let acceleration = value
             .get("ars_acceleration")
             .expect("adaptive_status() output must include `ars_acceleration` key");
-        assert_eq!(acceleration["enabled"].as_bool(), Some(false));
-        assert_eq!(acceleration["shadow_only"].as_bool(), Some(true));
+        assert_eq!(acceleration["enabled"].as_bool(), Some(true));
+        assert_eq!(acceleration["shadow_only"].as_bool(), Some(false));
         let shadow = acceleration
             .get("shadow_fusion_replay")
             .expect("ars_acceleration must include `shadow_fusion_replay`");
-        assert_eq!(shadow["enabled"].as_bool(), Some(false));
-        assert_eq!(shadow["status"].as_str(), Some("disabled"));
+        assert_eq!(shadow["enabled"].as_bool(), Some(true));
+        assert_eq!(shadow["status"].as_str(), Some("insufficient_samples"));
         assert!(shadow["global"].is_null());
     }
 }
