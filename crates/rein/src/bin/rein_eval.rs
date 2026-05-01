@@ -3526,17 +3526,20 @@ mod tests {
             assert!(o.treatment_summary.is_none());
         }
         // Surface a soft signal if every keyword set produces the same
-        // verdict — that's authoring drift, not a hard failure.
+        // verdict. The configured checker may be stem-only in CI (no
+        // embedding API key), while local runs may enable semantic fallback,
+        // so this must not be a hard test failure.
         let unanimous = sc
             .outcomes
             .windows(2)
             .all(|w| w[0].baseline_hit == w[1].baseline_hit);
-        assert!(
-            !unanimous,
-            "baseline_hit is uniform across {} fixtures — keywords likely don't \
-             discriminate against the topic+summary surface (authoring drift)",
-            sc.outcomes.len()
-        );
+        if unanimous {
+            eprintln!(
+                "baseline_hit is uniform across {} fixtures — keywords may not \
+                 discriminate against the topic+summary surface under the current checker",
+                sc.outcomes.len()
+            );
+        }
         let _ = fs::remove_file(&out_path);
     }
 }
