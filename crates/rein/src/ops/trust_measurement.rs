@@ -196,6 +196,10 @@ mod tests {
         let db_path = dir.path().join("memories.db");
         let mut config = ReinConfig::default();
         config.database.path = db_path.to_string_lossy().into_owned();
+        // v0.28.7 H0 — defaults reverted to `false`. Explicit opt-in here so the
+        // test still exercises the "report mirrors enabled-state" path.
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.nightly_cron.enabled = true;
         let store = SqliteStore::new(&db_path, "text-embedding-3-small", 3072).unwrap();
 
         let report = collect(&store, &config);

@@ -95,10 +95,15 @@ enabled = true
 shadow_only = false
 
 [ars.llm_judge]
-enabled = true
+# enabled defaults to false per v0.28 charter ("Do not make LLM judge
+# default-on") — uncomment + set true to opt in (incurs LLM API spend
+# against the shared judge_call_ledger.daily_call_cap).
+# enabled = true
 
 [ars.llm_judge.nightly_cron]
-enabled = true
+# enabled defaults to false — Layer 2 calibration cron shares the same
+# ledger as the runtime judge above; uncomment + set true to opt in.
+# enabled = true
 
 [extract]
 provider = "google"

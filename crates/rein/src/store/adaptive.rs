@@ -2939,7 +2939,19 @@ pub const CONCEPT_SUMMARY_PER_ID_CAP: usize = 1024;
 /// round 2 F-11). Once the cap is reached new buckets are dropped (the
 /// events still increment `total_events`), so legitimate buckets don't
 /// compete for capacity once the system has converged on real cluster ids.
+///
+/// **v0.28 H3 fix:** the cap budget counts only non-shadow (production)
+/// buckets. Shadow `route_context` buckets are bounded separately by
+/// [`CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP`] so a flood of shadow inserts
+/// can never evict a real production bucket.
 pub const CONCEPT_SUMMARY_BY_CLUSTER_CAP: usize = 4096;
+
+/// v0.28 H3 — separate budget for shadow (`route_context`-derived)
+/// buckets. Evicting only inside the shadow class on shadow-insert
+/// pressure means production buckets are sealed against shadow flooding.
+/// Mirrors the production cap so a vault that emits one shadow per
+/// production event has comparable headroom on each side.
+pub const CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP: usize = 4096;
 
 /// Whitelist of `query_type` values rein can legitimately emit (mirrors
 /// `SYNTHESIS_ALLOWED_QUERY_TYPES`). Any client-supplied value outside
@@ -3029,6 +3041,18 @@ pub struct ClusterConceptSummaryStats {
     /// event are the natural eviction candidates once the cap is hit.
     #[serde(default)]
     pub last_event_id: i64,
+    /// v0.28 H3 — shadow flag. `true` only when every event ever folded
+    /// into this bucket has been a `route_context`-derived shadow write.
+    /// Once any production (primary `(cluster_id, query_type)`) event
+    /// lands on the same key the flag flips to `false` permanently
+    /// (monotonic AND across writes; see
+    /// [`fold_concept_summary_interaction_bucket`]). Default-`false` on
+    /// legacy snapshots is conservative: untagged buckets count against
+    /// the production cap budget, never the shadow cap. Used by
+    /// [`evict_concept_summary_lru_if_at_cap`] to seal production
+    /// capacity against shadow-bucket flooding (audit H3 fix).
+    #[serde(default)]
+    pub is_shadow: bool,
 }
 
 /// v0.27 ARS Cap A: per-concept_id stats with bounded LRU semantics.
@@ -3098,20 +3122,79 @@ pub struct ConceptSummaryFeedbackState {
 fn evict_concept_summary_lru_if_at_cap(
     by_cluster: &mut HashMap<String, ClusterConceptSummaryStats>,
     new_key: &str,
+    new_is_shadow: bool,
 ) {
-    if by_cluster.contains_key(new_key) || by_cluster.len() < CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+    // v0.28.7 audit R1 P2 #2 — detect shadow→production *promotion*: an
+    // existing shadow bucket whose next write is production. The bucket
+    // currently counts toward shadow but will count toward production after
+    // the fold. Treat as a production insert for cap purposes (excluding the
+    // promoting bucket from any candidate-victim list).
+    let promotion = by_cluster
+        .get(new_key)
+        .is_some_and(|b| b.is_shadow && !new_is_shadow);
+
+    // Same-class re-write of an existing key has no cap impact.
+    if by_cluster.contains_key(new_key) && !promotion {
         return;
     }
-    let victim_key = by_cluster
+    if new_is_shadow {
+        // Shadow insert: bounded by SHADOW_CAP over the shadow subset;
+        // never evicts a production bucket. (Promotion never enters this
+        // arm because `new_is_shadow == false` for promotions.)
+        let shadow_count = by_cluster.iter().filter(|(_, b)| b.is_shadow).count();
+        if shadow_count < CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP {
+            return;
+        }
+        let victim_key = by_cluster
+            .iter()
+            .filter(|(_, b)| b.is_shadow)
+            .min_by_key(|(_, b)| b.last_event_id)
+            .map(|(k, _)| k.clone());
+        if let Some(victim) = victim_key {
+            tracing::warn!(
+                evicted_bucket = %victim,
+                new_bucket = %new_key,
+                cap = CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP,
+                kind = "shadow",
+                "concept_summary_feedback: by_cluster shadow cap reached; evicting LRU shadow bucket"
+            );
+            by_cluster.remove(&victim);
+        }
+        return;
+    }
+    // Production path covers both fresh production inserts AND
+    // shadow→production promotions. Threshold is over the non-shadow
+    // subset; cap is bounded by CONCEPT_SUMMARY_BY_CLUSTER_CAP.
+    //
+    // v0.28.7 audit R1 P2 #1 — earlier code preferred to evict a shadow
+    // bucket here. That was wrong: shadow eviction does not free a
+    // production slot under separate caps, so the caller's subsequent
+    // production insert pushed `prod_count` to CAP + 1. Eviction must
+    // target the production subset directly.
+    let new_prod_after = if promotion {
+        // Existing key already in map; promotion flips its class but does
+        // NOT change `len()`. The post-fold non-shadow count equals the
+        // current non-shadow count + 1 (the bucket switches sides).
+        by_cluster.iter().filter(|(_, b)| !b.is_shadow).count() + 1
+    } else {
+        // New key; counted as +1 in the non-shadow subset after insertion.
+        by_cluster.iter().filter(|(_, b)| !b.is_shadow).count() + 1
+    };
+    if new_prod_after <= CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+        return;
+    }
+    let prod_victim = by_cluster
         .iter()
+        .filter(|(k, b)| !b.is_shadow && k.as_str() != new_key)
         .min_by_key(|(_, b)| b.last_event_id)
         .map(|(k, _)| k.clone());
-    if let Some(victim) = victim_key {
+    if let Some(victim) = prod_victim {
         tracing::warn!(
             evicted_bucket = %victim,
             new_bucket = %new_key,
             cap = CONCEPT_SUMMARY_BY_CLUSTER_CAP,
-            "concept_summary_feedback: by_cluster cap reached; evicting LRU bucket"
+            kind = if promotion { "production_promotion" } else { "production" },
+            "concept_summary_feedback: production cap reached; evicting LRU production bucket"
         );
         by_cluster.remove(&victim);
     }
@@ -3125,11 +3208,26 @@ fn normalize_concept_summary_query_type(raw_qtype: &str) -> String {
     }
 }
 
-fn concept_summary_bucket_keys_from_metadata(metadata: &ConceptSummaryMetadata) -> Vec<String> {
+/// Returns `(bucket_key, is_shadow)` pairs derived from event metadata.
+///
+/// The first entry is always the primary `(metadata.cluster_id,
+/// metadata.query_type)` bucket — `is_shadow = false` (production).
+/// When `metadata.route_context` is present and resolves to a distinct
+/// `(cluster_id, query_type)` pair, a second `is_shadow = true` entry
+/// is appended.
+///
+/// **v0.28 H3:** the shadow flag is what
+/// [`evict_concept_summary_lru_if_at_cap`] uses to keep shadow inserts
+/// from evicting production buckets. Production and shadow buckets
+/// share the same `state.by_cluster` HashMap but compete over disjoint
+/// cap budgets.
+fn concept_summary_bucket_keys_from_metadata(
+    metadata: &ConceptSummaryMetadata,
+) -> Vec<(String, bool)> {
     let primary_query_type =
         normalize_concept_summary_query_type(metadata.query_type.as_deref().unwrap_or(""));
     let primary = concept_summary_bucket_key(metadata.cluster_id, &primary_query_type);
-    let mut keys = vec![primary.clone()];
+    let mut keys = vec![(primary.clone(), false)];
 
     if let Some(route) = metadata.route_context.as_ref() {
         if route.query_type.is_some() || route.cluster_id.is_some() {
@@ -3137,7 +3235,7 @@ fn concept_summary_bucket_keys_from_metadata(metadata: &ConceptSummaryMetadata) 
                 normalize_concept_summary_query_type(route.query_type.as_deref().unwrap_or(""));
             let route_key = concept_summary_bucket_key(route.cluster_id, &route_query_type);
             if route_key != primary {
-                keys.push(route_key);
+                keys.push((route_key, true));
             }
         }
     }
@@ -3148,12 +3246,25 @@ fn concept_summary_bucket_keys_from_metadata(metadata: &ConceptSummaryMetadata) 
 fn fold_concept_summary_interaction_bucket(
     state: &mut ConceptSummaryFeedbackState,
     bucket_key: &str,
+    is_shadow: bool,
     interaction: &ConceptSummaryInteractionKind,
     event_id: i64,
 ) {
-    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, bucket_key);
+    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, bucket_key, is_shadow);
 
+    let new_entry = !state.by_cluster.contains_key(bucket_key);
     let bucket = state.by_cluster.entry(bucket_key.to_string()).or_default();
+    // v0.28 H3 — monotonic AND on `is_shadow`. New buckets adopt the
+    // incoming flag; existing buckets stay shadow only if every prior
+    // and the current write are also shadow. Once any production event
+    // lands the bucket flips to production permanently, so a key cannot
+    // oscillate back into the shadow class and bypass the production
+    // cap.
+    if new_entry {
+        bucket.is_shadow = is_shadow;
+    } else {
+        bucket.is_shadow = bucket.is_shadow && is_shadow;
+    }
     bucket.last_event_id = bucket.last_event_id.max(event_id);
     match interaction {
         ConceptSummaryInteractionKind::Viewed { dwell_ms } => {
@@ -3338,10 +3449,11 @@ pub fn recompute_concept_summary_feedback_stats(
         };
 
         let metadata = payload.metadata.clone().unwrap_or_default();
-        for bucket_key in concept_summary_bucket_keys_from_metadata(&metadata) {
+        for (bucket_key, is_shadow) in concept_summary_bucket_keys_from_metadata(&metadata) {
             fold_concept_summary_interaction_bucket(
                 &mut state,
                 &bucket_key,
+                is_shadow,
                 &payload.interaction,
                 ev.id,
             );
@@ -3611,8 +3723,14 @@ fn fold_concept_summary_interaction(
     event_id: i64,
 ) {
     let metadata = payload.metadata.clone().unwrap_or_default();
-    for bucket_key in concept_summary_bucket_keys_from_metadata(&metadata) {
-        fold_concept_summary_interaction_bucket(state, &bucket_key, &payload.interaction, event_id);
+    for (bucket_key, is_shadow) in concept_summary_bucket_keys_from_metadata(&metadata) {
+        fold_concept_summary_interaction_bucket(
+            state,
+            &bucket_key,
+            is_shadow,
+            &payload.interaction,
+            event_id,
+        );
         touched_buckets.insert(bucket_key);
     }
 
@@ -3708,9 +3826,16 @@ fn fold_concept_summary_llm_judge(
     let bucket_key = concept_summary_bucket_key(cluster_id, &query_type);
 
     // v0.27.5 R2 — LRU eviction at cap (replaces v0.27.4 drop-new-bucket).
-    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key);
+    // v0.28 H3 — judge writes are always production (no route_context
+    // shadow path); pass `is_shadow = false` to the cap predicate.
+    evict_concept_summary_lru_if_at_cap(&mut state.by_cluster, &bucket_key, false);
 
     let bucket = state.by_cluster.entry(bucket_key.clone()).or_default();
+    // v0.28 H3 — judge writes are always production. New buckets start
+    // `is_shadow = false`; existing shadow-only buckets get downgraded to
+    // production unconditionally (the cap predicate above already counts this
+    // bucket against the production budget).
+    bucket.is_shadow = false;
     bucket.last_event_id = bucket.last_event_id.max(event_id);
     bucket.llm_judge_count = bucket.llm_judge_count.saturating_add(1);
     if payload.hit {
@@ -7035,6 +7160,112 @@ mod tests {
                 "evicted key {evicted} must be gone from order vec"
             );
         }
+    }
+
+    // v0.28.7 audit R1 P2 #1 — production cap MUST be enforced over the
+    // non-shadow subset; evicting a shadow bucket does not free a production
+    // slot under separate caps. After a production insert at cap, the
+    // post-insert non-shadow count must remain ≤ CONCEPT_SUMMARY_BY_CLUSTER_CAP.
+    #[test]
+    fn evict_concept_summary_lru_admits_production_at_cap_by_evicting_production() {
+        let mut by_cluster: HashMap<String, ClusterConceptSummaryStats> = HashMap::new();
+        // Fill production cap with non-shadow buckets.
+        for i in 0..CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+            by_cluster.insert(
+                format!("prod-{i}"),
+                ClusterConceptSummaryStats {
+                    last_event_id: i as i64 + 1,
+                    is_shadow: false,
+                    ..Default::default()
+                },
+            );
+        }
+        // Add one shadow bucket — irrelevant to production cap accounting.
+        by_cluster.insert(
+            "shadow-x".to_string(),
+            ClusterConceptSummaryStats {
+                last_event_id: 0,
+                is_shadow: true,
+                ..Default::default()
+            },
+        );
+        // Insert a new production bucket at cap. Must evict a production
+        // bucket (not the shadow), keeping `prod_count <= CAP` post-insert.
+        evict_concept_summary_lru_if_at_cap(&mut by_cluster, "prod-new", false);
+        by_cluster.insert(
+            "prod-new".to_string(),
+            ClusterConceptSummaryStats {
+                last_event_id: 99_999,
+                is_shadow: false,
+                ..Default::default()
+            },
+        );
+        let prod_count = by_cluster.iter().filter(|(_, b)| !b.is_shadow).count();
+        assert_eq!(
+            prod_count, CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+            "production cap must hold after insert at cap"
+        );
+        assert!(
+            by_cluster.contains_key("shadow-x"),
+            "shadow bucket must NOT be evicted to admit a production insert (separate caps)"
+        );
+        // The evicted production bucket must be the LRU (smallest last_event_id),
+        // which is "prod-0" (last_event_id = 1).
+        assert!(
+            !by_cluster.contains_key("prod-0"),
+            "LRU production bucket (prod-0) must be evicted"
+        );
+    }
+
+    // v0.28.7 audit R1 P2 #2 — shadow→production promotion: when an existing
+    // shadow bucket flips to production while production is at cap, the
+    // promotion must trigger a production eviction. Otherwise the bucket
+    // class flip silently overshoots the cap.
+    #[test]
+    fn evict_concept_summary_lru_handles_shadow_to_production_promotion() {
+        let mut by_cluster: HashMap<String, ClusterConceptSummaryStats> = HashMap::new();
+        // Fill production cap with non-shadow buckets.
+        for i in 0..CONCEPT_SUMMARY_BY_CLUSTER_CAP {
+            by_cluster.insert(
+                format!("prod-{i}"),
+                ClusterConceptSummaryStats {
+                    last_event_id: i as i64 + 1,
+                    is_shadow: false,
+                    ..Default::default()
+                },
+            );
+        }
+        // A pre-existing shadow bucket sharing a key that will receive a
+        // production event next.
+        by_cluster.insert(
+            "promote-me".to_string(),
+            ClusterConceptSummaryStats {
+                last_event_id: 50,
+                is_shadow: true,
+                ..Default::default()
+            },
+        );
+        // Promotion: same key, but the new event is production.
+        evict_concept_summary_lru_if_at_cap(&mut by_cluster, "promote-me", false);
+        // Caller would now flip is_shadow on the existing entry.
+        if let Some(b) = by_cluster.get_mut("promote-me") {
+            b.is_shadow = false;
+        }
+        let prod_count = by_cluster.iter().filter(|(_, b)| !b.is_shadow).count();
+        assert_eq!(
+            prod_count, CONCEPT_SUMMARY_BY_CLUSTER_CAP,
+            "production cap must hold after shadow→production promotion at cap"
+        );
+        assert!(
+            by_cluster.contains_key("promote-me"),
+            "promoted bucket must remain (it is the freshest, not the eviction victim)"
+        );
+        // The LRU production bucket (prod-0) must be evicted, not the bucket
+        // being promoted.
+        assert!(
+            !by_cluster.contains_key("prod-0"),
+            "LRU production bucket (prod-0) must be evicted in favor of the promotion"
+        );
     }
 
     #[test]

@@ -426,9 +426,12 @@ impl Default for ArsAccelerationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsLlmJudgeConfig {
-    /// Master feature flag. Default `true`; provider resolution, sample rates,
-    /// daily caps, and policy gates still prevent unbounded judge traffic.
-    #[serde(default = "default_true")]
+    /// Master feature flag. Default `false` per the v0.28 charter
+    /// non-goal "Do not make LLM judge default-on" — operators must
+    /// explicitly opt in (incurs LLM API spend). Provider resolution,
+    /// sample rates, daily caps, and policy gates kick in only after
+    /// this flag is set.
+    #[serde(default)]
     pub enabled: bool,
     /// Judge Cap B (synthesis) outputs. Default `true` once master is on.
     #[serde(default = "default_true")]
@@ -483,9 +486,11 @@ pub struct ArsLlmJudgeConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArsLlmJudgeNightlyCronConfig {
-    /// Master cron flag. Default `true` (gated separately from
-    /// `[ars.llm_judge].enabled`).
-    #[serde(default = "default_true")]
+    /// Master cron flag. Default `false` per the v0.28 charter
+    /// non-goal — gated separately from `[ars.llm_judge].enabled`
+    /// but defaults off for the same reason (shared daily-call ledger,
+    /// LLM API spend).
+    #[serde(default)]
     pub enabled: bool,
     /// Fraction of the last 24h synthesis events to re-judge. Default
     /// 0.2 (20%).
@@ -496,7 +501,7 @@ pub struct ArsLlmJudgeNightlyCronConfig {
 impl Default for ArsLlmJudgeNightlyCronConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             sample_rate: default_judge_cron_sample_rate(),
         }
     }
@@ -533,7 +538,7 @@ fn default_judge_cron_sample_rate() -> f64 {
 impl Default for ArsLlmJudgeConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             synthesis_enabled: true,
             concept_summary_enabled: true,
             recall_ranking_enabled: false,
@@ -544,10 +549,7 @@ impl Default for ArsLlmJudgeConfig {
             weight_decay_rate: default_judge_weight_decay_rate(),
             daily_call_cap: default_judge_daily_call_cap(),
             cache_ttl_secs: default_judge_cache_ttl_secs(),
-            nightly_cron: ArsLlmJudgeNightlyCronConfig {
-                enabled: true,
-                ..ArsLlmJudgeNightlyCronConfig::default()
-            },
+            nightly_cron: ArsLlmJudgeNightlyCronConfig::default(),
         }
     }
 }
@@ -2947,8 +2949,12 @@ mod tests {
         assert_eq!(cfg.async_memory.selection_limit, 2);
         assert!(cfg.ars.acceleration.enabled);
         assert!(!cfg.ars.acceleration.shadow_only);
-        assert!(cfg.ars.llm_judge.enabled);
-        assert!(cfg.ars.llm_judge.nightly_cron.enabled);
+        // H0 (v0.28 audit): LLM judge defaults reverted to false in v0.28.7;
+        // operators must explicitly opt in. See
+        // `test_default_ars_llm_judge_disabled` for the dedicated regression
+        // guard.
+        assert!(!cfg.ars.llm_judge.enabled);
+        assert!(!cfg.ars.llm_judge.nightly_cron.enabled);
     }
 
     #[test]
@@ -2974,7 +2980,9 @@ max_additional_context_chars = 1024
         assert_eq!(cfg.embedding.dimensions, 3072);
         assert!(!cfg.server.compact);
         assert_eq!(cfg.database.path, "auto");
-        assert!(cfg.ars.llm_judge.nightly_cron.enabled);
+        // H0 (v0.28 audit): nightly_cron defaults to false; the user TOML
+        // here does not opt into it.
+        assert!(!cfg.ars.llm_judge.nightly_cron.enabled);
     }
 
     #[test]
@@ -3040,6 +3048,53 @@ shadow_only = false
 
         assert!(cfg.ars.acceleration.enabled);
         assert!(!cfg.ars.acceleration.shadow_only);
+    }
+
+    /// H0 regression guard (v0.28 audit): the master `[ars.llm_judge]`
+    /// feature flag must default to `false` per the v0.28 charter
+    /// non-goal "Do not make LLM judge default-on". A v0.28.6 regression
+    /// flipped both the Rust `Default` impl and the embedded `default.toml`
+    /// to `true`; this test pins the Rust-default side.
+    #[test]
+    fn test_default_ars_llm_judge_disabled() {
+        let cfg = ReinConfig::default();
+        assert!(
+            !cfg.ars.llm_judge.enabled,
+            "[ars.llm_judge].enabled must default to false (v0.28 charter non-goal)"
+        );
+    }
+
+    /// H0 regression guard: the Layer 2 nightly cron must also default
+    /// to `false` since it shares the same daily-call ledger and is
+    /// part of the same opt-in surface.
+    #[test]
+    fn test_default_ars_llm_judge_nightly_cron_disabled() {
+        let cfg = ReinConfig::default();
+        assert!(
+            !cfg.ars.llm_judge.nightly_cron.enabled,
+            "[ars.llm_judge.nightly_cron].enabled must default to false"
+        );
+    }
+
+    /// H0 regression guard: the embedded `config/default.toml` is the
+    /// foundation of `merge_toml`. Even if the Rust `Default` impl is
+    /// `false`, an `enabled = true` line in the embedded TOML would
+    /// override it for every operator who does not explicitly set the
+    /// field in their own `~/.rein/config.toml`. This test loads the
+    /// embedded TOML through the same path the binary uses (empty user
+    /// override) and asserts both gates remain off.
+    #[test]
+    fn test_embedded_default_toml_does_not_force_llm_judge_on() {
+        let cfg = ReinConfig::load_from_str("")
+            .expect("empty user TOML must load against embedded default.toml");
+        assert!(
+            !cfg.ars.llm_judge.enabled,
+            "embedded default.toml must not force [ars.llm_judge].enabled = true"
+        );
+        assert!(
+            !cfg.ars.llm_judge.nightly_cron.enabled,
+            "embedded default.toml must not force [ars.llm_judge.nightly_cron].enabled = true"
+        );
     }
 
     #[test]

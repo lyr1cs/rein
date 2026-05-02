@@ -776,6 +776,7 @@ pub fn effective_concept_summary_gate_parameters(
         calibration,
         runtime_adoption_weight,
         previous_cold_start,
+        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
     );
     let previous_threshold = adaptive_state.and_then(|state| {
         state.ars_effective_scalar(
@@ -809,6 +810,7 @@ pub fn effective_concept_summary_gate_parameters(
             calibration,
             runtime_adoption_weight,
             previous_threshold,
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
         );
     (cold_start_n, useful_rate_threshold)
 }
@@ -1049,6 +1051,7 @@ fn enqueue_judge_for_concept_summary(
         true,
         adaptive_state
             .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
+        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
     );
     let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
@@ -1057,6 +1060,7 @@ fn enqueue_judge_for_concept_summary(
         false,
         adaptive_state
             .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
+        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
     )
     .min(cold_rate);
     let rate = current_sample_rate_concept_summary_with_rates(

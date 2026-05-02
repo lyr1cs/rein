@@ -122,22 +122,60 @@ pub fn bootstrap_priors_from_corpus(config: &ReinConfig) -> ReinResult<Bootstrap
 /// fresh/migration-light connection and still receive constants. When enabled,
 /// a valid DB-scoped snapshot wins; otherwise this scans a bounded recent
 /// window for explicit `signal_hint` labels.
+///
+/// **v0.28.7 H1 BYPASS**: `signal_hint_for_synthesis_job`
+/// (`recall_synthesis.rs:996-1003`) and `signal_hint_for_concept_summary_job`
+/// (`concept_summary.rs:876-883`) currently emit hardcoded placeholder
+/// constants `(1.0, 1.5, 2.0, 1.5)` regardless of bucket statistics or the
+/// LLM judge verdict. v0.28 backlog Task 3
+/// (`docs/backlog/v0.28-ars-acceleration.md`) explicitly defers the real
+/// producer to v0.29 ("Keep producer wiring deferred"). Until v0.29 wires
+/// the producer, this consumer must NOT replay those placeholders into
+/// production via `runtime_adoption_weight` — doing so silently shifts
+/// `useful_rate_weights_from_signal_hint_priors` away from the operator-
+/// configured baseline as soon as the first runtime judge event lands.
+///
+/// We therefore short-circuit at the top with `BootstrapPriors::const_defaults()`.
+/// The body below is intentionally retained (and still type-checked) so that
+/// when v0.29 ships the real producer, removing the bypass re-enables the
+/// already-tested replay path — including the M-2 watermark-safe filter.
+///
+/// Audit reference: `source/rein/reviews/review-20260502-claude-v0.28-audit.md` (H1).
+#[allow(unused_variables)] // v0.28.7 H1 BYPASS — body is unreachable until v0.29.
 pub fn bootstrap_priors_from_replay(
     config: &ReinConfig,
     conn: &Connection,
 ) -> ReinResult<BootstrapPriors> {
-    if !config.ars.acceleration.enabled {
-        return Ok(BootstrapPriors::const_defaults());
+    // v0.28.7 H1 BYPASS — see doc-comment above. Remove this short-circuit
+    // (and the `#[allow(unreachable_code)]` below) once v0.29 wires
+    // `signal_hint_for_*_job` to derive `inferred_w_*` from judge verdicts.
+    return Ok(BootstrapPriors::const_defaults());
+
+    #[allow(unreachable_code)]
+    {
+        if !config.ars.acceleration.enabled {
+            return Ok(BootstrapPriors::const_defaults());
+        }
+        if let Some(priors) = load_bootstrap_priors_snapshot(config) {
+            return Ok(priors);
+        }
+        if !feedback_events_table_exists(conn) {
+            return Ok(BootstrapPriors::const_defaults());
+        }
+        // M-2: cutoff sourced from a deterministic event-id-bounded scan rather
+        // than `Utc::now() - 30d`. The wall-clock cutoff broke D3 replay-
+        // idempotence: re-running the pipeline at t1 and t2 over the SAME
+        // committed event range produced different `BootstrapPriors` because
+        // `now()` advanced between calls. The query is already bounded by
+        // `ORDER BY id DESC LIMIT 50_000`, which is a durable, monotonic
+        // watermark over the committed event log — so dropping the wall-clock
+        // filter is sufficient to make replay idempotent. v0.29 may reintroduce
+        // a watermark-based time cutoff once `AdaptiveState` exposes a durable
+        // pipeline timestamp (e.g. `last_pipeline_ts`).
+        let cutoff = 0_i64;
+        let hints = load_signal_hints_from_feedback_events(conn, cutoff, 50_000)?;
+        Ok(derive_priors_from_signal_hints(&hints))
     }
-    if let Some(priors) = load_bootstrap_priors_snapshot(config) {
-        return Ok(priors);
-    }
-    if !feedback_events_table_exists(conn) {
-        return Ok(BootstrapPriors::const_defaults());
-    }
-    let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
-    let hints = load_signal_hints_from_feedback_events(conn, cutoff, 50_000)?;
-    Ok(derive_priors_from_signal_hints(&hints))
 }
 
 fn feedback_events_table_exists(conn: &Connection) -> bool {
@@ -2082,7 +2120,12 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_from_replay_prefers_valid_snapshot() {
+    fn bootstrap_priors_from_replay_bypass_shadows_valid_snapshot() {
+        // v0.28.7 H1 BYPASS: even when a valid DB-scoped snapshot exists, the
+        // bypass short-circuits at the function entry and returns const_defaults.
+        // When v0.29 wires `signal_hint_for_*_job` to derive `inferred_w_*` from
+        // judge verdicts, this test should be re-enabled to assert the snapshot
+        // path (rename to `_prefers_valid_snapshot`).
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = crate::config::ReinConfig::default();
         config.ars.acceleration.enabled = true;
@@ -2104,9 +2147,10 @@ mod tests {
         .unwrap();
         let conn = Connection::open_in_memory().unwrap();
 
-        let priors = bootstrap_priors_from_replay(&config, &conn).expect("snapshot path");
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("bypass path");
 
-        assert_eq!(priors, snapshot);
+        assert_eq!(priors, BootstrapPriors::const_defaults());
+        assert_ne!(priors, snapshot, "bypass MUST shadow the snapshot");
     }
 
     #[test]
@@ -2125,7 +2169,23 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_priors_from_replay_derives_from_runtime_signal_hints() {
+    fn bootstrap_priors_from_replay_bypass_shadows_runtime_signal_hints() {
+        // v0.28.7 H1 BYPASS: even when runtime judge events with explicit
+        // signal_hint payloads are present, the bypass shadows the entire
+        // replay path. This is the behavior that prevents
+        // `signal_hint_for_*_job`'s placeholder constants `(1.0, 1.5, 2.0, 1.5)`
+        // from being ingested by `derive_priors_from_signal_hints` and blended
+        // into production via `runtime_adoption_weight`.
+        //
+        // Crucially: const_defaults has `prior_confidence == 0.0`, while the
+        // (now-unreachable) replay path would have produced
+        // `prior_confidence == 2.0` from the two emitted hints below. If a
+        // future change accidentally removes the bypass, `prior_confidence`
+        // is the field that catches it (the means happen to equal the
+        // const_defaults w_* by accident on this specific input set).
+        //
+        // When v0.29 wires the real producer, rename this back to
+        // `_derives_from_runtime_signal_hints` and assert the derived path.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = crate::config::ReinConfig::default();
         config.ars.acceleration.enabled = true;
@@ -2155,13 +2215,17 @@ mod tests {
             },
         );
 
-        let priors = bootstrap_priors_from_replay(&config, &conn).expect("replay path");
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("bypass path");
 
-        assert!((priors.w_view - 1.0).abs() < f64::EPSILON);
-        assert!((priors.w_click - 1.5).abs() < f64::EPSILON);
-        assert!((priors.w_thumb - 2.0).abs() < f64::EPSILON);
-        assert!((priors.w_req - 1.5).abs() < f64::EPSILON);
-        assert_eq!(priors.prior_confidence, 2.0);
+        assert_eq!(
+            priors,
+            BootstrapPriors::const_defaults(),
+            "bypass MUST shadow runtime signal_hint events while producer is deferred"
+        );
+        assert_eq!(
+            priors.prior_confidence, 0.0,
+            "const_defaults prior_confidence is 0.0; replay would have written 2.0"
+        );
     }
 
     #[test]
@@ -2703,5 +2767,129 @@ mod tests {
             run_judge_calibration_cron(&store, &config).expect("empty archive must succeed");
         assert_eq!(report.considered, 0);
         assert_eq!(report.emitted, 0);
+    }
+
+    // ── v0.28.7 H1 + M-2 audit regression tests ─────────────────────────────
+
+    /// H1 — While `signal_hint_for_synthesis_job`
+    /// (`recall_synthesis.rs:996-1003`) and `signal_hint_for_concept_summary_job`
+    /// (`concept_summary.rs:876-883`) emit the placeholder constants
+    /// `(1.0, 1.5, 2.0, 1.5)` regardless of judge verdict or bucket statistics,
+    /// `bootstrap_priors_from_replay` must NOT consume them. This pins the
+    /// bypass: any input (including a corpus full of placeholder hints) must
+    /// land on `const_defaults`. When v0.29 ships the real producer and removes
+    /// the bypass, this test should be removed (or converted to assert the
+    /// producer-derived values).
+    ///
+    /// Audit: `source/rein/reviews/review-20260502-claude-v0.28-audit.md` (H1).
+    #[test]
+    fn bootstrap_priors_from_replay_bypasses_until_producer_ships() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.hooks.buffer_dir = tmp.path().join("buffers").display().to_string();
+        config.database.path = tmp.path().join("memories.db").display().to_string();
+        let conn = setup_db();
+
+        // Emit the exact placeholder constants the v0.28 producer hardcodes.
+        // Tests at recall_synthesis.rs:2784-2787 and concept_summary.rs:1785-1788
+        // lock these in; mirroring them here makes the regression intent
+        // explicit so a future producer-side change is easy to cross-check.
+        let placeholder = SignalHint {
+            inferred_w_view: Some(1.0),
+            inferred_w_click: Some(1.5),
+            inferred_w_thumb: Some(2.0),
+            inferred_w_req: Some(1.5),
+            useful_rate_ci_width: Some(0.5),
+        };
+        emit_runtime_synth_with_hint(&conn, "synth-placeholder", placeholder.clone());
+        emit_runtime_concept_with_hint(&conn, "summary-placeholder", placeholder);
+
+        let priors = bootstrap_priors_from_replay(&config, &conn).expect("bypass must not error");
+
+        let defaults = BootstrapPriors::const_defaults();
+        assert_eq!(priors.w_view, defaults.w_view);
+        assert_eq!(priors.w_click, defaults.w_click);
+        assert_eq!(priors.w_thumb, defaults.w_thumb);
+        assert_eq!(priors.w_req, defaults.w_req);
+        assert_eq!(
+            priors.prior_confidence, defaults.prior_confidence,
+            "const_defaults has prior_confidence=0.0; replay would write a positive value — \
+             this field is the load-bearing assertion that the bypass is active"
+        );
+        assert_eq!(priors, defaults);
+    }
+
+    /// M-2 — Re-running over the same committed event range must produce the
+    /// same `BootstrapPriors`. The pre-fix `Utc::now() - 30d` cutoff broke this
+    /// because the wall-clock advanced between calls, while the
+    /// `LIMIT 50_000 ORDER BY id DESC` window stayed the same.
+    ///
+    /// While the v0.28.7 H1 bypass is active, the top-level
+    /// `bootstrap_priors_from_replay` is trivially idempotent via const_defaults.
+    /// This test additionally exercises the helpers
+    /// (`load_signal_hints_from_feedback_events` +
+    /// `derive_priors_from_signal_hints`) that v0.29 will reactivate, so the
+    /// idempotence guarantee survives the bypass removal without an additional
+    /// test edit.
+    ///
+    /// Audit: `source/rein/reviews/review-20260502-claude-v0.28-audit.md` (M-2).
+    #[test]
+    fn bootstrap_priors_from_replay_is_idempotent_across_pipeline_reruns() {
+        let conn = setup_db();
+        emit_runtime_synth_with_hint(
+            &conn,
+            "synth-idem-1",
+            SignalHint {
+                inferred_w_view: Some(1.2),
+                inferred_w_click: Some(1.8),
+                inferred_w_thumb: Some(2.4),
+                inferred_w_req: Some(1.0),
+                useful_rate_ci_width: Some(0.25),
+            },
+        );
+        emit_runtime_concept_with_hint(
+            &conn,
+            "summary-idem-1",
+            SignalHint {
+                inferred_w_view: Some(0.8),
+                inferred_w_click: Some(1.2),
+                inferred_w_thumb: Some(1.6),
+                inferred_w_req: Some(2.0),
+                useful_rate_ci_width: Some(0.75),
+            },
+        );
+
+        // Helpers that v0.29 will reactivate. Two separate calls with a sleep
+        // between them — wall-clock advances, but the committed event range
+        // does not. The pre-fix `Utc::now() - 30d` cutoff would still pass this
+        // assertion (50 ms is well inside the 30-day window), so the load
+        // helper alone does not bite the bug. The next assertion (over
+        // `bootstrap_priors_from_replay` itself) is what locks the M-2 fix.
+        let hints_1 = load_signal_hints_from_feedback_events(&conn, 0, 50_000).expect("load t1");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let hints_2 = load_signal_hints_from_feedback_events(&conn, 0, 50_000).expect("load t2");
+        assert_eq!(
+            hints_1, hints_2,
+            "identical event range + cutoff=0 must produce identical hints"
+        );
+
+        let priors_1 = derive_priors_from_signal_hints(&hints_1);
+        let priors_2 = derive_priors_from_signal_hints(&hints_2);
+        assert_eq!(
+            priors_1, priors_2,
+            "identical hints must derive identical priors"
+        );
+
+        // `bootstrap_priors_from_replay` itself: idempotent under the bypass
+        // (returns const_defaults). After v0.29 removes the bypass, this same
+        // assertion exercises the M-2 watermark-safe scan: cutoff=0 is durable
+        // and event-id ordering is monotonic, so the assertion still bites.
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        let p1 = bootstrap_priors_from_replay(&config, &conn).expect("replay t1");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let p2 = bootstrap_priors_from_replay(&config, &conn).expect("replay t2");
+        assert_eq!(p1, p2);
     }
 }

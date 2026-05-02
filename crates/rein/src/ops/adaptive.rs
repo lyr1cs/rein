@@ -20,12 +20,14 @@ fn persist_ars_effective_scalars(
 ) {
     let calibration_snapshot = state.judge_calibration_state.clone();
     let calibration = calibration_snapshot.as_ref();
-    let drift_alert = calibration
-        .map(|cal| {
-            cal.judge_drift_alert > 0
-                || cal.judge_drift_alert_synthesis > 0
-                || cal.judge_drift_alert_concept > 0
-        })
+    // v0.28.7 M-1 — split global drift_alert into per-surface flags so a
+    // synthesis-only drift burst does not zero concept-summary's threshold
+    // (and vice versa). Cross-surface judge_drift_alert still kills both.
+    let synthesis_drift_alert = calibration
+        .map(|cal| cal.judge_drift_alert > 0 || cal.judge_drift_alert_synthesis > 0)
+        .unwrap_or(false);
+    let concept_drift_alert = calibration
+        .map(|cal| cal.judge_drift_alert > 0 || cal.judge_drift_alert_concept > 0)
         .unwrap_or(false);
     let prior_count = if priors.prior_confidence.is_finite() && priors.prior_confidence > 0.0 {
         priors.prior_confidence.round() as u64
@@ -38,6 +40,7 @@ fn persist_ars_effective_scalars(
         calibration,
         synthesis_gate_adoption_weight,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
     );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N,
@@ -49,18 +52,28 @@ fn persist_ars_effective_scalars(
         calibration,
         concept_summary_gate_adoption_weight,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N),
+        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
     );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N,
         concept_cold_start as f64,
     );
 
+    // v0.28.7 M-1 — judge_sample_rate scalars are persisted per cold/warm
+    // ladder, but the underlying surface contributing drift signal differs:
+    // both synthesis and concept-summary funnel into the same global ladder
+    // here. We compute against `JudgeSurface::Synthesis` for consistency
+    // with the historical behavior; consumer call sites in
+    // ops/recall_synthesis.rs and ops/concept_summary.rs do their own
+    // per-surface lookup (see those files) and will not silently zero
+    // each other.
     let judge_sample_rate_cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
         judge_sample_rate_adoption_weight,
         true,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
     );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
@@ -73,6 +86,7 @@ fn persist_ars_effective_scalars(
         judge_sample_rate_adoption_weight,
         false,
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
     )
     .min(judge_sample_rate_cold);
     state.set_ars_effective_scalar(
@@ -89,7 +103,7 @@ fn persist_ars_effective_scalars(
         llm_reliability: 0.0,
         calibration: 1.0,
         stability: 1.0,
-        drift_alert,
+        drift_alert: synthesis_drift_alert,
         prior_strength: 20.0,
         max_trust: 0.50,
     };
@@ -110,6 +124,7 @@ fn persist_ars_effective_scalars(
     let concept_threshold_inputs = crate::ops::ars_tuning::TrustInputs {
         production_canary: concept_summary_gate_adoption_weight > f64::EPSILON,
         runtime_adoption_weight: concept_summary_gate_adoption_weight,
+        drift_alert: concept_drift_alert,
         ..threshold_inputs
     };
     let concept_threshold = crate::ops::ars_tuning::effective_scalar(
@@ -138,6 +153,17 @@ fn useful_rate_weights_from_signal_hint_priors(
         0.0
     };
     if adoption_weight <= f64::EPSILON {
+        return baseline;
+    }
+    // v0.28.7 audit R2 P2 — refuse to blend when the priors carry no
+    // pseudo-observation count. `BootstrapPriors::const_defaults()`
+    // (returned by the H1 bypass and on cold-start) sets
+    // `prior_confidence = 0.0` precisely to signal "no usable evidence."
+    // Without this guard, canary deployments with `signal_hint_priors`
+    // adoption > 0 would still shift live weights toward the
+    // const_defaults `(1.0, 1.5, 2.0, 1.5)`, which differ from the
+    // synthesis/concept baseline. Mirrors the adoption-weight guard above.
+    if priors.prior_confidence <= f64::EPSILON {
         return baseline;
     }
     let learned = crate::store::adaptive::UsefulRateWeights::from_priors(
@@ -323,6 +349,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
             state.judge_calibration_state.as_ref(),
             llm_feedback_decay_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
         );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
@@ -362,6 +389,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
             state.judge_calibration_state.as_ref(),
             llm_feedback_decay_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
         );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
@@ -400,9 +428,16 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         || drain_stats.errors > 0
         || drain_stats.malformed > 0
     {
+        // v0.28.7 M-9 — log per-reason drop counts so operators can spot
+        // cap-saturation, surface-disabled, contract, and LLM-error patterns.
         tracing::info!(
             emitted = drain_stats.emitted,
             dropped = drain_stats.dropped,
+            dropped_cap = drain_stats.dropped_cap,
+            dropped_disabled = drain_stats.dropped_disabled,
+            dropped_contract = drain_stats.dropped_contract,
+            dropped_llm_error = drain_stats.dropped_llm_error,
+            dropped_other = drain_stats.dropped_other,
             errors = drain_stats.errors,
             malformed = drain_stats.malformed,
             "judge drain pass"
@@ -584,6 +619,17 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     }
 }
 
+/// v0.28.7 — public wrapper used by `doctor::apply_local_fixes` to force a
+/// drift-triggered Canary→Shadow demotion. Internal callers continue to
+/// invoke the private `refresh_ars_parameter_policy` directly.
+pub(crate) fn refresh_ars_parameter_policy_for_doctor(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) {
+    refresh_ars_parameter_policy(conn, config, state);
+}
+
 fn refresh_ars_parameter_policy(
     conn: &rusqlite::Connection,
     config: &ReinConfig,
@@ -611,13 +657,29 @@ fn refresh_ars_parameter_policy(
         .learned_shadow_fusion
         .values()
         .any(|entry| entry.sample_count >= config.adaptive.min_samples_alpha);
-    let desired_mode = if !config.adaptive.enabled || !config.ars.acceleration.enabled {
+    // v0.28.7 H2 — drift alerts force Shadow demotion. Mirror of v0.27.1
+    // J-invariant fail-closed pattern: any drift signal (cross-surface or
+    // per-surface) demotes Canary back to Shadow so the bad parameter
+    // adoption is rolled back even if no operator intervenes.
+    let drift_active = state
+        .judge_calibration_state
+        .as_ref()
+        .map(|cal| {
+            cal.judge_drift_alert > 0
+                || cal.judge_drift_alert_synthesis > 0
+                || cal.judge_drift_alert_concept > 0
+        })
+        .unwrap_or(false);
+    let mut desired_mode = if !config.adaptive.enabled || !config.ars.acceleration.enabled {
         ArsParameterPolicyMode::Disabled
     } else if config.ars.acceleration.shadow_only || !eligible_shadow_fusion {
         ArsParameterPolicyMode::Shadow
     } else {
         ArsParameterPolicyMode::Canary
     };
+    if drift_active && matches!(desired_mode, ArsParameterPolicyMode::Canary) {
+        desired_mode = ArsParameterPolicyMode::Shadow;
+    }
     if matches!(loaded.status, ArsParameterPolicyLoadStatus::Missing)
         && matches!(desired_mode, ArsParameterPolicyMode::Disabled)
     {
@@ -626,6 +688,9 @@ fn refresh_ars_parameter_policy(
 
     let disabled_reason = match desired_mode {
         ArsParameterPolicyMode::Disabled => Some("adaptive or ars acceleration disabled".into()),
+        ArsParameterPolicyMode::Shadow if drift_active => {
+            Some("judge drift alert active — demoted from Canary".into())
+        }
         ArsParameterPolicyMode::Shadow if config.ars.acceleration.shadow_only => {
             Some("ars acceleration shadow_only=true".into())
         }
@@ -3509,6 +3574,10 @@ mod tests {
             w_click: baseline.click + 1.0,
             w_thumb: baseline.thumb + 1.0,
             w_req: baseline.requery + 1.0,
+            // v0.28.7 audit R2 P2 — explicit positive prior_confidence so the
+            // blend gate (which now also guards on confidence) lets the test
+            // exercise its original intent: adoption-weight-scoped blending.
+            prior_confidence: 50.0,
             ..crate::ops::judge_calibration::BootstrapPriors::const_defaults()
         };
 
@@ -3522,6 +3591,38 @@ mod tests {
         assert!((blended.click - (baseline.click + 0.5)).abs() < 1e-12);
         assert!((blended.thumb - (baseline.thumb + 0.5)).abs() < 1e-12);
         assert!((blended.requery - (baseline.requery + 0.5)).abs() < 1e-12);
+    }
+
+    // v0.28.7 audit R2 P2 — H1 bypass returns BootstrapPriors::const_defaults()
+    // with `prior_confidence = 0.0`. Even with positive adoption weight (canary
+    // mode), the consumer must NOT blend, otherwise the const_defaults
+    // `(1.0, 1.5, 2.0, 1.5)` shift live useful_rate weights away from the
+    // synthesis/concept baseline — exactly what the bypass is meant to prevent.
+    #[test]
+    fn ars_signal_hint_priors_bypass_does_not_shift_weights_at_zero_confidence() {
+        let baseline = crate::store::adaptive::UsefulRateWeights::synthesis_bootstrap();
+        let priors = crate::ops::judge_calibration::BootstrapPriors::const_defaults();
+        // const_defaults differs from synthesis baseline in click (Δ=1.0)
+        // and requery (Δ=0.5) axes; if the guard is missing, the assertion
+        // below would fail because the blend would shift live weights.
+        assert!((priors.w_click - baseline.click).abs() >= 1.0 - 1e-12);
+        assert!((priors.w_req - baseline.requery).abs() >= 0.5 - 1e-12);
+        assert_eq!(priors.prior_confidence, 0.0);
+
+        // Even at full canary weight (1.0), zero-confidence priors must not shift
+        // live weights.
+        let result = useful_rate_weights_from_signal_hint_priors(baseline, &priors, 1.0);
+        assert_eq!(
+            result, baseline,
+            "zero-confidence priors must leave baseline unchanged"
+        );
+
+        // Mid-weight too — guard is a hard floor, not a soft scaling.
+        let result_mid = useful_rate_weights_from_signal_hint_priors(baseline, &priors, 0.5);
+        assert_eq!(
+            result_mid, baseline,
+            "zero-confidence priors must leave baseline unchanged at mid weight"
+        );
     }
 
     #[test]
@@ -3540,6 +3641,122 @@ mod tests {
             crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow
         );
         assert!(!loaded.policy.allows_runtime_adoption(state.version));
+    }
+
+    #[test]
+    fn refresh_ars_parameter_policy_demotes_canary_on_drift_alert() {
+        // v0.28.7 H2 — cross-surface judge_drift_alert > 0 must force
+        // Canary → Shadow demotion and zero runtime_adoption_weight.
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_shadow_state();
+
+        // 1. Promote to Canary via a clean refresh.
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let promoted = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            promoted.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            "precondition: must reach Canary before drift fires"
+        );
+        assert!(promoted.runtime_adoption_weight > 0.0);
+
+        // 2. Stamp judge_drift_alert > 0.
+        let mut drifted_state = state.clone();
+        drifted_state.version += 1;
+        drifted_state.judge_calibration_state =
+            Some(crate::store::adaptive::JudgeCalibrationState {
+                judge_drift_alert: 1,
+                ..Default::default()
+            });
+
+        // 3. Refresh — drift signal must demote.
+        refresh_ars_parameter_policy(&conn, &config, &drifted_state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            loaded.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow,
+            "drift alert must demote Canary back to Shadow"
+        );
+        assert!(
+            loaded.runtime_adoption_weight.abs() < f64::EPSILON,
+            "runtime_adoption_weight must zero out under Shadow mode"
+        );
+        assert_eq!(
+            loaded.disabled_reason.as_deref(),
+            Some("judge drift alert active — demoted from Canary"),
+            "disabled_reason must surface drift demotion to operators"
+        );
+    }
+
+    #[test]
+    fn refresh_ars_parameter_policy_demotes_on_per_surface_drift() {
+        // v0.28.7 H2 — per-surface drift signals (synthesis or concept)
+        // also demote, even if cross-surface judge_drift_alert is 0.
+        let conn = metadata_conn();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_shadow_state();
+
+        // Promote to Canary first.
+        refresh_ars_parameter_policy(&conn, &config, &state);
+        let promoted = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            promoted.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+
+        // Synthesis-only drift.
+        let mut synth_drifted = state.clone();
+        synth_drifted.version += 1;
+        synth_drifted.judge_calibration_state =
+            Some(crate::store::adaptive::JudgeCalibrationState {
+                judge_drift_alert_synthesis: 1,
+                ..Default::default()
+            });
+        refresh_ars_parameter_policy(&conn, &config, &synth_drifted);
+        let after_synth = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            after_synth.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow,
+            "synthesis drift must demote Canary"
+        );
+        assert!(after_synth.runtime_adoption_weight.abs() < f64::EPSILON);
+
+        // Reset by clearing drift, then confirm we re-promote — guards
+        // against the demotion being one-way / sticky.
+        let clean_state = state.clone();
+        let mut bumped = clean_state;
+        bumped.version += 2;
+        refresh_ars_parameter_policy(&conn, &config, &bumped);
+        let recovered = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            recovered.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            "clearing drift must allow re-promotion to Canary"
+        );
+
+        // Concept-only drift.
+        let mut concept_drifted = state.clone();
+        concept_drifted.version += 3;
+        concept_drifted.judge_calibration_state =
+            Some(crate::store::adaptive::JudgeCalibrationState {
+                judge_drift_alert_concept: 1,
+                ..Default::default()
+            });
+        refresh_ars_parameter_policy(&conn, &config, &concept_drifted);
+        let after_concept = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            after_concept.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Shadow,
+            "concept drift must demote Canary"
+        );
     }
 
     fn test_memory(topic: &str, summary: &str, access_count: u32) -> Memory {

@@ -1652,6 +1652,44 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
         fixes.push(format!("triggered HNSW rebuild at {}", hnsw_path.display()));
     }
 
+    // v0.28.7 H2 — drift-triggered rollback. If the parameter policy is in
+    // Canary mode while `judge_calibration_state.judge_drift_alert*` is
+    // positive, force a refresh which (per the demote-on-drift logic in
+    // `ops/adaptive::refresh_ars_parameter_policy`) flips the policy back
+    // to Shadow and zeroes runtime_adoption_weight on the next pipeline
+    // tick. The refresh itself is idempotent and cheap.
+    if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
+        let drift_active = state
+            .judge_calibration_state
+            .as_ref()
+            .map(|cal| {
+                cal.judge_drift_alert > 0
+                    || cal.judge_drift_alert_synthesis > 0
+                    || cal.judge_drift_alert_concept > 0
+            })
+            .unwrap_or(false);
+        if drift_active {
+            let loaded = crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
+            if matches!(
+                loaded.status,
+                crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+            ) && matches!(
+                loaded.policy.mode,
+                crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+            ) {
+                crate::ops::adaptive::refresh_ars_parameter_policy_for_doctor(
+                    store.conn(),
+                    config,
+                    &state,
+                );
+                fixes.push(
+                    "demoted ARS parameter policy from Canary to Shadow due to active judge drift alert"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     fixes
 }
 
@@ -1898,8 +1936,24 @@ fn check_judge_call_ledger(store: &crate::store::SqliteStore, config: &ReinConfi
         }
     };
     let summary = format!("24h: {active}/{cap} (in_flight={in_flight} stale={stale})");
-    if (active as u64) >= cap {
-        warn_in(DoctorCategory::Configuration, "judge_call_ledger", summary)
+    let active_u = active as u64;
+    // v0.28.7 M-9 — saturation warn at 100% (existing) PLUS near-saturation
+    // attention at >= 90% so operators see the cap pressure before the
+    // worker starts dropping jobs into `dropped_cap`. Without this, the
+    // judge surface goes from "all good" to "cap exhausted" with no
+    // intermediate signal.
+    if active_u >= cap {
+        warn_in(
+            DoctorCategory::Configuration,
+            "judge_call_ledger",
+            format!("daily cap exhausted — {summary}"),
+        )
+    } else if cap > 0 && active_u.saturating_mul(10) >= cap.saturating_mul(9) {
+        warn_in(
+            DoctorCategory::Configuration,
+            "judge_call_ledger",
+            format!("near saturation (>=90%) — {summary}"),
+        )
     } else {
         ok_in(DoctorCategory::Configuration, "judge_call_ledger", summary)
     }

@@ -323,6 +323,7 @@ fn effective_synthesis_gate_parameters(
         calibration,
         runtime_adoption_weight,
         previous_cold_start,
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
     );
     let previous_threshold = adaptive_state.and_then(|state| {
         state.ars_effective_scalar(
@@ -356,6 +357,7 @@ fn effective_synthesis_gate_parameters(
             calibration,
             runtime_adoption_weight,
             previous_threshold,
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
         );
     (cold_start_n, useful_rate_threshold)
 }
@@ -508,6 +510,7 @@ pub fn run_recall_synthesis_with_policy(
                     crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
                 )
             }),
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
         );
     match decide_synthesize_with_threshold(
         config.ars.recall_synthesis_enabled,
@@ -1109,6 +1112,7 @@ fn enqueue_judge_for_synthesis(
                 crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
             )
         }),
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
     );
     let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_warm,
@@ -1118,6 +1122,7 @@ fn enqueue_judge_for_synthesis(
         adaptive_state.and_then(|state| {
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM)
         }),
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
     )
     .min(cold_rate);
     let rate = current_sample_rate_with_rates(

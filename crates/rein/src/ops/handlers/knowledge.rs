@@ -1167,6 +1167,7 @@ impl OpsRuntime {
                             adaptive_state.ars_effective_scalar(
                                 crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
                             ),
+                            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
                         );
                     match crate::ops::concept_summary::decide_concept_summary_quality_with_threshold(
                         global_enabled,
