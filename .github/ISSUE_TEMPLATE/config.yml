@@ -1,0 +1,19 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security vulnerability report
+    url: https://github.com/lyr1cs/rein/security/advisories/new
+    about: |
+      Please report security vulnerabilities through GitHub Security
+      Advisories (private channel) rather than a public issue. See
+      SECURITY.md for the full disclosure policy.
+  - name: 💬 Question or discussion
+    url: https://github.com/lyr1cs/rein/discussions
+    about: |
+      For open-ended questions, design discussions, or "is this the right
+      way to do X" — start a Discussion. Issues are reserved for actionable
+      bug reports and feature requests.
+  - name: 📖 Documentation
+    url: https://github.com/lyr1cs/rein/blob/master/docs/manual/README.md
+    about: |
+      Before opening an issue, check the manual — many setup, install,
+      and operations questions are already covered.

@@ -1,0 +1,38 @@
+# cargo-audit configuration — documented advisory ignores.
+#
+# This file lists RUSTSEC advisories whose advisory packages are pulled in
+# transitively through dependencies that pin them. Each ignore is paired with
+# a written rationale. Re-evaluate at every dependency upgrade pass.
+#
+# Direct fixes already applied (NOT listed here):
+# - RUSTSEC-2026-0097 rand 0.8.5 → 0.8.6 (cargo update -p rand --precise 0.8.6)
+
+[advisories]
+ignore = [
+  # fxhash 0.2.1 — `unmaintained` warning (not a vulnerability).
+  # https://github.com/cbreeden/fxhash/issues/20
+  # Source: jieba-rs 0.7.4 → fxhash. The advisory is informational
+  # ("crate has not been updated for years"); no exploit, no patch
+  # available because the upstream crate is abandoned. jieba-rs would
+  # need to migrate to a maintained alternative. We track it but
+  # accept the warning until jieba-rs upstream switches hashers.
+  "RUSTSEC-2025-0057",
+
+  # instant 0.1.13 — `unmaintained` warning (not a vulnerability).
+  # https://rustsec.org/advisories/RUSTSEC-2024-0384.html
+  # Source: tantivy 0.22.1 → measure_time 0.8.3 → instant. The
+  # advisory recommends migrating to `web-time`; no exploit, no patch.
+  # Pinned by tantivy's measure_time dependency. We accept the
+  # warning until tantivy's measure_time upstream migrates.
+  "RUSTSEC-2024-0384",
+
+  # lru 0.12.5 — Stacked Borrows soundness in `IterMut`.
+  # https://github.com/jeromefroe/lru-rs/pull/224
+  # Source: tantivy 0.22.1 → lru. Patched in lru ≥0.16.3.
+  # The actual issue manifests only under Miri analysis; standard
+  # rustc + the `IterMut` usage path inside tantivy don't trigger
+  # any observable misbehavior. We track it but accept the warning
+  # until tantivy upgrades its lru dependency (already happens in
+  # tantivy 0.24+, so a future tantivy upgrade closes this).
+  "RUSTSEC-2026-0002",
+]

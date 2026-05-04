@@ -1,0 +1,110 @@
+name: 🐛 Bug Report
+description: Report something that doesn't work as documented.
+title: "bug: <one-line summary>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Filling in the fields
+        below helps us reproduce and fix the issue quickly. **For security
+        vulnerabilities, please use [Security Advisories](https://github.com/lyr1cs/rein/security/advisories/new)
+        instead.**
+
+  - type: input
+    id: version
+    attributes:
+      label: rein version
+      description: Output of `rein --version`. If you built from source, also include the commit SHA.
+      placeholder: "rein 0.28.8 (commit abc1234)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Where did you observe the bug?
+      multiple: true
+      options:
+        - CLI (`rein` subcommand)
+        - MCP (stdio server)
+        - REST API (`/api/*`)
+        - GUI (Neural Wiki, port 8680)
+        - Hooks (Claude Code / Codex)
+        - Proxy (`rein serve --proxy`)
+        - Doctor / health checks
+        - Configuration / install
+        - Other (describe in details)
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + arch + Rust version + (if relevant) MCP client
+      placeholder: "macOS 15.4 arm64 / rustc 1.85 / Claude Code 0.42"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: |
+        Minimal steps that reproduce the problem. Where possible, share an
+        actual command sequence and the inputs. If a `cargo test`-style
+        reproducer is feasible, that's ideal.
+      placeholder: |
+        1. Start `rein serve --gui` with default config
+        2. Call `rein_recall` with `{"query": "...", "synthesize": true}`
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include error messages, stack traces, or unexpected output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Diagnostics
+      description: |
+        Run `rein doctor` (or `rein doctor --json`) and paste relevant
+        output. Redact anything sensitive (API keys, file paths under
+        `$HOME` if you prefer).
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Logs, config snippets, screenshots, or context that might help.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I checked existing issues and didn't find a duplicate
+          required: true
+        - label: This is not a security vulnerability (those go through Security Advisories)
+          required: true

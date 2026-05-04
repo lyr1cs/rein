@@ -1,0 +1,8 @@
+# CODEOWNERS for rein
+#
+# These owners will be the default reviewers for everything in the
+# repository. Order matters: more-specific paths override the wildcard.
+#
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @lyr1cs

@@ -1,0 +1,84 @@
+name: ✨ Feature Request
+description: Propose a new capability, MCP tool, or behavior change.
+title: "feat: <one-line summary>"
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Before filing, check if your request
+        overlaps with existing issues or with the
+        [roadmap notes](https://github.com/lyr1cs/rein/blob/master/README.md#recent-releases).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Describe the user-facing pain point. "I'm trying to do X but
+        currently Y is hard / impossible / surprising."
+      placeholder: |
+        When I'm using rein with Codex CLI, I want ... but currently ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        What would the feature look like from the user's perspective?
+        New CLI flag, new MCP tool, new REST endpoint, behavior change
+        on an existing surface — concrete is better than abstract.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where would this live?
+      multiple: true
+      options:
+        - CLI (new subcommand or flag)
+        - MCP tool (new `rein_*` tool)
+        - REST API (new `/api/*` endpoint)
+        - GUI (new Neural Wiki page)
+        - Hooks (new hook event or extraction logic)
+        - Proxy (new upstream or behavior)
+        - Adaptive engine (new learning signal / feedback)
+        - Storage (schema change, new index, new table)
+        - Other (describe)
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        What workarounds did you try? Why is the proposed solution better
+        than (a) doing nothing, (b) using a different tool, or (c) writing
+        a wrapper script?
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: |
+        Links to similar features in other projects, citations to relevant
+        papers (especially for adaptive / retrieval / dedup ideas), or
+        examples of expected input/output.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I checked existing issues and didn't find an overlap
+          required: true
+        - label: This proposal is consistent with rein's local-first, single-binary, no-mandatory-cloud philosophy
+          required: false
