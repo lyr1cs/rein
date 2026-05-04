@@ -580,11 +580,14 @@ canary policy enables runtime adoption.
 
 ### ARS Dynamic Parameter Rollout
 
-ARS acceleration keeps static configuration as the anchor. In v0.28.6 the
-acceleration, runtime judge, and nightly calibration switches are default-on,
-but learned values only affect runtime behavior when `ars_parameter_policy`
-is healthy, in canary mode, and has a positive adoption weight for the relevant
-scope.
+ARS acceleration keeps static configuration as the anchor. v0.28.6 made the
+acceleration, runtime judge, and nightly calibration switches default-on; v0.28.7
+H0 then **reverted the runtime judge defaults back to off** per the v0.28
+charter Non-Goal "Do not make LLM judge default-on", so the v0.28.8 default
+surface is: `[ars.acceleration].enabled = true`, `[ars.llm_judge].enabled = false`,
+`[ars.llm_judge.nightly_cron].enabled = false`. Learned values only affect
+runtime behavior when `ars_parameter_policy` is healthy, in canary mode, and
+has a positive adoption weight for the relevant scope.
 
 The policy row has two rollout layers:
 
@@ -627,6 +630,129 @@ This rollout layer is deliberately gradual. Global and scoped adoption weights
 move by at most `0.05` per durable adaptive snapshot and reset to zero outside
 canary mode. They gate recall fusion, synthesis and concept-summary gates, LLM
 judge sample rates, LLM judge decay, and SignalHint-derived useful-rate priors.
+
+#### v0.28.7 Audit Hardening
+
+v0.28.7 closes 4 HIGH + 4 MED items from the 2026-05-02 v0.28 audit. Default-OFF
+runtime behavior is bit-identical to v0.28.6.
+
+- **H0 — runtime judge defaults reverted.** v0.28.6 had defaulted `[ars.llm_judge].enabled`
+  and `[ars.llm_judge.nightly_cron].enabled` to `true`, which the audit flagged
+  as causing implicit LLM API spend on routine `cargo install` upgrade.
+  v0.28.7 reverts both defaults to `false` in code AND embedded `default.toml`.
+  `[ars.acceleration]` stays `true`. Operators who already opted in via TOML
+  see no behavior change.
+- **H1 — bootstrap-priors replay consumer guarded.** The
+  `bootstrap_priors_from_replay` consumer is wired but its v0.29 producer
+  hasn't landed; the consumer is held inactive against the placeholder
+  `signal_hint` producer so it never advances against an empty source.
+- **H2 — drift-triggered Canary→Shadow rollback.** `apply_local_fixes`
+  refreshes `ars_parameter_policy` when `judge_calibration_state.judge_drift_alert*`
+  is positive while the policy is in Canary; the next
+  `refresh_ars_parameter_policy` tick demotes the policy back to Shadow with
+  `runtime_adoption_weight = 0`. Drift cannot be merely logged.
+- **H3 — separate shadow buckets.** `route_context`-derived shadow buckets
+  get a separate `CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP = 4096` LRU,
+  preventing shadow flooding from evicting production buckets.
+- **M-1 input-side per-surface drift.** `JudgeSurface` is threaded through 5
+  helpers + handlers so per-surface drift visibility (Synthesis vs
+  ConceptSummary) is preserved end-to-end.
+
+#### v0.28.8 Audit Follow-up Hardening
+
+v0.28.8 is a second-pass audit on v0.28.7. **17 codex review rounds** (R1–R17)
+saturated at 2-consecutive-clean; **15 P2 + 1 P3** findings closed; **0 P1**
+throughout. Default-OFF runtime behavior bit-identical to v0.28.7.
+
+**M-8 cluster-bucket alignment (R13, structural).** Pre-fix, learn-time
+`top_vec_hit_cluster` honored the recall-time-recorded
+`query_cluster_id_at_recall` only when `cluster_version_at_recall` matched
+`AdaptiveState::cluster_version`. But M4 reclustering runs at the START of
+`run_adaptive_pipeline` and increments `cluster_version` BEFORE M2 consumes
+events emitted since the previous pass — so the version-match guard treated
+EVERY event as stale on the normal learning path, silently dropping scoped
+learning when the read-time top-vec hit was filtered or canonical-collapsed
+between recall and event emission.
+
+The fix stamps the recall-time top-vec memory id directly into the
+`recall_complete` event payload (`query_top_vec_memory_id_at_recall:
+Option<String>`) and makes that the **preferred** bucket-resolution path.
+Learn-time looks up the memory id in the CURRENT `memory_clusters` map and
+uses its current cluster id, which is the post-recluster truth a fresh read
+would also see — correct regardless of how many M4 passes fired between
+recall and learn-time. The legacy `cluster_version_at_recall` version-match
+path stays as a backward-compat hook for pre-R13 events.
+
+**L6 fallback bucket preservation in LRU eviction (R12).** The
+`learned_shadow_fusion` cap eviction (per-key insert path and
+`shrink_learned_shadow_fusion_to_cap`) restricts eviction targets to
+**cluster-scoped buckets** identified by the `is_cluster_scoped_bucket`
+predicate (key contains `:` AND suffix parses as `u32`). The fallback chain
+in `get_shadow_fusion_weights` — cluster-scoped → `{query_type}` → `global` —
+depends on the `global` and per-query-type fallback buckets being present;
+LRU'ing them out under high cluster cardinality would silently degrade
+dynamic recall fusion for queries without surviving cluster-scoped buckets.
+If the cluster-scoped victim pool is exhausted, the cap is allowed to
+overshoot rather than corrupt the fallback chain (degenerate state — only
+~7 fallback keys exist in practice).
+
+**`ars_parameter_policy` schema robustness.** Four layered fixes:
+
+1. **R8 schema-version peek**: `load_parameter_policy` peeks
+   `schema_version` from the raw JSON Value BEFORE the typed
+   `serde_json::from_str::<ArsParameterPolicy>` runs. Pre-R8 a future-schema
+   row whose payload added an unknown enum variant failed the typed parse
+   outright and fell into the `Corrupt` arm, where `doctor --fix` would
+   delete valid future canary state on a downgrade. Future schemas are now
+   classified `UnsupportedSchema` regardless of whether the additive change
+   is field-additive or breaks the older binary's enum coverage.
+2. **R8 schema-aware CAS predicate**: the UPDATE predicate uses
+   `COALESCE(json_extract(value, '$.schema_version'), ?4) = ?4` (default to
+   the current binary's schema) rather than `COALESCE(..., 0) = ?4`. A row
+   that omits the field entirely now accepts refresh; future schemas
+   (e.g., 9999) still fail the predicate.
+3. **R15 strict-greater future check**: the peek comparison uses `>` rather
+   than `!=` so older rows (e.g., `schema_version=0` from a hand-edited or
+   corrupt source) are NOT preserved as future-schema; they fall through to
+   typed deserialize and land in the `Corrupt` arm where the recovery path
+   can delete them.
+4. **R10 atomic recovery**: `repair_corrupt_parameter_policy` (new helper)
+   wraps load + DELETE in `BEGIN IMMEDIATE`, observes status under the write
+   lock, and DELETEs only if still `Corrupt`. Pre-R10 the doctor's
+   `load_parameter_policy` (read-only, no lock) followed by an unconditional
+   `delete_parameter_policy` had a TOCTOU window where a peer
+   `refresh_ars_parameter_policy` tick could rewrite the row to a healthy
+   canary in between, and the unconditional DELETE would destroy
+   newly-valid state.
+
+**M-1 persistence-side per-surface scalar split.** The snapshot blob gains
+4 new keys under `ars_effective_scalars` —
+`judge_sample_rate_{cold_start,warm}_{synthesis,concept_summary}` — written
+by `compute_and_persist_judge_sample_rate(surface, …)` once per surface.
+Reader sites consult the per-surface key first via
+`ars_effective_scalar_with_legacy_fallback`, which falls back to the legacy
+cluster-shared key as a one-time first-tick-after-upgrade source. The legacy
+keys keep being written with the synthesis-surface variant for downgrade-
+rollback compat. The split closes a per-surface drift cross-contamination
+where synthesis-surface drift would zero the legacy scalar and the
+concept-surface reader would see 0 instead of the live canary trust blend.
+
+**M-5 / M-6 rollback / outer-blend.** M-5 anchors `static_threshold` on the
+config default when `runtime_adoption_weight ≈ 0` (the rollback window),
+closing the rollback hole in v0.28.7's H2 fix-closed promise. M-6
+outer-blends the ARS simplex score against route-aware `legacy_score` by
+`runtime_adoption_weight` so a barely-promoted canary (adoption=0.05) does
+not lose 95% of route-specific signal in one step — `adoption=0` reproduces
+pre-canary behavior exactly, `adoption=1` reproduces v0.28.7's wholesale-
+simplex behavior.
+
+**R10 P2 — SQL-fallback cluster id atomicity.** `query_cluster_id_from_snapshot`
+(used for event payload, atomic with snapshot's `cluster_version`) is split
+from `query_cluster_id` (used for read-time alpha selection, falls back to
+SQL for live serving). The recorded payload field falls to `None` when the
+SQL fallback fired, forcing learn-time to re-derive the bucket from the
+candidate payload — which IS the post-recluster truth a fresh read would
+see.
 
 ### M5 Tiering
 
@@ -678,13 +804,19 @@ distribution when enough samples exist.
 ### Runtime Judge Feedback
 
 The runtime judge added in v0.27 is an optional feedback source for synthesis
-and concept-summary quality. It enqueues and consumes LLM judge events when the
-feature is enabled, compares runtime and offline judge streams for calibration,
-and feeds useful-rate style aggregates. It does not replace the durable memory
-model or make dedup decisions by itself. In v0.28.4, shadow judge jobs may carry
-bounded `signal_hint` evidence derived from already-recorded interaction stats;
-the hint does not create extra LLM calls or bypass the normal policy gates. In
-v0.28.6, those policy gates include scoped adoption weights, so LLM feedback
+and concept-summary quality. **As of v0.28.7 it is default-off** —
+`[ars.llm_judge].enabled` and `[ars.llm_judge.nightly_cron].enabled` both
+default to `false` (v0.28.7 H0 reverted v0.28.6's default-on flip per the
+v0.28 charter Non-Goal). When operators explicitly opt in, the judge enqueues
+and consumes LLM judge events, compares runtime and offline judge streams for
+calibration, and feeds useful-rate style aggregates. It does not replace the
+durable memory model or make dedup decisions by itself. In v0.28.4, shadow
+judge jobs may carry bounded `signal_hint` evidence derived from
+already-recorded interaction stats; the hint does not create extra LLM calls
+or bypass the normal policy gates. v0.28.7 M-1 input-side and v0.28.8 M-1
+persistence-side both split judge calibration state by `JudgeSurface`
+(Synthesis vs ConceptSummary), so per-surface drift no longer cross-
+contaminates the other surface's scalar. In
 accelerates tuning gradually instead of replacing static ARS parameters at once.
 
 ## Background Research

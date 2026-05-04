@@ -1,5 +1,9 @@
 # REST API Reference
 
+Updated for Rein v0.28.8 (2026-05-04). Route inventory is unchanged from
+v0.28.6 — v0.28.7 and v0.28.8 hardened existing surfaces without adding
+routes.
+
 The REST API is served under `/api/*` when HTTP/SSE or the GUI server is
 enabled. Network access is guarded by the HTTP server token policy; many
 mutating routes also require `x-rein-action: 1`. Protected reads accept
@@ -75,6 +79,30 @@ covers recall fusion, synthesis/concept scalar parameters, judge sample-rate
 adaptation, LLM feedback decay, SignalHint-derived useful-rate priors, and
 release-gate reporting.
 
+**v0.28.7 H0 default revert.** `[ars.acceleration].enabled` stays `true`,
+but `[ars.llm_judge].enabled` and `[ars.llm_judge.nightly_cron].enabled`
+revert to `false` per the v0.28 charter Non-Goal "Do not make LLM judge
+default-on". Operators must explicitly opt in.
+
+**v0.28.7 + v0.28.8 policy-row schema robustness** affects how
+`/api/adaptive` reports `parameter_policy.status`:
+
+- `loaded`: row deserializes at the current schema. CAS UPDATE accepts rows
+  that omit the `schema_version` field (treated as the current schema via
+  `COALESCE` default — v0.28.8 R8 fix).
+- `missing`: row absent. Refresh path can `INSERT` cleanly.
+- `corrupt`: bytes failed JSON parse, OR explicit `schema_version` is older
+  than the current binary (v0.28.8 R15 — `>` rather than `!=` in the peek
+  check). `doctor --fix` recovers via `repair_corrupt_parameter_policy`
+  (atomic `BEGIN IMMEDIATE` re-check, v0.28.8 R10).
+- `unsupported_schema`: explicit `schema_version` is STRICTLY GREATER than
+  the current binary (future-schema row written by a newer rein binary in
+  a downgrade scenario). `doctor --fix` does NOT delete this; the older
+  binary stays in failed-closed semantics until the newer binary is
+  restored.
+- `storage_error`: transient SQLite busy/locked read; doctor retries on
+  the next pass.
+
 `GET /api/adaptive` includes:
 
 ```json
@@ -130,6 +158,27 @@ replay weights:
 compatible `source_adaptive_version` with positive global or scoped adoption
 weight before consuming eligible persisted weights from
 `AdaptiveState.learned_shadow_fusion`.
+
+**v0.28.8 L6 fallback bucket preservation.** The
+`AdaptiveState.learned_shadow_fusion` map enforces a 4096-entry LRU cap.
+Eviction targets are restricted to **cluster-scoped** keys
+(`{query_type}:{cluster_id}` shape). The `global` and per-query-type
+fallback buckets that `get_shadow_fusion_weights` consults at the tail of
+its fallback chain are never evicted. Vaults at high cluster cardinality
+will see the `tracing::warn!` emitted on each eviction.
+
+**v0.28.8 M-1 persistence-side per-surface scalars.** The snapshot blob
+gains 4 new keys under `ars_effective_scalars`:
+
+- `judge_sample_rate_cold_start_synthesis`
+- `judge_sample_rate_cold_start_concept_summary`
+- `judge_sample_rate_warm_synthesis`
+- `judge_sample_rate_warm_concept_summary`
+
+Legacy keys (`judge_sample_rate_cold_start`, `judge_sample_rate_warm`) keep
+being written with the synthesis-surface variant for downgrade-rollback
+compat. External tooling that diffs the snapshot blob will see the
+additional keys; values within `[0, 1]` as before.
 
 ## `/api/ars-acceleration-gate`
 

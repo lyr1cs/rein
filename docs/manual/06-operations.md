@@ -271,6 +271,40 @@ Apply supported repairs:
 rein doctor --fix
 ```
 
+`rein doctor --fix` covers (non-exhaustive list):
+
+- **Side-index rebuilds** — Tantivy and HNSW are rebuildable accelerators;
+  doctor refreshes them when they drift from SQLite.
+- **`ars_parameter_policy` corruption recovery (v0.28.8)** — when
+  `load_parameter_policy` returns `Corrupt`, doctor calls
+  `repair_corrupt_parameter_policy`, which re-checks the row's status under
+  `BEGIN IMMEDIATE` and DELETEs only if it is still `Corrupt`. This closes
+  a TOCTOU window where a peer `refresh_ars_parameter_policy` tick could
+  rewrite the row to a healthy canary in the gap between the doctor's
+  earlier read and the recovery call. `UnsupportedSchema` (future-schema)
+  rows and `StorageError` (transient busy/lock) reads are LEFT IN PLACE
+  rather than deleted.
+- **Drift-triggered Canary→Shadow rollback (v0.28.7 H2)** — if
+  `judge_calibration_state.judge_drift_alert*` is positive while the policy
+  is in Canary mode, doctor refreshes `ars_parameter_policy` so the next
+  `refresh_ars_parameter_policy` tick demotes the policy back to Shadow
+  with `runtime_adoption_weight = 0`.
+
+`rein doctor` (read-only) also surfaces:
+
+- **`judge_call_ledger` saturation (v0.28.7 M-9)** — warns when the rolling
+  24h LLM-judge call ledger is approaching `daily_call_cap`. The ledger
+  is shared between the runtime judge and the nightly cron, so saturation
+  on one path affects the other.
+- **`learned_shadow_fusion` cap pressure** — warns when the LRU is at or
+  near `LEARNED_SHADOW_FUSION_CAP = 4096`; eviction is restricted to
+  cluster-scoped buckets (`{query_type}:{cluster_id}` shape) so the
+  `global` and per-query-type fallback chain is preserved.
+- **`policy.adoption_weights` cap pressure** — warns when the map exceeds
+  `ADOPTION_WEIGHTS_CAP = 4128`; this is warn-only with no eviction (every
+  `adoption_weights` key maps to a runtime trust gate scope identifier;
+  silently dropping one would mute a canary scope).
+
 Get machine-readable output:
 
 ```bash

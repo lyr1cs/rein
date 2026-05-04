@@ -189,3 +189,90 @@ Preserve these architecture rules when changing product code:
 - Adaptive consumers should not advance offsets until their derived state is
   durably saved.
 - LLM-backed features must retain local fallback or explicit opt-in behavior.
+
+### Adaptive cluster-bucket alignment (v0.28.8 M-8)
+
+When emitting a `recall_complete` event, the recorded
+`query_cluster_id_at_recall` MUST come from the same atomic source as
+`cluster_version_at_recall` — the snapshot's `memory_clusters` map. SQL
+fallback values (`memories.cluster_id`) may inform read-time alpha selection
+but MUST NOT be stamped into the event payload, because they are not atomic
+with the snapshot's `cluster_version`.
+
+Learn-time `top_vec_hit_cluster` resolves the bucket in this order:
+
+1. **Memory-id remap (preferred)** — look up
+   `query_top_vec_memory_id_at_recall` in the CURRENT `memory_clusters` map.
+   This returns the post-recluster cluster id a fresh read would also see,
+   and is correct regardless of how many M4 reclusters fired between recall
+   and learn-time.
+2. **Legacy version-match (backward compat)** — for pre-v0.28.8 events
+   without a memory-id stamp, honor `query_cluster_id_at_recall` only when
+   `cluster_version_at_recall == AdaptiveState::cluster_version`.
+3. **Candidates-derived (final fallback)** — derive from the highest-`vec_norm`
+   candidate in the payload (filter `vec_norm > 0.0` to mirror read-time's
+   `vec_for_fusion.first()` skip path).
+
+Adding any code path that constructs a `RecallEvent` MUST populate
+`query_top_vec_memory_id_at_recall` when `vec_for_fusion.first()` is
+non-empty. Code that relies on the `cluster_version_at_recall` guard alone
+is broken on the M4-then-M2 normal pipeline order (the version was
+incremented before M2 consumed events emitted since the previous pass).
+
+### `learned_shadow_fusion` LRU fallback preservation (v0.28.8 L6)
+
+The `LEARNED_SHADOW_FUSION_CAP = 4096` LRU eviction (per-key insert path
+and `shrink_learned_shadow_fusion_to_cap` snapshot boundary) MUST restrict
+victims to **cluster-scoped buckets** identified by
+`is_cluster_scoped_bucket(key)` — keys of the form `{query_type}:{cluster_id}`
+where the suffix parses as `u32`.
+
+The fallback chain in `get_shadow_fusion_weights` is cluster-scoped →
+`{query_type}` → `global`. The non-cluster fallback keys (`global` plus one
+per query type, ~7 total) are STRUCTURAL — losing them silently degrades
+dynamic recall fusion for queries without surviving cluster-scoped buckets.
+
+If the cluster-scoped victim pool is exhausted, the helper allows the cap
+to overshoot rather than corrupt the fallback chain (degenerate state — only
+~7 fallback keys can exist). The warn fires so operators see the over-cap
+condition.
+
+### `ars_parameter_policy` schema robustness (v0.28.8 R8/R10/R15)
+
+The policy row's load and CAS paths are layered against schema evolution:
+
+- **Load (`load_parameter_policy`)** — peek `schema_version` from raw JSON
+  Value BEFORE typed deserialize. If `schema > current` (strictly greater),
+  return `UnsupportedSchema` immediately so future-schema rows survive
+  downgrade windows even when an older binary's typed parse would fail on
+  unknown enum variants. Older or zero schemas fall through to typed
+  deserialize and land in `Corrupt` so the recovery path can unblock
+  refresh.
+- **Save (`save_parameter_policy_cas`)** — UPDATE predicate
+  `COALESCE(json_extract(value, '$.schema_version'), ?4) = ?4` matches
+  current-schema rows and rows that omit the field, but rejects future
+  schemas by their explicit value.
+- **Recover (`repair_corrupt_parameter_policy`)** — load + DELETE wrapped
+  in a single `BEGIN IMMEDIATE` transaction. Re-checks status under the
+  write lock; deletes only if still `Corrupt`. Any peer that rewrote the
+  row to a healthy canary in the gap between the doctor's earlier read and
+  the recovery call sees its work preserved.
+
+`apply_local_fixes` MUST go through `repair_corrupt_parameter_policy`; the
+older "load then `delete_parameter_policy`" pattern is a TOCTOU race.
+
+### Per-surface ARS scalars (v0.28.8 M-1 persistence-side)
+
+Snapshot key `ars_effective_scalars` carries 4 per-surface keys —
+`judge_sample_rate_{cold_start,warm}_{synthesis,concept_summary}` — written
+by `compute_and_persist_judge_sample_rate(surface, …)` once per surface.
+Reader sites consult the per-surface key first via
+`ars_effective_scalar_with_legacy_fallback(state, surface_key, legacy_key)`,
+which reads `legacy_key` only when `surface_key` is absent (one-time
+first-tick-after-upgrade fallback).
+
+Code that adds a new judge surface MUST add a per-surface scalar key (do
+not reuse a sibling surface's key). Code that writes to the legacy
+cluster-shared key MUST also write to the synthesis-surface variant for
+downgrade-rollback compat (both writes happen inside
+`compute_and_persist_judge_sample_rate`).

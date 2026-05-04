@@ -1,8 +1,10 @@
 # MCP Tools
 
-Updated for Rein v0.28.6. Rein exposes 40 production MCP tools through the
-operation inventory. Test-only tools and `/api/test_path_template/*` routes are
-not part of this reference.
+Updated for Rein v0.28.8 (2026-05-04). Rein exposes **40 production MCP tools**
+through the operation inventory. Tool count and inventory are unchanged since
+v0.28.6 — v0.28.7 and v0.28.8 hardened existing surfaces without adding tools.
+Test-only tools and `/api/test_path_template/*` routes are not part of this
+reference.
 
 ## Core Memory
 
