@@ -18,3 +18,11 @@ auto
 auto-shm
 auto-wal
 auto-journal
+
+# AI-agent personal working notes — kept out of public repo on purpose
+# (CLAUDE.md / SKILL.md are project-specific instructions for Claude Code
+# and other AI agents; they live in vault root or operator's private notes
+# rather than the public source tree). AGENTS.md is the public-facing
+# agent guide and IS tracked.
+CLAUDE.md
+SKILL.md
