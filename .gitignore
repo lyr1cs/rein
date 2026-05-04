@@ -26,3 +26,8 @@ auto-journal
 # agent guide and IS tracked.
 CLAUDE.md
 SKILL.md
+
+# THIRD_PARTY_NOTICES YAML — regenerable build artifact (the .md is the
+# canonical human-readable + tracked version). Regenerate via
+# scripts/generate-third-party-notices.sh
+THIRD_PARTY_NOTICES.yaml

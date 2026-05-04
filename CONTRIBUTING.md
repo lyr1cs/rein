@@ -2,7 +2,13 @@
 
 Thanks for your interest in improving rein.
 
-## License
+## Copyright and License
+
+The rein project copyright is held by **Eric Lee** (the project maintainer).
+Contributions you submit under DCO 1.1 (see below) are licensed to the
+project under AGPL-3.0-or-later; you retain copyright over your own
+contributions, and the project's right to dual-license future versions
+extends only to contributions covered by your DCO sign-off.
 
 rein is licensed under **AGPL-3.0-or-later**. By contributing you agree that your contribution will be distributed under the same license.
 

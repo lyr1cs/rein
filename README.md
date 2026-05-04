@@ -1027,6 +1027,8 @@ This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, whi
 
 ### License
 
+**Copyright (C) 2026 Eric Lee.** All rights reserved except as licensed under AGPL-3.0-or-later.
+
 **AGPL-3.0-or-later** — see [LICENSE](LICENSE).
 
 rein is a server (MCP / REST / GUI). The AGPL §13 network-use clause means: if you run a modified version of rein **as a service that users interact with over a network**, you must provide those users access to the modified source code. Self-hosted personal use, internal-only deployment within your organization, and integrations that talk to rein over its public API (Claude Code, Cursor, IDE plugins, etc.) are all unaffected.
@@ -1850,6 +1852,8 @@ OMLX 后端使用 OpenAI `/v1/embeddings` 格式，兼容 OpenRouter、LiteLLM �
 | **合计** | **$0.00/月** | **< $0.03/月** |
 
 ### 许可证
+
+**Copyright (C) 2026 Eric Lee.** 保留所有权利，除非依 AGPL-3.0-or-later 授权。
 
 **AGPL-3.0-or-later** — 见 [LICENSE](LICENSE)。
 
