@@ -351,6 +351,17 @@ fn bootstrap_priors_snapshot_read_path(config: &ReinConfig) -> PathBuf {
     db_scoped_queue_dir(config, false).join("bootstrap_priors.json")
 }
 
+/// v0.28.7+ audit L1 — defense-in-depth upper bound on bootstrap-prior
+/// numeric fields. Legitimate `prior_confidence` is event-count-shaped
+/// and fits well under 1e6 in practice; values above this saturate trust
+/// ceilings downstream (a corrupted snapshot containing 1e18 would lock
+/// the consumer into "fully confident" forever via
+/// `derive_priors_from_signal_hints` blending). Reject the snapshot
+/// rather than clamp so the operator notices a corrupt or attacker-
+/// influenced bootstrap file via the doctor + adaptive-status surfaces
+/// (snapshot is silently ignored, falling back to const_defaults).
+const SANITIZE_BOOTSTRAP_PRIORS_MAX: f64 = 1.0e6;
+
 fn sanitize_bootstrap_priors(priors: BootstrapPriors) -> Option<BootstrapPriors> {
     let BootstrapPriors {
         w_view,
@@ -363,7 +374,7 @@ fn sanitize_bootstrap_priors(priors: BootstrapPriors) -> Option<BootstrapPriors>
     } = priors;
     if [w_view, w_click, w_thumb, w_req, prior_confidence]
         .into_iter()
-        .any(|value| !value.is_finite() || value < 0.0)
+        .any(|value| !value.is_finite() || !(0.0..=SANITIZE_BOOTSTRAP_PRIORS_MAX).contains(&value))
     {
         return None;
     }
@@ -2891,5 +2902,101 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let p2 = bootstrap_priors_from_replay(&config, &conn).expect("replay t2");
         assert_eq!(p1, p2);
+    }
+
+    /// v0.28.7+ audit L1 — `sanitize_bootstrap_priors` must reject a
+    /// snapshot containing oversized weights or `prior_confidence` so a
+    /// corrupted bootstrap-priors file (or an attacker-influenced one)
+    /// cannot saturate the trust-blending ceiling downstream. Pre-fix
+    /// the function only checked finite + non-negative; 1e18 sailed
+    /// through and locked `derive_priors_from_signal_hints` callers
+    /// into "fully confident" forever.
+    #[test]
+    fn sanitize_bootstrap_priors_rejects_oversized_prior_confidence() {
+        let baseline = BootstrapPriors {
+            w_view: 1.0,
+            w_click: 1.5,
+            w_thumb: 2.0,
+            w_req: 1.5,
+            useful_rate_threshold: 0.3,
+            weight_decay_rate: 0.5,
+            prior_confidence: 1.0,
+        };
+        // Sanity: baseline passes.
+        assert!(sanitize_bootstrap_priors(baseline.clone()).is_some());
+
+        // Oversized prior_confidence is rejected.
+        let oversized_conf = BootstrapPriors {
+            prior_confidence: 1.0e18,
+            ..baseline.clone()
+        };
+        assert!(
+            sanitize_bootstrap_priors(oversized_conf).is_none(),
+            "prior_confidence > SANITIZE_BOOTSTRAP_PRIORS_MAX must reject"
+        );
+
+        // Boundary: equal to MAX is accepted; one ULP above is rejected.
+        let at_max = BootstrapPriors {
+            prior_confidence: SANITIZE_BOOTSTRAP_PRIORS_MAX,
+            ..baseline.clone()
+        };
+        assert!(sanitize_bootstrap_priors(at_max).is_some());
+
+        let above_max = BootstrapPriors {
+            prior_confidence: SANITIZE_BOOTSTRAP_PRIORS_MAX * 1.0001,
+            ..baseline.clone()
+        };
+        assert!(sanitize_bootstrap_priors(above_max).is_none());
+
+        // Oversized weights also rejected (each axis independently).
+        for (label, mutated) in [
+            (
+                "w_view",
+                BootstrapPriors {
+                    w_view: 1.0e18,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "w_click",
+                BootstrapPriors {
+                    w_click: 1.0e18,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "w_thumb",
+                BootstrapPriors {
+                    w_thumb: 1.0e18,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "w_req",
+                BootstrapPriors {
+                    w_req: 1.0e18,
+                    ..baseline.clone()
+                },
+            ),
+        ] {
+            assert!(
+                sanitize_bootstrap_priors(mutated).is_none(),
+                "oversized {label} must be rejected"
+            );
+        }
+
+        // Existing rejections still hold (regression guard for the
+        // pre-L1 code path).
+        let nan_conf = BootstrapPriors {
+            prior_confidence: f64::NAN,
+            ..baseline.clone()
+        };
+        assert!(sanitize_bootstrap_priors(nan_conf).is_none());
+
+        let neg_weight = BootstrapPriors {
+            w_view: -1.0,
+            ..baseline
+        };
+        assert!(sanitize_bootstrap_priors(neg_weight).is_none());
     }
 }

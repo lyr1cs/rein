@@ -277,12 +277,14 @@ pub fn decide_synthesize_with_threshold(
     // canary with zero `viewed_count` and a warm `llm_judge_count` bucket
     // would fall back to the global flag forever — defeating the entire
     // E direction premise.
-    // Default to 0.3 when caller passes 0 sentinel (test convenience —
-    // production caller always passes config.ars.llm_judge.weight_decay_rate
-    // which is validated > 0 by J6, but tests can pass 0.0 and get
-    // standard counting behavior). Use < 0 to opt INTO zero-weight
-    // skip semantics... actually just use the value: > 0.0 includes
-    // judge events, == 0.0 excludes them.
+    //
+    // v0.28.7+ audit L3: `judge_weight_decay_rate > 0.0` includes judge
+    // events in `total_signal`; `== 0.0` excludes them. The earlier
+    // "`weight_decay_rate > 0` invariant via J6" rationale was stale —
+    // v0.28's dynamic `[ars.llm_judge].weight_decay_rate` resolution can
+    // legitimately produce 0.0 (means "judge contributes no decay
+    // weight"), and tests intentionally pass 0.0 for the standard
+    // counting path. Treat the value as authoritative.
     let llm_contribution = if judge_weight_decay_rate > 0.0 {
         cluster.llm_judge_count
     } else {
@@ -330,7 +332,23 @@ fn effective_synthesis_gate_parameters(
             crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
         )
     });
-    let static_threshold = previous_threshold.unwrap_or(SYNTHESIS_USEFUL_RATE_THRESHOLD);
+    // v0.28.7+ audit M-5: when canary is rolled back
+    // (`runtime_adoption_weight ≈ 0`), anchor on the static config default,
+    // NOT on the previously-persisted blended scalar. Pre-fix, a rollback
+    // returned `previous_threshold` (the canary-blended value) until the
+    // next pipeline tick wrote a fresh snapshot — leaving v0.28.7's
+    // "fail-closed" promise unmet during the rollback window.
+    // `effective_useful_rate_threshold_with_previous` early-returns
+    // `static_threshold` when `runtime_adoption_weight <= EPSILON`, so the
+    // anchor we pass IS the rollback value. During canary
+    // (`runtime_adoption_weight > EPSILON`) we still pass the persisted
+    // value — it is the correct continuity anchor for step-bound
+    // smoothing.
+    let static_threshold = if runtime_adoption_weight <= f64::EPSILON {
+        SYNTHESIS_USEFUL_RATE_THRESHOLD
+    } else {
+        previous_threshold.unwrap_or(SYNTHESIS_USEFUL_RATE_THRESHOLD)
+    };
     let Some(cid) = cluster_id else {
         return (cold_start_n, static_threshold);
     };
@@ -1102,13 +1120,19 @@ fn enqueue_judge_for_synthesis(
 
     // (2) Sample-rate Bernoulli → judge worker queue.
     let calibration = adaptive_state.and_then(|s| s.judge_calibration_state.as_ref());
+    // v0.28.7+ audit M-1 persistence-side: read the synthesis-specific
+    // per-surface scalars, falling back to the legacy cluster-shared
+    // scalars for first-tick-after-upgrade continuity. See
+    // `ars_effective_scalar_with_legacy_fallback` doc.
     let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
         runtime_adoption_weight,
         true,
         adaptive_state.and_then(|state| {
-            state.ars_effective_scalar(
+            crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+                state,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS,
                 crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
             )
         }),
@@ -1120,7 +1144,11 @@ fn enqueue_judge_for_synthesis(
         runtime_adoption_weight,
         false,
         adaptive_state.and_then(|state| {
-            state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM)
+            crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+                state,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_SYNTHESIS,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+            )
         }),
         crate::ops::ars_tuning::JudgeSurface::Synthesis,
     )
@@ -2797,5 +2825,63 @@ mod tests {
 
         config.ars.acceleration.enabled = false;
         assert!(signal_hint_for_synthesis_job(&config, Some(&bucket)).is_none());
+    }
+
+    /// v0.28.7+ audit M-5 — on canary→shadow rollback (`runtime_adoption_weight ≈ 0`),
+    /// the synthesis useful_rate threshold must snap immediately to the
+    /// static config default. Pre-fix the function fell back to the
+    /// previously-persisted blended scalar (set by the canary while it
+    /// was active), so the rollback held the canary value until the next
+    /// pipeline tick wrote a fresh snapshot — defeating the
+    /// fail-closed-on-rollback promise.
+    #[test]
+    fn m5_synthesis_threshold_snaps_to_config_on_rollback() {
+        let config = ReinConfig::default();
+        let mut state = AdaptiveState::default();
+        // Persist a blended canary value well above the static default.
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+            0.92,
+        );
+        let blended = state
+            .ars_effective_scalar(
+                crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+            )
+            .unwrap();
+        assert!(
+            (blended - 0.92).abs() < 1e-9
+                && (blended - SYNTHESIS_USEFUL_RATE_THRESHOLD).abs() > 0.1,
+            "test setup must persist a value distinct from the static default"
+        );
+
+        // Rollback: adoption_weight=0.0. Threshold must equal the static
+        // default — NOT the blended 0.92.
+        let (_cold_start, threshold_rollback) =
+            effective_synthesis_gate_parameters(&config, Some(&state), Some(7), "Semantic", 0.0);
+        assert!(
+            (threshold_rollback - SYNTHESIS_USEFUL_RATE_THRESHOLD).abs() < 1e-9,
+            "rollback threshold = {threshold_rollback}; expected static default \
+             {SYNTHESIS_USEFUL_RATE_THRESHOLD}. Pre-M-5 fix would have returned \
+             the blended 0.92 (the persisted canary scalar) — the regression \
+             vector this test pins."
+        );
+
+        // Sanity: with adoption > EPSILON, the persisted scalar IS used as
+        // the anchor (continuity during canary is preserved). The
+        // resulting threshold is bound by step-bound smoothing inside
+        // `effective_useful_rate_threshold_with_previous`, so we can't
+        // assert exact equality here — only that the anchor differs from
+        // the rollback path's pure config default.
+        let (_cold_start, threshold_canary) =
+            effective_synthesis_gate_parameters(&config, Some(&state), Some(7), "Semantic", 1.0);
+        // The canary path's exact output depends on bucket presence and
+        // calibration; here `Some(&state)` has neither so it falls
+        // through the "no bucket" branch and returns `static_threshold`,
+        // which IS `previous_threshold` (= 0.92) under the canary path.
+        assert!(
+            (threshold_canary - 0.92).abs() < 1e-9,
+            "canary path must use persisted scalar as anchor when no bucket exists \
+             (got {threshold_canary}); this asserts M-5 fix did NOT regress canary continuity"
+        );
     }
 }

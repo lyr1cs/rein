@@ -783,7 +783,16 @@ pub fn effective_concept_summary_gate_parameters(
             crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
         )
     });
-    let static_threshold = previous_threshold.unwrap_or(CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
+    // v0.28.7+ audit M-5 (Cap A mirror): see synthesis-path comment in
+    // `effective_synthesis_gate_parameters`. Rollback must anchor on the
+    // static config default so `effective_useful_rate_threshold_with_previous`'s
+    // !production_canary early-return collapses to the config value
+    // (NOT the canary-blended scalar persisted via ARS_SCALAR_*).
+    let static_threshold = if runtime_adoption_weight <= f64::EPSILON {
+        CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD
+    } else {
+        previous_threshold.unwrap_or(CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD)
+    };
     let Some(cid) = cluster_id else {
         return (cold_start_n, static_threshold);
     };
@@ -1044,13 +1053,21 @@ fn enqueue_judge_for_concept_summary(
     // accumulate. Pre-v0.27.4 this looked up `(None, "unknown")`, which
     // was where ZERO Cap A judge events ever landed.
     let calibration = adaptive_state.judge_calibration_state.as_ref();
+    // v0.28.7+ audit M-1 persistence-side: read the concept-summary-
+    // specific per-surface scalars, falling back to the legacy cluster-
+    // shared scalars for first-tick-after-upgrade continuity. See
+    // `ars_effective_scalar_with_legacy_fallback` doc and the synthesis
+    // mirror in `ops/recall_synthesis.rs`.
     let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
         config.ars.llm_judge.sample_rate_cold_start,
         calibration,
         judge_sample_rate_adoption_weight,
         true,
-        adaptive_state
-            .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
+        crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+            adaptive_state,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+        ),
         crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
     );
     let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
@@ -1058,8 +1075,11 @@ fn enqueue_judge_for_concept_summary(
         calibration,
         judge_sample_rate_adoption_weight,
         false,
-        adaptive_state
-            .ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
+        crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+            adaptive_state,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_CONCEPT_SUMMARY,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+        ),
         crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
     )
     .min(cold_rate);
@@ -1797,5 +1817,45 @@ mod tests {
 
         config.ars.acceleration.enabled = false;
         assert!(signal_hint_for_concept_summary_job(&config, Some(&bucket)).is_none());
+    }
+
+    /// v0.28.7+ audit M-5 (Cap A mirror) — see synthesis-side test in
+    /// `recall_synthesis.rs::tests::m5_synthesis_threshold_snaps_to_config_on_rollback`.
+    /// Same regression vector: rollback must collapse to the static
+    /// concept-summary config default, not the persisted blended scalar.
+    #[test]
+    fn m5_concept_summary_threshold_snaps_to_config_on_rollback() {
+        let config = ReinConfig::default();
+        let mut state = AdaptiveState::default();
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+            0.88,
+        );
+
+        let (_cold_start, threshold_rollback) = effective_concept_summary_gate_parameters(
+            &config,
+            Some(&state),
+            Some(11),
+            "Semantic",
+            0.0,
+        );
+        assert!(
+            (threshold_rollback - CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD).abs() < 1e-9,
+            "rollback threshold = {threshold_rollback}; expected static default \
+             {CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD}"
+        );
+
+        let (_cold_start, threshold_canary) = effective_concept_summary_gate_parameters(
+            &config,
+            Some(&state),
+            Some(11),
+            "Semantic",
+            1.0,
+        );
+        assert!(
+            (threshold_canary - 0.88).abs() < 1e-9,
+            "canary path must use persisted scalar as anchor when no bucket exists \
+             (got {threshold_canary})"
+        );
     }
 }

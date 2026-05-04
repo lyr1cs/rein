@@ -208,7 +208,14 @@ pub fn evaluate_ars_acceleration_release_gate(
         ArsParameterPolicyLoadStatus::Missing => {
             canary_blockers.push("ars_parameter_policy_missing".to_string());
         }
-        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError => {
+        ArsParameterPolicyLoadStatus::Corrupt
+        | ArsParameterPolicyLoadStatus::UnsupportedSchema
+        | ArsParameterPolicyLoadStatus::StorageError => {
+            // R5 P2 fix (2026-05-04): all three "unhealthy" states
+            // collapse to the same blocker — the canary cannot
+            // promote against a policy row we can't safely interpret,
+            // regardless of whether the cause is parse error,
+            // future-schema downgrade, or transient I/O failure.
             canary_blockers.push("ars_parameter_policy_unhealthy".to_string());
         }
         ArsParameterPolicyLoadStatus::Loaded => {
@@ -275,7 +282,9 @@ fn doctor_policy_signal(
             "ok",
             "missing policy row; dynamic ARS parameters disabled".to_string(),
         ),
-        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError => (
+        ArsParameterPolicyLoadStatus::Corrupt
+        | ArsParameterPolicyLoadStatus::UnsupportedSchema
+        | ArsParameterPolicyLoadStatus::StorageError => (
             "warn",
             format!(
                 "policy row unhealthy; dynamic ARS parameters disabled ({})",
@@ -309,6 +318,7 @@ fn policy_status_name(status: &ArsParameterPolicyLoadStatus) -> &'static str {
         ArsParameterPolicyLoadStatus::Missing => "missing",
         ArsParameterPolicyLoadStatus::Loaded => "loaded",
         ArsParameterPolicyLoadStatus::Corrupt => "corrupt",
+        ArsParameterPolicyLoadStatus::UnsupportedSchema => "unsupported_schema",
         ArsParameterPolicyLoadStatus::StorageError => "storage_error",
     }
 }

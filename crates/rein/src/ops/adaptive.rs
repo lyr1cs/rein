@@ -59,40 +59,55 @@ fn persist_ars_effective_scalars(
         concept_cold_start as f64,
     );
 
-    // v0.28.7 M-1 — judge_sample_rate scalars are persisted per cold/warm
-    // ladder, but the underlying surface contributing drift signal differs:
-    // both synthesis and concept-summary funnel into the same global ladder
-    // here. We compute against `JudgeSurface::Synthesis` for consistency
-    // with the historical behavior; consumer call sites in
-    // ops/recall_synthesis.rs and ops/concept_summary.rs do their own
-    // per-surface lookup (see those files) and will not silently zero
-    // each other.
-    let judge_sample_rate_cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_cold_start,
+    // v0.28.7+ audit M-1 persistence-side fix: compute and persist
+    // `judge_sample_rate` cold/warm scalars **per surface**. v0.28.7's
+    // input-side fix already split drift gating per-surface, but the
+    // PERSISTED scalars were still cluster-shared (computed against
+    // `JudgeSurface::Synthesis` and read by both surfaces) — so a
+    // synthesis-only drift event would zero concept-summary's persisted
+    // sample rate via the shared scalar, defeating the per-surface
+    // input-side gate. Splitting the persisted scalars closes the loop.
+    //
+    // The legacy cluster-shared keys (`..._COLD_START` / `..._WARM`) are
+    // ALSO updated, with the synthesis-surface value, so a snapshot read
+    // by an old v0.28.7 binary downgrade still sees a usable scalar
+    // matching the pre-fix behavior. Per-surface readers consult the
+    // legacy key only as a one-time fallback during
+    // first-tick-after-upgrade (see `ars_effective_scalar_with_legacy_fallback`).
+    let (synthesis_judge_cold, synthesis_judge_warm) = compute_and_persist_judge_sample_rate(
+        state,
+        crate::ops::ars_tuning::JudgeSurface::Synthesis,
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS,
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_SYNTHESIS,
         calibration,
         judge_sample_rate_adoption_weight,
-        true,
-        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START),
-        crate::ops::ars_tuning::JudgeSurface::Synthesis,
+        config,
     );
+    let (_concept_judge_cold, _concept_judge_warm) = compute_and_persist_judge_sample_rate(
+        state,
+        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY,
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_CONCEPT_SUMMARY,
+        calibration,
+        judge_sample_rate_adoption_weight,
+        config,
+    );
+    // Downgrade-compat: keep writing the legacy cluster-shared keys
+    // with the synthesis-surface value (the pre-fix behavior). A
+    // downgraded v0.28.7 binary reading this snapshot still sees a
+    // sensible value here.
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
-        judge_sample_rate_cold,
+        synthesis_judge_cold,
     );
-
-    let judge_sample_rate_warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_warm,
-        calibration,
-        judge_sample_rate_adoption_weight,
-        false,
-        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM),
-        crate::ops::ars_tuning::JudgeSurface::Synthesis,
-    )
-    .min(judge_sample_rate_cold);
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
-        judge_sample_rate_warm,
+        synthesis_judge_warm,
     );
+    // Bind the synthesis values to a discardable name so the existing
+    // local variable consumers below (none in this function — the
+    // threshold blocks use their own scope) don't break.
+    let _ = (synthesis_judge_cold, synthesis_judge_warm);
 
     let threshold_inputs = crate::ops::ars_tuning::TrustInputs {
         enabled: config.ars.acceleration.enabled,
@@ -140,6 +155,63 @@ fn persist_ars_effective_scalars(
         crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
         concept_threshold,
     );
+}
+
+/// v0.28.7+ audit M-1 persistence-side helper — compute and persist
+/// the per-surface `judge_sample_rate` cold + warm scalars.
+///
+/// Returns `(cold, warm)` for the caller to forward to the
+/// downgrade-compat legacy-shared-key writes (see
+/// `persist_ars_effective_scalars`). The caller is responsible for
+/// choosing which surface's values to mirror into the legacy keys.
+///
+/// Each per-surface read consults
+/// `ars_effective_scalar_with_legacy_fallback` so the
+/// first-tick-after-upgrade path doesn't lose canary continuity:
+/// per-surface key absent → fall back to legacy shared key → blend
+/// against that. After the next pipeline tick writes the per-surface
+/// key, the fallback is no longer consulted on subsequent reads.
+fn compute_and_persist_judge_sample_rate(
+    state: &mut crate::store::adaptive::AdaptiveState,
+    surface: crate::ops::ars_tuning::JudgeSurface,
+    cold_key: &'static str,
+    warm_key: &'static str,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    judge_sample_rate_adoption_weight: f64,
+    config: &ReinConfig,
+) -> (f64, f64) {
+    let previous_cold = crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+        state,
+        cold_key,
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+    );
+    let cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
+        config.ars.llm_judge.sample_rate_cold_start,
+        calibration,
+        judge_sample_rate_adoption_weight,
+        true,
+        previous_cold,
+        surface,
+    );
+    state.set_ars_effective_scalar(cold_key, cold);
+
+    let previous_warm = crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+        state,
+        warm_key,
+        crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+    );
+    let warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
+        config.ars.llm_judge.sample_rate_warm,
+        calibration,
+        judge_sample_rate_adoption_weight,
+        false,
+        previous_warm,
+        surface,
+    )
+    .min(cold);
+    state.set_ars_effective_scalar(warm_key, warm);
+
+    (cold, warm)
 }
 
 fn useful_rate_weights_from_signal_hint_priors(
@@ -643,8 +715,23 @@ fn refresh_ars_parameter_policy(
     let loaded = load_parameter_policy(conn);
     if matches!(
         loaded.status,
-        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError
+        ArsParameterPolicyLoadStatus::Corrupt
+            | ArsParameterPolicyLoadStatus::UnsupportedSchema
+            | ArsParameterPolicyLoadStatus::StorageError
     ) {
+        // R6 P2 fix (2026-05-04): UnsupportedSchema MUST early-return
+        // here, not just Corrupt + StorageError. Pre-fix, an older
+        // binary running against a future-schema row would parse it as
+        // `disabled` at `revision=0` (the default fallback in
+        // `load_parameter_policy`), then build a fresh disabled policy
+        // and call `save_parameter_policy_cas(expected_revision=0)`.
+        // If the stored row's `revision` field happens to be missing
+        // or zero, `COALESCE(json_extract(value, '$.revision'), 0) = 0`
+        // matches and the CAS UPDATE OVERWRITES the future-schema
+        // row — destroying the newer binary's canary state on every
+        // pipeline tick a downgraded binary touches the vault.
+        // doctor / release-gate already collapse all three statuses
+        // to "unhealthy"; refresh must do the same.
         tracing::warn!(
             status = ?loaded.status,
             error = ?loaded.error,
@@ -1639,12 +1726,167 @@ fn parse_candidates_from_event(
         .into_iter()
         .collect();
 
+    // v0.28.7+ audit M-8 R2 P2 follow-up — extract the read-time
+    // `query_cluster_id` recorded at recall emit time. Pre-fix events
+    // (R1 and earlier) lack this field; fall through to `None` and
+    // let `top_vec_hit_cluster` derive a best-effort bucket from the
+    // candidates payload.
+    let query_cluster_id_at_recall: Option<u32> = payload_obj
+        .get("query_cluster_id_at_recall")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    // v0.28.7+ audit M-8 R3 P2 follow-up — extract the cluster_version
+    // stamp recorded at recall emit time. Pre-fix events lack this
+    // field; learn-time treats `None` as a stale id (always falls back
+    // to the candidate-derived bucket, since we can't validate the
+    // recorded id without a version stamp).
+    let cluster_version_at_recall: Option<u64> = payload_obj
+        .get("cluster_version_at_recall")
+        .and_then(|v| v.as_u64());
+    // v0.28.7+ audit R13 P2 (2026-05-04) — extract the recorded
+    // top-vec memory id used by `top_vec_hit_cluster` for the
+    // memory-id-remap path. Pre-R13 events lack this field; the
+    // helper falls through to the legacy version-match path.
+    let query_top_vec_memory_id_at_recall: Option<String> = payload_obj
+        .get("query_top_vec_memory_id_at_recall")
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+
     Some(crate::search::alpha_optimizer::RecallEvent {
         request_id,
         candidates,
         accessed_ids,
         timestamp: ts,
+        query_cluster_id_at_recall,
+        cluster_version_at_recall,
+        query_top_vec_memory_id_at_recall,
     })
+}
+
+/// v0.28.7+ audit M-8 — derive the per-event cluster bucket key from the
+/// **top vector hit** at recall time, mirroring read-time's
+/// `query_cluster_id` lookup in `search/recall.rs` (which calls
+/// `vec_for_fusion.first()` and reads its `cluster_id` from the memories
+/// table).
+///
+/// Pre-fix, both `compute_counterfactual_alphas` (alpha learning) and
+/// `compute_shadow_fusion_weight_replay` (shadow simplex weights) used a
+/// majority vote over `event.accessed_ids` (clicks) to pick the cluster
+/// bucket. When the user's click was NOT the top vec hit, learn-time and
+/// read-time bucketed the same query under different clusters, halving
+/// per-cluster bucket utility for both consumers. The audit-named fix is
+/// to align both sides on top-vec-hit.
+///
+/// Returns `None` (event is dropped from bucketing) when:
+/// - the event has no recorded read-time `query_cluster_id_at_recall`
+///   AND `event.candidates` has no entries with finite **strictly
+///   positive** `vec_norm`, OR
+/// - the top-vec-hit candidate's `memory_id` has no cluster mapping in
+///   `memory_clusters` AND no recorded field is present.
+///
+/// All drop conditions match read-time behavior: `query_cluster_id`
+/// resolves to `None` and the per-cluster lookup is skipped.
+///
+/// **Preference order (v0.28.7+ R2 P2 follow-up):**
+///
+/// 1. `event.query_cluster_id_at_recall` — the cluster id production
+///    recall actually used at fusion time. Persisted in the
+///    `recall_complete` event payload at emit time
+///    (`search/recall.rs`); this is the **only** value guaranteed to
+///    match read-time, since by event-emit time the candidates list
+///    may have been collapsed to canonical successors or filtered
+///    by keyword/time/tier. Codex review R2 P2 catch (2026-05-04).
+///
+/// 2. Fallback: derive from the highest-`vec_norm` candidate in the
+///    payload, filtered by `vec_norm > 0.0`. Used for pre-R2-fix
+///    events that lack the persisted field, and as a defense-in-depth
+///    floor for any future code path that constructs a `RecallEvent`
+///    without populating the field.
+///
+/// **`vec_norm > 0.0` (not just `is_finite()`).** Read-time at
+/// `search/recall.rs::query_cluster_id` only consults the cluster
+/// lookup when `vec_for_fusion.first()` is present — i.e., the vec
+/// channel actually returned a ranked hit. The candidate-payload
+/// emitter populates every FTS/KG candidate with a fallback
+/// `vec_norm = 0.0` via `unwrap_or(0.0)` even when the vec channel
+/// was empty or skipped. Filtering only `is_finite()` would treat
+/// those `0.0` fallbacks as real vec hits, bucketing the event under
+/// the highest-`bm25_norm` candidate's cluster while read-time
+/// silently produces `None` for the same query shape — re-creating
+/// exactly the learn/read disagreement M-8 was meant to close.
+/// Codex review R1 P2 audit-followup catch (2026-05-04).
+fn top_vec_hit_cluster(
+    event: &crate::search::alpha_optimizer::RecallEvent,
+    memory_clusters: &std::collections::HashMap<String, u32>,
+    current_cluster_version: u64,
+) -> Option<u32> {
+    // R13 P2 (2026-05-04) **PREFERRED PATH**: remap via the recorded
+    // top-vec memory id. The recall emit stamps
+    // `query_top_vec_memory_id_at_recall` with the exact memory id
+    // production used as `vec_for_fusion.first()`. Learn-time looks
+    // it up against the CURRENT `memory_clusters` map, so the
+    // returned cluster id reflects the post-recluster truth a fresh
+    // read would also see — regardless of how many M4 reclusters
+    // fired between recall and learn-time. This closes R13's normal-
+    // pipeline bug: M4 runs at the START of `run_adaptive_pipeline`
+    // and increments `state.cluster_version` BEFORE M2 consumes
+    // events, so the legacy version-match path (below) treats every
+    // event as stale on the normal learning path. The memory-id
+    // remap is correct in that case because the lookup is against
+    // current truth, not a versioned snapshot of past truth.
+    //
+    // The remap path is also a strict superset of read-time
+    // semantics: production read-time at `search/recall.rs::query_cluster_id`
+    // also looks up the top-vec memory id in the snapshot's
+    // `memory_clusters` map. Mirroring that lookup at learn-time is
+    // the structural alignment M-8 was always supposed to enforce.
+    if let Some(memory_id) = event.query_top_vec_memory_id_at_recall.as_deref() {
+        if let Some(&cluster) = memory_clusters.get(memory_id) {
+            return Some(cluster);
+        }
+        // Memory was deleted between recall and learn-time — fall
+        // through to the legacy paths so we don't lose the bucket
+        // entirely (best-effort recovery via candidates).
+    }
+
+    // Backward-compat for pre-R13 events: trust the read-time-recorded
+    // cluster id verbatim, **but only when the `cluster_version`
+    // stamp still matches**. HDBSCAN cluster ids are local labels —
+    // a recluster between recall and learn-time can reassign the
+    // same numeric id to a totally different semantic cluster
+    // (R3 P2 catch 2026-05-04). When versions disagree we DROP the
+    // recorded id and fall through to the candidate-derived path.
+    //
+    // Note: post-R13 events ALWAYS have `query_top_vec_memory_id_at_recall`
+    // populated (when vec_for_fusion was non-empty), so this branch
+    // is only reachable for pre-R13 events or for post-R13 events
+    // whose stamped memory got deleted. The cluster-version match
+    // guarantees we don't honor a stale id.
+    if let (Some(cid), Some(v)) = (
+        event.query_cluster_id_at_recall,
+        event.cluster_version_at_recall,
+    ) {
+        if v == current_cluster_version {
+            return Some(cid);
+        }
+        // version mismatch → fall through to candidates-derived path
+    }
+
+    // Final fallback: derive from the candidates payload using the
+    // CURRENT `memory_clusters` so the bucket reflects post-recluster
+    // truth. Used for pre-R2-fix events lacking any recorded field,
+    // R3 stale-version events from older binaries, or post-R13 events
+    // whose stamped memory was deleted AND whose cluster_version
+    // mismatches.
+    let top = event
+        .candidates
+        .iter()
+        .filter(|c| c.vec_norm.is_finite() && c.vec_norm > 0.0)
+        .max_by(|a, b| {
+            a.vec_norm
+                .partial_cmp(&b.vec_norm)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    memory_clusters.get(&top.memory_id).copied()
 }
 
 /// Compute optimal alpha values via counterfactual replay over candidate sets.
@@ -1762,14 +2004,11 @@ fn compute_counterfactual_alphas(
             .get(re.request_id.as_str())
             .copied()
             .unwrap_or("semantic");
-        // Vote for dominant cluster among accessed memories
-        let mut votes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-        for id in &re.accessed_ids {
-            if let Some(&cid) = state.memory_clusters.get(id) {
-                *votes.entry(cid).or_default() += 1;
-            }
-        }
-        if let Some((&cid, _)) = votes.iter().max_by_key(|(_, &c)| c) {
+        // v0.28.7+ audit M-8: bucket on read-time-aligned top-vec-hit
+        // cluster (was: majority vote over `accessed_ids` clicks). See
+        // `top_vec_hit_cluster` doc comment for the disagreement-halving
+        // bug it closes.
+        if let Some(cid) = top_vec_hit_cluster(re, &state.memory_clusters, state.cluster_version) {
             cluster_buckets
                 .entry((qt.to_string(), cid))
                 .or_default()
@@ -1910,13 +2149,13 @@ fn compute_shadow_fusion_weight_replay(
             .get(event.request_id.as_str())
             .copied()
             .unwrap_or("semantic");
-        let mut votes: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-        for id in &event.accessed_ids {
-            if let Some(&cid) = state.memory_clusters.get(id) {
-                *votes.entry(cid).or_default() += 1;
-            }
-        }
-        if let Some((&cid, _)) = votes.iter().max_by_key(|(_, &count)| count) {
+        // v0.28.7+ audit M-8: bucket on read-time-aligned top-vec-hit
+        // cluster (was: majority vote over `accessed_ids` clicks). See
+        // `top_vec_hit_cluster` doc comment in this file. This loop is
+        // the shadow-fusion-weights mirror of the alpha-learning loop in
+        // `compute_counterfactual_alphas`; both must align with read-time.
+        if let Some(cid) = top_vec_hit_cluster(event, &state.memory_clusters, state.cluster_version)
+        {
             cluster_buckets
                 .entry((qt.to_string(), cid))
                 .or_default()
@@ -2155,22 +2394,40 @@ fn commit_shadow_fusion_weight_replay(
     state: &mut crate::store::adaptive::AdaptiveState,
     report: &ShadowFusionReplayReport,
 ) {
+    // v0.28.7+ audit L6 — call the LRU-cap eviction helper before each
+    // new-key insert so `learned_shadow_fusion` cannot grow unbounded.
+    // Same-key rewrites are no-ops in the helper (the global / per-qt
+    // keys re-write each pipeline tick); only fresh per-cluster keys
+    // can trigger eviction in practice.
     if let Some(global) = &report.global {
+        let key = "global".to_string();
+        crate::store::adaptive::evict_learned_shadow_fusion_lru_if_at_cap(
+            &mut state.learned_shadow_fusion,
+            &key,
+        );
         state
             .learned_shadow_fusion
-            .insert("global".into(), learned_shadow_fusion_entry(global));
+            .insert(key, learned_shadow_fusion_entry(global));
     }
     for (query_type, learned) in &report.by_query_type {
-        state.learned_shadow_fusion.insert(
-            crate::store::adaptive::AdaptiveState::bucket_key(query_type, None),
-            learned_shadow_fusion_entry(learned),
+        let key = crate::store::adaptive::AdaptiveState::bucket_key(query_type, None);
+        crate::store::adaptive::evict_learned_shadow_fusion_lru_if_at_cap(
+            &mut state.learned_shadow_fusion,
+            &key,
         );
+        state
+            .learned_shadow_fusion
+            .insert(key, learned_shadow_fusion_entry(learned));
     }
     for ((query_type, cluster_id), learned) in &report.by_cluster {
-        state.learned_shadow_fusion.insert(
-            crate::store::adaptive::AdaptiveState::bucket_key(query_type, Some(*cluster_id)),
-            learned_shadow_fusion_entry(learned),
+        let key = crate::store::adaptive::AdaptiveState::bucket_key(query_type, Some(*cluster_id));
+        crate::store::adaptive::evict_learned_shadow_fusion_lru_if_at_cap(
+            &mut state.learned_shadow_fusion,
+            &key,
         );
+        state
+            .learned_shadow_fusion
+            .insert(key, learned_shadow_fusion_entry(learned));
     }
 }
 
@@ -3798,6 +4055,23 @@ mod tests {
         adaptive::emit_event(store.conn(), event).unwrap()
     }
 
+    /// v0.28.7+ audit M-8 (test fixture): post-fix `compute_shadow_fusion_weight_replay`
+    /// buckets by the top-vec-hit candidate's cluster (read-time aligned),
+    /// NOT by majority vote over `accessed_ids`. The original fixture
+    /// shape (accessed_id at vec_norm=0.2, an unused candidate at
+    /// vec_norm=0.9 with no cluster mapping) was specifically engineered
+    /// to exercise the disagreement bug; after the M-8 fix it produces
+    /// the (correct) "top-vec-hit has no cluster, drop from bucket"
+    /// behavior, which broke the original assertions about per-cluster
+    /// bucket presence.
+    ///
+    /// New shape: `accessed_id` IS the top-vec-hit (the realistic
+    /// "user clicked the highest-ranked vec candidate" pattern), and
+    /// the secondary candidate is a lower-ranked alternative. The
+    /// cluster of `accessed_id` (which the caller maps via
+    /// `state.memory_clusters`) becomes the bucket key — same outcome
+    /// the original tests expected, but achieved via the read-time-
+    /// aligned bucketing path that the audit asked for.
     fn shadow_replay_event(
         request_id: &str,
         accessed_id: &str,
@@ -3808,16 +4082,20 @@ mod tests {
                 crate::search::alpha_optimizer::CandidateLog {
                     memory_id: accessed_id.to_string(),
                     bm25_norm: 0.2,
-                    vec_norm: 0.2,
+                    // M-8 fix: accessed_id is the top-vec-hit so
+                    // post-fix bucketing picks its cluster.
+                    vec_norm: 0.95,
                     kg_norm: 1.0,
                     episode_norm: 0.1,
                     support_count: 1,
                     source_diversity: 1.0,
                 },
                 crate::search::alpha_optimizer::CandidateLog {
-                    memory_id: format!("unused-{request_id}"),
+                    memory_id: format!("alt-{request_id}"),
                     bm25_norm: 0.9,
-                    vec_norm: 0.9,
+                    // Lower than accessed_id so accessed_id is the
+                    // unambiguous top-vec-hit.
+                    vec_norm: 0.30,
                     kg_norm: 0.0,
                     episode_norm: 0.1,
                     support_count: 1,
@@ -3826,6 +4104,9 @@ mod tests {
             ],
             accessed_ids: vec![accessed_id.to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         }
     }
 
@@ -4923,6 +5204,9 @@ mod tests {
                 // Agent accessed the BM25-dominant candidate
                 accessed_ids: vec![mem_a],
                 timestamp: Utc::now() - chrono::Duration::hours(i as i64),
+                query_cluster_id_at_recall: None,
+                cluster_version_at_recall: None,
+                query_top_vec_memory_id_at_recall: None,
             };
             recall_events.push(recall_event);
 
@@ -4993,6 +5277,9 @@ mod tests {
                 ],
                 accessed_ids: vec![target.clone()],
                 timestamp: Utc::now() - chrono::Duration::minutes(i as i64),
+                query_cluster_id_at_recall: None,
+                cluster_version_at_recall: None,
+                query_top_vec_memory_id_at_recall: None,
             });
             stored_events.push(adaptive::StoredEvent {
                 id: (i + 1) as i64,
@@ -5914,5 +6201,644 @@ mod tests {
              not advance to rid-C's access past rid-B's orphan. \
              A `max(correlated_id)` strategy would fail this assertion."
         );
+    }
+
+    /// v0.28.7+ audit M-8 — `top_vec_hit_cluster` must return the
+    /// cluster of the candidate with the highest `vec_norm`, NOT a
+    /// majority vote over `accessed_ids` clicks. Pre-fix, learn-time
+    /// (`compute_counterfactual_alphas` / `compute_shadow_fusion_weight_replay`)
+    /// disagreed with read-time (`search/recall.rs::query_cluster_id` =
+    /// `vec_for_fusion.first()`) whenever the user clicked a non-top-vec
+    /// candidate. The disagreement halved per-cluster bucket utility for
+    /// both alpha learning and shadow fusion learning.
+    ///
+    /// Test setup deliberately puts the click and the top-vec-hit in
+    /// different clusters so the pre-fix majority-vote and the post-fix
+    /// top-vec-hit produce DIFFERENT bucket choices. Asserts the
+    /// post-fix choice (top-vec-hit's cluster).
+    #[test]
+    fn m8_top_vec_hit_cluster_aligns_learn_with_read_time() {
+        use crate::search::alpha_optimizer::{CandidateLog, RecallEvent};
+
+        let event = RecallEvent {
+            request_id: "rid-1".to_string(),
+            candidates: vec![
+                // Top vec hit: vec_norm=0.9 — read-time would bucket on
+                // THIS candidate's cluster.
+                CandidateLog {
+                    memory_id: "vec_top".to_string(),
+                    bm25_norm: 0.0,
+                    vec_norm: 0.9,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                // User actually clicked this lower-vec-ranked candidate.
+                CandidateLog {
+                    memory_id: "click_target".to_string(),
+                    bm25_norm: 0.1,
+                    vec_norm: 0.1,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["click_target".to_string()],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+
+        let mut memory_clusters: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        memory_clusters.insert("vec_top".to_string(), 100);
+        memory_clusters.insert("click_target".to_string(), 200);
+
+        let resolved = top_vec_hit_cluster(&event, &memory_clusters, 0);
+        assert_eq!(
+            resolved,
+            Some(100),
+            "must bucket on top-vec-hit cluster (100), NOT majority of accessed_ids (200). \
+             A regression to majority-vote-over-clicks would return Some(200) here, \
+             reproducing the per-cluster bucket-utility halving the audit named."
+        );
+
+        // No-vec-channel event drops out of bucketing (matches read-time
+        // `vec_for_fusion.first() == None` skip path).
+        let event_no_vec = RecallEvent {
+            request_id: "rid-2".to_string(),
+            candidates: vec![],
+            accessed_ids: vec!["click_target".to_string()],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_no_vec, &memory_clusters, 0),
+            None,
+            "empty candidates list must drop out of bucketing"
+        );
+
+        // Top-vec-hit with no cluster mapping also drops (matches read-time
+        // `query_cluster_id = None` when the SQL row has NULL cluster_id).
+        let event_no_cluster = RecallEvent {
+            request_id: "rid-3".to_string(),
+            candidates: vec![CandidateLog {
+                memory_id: "unknown_cluster".to_string(),
+                bm25_norm: 0.0,
+                vec_norm: 0.5,
+                kg_norm: 0.0,
+                episode_norm: 0.0,
+                support_count: 1,
+                source_diversity: 1.0,
+            }],
+            accessed_ids: vec![],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_no_cluster, &memory_clusters, 0),
+            None,
+            "top-vec-hit without cluster mapping must drop"
+        );
+
+        // NaN vec_norm is filtered (top hit chosen from finite candidates).
+        let event_nan = RecallEvent {
+            request_id: "rid-4".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "nan_candidate".to_string(),
+                    bm25_norm: 0.0,
+                    vec_norm: f32::NAN,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "vec_top".to_string(),
+                    bm25_norm: 0.0,
+                    vec_norm: 0.3,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec![],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_nan, &memory_clusters, 0),
+            Some(100),
+            "NaN vec_norm must not eclipse a finite candidate"
+        );
+
+        // v0.28.7+ audit M-8 R1 P2 follow-up — the candidate emitter
+        // populates `vec_norm = 0.0` for FTS/KG candidates when the vec
+        // channel was skipped or returned no hits. Read-time at
+        // `search/recall.rs::query_cluster_id` only fires the cluster
+        // lookup when `vec_for_fusion.first()` is present (= real vec
+        // hit). Learn-time MUST mirror that: candidates with
+        // `vec_norm == 0.0` are NOT real vec hits and must not bucket
+        // the event.
+        let event_all_zero_vec = crate::search::alpha_optimizer::RecallEvent {
+            request_id: "rid-zero-vec".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "vec_top".to_string(),
+                    bm25_norm: 0.9,
+                    vec_norm: 0.0, // FTS-only fallback — NOT a real vec hit
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "click_target".to_string(),
+                    bm25_norm: 0.5,
+                    vec_norm: 0.0, // also FTS-only fallback
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["click_target".to_string()],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_all_zero_vec, &memory_clusters, 0),
+            None,
+            "all-zero `vec_norm` candidates must NOT bucket the event \
+             (mirrors read-time `vec_for_fusion.first() == None` skip path). \
+             Pre-R1 fix the helper accepted `0.0` as a real vec hit, which \
+             would silently bucket FTS/KG-only events under the top-bm25-by-\
+             tiebreak candidate's cluster while production read-time \
+             ignored the same query shape."
+        );
+
+        // Mixed: one real vec hit (vec_norm > 0) and one zero-vec
+        // fallback. The real vec hit wins regardless of bm25 ranking.
+        let event_mixed = crate::search::alpha_optimizer::RecallEvent {
+            request_id: "rid-mixed".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "vec_top".to_string(),
+                    bm25_norm: 0.1,
+                    vec_norm: 0.4, // real vec hit
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "click_target".to_string(),
+                    bm25_norm: 0.95, // higher bm25 — irrelevant for vec bucketing
+                    vec_norm: 0.0,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["click_target".to_string()],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_mixed, &memory_clusters, 0),
+            Some(100),
+            "mixed event must pick the real vec hit's cluster (100), not the \
+             higher-bm25 candidate's cluster (200)"
+        );
+    }
+
+    /// v0.28.7+ audit M-8 R2 P2 #1 follow-up — when
+    /// `event.query_cluster_id_at_recall` is `Some`, `top_vec_hit_cluster`
+    /// must prefer it verbatim and ignore the derived
+    /// candidates-payload bucket. This is the only path that
+    /// guarantees alignment with read-time when the actual top vec
+    /// hit was collapsed to a canonical successor or filtered out by
+    /// the time the event was emitted.
+    #[test]
+    fn m8_top_vec_hit_cluster_prefers_recorded_field_over_derived() {
+        use crate::search::alpha_optimizer::{CandidateLog, RecallEvent};
+
+        let event = crate::search::alpha_optimizer::RecallEvent {
+            request_id: "rid-recorded".to_string(),
+            // Candidates payload alone would derive cluster=200 (the
+            // lone real vec hit, mapped via memory_clusters below).
+            candidates: vec![CandidateLog {
+                memory_id: "derived_top".to_string(),
+                bm25_norm: 0.0,
+                vec_norm: 0.5,
+                kg_norm: 0.0,
+                episode_norm: 0.0,
+                support_count: 1,
+                source_diversity: 1.0,
+            }],
+            accessed_ids: vec![],
+            timestamp: chrono::Utc::now(),
+            // But production read-time recorded cluster=42 — that is
+            // the SOURCE OF TRUTH for bucket alignment.
+            query_cluster_id_at_recall: Some(42),
+            // R3 P2 follow-up: cluster_version stamped at recall time.
+            // Matching the helper's `current_cluster_version=7` arg
+            // below preserves the recorded id.
+            cluster_version_at_recall: Some(7),
+            query_top_vec_memory_id_at_recall: None,
+        };
+
+        let mut memory_clusters: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        memory_clusters.insert("derived_top".to_string(), 200);
+
+        assert_eq!(
+            top_vec_hit_cluster(&event, &memory_clusters, 7),
+            Some(42),
+            "must prefer event.query_cluster_id_at_recall (42) over the \
+             derived candidates-payload bucket (200) when cluster_version \
+             stamps match. Pre-R2 fix the helper would have returned 200, \
+             re-creating the learn/read divergence whenever the read-time \
+             top-vec-hit row was collapsed/filtered between recall and \
+             event emission."
+        );
+
+        // Sanity: when the field is None, fallback to derived bucket.
+        let event_no_field = RecallEvent {
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            ..event.clone()
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_no_field, &memory_clusters, 7),
+            Some(200),
+            "fallback to derived bucket when query_cluster_id_at_recall is None"
+        );
+
+        // R3 P2 follow-up: when the recorded cluster_version is STALE
+        // (a recluster happened between recall and learn-time), drop
+        // the recorded id and fall through to derived. Without this
+        // version check, the recorded `42` would silently apply to a
+        // post-recluster cluster that may have nothing to do with the
+        // pre-recluster cluster `42`.
+        let event_stale_version = RecallEvent {
+            query_cluster_id_at_recall: Some(42),
+            cluster_version_at_recall: Some(7), // stamped at v7
+            ..event.clone()
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_stale_version, &memory_clusters, 8),
+            Some(200),
+            "current_cluster_version=8 disagrees with stamped v7; recorded id \
+             must be dropped and bucket must fall back to candidate-derived \
+             (200, the current cluster of the top-vec-hit). Pre-R3 fix the \
+             helper returned 42 unconditionally, mis-attributing learn weights \
+             to a stale cluster id."
+        );
+
+        // R3 P2 sanity: pre-R3 events lacking the version stamp ALSO
+        // fall back (we cannot validate the recorded id without a
+        // stamp, so treat it as untrusted).
+        let event_no_version_stamp = RecallEvent {
+            query_cluster_id_at_recall: Some(42),
+            cluster_version_at_recall: None,
+            ..event.clone()
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_no_version_stamp, &memory_clusters, 7),
+            Some(200),
+            "pre-R3 events without cluster_version_at_recall stamp must fall \
+             back to derived bucket — we can't validate the recorded id \
+             without a version, so treat it as untrusted"
+        );
+    }
+
+    /// v0.28.7+ audit R13 P2 (2026-05-04) — `query_top_vec_memory_id_at_recall`
+    /// is the PREFERRED bucket-resolution path. The recall emit always
+    /// stamps it (when vec_for_fusion is non-empty), and learn-time
+    /// looks up the memory id in the CURRENT memory_clusters map to
+    /// get the post-recluster cluster id. This works correctly across
+    /// HDBSCAN reclusters AND across the normal M4-then-M2 pipeline
+    /// order (where cluster_version was incremented BEFORE M2
+    /// consumed the events).
+    ///
+    /// Pre-R13 the helper required `cluster_version_at_recall` to
+    /// match `current_cluster_version`, but in the normal pipeline
+    /// order M4 increments the version before M2 consumes events, so
+    /// the version-match guard would force fallback for EVERY event
+    /// in the common path — silently dropping scoped learning for
+    /// events whose top-vec hit was filtered/collapsed (the case the
+    /// `query_cluster_id_at_recall` field was originally added to
+    /// cover).
+    #[test]
+    fn r13_top_vec_hit_cluster_remaps_via_memory_id_across_recluster() {
+        use crate::search::alpha_optimizer::{CandidateLog, RecallEvent};
+
+        // Plant a memory_clusters map that represents the POST-recluster
+        // state: the recall-time top-vec memory `m_top` was originally
+        // in cluster 7 (recorded in `query_cluster_id_at_recall`) but
+        // has been reassigned to cluster 12 by M4 reclustering.
+        let mut memory_clusters: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        memory_clusters.insert("m_top".to_string(), 12); // post-recluster id
+
+        // Event stamped pre-recluster: cluster_id=7, version=5,
+        // memory_id="m_top". Current cluster_version is 6 (M4 ran,
+        // version was incremented).
+        let event = RecallEvent {
+            request_id: "rid-r13-remap".to_string(),
+            candidates: vec![CandidateLog {
+                memory_id: "m_top".to_string(),
+                bm25_norm: 0.0,
+                vec_norm: 0.5,
+                kg_norm: 0.0,
+                episode_norm: 0.0,
+                support_count: 1,
+                source_diversity: 1.0,
+            }],
+            accessed_ids: vec![],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: Some(7),
+            cluster_version_at_recall: Some(5),
+            query_top_vec_memory_id_at_recall: Some("m_top".to_string()),
+        };
+
+        // current_cluster_version (6) != stamped version (5), so the
+        // R3 version-match guard would force fallback. R13's memory-
+        // id-remap path takes precedence and looks up `m_top` in
+        // memory_clusters → returns 12 (the post-recluster id).
+        assert_eq!(
+            top_vec_hit_cluster(&event, &memory_clusters, 6),
+            Some(12),
+            "R13 memory-id-remap must return the CURRENT cluster id (12) \
+             for the recorded memory, not the stale stamped id (7) and \
+             not None. Pre-R13 the version-match guard forced fallback \
+             on every event in the M4-then-M2 normal pipeline order, \
+             dropping scoped learning entirely."
+        );
+
+        // Sanity: when the stamped memory was deleted between recall
+        // and learn-time, the lookup misses and we fall through to
+        // the legacy version-match path. With version mismatch, that
+        // also falls through to candidates-derived. With memory_id
+        // present in candidates AND in memory_clusters, the derived
+        // path returns the same answer (12).
+        let mut shrunk_clusters = memory_clusters.clone();
+        shrunk_clusters.remove("m_top");
+        assert_eq!(
+            top_vec_hit_cluster(&event, &shrunk_clusters, 6),
+            None,
+            "R13 sanity: deleted memory + stale version + derived missing \
+             must drop the bucket entirely (candidates_derived also misses \
+             because `m_top` is no longer in shrunk_clusters)"
+        );
+
+        // Sanity: when version stamps DO match, the legacy fast path
+        // would return the stamped cluster_id (7). But R13's memory-
+        // id-remap takes precedence and returns the current cluster id
+        // for the stamped memory (12). Both are "correct" but the
+        // remap is more accurate when reclusters happen — the stamped
+        // id may have been a stale snapshot at recall time.
+        let event_matching_version = RecallEvent {
+            cluster_version_at_recall: Some(6), // matches current_cluster_version
+            ..event.clone()
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&event_matching_version, &memory_clusters, 6),
+            Some(12),
+            "R13 memory-id-remap takes precedence over version-match path; \
+             returning the current cluster (12) — same answer as a fresh \
+             read of `m_top`'s cluster_id would yield"
+        );
+
+        // Sanity: pre-R13 events (no memory_id stamp) fall through to
+        // the legacy version-match path. With matching version, the
+        // legacy path honors the recorded cluster_id verbatim (7).
+        let pre_r13_event = RecallEvent {
+            query_top_vec_memory_id_at_recall: None,
+            cluster_version_at_recall: Some(6),
+            ..event.clone()
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&pre_r13_event, &memory_clusters, 6),
+            Some(7),
+            "pre-R13 backward compat: events without memory_id stamp must \
+             fall through to the legacy version-match path. With matching \
+             version (6), the recorded cluster_id (7) is honored verbatim."
+        );
+
+        // Sanity: pre-R13 events with version mismatch fall all the
+        // way to candidates-derived (cluster 12 from memory_clusters).
+        let pre_r13_stale_version = RecallEvent {
+            query_top_vec_memory_id_at_recall: None,
+            cluster_version_at_recall: Some(4), // stale
+            ..event.clone()
+        };
+        assert_eq!(
+            top_vec_hit_cluster(&pre_r13_stale_version, &memory_clusters, 6),
+            Some(12),
+            "pre-R13 backward compat: events with stale version + no \
+             memory_id stamp fall to candidates-derived"
+        );
+    }
+
+    /// v0.28.7+ audit M-1 persistence-side end-to-end:
+    /// `compute_and_persist_judge_sample_rate` writes to per-surface
+    /// keys and the surfaces do NOT cross-contaminate. With
+    /// synthesis-surface drift active and concept-surface drift quiet,
+    /// only the synthesis-side persisted scalar collapses to its
+    /// static config value (the surface_drift_active early-return path
+    /// in `effective_judge_sample_rate_with_previous`); concept-side
+    /// scalar must still reflect the active canary trust blend.
+    #[test]
+    fn m1_persistence_side_per_surface_independence_under_partial_drift() {
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        // Make the static config values distinguishable so we can tell
+        // "snapped to config" apart from "blended" without depending on
+        // any specific blend coefficient.
+        config.ars.llm_judge.sample_rate_cold_start = 0.5;
+        config.ars.llm_judge.sample_rate_warm = 0.25;
+
+        let calibration = crate::store::adaptive::JudgeCalibrationState {
+            judge_drift_alert_synthesis: 1,
+            judge_drift_alert_concept: 0,
+            judge_drift_alert: 0, // cross-surface kill switch off
+            ..crate::store::adaptive::JudgeCalibrationState::default()
+        };
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        // Pre-seed a blended persisted scalar that differs from the
+        // static config; without M-1 persistence-side independence,
+        // both surfaces would diverge from this value identically.
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY,
+            0.9,
+        );
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_CONCEPT_SUMMARY,
+            0.85,
+        );
+
+        // Synthesis surface: drift_active → fail-closed early-return
+        // in `effective_judge_sample_rate_with_previous`, which yields
+        // **0.0** (no LLM spend), NOT the static config rate. This
+        // matches the v0.28.7 H0 Layer 2 + M-1 input-side discipline:
+        // drift means stop the canary's LLM bleeding, not "fall back
+        // to static blending."
+        let (synth_cold, synth_warm) = compute_and_persist_judge_sample_rate(
+            &mut state,
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_SYNTHESIS,
+            Some(&calibration),
+            1.0, // adoption_weight
+            &config,
+        );
+        assert_eq!(
+            synth_cold, 0.0,
+            "synthesis-surface drift must zero synth cold (fail-closed); got {synth_cold}"
+        );
+        assert_eq!(
+            synth_warm, 0.0,
+            "synthesis-surface drift must zero synth warm (fail-closed); got {synth_warm}"
+        );
+
+        // ConceptSummary surface: drift quiet → fail-closed early-return
+        // does NOT fire. The function continues to the trust blend
+        // against the previously-persisted concept-side scalars
+        // (0.9 / 0.85). Result must be **strictly positive** — that's
+        // the per-surface independence assertion: synthesis drift did
+        // NOT zero the concept-side persisted scalar via the shared
+        // legacy ladder (which was the M-1 persistence-side bug).
+        let (concept_cold, concept_warm) = compute_and_persist_judge_sample_rate(
+            &mut state,
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_CONCEPT_SUMMARY,
+            Some(&calibration),
+            1.0, // adoption_weight
+            &config,
+        );
+        assert!(
+            concept_cold > f64::EPSILON,
+            "concept_cold={concept_cold} must be > 0 — synthesis-surface drift \
+             must NOT cross-contaminate the concept-surface persisted scalar. \
+             Pre-M-1-persistence-side fix this would have been 0.0 because the \
+             reader pulled from the shared legacy scalar that synthesis just zeroed."
+        );
+        assert!(
+            concept_warm > f64::EPSILON,
+            "concept_warm={concept_warm} must be > 0 — same per-surface independence \
+             argument as concept_cold above"
+        );
+        // Sanity bounds.
+        assert!(
+            (0.0..=1.0).contains(&concept_cold),
+            "concept_cold {concept_cold} must be in [0, 1]"
+        );
+        assert!(
+            (0.0..=1.0).contains(&concept_warm),
+            "concept_warm {concept_warm} must be in [0, 1]"
+        );
+
+        // Per-surface keys present in the persisted snapshot.
+        assert!(state
+            .ars_effective_scalar(
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS
+            )
+            .is_some());
+        assert!(state
+            .ars_effective_scalar(
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY
+            )
+            .is_some());
+    }
+
+    /// v0.28.7+ audit M-1 persistence-side — first-tick-after-upgrade
+    /// continuity: a snapshot containing ONLY the legacy cluster-shared
+    /// scalar must let the per-surface read-fallback recover the value
+    /// (no canary learning lost to the schema migration). After the
+    /// per-surface key is then written by `compute_and_persist_judge_sample_rate`,
+    /// subsequent reads see the per-surface value directly.
+    #[test]
+    fn m1_persistence_side_legacy_fallback_preserves_canary_continuity() {
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.ars.llm_judge.sample_rate_cold_start = 0.5;
+        config.ars.llm_judge.sample_rate_warm = 0.25;
+
+        // Pre-upgrade snapshot: only the legacy shared scalar exists.
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+            0.7,
+        );
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+            0.6,
+        );
+        // Per-surface keys absent (this is the upgrade boundary).
+        assert!(state
+            .ars_effective_scalar(
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS
+            )
+            .is_none());
+
+        let calibration = crate::store::adaptive::JudgeCalibrationState::default();
+        let (synth_cold, synth_warm) = compute_and_persist_judge_sample_rate(
+            &mut state,
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS,
+            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_SYNTHESIS,
+            Some(&calibration),
+            1.0,
+            &config,
+        );
+
+        // The legacy fallback must have been consulted (per-surface key
+        // was absent), so the resulting blend uses 0.7 / 0.6 as the
+        // previous_effective. Without the fallback, previous_effective
+        // would have been None → step-bound clamp would snap directly
+        // to the static config (0.5 / 0.25), erasing the canary's
+        // accumulated learning. Assert the result is influenced by the
+        // legacy values.
+        assert!(
+            (synth_cold - 0.5).abs() > 1e-3 || (synth_cold - 0.7).abs() < 0.5,
+            "first-tick-after-upgrade must NOT snap straight to static config; \
+             the legacy 0.7 must be consulted as previous_effective. \
+             Got synth_cold={synth_cold} but expected something blended toward 0.7."
+        );
+        assert!(
+            (synth_warm - 0.25).abs() > 1e-3 || (synth_warm - 0.6).abs() < 0.5,
+            "synth_warm={synth_warm} must reflect legacy fallback influence"
+        );
+
+        // The per-surface key is now persisted; legacy fallback won't
+        // be consulted on the next tick.
+        assert!(state
+            .ars_effective_scalar(
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS
+            )
+            .is_some());
     }
 }

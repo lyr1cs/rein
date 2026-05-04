@@ -34,6 +34,71 @@ pub struct RecallEvent {
     /// Which memories were actually accessed/used after recall.
     pub accessed_ids: Vec<String>,
     pub timestamp: DateTime<Utc>,
+    /// v0.28.7+ audit M-8 R2 P2 follow-up — the cluster id production
+    /// recall actually used to bucket per-cluster fusion lookups
+    /// (`vec_for_fusion.first()`'s cluster mapping at recall time, see
+    /// `search/recall.rs::query_cluster_id`). Persisted into the
+    /// `recall_complete` event payload at emit time so learn-time
+    /// cannot diverge from read-time, even when:
+    /// - the actual top-vec-hit row was collapsed to a canonical
+    ///   successor by the time `candidates` was built, or
+    /// - a keyword/time/tier filter removed the read-time top hit
+    ///   from the final candidate set.
+    ///
+    /// Backward compat: pre-fix events lack this field in their JSON
+    /// payload, so it deserializes to `None` and learn-time falls back
+    /// to deriving the bucket via `top_vec_hit_cluster` over
+    /// `candidates`. The fallback is a strict superset of the pre-fix
+    /// behavior — events with a populated field bucket the correct
+    /// way; events without it bucket the best-effort derived way (and
+    /// still match read-time more often than the pre-M-8 click-vote
+    /// did).
+    pub query_cluster_id_at_recall: Option<u32>,
+    /// v0.28.7+ audit M-8 R3 P2 follow-up — the
+    /// `AdaptiveState::cluster_version` value when the recall event
+    /// was emitted. HDBSCAN cluster ids are LOCAL LABELS that get
+    /// reassigned on every M4 recluster pass; the same numeric id
+    /// before/after a recluster may name a totally different semantic
+    /// cluster. Without this version stamp, learn-time would
+    /// repopulate `learned_alpha` / `learned_shadow_fusion` under a
+    /// stale id, then read-time (using the fresh post-recluster id
+    /// for the same query) would never find the learned weights —
+    /// re-creating learn/read divergence in a NEW way the M-8 fix
+    /// was meant to close.
+    ///
+    /// Learn-time uses `query_cluster_id_at_recall` ONLY when
+    /// `cluster_version_at_recall == Some(state.cluster_version)`.
+    /// Otherwise it falls back to deriving the bucket from the
+    /// current `memory_clusters` map — which IS the post-recluster
+    /// truth that a fresh read-time call would also see.
+    ///
+    /// Backward compat: pre-fix events lack this field → `None` →
+    /// the version-mismatch arm forces fallback to derived bucket.
+    pub cluster_version_at_recall: Option<u64>,
+    /// v0.28.7+ audit R13 P2 (2026-05-04) — the read-time top-vec
+    /// memory id (`vec_for_fusion.first()`'s memory id at recall
+    /// time). Used by learn-time `top_vec_hit_cluster` to remap to
+    /// the CURRENT cluster id via `state.memory_clusters` regardless
+    /// of HDBSCAN reclustering between recall and learn.
+    ///
+    /// Why this is the structurally correct fix: HDBSCAN cluster ids
+    /// are local labels that get reassigned on every M4 pass. The R3
+    /// `cluster_version_at_recall` guard catches the in-flight race
+    /// (cluster id reassigned mid-window) but it ALSO invalidates
+    /// every event when M4 runs at the START of `run_adaptive_pipeline`
+    /// before M2 consumes the events emitted since the previous pass —
+    /// which is the normal pipeline order, NOT an edge case. With the
+    /// memory id stamped, learn-time looks up its CURRENT cluster id
+    /// in `memory_clusters` (the post-recluster truth a fresh read
+    /// would also see) and is correct regardless of how many
+    /// reclusters fired between recall and learn-time.
+    ///
+    /// Backward compat: pre-R13 events lack this field → `None` →
+    /// fall through to the legacy `query_cluster_id_at_recall +
+    /// cluster_version_at_recall` version-match path → if that also
+    /// misses, fall back to candidates-derived (the original M-8 R3
+    /// derived path, unchanged).
+    pub query_top_vec_memory_id_at_recall: Option<String>,
 }
 
 /// Learned alpha with metadata.
@@ -978,6 +1043,9 @@ mod tests {
                 .collect(),
             accessed_ids: accessed.iter().map(|s| s.to_string()).collect(),
             timestamp: Utc::now() - Duration::days(days_ago),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         }
     }
 
@@ -1169,6 +1237,9 @@ mod tests {
             ],
             accessed_ids: vec!["episodic".to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         };
 
         let alpha = optimal_alpha_for_event(&event).unwrap();
@@ -1205,6 +1276,9 @@ mod tests {
             ],
             accessed_ids: vec!["a".to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         };
 
         assert_eq!(optimal_alpha_for_event(&event), None);
@@ -1244,6 +1318,9 @@ mod tests {
             ],
             accessed_ids: vec!["target".to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         }
     }
 
@@ -1379,6 +1456,9 @@ mod tests {
             ],
             accessed_ids: vec!["a".to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         };
 
         assert!(
@@ -1436,6 +1516,9 @@ mod tests {
             ],
             accessed_ids: vec!["target".to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         };
 
         let learned = optimal_shadow_weights_for_event(&event).unwrap();
@@ -1489,6 +1572,9 @@ mod tests {
             ],
             accessed_ids: vec!["target".to_string()],
             timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
         };
 
         let learned = optimal_shadow_weights_for_event(&event).unwrap();

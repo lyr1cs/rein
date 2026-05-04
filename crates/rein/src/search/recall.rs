@@ -92,10 +92,26 @@ fn apply_ars_dynamic_fusion_scores(
     episode_norm_log: &std::collections::HashMap<String, f32>,
     memory_map: &std::collections::HashMap<String, Memory>,
     weights: Option<crate::search::alpha_optimizer::ShadowFusionWeights>,
+    runtime_adoption_weight: f64,
 ) -> Vec<(String, f32)> {
     let Some(weights) = weights.map(|w| w.normalized_or_default()) else {
         return fused;
     };
+
+    // v0.28.7+ audit M-6 fix: outer-blend the ARS simplex score against the
+    // route-aware `legacy_score` by `runtime_adoption_weight`. Pre-fix the
+    // simplex score replaced `legacy_score` wholesale whenever `weights` was
+    // Some, which silently nuked route-specific alpha (most visibly
+    // ExactKeyword's alpha=0.85 BM25-heavy signal — it became indistinguishable
+    // from the generic simplex). The inner trust blend in
+    // `ready_shadow_fusion_weights_for_recall::effective_simplex` blends
+    // weights against a static prior; this OUTER blend smooths the
+    // simplex-vs-legacy transition so a barely-promoted canary
+    // (adoption=0.05) does not lose 95% of the route-specific signal in one
+    // step. `adoption=0` reproduces pre-canary behavior exactly; `adoption=1`
+    // reproduces the pre-fix wholesale-simplex behavior.
+    let adoption = runtime_adoption_weight.clamp(0.0, 1.0) as f32;
+    let legacy_share = 1.0 - adoption;
 
     let mut rescored: Vec<(String, f32, usize)> = fused
         .into_iter()
@@ -112,8 +128,14 @@ fn apply_ars_dynamic_fusion_scores(
                     * crate::search::alpha_optimizer::support_signal(memory.support_count)
                 + weights.diversity
                     * crate::search::alpha_optimizer::diversity_signal(memory.source_diversity);
-            let score = if score.is_finite() {
+            let simplex = if score.is_finite() {
                 score as f32
+            } else {
+                legacy_score
+            };
+            let blended = adoption * simplex + legacy_share * legacy_score;
+            let score = if blended.is_finite() {
+                blended
             } else {
                 legacy_score
             };
@@ -1059,43 +1081,103 @@ pub fn recall_temporal_with_request_id(
     // === Adaptive alpha (M2): read from AdaptiveState if available ===
     // Use the dominant cluster from vector-search top candidate as a proxy for the
     // current query's semantic neighborhood, enabling per-cluster alpha lookup.
-    let query_cluster_id: Option<u32> = vec_for_fusion.first().and_then(|(id, _)| {
-        store
-            .conn()
-            .query_row(
-                "SELECT cluster_id FROM memories WHERE id = ?1",
-                rusqlite::params![id],
-                |row| row.get::<_, Option<u32>>(0),
-            )
-            .ok()
-            .flatten()
-    });
+    //
+    // v0.28.7+ audit M-8 R4 P2 #1 — read `cluster_id` from
+    // `adaptive_state_snapshot.memory_clusters` (the SAME atomic
+    // source as `cluster_version`), NOT from the `memories.cluster_id`
+    // SQL column. M4 reclustering writes the SQL column FIRST and
+    // saves the snapshot's incremented `cluster_version` LAST; the
+    // window between is a mixed-source race (new SQL cluster_id, old
+    // snapshot cluster_version) that would make learn-time treat
+    // every recall in the window as stale-versioned and drop them
+    // back to the derived-bucket fallback — defeating M-8's
+    // alignment exactly during live reclustering. Reading both
+    // cluster_id and cluster_version from the same snapshot blob
+    // guarantees they belong to the same atomic epoch.
+    //
+    // SQL-column fallback retained for adaptive-disabled deployments
+    // (snapshot is None there) and for the rare path where the
+    // top-vec-hit memory isn't yet in the snapshot's
+    // `memory_clusters` map (e.g., a memory just inserted but not
+    // yet swept into the cluster index).
     let adaptive_state_snapshot = if config.adaptive.enabled {
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
     } else {
         None
     };
+    // R10 P2 (2026-05-04): split the cluster-id resolution so the
+    // event payload only stamps `query_cluster_id_at_recall` when the
+    // id came from `adaptive_state_snapshot.memory_clusters`. The
+    // event ALSO logs `cluster_version_at_recall` from the same
+    // snapshot, so a SQL-fallback id (read from `memories.cluster_id`
+    // when the snapshot's `memory_clusters` map doesn't yet cover the
+    // top-vec hit — e.g., a freshly-inserted memory) is NOT atomic
+    // with that version. Pre-R10 the event recorded the SQL id
+    // alongside the snapshot's version, and learn-time's
+    // `top_vec_hit_cluster` saw a version match (snapshot version
+    // equals the current cluster_version) and HONORED the SQL id —
+    // potentially bucketing scoped weights under a stale or
+    // reassigned cluster label. Read-time alpha / shadow-fusion
+    // lookups still consult the SQL fallback (best-effort bucket
+    // for live serving), but the event payload's recorded id falls
+    // back to None when the snapshot-source path didn't fire,
+    // forcing learn-time to re-derive the bucket from the candidate
+    // payload — which IS the post-recluster truth a fresh read would
+    // see.
+    let query_cluster_id_from_snapshot: Option<u32> = vec_for_fusion.first().and_then(|(id, _)| {
+        adaptive_state_snapshot
+            .as_ref()
+            .and_then(|s| s.memory_clusters.get(id).copied())
+    });
+    let query_cluster_id: Option<u32> = query_cluster_id_from_snapshot.or_else(|| {
+        vec_for_fusion.first().and_then(|(id, _)| {
+            store
+                .conn()
+                .query_row(
+                    "SELECT cluster_id FROM memories WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, Option<u32>>(0),
+                )
+                .ok()
+                .flatten()
+        })
+    });
+    // R13 P2 (2026-05-04): capture the top-vec memory id BEFORE
+    // `vec_for_fusion` is moved into the fusion `lists` collection
+    // below. Stamped into the recall_complete event payload for
+    // learn-time's memory-id-remap bucket-resolution path. One String
+    // clone per recall — negligible cost.
+    let query_top_vec_memory_id_at_recall: Option<String> =
+        vec_for_fusion.first().map(|(id, _)| id.clone());
     let query_type_label = format!("{}", strategy.query_type);
     let adaptive_alpha = adaptive_state_snapshot
         .as_ref()
         .and_then(|s| s.get_alpha(&query_type_label, query_cluster_id));
-    let ars_dynamic_fusion_weights = adaptive_state_snapshot.as_ref().and_then(|s| {
-        let runtime_adoption_weight =
-            crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
-                store.conn(),
-                config,
+    // v0.28.7+ audit M-6: capture `runtime_adoption_weight` alongside the
+    // shadow weights so `apply_ars_dynamic_fusion_scores` can outer-blend
+    // simplex against legacy by the same scalar that the inner trust blend
+    // uses. Default 0.0 falls cleanly into the "no canary" branch.
+    let (ars_dynamic_fusion_weights, ars_runtime_adoption_weight) = adaptive_state_snapshot
+        .as_ref()
+        .map(|s| {
+            let runtime_adoption_weight =
+                crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
+                    store.conn(),
+                    config,
+                    s,
+                    &query_type_label,
+                    query_cluster_id,
+                );
+            let weights = ready_shadow_fusion_weights_for_recall(
                 s,
+                config,
                 &query_type_label,
                 query_cluster_id,
+                runtime_adoption_weight,
             );
-        ready_shadow_fusion_weights_for_recall(
-            s,
-            config,
-            &query_type_label,
-            query_cluster_id,
-            runtime_adoption_weight,
-        )
-    });
+            (weights, runtime_adoption_weight)
+        })
+        .unwrap_or((None, 0.0));
     let ars_dynamic_fusion_active = ars_dynamic_fusion_weights.is_some();
 
     // Capture per-channel scores for reranking and M2 logging.
@@ -1364,6 +1446,7 @@ pub fn recall_temporal_with_request_id(
         &episode_norm_log,
         &memory_map,
         ars_dynamic_fusion_weights,
+        ars_runtime_adoption_weight,
     );
 
     // Apply strength weighting (Ebbinghaus or KM survival curve) + temporal filter
@@ -1790,6 +1873,55 @@ pub fn recall_temporal_with_request_id(
                 "ars_dynamic_fusion": ars_dynamic_fusion_active,
                 "fusion_method": &config.search.fusion_method,
                 "result_count": results.len(),
+                // v0.28.7+ audit M-8 R2 P2 follow-up — log the cluster id
+                // production recall actually used. R10 P2 (2026-05-04)
+                // tightens this to the SNAPSHOT-SOURCED id only:
+                // `query_cluster_id_from_snapshot` is `Some` exactly when
+                // the top-vec hit appeared in
+                // `adaptive_state_snapshot.memory_clusters`, so it's
+                // atomic with `cluster_version_at_recall` below. The
+                // SQL-fallback path (best-effort live read from
+                // `memories.cluster_id`) still serves read-time alpha
+                // selection but is NOT recorded here — feeding the SQL
+                // id alongside the snapshot's version would lie to
+                // learn-time, allowing scoped weights to land under a
+                // stale or reassigned cluster label. Learn-time at
+                // `parse_candidates_from_event` reads this field back so
+                // alpha / shadow-fusion bucketing matches read-time
+                // exactly, immune to candidate-set collapse / filter /
+                // canonical-collapse rewrites between recall and event
+                // emission. When this is None, learn-time falls back to
+                // deriving the bucket from the candidate payload (the
+                // M-8 R3 derived path).
+                "query_cluster_id_at_recall": query_cluster_id_from_snapshot,
+                // v0.28.7+ audit M-8 R3 P2 follow-up — also stamp the
+                // `AdaptiveState::cluster_version` (== `state.version` here;
+                // see `commit_shadow_fusion_weight_replay` and snapshot
+                // CAS-merge logic where cluster_version is folded). HDBSCAN
+                // cluster ids are local labels that get reassigned on M4
+                // recluster; learn-time MUST drop the recorded
+                // `query_cluster_id_at_recall` and fall back to the
+                // current-state-derived bucket when the version no longer
+                // matches.
+                "cluster_version_at_recall": adaptive_state_snapshot.as_ref().map(|s| s.cluster_version),
+                // v0.28.7+ audit R13 P2 (2026-05-04) — stamp the
+                // top-vec-hit memory id directly. Learn-time uses this
+                // as the PREFERRED bucket-resolution path: looking it
+                // up against the CURRENT memory_clusters returns the
+                // post-recluster truth a fresh read would also see,
+                // which is correct regardless of how many M4 passes
+                // have fired between recall and learn-time. The
+                // `cluster_version_at_recall` guard above stays only
+                // as a backward-compat hook for pre-R13 events.
+                //
+                // Always stamped when vec_for_fusion is non-empty,
+                // regardless of whether `query_cluster_id` came from
+                // the snapshot or SQL fallback (the R10 discipline
+                // applied to the cluster_id field, not the memory_id —
+                // memory_id remap doesn't depend on snapshot atomicity
+                // because we look it up against current memory_clusters
+                // at learn-time).
+                "query_top_vec_memory_id_at_recall": query_top_vec_memory_id_at_recall,
                 })),
             },
         );
@@ -2341,6 +2473,10 @@ mod tests {
             &std::collections::HashMap::new(),
             &memory_map,
             None,
+            // adoption_weight is irrelevant when weights=None — the early
+            // return preserves `fused` regardless. Use 1.0 to make any
+            // future regression that drops the early-return obvious.
+            1.0,
         );
 
         assert_eq!(actual, fused);
@@ -2374,10 +2510,127 @@ mod tests {
             &std::collections::HashMap::new(),
             &memory_map,
             Some(weights),
+            // Full canary (adoption_weight=1.0) reproduces the pre-M-6
+            // wholesale-simplex behavior this test was originally written
+            // against; the M-6 outer blend is a no-op at this extreme.
+            1.0,
         );
 
         assert_eq!(actual[0].0, "supported");
         assert!(actual[0].1 > actual[1].1);
+    }
+
+    /// v0.28.7+ audit M-6 — the audit-named regression vector. With
+    /// `weights=Some` AND `runtime_adoption_weight=0`, the outer blend
+    /// must collapse to pure legacy so route-specific signal
+    /// (canonically: ExactKeyword's `alpha=0.85` BM25-heavy fusion) is
+    /// preserved bit-for-bit during a barely-promoted-or-rolled-back
+    /// canary. Pre-fix the function unconditionally replaced
+    /// `legacy_score` with the simplex sum the moment `weights` was Some,
+    /// nuking the route alpha. The two assertions below would both have
+    /// failed against the pre-fix behavior — `actual` would have ranked
+    /// "support-heavy" first and rewritten the BM25-leader's score.
+    #[test]
+    fn ars_dynamic_fusion_zero_adoption_preserves_route_specific_legacy_scores() {
+        // Mimic an ExactKeyword route: BM25 strongly favors "bm25-leader",
+        // legacy fused score reflects that.
+        let fused = vec![
+            ("bm25-leader".to_string(), 0.95),
+            ("support-heavy".to_string(), 0.10),
+        ];
+        let fts_norm_log = std::collections::HashMap::from([
+            ("bm25-leader".to_string(), 1.0),
+            ("support-heavy".to_string(), 0.05),
+        ]);
+        let memory_map = std::collections::HashMap::from([
+            (
+                "bm25-leader".to_string(),
+                test_memory("bm25-leader", 0, 0.0),
+            ),
+            // High support_count + diversity would let a support-weighted
+            // simplex re-rank this above bm25-leader if the outer blend
+            // were absent.
+            (
+                "support-heavy".to_string(),
+                test_memory("support-heavy", 9, 9.0),
+            ),
+        ]);
+        // Simplex weights chosen to dominate via support+diversity (the
+        // pre-M-6 reproduction).
+        let weights = crate::search::alpha_optimizer::ShadowFusionWeights {
+            bm25: 0.0,
+            vec: 0.0,
+            kg: 0.0,
+            episode: 0.0,
+            support: 0.6,
+            diversity: 0.4,
+        };
+
+        let actual_zero = apply_ars_dynamic_fusion_scores(
+            fused.clone(),
+            &fts_norm_log,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &memory_map,
+            Some(weights),
+            0.0,
+        );
+
+        assert_eq!(
+            actual_zero, fused,
+            "adoption_weight=0 must reproduce legacy fused output exactly \
+             (pre-M-6 wholesale-replace would have rewritten both scores \
+             AND reordered the pair to put 'support-heavy' first, which \
+             is the recall-quality regression the audit named)"
+        );
+
+        // Mid-canary (adoption=0.5) sanity: each output score is exactly
+        // halfway between legacy and the simplex it would have been at
+        // adoption=1.0. Asserts the blend is a true linear interpolation,
+        // not a step or threshold.
+        let actual_full = apply_ars_dynamic_fusion_scores(
+            fused.clone(),
+            &fts_norm_log,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &memory_map,
+            Some(weights),
+            1.0,
+        );
+        let actual_half = apply_ars_dynamic_fusion_scores(
+            fused.clone(),
+            &fts_norm_log,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &memory_map,
+            Some(weights),
+            0.5,
+        );
+        // For each id, find legacy + full + half and assert
+        // half ≈ 0.5 * legacy + 0.5 * full.
+        // (Outputs may be reordered by score, so look up by id.)
+        for (id, legacy_score) in &fused {
+            let full = actual_full
+                .iter()
+                .find(|(other, _)| other == id)
+                .map(|(_, s)| *s)
+                .expect("full canary preserves all ids");
+            let half = actual_half
+                .iter()
+                .find(|(other, _)| other == id)
+                .map(|(_, s)| *s)
+                .expect("half canary preserves all ids");
+            let expected = 0.5 * legacy_score + 0.5 * full;
+            let diff = (half - expected).abs();
+            assert!(
+                diff < 1e-6,
+                "linear blend failed for id={id}: legacy={legacy_score} full={full} \
+                 half={half} expected={expected} (diff={diff})"
+            );
+        }
     }
 
     #[test]

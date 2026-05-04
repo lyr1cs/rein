@@ -1652,6 +1652,62 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
         fixes.push(format!("triggered HNSW rebuild at {}", hnsw_path.display()));
     }
 
+    // v0.28.7+ audit L5 — corrupt policy row recovery. When
+    // `load_parameter_policy` reports `Corrupt`, every subsequent
+    // `save_parameter_policy_cas` UPDATE matches 0 rows
+    // (`json_valid(value)` fails) and the existence check then
+    // returns `Ok(false)` — the caller treats this as a CAS miss and
+    // never inserts a fresh row, so the policy refresh stalls
+    // permanently. Delete the row so the next
+    // `refresh_ars_parameter_policy` tick can `INSERT` cleanly.
+    // Read-only doctor (`fix=false`) still surfaces the corruption
+    // via `check_ars_parameter_policy`'s warn.
+    //
+    // **NOT** wired for `StorageError` (R4 P2 #2 audit catch
+    // 2026-05-04): a transient SQLite busy/locked read returns
+    // `StorageError`, but the underlying row may still be valid.
+    // Unconditional deletion in that case would reset a healthy
+    // canary policy as collateral damage from a recoverable read
+    // error. Restrict destructive recovery to confirmed `Corrupt`
+    // (the row was read AND failed `serde_json::from_str` or the
+    // schema-version check); leave `StorageError` to be retried on
+    // the next doctor pass when the lock has cleared.
+    //
+    // R10 P3 (2026-05-04): use the atomic `repair_corrupt_parameter_policy`
+    // helper, which wraps the status re-check + DELETE in a single
+    // `BEGIN IMMEDIATE` transaction. Pre-fix this path did
+    // `load_parameter_policy` (read-only, no lock) followed by an
+    // unconditional `delete_parameter_policy` — a peer
+    // `refresh_ars_parameter_policy` tick or a concurrent
+    // `doctor --fix` could rewrite the row to a healthy canary in the
+    // gap between those two ops, and then the unconditional DELETE
+    // would destroy that newly-valid state. The new helper observes
+    // status under the write lock and refuses to delete when the row
+    // is no longer Corrupt, surfacing the observed status in the fix
+    // report so the operator can see what happened.
+    match crate::store::ars_parameter_policy::repair_corrupt_parameter_policy(store.conn()) {
+        Ok(outcome) if outcome.deleted > 0 => fixes.push(format!(
+            "deleted corrupt ars_parameter_policy row ({} row{}): {}",
+            outcome.deleted,
+            if outcome.deleted == 1 { "" } else { "s" },
+            outcome
+                .error_at_delete
+                .unwrap_or_else(|| "unknown error".to_string())
+        )),
+        Ok(_) => {
+            // No-op: either the row was never Corrupt at recovery
+            // time (peer repaired or transitioned to a different
+            // unhealthy status under the write lock) or the row is
+            // healthy. `fixes_applied` lists ACTIONS taken, not
+            // non-actions — the doctor's `check_ars_parameter_policy`
+            // already surfaces non-Corrupt unhealthy states via warn,
+            // so silence here keeps the fix-list clean.
+        }
+        Err(e) => fixes.push(format!(
+            "failed to delete corrupt ars_parameter_policy row: {e}"
+        )),
+    }
+
     // v0.28.7 H2 — drift-triggered rollback. If the parameter policy is in
     // Canary mode while `judge_calibration_state.judge_drift_alert*` is
     // positive, force a refresh which (per the demote-on-drift logic in
@@ -1772,7 +1828,14 @@ fn check_ars_parameter_policy(
             "ars_parameter_policy",
             "missing policy row; dynamic ARS parameters disabled".to_string(),
         ),
-        ArsParameterPolicyLoadStatus::Corrupt | ArsParameterPolicyLoadStatus::StorageError => {
+        ArsParameterPolicyLoadStatus::Corrupt
+        | ArsParameterPolicyLoadStatus::UnsupportedSchema
+        | ArsParameterPolicyLoadStatus::StorageError => {
+            // All three statuses mean dynamic ARS parameters are
+            // disabled; doctor surfaces them as a warn so an operator
+            // can investigate. The status-specific recovery (delete
+            // for Corrupt, leave for UnsupportedSchema/StorageError)
+            // happens in `apply_local_fixes`.
             warn_in(
                 DoctorCategory::Storage,
                 "ars_parameter_policy",
@@ -2700,6 +2763,273 @@ provider = "inherit"
         assert_eq!(
             parse_documented_mcp_tool_count_line("| **28 MCP tools** | 13 core"),
             Some(28)
+        );
+    }
+
+    /// v0.28.7+ audit L5 — `doctor --fix` must delete a corrupt
+    /// `ars_parameter_policy` metadata row so subsequent
+    /// `save_parameter_policy_cas` writes can `INSERT` cleanly. Pre-fix
+    /// the row was only surfaced as a warning; the silent stall was
+    /// indefinite because every CAS attempt matched 0 rows on
+    /// `json_valid(value)` and then short-circuited on the existence
+    /// check.
+    #[tokio::test]
+    async fn doctor_fix_deletes_corrupt_ars_parameter_policy_row() {
+        use crate::store::ars_parameter_policy::{
+            load_parameter_policy, ArsParameterPolicyLoadStatus,
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+
+        // Plant a corrupt JSON row at the policy key (mirrors the
+        // failure mode that `parameter_policy_missing_or_corrupt_loads_disabled`
+        // covers in the store layer).
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params!["ars_parameter_policy", "{not json"],
+            )
+            .unwrap();
+        assert_eq!(
+            load_parameter_policy(store.conn()).status,
+            ArsParameterPolicyLoadStatus::Corrupt,
+            "precondition: planted row must read as Corrupt"
+        );
+
+        // Drop the in-test handle so `apply_local_fixes` opens its own
+        // connection without contention. (The doctor `run` re-opens via
+        // `config.open_store()` internally.)
+        drop(store);
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|line| line.contains("ars_parameter_policy")),
+            "fixes_applied must mention ars_parameter_policy deletion (got {:?})",
+            report.fixes_applied
+        );
+
+        // Re-open and confirm the row is gone.
+        let store2 = config.open_store().unwrap();
+        assert_eq!(
+            load_parameter_policy(store2.conn()).status,
+            ArsParameterPolicyLoadStatus::Missing,
+            "row must be deleted after --fix"
+        );
+
+        // Idempotency: a second --fix run must not re-emit the deletion
+        // line (no row to delete) and must not error.
+        drop(store2);
+        let report2 = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+        assert!(
+            !report2
+                .fixes_applied
+                .iter()
+                .any(|line| line.contains("ars_parameter_policy")),
+            "second --fix must be a no-op for the corrupt-policy path (got {:?})",
+            report2.fixes_applied
+        );
+    }
+
+    /// v0.28.7+ audit L5 R4 P2 #2 — `doctor --fix` MUST NOT delete a
+    /// healthy `ars_parameter_policy` row when the load encountered a
+    /// transient `StorageError` (busy/locked SQLite read). Pre-R4 fix
+    /// the recovery branch matched both `Corrupt` AND `StorageError`,
+    /// so a transient read failure could destroy a valid canary
+    /// policy as collateral damage. Post-fix only `Corrupt` triggers
+    /// deletion; `StorageError` is left for the next doctor pass to
+    /// retry against the now-unlocked row.
+    ///
+    /// We can't easily synthesize a real SQLite busy/locked read in a
+    /// unit test (the lock would have to span the
+    /// `apply_local_fixes`'s `load_parameter_policy` call), so the
+    /// test instead asserts the invariant directly via the load
+    /// helper: a hand-planted VALID JSON row that successfully loads
+    /// must NOT be deleted by `doctor --fix`. This pins the
+    /// "delete-only-on-Corrupt" behavior — any future regression that
+    /// re-broadens the match arm to non-Corrupt statuses would also
+    /// delete this valid row and the test would fail.
+    #[tokio::test]
+    async fn doctor_fix_preserves_valid_ars_parameter_policy_row() {
+        use crate::store::ars_parameter_policy::{
+            load_parameter_policy, ArsParameterPolicyLoadStatus,
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+
+        // Plant a syntactically valid policy row at the current schema
+        // version; load_parameter_policy will return Loaded.
+        let valid_policy = serde_json::json!({
+            "schema_version": 1,
+            "revision": 5,
+            "mode": "canary",
+            "source_adaptive_version": 0,
+            "runtime_adoption_weight": 0.25,
+            "adoption_weights": {},
+            "last_event_id": 100,
+            "last_updated": "2026-05-04T00:00:00Z",
+        });
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params!["ars_parameter_policy", valid_policy.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            load_parameter_policy(store.conn()).status,
+            ArsParameterPolicyLoadStatus::Loaded,
+            "precondition: planted row must read as Loaded"
+        );
+
+        drop(store);
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(
+            !report
+                .fixes_applied
+                .iter()
+                .any(|line| line.contains("ars_parameter_policy")),
+            "doctor --fix MUST NOT mention ars_parameter_policy when the row \
+             is valid; only Corrupt rows trigger deletion. Got fixes_applied: \
+             {:?}",
+            report.fixes_applied
+        );
+
+        // Re-open and confirm the row STILL exists with the original
+        // revision — the policy was preserved across --fix.
+        let store2 = config.open_store().unwrap();
+        let loaded = load_parameter_policy(store2.conn());
+        assert_eq!(
+            loaded.status,
+            ArsParameterPolicyLoadStatus::Loaded,
+            "valid policy row must survive doctor --fix"
+        );
+        assert_eq!(
+            loaded.policy.revision, 5,
+            "policy revision must be preserved exactly (was 5)"
+        );
+    }
+
+    /// v0.28.7+ audit L5 R5 P2 — `doctor --fix` MUST NOT delete a row
+    /// whose `schema_version` is FUTURE relative to this binary
+    /// (downgrade scenario: a newer rein version wrote a payload that
+    /// the older binary can't interpret, but the data is valid for
+    /// the newer binary). `load_parameter_policy` distinguishes
+    /// future-schema (`UnsupportedSchema`) from genuinely-malformed
+    /// JSON (`Corrupt`); only the latter triggers deletion. Pre-R5
+    /// fix both arms collapsed to `Corrupt` and the recovery branch
+    /// would destroy valid future-schema data on every doctor pass.
+    #[tokio::test]
+    async fn doctor_fix_preserves_future_schema_ars_parameter_policy_row() {
+        use crate::store::ars_parameter_policy::{
+            load_parameter_policy, ArsParameterPolicyLoadStatus,
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+
+        // Plant a row whose schema_version is far in the future. The
+        // JSON parses cleanly, but the schema-version check rejects
+        // it, so load_parameter_policy returns `UnsupportedSchema`.
+        let future_policy = serde_json::json!({
+            "schema_version": 9999,
+            "revision": 7,
+            "mode": "canary",
+            "source_adaptive_version": 0,
+            "runtime_adoption_weight": 0.5,
+            "adoption_weights": {},
+            "last_event_id": 200,
+            "last_updated": "2030-01-01T00:00:00Z",
+            "future_field_unknown_to_us": "neat",
+        });
+        let original_value = future_policy.to_string();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params!["ars_parameter_policy", &original_value],
+            )
+            .unwrap();
+        let pre_loaded = load_parameter_policy(store.conn());
+        assert_eq!(
+            pre_loaded.status,
+            ArsParameterPolicyLoadStatus::UnsupportedSchema,
+            "precondition: future-schema row must read as UnsupportedSchema, \
+             not Corrupt; collapsing the two would re-open the deletion bug"
+        );
+
+        drop(store);
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(
+            !report
+                .fixes_applied
+                .iter()
+                .any(|line| line.contains("ars_parameter_policy")),
+            "doctor --fix MUST NOT delete a future-schema row; it belongs to \
+             a newer binary in a downgrade scenario. Got fixes_applied: {:?}",
+            report.fixes_applied
+        );
+
+        // Re-open and confirm the row STILL exists with the original
+        // raw value bit-for-bit (no rewrite, no clamp, no anything).
+        let store2 = config.open_store().unwrap();
+        let raw_now: String = store2
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'ars_parameter_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("future-schema row must survive doctor --fix");
+        assert_eq!(
+            raw_now, original_value,
+            "future-schema row's raw bytes must be preserved exactly"
+        );
+        // And re-loading still produces UnsupportedSchema, not Corrupt.
+        assert_eq!(
+            load_parameter_policy(store2.conn()).status,
+            ArsParameterPolicyLoadStatus::UnsupportedSchema
         );
     }
 }

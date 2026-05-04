@@ -575,4 +575,61 @@ mod auth_policy_tests {
             "/api/version must not regress to Public"
         );
     }
+
+    /// v0.28.7+ audit L4 — lock the inventory registration AND auth
+    /// policy of `/api/trust-measurement` so future renames can't
+    /// silently drop the route off the inventory (re-opening the
+    /// pre-v0.27.3 literal-match-arm bypass class) or flip the policy
+    /// without an explicit decision.
+    ///
+    /// **Current expected policy: Public** (matches the surrounding
+    /// diagnostic GET pattern e.g. `/api/doctor`). The route exposes
+    /// release-gate / eval-gate / index-consistency / active-learning
+    /// state, which is more sensitive than `/api/version` was before
+    /// the v0.27.3 F5/C4 elevation. Promoting to `ReadToken` is a v0.29
+    /// hardening candidate; this test exists to make any such promotion
+    /// (or accidental demotion) intentional and visible.
+    #[test]
+    fn ars_audit_l4_trust_measurement_auth_policy_locked() {
+        crate::ops::inventory::ensure_unique_registrations();
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| e.method == hyper::Method::GET && e.path_template == "/api/trust-measurement")
+            .expect(
+                "/api/trust-measurement GET op should be registered via #[op] inventory; \
+                 if you intentionally renamed/removed the route, update this regression test",
+            );
+        assert_eq!(
+            entry.auth_policy,
+            AuthPolicy::Public,
+            "/api/trust-measurement auth_policy was {:?}; if you intentionally \
+             promoted to ReadToken/MutationMarker (v0.29 hardening), update this \
+             regression test to lock the new policy",
+            entry.auth_policy
+        );
+    }
+
+    /// v0.28.7+ audit L4 — same lockdown for `/api/ars-acceleration-gate`,
+    /// which exposes canary status / runtime adoption weights / release
+    /// gate detail. See `ars_audit_l4_trust_measurement_auth_policy_locked`
+    /// rationale; the same v0.29 ReadToken promotion candidacy applies.
+    #[test]
+    fn ars_audit_l4_ars_acceleration_gate_auth_policy_locked() {
+        crate::ops::inventory::ensure_unique_registrations();
+        let entry = inventory::iter::<OpsRestEntry>()
+            .find(|e| {
+                e.method == hyper::Method::GET && e.path_template == "/api/ars-acceleration-gate"
+            })
+            .expect(
+                "/api/ars-acceleration-gate GET op should be registered via #[op] inventory; \
+                 if you intentionally renamed/removed the route, update this regression test",
+            );
+        assert_eq!(
+            entry.auth_policy,
+            AuthPolicy::Public,
+            "/api/ars-acceleration-gate auth_policy was {:?}; if you intentionally \
+             promoted to ReadToken/MutationMarker (v0.29 hardening), update this \
+             regression test to lock the new policy",
+            entry.auth_policy
+        );
+    }
 }
