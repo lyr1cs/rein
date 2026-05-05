@@ -207,6 +207,17 @@ rm -rf ~/.rein/
 | `unable to open database` on first run | Sandbox can't write `~/.rein/` | Set `Memory database path` explicitly in `user_config` to a path inside Claude Desktop's data directory. |
 | High memory or CPU after months of use | Memories DB grew | Run `rein gc` from a terminal install (or via the MCP `rein_gc` tool). |
 
+### Cowork, claude.ai, and mobile (remote MCP)
+
+This DXT path enables rein in Claude Desktop's **Chat** tab only. It does
+**not** make rein available in **Cowork** (the agentic-work tab in Claude
+Desktop), **claude.ai** web, or the **Claude mobile** apps. Those clients
+route MCP traffic through Anthropic's cloud rather than local stdio, so
+they need a public HTTPS endpoint they can reach. See
+[02b-remote-mcp-deployment.md](02b-remote-mcp-deployment.md) for the full
+remote-MCP deployment guide (Cloudflare Tunnel / Tailscale Funnel / Caddy +
+Let's Encrypt / ngrok recipes plus the Claude UI configuration flow).
+
 ### Other platforms
 
 The current DXT ships only macOS Apple Silicon binaries. Intel Mac, Linux,

@@ -76,7 +76,7 @@ chmod +x scripts/build-dxt.sh
 ./scripts/build-dxt.sh
 ```
 
-Expected output: `target/rein-v0.28.9.mcpb`, ~16 MB.
+Expected output: `target/rein-v0.28.10.mcpb`, ~16 MB.
 
 ## Manifest field reference
 
@@ -107,12 +107,12 @@ to confirm it parses, then re-run `build-dxt.sh` end-to-end.
 
 ## Local testing
 
-After `build-dxt.sh` produces `target/rein-v0.28.9.mcpb`:
+After `build-dxt.sh` produces `target/rein-v0.28.10.mcpb`:
 
 1. Open Finder, navigate to `target/`.
 2. (Once for unsigned builds) clear macOS quarantine:
    ```bash
-   xattr -d com.apple.quarantine target/rein-v0.28.9.mcpb
+   xattr -d com.apple.quarantine target/rein-v0.28.10.mcpb
    ```
 3. Double-click the `.mcpb`. Claude Desktop opens an install dialog.
 4. Fill in `Gemini API Key` (any string for tool registration testing — rein
@@ -141,11 +141,12 @@ Steps:
 3. Run `./scripts/build-dxt.sh`.
 4. Sanity-check the output `.mcpb` size and run the local-install test
    above.
-5. `git commit` + tag: `git tag v0.28.9 && git push --tags`.
+5. `git commit` + tag: `git tag v<version> && git push --tags` (replace
+   `<version>` with the value bumped in step 1, e.g., `v0.28.10`).
 6. Create the GitHub Release. Attach two artifacts:
    - the existing GUI binary (`rein` from `target/release/`), as in
      v0.27.4–v0.28.8 releases
-   - `target/rein-v0.28.9.mcpb`
+   - `target/rein-v0.28.10.mcpb`
 7. Edit the release notes to point install instructions at the new `.mcpb`
    filename.
 

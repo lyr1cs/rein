@@ -12,7 +12,9 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.9`** (2026-05-06) — distribution-channels patch on v0.28.8. Adds **Claude Desktop one-click install** via DXT (`.mcpb` artifact, macOS Apple Silicon) with `user_config`-prompted `GEMINI_API_KEY` / `REIN_DB` / `SUPERMEMORY_CC_API_KEY`, and **Claude Code plugin marketplace** registration (`/plugin marketplace add lyr1cs/rein`). Build pipeline added at `scripts/build-dxt.sh`; manifest at `dxt/manifest.json`; plugin manifests at `.claude-plugin/marketplace.json` + `plugins/rein/`. New maintainer guide at `docs/guides/dxt-build.md`; ADR at `docs/decisions/distribution-channels.md`. End-user install steps in [docs/manual/02-installation.md](docs/manual/02-installation.md#claude-desktop-one-click-via-dxt). **No runtime behavior changes from v0.28.8** — binary is bit-identical to v0.28.8 with the version field bumped. Tests / clippy / fmt status unchanged from v0.28.8 (1462 / 0 / 3 ignored / 0 / 0). License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.9 progression.
+**Current release: `v0.28.10`** (2026-05-06) — docs-only patch on v0.28.9 closing the **remote-MCP gap** for Claude Cowork / claude.ai / mobile. New chapter at [docs/manual/02b-remote-mcp-deployment.md](docs/manual/02b-remote-mcp-deployment.md) — four deployment recipes (Cloudflare Tunnel recommended, Tailscale Funnel, Caddy/nginx + Let's Encrypt, ngrok dev), the exact UI configuration flow for **Customize → Connectors → "+" → Add custom connector** with OAuth tradeoffs, and an Anthropic-quoted explanation of why the local-stdio paths (DXT / plugin marketplace / `claude_desktop_config.json`) don't reach Cowork. README install table now lists 4 paths (Chat tab DXT / Claude Code marketplace / Cowork remote MCP / from source). **No runtime / binary changes** — rein already implements the Streamable HTTP transport at `/mcp` (since the rmcp crate's `streamable_http_server` integration); v0.28.10 is purely documentation. Tests / clippy / fmt status unchanged (1462 / 0 / 3 ignored / 0 / 0).
+
+**Previous release: `v0.28.9`** (2026-05-06) — distribution-channels patch on v0.28.8. Adds **Claude Desktop one-click install** via DXT (`.mcpb` artifact, macOS Apple Silicon) with `user_config`-prompted `GEMINI_API_KEY` / `REIN_DB` / `SUPERMEMORY_CC_API_KEY`, and **Claude Code plugin marketplace** registration (`/plugin marketplace add lyr1cs/rein`). Build pipeline added at `scripts/build-dxt.sh`; manifest at `dxt/manifest.json`; plugin manifests at `.claude-plugin/marketplace.json` + `plugins/rein/`. Maintainer guide at `docs/guides/dxt-build.md`; ADR at `docs/decisions/distribution-channels.md`. **Binary bit-identical to v0.28.8.**
 
 **Previous release: `v0.28.8`** (2026-05-04) — second-pass audit hardening on v0.28.7. Closed **15 P2 + 1 P3** findings across **17 codex review rounds** (2-consecutive-clean saturation at R16/R17). Headline fixes: **M-8 cluster-bucket alignment** (learn-time `top_vec_hit_cluster` now uses memory-id-remap against current `memory_clusters`), **L6 LRU fallback preservation** (`learned_shadow_fusion` cap eviction restricted to cluster-scoped buckets), **`ars_parameter_policy` schema robustness** (peek `schema_version` before typed deserialize, schema-aware COALESCE default, BEGIN IMMEDIATE wrapping in `repair_corrupt_parameter_policy`). Plus M-1 persistence-side per-surface scalar split, M-5 synthesis/concept-summary threshold rollback, M-6 outer simplex↔legacy blend, L1 `bootstrap_priors` sanitize cap, L4 auth-policy locks, L5+L7 doctor recovery + release-gate test coverage. Default-OFF behavior bit-identical to v0.28.7.
 
@@ -64,23 +66,24 @@ For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README
 
 Three install paths depending on your client:
 
-| Client                                      | Recommended path                                              |
-| ------------------------------------------- | ------------------------------------------------------------- |
-| Claude Desktop on macOS Apple Silicon       | [DXT one-click](#install-on-claude-desktop-dxt--macos-apple-silicon) |
-| Claude Code (CLI)                           | [Plugin marketplace](#install-via-claude-code-plugin-marketplace) |
-| Anything else, or you want full control     | [From source](#from-source)                                   |
+| Client                                                              | Recommended path                                                      |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Claude Desktop **Chat tab** on macOS Apple Silicon                  | [DXT one-click](#install-on-claude-desktop-dxt--macos-apple-silicon)  |
+| Claude Code (CLI)                                                   | [Plugin marketplace](#install-via-claude-code-plugin-marketplace)     |
+| Claude **Cowork** / claude.ai / mobile (cloud-routed remote MCP)    | [Remote MCP custom connector](#install-via-remote-mcp-cowork-claudeai-mobile) |
+| Anything else, or you want full control                             | [From source](#from-source)                                           |
 
 #### Install on Claude Desktop (DXT — macOS Apple Silicon)
 
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v0.28.9.mcpb` from
+1. Download `rein-v0.28.10.mcpb` from
    [Releases](https://github.com/lyr1cs/rein/releases/latest).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.9.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.10.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -117,6 +120,58 @@ cargo install --git https://github.com/lyr1cs/rein --locked rein
 Then set `GEMINI_API_KEY` in your shell environment or `~/.rein/config.toml`.
 See [docs/manual/02-installation.md](docs/manual/02-installation.md) for
 full configuration.
+
+#### Install via Remote MCP (Cowork, claude.ai, mobile)
+
+Claude Cowork (the agentic-work tab inside Claude Desktop), claude.ai
+web, and the Claude mobile apps route MCP traffic through Anthropic's
+cloud, **not** through your local stdio. They cannot use the DXT or
+plugin marketplace paths above. They need a public HTTPS endpoint that
+Anthropic's servers can reach.
+
+rein already implements the **Streamable HTTP** transport (current MCP
+standard) at `/mcp` on its built-in HTTP server. Three prerequisites
+before exposing it:
+
+1. Set `[server].allow_unauthenticated_loopback = true` in
+   `~/.rein/config.toml` (loopback-only bind, opt-in unauth) **OR**
+   set `REIN_HTTP_TOKEN` to a strong secret and have your reverse
+   proxy inject `Authorization: Bearer …` upstream.
+2. Add the public hostname to `[server].allowed_hosts` in
+   `~/.rein/config.toml`, e.g.,
+   `allowed_hosts = ["rein.your-domain.com"]`. Without this, rein
+   returns `403 Host header is not allowed` for any request whose
+   `Host:` is not localhost / 127.0.0.1 / ::1, and your tunnel will
+   appear broken even when up.
+3. Start the listener:
+
+   ```bash
+   rein serve --sse        # listens on 127.0.0.1:8680/mcp
+   ```
+
+Without one of the auth postures in step 1, `rein serve --sse` exits
+immediately with `REIN_HTTP_TOKEN must be set`. Without step 2 the
+listener starts but rejects every tunnel request.
+
+Expose the listener publicly via one of:
+
+- **Cloudflare Tunnel** (recommended — free, no public IP, automatic
+  HTTPS, optional Cloudflare Access for OAuth)
+- **Tailscale Funnel** (alternative for Tailscale users)
+- **Caddy / nginx + Let's Encrypt** (self-hosted with own VPS + domain)
+- **ngrok** (development/testing only; URL ephemeral on free tier)
+
+Then in Claude: **Customize → Connectors → "+" → Add custom connector**,
+paste your URL (e.g., `https://rein.your-domain.com/mcp`), optionally
+add OAuth credentials.
+
+Step-by-step recipes for each tunnel option, the Claude UI configuration
+flow, and authentication tradeoffs are in
+[docs/manual/02b-remote-mcp-deployment.md](docs/manual/02b-remote-mcp-deployment.md).
+
+> **Note**: custom remote connectors require a Pro / Max / Team /
+> Enterprise Claude account. Free-plan users can use the local-stdio
+> paths (DXT, plugin marketplace) but not Cowork.
 
 #### From source
 

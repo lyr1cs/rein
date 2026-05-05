@@ -1,7 +1,7 @@
 # ADR — Distribution channels for rein
 
-**Status:** Adopted, v0.28.9
-**Date:** 2026-05-06
+**Status:** Adopted, v0.28.9; extended to remote MCP in v0.28.10
+**Date:** 2026-05-06 (v0.28.9 decision); extended 2026-05-06 (v0.28.10)
 
 ## Context
 
@@ -54,6 +54,20 @@ For v0.28.9, ship two channels:
 2. **Claude Desktop DXT, macOS Apple Silicon only** — single-platform
    `.mcpb` attached to GitHub Releases. Unsigned; documented `xattr`
    workaround.
+
+For v0.28.10, extend with:
+
+3. **Documented remote-MCP deployment path** for Cowork / claude.ai /
+   mobile. rein already serves the Streamable HTTP transport at `/mcp`
+   (no code change needed); v0.28.10 adds
+   `docs/manual/02b-remote-mcp-deployment.md` covering Cloudflare Tunnel
+   (default recipe), Tailscale Funnel, Caddy / nginx + Let's Encrypt,
+   and ngrok, plus the Anthropic connector UI configuration flow
+   (`Customize → Connectors → "+" → Add custom connector`) and OAuth /
+   auth tradeoffs. This was an oversight in the v0.28.9 plan — the
+   original three-channel set covered Claude Code CLI and Claude
+   Desktop Chat tab but missed the cloud-routed MCP path used by
+   Cowork, claude.ai web, and mobile.
 
 Rejected for v0.28.9:
 
