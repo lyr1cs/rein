@@ -128,6 +128,114 @@ enabled for service-level startup warmup.
 See the OpenAI Codex MCP documentation entry in
 `docs/reference/bibliography.md` for the upstream config format reference.
 
+## Claude Desktop (One-click via DXT)
+
+Rein ships as a Claude Desktop Extension (DXT, file extension `.mcpb`) for
+macOS Apple Silicon. This path requires no Rust toolchain and no manual
+`mcpServers` editing.
+
+### What gets installed
+
+A `.mcpb` is a zip archive containing:
+
+- `manifest.json` — declares the binary, env vars, and the user-config
+  fields Claude Desktop should prompt for at install time.
+- `server/rein-darwin-arm64` — precompiled rein binary (~16 MB with GUI).
+
+Claude Desktop unpacks the archive into its extension directory, prompts
+the user for the fields declared in `user_config`, injects them as env
+vars, and spawns `rein serve` over stdio.
+
+### Quick install (5 steps)
+
+1. **Download** `rein-v<version>.mcpb` from
+   [GitHub Releases](https://github.com/lyr1cs/rein/releases/latest).
+2. **Clear macOS quarantine** (one-time — the build is unsigned):
+
+   ```bash
+   xattr -d com.apple.quarantine ~/Downloads/rein-v*.mcpb
+   ```
+
+   Without this, double-click triggers Gatekeeper's "cannot be opened
+   because the developer cannot be verified" dialog. Alternative: open
+   `Settings → Privacy & Security` after the rejection and click `Open
+   Anyway`.
+
+3. **Double-click** the `.mcpb`. Claude Desktop displays an install dialog.
+4. **Fill in user config**:
+
+   | Field                  | Required | Notes |
+   | ---------------------- | :------: | ----- |
+   | `Gemini API Key`       | yes      | Stored encrypted by Claude Desktop. Injected as `GEMINI_API_KEY`. Get a key at <https://aistudio.google.com/apikey> (1500 req/day free tier). |
+   | `Memory database path` | no       | Defaults to `~/.rein/memories.db`. Override only if you maintain multiple memory stores. |
+   | `Supermemory API Key`  | no       | Optional cross-validation source. Leave blank to skip Supermemory hybrid search. |
+
+5. **Click Install.** Claude Desktop will spawn `rein serve` on the next
+   conversation. ~40 `rein_*` tools appear in the tool list.
+
+### Verifying the install
+
+- **Tool count**: in a new chat, ask Claude to list rein tools. Expect
+  `rein_recall`, `rein_store`, `rein_stats`, plus 37 others.
+- **Process check**: `ps aux | grep "rein serve"` should show one process.
+- **Logs**: `~/Library/Logs/Claude/mcp-server-rein.log`. Tail it with
+  `tail -F` while exercising the extension.
+
+### Upgrading
+
+Download the new `.mcpb`, clear quarantine, double-click. Claude Desktop
+replaces the existing extension in place; your `user_config` values are
+preserved unless you reset them in `Settings → Extensions → rein`.
+
+### Uninstalling
+
+`Settings → Extensions → rein → Disable` (keeps config) or `Remove`
+(deletes config). The SQLite database at `~/.rein/memories.db` is **not**
+deleted — remove it manually if you want a clean slate:
+
+```bash
+rm -rf ~/.rein/
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| ------- | ------------ | --- |
+| "rein cannot be opened because the developer cannot be verified" | Build is unsigned | `xattr -d com.apple.quarantine` (step 2) or `Settings → Privacy & Security → Open Anyway` |
+| Install dialog never appears after double-click | Claude Desktop < 1.0 | Update Claude Desktop. `Help → About Claude` shows the version. |
+| Tools not appearing in chat | `GEMINI_API_KEY` unset or wrong | Check `mcp-server-rein.log` for `gemini api key not set` or HTTP 401. |
+| `unable to open database` on first run | Sandbox can't write `~/.rein/` | Set `Memory database path` explicitly in `user_config` to a path inside Claude Desktop's data directory. |
+| High memory or CPU after months of use | Memories DB grew | Run `rein gc` from a terminal install (or via the MCP `rein_gc` tool). |
+
+### Other platforms
+
+The current DXT ships only macOS Apple Silicon binaries. Intel Mac, Linux,
+and Windows users have two alternatives:
+
+1. **Claude Code plugin marketplace** — see the project README's
+   `Install via Claude Code plugin marketplace` section. Requires
+   `cargo install rein` separately.
+2. **Manual MCP entry** — edit
+   `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+   ```json
+   {
+     "mcpServers": {
+       "rein": {
+         "command": "/Users/<you>/.cargo/bin/rein",
+         "args": ["serve"],
+         "env": { "GEMINI_API_KEY": "..." }
+       }
+     }
+   }
+   ```
+
+   Use the **absolute path** because Claude Desktop does not inherit shell
+   `PATH`.
+
+For maintainers building the `.mcpb` artifact, see
+[docs/guides/dxt-build.md](../guides/dxt-build.md).
+
 ## HTTP, SSE, And GUI
 
 Start stdio MCP for local MCP clients:

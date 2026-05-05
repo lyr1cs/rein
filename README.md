@@ -12,7 +12,9 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.8`** (2026-05-04) — second-pass audit hardening on v0.28.7. Closes **15 P2 + 1 P3** findings across **17 codex review rounds** (2-consecutive-clean saturation at R16/R17). Headline fixes — **M-8 cluster-bucket alignment**: learn-time `top_vec_hit_cluster` now uses memory-id-remap against current `memory_clusters` so the M4-then-M2 normal pipeline order no longer invalidates `cluster_version_at_recall`; **L6 LRU fallback preservation**: `learned_shadow_fusion` cap eviction restricts targets to cluster-scoped buckets (`{query_type}:{cluster_id}` shape), preserving the `global` and per-query-type fallback chain that `get_shadow_fusion_weights` depends on; **`ars_parameter_policy` schema robustness**: peek `schema_version` before typed deserialize (prevents future-schema rows from being mis-classified as `Corrupt` and deleted by `doctor --fix`), CAS predicate uses schema-aware COALESCE default, and `repair_corrupt_parameter_policy` wraps load+delete in `BEGIN IMMEDIATE` to close a peer-race window. Plus M-1 persistence-side per-surface scalar split (4 new ARS keys with legacy fallback for downgrade compat), M-5 synthesis/concept-summary threshold rollback, M-6 outer simplex↔legacy blend by adoption weight, L1 `bootstrap_priors` sanitize cap, L4 auth-policy locks, L5+L7 doctor recovery + release-gate test coverage. **1462 tests / 0 fail / 3 ignored / 0 clippy / 0 fmt.** Default-OFF behavior bit-identical to v0.28.7. License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.8 progression.
+**Current release: `v0.28.9`** (2026-05-06) — distribution-channels patch on v0.28.8. Adds **Claude Desktop one-click install** via DXT (`.mcpb` artifact, macOS Apple Silicon) with `user_config`-prompted `GEMINI_API_KEY` / `REIN_DB` / `SUPERMEMORY_CC_API_KEY`, and **Claude Code plugin marketplace** registration (`/plugin marketplace add lyr1cs/rein`). Build pipeline added at `scripts/build-dxt.sh`; manifest at `dxt/manifest.json`; plugin manifests at `.claude-plugin/marketplace.json` + `plugins/rein/`. New maintainer guide at `docs/guides/dxt-build.md`; ADR at `docs/decisions/distribution-channels.md`. End-user install steps in [docs/manual/02-installation.md](docs/manual/02-installation.md#claude-desktop-one-click-via-dxt). **No runtime behavior changes from v0.28.8** — binary is bit-identical to v0.28.8 with the version field bumped. Tests / clippy / fmt status unchanged from v0.28.8 (1462 / 0 / 3 ignored / 0 / 0). License: AGPL-3.0-or-later. See [Recent releases](#recent-releases) below for the v0.21 → v0.28.9 progression.
+
+**Previous release: `v0.28.8`** (2026-05-04) — second-pass audit hardening on v0.28.7. Closed **15 P2 + 1 P3** findings across **17 codex review rounds** (2-consecutive-clean saturation at R16/R17). Headline fixes: **M-8 cluster-bucket alignment** (learn-time `top_vec_hit_cluster` now uses memory-id-remap against current `memory_clusters`), **L6 LRU fallback preservation** (`learned_shadow_fusion` cap eviction restricted to cluster-scoped buckets), **`ars_parameter_policy` schema robustness** (peek `schema_version` before typed deserialize, schema-aware COALESCE default, BEGIN IMMEDIATE wrapping in `repair_corrupt_parameter_policy`). Plus M-1 persistence-side per-surface scalar split, M-5 synthesis/concept-summary threshold rollback, M-6 outer simplex↔legacy blend, L1 `bootstrap_priors` sanitize cap, L4 auth-policy locks, L5+L7 doctor recovery + release-gate test coverage. Default-OFF behavior bit-identical to v0.28.7.
 
 For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README.md). Reference tables live under [docs/reference/](docs/reference/).
 
@@ -59,6 +61,62 @@ For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README
 | **Remote access** | HTTP / SSE transport with bearer token authentication |
 
 ### Installation
+
+Three install paths depending on your client:
+
+| Client                                      | Recommended path                                              |
+| ------------------------------------------- | ------------------------------------------------------------- |
+| Claude Desktop on macOS Apple Silicon       | [DXT one-click](#install-on-claude-desktop-dxt--macos-apple-silicon) |
+| Claude Code (CLI)                           | [Plugin marketplace](#install-via-claude-code-plugin-marketplace) |
+| Anything else, or you want full control     | [From source](#from-source)                                   |
+
+#### Install on Claude Desktop (DXT — macOS Apple Silicon)
+
+rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
+no Rust toolchain required.
+
+1. Download `rein-v0.28.9.mcpb` from
+   [Releases](https://github.com/lyr1cs/rein/releases/latest).
+2. Clear macOS quarantine (one-time, the build is unsigned):
+
+   ```bash
+   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.9.mcpb
+   ```
+
+3. Double-click the file. Claude Desktop opens its install dialog.
+4. Fill in `Gemini API Key` (required); leave `Memory database path` and
+   `Supermemory API Key` blank to use defaults.
+5. Click Install. Claude Desktop spawns `rein serve` over stdio. ~40
+   `rein_*` tools appear in your next chat.
+
+For step-by-step including upgrade, uninstall, and troubleshooting, see
+[docs/manual/02-installation.md → Claude Desktop](docs/manual/02-installation.md#claude-desktop-one-click-via-dxt).
+For maintainers, the build pipeline is documented in
+[docs/guides/dxt-build.md](docs/guides/dxt-build.md).
+
+> **Other platforms** (Intel Mac / Linux / Windows): the DXT bundle is
+> macOS Apple Silicon only. Use the
+> [Claude Code plugin marketplace](#install-via-claude-code-plugin-marketplace)
+> path or `cargo install` instead.
+
+#### Install via Claude Code plugin marketplace
+
+```text
+/plugin marketplace add lyr1cs/rein
+/plugin install rein@rein
+```
+
+The plugin registers the rein MCP server entry in Claude Code. You still
+need the `rein` binary on your `PATH`:
+
+```bash
+cargo install --git https://github.com/lyr1cs/rein --locked rein
+# or download a release binary and put it in $PATH
+```
+
+Then set `GEMINI_API_KEY` in your shell environment or `~/.rein/config.toml`.
+See [docs/manual/02-installation.md](docs/manual/02-installation.md) for
+full configuration.
 
 #### From source
 

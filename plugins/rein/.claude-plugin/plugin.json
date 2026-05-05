@@ -1,0 +1,13 @@
+{
+  "name": "rein",
+  "description": "Persistent multi-source cross-validated memory across sessions, with knowledge graph and adaptive learning",
+  "version": "0.28.9",
+  "author": {
+    "name": "Eric Lee",
+    "email": "42969110+lyr1cs@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/lyr1cs/rein",
+  "repository": "https://github.com/lyr1cs/rein",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["memory", "mcp", "rag", "knowledge-graph", "adaptive"]
+}
