@@ -12,7 +12,9 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.10`** (2026-05-06) — docs-only patch on v0.28.9 closing the **remote-MCP gap** for Claude Cowork / claude.ai / mobile. New chapter at [docs/manual/02b-remote-mcp-deployment.md](docs/manual/02b-remote-mcp-deployment.md) — four deployment recipes (Cloudflare Tunnel recommended, Tailscale Funnel, Caddy/nginx + Let's Encrypt, ngrok dev), the exact UI configuration flow for **Customize → Connectors → "+" → Add custom connector** with OAuth tradeoffs, and an Anthropic-quoted explanation of why the local-stdio paths (DXT / plugin marketplace / `claude_desktop_config.json`) don't reach Cowork. README install table now lists 4 paths (Chat tab DXT / Claude Code marketplace / Cowork remote MCP / from source). **No runtime / binary changes** — rein already implements the Streamable HTTP transport at `/mcp` (since the rmcp crate's `streamable_http_server` integration); v0.28.10 is purely documentation. Tests / clippy / fmt status unchanged (1462 / 0 / 3 ignored / 0 / 0).
+**Current release: `v0.28.11`** (2026-05-06) — docs-only polish on v0.28.10 adding a **Verified end-to-end walkthrough** to the Tailscale Funnel recipe in [docs/manual/02b-remote-mcp-deployment.md](docs/manual/02b-remote-mcp-deployment.md). The walkthrough is the exact 7-step sequence (FQDN discovery via `tailscale status --json`, `~/.rein/config.toml` `[server].allowed_hosts` entry, **`env -u REIN_HTTP_TOKEN` to defeat shell-inherited bearer auth**, `tailscale funnel --bg --https=443`, Let's Encrypt cert provisioning wait, `tail -F /tmp/rein-sse.log` as ground truth during connector add, Cowork verification) that successfully brought up a working Cowork connector during v0.28.11 development. Plus a "Common pitfalls" subsection covering the 4 traps an operator can hit: REIN_HTTP_TOKEN env-var inheritance, the plugin-marketplace-vs-custom-connector distinction (both can/should coexist), LAN-side `*.ts.net` interception, and cert provisioning delay. Companion `.gitignore` patch (`*.crt` / `*.key` / `*.pem` / `*.p12` / `*.pfx`) blocks accidental commit of TLS material — none was leaked, but `tailscale cert` writes private keys into cwd and the patch closes that footgun. **No runtime / binary changes.** Tests / clippy / fmt unchanged from v0.28.10 (1462 / 0 / 3 ignored / 0 / 0).
+
+**Previous release: `v0.28.10`** (2026-05-06) — docs-only patch on v0.28.9 closing the **remote-MCP gap** for Claude Cowork / claude.ai / mobile. New chapter at [docs/manual/02b-remote-mcp-deployment.md](docs/manual/02b-remote-mcp-deployment.md) — four deployment recipes (Cloudflare Tunnel recommended, Tailscale Funnel, Caddy/nginx + Let's Encrypt, ngrok dev), the exact UI configuration flow for **Customize → Connectors → "+" → Add custom connector** with OAuth tradeoffs, and an Anthropic-quoted explanation of why the local-stdio paths (DXT / plugin marketplace / `claude_desktop_config.json`) don't reach Cowork.
 
 **Previous release: `v0.28.9`** (2026-05-06) — distribution-channels patch on v0.28.8. Adds **Claude Desktop one-click install** via DXT (`.mcpb` artifact, macOS Apple Silicon) with `user_config`-prompted `GEMINI_API_KEY` / `REIN_DB` / `SUPERMEMORY_CC_API_KEY`, and **Claude Code plugin marketplace** registration (`/plugin marketplace add lyr1cs/rein`). Build pipeline added at `scripts/build-dxt.sh`; manifest at `dxt/manifest.json`; plugin manifests at `.claude-plugin/marketplace.json` + `plugins/rein/`. Maintainer guide at `docs/guides/dxt-build.md`; ADR at `docs/decisions/distribution-channels.md`. **Binary bit-identical to v0.28.8.**
 
@@ -78,12 +80,12 @@ Three install paths depending on your client:
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v0.28.10.mcpb` from
+1. Download `rein-v0.28.11.mcpb` from
    [Releases](https://github.com/lyr1cs/rein/releases/latest).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.10.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.11.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -153,13 +155,21 @@ Without one of the auth postures in step 1, `rein serve --sse` exits
 immediately with `REIN_HTTP_TOKEN must be set`. Without step 2 the
 listener starts but rejects every tunnel request.
 
-Expose the listener publicly via one of:
+Expose the listener publicly via one of (no Tailscale or domain
+required for the simpler ones):
 
-- **Cloudflare Tunnel** (recommended — free, no public IP, automatic
-  HTTPS, optional Cloudflare Access for OAuth)
-- **Tailscale Funnel** (alternative for Tailscale users)
-- **Caddy / nginx + Let's Encrypt** (self-hosted with own VPS + domain)
-- **ngrok** (development/testing only; URL ephemeral on free tier)
+- **Cloudflare Quick Tunnel** — `cloudflared tunnel --url
+  http://localhost:8680`. **No account, no domain.** Random
+  `*.trycloudflare.com` URL, ephemeral. Lowest friction; works on
+  most networks (use `--protocol http2` if your network blocks QUIC).
+- **ngrok** — free account, no domain. URL ephemeral on free tier;
+  reserved domains on paid. Tends to work on networks where Quick
+  Tunnel can't.
+- **Tailscale Funnel** — free account, no domain. Permanent
+  `*.ts.net` URL. Most network-tolerant of the no-domain options.
+- **Cloudflare Tunnel + own domain** — permanent URL under your
+  domain, optional Cloudflare Access OIDC for real edge auth.
+- **Caddy / nginx + Let's Encrypt** — self-hosted on your own VPS.
 
 Then in Claude: **Customize → Connectors → "+" → Add custom connector**,
 paste your URL (e.g., `https://rein.your-domain.com/mcp`), optionally

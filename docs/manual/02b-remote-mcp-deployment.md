@@ -55,19 +55,149 @@ authenticated traffic through.
 
 - rein v0.28.9 or newer running locally (`rein --version`)
 - `GEMINI_API_KEY` configured in `~/.rein/config.toml` or shell env
-- One of:
-  - A **Cloudflare account** (free tier sufficient) — recommended path
-  - A **Tailscale account** (free for personal use)
-  - A **VPS or own server with a public domain + DNS access**
 - A **Pro / Max / Team / Enterprise** Claude account (custom connectors
   are not available on Free)
+- A way to expose `127.0.0.1:8680` to the public internet — see the
+  decision tree below to pick the cheapest one for your situation
 
-## Recipe A: Cloudflare Tunnel (recommended)
+## Choosing a recipe
 
-Cloudflare Tunnel gives you a free public HTTPS URL that proxies to your
-local `rein serve --sse`, with no port forwarding, no certificate
-management, and optional Cloudflare Access in front for identity-based
-auth.
+You don't need a Tailscale account, a Cloudflare account, a domain, or a
+VPS to use rein in Cowork. You just need **some** way to give your
+local rein a public HTTPS URL. The recipes below are ranked by friction
+and trade-offs; pick the first one whose prerequisites you already
+meet.
+
+| You have… | Recipe | Setup time | URL stability | Auth options |
+| --- | --- | --- | --- | --- |
+| **Nothing** (no account, no domain) | **A.0: Cloudflare Quick Tunnel** | ~1 min | Ephemeral (changes per restart) | URL obscurity only |
+| ngrok account (free) | **D: ngrok** | ~3 min | Ephemeral on free tier; reserved domains on paid | URL obscurity only |
+| Tailscale account (free) | **B: Tailscale Funnel** | ~5 min | Permanent (`*.ts.net`) | URL obscurity only |
+| Cloudflare account + own domain | **A: Cloudflare Tunnel** | ~15 min | Permanent under your domain | OIDC via Cloudflare Access |
+| VPS + own domain | **C: Caddy / nginx + Let's Encrypt** | ~30 min | Permanent | Anything (basic_auth, OIDC, mTLS) |
+
+**Network gotcha noted across recipes:** several routers and corporate
+proxies intercept and remap `*.trycloudflare.com`, `*.ts.net`,
+`*.ngrok-free.app` traffic — typically to private CGNAT space like
+`198.18.0.0/15`. The some home LANs do this. The
+operational symptoms differ per recipe (Quick Tunnel: cloudflared can't
+establish QUIC tunnel; Tailscale: local curl returns `[HTTP 000]` but
+the public path still works; ngrok: similar). Each recipe below
+documents how to detect and work around its specific manifestation.
+
+## Recipe A.0: Cloudflare Quick Tunnel (no account, no domain)
+
+The lowest-friction option. `cloudflared tunnel --url` provisions a
+random `*.trycloudflare.com` URL on Cloudflare's free quick-tunnel
+service. No Cloudflare account needed; no domain needed. You install
+`cloudflared`, run one command, get a URL.
+
+### Trade-offs
+
+- **No auth layer** — `*.trycloudflare.com` URL is the only secret.
+  Anyone who learns it has rein access. Pair with rein's
+  `allow_unauthenticated_loopback = true` only if your memory
+  database doesn't contain anything sensitive.
+- **URL changes every time `cloudflared` restarts.** You'll re-edit
+  `[server].allowed_hosts` in `~/.rein/config.toml` and re-add the
+  custom connector in Claude Desktop on every reboot. Painful for
+  daily use; fine for "I want to try Cowork once before signing up
+  for anything."
+- **Cloudflare reserves the right to throttle / cut Quick Tunnels**
+  at any time — they're explicitly not for production. Quote from
+  Cloudflare's own banner: "these account-less Tunnels have no
+  uptime guarantee."
+- **Requires QUIC outbound to Cloudflare's edge** — many corporate
+  networks and some consumer routers block QUIC (UDP/443). When this
+  happens, `cloudflared` logs `Failed to dial a quic connection
+  error="failed to dial to edge with quic: timeout: no recent network
+  activity"` repeatedly. Add `--protocol http2` to fall back to TCP;
+  if HTTP/2 also fails, your network is too restrictive for Quick
+  Tunnel — switch to Tailscale Funnel (Recipe B) which uses
+  WireGuard and tends to work where QUIC is blocked.
+
+### Steps
+
+```bash
+# 1. Install cloudflared (no Cloudflare account needed for Quick Tunnel)
+brew install cloudflared        # macOS
+# Linux: see https://pkg.cloudflare.com/index.html
+
+# 2. Make sure rein is up with allow_unauthenticated_loopback = true.
+#    See Recipe B Step 2-3 for the config rationale. Use `env -u
+#    REIN_HTTP_TOKEN` (NOT just `unset`) so the inheritance is blocked
+#    even when this command runs from a shell that has the token
+#    exported — `unset` is shell-local and a forked nohup process
+#    can still inherit a token set in a parent shell that hadn't
+#    seen the unset.
+REIN_LOG=info env -u REIN_HTTP_TOKEN \
+    nohup rein serve --sse > /tmp/rein-sse.log 2>&1 &
+
+# 3. Start the Quick Tunnel. --protocol http2 falls back to TCP if
+#    QUIC is blocked on your network.
+nohup cloudflared tunnel --protocol http2 --url http://localhost:8680 \
+    > /tmp/cloudflared.log 2>&1 &
+
+# 4. Wait ~10s, then read the assigned URL from the log:
+grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1
+# → e.g., https://<your-tunnel-id>.trycloudflare.com
+
+# 5. Add that hostname to ~/.rein/config.toml:
+#      [server]
+#      allow_unauthenticated_loopback = true
+#      allowed_hosts = ["<your-tunnel-id>.trycloudflare.com"]
+#    Restart rein after editing (kill the rein serve --sse process and
+#    relaunch it; config is read at startup, not hot-reloaded).
+
+# 6. In Claude Desktop: Customize → Connectors → "+" → "Add custom
+#    connector" → URL = "https://<the-trycloudflare-hostname>/mcp",
+#    OAuth fields blank, Add.
+```
+
+When you're done, kill `cloudflared` (`pkill -f 'cloudflared tunnel'`).
+
+### When Quick Tunnel fails on a restrictive network
+
+Symptoms in `/tmp/cloudflared.log`:
+
+```
+ERR Failed to dial a quic connection error="failed to dial to edge with quic: timeout: no recent network activity"
+INF Retrying connection in up to 2s
+ERR Failed to dial a quic connection ...
+```
+
+This means cloudflared can't reach Cloudflare's edge. Likely causes
+(in order of frequency):
+
+1. **Network blocks QUIC outbound on UDP/443** (corporate firewalls,
+   some consumer routers, school networks). Mitigation: add
+   `--protocol http2` to the cloudflared command. Falls back to TCP.
+2. **Network intercepts Cloudflare IPs and remaps to private CGNAT
+   space** (many home LANs do this — `198.18.x.x`
+   resolution for Cloudflare hostnames). Even HTTP/2 fallback won't
+   help; cloudflared traffic gets black-holed at the local proxy.
+   Mitigation: switch to Tailscale Funnel (Recipe B). Tailscale uses
+   WireGuard which tends to work where Cloudflare protocols are
+   blocked or intercepted.
+3. **Genuine Cloudflare outage** (rare; check
+   <https://www.cloudflarestatus.com>).
+
+If `--protocol http2` doesn't fix it within 30 seconds, give up on
+Quick Tunnel and use Recipe B (Tailscale Funnel) — it has a free tier
+with permanent URLs and is more network-tolerant.
+
+
+
+## Recipe A: Cloudflare Tunnel with your own domain (production / OIDC)
+
+This is Recipe A.0 with a permanent URL under a domain you own and the
+option to put Cloudflare Access OIDC in front for real edge auth.
+Requires a Cloudflare account and a domain on Cloudflare.
+
+Unlike Quick Tunnel above, the URL is permanent (you choose it), and
+you can attach Cloudflare Access policies for identity-based auth — the
+only OAuth path that maps cleanly to Anthropic's connector OAuth
+fields.
 
 ### Step 1 — Start rein in HTTP mode
 
@@ -293,6 +423,236 @@ If neither option fits, switch to Recipe A (Cloudflare Tunnel + an
 OIDC IdP via Cloudflare Access) instead — that path has a real
 edge-auth story.
 
+### Verified end-to-end walkthrough (macOS Apple Silicon, 2026-05-06)
+
+This is the exact command sequence that brought up a working Cowork
+connector during v0.28.11 development. Every step was executed; every
+output was observed. Use it as a copy-paste recipe; substitute your
+own FQDN where shown.
+
+**Step 1 — Confirm Tailscale is logged in and discover your FQDN.**
+
+```bash
+# Quick inventory — should show your Mac in the tailnet, status "active"
+# or "-" (idle).
+tailscale status | head -5
+
+# Discover the exact FQDN Funnel will use. The Self.DNSName field is
+# the source of truth (trailing dot is just FQDN canonical form;
+# Funnel and Anthropic both accept it without the trailing dot).
+tailscale status --json \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))"
+# → e.g., <your-machine>.<your-tailnet>.ts.net
+```
+
+If the second command prints empty, you haven't run `sudo tailscale up`
+yet (or your tailnet name hasn't been generated). Run `sudo tailscale
+up` and retry.
+
+**Step 2 — Edit `~/.rein/config.toml`.**
+
+Add or amend the `[server]` section so it has BOTH
+`allow_unauthenticated_loopback` AND `allowed_hosts`:
+
+```toml
+[server]
+allow_unauthenticated_loopback = true
+allowed_hosts = ["<your-machine>.<your-tailnet>.ts.net"]   # ← your FQDN
+```
+
+The `allowed_hosts` entry is mandatory. Without it rein returns
+`403 Host header is not allowed` for every Funnel request, even
+though `allow_unauthenticated_loopback` is on. The default Host
+allowlist is localhost-only; the Funnel forwards `Host:` set to your
+public FQDN, which doesn't match.
+
+**Step 3 — Start `rein serve --sse` with `REIN_HTTP_TOKEN` unset and
+verbose logging.**
+
+```bash
+# Critical: explicitly unset REIN_HTTP_TOKEN before starting. Many users
+# (including many setups) have REIN_HTTP_TOKEN exported
+# in their shell so other rein clients can authenticate locally; rein
+# inherits that env var on spawn and switches to bearer-required mode,
+# overriding `allow_unauthenticated_loopback = true`. Anthropic's
+# connector won't supply a bearer header (no UI field for it), so
+# requests would 401. `env -u` inherits the rest of the environment
+# but unsets just this one var.
+#
+# REIN_LOG=info is set so the server emits per-request lines for the
+# initialize / tools / call traffic that Anthropic's connector
+# generates — without it, rein defaults to `warn` and successful
+# requests are silent in the log, making `tail -F /tmp/rein-sse.log`
+# useless as a "did Anthropic reach me?" signal during connector setup.
+REIN_LOG=info env -u REIN_HTTP_TOKEN \
+    nohup rein serve --sse > /tmp/rein-sse.log 2>&1 &
+```
+
+Verify it bound to loopback:
+
+```bash
+cat /tmp/rein-sse.log
+# Expect: "rein HTTP server listening on http://127.0.0.1:8680/mcp"
+
+curl -s -X POST http://127.0.0.1:8680/mcp \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
+         "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                   "clientInfo":{"name":"loopback-test","version":"1"}}}' \
+    | head -5
+# Expect: SSE response with "result":{"protocolVersion":...,"serverInfo":...}
+# If you see "Unauthorized", REIN_HTTP_TOKEN was inherited despite step 3 —
+# unset it in your current shell with `unset REIN_HTTP_TOKEN`, kill the
+# rein process, and retry.
+```
+
+**Step 4 — Enable Tailscale Funnel.**
+
+Modern Tailscale (>= 1.50) syntax — `--bg` runs cloudflared-style
+background, `--https=443` is explicit:
+
+```bash
+tailscale funnel --bg --https=443 http://127.0.0.1:8680
+# Expect:
+#   Available on the internet:
+#   https://<your-machine>.<your-tailnet>.ts.net/
+#   |-- proxy http://127.0.0.1:8680
+#   Funnel started and running in the background.
+
+tailscale funnel status
+# Expect: "Funnel on" with `/ proxy http://127.0.0.1:8680`
+```
+
+The first time you run Funnel under a given hostname, Tailscale's
+edge provisions a Let's Encrypt cert. This typically takes 30 seconds
+to 2 minutes; subsequent restarts reuse the cert.
+
+**Step 5 — Verify externally (or skip this step).**
+
+The local-network curl test below is **unreliable on many home/office
+LANs** — corporate proxies, transparent CGNAT setups, and some
+consumer routers intercept `*.ts.net` DNS resolution and remap it to
+private space (e.g., `198.18.x.x`), so a curl from the same Mac
+fails to reach the public Tailscale edge. Some networks do
+this; the curl returned `[HTTP 000]` even though Funnel was healthy.
+
+If you can curl from a phone on cellular data, that bypasses your
+LAN's interception. Otherwise just skip to Step 6 — the actual proof
+is whether Anthropic's cloud can reach the URL when you Add the
+custom connector, which is what we're trying to verify anyway.
+
+```bash
+# May or may not work depending on your LAN.
+curl -s -w "\n[HTTP %{http_code}]\n" --max-time 10 \
+    https://<your-machine>.<your-tailnet>.ts.net/mcp \
+    -X POST -H 'Accept: application/json, text/event-stream' \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"public-test","version":"1"}}}'
+```
+
+**Step 6 — Add the custom connector in Claude Desktop.**
+
+Before clicking Add, open a second terminal:
+
+```bash
+tail -F /tmp/rein-sse.log
+```
+
+This shows incoming HTTP request lines in real time **only because
+Step 3 started rein with `REIN_LOG=info`**, AND only for requests
+that pass the pre-rmcp guards (Host allowlist + auth). The default
+`REIN_LOG=warn` emits startup/shutdown but stays silent on successful
+initialize / tool calls. **More importantly, requests rejected by
+the Host guard (403) or auth guard (401) are also silent at
+`REIN_LOG=info`** — they short-circuit before any per-request log
+line is written. So a silent log can mean any of:
+
+1. The handshake is **succeeding silently** at INFO (this is fine —
+   check the Connectors list in Claude Desktop for the green
+   "connected" dot).
+2. Requests are **being rejected at the Host guard** (typo in
+   `allowed_hosts`, missing FQDN entry).
+3. Requests are **being rejected at the auth guard** (inherited
+   `REIN_HTTP_TOKEN` putting rein into bearer-required mode despite
+   the loopback opt-in).
+4. Requests **never arrived at all** (tunnel down, DNS issue,
+   Anthropic-side fault).
+
+Don't infer from log silence alone. Use the Connectors list state in
+Claude Desktop as the primary "did Anthropic reach me successfully"
+signal. If it shows red / "failed to connect", check `allowed_hosts`
+and the env-var inheritance trap before assuming the tunnel itself is
+broken. For decisive proof you can also raise the verbosity to
+`REIN_LOG=debug` which logs the guard rejections explicitly.
+
+Now the UI:
+
+1. Open **Claude Desktop**.
+2. Click your avatar / username (top-left) → **"Customize"**, OR press
+   `⌘,` to open Settings.
+3. Top-level navigation: click **"Connectors"** (NOT the "Connectors"
+   sub-tab nested under any plugin).
+4. Click **"+"** → **"Add custom connector"**. The dialog title
+   should say `Add custom connector  BETA`.
+5. Fill in:
+   - **Name:** `rein`
+   - **Remote MCP server URL:** `https://<your-machine>.<your-tailnet>.ts.net/mcp`
+   - **Advanced settings → OAuth Client ID / Secret:** **leave both blank**
+6. Click **"Add"**.
+
+Expected result: dialog closes, Connectors list shows `rein` with the
+toggle on, and `tail -F /tmp/rein-sse.log` shows an `initialize`
+request landing.
+
+**Step 7 — Verify in Cowork.**
+
+Switch to the **Cowork** tab in Claude Desktop, open a new
+conversation, click the connectors menu in the chat, confirm `rein`
+is listed and enabled. Try:
+
+```text
+Use rein to count my memories.
+```
+
+Expected: Claude calls `rein_stats` and returns the count from your
+local `~/.rein/memories.db`.
+
+### Tailscale Funnel — common pitfalls (from the v0.28.11 walkthrough)
+
+- **`REIN_HTTP_TOKEN` env-var inheritance is the most common
+  failure.** Loopback curl returns 401, you assume rein is broken,
+  you spend 20 minutes restarting things — but your shell exports
+  the token and rein just enabled bearer mode. Always start the
+  Funnel-facing rein with `env -u REIN_HTTP_TOKEN nohup rein serve
+  --sse …`. The Step 3 verification command above is the fast
+  diagnostic.
+- **The plugin marketplace `rein` plugin and the custom Cowork
+  connector are two different things, and you may want both.** The
+  `Personal plugins → Rein` entry (installed via the v0.28.9
+  marketplace path) gives Claude Desktop's **Chat tab** and
+  Claude Code stdio access; it does NOT make rein visible in
+  Cowork. The custom connector you Add here gives Cowork /
+  claude.ai / mobile access via the public Funnel URL. Both can be
+  enabled simultaneously — Chat tab uses the faster stdio path
+  automatically, Cowork uses the cloud-routed path.
+- **LAN-side `*.ts.net` interception** — many home/office networks
+  map `*.ts.net` resolution to private space, so local curl tests
+  fail or time out. This does not mean Funnel is broken; the public
+  edge still works, and Anthropic's cloud reaches it directly. Use
+  `tail -F /tmp/rein-sse.log` as ground truth instead.
+- **Cert provisioning delay** — first Funnel under a new hostname
+  takes 30 seconds to 2 minutes for Let's Encrypt. If `Add custom
+  connector` fails immediately, retry in 60 seconds. You can force
+  cert provisioning with `tailscale cert <fqdn>` (writes
+  `<fqdn>.crt` and `<fqdn>.key` into cwd — these are private keys;
+  delete them when done, and the project's `.gitignore` already
+  blocks `*.crt` / `*.key` since v0.28.11 as defense-in-depth).
+- **Funnel hostname in `allowed_hosts`** — every additional client
+  hostname you accept must be added; the default localhost-only
+  allowlist is restrictive on purpose. Wildcards are not supported;
+  list each FQDN explicitly.
+
 ## Recipe C: Self-hosted with Caddy + Let's Encrypt
 
 For users with their own VPS and domain. Most flexible, most work.
@@ -446,26 +806,41 @@ rendering the bearer into the nginx config, restrict file permissions
 (`chmod 600 /etc/nginx/conf.d/rein.conf`) since the secret is now
 inline.
 
-## Recipe D: ngrok (development / testing only)
+## Recipe D: ngrok
+
+ngrok is the closest alternative to Recipe A.0 (Cloudflare Quick
+Tunnel) for users whose network blocks Cloudflare's QUIC/HTTP/2 paths
+or intercepts `*.trycloudflare.com` resolution. It needs a free
+account but no domain. ngrok uses standard HTTPS over TCP/443 so it
+tends to work where Cloudflare Quick Tunnel doesn't.
 
 ```bash
 brew install ngrok
-ngrok config add-authtoken <your-token>
+ngrok config add-authtoken <your-token>     # one-time, get from ngrok.com
 ngrok http 8680
 ```
 
-ngrok prints a temporary URL like `https://abcd-1234.ngrok-free.app`
-that lasts until the process exits. Useful for one-off testing of the
-Anthropic connector setup; **not** suitable for ongoing use because
-the URL changes on each invocation (free tier).
+ngrok prints a temporary URL like `https://abcd-1234.ngrok-free.app`.
+On the **free tier**, this URL changes every time `ngrok` restarts;
+on **paid tiers** you can reserve a domain and the URL stays
+permanent.
+
+### When to choose ngrok
+
+- You don't have a Cloudflare account or domain.
+- Cloudflare Quick Tunnel (Recipe A.0) failed because your network
+  blocks QUIC and HTTP/2 fallback also didn't help.
+- You don't want to install Tailscale.
+- You're OK signing up for one more SaaS account.
 
 > **Host header caveat:** rein's `[server].allowed_hosts` must include
 > the ngrok hostname (`abcd-1234.ngrok-free.app`) for each new tunnel,
-> or every request returns `403 Host header is not allowed`. Since the
-> ngrok URL changes per invocation on the free tier, you'll be editing
-> `~/.rein/config.toml` and restarting `rein serve --sse` each
-> session — another reason ngrok is dev-only. ngrok paid tiers offer
-> reserved domains that make this less painful.
+> or every request returns `403 Host header is not allowed`. Since
+> the ngrok URL changes per invocation on the free tier, you'll be
+> editing `~/.rein/config.toml` and restarting `rein serve --sse`
+> each session. ngrok paid tiers offer reserved domains that make
+> this less painful and are worth the upgrade if you're using ngrok
+> as your daily Cowork-rein tunnel.
 
 ## Authentication
 
