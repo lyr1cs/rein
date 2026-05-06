@@ -31,3 +31,13 @@ SKILL.md
 # canonical human-readable + tracked version). Regenerate via
 # scripts/generate-third-party-notices.sh
 THIRD_PARTY_NOTICES.yaml
+
+# TLS certificates and private keys — must NEVER be committed.
+# Defense-in-depth against `tailscale cert <name>` (writes <name>.crt
+# and <name>.key into cwd), Let's Encrypt artifacts, and any other
+# tooling that drops keys into the working tree.
+*.crt
+*.key
+*.pem
+*.p12
+*.pfx
