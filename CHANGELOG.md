@@ -13,6 +13,34 @@ This file is a condensed index intended for quick scanning.
 
 _Nothing yet._
 
+## [0.28.13] — 2026-05-07
+
+Second hotfix today. Restores remote MCP access via Tailscale Funnel
+(and any other reverse-proxy fronting rein) by bridging rein's
+`[server].allowed_hosts` config into rmcp 1.6's own streamable-HTTP host
+guard.
+
+### Fixed
+
+- **rmcp host-guard bridge (hotfix)** — rmcp 1.6 added its own
+  DNS-rebinding host check inside `StreamableHttpServerConfig` (default
+  `["localhost", "127.0.0.1", "::1"]`) which runs **ahead** of rein's
+  `validate_http_request_host`. rein already had `[server].allowed_hosts`
+  in config and a working guard, but the rmcp config was built with
+  `default()` and never told about the operator-supplied allowlist —
+  silently rejecting non-loopback Hosts (e.g. Tailscale Funnel hostnames)
+  before the request reached rein's middleware. Now `run_http` calls
+  `.with_allowed_hosts(...)` or `.disable_allowed_hosts()` based on bind
+  shape, preserving documented loopback / specific-bind / token-protected
+  wildcard deployment modes. Codex review clean.
+
+### Changed
+
+- `rmcp = "1.2"` → `"1.6"` in `crates/rein/Cargo.toml`. The
+  compatible-update was already resolving to 1.3.0 in lockfile; 1.6.0
+  adds the `with_allowed_hosts` / `disable_allowed_hosts` builder methods
+  without other API breakage.
+
 ## [0.28.12] — 2026-05-07
 
 Single-line hotfix on top of v0.28.11. Restores Claude Code MCP client

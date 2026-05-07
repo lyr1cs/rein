@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "0.28.12"
+version = "0.28.13"
 edition = "2021"
 description = "Multi-source cross-validated memory for AI agents"
 license = "AGPL-3.0-or-later"
@@ -12,7 +12,7 @@ readme = "../../README.md"
 rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
-rmcp = { version = "1.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "tower"] }
+rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "tower"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "stream"] }
 serde = { version = "1", features = ["derive"] }
