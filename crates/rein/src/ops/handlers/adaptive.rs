@@ -233,6 +233,7 @@ impl schemars::JsonSchema for FeedbackParams {
         let synthesis_inner = generator.subschema_for::<SynthesisInteractionFeedbackParams>();
 
         schemars::json_schema!({
+            "type": "object",
             "title": "FeedbackParams",
             "description": "Tagged union dispatched on optional `kind` field. Missing `kind` defaults to `\"access\"` for pre-v0.26 back-compat.",
             "oneOf": [

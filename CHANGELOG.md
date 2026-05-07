@@ -13,6 +13,23 @@ This file is a condensed index intended for quick scanning.
 
 _Nothing yet._
 
+## [0.28.12] — 2026-05-07
+
+Single-line hotfix on top of v0.28.11. Restores Claude Code MCP client
+compatibility for the `rein_feedback` tool.
+
+### Fixed
+
+- **`rein_feedback` MCP `inputSchema` validation (hotfix)** — the manual
+  `JsonSchema` impl on `FeedbackParams` (untagged enum, custom
+  `Deserialize` for optional `kind` back-compat) emitted a schema with
+  `oneOf` but no top-level `"type": "object"`. JSON Schema accepts this,
+  but Claude Code's MCP client uses Zod strict-validation that requires
+  `type` on every tool input schema, so `tools/list` rejected the entire
+  rein tool list with `path: ["tools", 12, "inputSchema", "type"]`. Added
+  `"type": "object"` to the hand-written schema. Runtime deserialization
+  path unchanged. Codex review clean.
+
 ## [0.28.8] — 2026-05-04
 
 Second-pass audit hardening on v0.28.7. **17 codex review rounds (R1–R17)**
