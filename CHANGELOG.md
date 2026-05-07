@@ -13,6 +13,40 @@ This file is a condensed index intended for quick scanning.
 
 _Nothing yet._
 
+## [0.28.14] — 2026-05-07
+
+Docs-only polish on top of v0.28.13. Closes the
+`cargo install --git --tag` footgun discovered while deploying v0.28.13 to
+an aarch64 Linux host.
+
+### Documented
+
+- **`docs/manual/02-installation.md`** — new "Remote Install (Pinned Tag)"
+  section that shows the correct `cargo install --git ... --tag X --locked`
+  invocation, with a callout explaining why `--locked` is mandatory: without
+  it, `cargo install --git` ignores the committed `Cargo.lock` and
+  re-resolves transitive deps to the latest semver-compatible versions on
+  crates.io, which can pull in newer C/SIMD code (e.g. `usearch 2.25` →
+  `numkong 7.6.0`) requiring a host toolchain newer than what the target
+  ships (GCC 13+ / clang 17+ on aarch64 Linux). Plus a Troubleshooting row
+  pointing at this fix when users hit the
+  `inlining failed in call to 'always_inline' 'vdotq_s32'` symptom.
+- **`README.md`** — one-line install snippet now shows both the latest-master
+  and pinned-tag forms, with a short callout linking to the manual section.
+- **GitHub Release notes for v0.28.12 + v0.28.13** retroactively patched to
+  add `--locked` to the upgrade command.
+
+### Fixed
+
+- **`AGENTS.md` overview line** — version pin updated from `v0.28.11` to
+  `v0.28.14` so `rein doctor`'s `overview_version` check stops warning
+  about a stale overview.
+
+### No runtime behavior changes from v0.28.13
+
+Binary is bit-identical with the version field bumped. Same dependency
+graph, same `Cargo.lock`, same 1462 / 1462 tests.
+
 ## [0.28.13] — 2026-05-07
 
 Second hotfix today. Restores remote MCP access via Tailscale Funnel

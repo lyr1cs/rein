@@ -56,6 +56,41 @@ REIN_INSTALL_GUI=0 ./scripts/install.sh
 When `REIN_INSTALL_GUI=1` or unset, npm controls whether the script attempts the
 GUI build. If npm is missing, the script falls back to a CLI-only install.
 
+## Remote Install (Pinned Tag)
+
+When you want to install a specific tagged release directly from GitHub
+without cloning, use `cargo install --git` with **both** `--tag` **and**
+`--locked`:
+
+```bash
+# Install a specific release (binary only, no GUI)
+cargo install --git https://github.com/lyr1cs/rein --tag v0.28.13 --locked rein
+```
+
+To upgrade an existing install in place, add `--force`:
+
+```bash
+cargo install --git https://github.com/lyr1cs/rein --tag v0.28.13 --locked rein --force
+```
+
+> ⚠️ **`--locked` is mandatory when using `--tag`.** Without `--locked`,
+> `cargo install --git` ignores the `Cargo.lock` committed at that tag and
+> re-resolves every transitive dependency to the latest semver-compatible
+> version on crates.io. A newer dependency may pull in C/SIMD code that
+> requires a newer host toolchain than the one on the target machine
+> (e.g. `usearch 2.25` introduced `numkong 7.6.0`, whose SIMD probes need
+> GCC 13+ or clang 17+ on aarch64 Linux). With `--locked`, you build the
+> exact dependency graph that was tested at release time.
+
+If you need the embedded GUI when installing remotely, you must clone the
+source instead — `--git` alone does not run `npm` for the GUI bundle:
+
+```bash
+git clone --branch v0.28.13 https://github.com/lyr1cs/rein
+cd rein
+./scripts/install.sh        # builds GUI then runs cargo install --locked --features gui
+```
+
 ## Docker
 
 Build the image:
@@ -206,6 +241,7 @@ rm -rf ~/.rein/
 | Tools not appearing in chat | `GEMINI_API_KEY` unset or wrong | Check `mcp-server-rein.log` for `gemini api key not set` or HTTP 401. |
 | `unable to open database` on first run | Sandbox can't write `~/.rein/` | Set `Memory database path` explicitly in `user_config` to a path inside Claude Desktop's data directory. |
 | High memory or CPU after months of use | Memories DB grew | Run `rein gc` from a terminal install (or via the MCP `rein_gc` tool). |
+| `cargo install` fails with `inlining failed in call to 'always_inline' 'vdotq_s32'` (or similar SIMD intrinsic name) on aarch64 Linux | `cargo install --git --tag` re-resolved dependencies and pulled a newer `usearch`/`numkong` requiring GCC 13+ / clang 17+ | Add `--locked` to the install command (see [Remote Install (Pinned Tag)](#remote-install-pinned-tag)). |
 
 ### Cowork, claude.ai, and mobile (remote MCP)
 

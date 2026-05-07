@@ -115,9 +115,19 @@ The plugin registers the rein MCP server entry in Claude Code. You still
 need the `rein` binary on your `PATH`:
 
 ```bash
+# Latest master
 cargo install --git https://github.com/lyr1cs/rein --locked rein
-# or download a release binary and put it in $PATH
+
+# Or pin to a specific release tag (recommended for reproducible installs)
+cargo install --git https://github.com/lyr1cs/rein --tag v0.28.13 --locked rein
 ```
+
+> **`--locked` is required.** Without it, `cargo install --git` ignores
+> the committed `Cargo.lock` and re-resolves every transitive dependency
+> to the latest semver-compatible version on crates.io, which can pull
+> in C/SIMD code that requires a newer host toolchain than your machine
+> ships. See
+> [docs/manual/02-installation.md → Remote Install](docs/manual/02-installation.md#remote-install-pinned-tag).
 
 Then set `GEMINI_API_KEY` in your shell environment or `~/.rein/config.toml`.
 See [docs/manual/02-installation.md](docs/manual/02-installation.md) for
