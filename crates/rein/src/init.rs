@@ -528,11 +528,26 @@ fn enable_codex_hooks_feature(path: &Path) -> anyhow::Result<()> {
     let features_tbl = features
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[features] is not a table"))?;
-    if features_tbl.get("codex_hooks").and_then(|v| v.as_bool()) == Some(true) {
+    // Codex 0.129+ uses `[features].hooks`. Pre-0.129 used `codex_hooks`.
+    // Strategy across the rename window:
+    //
+    //   - If `hooks = true` is already set, no-op (user is on Codex 0.129+
+    //     and already configured).
+    //   - Otherwise always set `hooks = true` so Codex 0.129+ picks up hooks.
+    //   - On fresh inits where `codex_hooks` was not previously present, also
+    //     set `codex_hooks = true` so users still on Codex <0.129 get hooks
+    //     enabled — `rein doctor` (which accepts either key) cannot
+    //     distinguish the two cases, so a fresh install must work on both.
+    //   - Don't touch an existing `codex_hooks` entry: if the user explicitly
+    //     set it (true or false), respect their choice.
+    if features_tbl.get("hooks").and_then(|v| v.as_bool()) == Some(true) {
         return Ok(());
     }
 
-    features_tbl.insert("codex_hooks".to_string(), toml::Value::Boolean(true));
+    features_tbl.insert("hooks".to_string(), toml::Value::Boolean(true));
+    if !features_tbl.contains_key("codex_hooks") {
+        features_tbl.insert("codex_hooks".to_string(), toml::Value::Boolean(true));
+    }
     let formatted = toml::to_string_pretty(&root)?;
     std::fs::write(path, formatted)?;
     Ok(())
@@ -779,7 +794,9 @@ mod tests {
 
         let config = std::fs::read_to_string(&config_path).unwrap();
         assert!(config.contains("[mcp.rein]"));
+        // No hooks feature flag for the generic (non-Codex) path.
         assert!(!config.contains("codex_hooks"));
+        assert!(!config.contains("hooks = true"));
         assert!(!dir.path().join("hooks.json").exists());
     }
 
@@ -792,7 +809,11 @@ mod tests {
         configure_codex_client(&config_path).unwrap();
 
         let config = std::fs::read_to_string(&config_path).unwrap();
-        assert!(config.contains("codex_hooks = true"));
+        // Fresh init must enable hooks on BOTH Codex 0.129+ (`hooks`) and
+        // pre-0.129 (`codex_hooks`) since `rein doctor` accepts either key
+        // and would otherwise falsely report healthy on old Codex.
+        assert!(config.contains("hooks = true"), "config: {config}");
+        assert!(config.contains("codex_hooks = true"), "config: {config}");
 
         let hooks_path = dir.path().join("hooks.json");
         let hooks = std::fs::read_to_string(&hooks_path).unwrap();
@@ -818,5 +839,73 @@ mod tests {
         for (event, command) in expected {
             assert_eq!(root["hooks"][event][0]["hooks"][0]["command"], command);
         }
+    }
+
+    #[test]
+    fn codex_init_writes_new_hooks_key_and_preserves_legacy_codex_hooks() {
+        // Regression for the codex 0.129 [features].codex_hooks → hooks rename.
+        // When a user already has `codex_hooks = true` from an older codex
+        // setup, `rein init` should add the new `hooks = true` (so codex 0.129+
+        // actually picks up hooks) without removing the legacy key (in case
+        // they downgrade or share the config across machines).
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config.contains("hooks = true"),
+            "new hooks key missing: {config}"
+        );
+        assert!(
+            config.contains("codex_hooks = true"),
+            "legacy codex_hooks key was removed: {config}"
+        );
+    }
+
+    #[test]
+    fn codex_init_is_idempotent_under_new_hooks_key() {
+        // If `hooks = true` is already present, init should be a no-op for the
+        // feature flag — including not adding the legacy `codex_hooks` key.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        // Exactly one occurrence — we did not duplicate the line.
+        assert_eq!(
+            config.matches("hooks = true").count(),
+            1,
+            "hooks flag was duplicated: {config}"
+        );
+        assert!(!config.contains("codex_hooks"));
+    }
+
+    #[test]
+    fn codex_init_respects_explicitly_disabled_legacy_key() {
+        // If the user has explicitly set `codex_hooks = false`, init must
+        // still write `hooks = true` (Codex 0.129+) without flipping the
+        // explicit opt-out to true.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[features]\ncodex_hooks = false\n").unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("hooks = true"), "config: {config}");
+        // Explicit user opt-out preserved.
+        assert!(
+            config.contains("codex_hooks = false"),
+            "explicit codex_hooks=false was overwritten: {config}"
+        );
+        assert!(
+            !config.contains("codex_hooks = true"),
+            "explicit codex_hooks=false was overwritten: {config}"
+        );
     }
 }

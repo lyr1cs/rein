@@ -527,20 +527,30 @@ fn check_codex_hooks_at(codex_dir: &Path) -> DoctorCheck {
         );
     }
 
+    // Codex 0.129+ uses `[features].hooks`. Older releases used `codex_hooks`.
+    // Accept either key as the enabling signal so this check works across the
+    // rename window. `rein init` writes the new key going forward.
     let feature_enabled = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
         .and_then(|root| {
-            root.get("features")
-                .and_then(|features| features.get("codex_hooks"))
-                .and_then(|enabled| enabled.as_bool())
+            root.get("features").and_then(|features| {
+                features
+                    .get("hooks")
+                    .and_then(|enabled| enabled.as_bool())
+                    .or_else(|| {
+                        features
+                            .get("codex_hooks")
+                            .and_then(|enabled| enabled.as_bool())
+                    })
+            })
         })
         == Some(true);
     if !feature_enabled {
         return warn_with_hint(
             DoctorCategory::Configuration,
             "codex_hooks",
-            "[features].codex_hooks = true is not configured",
+            "Codex [features].hooks = true is not configured",
             "run rein init",
         );
     }
@@ -2234,6 +2244,19 @@ provider = "inherit"
     }
 
     fn write_codex_config(codex_dir: &Path, enabled: bool) {
+        // Codex 0.129+ format. `check_codex_hooks_at` should also accept the
+        // legacy `codex_hooks` key — see `write_codex_config_legacy`.
+        std::fs::create_dir_all(codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            format!("[features]\nhooks = {enabled}\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_codex_config_legacy(codex_dir: &Path, enabled: bool) {
+        // Pre-0.129 layout. Verifies graceful read-side compat for users still
+        // on the old codex CLI.
         std::fs::create_dir_all(codex_dir).unwrap();
         std::fs::write(
             codex_dir.join("config.toml"),
@@ -2317,7 +2340,22 @@ provider = "inherit"
         assert_eq!(check.name, "codex_hooks");
         assert_eq!(check.status, CheckStatus::Warn);
         assert_eq!(check.repair_hint.as_deref(), Some("run rein init"));
-        assert!(check.message.contains("codex_hooks"));
+        assert!(check.message.contains("hooks"));
+    }
+
+    #[test]
+    fn test_doctor_accepts_legacy_codex_hooks_key() {
+        // Older codex (<0.129) used `[features].codex_hooks = true`. Rein
+        // doctor must keep recognising that until those users upgrade.
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_legacy(dir.path(), true);
+        write_codex_hooks(dir.path(), None);
+
+        let check = check_codex_hooks_at(dir.path());
+
+        assert_eq!(check.name, "codex_hooks");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("six hooks configured"));
     }
 
     #[test]
