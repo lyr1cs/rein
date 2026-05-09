@@ -598,10 +598,13 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     let auth_token = std::env::var("REIN_HTTP_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty());
-    let allow_loopback_unauth = config.server.allow_unauthenticated_loopback
-        && (config.server.sse_bind == "127.0.0.1"
-            || config.server.sse_bind == "::1"
-            || config.server.sse_bind == "localhost");
+    let allow_loopback_unauth = config.server.loopback_unauth_requested();
+    if auth_token.is_some() && config.server.allow_unauthenticated_loopback {
+        tracing::warn!(
+            "REIN_HTTP_TOKEN is set while [server].allow_unauthenticated_loopback=true; \
+             token auth wins and the loopback flag is a no-op at runtime"
+        );
+    }
     if auth_token.is_none() && !allow_loopback_unauth {
         return Err(anyhow::anyhow!(
             "REIN_HTTP_TOKEN must be set for HTTP/SSE access on '{}'. \

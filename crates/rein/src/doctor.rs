@@ -107,6 +107,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_http_auth(config));
     checks.push(check_proxy_auth(config));
     checks.push(check_codex_hooks());
+    checks.push(check_codex_mcp_server());
     checks.push(check_gui_runtime(config));
     checks.push(check_proxy_runtime(config));
     checks.push(check_overview_version());
@@ -517,6 +518,118 @@ fn check_codex_hooks() -> DoctorCheck {
     check_codex_hooks_at(&codex_dir)
 }
 
+fn check_codex_mcp_server() -> DoctorCheck {
+    let Some(codex_dir) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|p| p.join(".codex"))
+    else {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            "HOME not set; skipping Codex MCP checks",
+        );
+    };
+    check_codex_mcp_server_at(&codex_dir)
+}
+
+fn check_codex_mcp_server_at(codex_dir: &Path) -> DoctorCheck {
+    let config_path = codex_dir.join("config.toml");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(_) => {
+            return ok_in(
+                DoctorCategory::Configuration,
+                "codex_mcp",
+                "Codex config not found; skipping Codex MCP checks",
+            );
+        }
+    };
+    let parsed: toml::Value = match toml::from_str(&content) {
+        Ok(value) => value,
+        Err(_) => {
+            return warn_with_hint(
+                DoctorCategory::Configuration,
+                "codex_mcp",
+                "Codex config.toml is not valid TOML",
+                "fix ~/.codex/config.toml or rerun rein init",
+            );
+        }
+    };
+
+    let rein_entry = parsed
+        .get("mcp_servers")
+        .and_then(|v| v.get("rein"))
+        .or_else(|| parsed.get("mcp").and_then(|v| v.get("rein")));
+    let Some(entry) = rein_entry.and_then(|v| v.as_table()) else {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            "Codex rein MCP server is not configured",
+            "run rein init",
+        );
+    };
+
+    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+        return check_codex_mcp_url(url);
+    }
+
+    if let Some(command) = entry.get("command").and_then(|v| v.as_str()) {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex rein MCP uses stdio command `{command}`"),
+        );
+    }
+
+    warn_with_hint(
+        DoctorCategory::Configuration,
+        "codex_mcp",
+        "Codex rein MCP entry has neither url nor command",
+        "run rein init or edit ~/.codex/config.toml",
+    )
+}
+
+fn check_codex_mcp_url(url: &str) -> DoctorCheck {
+    let uri: hyper::Uri = match url.parse() {
+        Ok(uri) => uri,
+        Err(_) => {
+            return warn_with_hint(
+                DoctorCategory::Configuration,
+                "codex_mcp",
+                format!("Codex rein MCP url is not a valid URI: {url}"),
+                "fix ~/.codex/config.toml or rerun rein init",
+            );
+        }
+    };
+    let host = uri.host().unwrap_or_default();
+    if is_loopback_http_host(host) {
+        ok_in(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex rein MCP uses loopback HTTP endpoint {url}"),
+        )
+    } else {
+        warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!(
+                "Codex rein MCP points at non-loopback HTTP endpoint {url}; \
+                 recall may use a different machine/database than local `rein` CLI"
+            ),
+            "use stdio (`command = \"rein\", args = [\"serve\"]`) for local memories, or verify the remote endpoint is intentional",
+        )
+    }
+}
+
+fn is_loopback_http_host(host: &str) -> bool {
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    normalized == "localhost" || normalized == "127.0.0.1" || normalized == "::1"
+}
+
 fn check_codex_hooks_at(codex_dir: &Path) -> DoctorCheck {
     let config_path = codex_dir.join("config.toml");
     if !config_path.exists() {
@@ -871,18 +984,31 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
     let token_present = std::env::var("REIN_HTTP_TOKEN")
         .ok()
         .is_some_and(|token| !token.trim().is_empty());
-    let is_loopback = is_loopback_bind(&config.server.sse_bind);
-    let allow_unauth = config.server.allow_unauthenticated_loopback && is_loopback;
+    let allow_unauth = config.server.loopback_unauth_requested();
 
     if token_present {
-        ok_in(
-            DoctorCategory::Configuration,
-            "http_auth",
-            format!(
-                "token configured for {}:{}",
-                config.server.sse_bind, config.server.sse_port
-            ),
-        )
+        if config.server.allow_unauthenticated_loopback {
+            warn_with_hint(
+                DoctorCategory::Configuration,
+                "http_auth",
+                format!(
+                    "REIN_HTTP_TOKEN is set for {}:{} and \
+                     [server].allow_unauthenticated_loopback=true; token auth wins, \
+                     so loopback unauth is disabled at runtime",
+                    config.server.sse_bind, config.server.sse_port
+                ),
+                "unset REIN_HTTP_TOKEN for public/loopback-unauth testing, or set allow_unauthenticated_loopback=false when bearer auth is intended",
+            )
+        } else {
+            ok_in(
+                DoctorCategory::Configuration,
+                "http_auth",
+                format!(
+                    "token configured for {}:{}",
+                    config.server.sse_bind, config.server.sse_port
+                ),
+            )
+        }
     } else if allow_unauth {
         ok_in(
             DoctorCategory::Configuration,
@@ -2265,6 +2391,11 @@ provider = "inherit"
         .unwrap();
     }
 
+    fn write_codex_config_raw(codex_dir: &Path, content: &str) {
+        std::fs::create_dir_all(codex_dir).unwrap();
+        std::fs::write(codex_dir.join("config.toml"), content).unwrap();
+    }
+
     fn write_codex_hooks(codex_dir: &Path, omit_event: Option<&str>) {
         let mut hooks = serde_json::Map::new();
         for (event, command) in expected_codex_hook_commands() {
@@ -2383,6 +2514,83 @@ provider = "inherit"
         assert_eq!(check.status, CheckStatus::Warn);
         assert_eq!(check.repair_hint.as_deref(), Some("run rein init"));
         assert!(check.message.contains("Stop"));
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_mcp_stdio_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path());
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("stdio"));
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_mcp_loopback_url_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\nurl = \"http://127.0.0.1:8680/mcp\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path());
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("loopback"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_non_loopback_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\nurl = \"http://100.64.0.10:8680/mcp\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path());
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("non-loopback"));
+        assert!(check.message.contains("different machine/database"));
+        assert!(check.repair_hint.as_deref().unwrap().contains("stdio"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_warns_when_http_token_overrides_loopback_unauth() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.sse_bind = "127.0.0.1".to_string();
+        config.server.allow_unauthenticated_loopback = true;
+
+        let check = check_http_auth(&config);
+
+        assert_eq!(check.name, "http_auth");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("token auth wins"));
+        assert!(check
+            .repair_hint
+            .as_deref()
+            .unwrap()
+            .contains("unset REIN_HTTP_TOKEN"));
+
+        config.server.sse_bind = "0.0.0.0".to_string();
+        let check = check_http_auth(&config);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("token auth wins"));
     }
 
     #[test]

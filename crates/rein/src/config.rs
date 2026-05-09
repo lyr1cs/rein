@@ -987,6 +987,19 @@ pub struct ServerConfig {
     pub allowed_hosts: Option<Vec<String>>,
 }
 
+/// True when an HTTP bind address is unambiguously local loopback.
+pub(crate) fn is_loopback_bind_host(bind: &str) -> bool {
+    matches!(bind, "127.0.0.1" | "::1" | "localhost")
+}
+
+impl ServerConfig {
+    /// Whether `[server].allow_unauthenticated_loopback` can take effect for
+    /// the configured bind address.
+    pub(crate) fn loopback_unauth_requested(&self) -> bool {
+        self.allow_unauthenticated_loopback && is_loopback_bind_host(&self.sse_bind)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HooksConfig {
@@ -3184,6 +3197,34 @@ max_input_chars = 512
             config.resolve_db_path(),
             std::path::PathBuf::from("/custom/path/test.db")
         );
+    }
+
+    #[test]
+    fn server_loopback_unauth_requested_requires_loopback_bind() {
+        let mut server = ServerConfig {
+            allow_unauthenticated_loopback: true,
+            ..ServerConfig::default()
+        };
+
+        for bind in ["127.0.0.1", "::1", "localhost"] {
+            server.sse_bind = bind.to_string();
+            assert!(
+                server.loopback_unauth_requested(),
+                "{bind} should allow the loopback unauth flag to take effect"
+            );
+        }
+
+        for bind in ["0.0.0.0", "::", "192.168.1.10", "example.com"] {
+            server.sse_bind = bind.to_string();
+            assert!(
+                !server.loopback_unauth_requested(),
+                "{bind} must not be treated as loopback"
+            );
+        }
+
+        server.sse_bind = "127.0.0.1".to_string();
+        server.allow_unauthenticated_loopback = false;
+        assert!(!server.loopback_unauth_requested());
     }
 
     #[test]
