@@ -469,35 +469,79 @@ fn configure_toml_client(path: &Path) -> anyhow::Result<()> {
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config is not a TOML table"))?;
 
-    // Ensure [mcp] section exists
-    let mcp = root_tbl
-        .entry("mcp")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let mcp_tbl = mcp
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[mcp] is not a table"))?;
+    // Codex 0.129+ uses `[mcp_servers.<name>]` for stdio MCP servers; older
+    // Codex used `[mcp.<name>]`. (Same `legacy-clean` pass that renamed
+    // `[features].codex_hooks` → `[features].hooks`.) Strategy mirrors
+    // `enable_codex_hooks_feature`:
+    //
+    //   - If `[mcp_servers.rein]` is already present, no-op (Codex 0.129+
+    //     setup already done — leave the user's customisations alone).
+    //   - Otherwise always write `[mcp_servers.rein]` so Codex 0.129+ picks
+    //     up rein as an MCP server.
+    //   - On fresh inits where `[mcp.rein]` was not previously present, also
+    //     write `[mcp.rein]` for Codex <0.129 compat — `rein init` cannot
+    //     detect the operator's Codex version, so a fresh install must work
+    //     on both.
+    //   - Don't touch an existing `[mcp.rein]` entry: if the user customised
+    //     it (e.g. different command path or args), respect their choice.
+    let has_new = root_tbl
+        .get("mcp_servers")
+        .and_then(|t| t.as_table())
+        .map(|t| t.contains_key("rein"))
+        .unwrap_or(false);
+    if has_new {
+        println!("  (rein already configured in [mcp_servers], skipping)");
+        return Ok(());
+    }
 
-    let mut modified = false;
-    if mcp_tbl.contains_key("rein") {
-        println!("  (rein already configured, skipping)");
-    } else {
-        let mut rein_tbl = toml::map::Map::new();
-        rein_tbl.insert(
+    // Snapshot any pre-existing `[mcp.rein]` entry so we can clone the
+    // user's customisations (custom command path, env, args, cwd, …) into
+    // the new `[mcp_servers.rein]` table. Codex 0.129+ ignores `[mcp]`,
+    // so without this clone an operator who had customised the legacy
+    // entry would silently fall back to rein's defaults after upgrading.
+    let legacy_entry = root_tbl
+        .get("mcp")
+        .and_then(|t| t.as_table())
+        .and_then(|t| t.get("rein"))
+        .cloned();
+
+    fn rein_entry() -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert(
             "command".to_string(),
             toml::Value::String("rein".to_string()),
         );
-        rein_tbl.insert(
+        t.insert(
             "args".to_string(),
             toml::Value::Array(vec![toml::Value::String("serve".to_string())]),
         );
-        mcp_tbl.insert("rein".to_string(), toml::Value::Table(rein_tbl));
-        modified = true;
+        toml::Value::Table(t)
     }
 
-    if modified {
-        let formatted = toml::to_string_pretty(&root)?;
-        std::fs::write(path, formatted)?;
+    let new_entry = legacy_entry.clone().unwrap_or_else(rein_entry);
+    let mcp_servers = root_tbl
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let mcp_servers_tbl = mcp_servers
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[mcp_servers] is not a table"))?;
+    mcp_servers_tbl.insert("rein".to_string(), new_entry);
+
+    if legacy_entry.is_none() {
+        // Fresh init — also write `[mcp.rein]` (rein defaults) for Codex
+        // <0.129 compat. `rein init` cannot detect the operator's Codex
+        // version, so a fresh install must work on both.
+        let mcp = root_tbl
+            .entry("mcp")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let mcp_tbl = mcp
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("[mcp] is not a table"))?;
+        mcp_tbl.insert("rein".to_string(), rein_entry());
     }
+
+    let formatted = toml::to_string_pretty(&root)?;
+    std::fs::write(path, formatted)?;
     Ok(())
 }
 
@@ -793,11 +837,122 @@ mod tests {
         configure_toml_client(&config_path).unwrap();
 
         let config = std::fs::read_to_string(&config_path).unwrap();
-        assert!(config.contains("[mcp.rein]"));
+        // Fresh init writes BOTH `[mcp_servers.rein]` (Codex 0.129+) and
+        // `[mcp.rein]` (Codex <0.129) since `configure_toml_client` cannot
+        // detect the operator's Codex version.
+        assert!(
+            config.contains("[mcp_servers.rein]"),
+            "missing new mcp_servers entry: {config}"
+        );
+        assert!(
+            config.contains("[mcp.rein]"),
+            "missing legacy mcp entry: {config}"
+        );
         // No hooks feature flag for the generic (non-Codex) path.
         assert!(!config.contains("codex_hooks"));
         assert!(!config.contains("hooks = true"));
         assert!(!dir.path().join("hooks.json").exists());
+    }
+
+    #[test]
+    fn codex_init_writes_new_mcp_servers_and_preserves_legacy_mcp() {
+        // Regression for the codex 0.129 [mcp.<name>] → [mcp_servers.<name>]
+        // rename. When a user already has `[mcp.rein]` from an older codex
+        // setup, `rein init` should add `[mcp_servers.rein]` (so codex 0.129+
+        // actually discovers rein) without removing the legacy entry.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[mcp.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config.contains("[mcp_servers.rein]"),
+            "new mcp_servers entry missing: {config}"
+        );
+        assert!(
+            config.contains("[mcp.rein]"),
+            "legacy mcp entry was removed: {config}"
+        );
+    }
+
+    #[test]
+    fn codex_init_skips_when_mcp_servers_rein_already_present() {
+        // If `[mcp_servers.rein]` is already there (Codex 0.129+ user is
+        // already configured), init must not duplicate the entry and must
+        // not retroactively add `[mcp.rein]`.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            config.matches("[mcp_servers.rein]").count(),
+            1,
+            "mcp_servers.rein duplicated: {config}"
+        );
+        assert!(
+            !config.contains("[mcp.rein]"),
+            "legacy mcp.rein retroactively added: {config}"
+        );
+    }
+
+    #[test]
+    fn codex_init_clones_user_customised_legacy_mcp_into_mcp_servers() {
+        // If a user has customised the legacy `[mcp.rein]` entry (e.g. with
+        // a non-default command path or extra args/env), `rein init` must
+        // CLONE those customisations into the new `[mcp_servers.rein]`
+        // entry, not silently fall back to rein's defaults. Codex 0.129+
+        // ignores `[mcp]`, so a default `[mcp_servers.rein]` would replace
+        // the user's working setup.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[mcp.rein]\ncommand = \"/opt/custom/rein\"\nargs = [\"serve\", \"--quiet\"]\n",
+        )
+        .unwrap();
+
+        configure_codex_client(&config_path).unwrap();
+
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&config).unwrap();
+
+        // Legacy `[mcp.rein]` preserved verbatim.
+        assert_eq!(
+            parsed["mcp"]["rein"]["command"].as_str(),
+            Some("/opt/custom/rein"),
+            "legacy command was overwritten: {config}"
+        );
+
+        // New `[mcp_servers.rein]` cloned the user's customisations.
+        assert_eq!(
+            parsed["mcp_servers"]["rein"]["command"].as_str(),
+            Some("/opt/custom/rein"),
+            "new entry did not clone user's command: {config}"
+        );
+        let new_args: Vec<&str> = parsed["mcp_servers"]["rein"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            new_args,
+            vec!["serve", "--quiet"],
+            "new entry did not clone user's args: {config}"
+        );
     }
 
     #[test]
