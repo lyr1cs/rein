@@ -920,7 +920,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[mcp.rein]\ncommand = \"/opt/custom/rein\"\nargs = [\"serve\", \"--quiet\"]\n",
+            "[mcp.rein]\ncommand = \"/opt/custom/rein\"\nargs = [\"serve\", \"--quiet\"]\ncwd = \"/opt/custom\"\n\n[mcp.rein.env]\nREIN_DB = \"/opt/custom/memories.db\"\nREIN_AGENT_LABEL = \"codex\"\n",
         )
         .unwrap();
 
@@ -952,6 +952,21 @@ mod tests {
             new_args,
             vec!["serve", "--quiet"],
             "new entry did not clone user's args: {config}"
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["rein"]["cwd"].as_str(),
+            Some("/opt/custom"),
+            "new entry did not clone user's cwd: {config}"
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["rein"]["env"]["REIN_DB"].as_str(),
+            Some("/opt/custom/memories.db"),
+            "new entry did not clone user's REIN_DB env: {config}"
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["rein"]["env"]["REIN_AGENT_LABEL"].as_str(),
+            Some("codex"),
+            "new entry did not clone user's env table: {config}"
         );
     }
 

@@ -64,9 +64,9 @@ uploaded to the GitHub Release page).
    - patches the manifest's `version` field with `jq` so manifest and
      `Cargo.toml` never drift
 6. Runs `jq -e .` on the staged manifest to validate JSON.
-7. Zips the staging directory with `zip -r -X` (the `-X` flag strips macOS
-   extended attributes; without it Claude Desktop's unpacker can misbehave
-   on HFS resource forks).
+7. Zips the staging directory with `zip -r -X -D` (`-X` strips macOS
+   extended attributes; `-D` omits directory entries that can confuse the
+   MCPB unpacker).
 8. Outputs `target/rein-v<version>.mcpb`.
 
 Run:
@@ -76,7 +76,7 @@ chmod +x scripts/build-dxt.sh
 ./scripts/build-dxt.sh
 ```
 
-Expected output: `target/rein-v0.28.11.mcpb`, ~16 MB.
+Expected output: `target/rein-v<version>.mcpb`, ~10-16 MB.
 
 ## Manifest field reference
 
@@ -107,12 +107,12 @@ to confirm it parses, then re-run `build-dxt.sh` end-to-end.
 
 ## Local testing
 
-After `build-dxt.sh` produces `target/rein-v0.28.11.mcpb`:
+After `build-dxt.sh` produces `target/rein-v<version>.mcpb`:
 
 1. Open Finder, navigate to `target/`.
 2. (Once for unsigned builds) clear macOS quarantine:
    ```bash
-   xattr -d com.apple.quarantine target/rein-v0.28.11.mcpb
+   xattr -d com.apple.quarantine target/rein-v<version>.mcpb
    ```
 3. Double-click the `.mcpb`. Claude Desktop opens an install dialog.
 4. Fill in `Gemini API Key` (any string for tool registration testing — rein
@@ -142,11 +142,11 @@ Steps:
 4. Sanity-check the output `.mcpb` size and run the local-install test
    above.
 5. `git commit` + tag: `git tag v<version> && git push --tags` (replace
-   `<version>` with the value bumped in step 1, e.g., `v0.28.11`).
+   `<version>` with the value bumped in step 1).
 6. Create the GitHub Release. Attach two artifacts:
    - the existing GUI binary (`rein` from `target/release/`), as in
      v0.27.4–v0.28.8 releases
-   - `target/rein-v0.28.11.mcpb`
+   - `target/rein-v<version>.mcpb`
 7. Edit the release notes to point install instructions at the new `.mcpb`
    filename.
 

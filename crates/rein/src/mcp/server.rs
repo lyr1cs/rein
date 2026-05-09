@@ -3,6 +3,7 @@ use rmcp::{ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
 use http_body_util::BodyExt;
+use serde_json::Value;
 
 /// MCP server for rein memory system.
 ///
@@ -287,7 +288,7 @@ fn same_origin_as_request(origin: &str, request_host: &HttpRequestHost) -> bool 
     let Some((scheme, origin_host)) = origin_authority(origin) else {
         return false;
     };
-    if scheme != "http" {
+    if !matches!(scheme.as_str(), "http" | "https") {
         return false;
     }
     let origin_port = origin_host
@@ -297,6 +298,38 @@ fn same_origin_as_request(origin: &str, request_host: &HttpRequestHost) -> bool 
         .port
         .or_else(|| default_port_for_scheme(&scheme));
     origin_host.host == request_host.host && origin_port == request_port
+}
+
+fn is_loopback_request_host(host: &HttpRequestHost) -> bool {
+    if host.host == "localhost" {
+        return true;
+    }
+    host.host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn mcp_body_mutating_tool_name(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    json_rpc_mutating_tool_name(&value).map(str::to_string)
+}
+
+fn json_rpc_mutating_tool_name(value: &Value) -> Option<&str> {
+    if let Some(batch) = value.as_array() {
+        return batch.iter().find_map(json_rpc_mutating_tool_name);
+    }
+
+    let obj = value.as_object()?;
+    if obj.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let name = obj
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    inventory::iter::<crate::ops::OpsMcpEntry>()
+        .any(|entry| entry.mcp_name == name && entry.mutating)
+        .then_some(name)
 }
 
 fn validate_browser_mutation_guard(
@@ -599,10 +632,16 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         .ok()
         .filter(|token| !token.trim().is_empty());
     let allow_loopback_unauth = config.server.loopback_unauth_requested();
-    if auth_token.is_some() && config.server.allow_unauthenticated_loopback {
+    if auth_token.is_some() && allow_loopback_unauth {
         tracing::warn!(
             "REIN_HTTP_TOKEN is set while [server].allow_unauthenticated_loopback=true; \
              token auth wins and the loopback flag is a no-op at runtime"
+        );
+    } else if auth_token.is_some() && config.server.allow_unauthenticated_loopback {
+        tracing::warn!(
+            "REIN_HTTP_TOKEN is set while [server].allow_unauthenticated_loopback=true, \
+             but the flag cannot take effect because server.sse_bind is not loopback; \
+             bearer auth remains required"
         );
     }
     if auth_token.is_none() && !allow_loopback_unauth {
@@ -721,8 +760,8 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         let token = auth_token.clone();
         let cfg = rest_config.clone();
         async move {
-            let path = req.uri().path();
-            let method = req.method();
+            let path = req.uri().path().to_string();
+            let method = req.method().clone();
             let allowed_hosts = cfg.server.allowed_hosts.as_deref();
             let host_for_origin = if http_host_guard_enabled(&cfg.server.sse_bind, allowed_hosts) {
                 match validate_http_request_host(req.headers(), &cfg.server.sse_bind, allowed_hosts)
@@ -738,11 +777,11 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
 
             if let Some(host) = host_for_origin.as_ref() {
                 if let Err(rejection) =
-                    validate_browser_mutation_guard(method, path, req.headers(), host)
+                    validate_browser_mutation_guard(&method, &path, req.headers(), host)
                 {
                     return Ok::<_, std::convert::Infallible>(http_guard_response(rejection));
                 }
-            } else if is_mutating_http_surface_request(method, path)
+            } else if is_mutating_http_surface_request(&method, &path)
                 && request_has_browser_mutation_headers(req.headers())
             {
                 return Ok::<_, std::convert::Infallible>(http_guard_response(
@@ -756,7 +795,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             // unmatched paths fall through to the MCP service, so a request
             // like `POST /not-mcp` ran MCP `initialize` with no token. The
             // pure helper `http_request_needs_auth` is unit-tested below.
-            let needs_auth = http_request_needs_auth(method, path, gui_enabled);
+            let needs_auth = http_request_needs_auth(&method, &path, gui_enabled);
             if needs_auth {
                 if let Some(ref expected) = token {
                     if !request_has_valid_http_auth(req.headers(), expected) {
@@ -774,6 +813,17 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             // entry point since they never consult the body. /mcp and unknown
             // paths fall through to MCP dispatch with the original body.
             if path.starts_with("/api/") {
+                if token.is_none()
+                    && is_mutating_http_surface_request(&method, &path)
+                    && !host_for_origin
+                        .as_ref()
+                        .is_some_and(is_loopback_request_host)
+                {
+                    return Ok::<_, std::convert::Infallible>(plain_http_response(
+                        hyper::StatusCode::FORBIDDEN,
+                        "unauthenticated public HTTP REST cannot mutate state",
+                    ));
+                }
                 let response = crate::mcp::rest::handle_api_request(req, &cfg).await;
                 return Ok::<_, std::convert::Infallible>(response);
             }
@@ -790,6 +840,22 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                 Ok(body) => body,
                 Err(response) => return Ok::<_, std::convert::Infallible>(response),
             };
+            if token.is_none()
+                && !host_for_origin
+                    .as_ref()
+                    .is_some_and(is_loopback_request_host)
+            {
+                if let Some(tool_name) = mcp_body_mutating_tool_name(&body) {
+                    tracing::warn!(
+                        tool = tool_name,
+                        "blocked unauthenticated public HTTP MCP mutating tool call"
+                    );
+                    return Ok::<_, std::convert::Infallible>(plain_http_response(
+                        hyper::StatusCode::FORBIDDEN,
+                        "unauthenticated public HTTP MCP cannot call mutating tools",
+                    ));
+                }
+            }
             let req = hyper::Request::from_parts(parts, http_body_util::Full::new(body));
             Ok::<_, std::convert::Infallible>(svc.handle(req).await)
         }
@@ -1208,6 +1274,54 @@ mod tests {
             validate_browser_mutation_guard(&Method::POST, "/api/memories", &native, &host).is_ok()
         );
         assert!(validate_browser_mutation_guard(&Method::POST, "/mcp", &native, &host).is_ok());
+    }
+
+    #[test]
+    fn browser_mutating_surface_guard_allows_https_same_origin() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("rein.example.com"),
+        );
+        headers.insert(
+            hyper::header::ORIGIN,
+            hyper::header::HeaderValue::from_static("https://rein.example.com"),
+        );
+        headers.insert(
+            "sec-fetch-site",
+            hyper::header::HeaderValue::from_static("same-origin"),
+        );
+        let allowed = vec!["rein.example.com".to_string()];
+        let host = validate_http_request_host(&headers, "127.0.0.1", Some(&allowed)).unwrap();
+
+        assert!(validate_browser_mutation_guard(&Method::POST, "/mcp", &headers, &host).is_ok());
+
+        headers.insert(
+            hyper::header::ORIGIN,
+            hyper::header::HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(matches!(
+            validate_browser_mutation_guard(&Method::POST, "/mcp", &headers, &host),
+            Err(HttpGuardRejection::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn public_mcp_mutation_detector_flags_mutating_tools_only() {
+        let store_call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rein_store","arguments":{"content":"x"}}}"#;
+        assert_eq!(
+            mcp_body_mutating_tool_name(store_call).as_deref(),
+            Some("rein_store")
+        );
+
+        let recall_call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rein_recall","arguments":{"query":"x"}}}"#;
+        assert_eq!(mcp_body_mutating_tool_name(recall_call), None);
+
+        let batch = br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rein_forget","arguments":{"id":"1"}}}]"#;
+        assert_eq!(
+            mcp_body_mutating_tool_name(batch).as_deref(),
+            Some("rein_forget")
+        );
     }
 
     #[tokio::test]

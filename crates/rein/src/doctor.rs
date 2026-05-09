@@ -107,10 +107,11 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_http_auth(config));
     checks.push(check_proxy_auth(config));
     checks.push(check_codex_hooks());
-    checks.push(check_codex_mcp_server());
+    checks.push(check_codex_mcp_server(config));
     checks.push(check_gui_runtime(config));
     checks.push(check_proxy_runtime(config));
     checks.push(check_overview_version());
+    checks.push(check_release_metadata_versions());
     checks.push(check_cli_registry());
     checks.push(check_mcp_registry());
     checks.push(check_rest_registry());
@@ -338,6 +339,90 @@ fn check_overview_version() -> DoctorCheck {
     }
 }
 
+fn check_release_metadata_versions() -> DoctorCheck {
+    let cargo_version = env!("CARGO_PKG_VERSION");
+    let mismatches = release_metadata_versions()
+        .into_iter()
+        .filter_map(|(name, version)| (version != cargo_version).then_some((name, version)))
+        .collect::<Vec<_>>();
+
+    if mismatches.is_empty() {
+        return ok_in(
+            DoctorCategory::Architecture,
+            "release_metadata_versions",
+            format!("release metadata versions match Cargo v{cargo_version}"),
+        );
+    }
+
+    let summary = mismatches
+        .iter()
+        .map(|(name, version)| format!("{name}={version}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn_with_hint(
+        DoctorCategory::Architecture,
+        "release_metadata_versions",
+        format!("Cargo.toml is v{cargo_version}, but release metadata says {summary}"),
+        "update DXT and Claude plugin manifest versions before publishing",
+    )
+}
+
+fn release_metadata_versions() -> Vec<(&'static str, String)> {
+    let mut versions = Vec::new();
+    collect_json_version(
+        &mut versions,
+        "dxt/manifest.json",
+        include_str!("../../../dxt/manifest.json"),
+        &["version"],
+    );
+    collect_json_version(
+        &mut versions,
+        ".claude-plugin/marketplace.json",
+        include_str!("../../../.claude-plugin/marketplace.json"),
+        &["version"],
+    );
+    collect_json_version(
+        &mut versions,
+        ".claude-plugin/marketplace.json plugins[0]",
+        include_str!("../../../.claude-plugin/marketplace.json"),
+        &["plugins", "0", "version"],
+    );
+    collect_json_version(
+        &mut versions,
+        "plugins/rein/.claude-plugin/plugin.json",
+        include_str!("../../../plugins/rein/.claude-plugin/plugin.json"),
+        &["version"],
+    );
+    versions
+}
+
+fn collect_json_version(
+    versions: &mut Vec<(&'static str, String)>,
+    name: &'static str,
+    text: &str,
+    path: &[&str],
+) {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        versions.push((name, "<invalid-json>".to_string()));
+        return;
+    };
+    let mut value = &root;
+    for key in path {
+        value = if let Ok(idx) = key.parse::<usize>() {
+            value
+                .as_array()
+                .and_then(|items| items.get(idx))
+                .unwrap_or(&serde_json::Value::Null)
+        } else {
+            value.get(*key).unwrap_or(&serde_json::Value::Null)
+        };
+    }
+    versions.push((
+        name,
+        value.as_str().unwrap_or("<missing-version>").to_string(),
+    ));
+}
+
 // Phase 3 dropped the hand-maintained `ops::registry::*_OPERATIONS` arrays
 // that used to sit between inventory and the drift check. Now the checks
 // compare inventory counts (authoritative) against source-scanned derived
@@ -518,7 +603,7 @@ fn check_codex_hooks() -> DoctorCheck {
     check_codex_hooks_at(&codex_dir)
 }
 
-fn check_codex_mcp_server() -> DoctorCheck {
+fn check_codex_mcp_server(config: &ReinConfig) -> DoctorCheck {
     let Some(codex_dir) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|p| p.join(".codex"))
@@ -529,10 +614,10 @@ fn check_codex_mcp_server() -> DoctorCheck {
             "HOME not set; skipping Codex MCP checks",
         );
     };
-    check_codex_mcp_server_at(&codex_dir)
+    check_codex_mcp_server_at(&codex_dir, &config.resolve_db_path())
 }
 
-fn check_codex_mcp_server_at(codex_dir: &Path) -> DoctorCheck {
+fn check_codex_mcp_server_at(codex_dir: &Path, local_db_path: &Path) -> DoctorCheck {
     let config_path = codex_dir.join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(content) => content,
@@ -556,68 +641,265 @@ fn check_codex_mcp_server_at(codex_dir: &Path) -> DoctorCheck {
         }
     };
 
-    let rein_entry = parsed
+    let mut entries = Vec::new();
+    if let Some(entry) = parsed
         .get("mcp_servers")
         .and_then(|v| v.get("rein"))
-        .or_else(|| parsed.get("mcp").and_then(|v| v.get("rein")));
-    let Some(entry) = rein_entry.and_then(|v| v.as_table()) else {
+        .and_then(|v| v.as_table())
+    {
+        entries.push(("[mcp_servers.rein]", entry));
+    }
+    if let Some(entry) = parsed
+        .get("mcp")
+        .and_then(|v| v.get("rein"))
+        .and_then(|v| v.as_table())
+    {
+        entries.push(("[mcp.rein]", entry));
+    }
+
+    if entries.is_empty() {
         return warn_with_hint(
             DoctorCategory::Configuration,
             "codex_mcp",
             "Codex rein MCP server is not configured",
             "run rein init",
         );
-    };
-
-    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-        return check_codex_mcp_url(url);
     }
 
-    if let Some(command) = entry.get("command").and_then(|v| v.as_str()) {
-        return ok_in(
-            DoctorCategory::Configuration,
-            "codex_mcp",
-            format!("Codex rein MCP uses stdio command `{command}`"),
-        );
+    let mut ok_messages = Vec::new();
+    for (label, entry) in entries {
+        match check_codex_mcp_entry(label, entry, local_db_path) {
+            Ok(message) => ok_messages.push(message),
+            Err(check) => return check,
+        }
     }
 
-    warn_with_hint(
+    ok_in(
         DoctorCategory::Configuration,
         "codex_mcp",
-        "Codex rein MCP entry has neither url nor command",
-        "run rein init or edit ~/.codex/config.toml",
+        format!("Codex rein MCP entries healthy: {}", ok_messages.join("; ")),
     )
 }
 
-fn check_codex_mcp_url(url: &str) -> DoctorCheck {
+fn check_codex_mcp_entry(
+    label: &str,
+    entry: &toml::map::Map<String, toml::Value>,
+    local_db_path: &Path,
+) -> Result<String, DoctorCheck> {
+    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+        return check_codex_mcp_url(label, url);
+    }
+
+    let Some(command) = entry.get("command").and_then(|v| v.as_str()) else {
+        return Err(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex {label} entry has neither url nor command"),
+            "run rein init or edit ~/.codex/config.toml",
+        ));
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex {label} command is empty"),
+            "run rein init or set command = \"rein\"",
+        ));
+    }
+
+    validate_codex_mcp_stdio_args(label, entry)?;
+    if let Some(check) = check_codex_mcp_process_context(label, entry, local_db_path) {
+        return Err(check);
+    }
+    if let Some(rein_db) = codex_mcp_rein_db_override(entry) {
+        if let Some(check) = check_codex_mcp_rein_db_override(label, rein_db, local_db_path) {
+            return Err(check);
+        }
+    }
+
+    Ok(format!("{label} stdio command `{command}`"))
+}
+
+fn validate_codex_mcp_stdio_args(
+    label: &str,
+    entry: &toml::map::Map<String, toml::Value>,
+) -> Result<(), DoctorCheck> {
+    let Some(args) = entry.get("args").and_then(|v| v.as_array()) else {
+        return Err(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex {label} does not set args = [\"serve\"]"),
+            "run rein init or set args = [\"serve\"] for stdio MCP",
+        ));
+    };
+    let mut arg_strings = Vec::with_capacity(args.len());
+    for arg in args {
+        let Some(arg) = arg.as_str() else {
+            return Err(warn_with_hint(
+                DoctorCategory::Configuration,
+                "codex_mcp",
+                format!("Codex {label} args must be strings"),
+                "run rein init or set args = [\"serve\"]",
+            ));
+        };
+        arg_strings.push(arg);
+    }
+
+    if arg_strings.first().copied() != Some("serve") {
+        return Err(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex {label} does not start rein with `serve`"),
+            "run rein init or set args = [\"serve\"]",
+        ));
+    }
+
+    if let Some(flag) = arg_strings
+        .iter()
+        .skip(1)
+        .find(|arg| matches!(**arg, "--sse" | "--gui" | "--proxy"))
+    {
+        return Err(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!("Codex {label} uses `rein serve {flag}`, which is not stdio MCP"),
+            "remove --sse/--gui/--proxy from the Codex MCP args; remote HTTP MCP belongs in a url entry",
+        ));
+    }
+
+    Ok(())
+}
+
+fn codex_mcp_rein_db_override(entry: &toml::map::Map<String, toml::Value>) -> Option<&str> {
+    codex_mcp_env_value(entry, "REIN_DB")
+}
+
+fn codex_mcp_env_value<'a>(
+    entry: &'a toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    entry
+        .get("env")
+        .and_then(|v| v.as_table())
+        .and_then(|env| env.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn check_codex_mcp_process_context(
+    label: &str,
+    entry: &toml::map::Map<String, toml::Value>,
+    local_db_path: &Path,
+) -> Option<DoctorCheck> {
+    if let Some(rein_config) = codex_mcp_env_value(entry, "REIN_CONFIG") {
+        return Some(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!(
+                "Codex {label} sets REIN_CONFIG={rein_config}; it may load a different config/database than local `rein` CLI ({})",
+                local_db_path.display()
+            ),
+            "remove the Codex MCP REIN_CONFIG override, or verify it resolves to the same database as `rein config`",
+        ));
+    }
+
+    if let Some(home) = codex_mcp_env_value(entry, "HOME") {
+        return Some(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!(
+                "Codex {label} sets HOME={home}; `database.path = \"auto\"` may resolve to a different database than local `rein` CLI ({})",
+                local_db_path.display()
+            ),
+            "remove the Codex MCP HOME override, or set an explicit absolute REIN_DB that matches `rein config`",
+        ));
+    }
+
+    if local_db_path.is_relative() {
+        if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
+            return Some(warn_with_hint(
+                DoctorCategory::Configuration,
+                "codex_mcp",
+                format!(
+                    "local rein database path is relative ({}) and Codex {label} sets cwd={cwd}; CLI and MCP recall may use different databases",
+                    local_db_path.display()
+                ),
+                "set [database].path or [mcp_servers.rein.env].REIN_DB to an absolute path",
+            ));
+        }
+    }
+
+    None
+}
+
+fn check_codex_mcp_rein_db_override(
+    label: &str,
+    rein_db: &str,
+    local_db_path: &Path,
+) -> Option<DoctorCheck> {
+    let override_path = PathBuf::from(rein_db);
+    if override_path.is_relative() {
+        return Some(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!(
+                "Codex {label} sets relative REIN_DB={rein_db}; recall may use a different database than local `rein` CLI ({}) depending on Codex cwd",
+                local_db_path.display()
+            ),
+            "use an absolute REIN_DB path that matches `rein config`, or remove the Codex MCP env override",
+        ));
+    }
+
+    if !paths_equivalent(&override_path, local_db_path) {
+        return Some(warn_with_hint(
+            DoctorCategory::Configuration,
+            "codex_mcp",
+            format!(
+                "Codex {label} sets REIN_DB={} but local `rein` CLI uses {}; recall may use a different database",
+                override_path.display(),
+                local_db_path.display()
+            ),
+            "update ~/.codex/config.toml so [mcp_servers.rein.env].REIN_DB matches `rein config`, or remove the override",
+        ));
+    }
+
+    None
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn check_codex_mcp_url(label: &str, url: &str) -> Result<String, DoctorCheck> {
     let uri: hyper::Uri = match url.parse() {
         Ok(uri) => uri,
         Err(_) => {
-            return warn_with_hint(
+            return Err(warn_with_hint(
                 DoctorCategory::Configuration,
                 "codex_mcp",
-                format!("Codex rein MCP url is not a valid URI: {url}"),
+                format!("Codex {label} url is not a valid URI: {url}"),
                 "fix ~/.codex/config.toml or rerun rein init",
-            );
+            ));
         }
     };
     let host = uri.host().unwrap_or_default();
     if is_loopback_http_host(host) {
-        ok_in(
-            DoctorCategory::Configuration,
-            "codex_mcp",
-            format!("Codex rein MCP uses loopback HTTP endpoint {url}"),
-        )
+        Ok(format!("{label} loopback HTTP endpoint {url}"))
     } else {
-        warn_with_hint(
+        Err(warn_with_hint(
             DoctorCategory::Configuration,
             "codex_mcp",
             format!(
-                "Codex rein MCP points at non-loopback HTTP endpoint {url}; \
+                "Codex {label} points at non-loopback HTTP endpoint {url}; \
                  recall may use a different machine/database than local `rein` CLI"
             ),
             "use stdio (`command = \"rein\", args = [\"serve\"]`) for local memories, or verify the remote endpoint is intentional",
-        )
+        ))
     }
 }
 
@@ -627,7 +909,12 @@ fn is_loopback_http_host(host: &str) -> bool {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_ascii_lowercase();
-    normalized == "localhost" || normalized == "127.0.0.1" || normalized == "::1"
+    if normalized == "localhost" {
+        return true;
+    }
+    normalized
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn check_codex_hooks_at(codex_dir: &Path) -> DoctorCheck {
@@ -987,7 +1274,7 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
     let allow_unauth = config.server.loopback_unauth_requested();
 
     if token_present {
-        if config.server.allow_unauthenticated_loopback {
+        if allow_unauth {
             warn_with_hint(
                 DoctorCategory::Configuration,
                 "http_auth",
@@ -998,6 +1285,18 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
                     config.server.sse_bind, config.server.sse_port
                 ),
                 "unset REIN_HTTP_TOKEN for public/loopback-unauth testing, or set allow_unauthenticated_loopback=false when bearer auth is intended",
+            )
+        } else if config.server.allow_unauthenticated_loopback {
+            warn_with_hint(
+                DoctorCategory::Configuration,
+                "http_auth",
+                format!(
+                    "REIN_HTTP_TOKEN is set for {}:{} and \
+                     [server].allow_unauthenticated_loopback=true cannot take effect because the bind host is not loopback; \
+                     bearer auth remains required",
+                    config.server.sse_bind, config.server.sse_port
+                ),
+                "keep REIN_HTTP_TOKEN for this bind, or bind to 127.0.0.1, ::1, or localhost for loopback-unauth testing",
             )
         } else {
             ok_in(
@@ -1017,6 +1316,17 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
                 "loopback-only unauthenticated access allowed for {}:{}",
                 config.server.sse_bind, config.server.sse_port
             ),
+        )
+    } else if config.server.allow_unauthenticated_loopback {
+        fail_with_hint(
+            DoctorCategory::Configuration,
+            "http_auth",
+            format!(
+                "HTTP/SSE is enabled on {}:{} without REIN_HTTP_TOKEN; \
+                 [server].allow_unauthenticated_loopback=true cannot take effect because the bind host is not loopback",
+                config.server.sse_bind, config.server.sse_port
+            ),
+            "bind to 127.0.0.1, ::1, or localhost for loopback-unauth testing, or set REIN_HTTP_TOKEN=<secret>",
         )
     } else {
         fail_with_hint(
@@ -2524,7 +2834,7 @@ provider = "inherit"
             "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n",
         );
 
-        let check = check_codex_mcp_server_at(dir.path());
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
 
         assert_eq!(check.name, "codex_mcp");
         assert_eq!(check.status, CheckStatus::Ok);
@@ -2539,11 +2849,31 @@ provider = "inherit"
             "[mcp_servers.rein]\nurl = \"http://127.0.0.1:8680/mcp\"\n",
         );
 
-        let check = check_codex_mcp_server_at(dir.path());
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
 
         assert_eq!(check.name, "codex_mcp");
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.message.contains("loopback"));
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_mcp_loopback_ip_url_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        for url in [
+            "http://127.0.0.2:8680/mcp",
+            "http://[0:0:0:0:0:0:0:1]:8680/mcp",
+        ] {
+            write_codex_config_raw(
+                dir.path(),
+                &format!("[mcp_servers.rein]\nurl = \"{url}\"\n"),
+            );
+
+            let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
+
+            assert_eq!(check.name, "codex_mcp");
+            assert_eq!(check.status, CheckStatus::Ok);
+            assert!(check.message.contains("loopback"));
+        }
     }
 
     #[test]
@@ -2554,13 +2884,189 @@ provider = "inherit"
             "[mcp_servers.rein]\nurl = \"http://100.64.0.10:8680/mcp\"\n",
         );
 
-        let check = check_codex_mcp_server_at(dir.path());
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
 
         assert_eq!(check.name, "codex_mcp");
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.message.contains("non-loopback"));
         assert!(check.message.contains("different machine/database"));
         assert!(check.repair_hint.as_deref().unwrap().contains("stdio"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_legacy_codex_mcp_non_loopback_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp.rein]\nurl = \"http://100.64.0.10:8680/mcp\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("[mcp.rein]"));
+        assert!(check.message.contains("non-loopback"));
+    }
+
+    #[test]
+    fn test_doctor_warns_when_any_codex_mcp_entry_uses_non_loopback_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n\n[mcp.rein]\nurl = \"http://100.64.0.10:8680/mcp\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("[mcp.rein]"));
+        assert!(check.message.contains("different machine/database"));
+
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\nurl = \"http://100.64.0.10:8680/mcp\"\n\n[mcp.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
+
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("[mcp_servers.rein]"));
+        assert!(check.message.contains("different machine/database"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_non_stdio_args() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\", \"--sse\"]\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("not stdio MCP"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_wrong_args() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"doctor\"]\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/rein-local.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("does not start rein with `serve`"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_stdio_rein_db_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n\n[mcp_servers.rein.env]\nREIN_DB = \"/tmp/remote-memories.db\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/local-memories.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("REIN_DB"));
+        assert!(check.message.contains("different database"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_stdio_rein_config_override() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n\n[mcp_servers.rein.env]\nREIN_CONFIG = \"/tmp/other-config.toml\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/local-memories.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("REIN_CONFIG"));
+        assert!(check.message.contains("different config/database"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_stdio_home_override() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n\n[mcp_servers.rein.env]\nHOME = \"/tmp/other-home\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/local-memories.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("HOME"));
+        assert!(check.message.contains("different database"));
+    }
+
+    #[test]
+    fn test_doctor_warns_on_codex_mcp_stdio_relative_rein_db() {
+        let dir = tempfile::tempdir().unwrap();
+        write_codex_config_raw(
+            dir.path(),
+            "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n\n[mcp_servers.rein.env]\nREIN_DB = \"memories.db\"\n",
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), Path::new("/tmp/local-memories.db"));
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("relative REIN_DB"));
+    }
+
+    #[test]
+    fn test_doctor_reports_codex_mcp_stdio_matching_rein_db_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        write_codex_config_raw(
+            dir.path(),
+            &format!(
+                "[mcp_servers.rein]\ncommand = \"rein\"\nargs = [\"serve\"]\n\n[mcp_servers.rein.env]\nREIN_DB = \"{}\"\n",
+                db_path.display()
+            ),
+        );
+
+        let check = check_codex_mcp_server_at(dir.path(), &db_path);
+
+        assert_eq!(check.name, "codex_mcp");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("stdio"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_warns_when_loopback_unauth_cannot_apply_to_non_loopback_bind() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.sse_bind = "0.0.0.0".to_string();
+        config.server.allow_unauthenticated_loopback = true;
+
+        let check = check_http_auth(&config);
+
+        assert_eq!(check.name, "http_auth");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("cannot take effect"));
+        assert!(check.repair_hint.as_deref().unwrap().contains("127.0.0.1"));
     }
 
     #[test]
@@ -2590,7 +3096,8 @@ provider = "inherit"
         config.server.sse_bind = "0.0.0.0".to_string();
         let check = check_http_auth(&config);
         assert_eq!(check.status, CheckStatus::Warn);
-        assert!(check.message.contains("token auth wins"));
+        assert!(check.message.contains("cannot take effect"));
+        assert!(check.message.contains("bearer auth remains required"));
     }
 
     #[test]
@@ -2613,6 +3120,14 @@ provider = "inherit"
         assert!(text.contains("[WARN] queues: pending jobs"));
         assert!(text.contains("repair: run `rein worker memory`"));
         assert!(text.contains("Overall: degraded"));
+    }
+
+    #[test]
+    fn release_metadata_versions_match_cargo() {
+        let check = check_release_metadata_versions();
+
+        assert_eq!(check.name, "release_metadata_versions");
+        assert_eq!(check.status, CheckStatus::Ok);
     }
 
     #[test]

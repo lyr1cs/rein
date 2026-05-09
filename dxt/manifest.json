@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "rein",
   "display_name": "rein — Multi-source Memory MCP",
-  "version": "0.28.9",
+  "version": "0.28.18",
   "description": "Persistent cross-session memory MCP server with knowledge graph and adaptive learning",
   "long_description": "rein is a self-adaptive memory MCP server for AI agents. Multi-source cross-validated memory with embedding-based semantic dedup, Kaplan-Meier survival decay, knowledge graph (Memoir / Concept / ConceptLink with temporal validity windows), HDBSCAN clustering, and a self-learning loop replacing fixed parameters with learned values. Exposes 40 MCP tools across core memory ops, knowledge graph, temporal recall, adaptive engine, ARS feedback (Cap A mirror, Cap B synthesis, Cap C archival summary), runtime LLM judge, and Trust & Measurement.\n\nThis extension targets macOS Apple Silicon. Other platforms: see the project README for the Claude Code plugin marketplace path or `cargo install`.",
   "author": {

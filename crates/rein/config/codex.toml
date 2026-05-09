@@ -1,3 +1,7 @@
+[mcp_servers.rein]
+command = "rein"
+args = ["serve"]
+
 [mcp.rein]
 command = "rein"
 args = ["serve"]

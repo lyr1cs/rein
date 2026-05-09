@@ -12,7 +12,9 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.17`** (2026-05-09) — Cowork/auth diagnostics patch. Runtime auth semantics stay unchanged, but the two silent traps from the May 9 Cowork incident now surface explicitly: `rein serve --gui` logs a WARN when `REIN_HTTP_TOKEN` is set while `[server].allow_unauthenticated_loopback=true` because token auth wins and the loopback flag is a runtime no-op; `rein doctor` reports the same `http_auth` WARN and also checks Codex's `~/.codex/config.toml` Rein MCP entry, warning when it points at a non-loopback HTTP URL whose database may differ from the local `rein` CLI. See the [v0.28.17 release](https://github.com/lyr1cs/rein/releases/tag/v0.28.17).
+**Current release: `v0.28.18`** (2026-05-09) — follow-up audit hardening for the Cowork/auth diagnostics arc. Public unauthenticated HTTP now blocks mutating MCP/REST calls from non-loopback Hosts, while keeping read-only Cowork recall usable; `rein doctor` now checks both Codex MCP tables, catches non-stdio `rein serve --sse/--gui/--proxy` entries, flags `REIN_DB` / `REIN_CONFIG` / `HOME` database-split risks, and verifies DXT / Claude plugin manifest versions match Cargo before release. See the [v0.28.18 release](https://github.com/lyr1cs/rein/releases/tag/v0.28.18).
+
+**Previous release: `v0.28.17`** (2026-05-09) — Cowork/auth diagnostics patch. Runtime auth semantics stayed unchanged, but the two silent traps from the May 9 Cowork incident now surface explicitly: `rein serve --gui` logs a WARN when `REIN_HTTP_TOKEN` is set while `[server].allow_unauthenticated_loopback=true` because token auth wins and the loopback flag is a runtime no-op; `rein doctor` reports the same `http_auth` WARN and also checks Codex's `~/.codex/config.toml` Rein MCP entry, warning when it points at a non-loopback HTTP URL whose database may differ from the local `rein` CLI.
 
 **Previous release: `v0.28.16`** (2026-05-09) — Codex 0.129 `[mcp.<name>]` → `[mcp_servers.<name>]` compatibility. `rein init` now writes the new Codex MCP table while preserving and cloning legacy customizations, closing the second half of the Codex 0.129 rename window opened by v0.28.15.
 
@@ -84,12 +86,12 @@ Three install paths depending on your client:
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v0.28.11.mcpb` from
-   [Releases](https://github.com/lyr1cs/rein/releases/latest).
+1. Download `rein-v0.28.18.mcpb` from
+   [the v0.28.18 release](https://github.com/lyr1cs/rein/releases/download/v0.28.18/rein-v0.28.18.mcpb).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.11.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.18.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -123,7 +125,7 @@ need the `rein` binary on your `PATH`:
 cargo install --git https://github.com/lyr1cs/rein --locked rein
 
 # Or pin to a specific release tag (recommended for reproducible installs)
-cargo install --git https://github.com/lyr1cs/rein --tag v0.28.13 --locked rein
+cargo install --git https://github.com/lyr1cs/rein --tag v0.28.18 --locked rein
 ```
 
 > **`--locked` is required.** Without it, `cargo install --git` ignores
@@ -735,14 +737,14 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
 
 ### Hook Setup for Codex CLI
 
-Codex CLI hooks require `codex_hooks = true` and either `~/.codex/hooks.json`
+Codex CLI hooks require `hooks = true` (Codex 0.129+) and either `~/.codex/hooks.json`
 or inline `[hooks]` tables in `~/.codex/config.toml`.
 
 `rein init` now configures the Codex MCP entry and installs the Rein hooks:
 
 ```toml
 [features]
-codex_hooks = true
+hooks = true
 ```
 
 ```json
@@ -1181,7 +1183,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.28.8`**（2026-05-04）— v0.28.7 之上的二轮 audit 加固。**17 轮 codex review**（R1–R17）跑到 2-consecutive-clean 饱和。共关闭 **15 P2 + 1 P3**，全程 0 P1。重点：**M-8 cluster bucket 对齐** — 学习时 `top_vec_hit_cluster` 改用 memory-id remap 查 `memory_clusters`，修掉 R13 发现的 M4-然后-M2 正常流水线顺序使 `cluster_version_at_recall` 对每个 event 都失效的常态 bug。**L6 fallback 保护** — `learned_shadow_fusion` 的 LRU 驱逐限定在 cluster-scoped 桶（`{query_type}:{cluster_id}` 形状，由 `is_cluster_scoped_bucket` 谓词识别），保证高 cardinality 下 `global` 与 per-query-type fallback 链不被静默驱逐。**`ars_parameter_policy` schema 健壮性** — typed deserialize 之前先 peek `schema_version`（R8 修 future-schema 被误判 `Corrupt` 后被 `doctor --fix` 删除）、CAS predicate 用 schema-aware COALESCE 默认值（R8）、用 `>` 而非 `!=` 决定 future-schema 保护（R15）、`repair_corrupt_parameter_policy` 把 load+delete 包进 `BEGIN IMMEDIATE` 关掉 peer race（R10）。**M-1 持久化侧** — 新增 4 个 per-surface `ars_effective_scalars` keys（`judge_sample_rate_{cold_start,warm}_{synthesis,concept_summary}`），带一次性 legacy fallback 保 downgrade 兼容。**M-5 / M-6** rollback 静态阈值 anchoring + outer simplex↔legacy 按 `runtime_adoption_weight` 混合。加上 L1 `sanitize_bootstrap_priors` cap、L4 auth-policy 回归锁、L5 doctor recovery、L7 release-gate 测试覆盖。**1462 测试 / 0 失败 / 3 ignored / 0 clippy / 0 fmt**。Default-OFF 行为与 v0.28.7 二进制一致。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.28.18`**（2026-05-09）— Cowork/auth 诊断的 agent-team audit 后续补丁。公网无 bearer 的 HTTP MCP 对非 loopback Host 默认阻止 mutating 工具调用，保留只读 recall；`rein doctor` 会检查 Codex 新旧 MCP 表、stdio args、`REIN_DB`/`REIN_CONFIG`/`HOME` 导致的数据库分裂风险，以及 DXT/Claude plugin manifest 版本漂移。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1555,7 +1557,7 @@ sse_bind = "127.0.0.1"
 
 ### Codex CLI Hook 设置
 
-Codex CLI 需要启用 `codex_hooks = true`，并在 `~/.codex/hooks.json` 或
+Codex CLI 需要启用 `hooks = true`（Codex 0.129+），并在 `~/.codex/hooks.json` 或
 `~/.codex/config.toml` 的 `[hooks]` 表中声明 hook。`rein init` 会配置 Codex
 MCP entry，并安装以下 hook：
 

@@ -49,8 +49,9 @@ For v0.28.9, ship two channels:
 
 1. **Claude Code plugin marketplace** — three-file manifest addition. Users
    with Claude Code can `/plugin marketplace add lyr1cs/rein` and
-   `/plugin install rein@rein`. They still need `cargo install rein` (or a
-   release binary on `PATH`).
+   `/plugin install rein@rein`. They still need
+   `cargo install --git https://github.com/lyr1cs/rein --tag v0.28.18 --locked rein`
+   (or a release binary on `PATH`).
 2. **Claude Desktop DXT, macOS Apple Silicon only** — single-platform
    `.mcpb` attached to GitHub Releases. Unsigned; documented `xattr`
    workaround.

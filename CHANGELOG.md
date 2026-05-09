@@ -13,6 +13,47 @@ This file is a condensed index intended for quick scanning.
 
 _Nothing yet._
 
+## [0.28.18] — 2026-05-09
+
+Agent-team audit follow-up to v0.28.17's Cowork/auth diagnostics.
+
+### Fixed
+
+- Public unauthenticated HTTP now blocks mutating MCP/REST calls from
+  non-loopback Hosts while preserving read-only Cowork recall.
+- HTTPS same-origin browser mutation requests are accepted behind
+  TLS-terminating reverse proxies.
+- `rein doctor` validates both new and legacy Codex MCP tables, rejects
+  non-stdio `rein serve --sse/--gui/--proxy` MCP entries, and warns on
+  `REIN_DB`, `REIN_CONFIG`, and `HOME` database-split risks.
+- DXT and Claude plugin manifest versions are checked against Cargo.
+
+### Documented
+
+- Install snippets and DXT artifact names now point at the current release.
+- Codex config examples prefer `[mcp_servers.rein]` and `[features].hooks`.
+
+## [0.28.17] — 2026-05-09
+
+Cowork/auth diagnostics patch.
+
+### Fixed
+
+- `rein serve --gui` warns when `REIN_HTTP_TOKEN` is set alongside
+  `[server].allow_unauthenticated_loopback=true`.
+- `rein doctor` reports the same token-vs-loopback auth conflict.
+- `rein doctor` warns when Codex's Rein MCP entry points at a non-loopback
+  HTTP URL whose database may differ from local CLI recall.
+
+## [0.28.16] — 2026-05-09
+
+Codex 0.129 `[mcp.<name>]` → `[mcp_servers.<name>]` compatibility. `rein init`
+writes the new table and preserves legacy customizations.
+
+## [0.28.15] — 2026-05-09
+
+Codex 0.129 `[features].codex_hooks` → `[features].hooks` compatibility.
+
 ## [0.28.14] — 2026-05-07
 
 Docs-only polish on top of v0.28.13. Closes the
@@ -322,7 +363,17 @@ operation registry, an adaptive read-side synthesis (ARS) stack with
 feedback-driven gates, and end-to-end audit-cycle hardening of every
 adaptive surface.
 
-[Unreleased]: https://github.com/lyr1cs/rein/compare/v0.28.8...HEAD
+[Unreleased]: https://github.com/lyr1cs/rein/compare/v0.28.18...HEAD
+[0.28.18]: https://github.com/lyr1cs/rein/releases/tag/v0.28.18
+[0.28.17]: https://github.com/lyr1cs/rein/releases/tag/v0.28.17
+[0.28.16]: https://github.com/lyr1cs/rein/releases/tag/v0.28.16
+[0.28.15]: https://github.com/lyr1cs/rein/releases/tag/v0.28.15
+[0.28.14]: https://github.com/lyr1cs/rein/releases/tag/v0.28.14
+[0.28.13]: https://github.com/lyr1cs/rein/releases/tag/v0.28.13
+[0.28.12]: https://github.com/lyr1cs/rein/releases/tag/v0.28.12
+[0.28.11]: https://github.com/lyr1cs/rein/releases/tag/v0.28.11
+[0.28.10]: https://github.com/lyr1cs/rein/releases/tag/v0.28.10
+[0.28.9]: https://github.com/lyr1cs/rein/releases/tag/v0.28.9
 [0.28.8]: https://github.com/lyr1cs/rein/releases/tag/v0.28.8
 [0.28.7]: https://github.com/lyr1cs/rein/releases/tag/v0.28.7
 [0.28.6]: https://github.com/lyr1cs/rein/releases/tag/v0.28.6
