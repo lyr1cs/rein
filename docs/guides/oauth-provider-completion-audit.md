@@ -39,6 +39,7 @@ Verification run on the reviewed implementation through `ceeed5b`:
 - `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final completion audit after review fixes"` -> found four P2 OAuth edge cases; fixed in `ceeed5b`.
 - `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final completion audit after edge-case fixes"` -> no discrete correctness, security, or maintainability issues found; OAuth unit tests, cargo check, GUI build, and local OAuth e2e passed on this tree.
 - Post-audit fresh check on HEAD `77c4551`: `./scripts/oauth-e2e-test.sh` -> `oauth e2e ok`.
+- Live claude.ai/Cowork validation: switched the live service to `auth = "oauth"` behind Cloudflare Quick Tunnel `https://<your-tunnel-id>.trycloudflare.com`, `./scripts/oauth-live-readiness.sh` passed, Claude custom connector completed DCR + OAuth callback, and a fresh Claude conversation used the `rein` integration to answer the memory count as `5664`.
 
 ## Requirement Checklist
 
@@ -68,36 +69,46 @@ Verification run on the reviewed implementation through `ceeed5b`:
 | Live readiness check script | `scripts/oauth-live-readiness.sh`, executable bit committed | Done |
 | Codex review convergence | Latest final HEAD review reported no blocking findings | Done |
 | Implementation commits | `998804d feat(v0.30): add built-in OAuth provider`, `1fe2e83 test(v0.30): add OAuth live readiness check`, `4050f28 harden(v0.30): close OAuth public surface review gaps`, `f745115 test(v0.30): isolate OAuth e2e environment`, `dd8c1dd harden(v0.30): fix OAuth session and discovery edges`, `a5ff0d8 harden(v0.30): secure OAuth review response paths`, `ceeed5b harden(v0.30): close OAuth auth edge cases` | Done |
-| Live claude.ai / Cowork connector validation | Requires restarting the current public `:8680` service and operating the user's Claude connector | Blocked |
+| Live claude.ai / Cowork connector validation | Cloudflare Quick Tunnel URL, Claude connector state `Configure`, and fresh Claude chat `<conversation-id>` answer `the configured memory count` after loading/using the rein integration | Done |
 | Phase A/B ship tags (`v0.29.0`, `v0.30.0`) | Handoff section 11 says do not tag until the operator explicitly says ship; phases were implemented together in the v0.30 audit scope | Intentionally not done |
-| Release devlog / public release notes | The vault convention treats devlog as a release artifact; live Cowork validation is still blocked, so v0.30 should not be documented as shipped yet | Blocked until ship |
+| Release devlog / public release notes | The vault convention treats devlog as a release artifact; operator has not explicitly said ship | Blocked until ship |
 | Push / GitHub release | Handoff section 11 says do not push until the operator explicitly says ship | Intentionally not done |
 
 ## Live Gate State
 
-Current machine state inspected after commit:
+Current machine state after live validation:
 
 - `tailscale funnel status` shows `https://<your-machine>.<your-tailnet>.ts.net` proxies `/` to `http://127.0.0.1:8680`.
-- `:8680` is currently served by PID `92942`: `/Users/<author>/.cargo/bin/rein serve --gui`.
-- Current `~/.rein/config.toml` still uses the legacy public tunnel posture: `allow_unauthenticated_loopback = true` plus `allowed_hosts`.
-- `GET http://127.0.0.1:8680/.well-known/oauth-authorization-server` currently returns GUI HTML, not OAuth metadata.
-- `curl -vkI https://<your-machine>.<your-tailnet>.ts.net/.well-known/oauth-authorization-server` from the current execution environment reaches `the local CGNAT-remapped address` but fails TLS handshake with `SSL_ERROR_SYSCALL`; public reachability must be rechecked after the OAuth cutover.
+- Tailscale Funnel was not used for validation because `curl -vkI https://<your-machine>.<your-tailnet>.ts.net/.well-known/oauth-authorization-server`
+  from the current execution environment reached `the local CGNAT-remapped address` but failed TLS handshake with `SSL_ERROR_SYSCALL`, and an external reader could not resolve the `.ts.net` hostname.
+- Cloudflare Quick Tunnel with HTTP/2 fallback exposed `http://127.0.0.1:8680`
+  at `https://<your-tunnel-id>.trycloudflare.com`.
+- `~/.rein/config.toml` was switched to `auth = "oauth"` and
+  `public_url = "https://<your-tunnel-id>.trycloudflare.com"`.
+- `GET http://127.0.0.1:8680/.well-known/oauth-authorization-server`
+  returns OAuth metadata with the Cloudflare issuer.
+- `./scripts/oauth-live-readiness.sh https://<your-tunnel-id>.trycloudflare.com`
+  returns `oauth live readiness ok`.
 
-Therefore the live claude.ai/Cowork gate is not yet satisfied. Completing it requires operator approval to restart or replace the current public GUI process with the OAuth-enabled build and then use claude.ai/Claude Connectors to run the actual DCR + authorize + `/mcp` flow.
+The live claude.ai/Cowork gate was completed with Cloudflare Quick Tunnel because
+the Tailscale Funnel hostname was not externally resolvable from the validation
+path. The Cloudflare Quick Tunnel URL is ephemeral; a durable deployment should
+use a named Cloudflare tunnel or a repaired public Funnel hostname before ship.
 
-## Authorized Live Validation Runbook
+## Live Validation Runbook
 
-This runbook has **not** been executed. It is the next action after the operator
-explicitly approves changing the public `:8680` service.
+This runbook was executed with a Cloudflare Quick Tunnel instead of the
+Tailscale Funnel hostname, because the Tailscale hostname was not externally
+reachable from the validation path.
 
 1. Back up the active config:
    `cp ~/.rein/config.toml ~/.rein/config.toml.oauth-preflight-$(date +%Y%m%d%H%M%S).bak`.
 2. Ensure an owner approval token is available in the service environment:
    `REIN_HTTP_TOKEN` must be set and non-empty.
-3. Switch `[server]` to OAuth posture for the current Funnel hostname:
-   `auth = "oauth"`, `public_url = "https://<your-machine>.<your-tailnet>.ts.net"`,
+3. Switch `[server]` to OAuth posture for the public hostname:
+   `auth = "oauth"`, `public_url = "https://<public-hostname>"`,
    `sse_bind = "127.0.0.1"`, `sse_port = 8680`, and
-   `allowed_hosts = ["<your-machine>.<your-tailnet>.ts.net"]`.
+   `allowed_hosts` containing the public hostname.
 4. Stop the current listener on `127.0.0.1:8680` and start the OAuth-enabled
    build with GUI enabled.
 5. Verify metadata before opening Claude:
@@ -105,7 +116,7 @@ explicitly approves changing the public `:8680` service.
    must return JSON, and `./scripts/oauth-live-readiness.sh <public-url>` should
    pass from a network path that can validate the public TLS endpoint.
 6. In claude.ai / Claude Connectors, add or reconnect the custom connector with
-   MCP URL `https://<your-machine>.<your-tailnet>.ts.net/mcp` and blank OAuth
+   MCP URL `https://<public-hostname>/mcp` and blank OAuth
    Client ID / Secret fields so Anthropic uses DCR.
 7. Approve the browser `/oauth/authorize` page through the same public hostname.
 8. Confirm the connector shows connected and a fresh conversation can ask rein
