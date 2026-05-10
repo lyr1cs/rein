@@ -2,7 +2,42 @@
 
 ## Overview
 
-rein v0.30.0 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 40 MCP tools (v0.28.6 added `rein_trust_measurement`; v0.28.4 added `rein_ars_acceleration_gate`). **v0.30.0** adds the built-in OAuth provider for Claude Cowork / claude.ai / mobile remote MCP connectors: explicit `[server].auth` policy, Authorization Server metadata, protected-resource metadata, Dynamic Client Registration, Authorization Code + PKCE S256, refresh rotation, revocation, SQLite-backed OAuth clients/grants/signing keys, owner approval, GUI Connectors management, OAuth GC, doctor checks, and local/live readiness scripts. **v0.28.18** was the agent-team audit follow-up to v0.28.17: unauthenticated public HTTP blocks mutating MCP/REST calls from non-loopback Hosts; same-origin browser mutation guard accepts HTTPS reverse-proxy origins; `rein doctor` validates both Codex MCP tables, stdio args, `REIN_DB` / `REIN_CONFIG` / `HOME` split risks, loopback URL parsing, and release manifest version drift. **v0.28.17** made the original Cowork/auth traps visible: `REIN_HTTP_TOKEN` winning over `[server].allow_unauthenticated_loopback=true`, and Codex MCP pointing at a non-loopback HTTP URL whose database may differ from local CLI. **v0.28.16** closed Codex 0.129 `[mcp.<name>]` → `[mcp_servers.<name>]` compatibility, completing the v0.28.15 hooks-gate rename patch. **v0.28.11** is the verified Tailscale Funnel walkthrough / Cowork deployment docs patch. **v0.28.10** closed the remote-MCP docs gap for Claude Cowork / claude.ai / mobile. **v0.28.9** added Claude Desktop DXT and Claude Code plugin marketplace distribution. v0.28.8 was a second-pass audit hardening on v0.28.7. Unified operation registry (CLI / MCP / REST authored once via `#[op]` macro). Self-adaptive engine (M1-M6), 3-channel retrieval (FTS + Vector + KG), transparent LLM proxy, async memory pipeline, unified dedup architecture, canonical-first read model, evidence-aware recall, hybrid CJK tokenization, cluster-aware admission, service management, and Neural Wiki GUI remain core surfaces.
+rein v0.30.1 — Multi-source cross-validated memory MCP server for AI agents. Rust single binary. 40 MCP tools (v0.28.6 added `rein_trust_measurement`; v0.28.4 added `rein_ars_acceleration_gate`). **v0.30.1** is the operator-driven follow-up to v0.30.0: every `/mcp` 4xx is wrapped in a JSON-RPC 2.0 error envelope (Anthropic's MCP client now surfaces actual rejection reasons instead of "An unknown error occurred connecting to the MCP server"); `rein doctor` flags the v0.30.0 release-day `refresh_token_fingerprint` migration's grant-revoke state with a single actionable WARN. **v0.30.0** adds the built-in OAuth provider for Claude Cowork / claude.ai / mobile remote MCP connectors: explicit `[server].auth` policy, Authorization Server metadata, protected-resource metadata, Dynamic Client Registration, Authorization Code + PKCE S256, refresh rotation, revocation, SQLite-backed OAuth clients/grants/signing keys, owner approval, GUI Connectors management, OAuth GC, doctor checks, and local/live readiness scripts. **v0.28.18** was the agent-team audit follow-up to v0.28.17: unauthenticated public HTTP blocks mutating MCP/REST calls from non-loopback Hosts; same-origin browser mutation guard accepts HTTPS reverse-proxy origins; `rein doctor` validates both Codex MCP tables, stdio args, `REIN_DB` / `REIN_CONFIG` / `HOME` split risks, loopback URL parsing, and release manifest version drift. **v0.28.17** made the original Cowork/auth traps visible: `REIN_HTTP_TOKEN` winning over `[server].allow_unauthenticated_loopback=true`, and Codex MCP pointing at a non-loopback HTTP URL whose database may differ from local CLI. **v0.28.16** closed Codex 0.129 `[mcp.<name>]` → `[mcp_servers.<name>]` compatibility, completing the v0.28.15 hooks-gate rename patch. **v0.28.11** is the verified Tailscale Funnel walkthrough / Cowork deployment docs patch. **v0.28.10** closed the remote-MCP docs gap for Claude Cowork / claude.ai / mobile. **v0.28.9** added Claude Desktop DXT and Claude Code plugin marketplace distribution. v0.28.8 was a second-pass audit hardening on v0.28.7. Unified operation registry (CLI / MCP / REST authored once via `#[op]` macro). Self-adaptive engine (M1-M6), 3-channel retrieval (FTS + Vector + KG), transparent LLM proxy, async memory pipeline, unified dedup architecture, canonical-first read model, evidence-aware recall, hybrid CJK tokenization, cluster-aware admission, service management, and Neural Wiki GUI remain core surfaces.
+
+## v0.30.1 release (2026-05-11)
+
+Operator-driven follow-up to v0.30.0 closing two debugging-tax issues from
+the first end-to-end claude.ai integration cycle on v0.30.0.
+
+Changed:
+
+- `crates/rein/src/mcp/server.rs` — every `/mcp` 4xx response is now
+  wrapped in a JSON-RPC 2.0 error envelope
+  (`{"jsonrpc":"2.0","id":<echoed-or-null>,"error":{"code":<code>,"message":"..."}}`)
+  with `Content-Type: application/json` so claude.ai's MCP UI can surface
+  the actual rejection reason. Covers host/Origin guards, generic auth
+  Deny, OAuth `WWW-Authenticate` challenge (header preserved per RFC 6750
+  / RFC 9728), and the public-mutation block. `/api/` REST keeps plain
+  text. New helpers `mcp_jsonrpc_error_response` and `extract_jsonrpc_id`
+  factor envelope + body-id parsing.
+- `crates/rein/src/doctor.rs` — `oauth_provider` check emits a
+  `Configuration` WARN when `auth_policy = "oauth"` AND `oauth_clients > 0`
+  AND `active_grants = 0`. Catches the v0.30.0 release-day
+  `refresh_token_fingerprint` migration revoke and any other state where
+  every grant is revoked, with a one-line hint to remove + re-add the rein
+  connector on claude.ai.
+- `docs/manual/02b-remote-mcp-deployment.md` — adds a
+  `## Choosing your auth posture` decision tree for `public` / `oauth` /
+  `bearer_required` / `loopback_only` and recommends `auth = "public"` for
+  single-user private Tailscale Funnel deployments (v0.28.18 mutation gate
+  keeps writes locked).
+
+Validation:
+
+- `cargo test --workspace` — 1570 passed, 3 ignored
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo fmt --all -- --check` — clean
+- Codex review on uncommitted diff — 0 P1 (saturation per memory pattern)
 
 ## v0.30.0 release (2026-05-10)
 

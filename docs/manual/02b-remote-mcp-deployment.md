@@ -220,6 +220,37 @@ listener, stable public HTTPS URL, OAuth for remote Claude clients**.
 - A way to expose `127.0.0.1:8680` to the public internet — see the
   decision tree below to pick the cheapest one for your situation
 
+## Choosing your auth posture
+
+`[server].auth` controls how rein gates incoming HTTP / `/mcp` requests.
+Pick before choosing a recipe — the recipe just exposes the listener;
+auth is what the broker negotiates against.
+
+| Posture | When it fits | Anthropic UI auth | Recovery cost on rein restart |
+| --- | --- | --- | --- |
+| `public` | Single-user, private tunnel hostname, read-only memory access from claude.ai is the goal (writes happen locally over stdio anyway). v0.28.18's mutation gate still blocks `rein_store` / `rein_forget` / `rein_update` on non-loopback Hosts, so the threat model is read-only leak only. | None | None — claude.ai re-uses the same connector forever |
+| `oauth` | Multi-user, shared deployment, or a setup where you want claude.ai to also call mutating tools. Requires the operator's browser to set the `rein_oauth_owner` cookie via `POST /api/session` before each authorize flow (10-minute window). | OAuth 2.0 (PKCE + DCR) | Connector usually re-authorizes silently; the v0.30.0 release-day migration revokes existing grants and forces a manual disconnect+reconnect on claude.ai |
+| `bearer_required` | stdio-friendly token auth for tooling that can inject `Authorization: Bearer <REIN_HTTP_TOKEN>`. Anthropic's UI has no field for this — useful for direct API consumers (Codex CLI, custom scripts), not the claude.ai connector. | n/a | None |
+| `loopback_only` | Local-only deployment; rein refuses any non-loopback request. Choose this when the only consumers are stdio MCP and same-machine REST. | n/a | None |
+
+**For most personal Tailscale Funnel deployments**, `public` is the
+simplest path: one config line, no cookie windows, no migration tax,
+and the mutation gate keeps writes locked. Set it explicitly so doctor
+isn't ambiguous:
+
+```toml
+[server]
+auth = "public"
+```
+
+**For shared deployments or full read+write claude.ai integration**,
+go through Recipe E (built-in OAuth) below. Be aware the connector
+breaks once during a v0.30.x upgrade because the
+`refresh_token_fingerprint` schema migration revokes pre-upgrade
+grants — recover by removing and re-adding the connector on claude.ai
+once. `rein doctor` flags this state with a one-line WARN and an
+actionable hint.
+
 ## Choosing a recipe
 
 You don't need a Tailscale account, a Cloudflare account, a domain, or a

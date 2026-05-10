@@ -1474,14 +1474,15 @@ fn check_oauth_provider(config: &ReinConfig) -> DoctorCheck {
     let client_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM oauth_clients", [], |row| row.get(0))
         .unwrap_or(0);
+    let now = chrono::Utc::now().timestamp();
     let active_grants: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM oauth_grants WHERE revoked_at IS NULL",
-            [],
+            "SELECT COUNT(*) FROM oauth_grants
+             WHERE revoked_at IS NULL AND refresh_expires_at > ?1",
+            [now],
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let now = chrono::Utc::now().timestamp();
     let expired_codes: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM oauth_auth_codes WHERE expires_at < ?1",
@@ -1497,6 +1498,33 @@ fn check_oauth_provider(config: &ReinConfig) -> DoctorCheck {
             |row| row.get(0),
         )
         .unwrap_or(0);
+    // Post-upgrade grant-loss detection: when the explicit OAuth policy is
+    // active and at least one DCR client is registered but every grant is
+    // revoked or never issued, the connector is silently broken until the
+    // operator disconnects + re-adds it on claude.ai. This is the signature
+    // of the v0.30.0 `refresh_token_fingerprint` schema migration — the
+    // backfill stamps `revoked_at` on every pre-release grant without a
+    // fingerprint, and Anthropic's broker doesn't always fall back from a
+    // failed refresh-token to a fresh authorization-code flow.
+    //
+    // Surface this as a single actionable WARN line so the operator can
+    // recover with a single UI action instead of chasing a generic
+    // "unknown error" message in the connector dialog. The same condition
+    // also catches less common cases (operator manually revoked all grants,
+    // every grant expired past TTL without a refresh) where the fix is the
+    // same: re-authorize on claude.ai.
+    if policy == "oauth" && client_count > 0 && active_grants == 0 {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "oauth_provider",
+            format!(
+                "auth_policy={policy}; oauth_clients={client_count}; active_grants=0; expired_oauth_records={} — DCR clients exist but every grant is revoked",
+                expired_codes + expired_grants
+            ),
+            "in claude.ai → Settings → Connectors, remove the rein connector and re-add it (same URL); this re-runs DCR + authorization-code and issues a fresh grant",
+        );
+    }
+
     if expired_codes + expired_grants > 1000 {
         warn_with_hint(
             DoctorCategory::Storage,

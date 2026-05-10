@@ -140,6 +140,55 @@ fn plain_http_response(
         })
 }
 
+/// JSON-RPC 2.0 error envelope for `/mcp` 4xx responses.
+///
+/// Anthropic's MCP client (and other spec-compliant clients) parse JSON-RPC
+/// error envelopes; a plain-text 4xx surfaces in claude.ai's UI as a
+/// generic "An unknown error occurred connecting to the MCP server" with
+/// no actionable detail. This helper produces a body of the form
+/// `{"jsonrpc":"2.0","id":<id>,"error":{"code":<code>,"message":"..."}}`
+/// with `Content-Type: application/json` so the broker can surface the
+/// rejection reason in its UI. `extra_headers` carries OAuth challenge
+/// (`WWW-Authenticate`) or other rejection-specific headers.
+fn mcp_jsonrpc_error_response(
+    status: hyper::StatusCode,
+    code: i32,
+    message: &str,
+    id: serde_json::Value,
+    extra_headers: &[(&'static str, String)],
+) -> hyper::Response<HttpBoxBody> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
+    });
+    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| {
+        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}"#.to_vec()
+    });
+    let mut builder = hyper::Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-source-code", crate::SOURCE_URL)
+        .header("x-license", crate::LICENSE_SPDX);
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, value.as_str());
+    }
+    builder
+        .body(http_body_util::Full::new(bytes::Bytes::from(bytes)).boxed())
+        .unwrap_or_else(|_| plain_http_response(status, "internal error"))
+}
+
+/// Extract the JSON-RPC `id` field from a request body so error envelopes
+/// can echo it back per JSON-RPC 2.0. Returns `Null` when the body isn't
+/// parseable or has no `id` (which the spec then requires for the error
+/// envelope's `id` field).
+fn extract_jsonrpc_id(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn json_http_response(
     status: hyper::StatusCode,
     body: serde_json::Value,
@@ -219,8 +268,27 @@ fn oauth_resource_path_from_metadata_path(path: &str) -> Option<&str> {
     }
 }
 
-fn http_guard_response(rejection: HttpGuardRejection) -> hyper::Response<HttpBoxBody> {
-    plain_http_response(rejection.status(), rejection.message())
+fn http_guard_response(rejection: HttpGuardRejection, path: &str) -> hyper::Response<HttpBoxBody> {
+    if path.starts_with("/mcp") {
+        // claude.ai's MCP client wraps everything in JSON-RPC envelopes, so
+        // a plain-text 4xx surfaces as a generic "unknown error" with no
+        // actionable detail. Wrap host-guard rejections so the broker can
+        // show the operator the real reason (Host header / browser-origin
+        // mismatch).
+        let code = match rejection {
+            HttpGuardRejection::BadRequest(_) => -32600, // JSON-RPC: Invalid Request
+            HttpGuardRejection::Forbidden(_) => -32001, // implementation-defined: rejected pre-auth
+        };
+        mcp_jsonrpc_error_response(
+            rejection.status(),
+            code,
+            rejection.message(),
+            serde_json::Value::Null,
+            &[],
+        )
+    } else {
+        plain_http_response(rejection.status(), rejection.message())
+    }
 }
 
 fn normalize_host_for_guard(host: &str) -> String {
@@ -958,7 +1026,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                             Ok(host) => Some(host),
                             Err(rejection) => {
                                 return Ok::<_, std::convert::Infallible>(http_guard_response(
-                                    rejection,
+                                    rejection, &path,
                                 ));
                             }
                         }
@@ -970,13 +1038,16 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                     if let Err(rejection) =
                         validate_browser_mutation_guard(&method, &path, req.headers(), host)
                     {
-                        return Ok::<_, std::convert::Infallible>(http_guard_response(rejection));
+                        return Ok::<_, std::convert::Infallible>(http_guard_response(
+                            rejection, &path,
+                        ));
                     }
                 } else if is_mutating_http_surface_request(&method, &path)
                     && request_has_browser_mutation_headers(req.headers())
                 {
                     return Ok::<_, std::convert::Infallible>(http_guard_response(
                         HttpGuardRejection::BadRequest("missing Host header"),
+                        &path,
                     ));
                 }
 
@@ -1116,10 +1187,44 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                         if runtime_auth_policy == crate::auth::AuthPolicy::OAuth
                             && status == hyper::StatusCode::UNAUTHORIZED
                         {
+                            // Spec-compliant clients (RFC 6750 §3, RFC 9728 §5.1)
+                            // parse the WWW-Authenticate header on /mcp 401s, but
+                            // claude.ai's UI also expects the body to be a
+                            // JSON-RPC envelope; a plain text body becomes "An
+                            // unknown error" with no diagnostic surface. Wrap the
+                            // 401 in a JSON-RPC envelope on /mcp paths while
+                            // preserving the WWW-Authenticate challenge header.
+                            if path.starts_with("/mcp") {
+                                let issuer = crate::auth::oauth::metadata::issuer_from_request(
+                                    req.headers(),
+                                    &cfg,
+                                );
+                                let metadata_path = oauth_protected_resource_metadata_path(&path);
+                                let challenge =
+                                    format!("Bearer resource_metadata=\"{issuer}{metadata_path}\"");
+                                return Ok::<_, std::convert::Infallible>(
+                                    mcp_jsonrpc_error_response(
+                                        hyper::StatusCode::UNAUTHORIZED,
+                                        -32001,
+                                        "authentication required",
+                                        serde_json::Value::Null,
+                                        &[("www-authenticate", challenge)],
+                                    ),
+                                );
+                            }
                             return Ok::<_, std::convert::Infallible>(oauth_unauthorized_response(
                                 req.headers(),
                                 &cfg,
                                 &path,
+                            ));
+                        }
+                        if path.starts_with("/mcp") {
+                            return Ok::<_, std::convert::Infallible>(mcp_jsonrpc_error_response(
+                                status,
+                                -32001,
+                                "authentication required",
+                                serde_json::Value::Null,
+                                &[],
                             ));
                         }
                         return Ok::<_, std::convert::Infallible>(plain_http_response(
@@ -1169,9 +1274,20 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                             tool = tool_name,
                             "blocked unauthenticated public HTTP MCP mutating tool call"
                         );
-                        return Ok::<_, std::convert::Infallible>(plain_http_response(
+                        // Body is already collected at this point; echo the
+                        // request id so claude.ai's UI can correlate the error
+                        // with the originating tool call. Path is necessarily
+                        // `/mcp` (only path that reaches this block), so wrap
+                        // the rejection in a JSON-RPC envelope so the broker
+                        // can surface the actual reason instead of "unknown
+                        // error".
+                        let id = extract_jsonrpc_id(&body);
+                        return Ok::<_, std::convert::Infallible>(mcp_jsonrpc_error_response(
                             hyper::StatusCode::FORBIDDEN,
+                            -32001,
                             "unauthenticated public HTTP MCP cannot call mutating tools",
+                            id,
+                            &[],
                         ));
                     }
                 }

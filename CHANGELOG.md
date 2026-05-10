@@ -13,6 +13,49 @@ This file is a condensed index intended for quick scanning.
 
 _Nothing yet._
 
+## [0.30.1] — 2026-05-11
+
+Operator-driven follow-up to v0.30.0 closing two debugging-tax issues
+that surfaced during the first end-to-end claude.ai integration cycle.
+
+### Fixed
+
+- Every `/mcp` 4xx response now ships as a JSON-RPC 2.0 error envelope
+  (`{"jsonrpc":"2.0","id":<echoed>,"error":{"code":<code>,"message":"..."}}`)
+  with `Content-Type: application/json`. Anthropic's MCP client and other
+  spec-compliant clients can now surface the actual rejection reason
+  (host guard / browser-origin guard / auth policy / public-mutation
+  block / OAuth challenge) instead of "An unknown error occurred
+  connecting to the MCP server". OAuth 401 still carries the
+  `WWW-Authenticate: Bearer resource_metadata="..."` header per RFC 6750
+  and RFC 9728. `/api/` REST rejections retain plain-text bodies.
+- `rein doctor` `oauth_provider` check emits a `Configuration` WARN when
+  `auth_policy = "oauth"` AND `oauth_clients > 0` AND `active_grants = 0`.
+  Catches the v0.30.0 release-day `refresh_token_fingerprint` migration
+  revoke (and any other state where every grant is revoked) and gives
+  the operator a one-line actionable hint to remove + re-add the rein
+  connector on claude.ai instead of chasing a generic error message.
+
+### Documented
+
+- `docs/manual/02b-remote-mcp-deployment.md` adds a
+  `## Choosing your auth posture` decision tree covering
+  `public` / `oauth` / `bearer_required` / `loopback_only`. Calls out
+  `auth = "public"` as the simplest path for single-user private
+  Tailscale Funnel deployments (mutation gate keeps writes locked) and
+  documents the v0.30.0 OAuth grant-revoke trap so anyone upgrading
+  along the OAuth path knows the recovery action.
+
+### Security
+
+- Redacts operator-specific Tailscale Funnel FQDN, Quick Tunnel URLs,
+  Tailscale CGNAT IPs, claude.ai conversation IDs, internal vault path
+  references, and author-perspective phrasings from public docs and
+  test fixtures. Doc and fixture string substitutions only — no
+  runtime / binary / behavior changes (replacement Tailscale CGNAT
+  addresses stay in `100.64.0.0/10` and remain non-loopback for the
+  same test assertions).
+
 ## [0.28.18] — 2026-05-09
 
 Agent-team audit follow-up to v0.28.17's Cowork/auth diagnostics.
@@ -363,7 +406,9 @@ operation registry, an adaptive read-side synthesis (ARS) stack with
 feedback-driven gates, and end-to-end audit-cycle hardening of every
 adaptive surface.
 
-[Unreleased]: https://github.com/lyr1cs/rein/compare/v0.28.18...HEAD
+[Unreleased]: https://github.com/lyr1cs/rein/compare/v0.30.1...HEAD
+[0.30.1]: https://github.com/lyr1cs/rein/releases/tag/v0.30.1
+[0.30.0]: https://github.com/lyr1cs/rein/releases/tag/v0.30.0
 [0.28.18]: https://github.com/lyr1cs/rein/releases/tag/v0.28.18
 [0.28.17]: https://github.com/lyr1cs/rein/releases/tag/v0.28.17
 [0.28.16]: https://github.com/lyr1cs/rein/releases/tag/v0.28.16
