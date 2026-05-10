@@ -106,12 +106,22 @@ fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
     json_response(status, json!({ "error": msg }))
 }
 
-fn session_cookie_value(token: &str) -> String {
-    format!("{HTTP_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/api")
+fn secure_cookie_suffix(secure: bool) -> &'static str {
+    if secure {
+        "; Secure"
+    } else {
+        ""
+    }
 }
 
-fn clear_session_cookie_value() -> String {
-    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0")
+fn session_cookie_value(token: &str, secure: bool) -> String {
+    let secure = secure_cookie_suffix(secure);
+    format!("{HTTP_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/api{secure}")
+}
+
+fn clear_session_cookie_value(secure: bool) -> String {
+    let secure = secure_cookie_suffix(secure);
+    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0{secure}")
 }
 
 fn clear_legacy_session_cookie_value() -> String {
@@ -122,7 +132,7 @@ fn clear_legacy_root_session_cookie_value() -> String {
     format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
 }
 
-fn oauth_owner_cookie_should_be_secure(config: &ReinConfig) -> bool {
+fn session_cookies_should_be_secure(config: &ReinConfig) -> bool {
     config
         .server
         .public_url
@@ -133,7 +143,7 @@ fn oauth_owner_cookie_should_be_secure(config: &ReinConfig) -> bool {
 }
 
 fn oauth_owner_cookie_value(token: &str, secure: bool) -> String {
-    let secure = if secure { "; Secure" } else { "" };
+    let secure = secure_cookie_suffix(secure);
     format!(
         "{}={token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{secure}",
         crate::auth::oauth::OAUTH_OWNER_COOKIE
@@ -141,7 +151,7 @@ fn oauth_owner_cookie_value(token: &str, secure: bool) -> String {
 }
 
 fn clear_oauth_owner_cookie_value(secure: bool) -> String {
-    let secure = if secure { "; Secure" } else { "" };
+    let secure = secure_cookie_suffix(secure);
     format!(
         "{}=; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=0{secure}",
         crate::auth::oauth::OAUTH_OWNER_COOKIE
@@ -994,12 +1004,12 @@ fn api_create_session(config: &ReinConfig) -> BoxedResponse {
         .filter(|token| !token.trim().is_empty());
     match token {
         Some(token) => {
-            let secure_oauth_owner_cookie = oauth_owner_cookie_should_be_secure(config);
+            let secure_session_cookies = session_cookies_should_be_secure(config);
             let cookies = [
                 clear_legacy_root_session_cookie_value(),
                 clear_legacy_session_cookie_value(),
-                session_cookie_value(&token),
-                oauth_owner_cookie_value(&token, secure_oauth_owner_cookie),
+                session_cookie_value(&token, secure_session_cookies),
+                oauth_owner_cookie_value(&token, secure_session_cookies),
             ];
             json_response_with_cookies(StatusCode::OK, json!({ "authenticated": true }), &cookies)
         }
@@ -1011,12 +1021,12 @@ fn api_create_session(config: &ReinConfig) -> BoxedResponse {
 }
 
 fn api_clear_session(config: &ReinConfig) -> BoxedResponse {
-    let secure_oauth_owner_cookie = oauth_owner_cookie_should_be_secure(config);
+    let secure_session_cookies = session_cookies_should_be_secure(config);
     let cookies = [
-        clear_session_cookie_value(),
+        clear_session_cookie_value(secure_session_cookies),
         clear_legacy_root_session_cookie_value(),
         clear_legacy_session_cookie_value(),
-        clear_oauth_owner_cookie_value(secure_oauth_owner_cookie),
+        clear_oauth_owner_cookie_value(secure_session_cookies),
     ];
     json_response_with_cookies(StatusCode::OK, json!({ "authenticated": false }), &cookies)
 }
@@ -2275,6 +2285,14 @@ mod tests {
                     && value.contains("Path=/oauth/authorize")
                     && value.contains("Secure")),
             "OAuth owner cookie must be Secure when public_url uses HTTPS: {session_cookies:?}"
+        );
+        assert!(
+            session_cookies
+                .iter()
+                .any(|value| value.contains("rein_http_token=owner-secret")
+                    && value.contains("Path=/api")
+                    && value.contains("Secure")),
+            "API session cookie must be Secure when public_url uses HTTPS: {session_cookies:?}"
         );
 
         match original {

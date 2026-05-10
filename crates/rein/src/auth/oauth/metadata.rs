@@ -23,10 +23,26 @@ pub fn issuer_from_request(headers: &hyper::HeaderMap, config: &ReinConfig) -> S
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return format!("https://{host}");
+        let scheme = if host_header_is_loopback(host) {
+            "http"
+        } else {
+            "https"
+        };
+        return format!("{scheme}://{host}");
     }
 
     format!("http://127.0.0.1:{}", config.server.sse_port)
+}
+
+fn host_header_is_loopback(host: &str) -> bool {
+    let Ok(authority) = hyper::http::uri::Authority::try_from(host) else {
+        return false;
+    };
+    let host = authority.host();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn normalize_resource_path(path: &str) -> String {
@@ -105,6 +121,24 @@ mod tests {
         assert_eq!(
             value["registration_endpoint"],
             "https://rein.ts.net/oauth/register"
+        );
+    }
+
+    #[test]
+    fn metadata_falls_back_to_http_for_loopback_host_header() {
+        let config = crate::config::ReinConfig::default();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("127.0.0.1:8680"),
+        );
+
+        let value = authorization_server_metadata(&headers, &config);
+
+        assert_eq!(value["issuer"], "http://127.0.0.1:8680");
+        assert_eq!(
+            value["authorization_endpoint"],
+            "http://127.0.0.1:8680/oauth/authorize"
         );
     }
 
