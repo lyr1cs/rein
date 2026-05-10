@@ -1,7 +1,8 @@
 # OAuth Provider Completion Audit
 
 Date: 2026-05-10
-Commit under audit: `998804d feat(v0.30): add built-in OAuth provider`
+Code/review audit scope: `006d984..1fe2e83`
+Audit note: the follow-up documentation commit records this evidence; it does not change the reviewed Rust, GUI, script, or deployment behavior.
 
 ## Objective
 
@@ -9,7 +10,7 @@ Implement the goals in `docs/backlog/oauth-provider-l5.md` and run a complete co
 
 ## Evidence Summary
 
-Implemented and committed:
+Implemented and committed across the audit scope:
 
 - Explicit HTTP auth policy: `loopback_only`, `bearer_required`, `oauth`, `public`.
 - OAuth provider endpoints: metadata, protected-resource metadata, DCR, authorize, token, refresh, revoke.
@@ -33,6 +34,7 @@ Verification already run on the audited tree before commit:
 - `scripts/oauth-live-readiness.sh http://127.0.0.1:8680` -> fails as expected on the current old runtime because the endpoint is not OAuth-ready.
 - `REIN_EVAL_JUDGE=llm rein-eval synthesis baseline/run/compare` -> `SHIP (NonInferior)`.
 - `codex review --uncommitted --title "v0.30 OAuth provider full audit after P2 fixes"` -> no blocking correctness, security, or maintainability issues found.
+- `codex review --base HEAD~3 --title "v0.30 OAuth provider final HEAD audit"` -> no discrete introduced correctness, security, or maintainability issues found; Rust tests and OAuth e2e passed on this tree.
 
 ## Requirement Checklist
 
@@ -60,10 +62,12 @@ Verification already run on the audited tree before commit:
 | OAuth-provider ADR | `docs/decisions/oauth-provider.md` | Done |
 | Local e2e script | `scripts/oauth-e2e-test.sh`, executable bit committed | Done |
 | Live readiness check script | `scripts/oauth-live-readiness.sh`, executable bit committed | Done |
-| Codex review convergence | Latest review reported no blocking findings | Done |
-| Implementation commit | `998804d feat(v0.30): add built-in OAuth provider` | Done |
+| Codex review convergence | Latest final HEAD review reported no blocking findings | Done |
+| Implementation commits | `998804d feat(v0.30): add built-in OAuth provider`, `508d5a4 docs(v0.30): record OAuth provider completion audit`, `1fe2e83 test(v0.30): add OAuth live readiness check` | Done |
 | Live claude.ai / Cowork connector validation | Requires restarting the current public `:8680` service and operating the user's Claude connector | Blocked |
-| Tag/push/release | Handoff section 11 says do not tag or push until the operator explicitly says ship | Intentionally not done |
+| Phase A/B ship tags (`v0.29.0`, `v0.30.0`) | Handoff section 11 says do not tag until the operator explicitly says ship; phases were implemented together in the v0.30 audit scope | Intentionally not done |
+| Release devlog / public release notes | The vault convention treats devlog as a release artifact; live Cowork validation is still blocked, so v0.30 should not be documented as shipped yet | Blocked until ship |
+| Push / GitHub release | Handoff section 11 says do not push until the operator explicitly says ship | Intentionally not done |
 
 ## Live Gate State
 
@@ -75,3 +79,31 @@ Current machine state inspected after commit:
 - `GET http://127.0.0.1:8680/.well-known/oauth-authorization-server` currently returns GUI HTML, not OAuth metadata.
 
 Therefore the live claude.ai/Cowork gate is not yet satisfied. Completing it requires operator approval to restart or replace the current public GUI process with the OAuth-enabled build and then use claude.ai/Claude Connectors to run the actual DCR + authorize + `/mcp` flow.
+
+## Authorized Live Validation Runbook
+
+This runbook has **not** been executed. It is the next action after the operator
+explicitly approves changing the public `:8680` service.
+
+1. Back up the active config:
+   `cp ~/.rein/config.toml ~/.rein/config.toml.oauth-preflight-$(date +%Y%m%d%H%M%S).bak`.
+2. Ensure an owner approval token is available in the service environment:
+   `REIN_HTTP_TOKEN` must be set and non-empty.
+3. Switch `[server]` to OAuth posture for the current Funnel hostname:
+   `auth = "oauth"`, `public_url = "https://<your-machine>.<your-tailnet>.ts.net"`,
+   `sse_bind = "127.0.0.1"`, `sse_port = 8680`, and
+   `allowed_hosts = ["<your-machine>.<your-tailnet>.ts.net"]`.
+4. Stop the current listener on `127.0.0.1:8680` and start the OAuth-enabled
+   build with GUI enabled.
+5. Verify metadata before opening Claude:
+   `curl -H 'Host: <your-machine>.<your-tailnet>.ts.net' http://127.0.0.1:8680/.well-known/oauth-authorization-server`
+   must return JSON, and `./scripts/oauth-live-readiness.sh <public-url>` should
+   pass from a network path that can validate the public TLS endpoint.
+6. In claude.ai / Claude Connectors, add or reconnect the custom connector with
+   MCP URL `https://<your-machine>.<your-tailnet>.ts.net/mcp` and blank OAuth
+   Client ID / Secret fields so Anthropic uses DCR.
+7. Approve the browser `/oauth/authorize` page through the same public hostname.
+8. Confirm the connector shows connected and a fresh conversation can ask rein
+   to count memories.
+9. If validation fails, restore the backed-up config and restart the previous
+   service command.
