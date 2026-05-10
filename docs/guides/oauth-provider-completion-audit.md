@@ -30,6 +30,7 @@ Verification already run on the audited tree before commit:
 - `cargo build -p rein --release --features gui` -> pass.
 - `./target/release/rein doctor` -> `Overall: healthy`.
 - `./scripts/oauth-e2e-test.sh` -> `oauth e2e ok`.
+- `scripts/oauth-live-readiness.sh http://127.0.0.1:8680` -> fails as expected on the current old runtime because the endpoint is not OAuth-ready.
 - `REIN_EVAL_JUDGE=llm rein-eval synthesis baseline/run/compare` -> `SHIP (NonInferior)`.
 - `codex review --uncommitted --title "v0.30 OAuth provider full audit after P2 fixes"` -> no blocking correctness, security, or maintainability issues found.
 
@@ -58,6 +59,7 @@ Verification already run on the audited tree before commit:
 | Auth-policy ADR | `docs/decisions/auth-policy-explicit.md` | Done |
 | OAuth-provider ADR | `docs/decisions/oauth-provider.md` | Done |
 | Local e2e script | `scripts/oauth-e2e-test.sh`, executable bit committed | Done |
+| Live readiness check script | `scripts/oauth-live-readiness.sh`, executable bit committed | Done |
 | Codex review convergence | Latest review reported no blocking findings | Done |
 | Implementation commit | `998804d feat(v0.30): add built-in OAuth provider` | Done |
 | Live claude.ai / Cowork connector validation | Requires restarting the current public `:8680` service and operating the user's Claude connector | Blocked |
@@ -73,4 +75,3 @@ Current machine state inspected after commit:
 - `GET http://127.0.0.1:8680/.well-known/oauth-authorization-server` currently returns GUI HTML, not OAuth metadata.
 
 Therefore the live claude.ai/Cowork gate is not yet satisfied. Completing it requires operator approval to restart or replace the current public GUI process with the OAuth-enabled build and then use claude.ai/Claude Connectors to run the actual DCR + authorize + `/mcp` flow.
-
