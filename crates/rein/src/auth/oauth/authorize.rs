@@ -173,7 +173,7 @@ fn redirect_or_bad_request(
     }
 }
 
-fn owner_authorized(headers: &hyper::HeaderMap) -> bool {
+pub(crate) fn owner_authorized(headers: &hyper::HeaderMap) -> bool {
     let Some(token) = std::env::var("REIN_HTTP_TOKEN")
         .ok()
         .map(|token| token.trim().to_string())

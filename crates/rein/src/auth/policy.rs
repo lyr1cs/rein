@@ -29,9 +29,6 @@ impl AuthPolicy {
         if ctx.gui_enabled && !ctx.path.starts_with("/api/") && !ctx.path.starts_with("/mcp") {
             return AuthDecision::Allow;
         }
-        if matches!(self, Self::OAuth) && is_oauth_owner_api_endpoint(ctx.method, ctx.path) {
-            return AuthDecision::Allow;
-        }
 
         match self {
             Self::Public => AuthDecision::Allow,
@@ -87,14 +84,6 @@ pub struct HttpAuthContext<'a> {
 
 pub fn is_oauth_endpoint(path: &str) -> bool {
     path.starts_with("/oauth/") || is_oauth_metadata_endpoint(path)
-}
-
-fn is_oauth_owner_api_endpoint(method: &hyper::Method, path: &str) -> bool {
-    (*method == hyper::Method::POST && path == "/api/session")
-        || (*method == hyper::Method::GET && path == "/api/oauth/clients")
-        || (*method == hyper::Method::POST
-            && path.starts_with("/api/oauth/clients/")
-            && path.ends_with("/revoke"))
 }
 
 pub fn is_oauth_metadata_endpoint(path: &str) -> bool {
@@ -312,14 +301,29 @@ mod tests {
     }
 
     #[test]
-    fn oauth_policy_allows_owner_api_routes_to_reach_route_level_auth() {
+    fn oauth_policy_keeps_owner_api_routes_behind_static_owner_token() {
         for (method, path) in [
             (hyper::Method::POST, "/api/session"),
             (hyper::Method::GET, "/api/oauth/clients"),
             (hyper::Method::POST, "/api/oauth/clients/client-1/revoke"),
         ] {
-            let headers = hyper::HeaderMap::new();
-            let ctx = HttpAuthContext {
+            let missing = hyper::HeaderMap::new();
+            let missing_ctx = HttpAuthContext {
+                method: &method,
+                path,
+                gui_enabled: false,
+                headers: &missing,
+                request_host_is_loopback: false,
+                rein_http_token: Some("owner-secret"),
+                oauth_bearer_valid: false,
+            };
+            assert_eq!(
+                AuthPolicy::OAuth.evaluate_http(&missing_ctx),
+                AuthDecision::Deny(hyper::StatusCode::UNAUTHORIZED)
+            );
+
+            let headers = headers_with_bearer("owner-secret");
+            let ok_ctx = HttpAuthContext {
                 method: &method,
                 path,
                 gui_enabled: false,
@@ -329,7 +333,10 @@ mod tests {
                 oauth_bearer_valid: false,
             };
 
-            assert_eq!(AuthPolicy::OAuth.evaluate_http(&ctx), AuthDecision::Allow);
+            assert_eq!(
+                AuthPolicy::OAuth.evaluate_http(&ok_ctx),
+                AuthDecision::Allow
+            );
         }
     }
 

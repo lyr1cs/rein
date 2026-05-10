@@ -1042,6 +1042,15 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                             )
                         }
                         (hyper::Method::POST, "/oauth/authorize") => {
+                            if !crate::auth::oauth::authorize::owner_authorized(&headers) {
+                                return Ok::<_, std::convert::Infallible>(oauth_http_response(
+                                    crate::auth::oauth::oauth_error(
+                                        hyper::StatusCode::UNAUTHORIZED,
+                                        "access_denied",
+                                        "owner authentication is required before approving OAuth access",
+                                    ),
+                                ));
+                            }
                             let body = match collect_mcp_request_body_capped(req.into_body()).await
                             {
                                 Ok(body) => body,

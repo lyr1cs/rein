@@ -13,6 +13,46 @@ struct RevokeRequest {
     client_secret: Option<String>,
 }
 
+fn revoke_access_token_if_owned(conn: &rusqlite::Connection, client_id: &str, token: &str) -> bool {
+    let Ok(keys) = store::signing_keys_for_verification(conn) else {
+        return false;
+    };
+    let refs = keys
+        .iter()
+        .map(|key| jwt::SigningKeyRef {
+            kid: key.kid.as_str(),
+            secret_hex: key.secret_hex.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let Ok(claims) = jwt::verify_access_token(token, &refs, chrono::Utc::now().timestamp()) else {
+        return false;
+    };
+    if claims.aud != client_id {
+        return false;
+    }
+    let _ = store::revoke_grant_by_access_jti(conn, &claims.jti);
+    true
+}
+
+fn revoke_refresh_token_if_owned(
+    conn: &rusqlite::Connection,
+    client_id: &str,
+    token: &str,
+) -> bool {
+    match store::find_active_grant_by_refresh(
+        conn,
+        client_id,
+        token,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(Some(grant)) => {
+            let _ = store::revoke_grant(conn, &grant.grant_id);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn handle_revoke(
     headers: &hyper::HeaderMap,
     body: &[u8],
@@ -47,30 +87,23 @@ pub fn handle_revoke(
         );
     }
 
-    if req.token_type_hint.as_deref() == Some("access_token") || req.token.contains('.') {
-        if let Ok(keys) = store::signing_keys_for_verification(store.conn()) {
-            let refs = keys
-                .iter()
-                .map(|key| jwt::SigningKeyRef {
-                    kid: key.kid.as_str(),
-                    secret_hex: key.secret_hex.as_str(),
-                })
-                .collect::<Vec<_>>();
-            if let Ok(claims) =
-                jwt::verify_access_token(&req.token, &refs, chrono::Utc::now().timestamp())
-            {
-                if claims.aud == client_id {
-                    let _ = store::revoke_grant_by_access_jti(store.conn(), &claims.jti);
-                }
-            }
+    let access_first = req.token_type_hint.as_deref() == Some("access_token")
+        || (req.token_type_hint.as_deref() != Some("refresh_token") && req.token.contains('.'));
+    let revoked = if access_first {
+        if revoke_access_token_if_owned(store.conn(), &client_id, &req.token) {
+            true
+        } else {
+            revoke_refresh_token_if_owned(store.conn(), &client_id, &req.token)
         }
-    } else if let Ok(Some(grant)) = store::find_active_grant_by_refresh(
-        store.conn(),
-        &client_id,
-        &req.token,
-        chrono::Utc::now().timestamp(),
-    ) {
-        let _ = store::revoke_grant(store.conn(), &grant.grant_id);
+    } else {
+        if revoke_refresh_token_if_owned(store.conn(), &client_id, &req.token) {
+            true
+        } else {
+            revoke_access_token_if_owned(store.conn(), &client_id, &req.token)
+        }
+    };
+    if !revoked {
+        tracing::debug!("OAuth revoke request did not match an active token for client");
     }
 
     OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({}))
@@ -235,5 +268,57 @@ mod tests {
         let active =
             store::active_grant_count_for_client(store.conn(), &client_a.client_id).expect("count");
         assert_eq!(active, 0, "client A should revoke its own grant");
+    }
+
+    #[test]
+    fn revoke_treats_token_type_hint_as_advisory() {
+        let (_dir, config) = temp_config();
+        let store = config.open_store().expect("open store");
+        let client = store::register_client(
+            store.conn(),
+            store::RegisterClientInput {
+                client_name: "connector".to_string(),
+                redirect_uris: vec!["https://claude.ai/callback".to_string()],
+                grant_types: vec![
+                    "authorization_code".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                token_endpoint_auth_method: "client_secret_basic".to_string(),
+            },
+        )
+        .expect("register client");
+        let secret = client.client_secret.as_deref().expect("client secret");
+        store::insert_grant(
+            store.conn(),
+            store::InsertGrantInput {
+                client_id: client.client_id.clone(),
+                access_token_jti: "jti-wrong-hint".to_string(),
+                access_expires_at: chrono::Utc::now().timestamp() + 3600,
+                refresh_token: "refresh-hinted-as-access".to_string(),
+                refresh_expires_at: chrono::Utc::now().timestamp() + 86_400,
+            },
+        )
+        .expect("insert grant");
+        drop(store);
+
+        let body = serde_urlencoded::to_string([
+            ("token", "refresh-hinted-as-access"),
+            ("token_type_hint", "access_token"),
+        ])
+        .expect("form");
+        let response = handle_revoke(
+            &basic_headers(&client.client_id, secret),
+            body.as_bytes(),
+            &config,
+        );
+        assert_eq!(response.status, hyper::StatusCode::OK);
+
+        let store = config.open_store().expect("open store");
+        let active =
+            store::active_grant_count_for_client(store.conn(), &client.client_id).expect("count");
+        assert_eq!(
+            active, 0,
+            "refresh token must be revoked despite wrong hint"
+        );
     }
 }

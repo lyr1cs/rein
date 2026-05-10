@@ -38,7 +38,10 @@ fn host_header_is_loopback(host: &str) -> bool {
     let Ok(authority) = hyper::http::uri::Authority::try_from(host) else {
         return false;
     };
-    let host = authority.host();
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
@@ -139,6 +142,24 @@ mod tests {
         assert_eq!(
             value["authorization_endpoint"],
             "http://127.0.0.1:8680/oauth/authorize"
+        );
+    }
+
+    #[test]
+    fn metadata_falls_back_to_http_for_ipv6_loopback_host_header() {
+        let config = crate::config::ReinConfig::default();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("[::1]:8680"),
+        );
+
+        let value = authorization_server_metadata(&headers, &config);
+
+        assert_eq!(value["issuer"], "http://[::1]:8680");
+        assert_eq!(
+            value["authorization_endpoint"],
+            "http://[::1]:8680/oauth/authorize"
         );
     }
 
