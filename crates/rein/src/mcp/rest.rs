@@ -107,26 +107,51 @@ fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
 }
 
 fn session_cookie_value(token: &str) -> String {
-    format!("{HTTP_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/api/")
+    format!("{HTTP_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/api")
 }
 
 fn clear_session_cookie_value() -> String {
-    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/api/; Max-Age=0")
+    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0")
 }
 
-fn json_response_with_cookie(
+fn clear_legacy_session_cookie_value() -> String {
+    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/api/; Max-Age=0")
+}
+
+fn clear_legacy_root_session_cookie_value() -> String {
+    format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+}
+
+fn oauth_owner_cookie_value(token: &str) -> String {
+    format!(
+        "{}={token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600",
+        crate::auth::oauth::OAUTH_OWNER_COOKIE
+    )
+}
+
+fn clear_oauth_owner_cookie_value() -> String {
+    format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=0",
+        crate::auth::oauth::OAUTH_OWNER_COOKIE
+    )
+}
+
+fn json_response_with_cookies(
     status: StatusCode,
     body: serde_json::Value,
-    cookie: &str,
+    cookies: &[String],
 ) -> BoxedResponse {
     let json_bytes = serde_json::to_vec(&body).unwrap_or_default();
     // AGPL §13: every network response carries a pointer to the source.
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .header("set-cookie", cookie)
         .header("x-source-code", crate::SOURCE_URL)
-        .header("x-license", crate::LICENSE_SPDX)
+        .header("x-license", crate::LICENSE_SPDX);
+    for cookie in cookies {
+        builder = builder.header(hyper::header::SET_COOKIE, cookie.as_str());
+    }
+    builder
         .body(
             Full::new(Bytes::from(json_bytes))
                 .map_err(|never: std::convert::Infallible| match never {})
@@ -296,7 +321,7 @@ where
     // auth checks inline, so no ordering inversion there.
     if let Some(entry) = resolve_route(req.method(), req.uri().path()) {
         if !matches!(entry.auth_policy, crate::ops::AuthPolicy::Public) {
-            if let Err(resp) = enforce_auth_policy(&req, entry.auth_policy) {
+            if let Err(resp) = enforce_auth_policy(&req, entry.auth_policy, config) {
                 return resp;
             }
         }
@@ -351,11 +376,12 @@ pub async fn handle_rest_request_with_body<B>(
 fn enforce_auth_policy<B>(
     req: &Request<B>,
     policy: crate::ops::AuthPolicy,
+    config: &ReinConfig,
 ) -> Result<(), BoxedResponse> {
     match policy {
         crate::ops::AuthPolicy::Public => Ok(()),
         crate::ops::AuthPolicy::MutationMarker => require_mutation_marker(req),
-        crate::ops::AuthPolicy::ReadToken => require_read_token(req),
+        crate::ops::AuthPolicy::ReadToken => require_read_token(req, config),
     }
 }
 
@@ -371,16 +397,22 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
-fn cookie_value(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
-    let cookies = headers.get("cookie")?.to_str().ok()?;
-    cookies.split(';').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        if key.trim() == name {
-            Some(value.trim().to_string())
-        } else {
-            None
+fn cookie_values(headers: &hyper::HeaderMap, name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for header in headers.get_all(hyper::header::COOKIE) {
+        let Ok(cookies) = header.to_str() else {
+            continue;
+        };
+        for part in cookies.split(';') {
+            let Some((key, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if key.trim() == name {
+                values.push(value.trim().to_string());
+            }
         }
-    })
+    }
+    values
 }
 
 #[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body; boxing again would force every caller to dereference.
@@ -403,32 +435,34 @@ fn require_mutation_marker<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
 /// Require an `x-rein-token` header matching `$REIN_HTTP_TOKEN` for sensitive reads.
 ///
 /// Used for endpoints that return raw upstream transcripts (e.g. `/api/artifacts`).
-/// When `REIN_HTTP_TOKEN` is unset, the gate is permissive — this preserves the
-/// localhost-only dev convenience. When it IS set, the token must match exactly.
+/// Explicit `auth = "public"` and `auth = "loopback_only"` make the static token
+/// irrelevant for these read gates; owner/admin gates still require the owner
+/// token. Otherwise, when `REIN_HTTP_TOKEN` is unset, the gate is permissive to
+/// preserve localhost-only dev convenience. When it IS set, the token must match.
 #[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body.
-fn require_read_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
+fn require_read_token<B>(req: &Request<B>, config: &ReinConfig) -> Result<(), BoxedResponse> {
+    if matches!(
+        config.server.auth,
+        Some(
+            crate::config::AuthPolicyConfig::Public | crate::config::AuthPolicyConfig::LoopbackOnly
+        )
+    ) {
+        return Ok(());
+    }
+    if matches!(
+        config.server.auth,
+        Some(crate::config::AuthPolicyConfig::OAuth)
+    ) && crate::auth::oauth::verify_bearer(config, req.headers())
+    {
+        return Ok(());
+    }
     let expected = std::env::var("REIN_HTTP_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty());
     let Some(expected) = expected else {
         return Ok(());
     };
-    let presented = req
-        .headers()
-        .get("x-rein-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let auth_header = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let expected_bearer = format!("Bearer {}", expected.trim());
-    let session_cookie = cookie_value(req.headers(), HTTP_SESSION_COOKIE).unwrap_or_default();
-    if constant_time_eq(presented, expected.trim())
-        || constant_time_eq(auth_header, &expected_bearer)
-        || constant_time_eq(&session_cookie, expected.trim())
-    {
+    if request_has_static_read_token(req.headers(), expected.trim()) {
         Ok(())
     } else {
         Err(error_response(
@@ -436,6 +470,45 @@ fn require_read_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
             "missing or invalid protected-read credential",
         ))
     }
+}
+
+#[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body.
+fn require_owner_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
+    let expected = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let Some(expected) = expected else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "REIN_HTTP_TOKEN is not configured for owner-only endpoint",
+        ));
+    };
+    if request_has_static_read_token(req.headers(), expected.trim()) {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid owner credential",
+        ))
+    }
+}
+
+fn request_has_static_read_token(headers: &hyper::HeaderMap, expected: &str) -> bool {
+    let presented = headers
+        .get("x-rein-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let expected_bearer = format!("Bearer {expected}");
+    let session_cookie_matches = cookie_values(headers, HTTP_SESSION_COOKIE)
+        .iter()
+        .any(|value| constant_time_eq(value, expected));
+    constant_time_eq(presented, expected)
+        || constant_time_eq(auth_header, &expected_bearer)
+        || session_cookie_matches
 }
 
 async fn handle_api<B>(
@@ -488,13 +561,33 @@ async fn handle_api<B>(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
         ),
+        (&Method::GET, "/api/oauth/clients") => match require_owner_token(req) {
+            Ok(()) => api_oauth_clients(config),
+            Err(response) => response,
+        },
+        (&Method::POST, p) if p.starts_with("/api/oauth/clients/") && p.ends_with("/revoke") => {
+            match require_mutation_marker(req) {
+                Ok(()) => match require_owner_token(req) {
+                    Ok(()) => {
+                        let rest = &p["/api/oauth/clients/".len()..p.len() - "/revoke".len()];
+                        let client_id = percent_decode_lossy(rest.trim_end_matches('/'));
+                        api_oauth_revoke_client(config, &client_id)
+                    }
+                    Err(response) => response,
+                },
+                Err(response) => response,
+            }
+        }
         // Both GET and POST /api/doctor are served via OpsRestEntry
         // inventory (see ops/handlers/diagnostics.rs). POST migrated in
         // Phase 2.2 as the first `auth = "mutation_marker"` real consumer;
         // H5 JSON body carries the `network` flag. GUI/curl clients must
         // send body instead of `?fix=true` query string.
         (&Method::POST, "/api/session") => match require_mutation_marker(req) {
-            Ok(()) => api_create_session(),
+            Ok(()) => match require_owner_token(req) {
+                Ok(()) => api_create_session(),
+                Err(response) => response,
+            },
             Err(response) => response,
         },
         (&Method::DELETE, "/api/session") => match require_mutation_marker(req) {
@@ -505,7 +598,7 @@ async fn handle_api<B>(
         (&Method::GET, p)
             if p.starts_with("/api/memories") && !p.contains('/') || p == "/api/memories" =>
         {
-            match require_read_token(req) {
+            match require_read_token(req, config) {
                 Ok(()) => api_recall(config, &query),
                 Err(response) => response,
             }
@@ -518,17 +611,19 @@ async fn handle_api<B>(
         }
         (&Method::GET, "/api/timeline") => api_timeline(config, &query),
         (&Method::GET, "/api/episodes") => api_episodes(config, &query),
-        (&Method::GET, "/api/artifacts") => match require_read_token(req) {
+        (&Method::GET, "/api/artifacts") => match require_read_token(req, config) {
             Ok(()) => api_artifacts(config, &query),
             Err(response) => response,
         },
-        (&Method::GET, p) if p.starts_with("/api/artifacts/") => match require_read_token(req) {
-            Ok(()) => {
-                let id = percent_decode_lossy(&p["/api/artifacts/".len()..]);
-                api_artifact_detail(config, &id, &query)
+        (&Method::GET, p) if p.starts_with("/api/artifacts/") => {
+            match require_read_token(req, config) {
+                Ok(()) => {
+                    let id = percent_decode_lossy(&p["/api/artifacts/".len()..]);
+                    api_artifact_detail(config, &id, &query)
+                }
+                Err(response) => response,
             }
-            Err(response) => response,
-        },
+        }
 
         _ => error_response(StatusCode::NOT_FOUND, "unknown API endpoint"),
     }
@@ -574,6 +669,42 @@ fn handle_memoir_path(
 // api_stats / api_health migrated to #[op] (see ops/handlers/diagnostics.rs).
 // `try_dispatch_inventory_rest` intercepts /api/stats + /api/health before the
 // legacy match in `handle_api`.
+
+fn api_oauth_clients(config: &ReinConfig) -> BoxedResponse {
+    let store = match config.open_store() {
+        Ok(store) => store,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    };
+    match crate::auth::oauth::store::list_clients(store.conn()) {
+        Ok(clients) => json_response(
+            StatusCode::OK,
+            json!({
+                "clients": clients.into_iter().map(|client| {
+                    json!({
+                        "client_id": client.client_id,
+                        "client_name": client.client_name,
+                        "registered_at": client.registered_at,
+                        "last_used_at": client.last_used_at,
+                        "revoked_at": client.revoked_at,
+                        "active_grants": client.active_grants,
+                    })
+                }).collect::<Vec<_>>()
+            }),
+        ),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+fn api_oauth_revoke_client(config: &ReinConfig, client_id: &str) -> BoxedResponse {
+    let store = match config.open_store() {
+        Ok(store) => store,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    };
+    match crate::auth::oauth::store::revoke_client(store.conn(), client_id) {
+        Ok(()) => json_response(StatusCode::OK, json!({ "revoked": true })),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
 
 fn api_activity(
     config: &ReinConfig,
@@ -801,7 +932,7 @@ async fn try_dispatch_inventory_rest<B>(
     // handle_api_request, auth was already enforced pre-body via resolve_route.
     // This secondary check covers requests that arrive through the body-less
     // handle_rest_request_with_body path (e.g. tests, legacy callers).
-    if let Err(resp) = enforce_auth_policy(req, entry.auth_policy) {
+    if let Err(resp) = enforce_auth_policy(req, entry.auth_policy, config) {
         return Some(resp);
     }
 
@@ -850,11 +981,15 @@ fn api_create_session() -> BoxedResponse {
         .ok()
         .filter(|token| !token.trim().is_empty());
     match token {
-        Some(token) => json_response_with_cookie(
-            StatusCode::OK,
-            json!({ "authenticated": true }),
-            &session_cookie_value(&token),
-        ),
+        Some(token) => {
+            let cookies = [
+                clear_legacy_root_session_cookie_value(),
+                clear_legacy_session_cookie_value(),
+                session_cookie_value(&token),
+                oauth_owner_cookie_value(&token),
+            ];
+            json_response_with_cookies(StatusCode::OK, json!({ "authenticated": true }), &cookies)
+        }
         None => error_response(
             StatusCode::BAD_REQUEST,
             "REIN_HTTP_TOKEN is not configured on this server",
@@ -863,11 +998,13 @@ fn api_create_session() -> BoxedResponse {
 }
 
 fn api_clear_session() -> BoxedResponse {
-    json_response_with_cookie(
-        StatusCode::OK,
-        json!({ "authenticated": false }),
-        &clear_session_cookie_value(),
-    )
+    let cookies = [
+        clear_session_cookie_value(),
+        clear_legacy_root_session_cookie_value(),
+        clear_legacy_session_cookie_value(),
+        clear_oauth_owner_cookie_value(),
+    ];
+    json_response_with_cookies(StatusCode::OK, json!({ "authenticated": false }), &cookies)
 }
 
 fn recall_synthesis_adaptive_state(
@@ -1661,13 +1798,15 @@ mod tests {
     #[test]
     fn enforce_auth_public_always_passes() {
         let req: Request<String> = req_with(None);
-        assert!(enforce_auth_policy(&req, crate::ops::AuthPolicy::Public).is_ok());
+        let config = ReinConfig::default();
+        assert!(enforce_auth_policy(&req, crate::ops::AuthPolicy::Public, &config).is_ok());
     }
 
     #[test]
     fn enforce_auth_mutation_marker_rejects_missing_header() {
         let req: Request<String> = req_with(None);
-        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::MutationMarker);
+        let config = ReinConfig::default();
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::MutationMarker, &config);
         assert!(
             result.is_err(),
             "missing x-rein-action: 1 header must be rejected"
@@ -1677,7 +1816,8 @@ mod tests {
     #[test]
     fn enforce_auth_mutation_marker_accepts_correct_header() {
         let req: Request<String> = req_with(Some(("x-rein-action", "1")));
-        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::MutationMarker);
+        let config = ReinConfig::default();
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::MutationMarker, &config);
         assert!(result.is_ok(), "x-rein-action: 1 must pass the gate");
     }
 
@@ -1696,7 +1836,8 @@ mod tests {
         }
 
         let req: Request<String> = req_with(None);
-        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::ReadToken);
+        let config = ReinConfig::default();
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::ReadToken, &config);
 
         // Restore before asserting so a failing assert still leaves env clean.
         if let Some(v) = original {
@@ -1720,8 +1861,9 @@ mod tests {
         }
 
         let bearer_req: Request<String> = req_with(Some(("authorization", "Bearer secret-token")));
+        let config = ReinConfig::default();
         assert!(
-            enforce_auth_policy(&bearer_req, crate::ops::AuthPolicy::ReadToken).is_ok(),
+            enforce_auth_policy(&bearer_req, crate::ops::AuthPolicy::ReadToken, &config).is_ok(),
             "Bearer auth should satisfy read_token policy"
         );
 
@@ -1731,7 +1873,7 @@ mod tests {
             .body(String::new())
             .unwrap();
         assert!(
-            enforce_auth_policy(&cookie_req, crate::ops::AuthPolicy::ReadToken).is_ok(),
+            enforce_auth_policy(&cookie_req, crate::ops::AuthPolicy::ReadToken, &config).is_ok(),
             "session cookie should satisfy read_token policy"
         );
 
@@ -1754,17 +1896,134 @@ mod tests {
         }
 
         let short_req: Request<String> = req_with(Some(("x-rein-token", "secret")));
+        let config = ReinConfig::default();
         assert!(
-            enforce_auth_policy(&short_req, crate::ops::AuthPolicy::ReadToken).is_err(),
+            enforce_auth_policy(&short_req, crate::ops::AuthPolicy::ReadToken, &config).is_err(),
             "short x-rein-token must be rejected"
         );
 
         let long_bearer: Request<String> =
             req_with(Some(("authorization", "Bearer secret-token-longer")));
         assert!(
-            enforce_auth_policy(&long_bearer, crate::ops::AuthPolicy::ReadToken).is_err(),
+            enforce_auth_policy(&long_bearer, crate::ops::AuthPolicy::ReadToken, &config).is_err(),
             "wrong-length bearer token must be rejected"
         );
+
+        match original {
+            Some(v) => unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            },
+            None => unsafe {
+                std::env::remove_var("REIN_HTTP_TOKEN");
+            },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(rein_http_token_env)]
+    fn explicit_public_policy_makes_read_token_gate_noop() {
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::set_var("REIN_HTTP_TOKEN", "secret-token");
+        }
+        let req: Request<String> = req_with(None);
+        let mut config = ReinConfig::default();
+        config.server.auth = Some(crate::config::AuthPolicyConfig::Public);
+
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::ReadToken, &config);
+
+        match original {
+            Some(v) => unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            },
+            None => unsafe {
+                std::env::remove_var("REIN_HTTP_TOKEN");
+            },
+        }
+        assert!(
+            result.is_ok(),
+            "explicit public policy should prevent inherited REIN_HTTP_TOKEN from gating REST reads"
+        );
+    }
+
+    #[test]
+    fn oauth_policy_accepts_oauth_bearer_for_read_token_routes() {
+        let dir = tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("oauth-read-token.db"));
+        config.server.auth = Some(crate::config::AuthPolicyConfig::OAuth);
+        let store = config.open_store().expect("open store");
+        let client = crate::auth::oauth::store::register_client(
+            store.conn(),
+            crate::auth::oauth::store::RegisterClientInput {
+                client_name: "claude.ai".to_string(),
+                redirect_uris: vec!["https://claude.ai/callback".to_string()],
+                grant_types: vec![
+                    "authorization_code".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                token_endpoint_auth_method: "none".to_string(),
+            },
+        )
+        .expect("register client");
+        let key = crate::auth::oauth::store::current_signing_key(store.conn())
+            .expect("current signing key");
+        let now = Utc::now().timestamp();
+        let jti = ulid::Ulid::new().to_string();
+        let access_token = crate::auth::oauth::jwt::sign_access_token(
+            &key.kid,
+            &key.secret_hex,
+            &client.client_id,
+            &jti,
+            now,
+            3600,
+        )
+        .expect("sign access token");
+        crate::auth::oauth::store::insert_grant(
+            store.conn(),
+            crate::auth::oauth::store::InsertGrantInput {
+                client_id: client.client_id,
+                access_token_jti: jti,
+                access_expires_at: now + 3600,
+                refresh_token: "refresh-for-read-token".to_string(),
+                refresh_expires_at: now + 86_400,
+            },
+        )
+        .expect("insert grant");
+        drop(store);
+        let req = Request::builder()
+            .uri("/api/version")
+            .header("authorization", format!("Bearer {access_token}"))
+            .body(String::new())
+            .unwrap();
+
+        let result = enforce_auth_policy(&req, crate::ops::AuthPolicy::ReadToken, &config);
+
+        assert!(
+            result.is_ok(),
+            "OAuth bearer accepted by the outer HTTP auth gate must also satisfy REST ReadToken"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rein_http_token_env)]
+    async fn owner_token_gate_requires_configured_matching_token() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::set_var("REIN_HTTP_TOKEN", "owner-secret");
+        }
+
+        let missing: Request<String> = req_with(None);
+        assert!(require_owner_token(&missing).is_err());
+
+        let ok: Request<String> = req_with(Some(("authorization", "Bearer owner-secret")));
+        assert!(require_owner_token(&ok).is_ok());
+
+        unsafe {
+            std::env::remove_var("REIN_HTTP_TOKEN");
+        }
+        let unset: Request<String> = req_with(None);
+        assert!(require_owner_token(&unset).is_err());
 
         match original {
             Some(v) => unsafe {
@@ -1824,6 +2083,148 @@ mod tests {
     async fn read_json(response: BoxedResponse) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rein_http_token_env)]
+    async fn oauth_admin_and_session_endpoints_require_owner_token() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::set_var("REIN_HTTP_TOKEN", "owner-secret");
+        }
+        let dir = tempdir().unwrap();
+        let config = test_config(&dir.path().join("oauth-admin.db"));
+
+        let clients_missing = Request::builder()
+            .method("GET")
+            .uri("/api/oauth/clients")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&clients_missing, &config)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let clients_ok = Request::builder()
+            .method("GET")
+            .uri("/api/oauth/clients")
+            .header("authorization", "Bearer owner-secret")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&clients_ok, &config)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let clients_cookie_ok = Request::builder()
+            .method("GET")
+            .uri("/api/oauth/clients")
+            .header(
+                hyper::header::COOKIE,
+                "rein_http_token=stale-secret; theme=dark; rein_http_token=owner-secret",
+            )
+            .body(())
+            .unwrap();
+        assert_eq!(
+            handle_rest_request(&clients_cookie_ok, &config)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let session_missing = Request::builder()
+            .method("POST")
+            .uri("/api/session")
+            .header("x-rein-action", "1")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&session_missing, &config)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(hyper::header::SET_COOKIE).is_none());
+
+        let session_ok = Request::builder()
+            .method("POST")
+            .uri("/api/session")
+            .header("x-rein-action", "1")
+            .header("authorization", "Bearer owner-secret")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&session_ok, &config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_cookies: Vec<&str> = response
+            .headers()
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(session_cookies
+            .iter()
+            .any(|value| value.contains("rein_http_token=owner-secret")
+                && value.contains("SameSite=Strict")
+                && value.contains("Path=/api")));
+        assert!(session_cookies.iter().any(|value| value
+            .contains("rein_oauth_owner=owner-secret")
+            && value.contains("SameSite=Lax")
+            && value.contains("Path=/oauth/authorize")
+            && value.contains("Max-Age=600")));
+        assert!(session_cookies
+            .iter()
+            .any(|value| value.contains("rein_http_token=")
+                && value.contains("Path=/")
+                && value.contains("Max-Age=0")));
+        assert!(session_cookies
+            .iter()
+            .any(|value| value.contains("rein_http_token=")
+                && value.contains("Path=/api/")
+                && value.contains("Max-Age=0")));
+
+        let session_clear = Request::builder()
+            .method("DELETE")
+            .uri("/api/session")
+            .header("x-rein-action", "1")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&session_clear, &config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let clear_cookies: Vec<&str> = response
+            .headers()
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(clear_cookies
+            .iter()
+            .any(|value| value.contains("Path=/;") && value.contains("Max-Age=0")));
+        assert!(clear_cookies
+            .iter()
+            .any(|value| value.contains("Path=/api;") && value.contains("Max-Age=0")));
+        assert!(clear_cookies
+            .iter()
+            .any(|value| value.contains("Path=/api/") && value.contains("Max-Age=0")));
+        assert!(clear_cookies
+            .iter()
+            .any(|value| value.contains("rein_oauth_owner=")
+                && value.contains("Path=/oauth/authorize")
+                && value.contains("Max-Age=0")));
+
+        match original {
+            Some(v) => unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            },
+            None => unsafe {
+                std::env::remove_var("REIN_HTTP_TOKEN");
+            },
+        }
     }
 
     #[tokio::test]

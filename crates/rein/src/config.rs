@@ -964,6 +964,10 @@ pub struct ServerConfig {
     pub sse_enabled: bool,
     pub sse_port: u16,
     pub sse_bind: String,
+    #[serde(default)]
+    pub auth: Option<AuthPolicyConfig>,
+    #[serde(default)]
+    pub public_url: Option<String>,
     /// Run background warmup/side-index repair when service surfaces start.
     #[serde(default = "default_server_background_warmup")]
     pub background_warmup: bool,
@@ -985,6 +989,27 @@ pub struct ServerConfig {
     /// allowlist is derived from the bind host.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPolicyConfig {
+    LoopbackOnly,
+    BearerRequired,
+    #[serde(rename = "oauth")]
+    OAuth,
+    Public,
+}
+
+impl From<AuthPolicyConfig> for crate::auth::AuthPolicy {
+    fn from(value: AuthPolicyConfig) -> Self {
+        match value {
+            AuthPolicyConfig::LoopbackOnly => Self::LoopbackOnly,
+            AuthPolicyConfig::BearerRequired => Self::BearerRequired,
+            AuthPolicyConfig::OAuth => Self::OAuth,
+            AuthPolicyConfig::Public => Self::Public,
+        }
+    }
 }
 
 /// True when an HTTP bind address is unambiguously local loopback.
@@ -1303,6 +1328,8 @@ impl Default for ServerConfig {
             sse_enabled: false,
             sse_port: 8680,
             sse_bind: "127.0.0.1".to_string(),
+            auth: None,
+            public_url: None,
             background_warmup: default_server_background_warmup(),
             stdio_background_warmup: false,
             gui_enabled: false,
@@ -1546,6 +1573,43 @@ fn nonempty_env(key: &str) -> Option<String> {
 }
 
 impl ReinConfig {
+    pub fn resolve_auth_policy(&self) -> anyhow::Result<crate::auth::AuthPolicy> {
+        if let Some(policy) = self.server.auth {
+            let policy = crate::auth::AuthPolicy::from(policy);
+            if matches!(
+                policy,
+                crate::auth::AuthPolicy::BearerRequired | crate::auth::AuthPolicy::OAuth
+            ) && nonempty_env("REIN_HTTP_TOKEN").is_none()
+            {
+                let purpose = match policy {
+                    crate::auth::AuthPolicy::BearerRequired => "bearer auth",
+                    crate::auth::AuthPolicy::OAuth => "OAuth owner approval",
+                    _ => unreachable!(),
+                };
+                anyhow::bail!(
+                    "[server].auth = \"{}\" requires REIN_HTTP_TOKEN for {purpose}",
+                    policy.as_str()
+                );
+            }
+            return Ok(policy);
+        }
+
+        let has_http_token = nonempty_env("REIN_HTTP_TOKEN").is_some();
+        if has_http_token {
+            return Ok(crate::auth::AuthPolicy::BearerRequired);
+        }
+        if self.server.loopback_unauth_requested() {
+            return Ok(crate::auth::AuthPolicy::Public);
+        }
+
+        Err(anyhow::anyhow!(
+            "REIN_HTTP_TOKEN must be set for HTTP/SSE access on '{}'. \
+             Set REIN_HTTP_TOKEN=<secret>, set [server].auth explicitly, \
+             or opt into loopback-only access with [server].allow_unauthenticated_loopback=true",
+            self.server.sse_bind
+        ))
+    }
+
     /// Load configuration with the following priority (highest wins):
     /// 1. Environment variable overrides
     /// 2. TOML config file (`$REIN_CONFIG` or `~/.config/rein/config.toml`)
@@ -3145,6 +3209,12 @@ max_input_chars = 512
             std::env::set_var(key, value);
             Self { key, prior }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -3225,6 +3295,173 @@ max_input_chars = 512
         server.sse_bind = "127.0.0.1".to_string();
         server.allow_unauthenticated_loopback = false;
         assert!(!server.loopback_unauth_requested());
+    }
+
+    #[test]
+    fn auth_policy_parses_explicit_server_auth_values() {
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+auth = "oauth"
+public_url = "https://rein.example.com"
+"#,
+        )
+        .expect("server.auth should parse");
+
+        assert_eq!(cfg.server.auth, Some(AuthPolicyConfig::OAuth));
+        assert_eq!(
+            cfg.server.public_url.as_deref(),
+            Some("https://rein.example.com")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn explicit_auth_policy_is_not_changed_by_rein_http_token() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "secret-token");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+auth = "loopback_only"
+"#,
+        )
+        .expect("server.auth should parse");
+
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy should resolve"),
+            crate::auth::AuthPolicy::LoopbackOnly
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn auth_policy_derives_bearer_required_from_token_and_old_false_flag() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "secret-token");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+allow_unauthenticated_loopback = false
+"#,
+        )
+        .expect("legacy config should parse");
+
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy should resolve"),
+            crate::auth::AuthPolicy::BearerRequired
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn auth_policy_preserves_legacy_token_precedence_over_loopback_flag() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "secret-token");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy config should parse");
+
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy should resolve"),
+            crate::auth::AuthPolicy::BearerRequired
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn auth_policy_preserves_legacy_public_read_from_loopback_flag() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+allowed_hosts = ["rein.example.com"]
+"#,
+        )
+        .expect("legacy loopback config should parse");
+
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy should resolve"),
+            crate::auth::AuthPolicy::Public
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn auth_policy_rejects_implicit_public_http_without_token_or_loopback_opt_in() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "0.0.0.0"
+allow_unauthenticated_loopback = false
+"#,
+        )
+        .expect("config should parse");
+
+        let err = cfg
+            .resolve_auth_policy()
+            .expect_err("implicit unauthenticated public HTTP must not resolve");
+        assert!(
+            err.to_string().contains("REIN_HTTP_TOKEN"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn explicit_bearer_required_requires_rein_http_token() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+auth = "bearer_required"
+"#,
+        )
+        .expect("config should parse");
+
+        let err = cfg
+            .resolve_auth_policy()
+            .expect_err("bearer_required without token must fail");
+        assert!(err.to_string().contains("requires REIN_HTTP_TOKEN"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn explicit_oauth_requires_owner_approval_token() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+auth = "oauth"
+"#,
+        )
+        .expect("config should parse");
+
+        let err = cfg
+            .resolve_auth_policy()
+            .expect_err("oauth without owner token must fail");
+        assert!(err.to_string().contains("OAuth owner approval"));
+    }
+
+    #[test]
+    fn auth_policy_rejects_unknown_server_auth_value() {
+        let err = ReinConfig::load_from_str(
+            r#"
+[server]
+auth = "tokenish"
+"#,
+        )
+        .expect_err("unknown auth policy must fail config parsing");
+
+        assert!(
+            err.to_string().contains("unknown variant") || err.to_string().contains("tokenish"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

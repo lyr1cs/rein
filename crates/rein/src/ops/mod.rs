@@ -1446,6 +1446,20 @@ pub fn run_gc(store: &SqliteStore, threshold: f64, dry_run: bool) -> ReinResult<
         if concept_pruned > 0 {
             tracing::info!("pruned {concept_pruned} low-quality concepts");
         }
+        match crate::auth::oauth::store::gc_expired_oauth_records(
+            store.conn(),
+            chrono::Utc::now().timestamp(),
+        ) {
+            Ok((codes, grants)) if codes > 0 || grants > 0 => {
+                tracing::info!("pruned expired OAuth records: auth_codes={codes}, grants={grants}");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return Err(crate::types::ReinError::Config(format!(
+                    "OAuth GC failed: {err}"
+                )));
+            }
+        }
         Ok((decayed, mem_pruned, concept_pruned))
     }
 }

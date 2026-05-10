@@ -105,6 +105,8 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_reranker_provider(config));
     checks.push(check_supermemory(config));
     checks.push(check_http_auth(config));
+    checks.push(check_auth_policy_consistency(config));
+    checks.push(check_oauth_provider(config));
     checks.push(check_proxy_auth(config));
     checks.push(check_codex_hooks());
     checks.push(check_codex_mcp_server(config));
@@ -1271,6 +1273,43 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
     let token_present = std::env::var("REIN_HTTP_TOKEN")
         .ok()
         .is_some_and(|token| !token.trim().is_empty());
+    if let Some(policy) = config.server.auth {
+        let policy = crate::auth::AuthPolicy::from(policy);
+        return match policy {
+            crate::auth::AuthPolicy::BearerRequired if token_present => ok_in(
+                DoctorCategory::Configuration,
+                "http_auth",
+                "explicit auth policy bearer_required with REIN_HTTP_TOKEN configured",
+            ),
+            crate::auth::AuthPolicy::BearerRequired => fail_with_hint(
+                DoctorCategory::Configuration,
+                "http_auth",
+                "explicit auth policy bearer_required requires REIN_HTTP_TOKEN",
+                "set REIN_HTTP_TOKEN=<secret> or choose [server].auth = \"loopback_only\" / \"oauth\" / \"public\"",
+            ),
+            crate::auth::AuthPolicy::OAuth if token_present => ok_in(
+                DoctorCategory::Configuration,
+                "http_auth",
+                "explicit auth policy oauth with owner approval token configured",
+            ),
+            crate::auth::AuthPolicy::OAuth => fail_with_hint(
+                DoctorCategory::Configuration,
+                "http_auth",
+                "explicit auth policy oauth requires REIN_HTTP_TOKEN for owner approval",
+                "set REIN_HTTP_TOKEN=<secret>; OAuth clients will not need this token, but the owner approval page will",
+            ),
+            crate::auth::AuthPolicy::LoopbackOnly => ok_in(
+                DoctorCategory::Configuration,
+                "http_auth",
+                "explicit auth policy loopback_only",
+            ),
+            crate::auth::AuthPolicy::Public => ok_in(
+                DoctorCategory::Configuration,
+                "http_auth",
+                "explicit auth policy public",
+            ),
+        };
+    }
     let allow_unauth = config.server.loopback_unauth_requested();
 
     if token_present {
@@ -1337,6 +1376,145 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
                 config.server.sse_bind, config.server.sse_port
             ),
             "set REIN_HTTP_TOKEN=<secret> or enable [server].allow_unauthenticated_loopback for loopback-only access",
+        )
+    }
+}
+
+fn check_auth_policy_consistency(config: &ReinConfig) -> DoctorCheck {
+    if !config.server.sse_enabled && !config.server.gui_enabled {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "auth_policy",
+            "HTTP auth policy inactive because HTTP/SSE and GUI are disabled",
+        );
+    }
+
+    let token_present = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .is_some_and(|token| !token.trim().is_empty());
+    let policy = match config.resolve_auth_policy() {
+        Ok(policy) => policy,
+        Err(err) => {
+            return fail_with_hint(
+                DoctorCategory::Configuration,
+                "auth_policy",
+                format!("auth policy could not be resolved: {err}"),
+                "set [server].auth explicitly, set REIN_HTTP_TOKEN, or use [server].auth = \"loopback_only\" for loopback-only local HTTP",
+            );
+        }
+    };
+
+    if crate::mcp::server::wildcard_bind_requires_allowlist(
+        &config.server.sse_bind,
+        config.server.allowed_hosts.as_deref(),
+    ) && crate::mcp::server::auth_policy_requires_wildcard_allowlist(policy)
+    {
+        return fail_with_hint(
+            DoctorCategory::Configuration,
+            "auth_policy",
+            format!(
+                "auth policy {} on wildcard bind {} requires [server].allowed_hosts; rein serve will refuse to start",
+                policy.as_str(),
+                config.server.sse_bind
+            ),
+            "set [server].allowed_hosts = [\"your-public-host\"] or use auth = \"bearer_required\" with REIN_HTTP_TOKEN",
+        );
+    }
+
+    if config.server.auth.is_some()
+        && token_present
+        && matches!(
+            policy,
+            crate::auth::AuthPolicy::LoopbackOnly | crate::auth::AuthPolicy::Public
+        )
+    {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "auth_policy",
+            format!(
+                "REIN_HTTP_TOKEN is set but auth policy is {}; the token has no effect",
+                policy.as_str()
+            ),
+            "unset REIN_HTTP_TOKEN or change [server].auth = \"bearer_required\" if bearer auth is intended",
+        );
+    }
+
+    if config.server.auth.is_none() && config.server.allow_unauthenticated_loopback {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "auth_policy",
+            "[server].allow_unauthenticated_loopback is deprecated; use [server].auth = \"public\" for the legacy remote read-only tunnel mode, or [server].auth = \"loopback_only\" for local-only access. Will be removed in v0.31.",
+        );
+    }
+
+    ok_in(
+        DoctorCategory::Configuration,
+        "auth_policy",
+        format!("auth policy resolved to {}", policy.as_str()),
+    )
+}
+
+fn check_oauth_provider(config: &ReinConfig) -> DoctorCheck {
+    let policy = config
+        .resolve_auth_policy()
+        .map(|policy| policy.as_str().to_string())
+        .unwrap_or_else(|_| "unresolved".to_string());
+    let store = match config.open_store() {
+        Ok(store) => store,
+        Err(err) => {
+            return warn_with_hint(
+                DoctorCategory::Configuration,
+                "oauth_provider",
+                format!("auth_policy={policy}; OAuth provider store check failed: {err}"),
+                "run rein doctor after the database path is available",
+            );
+        }
+    };
+    let conn = store.conn();
+    let client_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM oauth_clients", [], |row| row.get(0))
+        .unwrap_or(0);
+    let active_grants: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_grants WHERE revoked_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let now = chrono::Utc::now().timestamp();
+    let expired_codes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_auth_codes WHERE expires_at < ?1",
+            [now - 86_400],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let expired_grants: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_grants
+             WHERE access_expires_at < ?1 AND refresh_expires_at < ?2",
+            [now - 86_400 * 30, now - 86_400 * 30],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if expired_codes + expired_grants > 1000 {
+        warn_with_hint(
+            DoctorCategory::Storage,
+            "oauth_provider",
+            format!(
+                "auth_policy={policy}; oauth_clients={client_count}; active_grants={active_grants}; expired_oauth_records={}",
+                expired_codes + expired_grants
+            ),
+            "run OAuth GC or restart rein so scheduled maintenance can prune expired OAuth rows",
+        )
+    } else {
+        ok_in(
+            DoctorCategory::Storage,
+            "oauth_provider",
+            format!(
+                "auth_policy={policy}; oauth_clients={client_count}; active_grants={active_grants}; expired_oauth_records={}",
+                expired_codes + expired_grants
+            ),
         )
     }
 }
@@ -3098,6 +3276,94 @@ provider = "inherit"
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.message.contains("cannot take effect"));
         assert!(check.message.contains("bearer auth remains required"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_warns_when_token_has_no_effect_under_explicit_loopback_policy() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.auth = Some(crate::config::AuthPolicyConfig::LoopbackOnly);
+
+        let check = check_auth_policy_consistency(&config);
+
+        assert_eq!(check.name, "auth_policy");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("token has no effect"));
+        assert!(check
+            .repair_hint
+            .as_deref()
+            .unwrap()
+            .contains("bearer_required"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_fails_wildcard_public_policy_without_allowed_hosts() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.sse_bind = "0.0.0.0".to_string();
+        config.server.auth = Some(crate::config::AuthPolicyConfig::Public);
+
+        let check = check_auth_policy_consistency(&config);
+
+        assert_eq!(check.name, "auth_policy");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("requires [server].allowed_hosts"));
+        assert!(check.message.contains("refuse to start"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_fails_wildcard_oauth_policy_without_allowed_hosts() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.sse_bind = "0.0.0.0".to_string();
+        config.server.auth = Some(crate::config::AuthPolicyConfig::OAuth);
+
+        let check = check_auth_policy_consistency(&config);
+
+        assert_eq!(check.name, "auth_policy");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("auth policy oauth"));
+        assert!(check.message.contains("requires [server].allowed_hosts"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_reports_legacy_loopback_flag_as_deprecated() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.allow_unauthenticated_loopback = true;
+
+        let check = check_auth_policy_consistency(&config);
+
+        assert_eq!(check.name, "auth_policy");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.severity, DoctorSeverity::Info);
+        assert!(check.message.contains("deprecated"));
+        assert!(check.message.contains("auth = \"public\""));
+        assert!(check.message.contains("auth = \"loopback_only\""));
     }
 
     #[test]

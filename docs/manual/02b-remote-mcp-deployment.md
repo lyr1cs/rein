@@ -75,6 +75,7 @@ meet.
 | Tailscale account (free) | **B: Tailscale Funnel** | ~5 min | Permanent (`*.ts.net`) | URL obscurity only |
 | Cloudflare account + own domain | **A: Cloudflare Tunnel** | ~15 min | Permanent under your domain | OIDC via Cloudflare Access |
 | VPS + own domain | **C: Caddy / nginx + Let's Encrypt** | ~30 min | Permanent | Anything (basic_auth, OIDC, mTLS) |
+| rein v0.30+ | **E: Built-in OAuth** | ~5 min after HTTPS exposure | Depends on tunnel | OAuth Authorization Code + PKCE |
 
 **Network gotcha noted across recipes:** several routers and corporate
 proxies intercept and remap `*.trycloudflare.com`, `*.ts.net`,
@@ -740,6 +741,9 @@ server {
     location /mcp {
         proxy_pass http://127.0.0.1:8680/mcp;
         proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
         # SSE buffering off so the stream is delivered promptly.
         proxy_buffering off;
@@ -779,6 +783,9 @@ server {
         proxy_set_header Authorization "Bearer REPLACE_WITH_REIN_HTTP_TOKEN";
         proxy_pass http://127.0.0.1:8680/mcp;
         proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
         proxy_buffering off;
         proxy_cache off;
@@ -800,6 +807,10 @@ Same Anthropic-connector compatibility note as Caddyfile B: the
 connector won't supply HTTP Basic credentials directly. Use this
 pattern only behind an OAuth/OIDC gateway in front, OR for callers
 other than Cowork (e.g., your own scripts that can pass basic auth).
+
+For nginx, preserving `Host` is not optional. If nginx rewrites the
+upstream Host to `127.0.0.1`, rein cannot identify the public hostname
+for `allowed_hosts`, OAuth metadata, or loopback-only auth decisions.
 
 Get the cert with `certbot --nginx -d rein.your-domain.com`. After
 rendering the bearer into the nginx config, restrict file permissions
@@ -842,6 +853,60 @@ permanent.
 > this less painful and are worth the upgrade if you're using ngrok
 > as your daily Cowork-rein tunnel.
 
+## Recipe E: Built-in OAuth provider (recommended for v0.30+)
+
+Use this when rein is reachable through any public HTTPS tunnel and you want
+Claude's custom connector to complete OAuth itself.
+
+`~/.rein/config.toml`:
+
+```toml
+[server]
+sse_enabled = true
+gui_enabled = true
+sse_bind = "127.0.0.1"
+sse_port = 8680
+auth = "oauth"
+public_url = "https://rein.example.com"
+allowed_hosts = ["rein.example.com"]
+```
+
+Start rein:
+
+```bash
+export REIN_HTTP_TOKEN="$(openssl rand -hex 32)"
+rein serve --gui
+```
+
+In OAuth mode this token is **not** required from Claude and does not
+turn `/mcp` back into static-bearer auth. It is the owner approval
+secret: sign into the rein GUI through the same public HTTPS hostname
+used by the connector, not through `http://127.0.0.1:8680`, before
+approving `/oauth/authorize`. The session cookie is host-only, so local
+login does not authenticate the public approval page.
+
+Expose `127.0.0.1:8680` with one of the HTTPS recipes above, then configure
+Claude's custom connector with:
+
+- MCP URL: `https://rein.example.com/mcp`
+- OAuth fields: leave blank if the client supports Dynamic Client Registration
+
+Expected connector flow:
+
+1. Claude reads `/.well-known/oauth-authorization-server`.
+2. Claude registers through `/oauth/register`.
+3. Browser opens `/oauth/authorize`.
+4. Owner signs into the rein GUI with `REIN_HTTP_TOKEN` if not already
+   signed in, then approves access.
+5. Claude exchanges the code at `/oauth/token`.
+6. Claude calls `/mcp` with `Authorization: Bearer <access_token>`.
+
+Verify locally before trying Claude:
+
+```bash
+./scripts/oauth-e2e-test.sh
+```
+
 ## Authentication
 
 This section consolidates the auth tradeoffs scattered across the
@@ -879,6 +944,7 @@ Quick reference of the practical combinations:
 | Cloudflare Access OIDC | OIDC IdP | `allow_unauthenticated_loopback = true` | URL + OAuth Client ID/Secret |
 | Caddy bearer injection | Caddy header check | `REIN_HTTP_TOKEN` enforced | URL only (Caddy still gates) |
 | OAuth gateway in front | gateway OAuth | either | URL + OAuth Client ID/Secret |
+| Built-in OAuth | rein OAuth | `auth = "oauth"` + owner `REIN_HTTP_TOKEN` | URL only / DCR |
 
 The known *broken* combination — Cloudflare Access **service tokens**
 + Anthropic OAuth fields — is documented in Recipe A Step 5.

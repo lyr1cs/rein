@@ -1,4 +1,4 @@
-use crate::types::ReinResult;
+use crate::types::{ReinError, ReinResult};
 use rusqlite::Connection;
 use std::sync::Once;
 
@@ -604,6 +604,89 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     // `reserve_call` makes the dedup atomic and pre-LLM, so only the
     // claim winner pays.
     migrate_cron_claims(conn)?;
+    migrate_oauth_tables(conn)?;
+
+    Ok(())
+}
+
+/// v0.29 Phase A — OAuth provider persistence.
+///
+/// The tables are created during normal schema init so a future switch to
+/// `[server].auth = "oauth"` does not require a separate operator migration.
+/// A single HS256 signing key is generated once per database and kept in
+/// `oauth_signing_keys`; later rotations add rows rather than replacing it.
+pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_secret_hash TEXT,
+            client_name TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL,
+            grant_types TEXT NOT NULL,
+            token_endpoint_auth_method TEXT NOT NULL CHECK(token_endpoint_auth_method IN ('none', 'client_secret_basic')),
+            registered_at INTEGER NOT NULL,
+            last_used_at INTEGER,
+            revoked_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+            code TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            code_challenge_method TEXT NOT NULL CHECK(code_challenge_method = 'S256'),
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_auth_codes_expires
+            ON oauth_auth_codes(expires_at);
+
+        CREATE TABLE IF NOT EXISTS oauth_grants (
+            grant_id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+            access_token_jti TEXT NOT NULL UNIQUE,
+            access_expires_at INTEGER NOT NULL,
+            refresh_token_hash TEXT NOT NULL,
+            refresh_expires_at INTEGER NOT NULL,
+            issued_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_grants_jti
+            ON oauth_grants(access_token_jti);
+        CREATE INDEX IF NOT EXISTS idx_oauth_grants_client
+            ON oauth_grants(client_id);
+
+        CREATE TABLE IF NOT EXISTS oauth_signing_keys (
+            kid TEXT PRIMARY KEY,
+            secret_hex TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            rotated_at INTEGER
+        );
+        ",
+    )?;
+
+    let key_count: i64 = conn.query_row("SELECT COUNT(*) FROM oauth_signing_keys", [], |row| {
+        row.get(0)
+    })?;
+    if key_count == 0 {
+        let mut secret = [0u8; 32];
+        let rng = ring::rand::SystemRandom::new();
+        ring::rand::SecureRandom::fill(&rng, &mut secret)
+            .map_err(|_| ReinError::Config("failed to generate OAuth signing key".to_string()))?;
+        let secret_hex = secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let now = chrono::Utc::now().timestamp();
+        let kid = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO oauth_signing_keys (kid, secret_hex, created_at, rotated_at)
+             VALUES (?1, ?2, ?3, NULL)",
+            rusqlite::params![kid, secret_hex, now],
+        )?;
+    }
 
     Ok(())
 }
@@ -1587,5 +1670,44 @@ mod migration_tests {
             fts_hit, 1,
             "memories_ai trigger must also survive migration"
         );
+    }
+
+    #[test]
+    fn init_schema_creates_oauth_tables_and_initial_signing_key() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema");
+
+        for table in [
+            "oauth_clients",
+            "oauth_auth_codes",
+            "oauth_grants",
+            "oauth_signing_keys",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(count, 1, "{table} should exist");
+        }
+
+        let key_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM oauth_signing_keys", [], |row| {
+                row.get(0)
+            })
+            .expect("query signing keys");
+        assert_eq!(key_count, 1, "schema init should create one signing key");
+
+        let secret_hex: String = conn
+            .query_row(
+                "SELECT secret_hex FROM oauth_signing_keys LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query signing key secret");
+        assert_eq!(secret_hex.len(), 64, "secret should be 32 random bytes hex");
     }
 }

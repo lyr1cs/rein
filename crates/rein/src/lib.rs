@@ -34,6 +34,7 @@ pub const SOURCE_URL: &str = "https://github.com/lyr1cs/rein";
 /// the LICENSE file.
 pub const LICENSE_SPDX: &str = "AGPL-3.0-or-later";
 
+pub mod auth;
 pub mod compression;
 pub mod config;
 pub mod doctor;
