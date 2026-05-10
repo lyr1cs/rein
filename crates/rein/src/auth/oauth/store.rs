@@ -4,6 +4,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 const MAX_CLIENT_NAME_BYTES: usize = 128;
 const MAX_REDIRECT_URIS: usize = 10;
@@ -132,6 +133,11 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(secret.as_bytes(), &parsed)
         .is_ok()
+}
+
+fn refresh_token_fingerprint(refresh_token: &str) -> String {
+    let digest = Sha256::digest(refresh_token.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn validate_redirect_uri(uri: &str) -> anyhow::Result<()> {
@@ -440,13 +446,14 @@ pub fn consume_auth_code(
 pub fn insert_grant(conn: &Connection, input: InsertGrantInput) -> anyhow::Result<GrantRecord> {
     let grant_id = ulid::Ulid::new().to_string();
     let refresh_token_hash = hash_secret(&input.refresh_token)?;
+    let refresh_token_fingerprint = refresh_token_fingerprint(&input.refresh_token);
     let now = chrono::Utc::now().timestamp();
     let changed = conn.execute(
         "INSERT INTO oauth_grants (
             grant_id, client_id, access_token_jti, access_expires_at,
-            refresh_token_hash, refresh_expires_at, issued_at, revoked_at
+            refresh_token_hash, refresh_token_fingerprint, refresh_expires_at, issued_at, revoked_at
          )
-         SELECT ?1, c.client_id, ?3, ?4, ?5, ?6, ?7, NULL
+         SELECT ?1, c.client_id, ?3, ?4, ?5, ?6, ?7, ?8, NULL
          FROM oauth_clients c
          WHERE c.client_id = ?2 AND c.revoked_at IS NULL",
         params![
@@ -455,6 +462,7 @@ pub fn insert_grant(conn: &Connection, input: InsertGrantInput) -> anyhow::Resul
             &input.access_token_jti,
             input.access_expires_at,
             &refresh_token_hash,
+            &refresh_token_fingerprint,
             input.refresh_expires_at,
             now
         ],
@@ -492,14 +500,15 @@ pub fn find_grant_by_refresh(
     refresh_token: &str,
     now: i64,
 ) -> anyhow::Result<RefreshGrantLookup> {
+    let refresh_token_fingerprint = refresh_token_fingerprint(refresh_token);
     let mut stmt = conn.prepare(
         "SELECT g.grant_id, g.client_id, g.access_token_jti, g.access_expires_at,
                 g.refresh_token_hash, g.refresh_expires_at, g.revoked_at
          FROM oauth_grants g
          JOIN oauth_clients c ON c.client_id = g.client_id AND c.revoked_at IS NULL
-         WHERE g.client_id = ?1",
+         WHERE g.client_id = ?1 AND g.refresh_token_fingerprint = ?2",
     )?;
-    let mut rows = stmt.query(params![client_id])?;
+    let mut rows = stmt.query(params![client_id, refresh_token_fingerprint])?;
     while let Some(row) = rows.next()? {
         let hash: String = row.get(4)?;
         if verify_secret(refresh_token, &hash) {
@@ -1313,5 +1322,70 @@ mod tests {
         let active = active_grant_count_for_client(store.conn(), &registered.client_id)
             .expect("count active grants");
         assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn refresh_lookup_is_constrained_by_indexed_fingerprint() {
+        let store = test_store();
+        let registered = register_client(
+            store.conn(),
+            RegisterClientInput {
+                client_name: "claude.ai".to_string(),
+                redirect_uris: vec!["https://claude.ai/callback".to_string()],
+                grant_types: vec![
+                    "authorization_code".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                token_endpoint_auth_method: "none".to_string(),
+            },
+        )
+        .expect("register client");
+
+        insert_grant(
+            store.conn(),
+            InsertGrantInput {
+                client_id: registered.client_id.clone(),
+                access_token_jti: "jti-target".to_string(),
+                access_expires_at: chrono::Utc::now().timestamp() + 3600,
+                refresh_token: "target-refresh-token".to_string(),
+                refresh_expires_at: chrono::Utc::now().timestamp() + 86400,
+            },
+        )
+        .expect("insert grant");
+
+        let fingerprint: String = store
+            .conn()
+            .query_row(
+                "SELECT refresh_token_fingerprint FROM oauth_grants WHERE access_token_jti = 'jti-target'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored refresh token fingerprint");
+        assert_eq!(fingerprint.len(), 64);
+        assert_ne!(fingerprint, "target-refresh-token");
+
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT g.grant_id
+                 FROM oauth_grants g
+                 JOIN oauth_clients c ON c.client_id = g.client_id AND c.revoked_at IS NULL
+                 WHERE g.client_id = ?1 AND g.refresh_token_fingerprint = ?2",
+            )
+            .expect("prepare query plan");
+        let plan = stmt
+            .query_map(params![registered.client_id, fingerprint], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect query plan");
+
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_oauth_grants_refresh_fingerprint")),
+            "refresh lookup must use fingerprint index, plan was {plan:?}"
+        );
     }
 }

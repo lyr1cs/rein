@@ -12,7 +12,9 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.28.18`** (2026-05-09) — follow-up audit hardening for the Cowork/auth diagnostics arc. Public unauthenticated HTTP now blocks mutating MCP/REST calls from non-loopback Hosts, while keeping read-only Cowork recall usable; `rein doctor` now checks both Codex MCP tables, catches non-stdio `rein serve --sse/--gui/--proxy` entries, flags `REIN_DB` / `REIN_CONFIG` / `HOME` database-split risks, and verifies DXT / Claude plugin manifest versions match Cargo before release. See the [v0.28.18 release](https://github.com/lyr1cs/rein/releases/tag/v0.28.18).
+**Current release: `v0.30.0`** (2026-05-10) — built-in OAuth provider for Claude Cowork / claude.ai / mobile remote MCP connectors. Adds explicit `[server].auth` policy (`loopback_only`, `bearer_required`, `oauth`, `public`), OAuth Authorization Server metadata, Dynamic Client Registration, authorization code + PKCE S256, refresh rotation, revocation, SQLite-backed clients/grants/signing keys, owner-approval GUI, Connectors management UI, OAuth `rein doctor` checks, and live-readiness/e2e scripts. The release was validated end-to-end with claude.ai/Cowork over a Cloudflare Quick Tunnel. See the [v0.30.0 release](https://github.com/lyr1cs/rein/releases/tag/v0.30.0).
+
+**Previous release: `v0.28.18`** (2026-05-09) — follow-up audit hardening for the Cowork/auth diagnostics arc. Public unauthenticated HTTP now blocks mutating MCP/REST calls from non-loopback Hosts, while keeping read-only Cowork recall usable; `rein doctor` now checks both Codex MCP tables, catches non-stdio `rein serve --sse/--gui/--proxy` entries, flags `REIN_DB` / `REIN_CONFIG` / `HOME` database-split risks, and verifies DXT / Claude plugin manifest versions match Cargo before release.
 
 **Previous release: `v0.28.17`** (2026-05-09) — Cowork/auth diagnostics patch. Runtime auth semantics stayed unchanged, but the two silent traps from the May 9 Cowork incident now surface explicitly: `rein serve --gui` logs a WARN when `REIN_HTTP_TOKEN` is set while `[server].allow_unauthenticated_loopback=true` because token auth wins and the loopback flag is a runtime no-op; `rein doctor` reports the same `http_auth` WARN and also checks Codex's `~/.codex/config.toml` Rein MCP entry, warning when it points at a non-loopback HTTP URL whose database may differ from the local `rein` CLI.
 
@@ -86,12 +88,12 @@ Three install paths depending on your client:
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v0.28.18.mcpb` from
-   [the v0.28.18 release](https://github.com/lyr1cs/rein/releases/download/v0.28.18/rein-v0.28.18.mcpb).
+1. Download `rein-v0.30.0.mcpb` from
+   [the v0.30.0 release](https://github.com/lyr1cs/rein/releases/download/v0.30.0/rein-v0.30.0.mcpb).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v0.28.18.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v0.30.0.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -125,7 +127,7 @@ need the `rein` binary on your `PATH`:
 cargo install --git https://github.com/lyr1cs/rein --locked rein
 
 # Or pin to a specific release tag (recommended for reproducible installs)
-cargo install --git https://github.com/lyr1cs/rein --tag v0.28.18 --locked rein
+cargo install --git https://github.com/lyr1cs/rein --tag v0.30.0 --locked rein
 ```
 
 > **`--locked` is required.** Without it, `cargo install --git` ignores
@@ -134,6 +136,11 @@ cargo install --git https://github.com/lyr1cs/rein --tag v0.28.18 --locked rein
 > in C/SIMD code that requires a newer host toolchain than your machine
 > ships. See
 > [docs/manual/02-installation.md → Remote Install](docs/manual/02-installation.md#remote-install-pinned-tag).
+>
+> This installs the default non-GUI binary. For the built-in OAuth
+> remote-connector flow, use the GUI-enabled source install in
+> [Recipe E](docs/manual/02b-remote-mcp-deployment.md#recipe-e-built-in-oauth-provider-recommended-for-v030)
+> so the owner approval pages are embedded.
 
 Then set `GEMINI_API_KEY` in your shell environment or `~/.rein/config.toml`.
 See [docs/manual/02-installation.md](docs/manual/02-installation.md) for
@@ -516,10 +523,13 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.28.8 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and end-to-end audit-cycle hardening of every adaptive surface.
+The v0.21 → v0.30.0 arc rebuilt rein around three axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, and secure remote MCP deployment for Claude clients.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.30.0** (2026-05-10) | Built-in OAuth provider | Adds explicit HTTP auth policy (`loopback_only`, `bearer_required`, `oauth`, `public`) and a single-user OAuth provider for Claude Cowork / claude.ai / mobile remote MCP. Implements Authorization Server metadata, protected-resource metadata, Dynamic Client Registration, Authorization Code + PKCE S256, refresh-token rotation, revocation, SQLite-backed OAuth clients/grants/signing keys, owner approval, GUI Connectors management, OAuth GC, doctor checks, and local/live readiness scripts. Validated by local e2e, full workspace gates, final code review, and a live claude.ai/Cowork connector over Cloudflare Quick Tunnel. |
+| **v0.28.18** (2026-05-09) | Cowork/auth audit follow-up | Public unauthenticated HTTP blocks mutating MCP/REST calls from non-loopback Hosts while keeping read-only remote recall usable. `rein doctor` validates new and legacy Codex MCP tables, catches non-stdio args, flags `REIN_DB` / `REIN_CONFIG` / `HOME` split risks, and checks release manifest version drift. |
+| **v0.28.17** (2026-05-09) | Cowork/auth diagnostics | Surfaces the `REIN_HTTP_TOKEN` vs `allow_unauthenticated_loopback` conflict and warns when Codex MCP points at a non-loopback HTTP URL that may use a different database than local CLI recall. |
 | **v0.28.8** (2026-05-04) | v0.28.7 follow-up audit | **17 codex review rounds** (R1–R17) reaching 2-consecutive-clean saturation. **15 P2 + 1 P3** closed; 0 P1 throughout. Headline: **M-8 cluster-bucket alignment** — learn-time bucket resolution now prefers memory-id-remap against current `memory_clusters` (R13 fix for the M4-then-M2 pipeline order that invalidated `cluster_version_at_recall` for every event in the common path). **L6 fallback preservation** — `learned_shadow_fusion` LRU restricted to cluster-scoped buckets (`{query_type}:{cluster_id}` shape via `is_cluster_scoped_bucket` predicate), so the `global` + per-query-type fallback chain stays intact under high cardinality. **`ars_parameter_policy` schema robustness** — schema_version peek before typed deserialize (R8 fix for `Corrupt` mis-classification on future schemas), CAS predicate uses schema-aware COALESCE default (R8), `>` rather than `!=` for future-schema preservation (R15), and `repair_corrupt_parameter_policy` wraps load+delete in `BEGIN IMMEDIATE` (R10 race fix). **M-1 persistence-side** — 4 new per-surface `ars_effective_scalars` keys (`judge_sample_rate_{cold_start,warm}_{synthesis,concept_summary}`) with one-time legacy fallback so the per-surface split lands without breaking downgrade compat. **M-5 / M-6** rollback static threshold anchoring + outer simplex↔legacy blend by `runtime_adoption_weight`. Plus L1 `sanitize_bootstrap_priors` cap, L4 auth-policy regression locks for `/api/trust-measurement` + `/api/ars-acceleration-gate`, L5 doctor recovery, L7 release-gate test coverage. **1462 tests / 0 fail / 3 ignored / 0 clippy / 0 fmt.** Default-OFF behavior bit-identical to v0.28.7. |
 | **v0.28.7** (2026-05-02) | v0.28 audit hardening | Closes 4 HIGH + 4 MED items from the 2026-05-02 v0.28 audit. **H0** reverts `[ars.llm_judge]` + `[ars.llm_judge.nightly_cron]` defaults from `true` (v0.28.6) back to `false` in code AND embedded `default.toml` per the v0.28 charter Non-Goal "Do not make LLM judge default-on" — runtime LLM judge stays opt-in until v0.29 surface-policy gating. `[ars.acceleration]` stays `true`. **H1** `bootstrap_priors_from_replay` replay consumer guarded against the placeholder `signal_hint` producer (real producer deferred to v0.29) — consumer never advances against an empty source. **H2** `apply_local_fixes` performs a drift-triggered canary→shadow rollback: when `judge_calibration_state.judge_drift_alert*` is positive while the policy is in Canary, doctor refreshes the row to flip back to Shadow with `runtime_adoption_weight = 0`. **H3** shadow `route_context` buckets isolated in a separate `CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP = 4096` LRU; recall via the shadow path cannot evict production cache entries. **M-1** `JudgeSurface` threaded through 5 helpers + handlers for per-surface drift visibility (Synthesis vs ConceptSummary). **M-2** `bootstrap_priors_from_replay` watermark cutoff uses state watermark (D3 replay-idempotence). **M-9** `DrainStats` per-reason counters + `tracing::warn` on dropped cap + doctor `judge_call_ledger` saturation check. **M-4** docs-only. 1419 tests / 0 fail / 3 ignored / 3 `codex review --uncommitted` rounds. M-1 persistence-side residual + LOW/NIT items deferred to v0.29. |
 | **v0.28.6** (2026-05-02) | ARS default-on + Trust & Measurement | Enables `[ars.acceleration]`, runtime LLM judge, and nightly calibration by default while keeping runtime adoption fail-closed behind `ars_parameter_policy`; adds scoped adoption weights for recall fusion/query/cluster and scalar surfaces, keeps SignalHint feedback active outside shadow mode, exposes scoped weights in release-gate output, and adds `rein_trust_measurement` / `rein trust-measurement` / `/api/trust-measurement`. |
@@ -1183,7 +1193,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.28.18`**（2026-05-09）— Cowork/auth 诊断的 agent-team audit 后续补丁。公网无 bearer 的 HTTP MCP 对非 loopback Host 默认阻止 mutating 工具调用，保留只读 recall；`rein doctor` 会检查 Codex 新旧 MCP 表、stdio args、`REIN_DB`/`REIN_CONFIG`/`HOME` 导致的数据库分裂风险，以及 DXT/Claude plugin manifest 版本漂移。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.30.0`**（2026-05-10）— 内建 OAuth provider，面向 Claude Cowork / claude.ai / mobile 的远程 MCP connector。新增显式 `[server].auth` 策略、OAuth metadata、Dynamic Client Registration、Authorization Code + PKCE S256、refresh rotation、revocation、SQLite 持久化、owner approval GUI、Connectors 管理页、OAuth doctor 检查和 e2e/live-readiness 脚本；已通过 claude.ai/Cowork + Cloudflare Quick Tunnel 真机验证。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1733,10 +1743,13 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.28.8 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、以及对每个 adaptive 表面的端到端 audit-cycle 强化。
+v0.21 → v0.30.0 这一段重构围绕三条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈，以及面向 Claude 客户端的安全远程 MCP 部署。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.30.0** (2026-05-10) | 内建 OAuth provider | 新增显式 HTTP auth policy（`loopback_only`、`bearer_required`、`oauth`、`public`）和单用户 OAuth provider，面向 Claude Cowork / claude.ai / mobile 远程 MCP。实现 Authorization Server metadata、protected-resource metadata、Dynamic Client Registration、Authorization Code + PKCE S256、refresh-token rotation、revocation、SQLite OAuth clients/grants/signing keys、owner approval、GUI Connectors 管理、OAuth GC、doctor 检查和 local/live readiness 脚本。已通过 local e2e、完整 workspace gates、最终 code review，以及 Cloudflare Quick Tunnel 上的 claude.ai/Cowork 真机 connector 验证。 |
+| **v0.28.18** (2026-05-09) | Cowork/auth audit follow-up | 公网无认证 HTTP 对非 loopback Host 阻止 mutating MCP/REST 调用，同时保留只读 remote recall。`rein doctor` 校验 Codex 新旧 MCP 表、非 stdio args、`REIN_DB` / `REIN_CONFIG` / `HOME` 数据库分裂风险和 release manifest 版本漂移。 |
+| **v0.28.17** (2026-05-09) | Cowork/auth diagnostics | 显示化 `REIN_HTTP_TOKEN` 与 `allow_unauthenticated_loopback` 的冲突，并在 Codex MCP 指向非 loopback HTTP URL 时警告可能和本地 CLI recall 使用不同数据库。 |
 | **v0.28.8** (2026-05-04) | v0.28.7 follow-up audit | **17 轮 codex review**（R1–R17）跑到 2-consecutive-clean 饱和。**15 P2 + 1 P3** 全部修复；全程 0 P1。**M-8 cluster bucket 对齐** — 学习时 `top_vec_hit_cluster` 优先用 memory-id remap（R13 修 M4-然后-M2 正常流水线顺序使 `cluster_version_at_recall` 对每个 event 都失效）。**L6 fallback 保护** — `learned_shadow_fusion` 的 LRU 限定 cluster-scoped 桶（`is_cluster_scoped_bucket` 谓词），保证 `global` + per-query-type fallback 链在高 cardinality 下不被驱逐。**`ars_parameter_policy` schema 健壮性** — peek `schema_version`（R8 修 future-schema 被误删）、CAS predicate 用 schema-aware COALESCE 默认值（R8）、`>` 而非 `!=` 决定 future-schema 保护（R15）、`repair_corrupt_parameter_policy` 用 `BEGIN IMMEDIATE` 关掉 peer race（R10）。**M-1 持久化侧** — 4 个 per-surface `ars_effective_scalars` keys 带 legacy fallback。**M-5 / M-6** rollback 阈值 anchoring + outer simplex 混合。加上 L1 `bootstrap_priors` cap、L4 auth-policy 锁、L5 doctor 恢复、L7 release-gate 测试。**1462 测试 / 0 失败 / 3 ignored / 0 clippy / 0 fmt**。Default-OFF 行为与 v0.28.7 二进制一致。 |
 | **v0.28.7** (2026-05-02) | v0.28 audit 加固 | 关闭 2026-05-02 v0.28 audit 的 4 HIGH + 4 MED。**H0** `[ars.llm_judge]` + `[ars.llm_judge.nightly_cron]` 默认值由 `true`（v0.28.6）回退为 `false`（同时改 code 与内嵌 `default.toml`），按 v0.28 charter Non-Goal "Do not make LLM judge default-on"—runtime LLM judge 在 v0.29 surface-policy gating 之前保持 opt-in。`[ars.acceleration]` 仍默认 `true`。**H1** `bootstrap_priors_from_replay` 重放消费者由 placeholder `signal_hint` producer 守住直到 v0.29 真实 producer 落地。**H2** `apply_local_fixes` 在 `judge_calibration_state.judge_drift_alert*` 为正且 policy 处于 Canary 时触发 `refresh_ars_parameter_policy`，下一轮 tick 把 policy 回滚为 Shadow 并将 `runtime_adoption_weight` 置 0。**H3** shadow `route_context` 桶进入独立的 `CONCEPT_SUMMARY_BY_CLUSTER_SHADOW_CAP = 4096` LRU；shadow 路径的 recall 不会驱逐生产缓存。**M-1** `JudgeSurface` 透过 5 个 helper + handler，区分 Synthesis 与 ConceptSummary 的 drift 可见度。**M-2** `bootstrap_priors_from_replay` watermark cutoff 改为 state watermark（D3 replay-idempotence）。**M-9** `DrainStats` 加 per-reason 计数器、`tracing::warn` on dropped cap、doctor `judge_call_ledger` 饱和检查。**M-4** 仅文档。1419 测试 / 0 失败 / 3 ignored / 3 轮 `codex review --uncommitted`。M-1 持久化侧残留 + LOW/NIT 留待 v0.29。 |
 | **v0.28.6** (2026-05-02) | ARS default-on + Trust & Measurement | `[ars.acceleration]`、runtime LLM judge、nightly calibration 默认开启，但 runtime adoption 仍由健康 `ars_parameter_policy` fail-closed；recall fusion/query/cluster 与 scalar surfaces 获得 scoped adoption weights；SignalHint feedback 不再仅限 shadow；release-gate 输出 scoped weights；新增 `rein_trust_measurement` / `rein trust-measurement` / `/api/trust-measurement`。 |

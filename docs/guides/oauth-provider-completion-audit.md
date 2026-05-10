@@ -70,9 +70,9 @@ Verification run on the reviewed implementation through `ceeed5b`:
 | Codex review convergence | Latest final HEAD review reported no blocking findings | Done |
 | Implementation commits | `998804d feat(v0.30): add built-in OAuth provider`, `1fe2e83 test(v0.30): add OAuth live readiness check`, `4050f28 harden(v0.30): close OAuth public surface review gaps`, `f745115 test(v0.30): isolate OAuth e2e environment`, `dd8c1dd harden(v0.30): fix OAuth session and discovery edges`, `a5ff0d8 harden(v0.30): secure OAuth review response paths`, `ceeed5b harden(v0.30): close OAuth auth edge cases` | Done |
 | Live claude.ai / Cowork connector validation | Cloudflare Quick Tunnel URL, Claude connector state `Configure`, and fresh Claude chat `<conversation-id>` answer `the configured memory count` after loading/using the rein integration | Done |
-| Phase A/B ship tags (`v0.29.0`, `v0.30.0`) | Handoff section 11 says do not tag until the operator explicitly says ship; phases were implemented together in the v0.30 audit scope | Intentionally not done |
-| Release devlog / public release notes | The vault convention treats devlog as a release artifact; operator has not explicitly said ship | Blocked until ship |
-| Push / GitHub release | Handoff section 11 says do not push until the operator explicitly says ship | Intentionally not done |
+| Release tag (`v0.30.0`) | Operator explicitly said to push and release after final checks; phases were implemented together in the v0.30 audit scope | Ready for tag |
+| Release notes | README / AGENTS / GitHub release notes document the v0.30 OAuth provider scope | Ready for release |
+| Push / GitHub release | Operator explicitly said to push and release after final checks | Ready for release |
 
 ## Live Gate State
 

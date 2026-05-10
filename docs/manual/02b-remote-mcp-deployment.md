@@ -858,6 +858,26 @@ permanent.
 Use this when rein is reachable through any public HTTPS tunnel and you want
 Claude's custom connector to complete OAuth itself.
 
+**Prerequisite: use a GUI-enabled rein binary.** The standard
+`cargo install --git https://github.com/lyr1cs/rein --tag v0.30.0 --locked rein`
+path builds the default non-GUI binary (`default = []`), so `rein serve --gui`
+cannot serve the Settings page needed to create the owner approval session.
+Use one of these instead:
+
+```bash
+# Clone build with embedded GUI assets.
+git clone --branch v0.30.0 https://github.com/lyr1cs/rein
+cd rein
+./scripts/install.sh
+
+# Or, from an existing checkout after building the GUI assets:
+cargo build -p rein --release --features gui
+install -m 0755 target/release/rein ~/.cargo/bin/rein
+```
+
+The Claude Desktop `.mcpb` release artifact also contains the GUI-enabled
+server binary.
+
 `~/.rein/config.toml`:
 
 ```toml
@@ -1078,11 +1098,12 @@ systemd / `cloudflared` parent process). Set `REIN_LOG=info` or
 
 The current rein remote-MCP path has these known limitations:
 
-- **No OAuth in rein itself** — auth must be terminated at the proxy
-  layer (Cloudflare Access, Caddy with a header matcher, etc.). rein
-  bearer auth via `REIN_HTTP_TOKEN` is not used in this deployment
-  pattern because Anthropic's connector UI doesn't expose an arbitrary
-  bearer field.
+- **Built-in OAuth is single-user** — v0.30's provider is designed for
+  one owner approving clients against one private `~/.rein/` database.
+  It is not a multi-tenant identity provider and does not implement
+  JWKS, token introspection, or federated OIDC login. If you need
+  organization-wide SSO policy, put Cloudflare Access / another OIDC
+  gateway in front of rein.
 - **No mobile-specific testing** — Anthropic says custom connectors
   work on mobile, but the rein team has not yet validated the
   end-to-end Cowork-mobile path. Open an issue if you find issues.

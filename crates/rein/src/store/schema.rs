@@ -649,6 +649,7 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
             access_token_jti TEXT NOT NULL UNIQUE,
             access_expires_at INTEGER NOT NULL,
             refresh_token_hash TEXT NOT NULL,
+            refresh_token_fingerprint TEXT NOT NULL,
             refresh_expires_at INTEGER NOT NULL,
             issued_at INTEGER NOT NULL,
             revoked_at INTEGER
@@ -665,6 +666,28 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
             rotated_at INTEGER
         );
         ",
+    )?;
+
+    let has_refresh_fingerprint: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('oauth_grants') WHERE name='refresh_token_fingerprint'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_refresh_fingerprint {
+        conn.execute_batch("ALTER TABLE oauth_grants ADD COLUMN refresh_token_fingerprint TEXT")?;
+    }
+    conn.execute(
+        "UPDATE oauth_grants
+         SET revoked_at = COALESCE(revoked_at, ?1)
+         WHERE refresh_token_fingerprint IS NULL",
+        [chrono::Utc::now().timestamp()],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_grants_refresh_fingerprint
+            ON oauth_grants(client_id, refresh_token_fingerprint);",
     )?;
 
     let key_count: i64 = conn.query_row("SELECT COUNT(*) FROM oauth_signing_keys", [], |row| {
@@ -1709,5 +1732,82 @@ mod migration_tests {
             )
             .expect("query signing key secret");
         assert_eq!(secret_hex.len(), 64, "secret should be 32 random bytes hex");
+    }
+
+    #[test]
+    fn oauth_migration_revokes_legacy_grants_without_refresh_fingerprint() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        conn.execute_batch(
+            "
+            CREATE TABLE oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                client_secret_hash TEXT,
+                client_name TEXT NOT NULL,
+                redirect_uris TEXT NOT NULL,
+                grant_types TEXT NOT NULL,
+                token_endpoint_auth_method TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                revoked_at INTEGER
+            );
+            CREATE TABLE oauth_grants (
+                grant_id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+                access_token_jti TEXT NOT NULL UNIQUE,
+                access_expires_at INTEGER NOT NULL,
+                refresh_token_hash TEXT NOT NULL,
+                refresh_expires_at INTEGER NOT NULL,
+                issued_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            );
+            INSERT INTO oauth_clients (
+                client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                token_endpoint_auth_method, registered_at, last_used_at, revoked_at
+            ) VALUES (
+                'legacy-client', NULL, 'legacy', '[]', '[]', 'none', 1, NULL, NULL
+            );
+            INSERT INTO oauth_grants (
+                grant_id, client_id, access_token_jti, access_expires_at,
+                refresh_token_hash, refresh_expires_at, issued_at, revoked_at
+            ) VALUES (
+                'legacy-grant', 'legacy-client', 'legacy-jti', 999999,
+                'legacy-hash', 999999, 1, NULL
+            );
+            ",
+        )
+        .expect("create legacy oauth schema");
+
+        migrate_oauth_tables(&conn).expect("migrate oauth tables");
+
+        let has_fingerprint: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('oauth_grants') WHERE name='refresh_token_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migrated column");
+        assert_eq!(has_fingerprint, 1);
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_oauth_grants_refresh_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migrated index");
+        assert_eq!(index_count, 1);
+
+        let revoked_at: Option<i64> = conn
+            .query_row(
+                "SELECT revoked_at FROM oauth_grants WHERE grant_id = 'legacy-grant'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query legacy grant");
+        assert!(
+            revoked_at.is_some(),
+            "legacy unindexed refresh grants must be revoked instead of kept on the slow path"
+        );
     }
 }
