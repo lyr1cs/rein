@@ -51,9 +51,169 @@ transport (current MCP standard since spec version 2025-06-18). The
 deployment work is to terminate HTTPS in front of it and route
 authenticated traffic through.
 
+### One rein memory, two Claude transports
+
+The important mental model is **not** "install rein twice." It is one
+private rein state directory, normally `~/.rein/`, exposed through two
+different MCP transports:
+
+- **Local Claude paths** — Claude Desktop Chat, Claude Code, and local
+  plugin/DXT installs start `rein serve` over stdio. Traffic stays on
+  the same machine. No public URL is involved.
+- **Remote Claude paths** — Claude Cowork, claude.ai, and mobile do not
+  run local stdio servers. Their connector traffic originates from
+  Anthropic's cloud, so they need a public HTTPS URL that forwards back
+  to the local rein HTTP listener.
+
+Both paths read and write the same SQLite database, side indexes, queue,
+and config under the same `HOME` / `REIN_DB` / `REIN_CONFIG`. The
+transport differs; the memory source of truth does not.
+
+```mermaid
+flowchart LR
+  subgraph Local["Your Mac / always-on host"]
+    DB[("~/.rein/memories.db")]
+    Queue[("~/.rein/queue + side indexes")]
+    Stdio["rein serve\nstdio MCP"]
+    HTTP["rein serve --gui\nHTTP MCP + OAuth\n127.0.0.1:8680"]
+    Tunnel["Public HTTPS tunnel\nTailscale Funnel / Cloudflare / Caddy"]
+  end
+
+  ClaudeLocal["Claude Desktop Chat\nClaude Code\nlocal plugin / DXT"]
+  ClaudeRemote["Claude Cowork\nclaude.ai\nmobile"]
+  Anthropic["Anthropic cloud connector"]
+
+  ClaudeLocal -->|"local stdio MCP"| Stdio
+  Stdio --> DB
+  Stdio --> Queue
+
+  ClaudeRemote -->|"connector request"| Anthropic
+  Anthropic -->|"HTTPS https://public-host/mcp"| Tunnel
+  Tunnel -->|"loopback HTTP http://127.0.0.1:8680/mcp"| HTTP
+  HTTP --> DB
+  HTTP --> Queue
+```
+
+This split is deliberate:
+
+- **Consistency** — a memory stored from Claude Code is immediately
+  visible to Cowork, and a memory created from claude.ai is visible to
+  Desktop Chat, because both surfaces hit the same database.
+- **No database sync problem** — rein stays single-writer /
+  single-owner. You do not need to rsync `memories.db` between "Claude"
+  and "Cowork" machines.
+- **Correct network boundary** — only the tunnel is public. rein itself
+  still listens on `127.0.0.1`, so random LAN hosts cannot connect
+  directly to the HTTP server.
+- **Claude compatibility** — local Claude clients can use stdio because
+  they run on your machine; Cowork / claude.ai cannot, because their MCP
+  connector runs in Anthropic's cloud.
+
+### Why `127.0.0.1` and `public_url` are both required
+
+`127.0.0.1` is the **listen/upstream address**. It is where rein accepts
+traffic from the tunnel process running on the same machine.
+
+`public_url` is the **external identity**. It is what Claude sees, what
+rein advertises in OAuth metadata, and what must appear in the
+connector URL. These two values must not be collapsed into one setting:
+
+```mermaid
+flowchart LR
+  Claude["Claude.ai / Cowork"]
+  Public["public_url\nhttps://<your-machine>.<your-tailnet>.ts.net"]
+  Funnel["Tailscale Funnel\nTLS + public routing"]
+  Loopback["sse_bind = 127.0.0.1\nsse_port = 8680"]
+  Rein["rein HTTP server\n/mcp /oauth/* /.well-known/*"]
+
+  Claude -->|"uses https://.../mcp"| Public
+  Public --> Funnel
+  Funnel -->|"proxy http://127.0.0.1:8680"| Loopback
+  Loopback --> Rein
+```
+
+If you put `127.0.0.1` into Claude's connector URL, Anthropic's cloud
+tries to connect to **Anthropic's own localhost**, not your Mac. That
+cannot work. `127.0.0.1` belongs only on the local side of the tunnel.
+
+For v0.30+ OAuth deployments the minimal shape is:
+
+```toml
+[server]
+auth = "oauth"
+gui_enabled = true
+sse_enabled = true
+sse_bind = "127.0.0.1"
+sse_port = 8680
+public_url = "https://<your-machine>.<your-tailnet>.ts.net"
+allowed_hosts = ["<your-machine>.<your-tailnet>.ts.net"]
+```
+
+`allowed_hosts` is not cosmetic. rein validates the incoming `Host:`
+header before routing requests. Tailscale Funnel preserves the public
+FQDN as the Host header, so that FQDN must be listed or rein returns
+`403 Host header is not allowed`.
+
+### OAuth flow when Cowork shares the same rein
+
+In v0.30+ the recommended remote path is built-in OAuth. Claude does
+not receive your static `REIN_HTTP_TOKEN`. Instead, `REIN_HTTP_TOKEN`
+is the owner approval credential for the GUI, while Claude receives its
+own OAuth access and refresh tokens after you approve the connector.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Claude Cowork / claude.ai
+  participant A as Anthropic connector service
+  participant T as Public HTTPS tunnel
+  participant R as rein HTTP/OAuth server
+  participant O as Owner browser
+  participant D as ~/.rein/memories.db
+
+  C->>A: Add connector: https://public-host/mcp
+  A->>T: GET /.well-known/oauth-authorization-server
+  T->>R: Forward to 127.0.0.1:8680
+  R-->>A: issuer, authorize/token/register endpoints
+  A->>R: POST /oauth/register
+  R-->>A: client_id (+ optional client_secret)
+  A->>O: Open /oauth/authorize in browser
+  O->>R: Owner login with REIN_HTTP_TOKEN if needed
+  O->>R: Approve connector access
+  R-->>A: authorization code
+  A->>R: POST /oauth/token with PKCE verifier
+  R-->>A: access_token + refresh_token
+  A->>R: POST /mcp with Authorization: Bearer access_token
+  R->>D: read/write same memory store as local stdio clients
+  R-->>A: rein_* tool results
+  A-->>C: Tool result in Cowork / claude.ai
+```
+
+The same machine can therefore serve both surfaces at once:
+
+- Local Claude continues to use stdio for low-latency local workflows.
+- Cowork / claude.ai uses the public `/mcp` URL plus OAuth for remote
+  access.
+- Both surfaces converge on the same `~/.rein/memories.db`.
+
+### Why this design is preferable to the alternatives
+
+| Alternative | Why it looks attractive | Why rein avoids it |
+| --- | --- | --- |
+| Run a separate rein for Cowork | Keeps remote setup isolated | Creates two memory databases that drift immediately |
+| Put `127.0.0.1` in Claude.ai | Matches local curl tests | Claude.ai runs in Anthropic's cloud; its localhost is not your Mac |
+| Expose rein directly on `0.0.0.0` | Removes the tunnel process | Increases LAN/public attack surface and makes Host guard mistakes costly |
+| Use Cloudflare/Quick Tunnel random URLs forever | Fast demo | URL changes or dies, forcing connector re-registration |
+| Reuse `REIN_HTTP_TOKEN` as Claude bearer | Simple mental model | Anthropic's connector UI has no arbitrary bearer header field |
+
+The durable pattern is: **one rein state directory, local loopback
+listener, stable public HTTPS URL, OAuth for remote Claude clients**.
+
 ## What you need before starting
 
-- rein v0.28.9 or newer running locally (`rein --version`)
+- rein v0.30.0 or newer for the built-in OAuth provider (`rein
+  --version`). Older v0.28.9+ builds can expose remote MCP, but only
+  with the legacy URL-only / proxy-auth recipes.
 - `GEMINI_API_KEY` configured in `~/.rein/config.toml` or shell env
 - A **Pro / Max / Team / Enterprise** Claude account (custom connectors
   are not available on Free)
@@ -72,9 +232,9 @@ meet.
 | --- | --- | --- | --- | --- |
 | **Nothing** (no account, no domain) | **A.0: Cloudflare Quick Tunnel** | ~1 min | Ephemeral (changes per restart) | URL obscurity only |
 | ngrok account (free) | **D: ngrok** | ~3 min | Ephemeral on free tier; reserved domains on paid | URL obscurity only |
-| Tailscale account (free) | **B: Tailscale Funnel** | ~5 min | Permanent (`*.ts.net`) | URL obscurity only |
-| Cloudflare account + own domain | **A: Cloudflare Tunnel** | ~15 min | Permanent under your domain | OIDC via Cloudflare Access |
-| VPS + own domain | **C: Caddy / nginx + Let's Encrypt** | ~30 min | Permanent | Anything (basic_auth, OIDC, mTLS) |
+| Tailscale account (free) | **B: Tailscale Funnel** | ~5 min | Permanent (`*.ts.net`) | URL obscurity, or rein OAuth via Recipe E |
+| Cloudflare account + own domain | **A: Cloudflare Tunnel** | ~15 min | Permanent under your domain | Cloudflare Access OIDC, or rein OAuth via Recipe E |
+| VPS + own domain | **C: Caddy / nginx + Let's Encrypt** | ~30 min | Permanent | Anything (basic_auth, OIDC, mTLS), or rein OAuth via Recipe E |
 | rein v0.30+ | **E: Built-in OAuth** | ~5 min after HTTPS exposure | Depends on tunnel | OAuth Authorization Code + PKCE |
 
 **Network gotcha noted across recipes:** several routers and corporate
@@ -399,10 +559,18 @@ Tailscale prints a URL like `https://<machine>.<tailnet>.ts.net`. The
 MCP endpoint becomes `https://<machine>.<tailnet>.ts.net/mcp`. HTTPS is
 automatic; no DNS / cert work.
 
-**Limitation — Tailscale Funnel does not provide an auth layer.**
-Anthropic's connector cannot pass arbitrary bearer tokens (no UI
-field), and rein's `REIN_HTTP_TOKEN` won't reach rein through the
-connector. So your two practical options with Tailscale Funnel are:
+**Limitation — Tailscale Funnel does not provide an auth layer by
+itself.** Tailscale gives you a stable public HTTPS route; rein still
+has to decide how the remote caller authenticates. On v0.30+ the
+recommended answer is **Recipe E: built-in OAuth** on top of the
+Funnel URL. In that posture, Funnel only transports HTTPS traffic and
+rein's OAuth provider protects `/mcp`.
+
+For pre-v0.30 builds, or when you intentionally choose not to use
+built-in OAuth, Anthropic's connector still cannot pass arbitrary
+bearer tokens (no UI field), and rein's `REIN_HTTP_TOKEN` won't reach
+rein through the connector. The legacy options with Tailscale Funnel
+are:
 
 1. **Accept unauthenticated public exposure** — set
    `allow_unauthenticated_loopback = true` in `~/.rein/config.toml`
@@ -420,9 +588,9 @@ connector. So your two practical options with Tailscale Funnel are:
    point at the Caddy port instead of `:8680`. The Caddy itself then
    needs an OIDC plugin / `basic_auth` / etc. for incoming auth.
 
-If neither option fits, switch to Recipe A (Cloudflare Tunnel + an
-OIDC IdP via Cloudflare Access) instead — that path has a real
-edge-auth story.
+If neither legacy option fits and you cannot upgrade to v0.30+, switch
+to Recipe A (Cloudflare Tunnel + an OIDC IdP via Cloudflare Access)
+instead — that path has a real edge-auth story outside rein.
 
 ### Verified end-to-end walkthrough (macOS Apple Silicon, 2026-05-06)
 
