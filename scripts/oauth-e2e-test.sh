@@ -29,7 +29,12 @@ background_warmup = false
 EOF
 
 (cd "${ROOT}" && cargo build -p rein >/dev/null)
-REIN_HTTP_TOKEN="oauth-e2e-owner-token" REIN_CONFIG="${TMPDIR}/config.toml" "${ROOT}/target/debug/rein" serve --sse >"${TMPDIR}/rein.log" 2>&1 &
+REIN_HTTP_TOKEN="oauth-e2e-owner-token" \
+  REIN_CONFIG="${TMPDIR}/config.toml" \
+  REIN_DB="${TMPDIR}/memories.db" \
+  REIN_SSE_BIND="127.0.0.1" \
+  REIN_SSE_PORT="${PORT}" \
+  "${ROOT}/target/debug/rein" serve --sse >"${TMPDIR}/rein.log" 2>&1 &
 PID="$!"
 
 python3 - "$PORT" "$TMPDIR" <<'PY'
