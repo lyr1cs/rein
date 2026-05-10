@@ -8,6 +8,7 @@ use crate::auth::oauth::{oauth_error, OAuthResponse};
 use crate::config::ReinConfig;
 
 const DCR_LIMIT_PER_HOUR: usize = 10;
+const DCR_RATE_LIMIT_MAX_KEYS: usize = 4096;
 static DCR_RATE_LIMIT: LazyLock<Mutex<HashMap<String, VecDeque<i64>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -56,16 +57,49 @@ fn check_rate_limit(key: &str, now: i64) -> bool {
     let Ok(mut buckets) = DCR_RATE_LIMIT.lock() else {
         return false;
     };
-    let cutoff = now - 3600;
-    let bucket = buckets.entry(key.to_string()).or_default();
-    while bucket.front().is_some_and(|seen| *seen <= cutoff) {
-        bucket.pop_front();
+    check_rate_limit_in_buckets(&mut buckets, key, now, DCR_RATE_LIMIT_MAX_KEYS)
+}
+
+fn check_rate_limit_in_buckets(
+    buckets: &mut HashMap<String, VecDeque<i64>>,
+    key: &str,
+    now: i64,
+    max_keys: usize,
+) -> bool {
+    if max_keys == 0 {
+        return false;
     }
+    let cutoff = now - 3600;
+    prune_stale_rate_limit_buckets(buckets, cutoff);
+    if !buckets.contains_key(key) && buckets.len() >= max_keys {
+        evict_oldest_rate_limit_bucket(buckets);
+    }
+    let bucket = buckets.entry(key.to_string()).or_default();
     if bucket.len() >= DCR_LIMIT_PER_HOUR {
         return false;
     }
     bucket.push_back(now);
     true
+}
+
+fn prune_stale_rate_limit_buckets(buckets: &mut HashMap<String, VecDeque<i64>>, cutoff: i64) {
+    for bucket in buckets.values_mut() {
+        while bucket.front().is_some_and(|seen| *seen <= cutoff) {
+            bucket.pop_front();
+        }
+    }
+    buckets.retain(|_, bucket| !bucket.is_empty());
+}
+
+fn evict_oldest_rate_limit_bucket(buckets: &mut HashMap<String, VecDeque<i64>>) {
+    let Some(oldest_key) = buckets
+        .iter()
+        .min_by_key(|(_, bucket)| bucket.back().copied().unwrap_or(i64::MIN))
+        .map(|(key, _)| key.clone())
+    else {
+        return;
+    };
+    buckets.remove(&oldest_key);
 }
 
 pub fn handle_register(body: &[u8], config: &ReinConfig, rate_limit_key: &str) -> OAuthResponse {
@@ -140,6 +174,20 @@ mod tests {
         }
         assert!(!check_rate_limit(&key, 1100));
         assert!(check_rate_limit(&key, 1000 + 3601));
+    }
+
+    #[test]
+    fn dcr_rate_limit_prunes_stale_keys_and_caps_bucket_count() {
+        let mut buckets = HashMap::new();
+        assert!(check_rate_limit_in_buckets(&mut buckets, "k1", 1000, 2));
+        assert!(check_rate_limit_in_buckets(&mut buckets, "k2", 1001, 2));
+        assert!(check_rate_limit_in_buckets(&mut buckets, "k3", 1002, 2));
+        assert_eq!(buckets.len(), 2);
+        assert!(!buckets.contains_key("k1"));
+
+        assert!(check_rate_limit_in_buckets(&mut buckets, "fresh", 4603, 2));
+        assert_eq!(buckets.len(), 1);
+        assert!(buckets.contains_key("fresh"));
     }
 
     #[test]

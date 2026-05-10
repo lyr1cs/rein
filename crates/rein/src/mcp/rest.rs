@@ -122,16 +122,28 @@ fn clear_legacy_root_session_cookie_value() -> String {
     format!("{HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
 }
 
-fn oauth_owner_cookie_value(token: &str) -> String {
+fn oauth_owner_cookie_should_be_secure(config: &ReinConfig) -> bool {
+    config
+        .server
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .and_then(|url| url.get(..8))
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
+fn oauth_owner_cookie_value(token: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!(
-        "{}={token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600",
+        "{}={token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{secure}",
         crate::auth::oauth::OAUTH_OWNER_COOKIE
     )
 }
 
-fn clear_oauth_owner_cookie_value() -> String {
+fn clear_oauth_owner_cookie_value(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!(
-        "{}=; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=0",
+        "{}=; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=0{secure}",
         crate::auth::oauth::OAUTH_OWNER_COOKIE
     )
 }
@@ -585,13 +597,13 @@ async fn handle_api<B>(
         // send body instead of `?fix=true` query string.
         (&Method::POST, "/api/session") => match require_mutation_marker(req) {
             Ok(()) => match require_owner_token(req) {
-                Ok(()) => api_create_session(),
+                Ok(()) => api_create_session(config),
                 Err(response) => response,
             },
             Err(response) => response,
         },
         (&Method::DELETE, "/api/session") => match require_mutation_marker(req) {
-            Ok(()) => api_clear_session(),
+            Ok(()) => api_clear_session(config),
             Err(response) => response,
         },
         (&Method::GET, "/api/recall_stream") => api_recall_stream(config, &query),
@@ -976,17 +988,18 @@ async fn try_dispatch_inventory_rest<B>(
 // (see ops/handlers/diagnostics.rs::doctor_fix). Legacy callers that sent
 // query-string flags now send a JSON body.
 
-fn api_create_session() -> BoxedResponse {
+fn api_create_session(config: &ReinConfig) -> BoxedResponse {
     let token = std::env::var("REIN_HTTP_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty());
     match token {
         Some(token) => {
+            let secure_oauth_owner_cookie = oauth_owner_cookie_should_be_secure(config);
             let cookies = [
                 clear_legacy_root_session_cookie_value(),
                 clear_legacy_session_cookie_value(),
                 session_cookie_value(&token),
-                oauth_owner_cookie_value(&token),
+                oauth_owner_cookie_value(&token, secure_oauth_owner_cookie),
             ];
             json_response_with_cookies(StatusCode::OK, json!({ "authenticated": true }), &cookies)
         }
@@ -997,12 +1010,13 @@ fn api_create_session() -> BoxedResponse {
     }
 }
 
-fn api_clear_session() -> BoxedResponse {
+fn api_clear_session(config: &ReinConfig) -> BoxedResponse {
+    let secure_oauth_owner_cookie = oauth_owner_cookie_should_be_secure(config);
     let cookies = [
         clear_session_cookie_value(),
         clear_legacy_root_session_cookie_value(),
         clear_legacy_session_cookie_value(),
-        clear_oauth_owner_cookie_value(),
+        clear_oauth_owner_cookie_value(secure_oauth_owner_cookie),
     ];
     json_response_with_cookies(StatusCode::OK, json!({ "authenticated": false }), &cookies)
 }
@@ -2216,6 +2230,52 @@ mod tests {
             .any(|value| value.contains("rein_oauth_owner=")
                 && value.contains("Path=/oauth/authorize")
                 && value.contains("Max-Age=0")));
+
+        match original {
+            Some(v) => unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            },
+            None => unsafe {
+                std::env::remove_var("REIN_HTTP_TOKEN");
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rein_http_token_env)]
+    async fn oauth_owner_cookie_is_secure_for_https_public_url() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::set_var("REIN_HTTP_TOKEN", "owner-secret");
+        }
+        let dir = tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("oauth-secure-cookie.db"));
+        config.server.public_url = Some("https://rein.example.com".to_string());
+
+        let session_ok = Request::builder()
+            .method("POST")
+            .uri("/api/session")
+            .header("x-rein-action", "1")
+            .header("authorization", "Bearer owner-secret")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&session_ok, &config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_cookies: Vec<&str> = response
+            .headers()
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(
+            session_cookies
+                .iter()
+                .any(|value| value.contains("rein_oauth_owner=owner-secret")
+                    && value.contains("Path=/oauth/authorize")
+                    && value.contains("Secure")),
+            "OAuth owner cookie must be Secure when public_url uses HTTPS: {session_cookies:?}"
+        );
 
         match original {
             Some(v) => unsafe {
