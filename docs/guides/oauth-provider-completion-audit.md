@@ -69,7 +69,7 @@ Verification run on the reviewed implementation through `ceeed5b`:
 | Live readiness check script | `scripts/oauth-live-readiness.sh`, executable bit committed | Done |
 | Codex review convergence | Latest final HEAD review reported no blocking findings | Done |
 | Implementation commits | `998804d feat(v0.30): add built-in OAuth provider`, `1fe2e83 test(v0.30): add OAuth live readiness check`, `4050f28 harden(v0.30): close OAuth public surface review gaps`, `f745115 test(v0.30): isolate OAuth e2e environment`, `dd8c1dd harden(v0.30): fix OAuth session and discovery edges`, `a5ff0d8 harden(v0.30): secure OAuth review response paths`, `ceeed5b harden(v0.30): close OAuth auth edge cases` | Done |
-| Live claude.ai / Cowork connector validation | Cloudflare Quick Tunnel URL, Claude connector state `Configure`, and fresh Claude chat `<conversation-id>` answer `the configured memory count` after loading/using the rein integration | Done |
+| Live claude.ai / Cowork connector validation | Cloudflare Quick Tunnel URL, Claude connector state `Configure`, and fresh Claude chat `<conversation-id>` answer the configured memory count after loading/using the rein integration | Done |
 | Release tag (`v0.30.0`) | Operator explicitly said to push and release after final checks; phases were implemented together in the v0.30 audit scope | Ready for tag |
 | Release notes | README / AGENTS / GitHub release notes document the v0.30 OAuth provider scope | Ready for release |
 | Push / GitHub release | Operator explicitly said to push and release after final checks | Ready for release |
@@ -80,7 +80,7 @@ Current machine state after live validation:
 
 - `tailscale funnel status` shows `https://<your-machine>.<your-tailnet>.ts.net` proxies `/` to `http://127.0.0.1:8680`.
 - Tailscale Funnel was not used for validation because `curl -vkI https://<your-machine>.<your-tailnet>.ts.net/.well-known/oauth-authorization-server`
-  from the current execution environment reached `the local CGNAT-remapped address` but failed TLS handshake with `SSL_ERROR_SYSCALL`, and an external reader could not resolve the `.ts.net` hostname.
+  from the current execution environment reached the local CGNAT-remapped address but failed TLS handshake with `SSL_ERROR_SYSCALL`, and an external reader could not resolve the `.ts.net` hostname.
 - Cloudflare Quick Tunnel with HTTP/2 fallback exposed `http://127.0.0.1:8680`
   at `https://<your-tunnel-id>.trycloudflare.com`.
 - `~/.rein/config.toml` was switched to `auth = "oauth"` and

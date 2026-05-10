@@ -17,10 +17,10 @@
     "description": "File paths with /Users/ prefix and tilde-home variants",
     "evidence": [
       {"content": "config lives at ~/.rein/config.toml and the db at ~/.rein/memories.db.", "merged_at": "2026-04-05T10:00:00Z"},
-      {"content": "source tree is at /Users/user/Desktop/rein-vault/source/rein with 2-crate workspace.", "merged_at": "2026-04-06T10:00:00Z"},
+      {"content": "source tree is at /Users/user/projects/rein with 2-crate workspace.", "merged_at": "2026-04-06T10:00:00Z"},
       {"content": "binary installs to ~/.cargo/bin/rein via cargo install --path crates/rein.", "merged_at": "2026-04-07T10:00:00Z"}
     ],
-    "current_canonical": "File layout: config ~/.rein/config.toml, db ~/.rein/memories.db, source /Users/user/Desktop/rein-vault/source/rein (2-crate workspace), binary ~/.cargo/bin/rein via cargo install --path crates/rein.",
+    "current_canonical": "File layout: config ~/.rein/config.toml, db ~/.rein/memories.db, source /Users/user/projects/rein (2-crate workspace), binary ~/.cargo/bin/rein via cargo install --path crates/rein.",
     "target_bytes": 8000,
     "expected_must_pass": ["no_new_facts", "length_bounded"]
   },

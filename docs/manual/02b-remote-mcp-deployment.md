@@ -240,7 +240,7 @@ meet.
 **Network gotcha noted across recipes:** several routers and corporate
 proxies intercept and remap `*.trycloudflare.com`, `*.ts.net`,
 `*.ngrok-free.app` traffic — typically to private CGNAT space like
-`198.18.0.0/15`. The some home LANs do this. The
+`198.18.0.0/15`. Some home LANs do this. The
 operational symptoms differ per recipe (Quick Tunnel: cloudflared can't
 establish QUIC tunnel; Tailscale: local curl returns `[HTTP 000]` but
 the public path still works; ngrok: similar). Each recipe below
