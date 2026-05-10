@@ -1,7 +1,7 @@
 # OAuth Provider Completion Audit
 
 Date: 2026-05-10
-Code/review audit scope: `006d984..dd8c1dd`
+Code/review audit scope: `006d984..ceeed5b`
 Audit note: the follow-up documentation commit records this evidence; it does not change the reviewed Rust, GUI, script, or deployment behavior.
 
 ## Objective
@@ -21,9 +21,9 @@ Implemented and committed across the audit scope:
 - Remote deployment Recipe E and ADRs.
 - End-to-end local OAuth script: `scripts/oauth-e2e-test.sh`.
 
-Verification run on the reviewed implementation through `dd8c1dd`:
+Verification run on the reviewed implementation through `ceeed5b`:
 
-- `cargo test --workspace --all-features` -> `1565 passed, 3 ignored`.
+- `cargo test --workspace --all-features` -> `1568 passed, 3 ignored`.
 - `cargo clippy --workspace --all-targets -- -D warnings` -> clean.
 - `cargo fmt --all -- --check` -> clean.
 - `cargo audit` -> no vulnerabilities reported.
@@ -36,6 +36,8 @@ Verification run on the reviewed implementation through `dd8c1dd`:
 - `REIN_EVAL_JUDGE=llm rein-eval synthesis baseline/run/compare` -> `SHIP (NonInferior)`.
 - `codex review --uncommitted --title "v0.30 OAuth provider full audit after P2 fixes"` -> no blocking correctness, security, or maintainability issues found.
 - `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final audit after session discovery hardening"` -> no discrete introduced correctness, security, or maintainability issues found; full Rust tests and OAuth e2e passed on this tree.
+- `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final completion audit after review fixes"` -> found four P2 OAuth edge cases; fixed in `ceeed5b`.
+- `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final completion audit after edge-case fixes"` -> no discrete correctness, security, or maintainability issues found; OAuth unit tests, cargo check, GUI build, and local OAuth e2e passed on this tree.
 
 ## Requirement Checklist
 
@@ -55,7 +57,7 @@ Verification run on the reviewed implementation through `dd8c1dd`:
 | GUI Connectors page | `crates/rein/gui/src/pages/Connectors.tsx`, routes/nav | Done |
 | Revocation endpoint | `revoke.rs`, e2e revoke and access-token 401 check | Done |
 | DCR rate limit and durable client cap | `register.rs`, `store.rs` tests | Done |
-| Security hardening: exact redirect URI, no fragments, bounded metadata, no client-secret logging, no-cache JSON, owner-token scoping, Secure cookies for HTTPS public URLs, bounded DCR rate-limit map, hermetic e2e environment | OAuth module tests, e2e tests, and final code review | Done |
+| Security hardening: exact redirect URI, no fragments, bounded metadata, no client-secret logging, no-cache JSON, owner-token scoping before body reads, Secure cookies for HTTPS public URLs, advisory revocation hints, loopback metadata scheme handling, bounded DCR rate-limit map, hermetic e2e environment | OAuth module tests, e2e tests, and final code review | Done |
 | OAuth GC | `auth/oauth/store.rs`, `ops/mod.rs`, doctor expired record count | Done |
 | Doctor OAuth summary | `crates/rein/src/doctor.rs` | Done |
 | Recipe E docs | `docs/manual/02b-remote-mcp-deployment.md` | Done |
@@ -64,7 +66,7 @@ Verification run on the reviewed implementation through `dd8c1dd`:
 | Local e2e script | `scripts/oauth-e2e-test.sh`, executable bit committed | Done |
 | Live readiness check script | `scripts/oauth-live-readiness.sh`, executable bit committed | Done |
 | Codex review convergence | Latest final HEAD review reported no blocking findings | Done |
-| Implementation commits | `998804d feat(v0.30): add built-in OAuth provider`, `1fe2e83 test(v0.30): add OAuth live readiness check`, `4050f28 harden(v0.30): close OAuth public surface review gaps`, `f745115 test(v0.30): isolate OAuth e2e environment`, `dd8c1dd harden(v0.30): fix OAuth session and discovery edges` | Done |
+| Implementation commits | `998804d feat(v0.30): add built-in OAuth provider`, `1fe2e83 test(v0.30): add OAuth live readiness check`, `4050f28 harden(v0.30): close OAuth public surface review gaps`, `f745115 test(v0.30): isolate OAuth e2e environment`, `dd8c1dd harden(v0.30): fix OAuth session and discovery edges`, `a5ff0d8 harden(v0.30): secure OAuth review response paths`, `ceeed5b harden(v0.30): close OAuth auth edge cases` | Done |
 | Live claude.ai / Cowork connector validation | Requires restarting the current public `:8680` service and operating the user's Claude connector | Blocked |
 | Phase A/B ship tags (`v0.29.0`, `v0.30.0`) | Handoff section 11 says do not tag until the operator explicitly says ship; phases were implemented together in the v0.30 audit scope | Intentionally not done |
 | Release devlog / public release notes | The vault convention treats devlog as a release artifact; live Cowork validation is still blocked, so v0.30 should not be documented as shipped yet | Blocked until ship |
