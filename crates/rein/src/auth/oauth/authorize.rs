@@ -199,6 +199,23 @@ fn require_owner_authorization(headers: &hyper::HeaderMap) -> Option<OAuthRespon
     }
 }
 
+fn csrf_cookie_secure_suffix(config: &ReinConfig) -> &'static str {
+    if config
+        .server
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| {
+            url.get(..8)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        })
+    {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
 pub fn handle_authorize_get(
     headers: &hyper::HeaderMap,
     query: &str,
@@ -264,7 +281,8 @@ pub fn handle_authorize_get(
         vec![(
             hyper::header::SET_COOKIE.as_str(),
             format!(
-                "{CSRF_COOKIE}={nonce}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600"
+                "{CSRF_COOKIE}={nonce}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{}",
+                csrf_cookie_secure_suffix(config)
             ),
         )],
     )
@@ -513,6 +531,34 @@ mod tests {
         );
         let response = handle_authorize_get(&headers, &query, &config);
         assert_eq!(response.status, hyper::StatusCode::OK);
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn authorize_get_marks_csrf_cookie_secure_for_https_public_url() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "owner-secret");
+        let (_dir, mut config) = temp_config();
+        config.server.public_url = Some("https://rein.example.com".to_string());
+        let client = register_client(&config);
+        let query = authorize_query(&client.client_id, "https://claude.ai/callback");
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::COOKIE,
+            hyper::header::HeaderValue::from_static("rein_oauth_owner=owner-secret"),
+        );
+
+        let response = handle_authorize_get(&headers, &query, &config);
+
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert!(
+            response.headers.iter().any(|(name, value)| *name
+                == hyper::header::SET_COOKIE.as_str()
+                && value.contains("rein_oauth_csrf=")
+                && value.contains("Path=/oauth/authorize")
+                && value.contains("Secure")),
+            "HTTPS OAuth public_url must emit Secure CSRF cookie: {:?}",
+            response.headers
+        );
     }
 
     #[test]

@@ -189,6 +189,8 @@ fn oauth_unauthorized_response(
         .status(hyper::StatusCode::UNAUTHORIZED)
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(hyper::header::WWW_AUTHENTICATE, challenge)
+        .header("x-source-code", crate::SOURCE_URL)
+        .header("x-license", crate::LICENSE_SPDX)
         .body(http_body_util::Full::new(bytes::Bytes::from_static(b"Unauthorized")).boxed())
         .unwrap_or_else(|_| plain_http_response(hyper::StatusCode::UNAUTHORIZED, "Unauthorized"))
 }
@@ -1371,6 +1373,20 @@ mod tests {
                 .get(hyper::header::WWW_AUTHENTICATE)
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer resource_metadata=\"https://rein.example.com/.well-known/oauth-protected-resource/mcp\"")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-source-code")
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::SOURCE_URL)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-license")
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::LICENSE_SPDX)
         );
     }
 
