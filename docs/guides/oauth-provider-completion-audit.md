@@ -38,6 +38,7 @@ Verification run on the reviewed implementation through `ceeed5b`:
 - `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final audit after session discovery hardening"` -> no discrete introduced correctness, security, or maintainability issues found; full Rust tests and OAuth e2e passed on this tree.
 - `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final completion audit after review fixes"` -> found four P2 OAuth edge cases; fixed in `ceeed5b`.
 - `codex review --base 006d984402bfb9492a525075bb2fefac0a5b04eb --title "v0.30 OAuth provider final completion audit after edge-case fixes"` -> no discrete correctness, security, or maintainability issues found; OAuth unit tests, cargo check, GUI build, and local OAuth e2e passed on this tree.
+- Post-audit fresh check on HEAD `77c4551`: `./scripts/oauth-e2e-test.sh` -> `oauth e2e ok`.
 
 ## Requirement Checklist
 
@@ -80,6 +81,7 @@ Current machine state inspected after commit:
 - `:8680` is currently served by PID `92942`: `/Users/<author>/.cargo/bin/rein serve --gui`.
 - Current `~/.rein/config.toml` still uses the legacy public tunnel posture: `allow_unauthenticated_loopback = true` plus `allowed_hosts`.
 - `GET http://127.0.0.1:8680/.well-known/oauth-authorization-server` currently returns GUI HTML, not OAuth metadata.
+- `curl -vkI https://<your-machine>.<your-tailnet>.ts.net/.well-known/oauth-authorization-server` from the current execution environment reaches `the local CGNAT-remapped address` but fails TLS handshake with `SSL_ERROR_SYSCALL`; public reachability must be rechecked after the OAuth cutover.
 
 Therefore the live claude.ai/Cowork gate is not yet satisfied. Completing it requires operator approval to restart or replace the current public GUI process with the OAuth-enabled build and then use claude.ai/Claude Connectors to run the actual DCR + authorize + `/mcp` flow.
 
