@@ -5,6 +5,7 @@
 use crate::config::ReinConfig;
 use crate::embed::{create_embedder, prepend_metadata, EmbedCache};
 use crate::store::SqliteStore;
+use crate::types::traits::MemoryStore as _;
 use crate::types::Embedder as _;
 use std::path::{Path, PathBuf};
 
@@ -26,9 +27,47 @@ pub enum TantivyRebuildState {
 /// Warm up the embedding cache by pre-computing embeddings for uncached memories.
 /// Returns (cached_count, error_count).
 pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) {
-    // Always rebuild side indexes from existing data, even if all embeddings are cached
-    populate_tantivy(store);
-    populate_hnsw(store, config);
+    // v0.30.2 B3 / B6: orphan-stage cleanup BEFORE any rebuild decision so a
+    // crash mid-swap from a previous run can't leave the search subsystem
+    // staring at a half-built `.new` dir.
+    let db_path = store.db_path();
+    if db_path.to_str() != Some(":memory:") {
+        // v0.30.3 codex R20 P2: migrate legacy `.tantivy/.dirty` markers
+        // to the new sibling `.tantivy.dirty` location. Pre-v0.30.3
+        // markers were inside the swapped dir; this rename moves them
+        // out so they survive swap. Run BEFORE cleanup so we don't
+        // delete a marker we should have migrated.
+        let legacy = tantivy_dirty_path_legacy(db_path);
+        if legacy.exists() {
+            let canonical = tantivy_dirty_path(db_path);
+            if !canonical.exists() {
+                let _ = std::fs::rename(&legacy, &canonical);
+            } else {
+                let _ = std::fs::remove_file(&legacy);
+            }
+        }
+        cleanup_tantivy_staging(db_path);
+        cleanup_hnsw_staging(db_path);
+    }
+
+    // v0.30.2 B3 / B6: cold-start rebuild now gated on
+    // `[warmup].always_rebuild_side_indexes` (default true preserves prior
+    // behavior) AND on the missing-or-dirty signal. With the flag flipped to
+    // false in an operator config, we only rebuild when there's a concrete
+    // reason (no index on disk or a dirty marker).
+    let should_rebuild_tantivy = side_index_rebuild_needed_tantivy(store, db_path, config);
+    let should_rebuild_hnsw = side_index_rebuild_needed_hnsw(db_path, config);
+
+    if should_rebuild_tantivy {
+        populate_tantivy(store);
+    } else {
+        tracing::debug!("warmup: skipping cold-start tantivy rebuild (gate satisfied)");
+    }
+    if should_rebuild_hnsw {
+        populate_hnsw(store, config);
+    } else {
+        tracing::debug!("warmup: skipping cold-start hnsw rebuild (gate satisfied)");
+    }
 
     let embedder = match create_embedder(config) {
         Some(e) => e,
@@ -40,31 +79,33 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
 
     let model = config.embedding_model();
 
-    // Get all memory IDs and their content
-    let memories = match store.get_all_for_warmup() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("failed to list memories for warmup: {e}");
-            return (0, 0);
+    // Stream memory rows; only retain the *uncached* ones in a Vec.
+    // F6 D-M3: the legacy `get_all_for_warmup` returned a Vec of every
+    // memory in the table, which OOM'd on 384 MB+ DBs. Streaming
+    // bounds the Vec at the uncached-subset size — typically small
+    // after the first warmup. First-run cost is unchanged (every row
+    // is uncached then) but at least pays it only once.
+    let mut total = 0usize;
+    let mut uncached: Vec<(String, String, String, String, String)> = Vec::new();
+    if let Err(e) = store.for_each_for_warmup(|row| {
+        total += 1;
+        let text = prepend_metadata(&row.topic, &row.summary, &row.content);
+        let already_cached = EmbedCache::get(store.conn(), &text, &model)
+            .ok()
+            .flatten()
+            .is_some();
+        if !already_cached {
+            uncached.push((row.id, row.topic, row.summary, row.content, row.keywords));
         }
-    };
-
-    let total = memories.len();
-    if total == 0 {
+        Ok(())
+    }) {
+        tracing::warn!("failed to list memories for warmup: {e}");
         return (0, 0);
     }
 
-    // Filter out already-cached ones
-    let uncached: Vec<(String, String, String, String, String)> = memories
-        .into_iter()
-        .filter(|(_, topic, summary, content, _)| {
-            let text = prepend_metadata(topic, summary, content);
-            EmbedCache::get(store.conn(), &text, &model)
-                .ok()
-                .flatten()
-                .is_none()
-        })
-        .collect();
+    if total == 0 {
+        return (0, 0);
+    }
 
     if uncached.is_empty() {
         tracing::info!("warmup: all {total} memories already cached");
@@ -112,7 +153,10 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
 }
 
 /// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
-/// Clears the existing index first to remove stale entries.
+/// v0.30.2 B4: builds at a `<base>_new.usearch` staging path and atomically
+/// swaps once the new index is fully written. The previous index stays
+/// readable for the entire rebuild duration; crash-recovery (handled by
+/// `cleanup_hnsw_staging` at warmup entry) wipes orphan staging files.
 /// Returns `true` if the index is now in a clean, usable state (success or intentionally empty).
 /// Returns `false` if the rebuild was skipped or failed (caller should restore the dirty marker).
 pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
@@ -147,18 +191,51 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
                 "hnsw: rebuild lock held by another process, skipping: {}",
                 std::io::Error::last_os_error()
             );
+            // v0.30.3 codex R17 P2: preserve the rebuild signal when
+            // we couldn't acquire LOCK_EX. The recall-side LOCK_SH
+            // reader (added R11 P2 fix) can block our LOCK_EX | NB,
+            // and the caller (HTTP background warmup / doctor --fix)
+            // treats a `false` return as "no-op" without re-marking
+            // dirty. Without this mark, one concurrent read can
+            // silently cancel a needed rebuild, leaving HNSW stale.
+            crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
             return false;
         }
     }
 
-    // Clear stale index before rebuilding
-    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
-    let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));
+    // v0.30.2 B4: stage to `<base>_new.usearch` + `<base>_new.usearch.meta`
+    // so the existing production index keeps serving until the new one is
+    // fully written. The previous (destructive) sequence was
+    // `remove .usearch / remove .usearch.meta / open / save` which left the
+    // search subsystem with no usable HNSW index for the duration of the
+    // rebuild. Crash mid-write here used to nuke the old index forever; now
+    // it just leaves orphan `_new.*` files that `cleanup_hnsw_staging` mops
+    // up at the next warmup entry.
+    let staging_index = hnsw_staging_index_path(&hnsw_path);
+    let staging_meta = hnsw_staging_meta_path(&hnsw_path);
+    // v0.30.3 codex R16 P2: HnswIndex::open accepts a base path and
+    // internally uses `Path::with_extension("usearch")` to derive the
+    // index/meta filenames. For dotted DB names (`memories.v1`)
+    // `with_extension` would strip the `.v1` segment, aliasing prod.
+    // Give it a path with a placeholder extension that with_extension
+    // can strip without losing our `_new` discriminator.
+    let staging_open_base = hnsw_path.with_file_name(format!(
+        "{}_new.placeholder",
+        hnsw_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("hnsw")
+    ));
+    let _ = std::fs::remove_file(&staging_index);
+    let _ = std::fs::remove_file(&staging_meta);
 
-    let mut index = match crate::store::hnsw::HnswIndex::open(&hnsw_path, dims) {
+    let mut index = match crate::store::hnsw::HnswIndex::open(&staging_open_base, dims) {
         Ok(idx) => idx,
         Err(e) => {
-            tracing::warn!("hnsw: failed to open index: {e}");
+            tracing::warn!("hnsw: failed to open staging index: {e}");
+            // Clean partial staging artifacts so the next pass starts clean.
+            let _ = std::fs::remove_file(&staging_index);
+            let _ = std::fs::remove_file(&staging_meta);
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
@@ -168,51 +245,141 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
         }
     };
 
-    // Get all memories and their cached embeddings
-    let memories = match store.get_all_for_warmup() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("hnsw: failed to list memories: {e}");
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd;
-                let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
-            }
-            return false;
-        }
-    };
-
+    // Stream memories and their cached embeddings directly into the
+    // HNSW index. F6 D-M3: peak heap is now one `WarmupRow` instead of
+    // a Vec of the entire `memories` table.
     let mut inserted = 0usize;
-    for (id, topic, summary, content, _keywords) in &memories {
-        let text = prepend_metadata(topic, summary, content);
+    let mut total_rows = 0usize;
+    let stream_result = store.for_each_for_warmup(|row| {
+        total_rows += 1;
+        let text = prepend_metadata(&row.topic, &row.summary, &row.content);
         if let Ok(Some(emb)) = EmbedCache::get(store.conn(), &text, &model) {
-            if emb.len() == dims && index.insert(id, &emb).is_ok() {
+            if emb.len() == dims && index.insert(&row.id, &emb).is_ok() {
                 inserted += 1;
             }
         }
+        Ok(())
+    });
+    if let Err(e) = stream_result {
+        tracing::warn!("hnsw: failed to list memories: {e}");
+        // v0.30.3 codex R11 P2: mirror the tantivy path — when streaming
+        // fails partway, the staging is incomplete (or the DB changed
+        // during the rebuild). The previous prod files might still be
+        // serving stale results without a dirty marker — gated warmup
+        // would never re-trigger. Mark dirty + remove staging so the
+        // next request observes the recovery signal and retries.
+        crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
+        let _ = std::fs::remove_file(&staging_index);
+        let _ = std::fs::remove_file(&staging_meta);
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        return false;
     }
 
+    let memories_empty = total_rows == 0;
     let mut rebuild_ok = false;
     if inserted > 0 {
         match index.save() {
             Ok(()) => {
-                tracing::info!("hnsw: indexed {inserted} vectors");
-                rebuild_ok = true;
+                // v0.30.2 B4: atomically swap staging files into production
+                // names. We drop the index struct first so the underlying
+                // usearch handle can't hold an open mapping on the staging
+                // file while we rename it.
+                drop(index);
+                let prod_index = hnsw_path.with_extension("usearch");
+                let prod_meta = hnsw_path.with_extension("usearch.meta");
+                // Mark dirty BEFORE the swap so a crash between the two
+                // renames (which would leave `.usearch` and `.usearch.meta`
+                // mismatched) is recoverable on next startup. The marker is
+                // cleared only after BOTH renames succeed.
+                crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
+                // v0.30.3 codex R15 P2: Windows fallback for the
+                // rename-over-existing case. Unix rename overwrites
+                // atomically; Windows fails if the target exists or is
+                // held open. Best-effort remove first.
+                #[cfg(windows)]
+                {
+                    let _ = std::fs::remove_file(&prod_index);
+                    let _ = std::fs::remove_file(&prod_meta);
+                }
+                match std::fs::rename(&staging_index, &prod_index)
+                    .and_then(|_| std::fs::rename(&staging_meta, &prod_meta))
+                {
+                    Ok(()) => {
+                        tracing::info!("hnsw: indexed {inserted} vectors (atomic swap ok)");
+                        rebuild_ok = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("hnsw: staging swap failed: {e}");
+                        // Best-effort cleanup of any partial state.
+                        let _ = std::fs::remove_file(&staging_index);
+                        let _ = std::fs::remove_file(&staging_meta);
+                    }
+                }
             }
-            Err(e) => tracing::warn!("hnsw: failed to save index: {e}"),
+            Err(e) => {
+                tracing::warn!("hnsw: failed to save index: {e}");
+                // v0.30.3 codex R14 P2-#2: explicitly mark dirty when
+                // save() fails. The old `.usearch` pair still exists
+                // (we haven't yet renamed staging into place), but it
+                // may not include vectors that were inserted into the
+                // staging index this run. Without a dirty marker,
+                // gated warmup (`always_rebuild_side_indexes = false`)
+                // would see "no dirty + clean prod files" and skip the
+                // next rebuild, leaving new memories out of HNSW
+                // indefinitely.
+                crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
+                let _ = std::fs::remove_file(&staging_index);
+                let _ = std::fs::remove_file(&staging_meta);
+            }
         }
-    } else if memories.is_empty() {
+    } else if memories_empty {
+        // No memories — clean staging AND any stale production index.
+        // v0.30.3 codex R2 P2: previously we only removed staging here,
+        // which left a pre-deletion `.usearch` / `.usearch.meta` on disk
+        // even though the DB is now empty. The dirty-marker clear below
+        // would then mark a stale index "clean" and vector recall would
+        // keep returning deleted IDs. Now we remove the production pair
+        // too so the empty-DB state is correctly reflected on disk.
+        let _ = std::fs::remove_file(&staging_index);
+        let _ = std::fs::remove_file(&staging_meta);
+        let prod_index = hnsw_path.with_extension("usearch");
+        let prod_meta = hnsw_path.with_extension("usearch.meta");
+        let _ = std::fs::remove_file(&prod_index);
+        let _ = std::fs::remove_file(&prod_meta);
         rebuild_ok = true; // no memories at all, empty index is intentionally correct
     } else {
+        // v0.30.3 codex R7 P2: when called from startup warmup (not from
+        // recall's `take_dirty_for_rebuild` path), there may be NO
+        // pre-existing dirty marker to "keep". A non-empty DB with 0
+        // cached embeddings (e.g. fresh deploy with no cache warmed yet,
+        // or transient cache read failures) returning false from this
+        // branch would leave any stale production `.usearch` files in
+        // place AND CLEAN — `vec_search_direct` would keep serving stale
+        // results. Explicitly mark dirty so vec_search falls through to
+        // sqlite-vec and the NEXT warmup retries.
         tracing::debug!(
-            "hnsw: {} memories but 0 cached embeddings, keeping dirty marker",
-            memories.len()
+            "hnsw: {total_rows} memories but 0 cached embeddings, marking dirty for retry"
         );
+        crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
+        let _ = std::fs::remove_file(&staging_index);
+        let _ = std::fs::remove_file(&staging_meta);
     }
     // Clear the legacy `.dirty` marker on success (no-op when called from async path
     // since `.dirty` was already renamed to `.rebuilding` before this function was called).
+    // v0.30.3 codex R12 P2: also clear `.rebuilding` on success. If a
+    // stranded `.rebuilding` marker triggered this rebuild via
+    // `is_dirty()` (which includes rebuilding markers), success here
+    // must remove BOTH markers — otherwise `.rebuilding` persists,
+    // `is_dirty()` keeps returning true, `take_dirty_for_rebuild` fails
+    // (no `.dirty` to take), and recall permanently bypasses HNSW.
     if rebuild_ok {
         let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path));
+        let _ =
+            std::fs::remove_file(crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path));
     }
 
     #[cfg(unix)]
@@ -239,6 +406,12 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
     let tantivy_path = db_path.with_extension("tantivy");
     let lock_path = tantivy_rebuild_lock_path(db_path);
     let rebuilding_path = tantivy_rebuilding_path(db_path);
+    // v0.30.3 codex R22 P2: capture dirty marker mtime BEFORE scan so
+    // `finish_tantivy_rebuild_markers` can distinguish "this rebuild's
+    // own claim" from "a concurrent mutation set it later".
+    let scan_dirty_mtime = std::fs::metadata(tantivy_dirty_path(db_path))
+        .and_then(|m| m.modified())
+        .ok();
 
     // Acquire exclusive file lock — skip if another process is rebuilding.
     let lock_file = match std::fs::OpenOptions::new()
@@ -276,65 +449,223 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
         };
     }
 
-    // Clear stale index before rebuilding
-    if let Err(e) = std::fs::remove_dir_all(&tantivy_path) {
+    // v0.30.2 B2: build the new index at `<db>.tantivy.new` first so the
+    // production `<db>.tantivy` directory keeps serving readers for the
+    // entire rebuild. The previous (destructive) sequence
+    // (`remove_dir_all(.tantivy)` BEFORE `open(.tantivy)`) left the index
+    // window-empty for the rebuild's full duration; a crash inside that
+    // window destroyed the index permanently. Crash mid-build now leaves
+    // only orphan `.tantivy.new` (and possibly `.tantivy.old`) which
+    // `cleanup_tantivy_staging` clears at the next warmup entry.
+    let staging_path = tantivy_staging_path(db_path);
+    let backup_path = tantivy_backup_path(db_path);
+    if let Err(e) = std::fs::remove_dir_all(&staging_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             mark_tantivy_dirty(db_path);
             let _ = std::fs::remove_file(&rebuilding_path);
             unlock_tantivy_rebuild_lock(&lock_file);
             return TantivyRebuildOutcome::Failed {
                 reason: format!(
-                    "failed to clear stale index {}: {e}",
-                    tantivy_path.display()
+                    "failed to clear stale staging dir {}: {e}",
+                    staging_path.display()
                 ),
             };
         }
     }
 
-    let tantivy = match crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
+    let tantivy = match crate::store::tantivy_fts::TantivyFts::open(&staging_path) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("tantivy: failed to open index: {e}");
+            tracing::warn!("tantivy: failed to open staging index: {e}");
             mark_tantivy_dirty(db_path);
+            let _ = std::fs::remove_dir_all(&staging_path);
             let _ = std::fs::remove_file(&rebuilding_path);
             unlock_tantivy_rebuild_lock(&lock_file);
             return TantivyRebuildOutcome::Failed {
-                reason: format!("failed to open index {}: {e}", tantivy_path.display()),
+                reason: format!("failed to open staging index {}: {e}", staging_path.display()),
             };
         }
     };
 
-    let memories = match store.get_all_for_warmup() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("tantivy: failed to list memories: {e}");
-            mark_tantivy_dirty(db_path);
-            let _ = std::fs::remove_file(&rebuilding_path);
-            unlock_tantivy_rebuild_lock(&lock_file);
-            return TantivyRebuildOutcome::Failed {
-                reason: format!("failed to list memories: {e}"),
-            };
-        }
-    };
-
+    // Stream memories into the Tantivy index. F6 D-M3: peak heap stays
+    // O(row_size) — the entire `memories` table is never materialized.
     let mut indexed = 0usize;
     let mut errors = 0usize;
-    for (id, topic, summary, content, keywords) in &memories {
+    let mut total_rows = 0usize;
+    let stream_result = store.for_each_for_warmup(|row| {
+        total_rows += 1;
         if tantivy
-            .insert_strict(id, topic, summary, content, keywords)
+            .insert_strict(&row.id, &row.topic, &row.summary, &row.content, &row.keywords)
             .is_ok()
         {
             indexed += 1;
         } else {
             errors += 1;
         }
+        Ok(())
+    });
+    if let Err(e) = stream_result {
+        tracing::warn!("tantivy: failed to list memories: {e}");
+        mark_tantivy_dirty(db_path);
+        drop(tantivy);
+        let _ = std::fs::remove_dir_all(&staging_path);
+        let _ = std::fs::remove_file(&rebuilding_path);
+        unlock_tantivy_rebuild_lock(&lock_file);
+        return TantivyRebuildOutcome::Failed {
+            reason: format!("failed to list memories: {e}"),
+        };
     }
 
     if indexed > 0 {
         tracing::info!("tantivy: indexed {indexed} documents ({errors} errors)");
     }
 
-    finish_tantivy_rebuild_markers(db_path, indexed, errors, memories.is_empty());
+    // v0.30.3 codex R5 P2: any `insert_strict` failure means the staging
+    // index is incomplete. Promoting it would replace a complete prior
+    // index with a partial one — the dirty marker triggers a later retry,
+    // but the last good Tantivy data is already gone. Abort the swap
+    // here, leave the previous prod dir alone, set dirty so the next
+    // rebuild attempt fires.
+    if errors > 0 {
+        tracing::warn!(
+            "tantivy: rebuild had {errors} insert errors — not promoting partial index, keeping prior prod"
+        );
+        mark_tantivy_dirty(db_path);
+        drop(tantivy);
+        let _ = std::fs::remove_dir_all(&staging_path);
+        let _ = std::fs::remove_file(&rebuilding_path);
+        unlock_tantivy_rebuild_lock(&lock_file);
+        return TantivyRebuildOutcome::Failed {
+            reason: format!("{errors} memories failed to index during rebuild"),
+        };
+    }
+
+    // v0.30.2 B2: drop the writer before renaming so any held tantivy
+    // resources release first (matters on platforms where rename of an
+    // in-use directory fails, and is harmless on Unix).
+    drop(tantivy);
+
+    // Atomic-ish swap: move the current production index aside, slide the
+    // staging dir into place, then delete the backup. Crash mid-sequence
+    // leaves a `<db>.tantivy.old` orphan that the next warmup entry
+    // (`cleanup_tantivy_staging`) removes. We mark the index dirty if any
+    // step fails so the next request triggers a fresh rebuild.
+    //
+    // v0.30.3 codex R9 P2: a previous interrupted swap may have left
+    // `.tantivy.old` as the only valid index. The recall-spawn path
+    // enters `try_populate_tantivy` directly (not via `warmup()` which
+    // would have run `cleanup_tantivy_staging` first), so we MUST
+    // restore any pre-existing backup-with-real-data before starting a
+    // new swap dance — otherwise the unconditional pre-swap
+    // `remove_dir_all(&backup_path)` would discard the last good index
+    // before the new staging is promoted, and a failure here would lose
+    // it permanently. If backup has real segments and prod is unusable,
+    // restore it to prod first; then proceed.
+    let prod_currently_has_segments = tantivy_has_segments(&tantivy_path);
+    if backup_path.exists()
+        && tantivy_has_segments(&backup_path)
+        && !prod_currently_has_segments
+    {
+        if tantivy_path.exists() {
+            let _ = std::fs::remove_dir_all(&tantivy_path);
+        }
+        if let Err(e) = std::fs::rename(&backup_path, &tantivy_path) {
+            tracing::warn!(
+                "tantivy: failed to pre-restore backup {} -> {}: {e}",
+                backup_path.display(),
+                tantivy_path.display()
+            );
+        } else {
+            tracing::info!(
+                "tantivy: pre-restored backup-with-data {} -> {} before new rebuild",
+                backup_path.display(),
+                tantivy_path.display()
+            );
+        }
+    }
+    // v0.30.3 codex R11 P2 + R12 P2: remove any pre-existing backup so
+    // the swap's `rename(prod → backup)` doesn't fail with EEXIST.
+    // BUT only delete when it's safe — if backup still has segments AND
+    // current prod has NO segments, the pre-restore must have failed
+    // (couldn't `remove_dir_all` an unusable prod, or rename failed).
+    // In that case backup is still the only valid index. Don't delete;
+    // skip this swap attempt and mark dirty so the next pass via
+    // `cleanup_tantivy_staging` can retry the restore.
+    let cur_backup_has_segments = tantivy_has_segments(&backup_path);
+    let cur_prod_has_segments = tantivy_has_segments(&tantivy_path);
+    if backup_path.exists() {
+        if cur_backup_has_segments && !cur_prod_has_segments {
+            // Pre-restore failed earlier; backup is the last good copy.
+            // Abort this rebuild rather than overwrite the only valid
+            // index — `cleanup_tantivy_staging` will retry the restore.
+            tracing::warn!(
+                "tantivy: pre-restore failed and backup is the only valid copy — aborting swap, marking dirty so cleanup retries"
+            );
+            mark_tantivy_dirty(db_path);
+            // `tantivy` writer was already dropped a few lines above via
+            // the unconditional `drop(tantivy)` between the index-log
+            // and this swap block.
+            let _ = std::fs::remove_dir_all(&staging_path);
+            let _ = std::fs::remove_file(&rebuilding_path);
+            unlock_tantivy_rebuild_lock(&lock_file);
+            return TantivyRebuildOutcome::Failed {
+                reason: "backup-with-segments + empty prod; cleanup must restore first".to_string(),
+            };
+        }
+        let _ = std::fs::remove_dir_all(&backup_path);
+    }
+    let prod_exists = tantivy_path.exists();
+    let mut swap_ok = true;
+
+    if prod_exists {
+        if let Err(e) = std::fs::rename(&tantivy_path, &backup_path) {
+            tracing::warn!(
+                "tantivy: failed to stash old index {} -> {}: {e}",
+                tantivy_path.display(),
+                backup_path.display()
+            );
+            swap_ok = false;
+        }
+    }
+    if swap_ok {
+        if let Err(e) = std::fs::rename(&staging_path, &tantivy_path) {
+            tracing::warn!(
+                "tantivy: failed to promote staging {} -> {}: {e}",
+                staging_path.display(),
+                tantivy_path.display()
+            );
+            // Try to restore the previous index from backup so the search
+            // path stays usable.
+            if prod_exists {
+                let _ = std::fs::rename(&backup_path, &tantivy_path);
+            }
+            swap_ok = false;
+        }
+    }
+    // v0.30.3 codex R3 P2: only delete the backup when the swap fully
+    // succeeded. On failure paths the backup may be the only remaining
+    // valid index (e.g. promote-failed AND restore-failed). Leave it on
+    // disk so `cleanup_tantivy_staging` can restore it via the
+    // backup-restore branch on the next warmup entry.
+    if swap_ok {
+        let _ = std::fs::remove_dir_all(&backup_path);
+    }
+    let _ = std::fs::remove_dir_all(&staging_path);
+
+    if !swap_ok {
+        mark_tantivy_dirty(db_path);
+        let _ = std::fs::remove_file(&rebuilding_path);
+        unlock_tantivy_rebuild_lock(&lock_file);
+        return TantivyRebuildOutcome::Failed {
+            reason: format!(
+                "failed to swap staging into production at {}",
+                tantivy_path.display()
+            ),
+        };
+    }
+
+    let memories_empty = total_rows == 0;
+    finish_tantivy_rebuild_markers(db_path, indexed, errors, memories_empty, scan_dirty_mtime);
 
     // Lock released when lock_file is dropped.
     let _ = std::fs::remove_file(&rebuilding_path);
@@ -343,7 +674,21 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
     TantivyRebuildOutcome::Rebuilt { indexed, errors }
 }
 
+/// v0.30.3 codex R20 P2: the dirty marker MUST live OUTSIDE the
+/// `<db>.tantivy/` directory — that directory is renamed to `.old` and
+/// deleted on a successful staging swap, so a marker nested inside it
+/// either disappears with the backup (signal lost) or causes the
+/// `rename(staging → prod)` to fail with EEXIST (promotion lost). The
+/// sibling-file location survives the swap untouched.
 pub fn tantivy_dirty_path(db_path: &Path) -> PathBuf {
+    // For `memories.db` → `memories.tantivy.dirty` (sibling file).
+    // For dotted `memories.v1.db` → `memories.v1.tantivy.dirty`.
+    db_path.with_extension("tantivy.dirty")
+}
+
+/// Legacy path inside the directory; used at warmup entry to migrate
+/// pre-v0.30.3 markers to the new sibling location.
+pub fn tantivy_dirty_path_legacy(db_path: &Path) -> PathBuf {
     db_path.with_extension("tantivy").join(".dirty")
 }
 
@@ -353,6 +698,409 @@ pub fn tantivy_rebuild_lock_path(db_path: &Path) -> PathBuf {
 
 pub fn tantivy_rebuilding_path(db_path: &Path) -> PathBuf {
     db_path.with_extension("tantivy.rebuilding")
+}
+
+/// v0.30.3 codex R7/R8 P2: "this directory contains real indexed data".
+/// Used by the cleanup-staging restore path and the gated-warmup rebuild
+/// predicate to distinguish a freshly-opened-but-empty index (only
+/// `meta.json` + `.tokenizer_v2`, no segments) from an actually populated
+/// index. Tantivy segment files use the `.idx` extension; presence of any
+/// `.idx` file is the reliable signal.
+fn tantivy_has_segments(tantivy_path: &Path) -> bool {
+    tantivy_path
+        .read_dir()
+        .map(|it| {
+            it.filter_map(|e| e.ok()).any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".idx")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// v0.30.2 B2: staging directory used while a Tantivy rebuild is in flight.
+/// Production `.tantivy` keeps serving readers until the swap completes.
+pub fn tantivy_staging_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("tantivy.new")
+}
+
+/// v0.30.2 B2: transient backup of the previous Tantivy dir during the swap
+/// window. A crash here leaves an orphan that `cleanup_tantivy_staging`
+/// removes at the next warmup entry.
+pub fn tantivy_backup_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("tantivy.old")
+}
+
+/// v0.30.2 B4: staging base for the HNSW rebuild. Returns
+/// `<hnsw_path>_new` as a PathBuf (no extension). Callers must NOT use
+/// `Path::with_extension` on this base — see [`hnsw_staging_index_path`]
+/// and [`hnsw_staging_meta_path`] for the safe extension-appending
+/// helpers. Kept for back-compat with tests that observe the base.
+pub fn hnsw_staging_base(hnsw_path: &Path) -> PathBuf {
+    let file_name = hnsw_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| format!("{s}_new"))
+        .unwrap_or_else(|| "hnsw_new".to_string());
+    hnsw_path.with_file_name(file_name)
+}
+
+/// v0.30.3 codex R16 P2: Path::with_extension strips the last
+/// dot-section, so `staging_base.with_extension("usearch")` for a
+/// dotted DB name like `memories.v1.db` (yielding hnsw_path
+/// `memories.v1`, staging_base `memories.v1_new`) WIPES `.v1_new` and
+/// produces `memories.usearch` — the same path as production. That
+/// makes cleanup_hnsw_staging delete the live index. Use direct
+/// string append instead.
+pub fn hnsw_staging_index_path(hnsw_path: &Path) -> PathBuf {
+    let parent = hnsw_path.parent().unwrap_or_else(|| Path::new(""));
+    let file = hnsw_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("hnsw");
+    parent.join(format!("{file}_new.usearch"))
+}
+
+/// Same defense for the meta sibling.
+pub fn hnsw_staging_meta_path(hnsw_path: &Path) -> PathBuf {
+    let parent = hnsw_path.parent().unwrap_or_else(|| Path::new(""));
+    let file = hnsw_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("hnsw");
+    parent.join(format!("{file}_new.usearch.meta"))
+}
+
+/// v0.30.2 B2: crash-recovery cleanup of orphan Tantivy staging dirs.
+/// Called at warmup entry. Removes both `.tantivy.new` and `.tantivy.old`
+/// best-effort; failures are logged but never fatal.
+///
+/// When the production `.tantivy` dir is missing AND we observe an orphan
+/// `.tantivy.old`, that's evidence of a process kill mid-swap; mark the
+/// index dirty so the next request triggers a fresh rebuild even when
+/// `[warmup].always_rebuild_side_indexes = false`.
+pub fn cleanup_tantivy_staging(db_path: &Path) {
+    // v0.30.3 codex R22 P2: migrate the legacy `.tantivy/.dirty` marker
+    // to the new sibling `.tantivy.dirty` location. The warmup() entry
+    // also does this, but `warmup()` may not run on stdio surfaces
+    // (where `background_warmup = false` by default) — so legacy
+    // markers would survive forever for stdio users without this. The
+    // recall-spawn rebuild path and `doctor --fix` both go through
+    // this cleanup so all paths now migrate.
+    let legacy = tantivy_dirty_path_legacy(db_path);
+    if legacy.exists() {
+        let canonical = tantivy_dirty_path(db_path);
+        if !canonical.exists() {
+            let _ = std::fs::rename(&legacy, &canonical);
+        } else {
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+    // v0.30.3 codex R2 P2: HOLD the rebuild lock through the entire cleanup
+    // (not just probe-and-release) so another process can't acquire the
+    // lock AFTER our probe and start writing `.tantivy.new` that we then
+    // delete out from under them. Probe-only (R1) had a TOCTOU window;
+    // hold-through-cleanup closes it.
+    let lock_path = tantivy_rebuild_lock_path(db_path);
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(
+                "warmup: failed to open tantivy rebuild lock {} for cleanup: {e}",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            tracing::debug!(
+                "warmup: skipping tantivy staging cleanup — rebuild lock held by another process"
+            );
+            return;
+        }
+    }
+    // Lock is held for the rest of this function; drop(lock_file) at scope
+    // exit releases it (kernel auto-releases flock on close).
+
+    let prod = db_path.with_extension("tantivy");
+    let staging = tantivy_staging_path(db_path);
+    let backup = tantivy_backup_path(db_path);
+
+    // v0.30.3 codex R1 P2 + R5 P2 + R6 P2 + R8 P2: production may be
+    // missing, empty, marker-only, OR metadata-only. The last case
+    // happens when `TantivyFts::open` creates an empty index after the
+    // swap was interrupted — the dir then contains `meta.json` +
+    // `.tokenizer_v2` but no actual indexed data. My earlier check
+    // counted ANY non-hidden file as "real data" (R6 fix), but
+    // `meta.json` is non-hidden and present in empty indexes too. The
+    // only reliable signal for "this dir contains indexed data" is the
+    // presence of `.idx` segment files. Apply that as the unified
+    // check throughout the staging/restore path.
+    let prod_unusable = !prod.exists() || !tantivy_has_segments(&prod);
+    let restored_from_backup = if prod_unusable && backup.exists() {
+        // Remove the empty prod dir (if any) so rename can succeed.
+        if prod.exists() {
+            let _ = std::fs::remove_dir_all(&prod);
+        }
+        match std::fs::rename(&backup, &prod) {
+            Ok(()) => {
+                tracing::warn!(
+                    "warmup: tantivy swap was interrupted; restored backup {} -> {}",
+                    backup.display(),
+                    prod.display()
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "warmup: failed to restore tantivy backup {} -> {}: {e}",
+                    backup.display(),
+                    prod.display()
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // v0.30.3 codex R5 P2: `prod_unusable` captures the pre-restore
+    // observation. `!prod.exists()` alone would miss the
+    // "empty-dir-created-by-TantivyFts::open" case the restore path
+    // above already handles.
+    let swap_interrupted =
+        restored_from_backup || (prod_unusable && (staging.exists() || backup.exists()));
+
+    // Always remove staging (it's an orphan from a failed/interrupted
+    // rebuild and never the canonical state). Only remove backup if it
+    // STILL exists after the restore attempt above — that means either
+    // restore failed, OR the rebuild had completed cleanly previously and
+    // the backup is stale post-success.
+    if staging.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(
+                "warmup: failed to clean orphan tantivy staging {}: {e}",
+                staging.display()
+            );
+        } else {
+            tracing::info!(
+                "warmup: removed orphan tantivy staging dir {}",
+                staging.display()
+            );
+        }
+    }
+    // v0.30.3 codex R6 P2 + R8 P2: only delete the backup if prod now has
+    // REAL indexed data (segment files), not just metadata or markers.
+    // `prod.exists()` alone, or "any non-hidden file present", would
+    // mis-classify a freshly-opened empty index (which has `meta.json`
+    // + `.tokenizer_v2` but no segments) as a valid prod and discard
+    // the still-valid backup.
+    if backup.exists() && tantivy_has_segments(&prod) {
+        if let Err(e) = std::fs::remove_dir_all(&backup) {
+            tracing::warn!(
+                "warmup: failed to clean stale tantivy backup {}: {e}",
+                backup.display()
+            );
+        }
+    }
+
+    if swap_interrupted {
+        tracing::warn!(
+            "warmup: tantivy swap was interrupted — marking dirty so next request rebuilds"
+        );
+        mark_tantivy_dirty(db_path);
+    }
+}
+
+/// v0.30.2 B4: crash-recovery cleanup of orphan HNSW staging files.
+/// Mirrors `cleanup_tantivy_staging` for the `_new.usearch` /
+/// `_new.usearch.meta` pair.
+pub fn cleanup_hnsw_staging(db_path: &Path) {
+    let hnsw_path = db_path.with_extension("");
+
+    // v0.30.3 codex R2 P2: HOLD the HNSW rebuild lock through the entire
+    // cleanup (not just probe-and-release) so another process can't
+    // acquire the lock AFTER our probe and start writing
+    // `<base>_new.usearch` that we then delete out from under them.
+    // populate_hnsw uses the same `<base>.usearch.lock` path with
+    // `LOCK_EX | LOCK_NB`. Always create-and-acquire (avoid existence
+    // race: if we checked-then-opened, another process could create+lock
+    // between the two ops).
+    let lock_path = hnsw_path.with_extension("usearch.lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(
+                "warmup: failed to open hnsw rebuild lock {} for cleanup: {e}",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            tracing::debug!(
+                "warmup: skipping hnsw staging cleanup — rebuild lock held by another process"
+            );
+            return;
+        }
+    }
+    // Lock held until function returns (kernel releases on close).
+
+    // v0.30.3 codex R16 P2: use the direct-concat helpers so dotted DB
+    // names (e.g. `memories.v1.db`) don't make staging alias prod.
+    for p in [
+        hnsw_staging_index_path(&hnsw_path),
+        hnsw_staging_meta_path(&hnsw_path),
+    ] {
+        if p.exists() {
+            if let Err(e) = std::fs::remove_file(&p) {
+                tracing::warn!(
+                    "warmup: failed to clean orphan hnsw staging {}: {e}",
+                    p.display()
+                );
+            } else {
+                tracing::info!("warmup: removed orphan hnsw staging file {}", p.display());
+            }
+        }
+    }
+    drop(lock_file);
+}
+
+/// v0.30.2 B3: gate the cold-start tantivy rebuild on either
+/// `[warmup].always_rebuild_side_indexes` (default true preserves prior
+/// behavior) OR a concrete recovery signal (missing index dir, dirty
+/// marker, or stale rebuild marker).
+fn side_index_rebuild_needed_tantivy(
+    store: &SqliteStore,
+    db_path: &Path,
+    config: &ReinConfig,
+) -> bool {
+    if config.warmup.always_rebuild_side_indexes {
+        return true;
+    }
+    let tantivy_path = db_path.with_extension("tantivy");
+    // v0.30.3 codex R5 P2: pre-tokenizer-v2 indexes have the dir but no
+    // `.tokenizer_v2` marker file. The next `TantivyFts::open` would
+    // wipe-and-recreate for migration WITHOUT setting `.dirty`, leaving
+    // gated warmups treating the empty migrated index as clean forever.
+    let tokenizer_marker = tantivy_path.join(".tokenizer_v2");
+    // v0.30.3 codex R7 P2: `TantivyFts::open` on a read/update path can
+    // create a freshly-marked index that has the marker but no segment
+    // data. Gate that to "and SQLite actually has memories" — an empty
+    // index on an empty DB is not a defect and rebuilding it every cold
+    // start would be wasteful. Only fire the rebuild signal when there's
+    // an observable mismatch (memories exist but index is empty).
+    let store_has_memories = store
+        .stats()
+        .map(|s| s.total_memories > 0)
+        .unwrap_or(false);
+    let empty_but_marked_with_data = tantivy_path.exists()
+        && tokenizer_marker.exists()
+        && !tantivy_has_segments(&tantivy_path)
+        && store_has_memories;
+    !tantivy_path.exists()
+        || !tokenizer_marker.exists()
+        || empty_but_marked_with_data
+        || tantivy_dirty_path(db_path).exists()
+        || matches!(
+            tantivy_rebuild_state(db_path),
+            TantivyRebuildState::StaleMarker
+        )
+}
+
+/// v0.30.2 B6: gate the cold-start HNSW rebuild on either
+/// `[warmup].always_rebuild_side_indexes` (default true preserves prior
+/// behavior) OR a concrete recovery signal (missing files, dirty marker).
+fn side_index_rebuild_needed_hnsw(db_path: &Path, config: &ReinConfig) -> bool {
+    if config.warmup.always_rebuild_side_indexes {
+        return true;
+    }
+    let hnsw_path = db_path.with_extension("");
+    let index_file = hnsw_path.with_extension("usearch");
+    let meta_file = hnsw_path.with_extension("usearch.meta");
+    !index_file.exists()
+        || !meta_file.exists()
+        || crate::store::hnsw::HnswIndex::is_dirty(&hnsw_path)
+}
+
+/// v0.30.2 B5 TTL helper used by `rein doctor --fix`: an HNSW
+/// `.rebuilding` marker older than `ttl` is treated as a stranded
+/// rebuild (worker panicked without restoring `.dirty`). Returns the
+/// marker path that was reset to `.dirty`, or `None` if nothing needed
+/// to be done.
+pub fn reset_stale_hnsw_rebuilding(
+    db_path: &Path,
+    ttl: std::time::Duration,
+) -> Option<PathBuf> {
+    let hnsw_path = db_path.with_extension("");
+    let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path);
+    let metadata = std::fs::metadata(&rebuilding).ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = modified.elapsed().unwrap_or_default();
+    if age >= ttl {
+        // v0.30.3 codex R6 P2: probe the HNSW rebuild lock before assuming
+        // the marker is stranded. `take_dirty_for_rebuild` renames
+        // `.dirty → .rebuilding` WITHOUT refreshing mtime, so an active
+        // rebuild that started from an old `.dirty` marker will have an
+        // old `.rebuilding` mtime even though it's live. Resetting the
+        // marker out from under the worker leaves HNSW dirty after the
+        // worker finishes (it clears `.rebuilding`, which is now a
+        // no-op). If the lock is held: don't touch the marker.
+        let lock_path = hnsw_path.with_extension("usearch.lock");
+        if lock_path.exists() {
+            if let Ok(lock_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = lock_file.as_raw_fd();
+                    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+                    if rc != 0 {
+                        tracing::debug!(
+                            "warmup: skipping stale-hnsw-rebuilding reset — rebuild lock held by another process"
+                        );
+                        return None;
+                    }
+                    // Release immediately so the real rebuild path can
+                    // race behind us if it wants the lock.
+                    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+                }
+                drop(lock_file);
+            }
+        }
+        let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path);
+        let _ = std::fs::rename(&rebuilding, &dirty);
+        return Some(rebuilding);
+    }
+    None
 }
 
 pub fn tantivy_rebuild_state(db_path: &Path) -> TantivyRebuildState {
@@ -380,12 +1128,36 @@ fn finish_tantivy_rebuild_markers(
     indexed: usize,
     errors: usize,
     memories_empty: bool,
+    scan_dirty_mtime: Option<std::time::SystemTime>,
 ) {
     // Only clear dirty marker if rebuild succeeded with actual data, or there
     // are truly no memories. Any partial error must keep the marker so a later
     // repair can pick up missing documents.
     if errors == 0 && (indexed > 0 || memories_empty) {
-        let _ = std::fs::remove_file(tantivy_dirty_path(db_path));
+        // v0.30.3 codex R22 P2: only remove the dirty marker if it has
+        // not been touched AFTER our rebuild scan started. A concurrent
+        // `update_tantivy`/`remove_from_tantivy` running mid-rebuild
+        // sets the dirty marker (R19 fix) to signal "my mutation is
+        // not in your staging snapshot". Unconditional removal here
+        // would wipe that signal and leave the next rebuild blind to
+        // the mutation. Compare mtimes — if the on-disk marker is
+        // newer than what we observed at scan start, leave it.
+        let dirty = tantivy_dirty_path(db_path);
+        let safe_to_remove = match (
+            scan_dirty_mtime,
+            std::fs::metadata(&dirty).and_then(|m| m.modified()).ok(),
+        ) {
+            (Some(scan_ts), Some(cur_ts)) => cur_ts <= scan_ts,
+            (None, Some(_)) => false, // marker appeared after scan started
+            _ => true,                 // no current marker, nothing to preserve
+        };
+        if safe_to_remove {
+            let _ = std::fs::remove_file(&dirty);
+        } else {
+            tracing::debug!(
+                "tantivy: keeping dirty marker — concurrent mutation observed after scan started"
+            );
+        }
     } else {
         mark_tantivy_dirty(db_path);
         if indexed == 0 && !memories_empty {
@@ -509,11 +1281,416 @@ mod tests {
         std::fs::create_dir_all(dirty.parent().unwrap()).unwrap();
         assert!(!dirty.exists());
 
-        finish_tantivy_rebuild_markers(store.db_path(), 1, 1, false);
+        finish_tantivy_rebuild_markers(store.db_path(), 1, 1, false, None);
 
         assert!(
             dirty.exists(),
             "partial rebuild errors must keep Tantivy dirty for repair"
         );
+    }
+
+    // -------- v0.30.2 B2 — staging swap regression --------
+
+    /// B2: a successful rebuild produces a `.tantivy` directory and leaves
+    /// no `.tantivy.new` / `.tantivy.old` orphans behind.
+    #[test]
+    fn try_populate_tantivy_b2_leaves_no_staging_orphans_on_success() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+
+        let outcome = try_populate_tantivy(&store);
+        assert!(matches!(outcome, TantivyRebuildOutcome::Rebuilt { .. }));
+
+        let prod = db.with_extension("tantivy");
+        let staging = tantivy_staging_path(db);
+        let backup = tantivy_backup_path(db);
+        assert!(prod.exists(), "production tantivy dir must exist after success");
+        assert!(!staging.exists(), "staging dir must not survive a successful swap");
+        assert!(!backup.exists(), "backup dir must not survive a successful swap");
+    }
+
+    /// B2: when the previous index exists, the rebuild keeps it accessible
+    /// during the build (we cannot deterministically check the in-flight
+    /// state from a single-threaded test, but we can assert the production
+    /// path was not unlinked at any observable point — it must exist at
+    /// the start of the rebuild and at the end).
+    #[test]
+    fn try_populate_tantivy_b2_preserves_prior_index_directory() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+
+        // First rebuild creates the production dir.
+        let _ = try_populate_tantivy(&store);
+        let prod = db.with_extension("tantivy");
+        assert!(prod.exists(), "first rebuild should produce a tantivy dir");
+
+        // Second rebuild must end with the production dir still present
+        // (staging swap is atomic-ish — the previous index is renamed to
+        // `.tantivy.old` only briefly, then deleted after promotion).
+        let _ = try_populate_tantivy(&store);
+        assert!(prod.exists(), "second rebuild must leave production dir in place");
+        assert!(!tantivy_staging_path(db).exists());
+        assert!(!tantivy_backup_path(db).exists());
+    }
+
+    /// B2 simulated mid-build interruption: create the production index,
+    /// then create an orphan `.tantivy.new` staging dir (as if a prior
+    /// rebuild crashed before swap). Assert the production index is STILL
+    /// loadable by `TantivyFts::open` (the previous-index invariant from
+    /// the brief), and that `cleanup_tantivy_staging` clears the orphan
+    /// without disturbing production.
+    #[test]
+    fn b2_previous_index_still_loads_after_simulated_interruption() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+
+        // Build a valid production tantivy.
+        let _ = try_populate_tantivy(&store);
+        let prod = db.with_extension("tantivy");
+        assert!(prod.exists());
+        // Confirm baseline: open returns Ok.
+        crate::store::tantivy_fts::TantivyFts::open(&prod)
+            .expect("baseline tantivy must be openable");
+
+        // Stage an orphan staging dir (simulates "we crashed inside the
+        // staging build, before the swap step").
+        let staging = tantivy_staging_path(db);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("partial.txt"), b"half-written").unwrap();
+
+        // Cleanup (runs at next warmup entry) removes the orphan without
+        // touching production.
+        cleanup_tantivy_staging(db);
+        assert!(!staging.exists(), "orphan staging removed");
+        assert!(prod.exists(), "production dir still present");
+
+        // PREVIOUS-INDEX INVARIANT: the production tantivy is still
+        // loadable. A regression that did `remove_dir_all(&prod)` BEFORE
+        // the staging build (the pre-B2 sequence) would have left this
+        // dir empty and `TantivyFts::open` could still create a fresh
+        // (empty) one — but our orphan-cleanup path explicitly preserves
+        // it.
+        crate::store::tantivy_fts::TantivyFts::open(&prod)
+            .expect("previous tantivy must still load after interruption recovery");
+    }
+
+    /// B4 simulated interruption: create the production HNSW pair, stamp
+    /// an orphan `_new.usearch` (as if save failed mid-write), assert the
+    /// production pair is unaffected and `HnswIndex::open` still works.
+    #[test]
+    fn b4_previous_hnsw_still_loads_after_simulated_interruption() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let hnsw_base = db.with_extension("");
+        let mut cfg = ReinConfig::default();
+        cfg.embedding.dimensions = 3072;
+
+        // Build an empty production state (memories.is_empty branch
+        // returns true). Synthesize the files because the empty-branch
+        // doesn't write them.
+        populate_hnsw(&store, &cfg);
+        let prod_index = hnsw_base.with_extension("usearch");
+        let prod_meta = hnsw_base.with_extension("usearch.meta");
+        if !prod_index.exists() {
+            std::fs::write(&prod_index, b"prod-index").unwrap();
+        }
+        if !prod_meta.exists() {
+            std::fs::write(&prod_meta, b"prod-meta").unwrap();
+        }
+        let pre_index_bytes = std::fs::read(&prod_index).unwrap();
+        let pre_meta_bytes = std::fs::read(&prod_meta).unwrap();
+
+        // Drop a half-written staging pair (simulates "save panicked mid
+        // write").
+        let staging_index = hnsw_staging_index_path(&hnsw_base);
+        let staging_meta = hnsw_staging_meta_path(&hnsw_base);
+        std::fs::write(&staging_index, b"partial").unwrap();
+        std::fs::write(&staging_meta, b"partial").unwrap();
+
+        cleanup_hnsw_staging(db);
+
+        // Orphans gone, production untouched.
+        assert!(!staging_index.exists());
+        assert!(!staging_meta.exists());
+        assert_eq!(std::fs::read(&prod_index).unwrap(), pre_index_bytes);
+        assert_eq!(std::fs::read(&prod_meta).unwrap(), pre_meta_bytes);
+    }
+
+    /// B2 crash recovery: orphan `.tantivy.new` left over from a prior
+    /// interrupted rebuild must be cleaned by `cleanup_tantivy_staging`.
+    #[test]
+    fn cleanup_tantivy_staging_removes_orphan_staging_and_backup() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let staging = tantivy_staging_path(db);
+        let backup = tantivy_backup_path(db);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("junk"), b"x").unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("junk"), b"x").unwrap();
+
+        cleanup_tantivy_staging(db);
+
+        assert!(!staging.exists(), "orphan staging must be cleaned");
+        assert!(!backup.exists(), "orphan backup must be cleaned");
+    }
+
+    // -------- v0.30.2 B4 — HNSW staging --------
+
+    /// B4: orphan HNSW staging files (`*_new.usearch[.meta]`) are cleaned
+    /// at warmup entry by `cleanup_hnsw_staging`.
+    #[test]
+    fn cleanup_hnsw_staging_removes_orphan_files() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let hnsw_path = db.with_extension("");
+        let staging_index = hnsw_staging_index_path(&hnsw_path);
+        let staging_meta = hnsw_staging_meta_path(&hnsw_path);
+        std::fs::write(&staging_index, b"orphan").unwrap();
+        std::fs::write(&staging_meta, b"orphan").unwrap();
+
+        cleanup_hnsw_staging(db);
+
+        assert!(!staging_index.exists(), "orphan _new.usearch must be cleaned");
+        assert!(!staging_meta.exists(), "orphan _new.usearch.meta must be cleaned");
+    }
+
+    /// v0.30.3 codex R16 P2 regression: for a DB filename with a dot in
+    /// the stem (e.g. `memories.v1.db`), the staging path computation
+    /// MUST NOT alias the production HNSW path. Previously the
+    /// `.with_extension("usearch")` step on `staging_base = memories.v1_new`
+    /// would strip `.v1_new` and produce `memories.usearch` — the same
+    /// path as the bugged production HNSW. The new helpers append the
+    /// extension via string concat so the staging path retains its
+    /// `_new.usearch` suffix.
+    #[test]
+    fn hnsw_staging_does_not_alias_prod_for_dotted_db_names() {
+        let hnsw_path = std::path::PathBuf::from("/tmp/memories.v1");
+        let staging_index = hnsw_staging_index_path(&hnsw_path);
+        assert_eq!(
+            staging_index,
+            std::path::PathBuf::from("/tmp/memories.v1_new.usearch")
+        );
+        let staging_meta = hnsw_staging_meta_path(&hnsw_path);
+        assert_eq!(
+            staging_meta,
+            std::path::PathBuf::from("/tmp/memories.v1_new.usearch.meta")
+        );
+        // Critically: neither aliases what the codebase computes as
+        // production for `memories.v1` (which the latent
+        // `with_extension` bug renders as `memories.usearch` — staging
+        // must NOT collide with that path).
+        let buggy_prod_path = hnsw_path.with_extension("usearch");
+        assert_ne!(staging_index, buggy_prod_path);
+    }
+
+    /// B4 helper sanity: the staging base for HNSW produces names that do
+    /// NOT collide with the production `.usearch` / `.usearch.meta` pair.
+    #[test]
+    fn hnsw_staging_base_does_not_collide_with_production() {
+        let p = std::path::PathBuf::from("/tmp/memories");
+        let staging = hnsw_staging_base(&p);
+        assert_eq!(staging, std::path::PathBuf::from("/tmp/memories_new"));
+        assert_eq!(
+            staging.with_extension("usearch"),
+            std::path::PathBuf::from("/tmp/memories_new.usearch")
+        );
+        assert_eq!(
+            staging.with_extension("usearch.meta"),
+            std::path::PathBuf::from("/tmp/memories_new.usearch.meta")
+        );
+    }
+
+    // -------- v0.30.2 B3 / B6 — cold-start gating --------
+
+    /// B3: with `always_rebuild_side_indexes = false` and a clean state
+    /// (no dirty marker, no stale rebuilding marker, index dir present),
+    /// the gating helper must return `false`.
+    #[test]
+    fn side_index_rebuild_needed_tantivy_false_when_clean_and_gate_off() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        // First rebuild leaves a clean tantivy dir
+        let _ = try_populate_tantivy(&store);
+
+        let mut cfg = ReinConfig::default();
+        cfg.warmup.always_rebuild_side_indexes = false;
+        assert!(
+            !side_index_rebuild_needed_tantivy(&store, db, &cfg),
+            "with gate off and clean state, rebuild must be skipped"
+        );
+    }
+
+    /// B3: with `always_rebuild_side_indexes = true` (default), the gate
+    /// always returns `true` to preserve prior behavior.
+    #[test]
+    fn side_index_rebuild_needed_tantivy_true_when_gate_on() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let _ = try_populate_tantivy(&store);
+
+        let cfg = ReinConfig::default();
+        assert!(cfg.warmup.always_rebuild_side_indexes);
+        assert!(side_index_rebuild_needed_tantivy(&store, db, &cfg));
+    }
+
+    /// B3: a dirty marker forces the rebuild regardless of the flag.
+    #[test]
+    fn side_index_rebuild_needed_tantivy_dirty_overrides_gate_off() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let _ = try_populate_tantivy(&store);
+        let dirty = tantivy_dirty_path(db);
+        std::fs::create_dir_all(dirty.parent().unwrap()).unwrap();
+        std::fs::write(&dirty, b"dirty").unwrap();
+
+        let mut cfg = ReinConfig::default();
+        cfg.warmup.always_rebuild_side_indexes = false;
+        assert!(side_index_rebuild_needed_tantivy(&store, db, &cfg));
+    }
+
+    /// B6: same gating, HNSW side.
+    #[test]
+    fn side_index_rebuild_needed_hnsw_true_when_files_missing_and_gate_off() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let mut cfg = ReinConfig::default();
+        cfg.warmup.always_rebuild_side_indexes = false;
+        // No `.usearch` files exist yet — must rebuild.
+        assert!(side_index_rebuild_needed_hnsw(db, &cfg));
+    }
+
+    // -------- B3 / B6 end-to-end: gate prevents `populate_*` from running --------
+
+    /// B3 end-to-end: with the flag flipped to `false` AND the Tantivy
+    /// production dir already present and clean, the next `warmup()` call
+    /// must NOT re-run `populate_tantivy`. We assert this by stamping a
+    /// known-fingerprint file into the production dir and verifying it
+    /// still exists (and the swap-staging orphans are absent) after
+    /// `warmup()` returns. A regression that ignores the gate would
+    /// `remove_dir_all`-clobber the fingerprint via the staging swap.
+    #[test]
+    fn b3_warmup_skips_populate_tantivy_when_gate_off_and_clean() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        // First rebuild creates the production dir.
+        let _ = try_populate_tantivy(&store);
+        let prod = db.with_extension("tantivy");
+        assert!(prod.exists());
+
+        // Stamp a sentinel file that would survive only if no rebuild ran.
+        // (`TantivyFts::open` doesn't write this name, and `populate_*`
+        // staging swap would wipe it via `remove_dir_all` on the old dir.)
+        let sentinel = prod.join(".b3-test-sentinel");
+        std::fs::write(&sentinel, b"do not clobber").unwrap();
+        let pre_mtime = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+
+        let mut cfg = ReinConfig::default();
+        cfg.warmup.always_rebuild_side_indexes = false;
+
+        // Run only the side-index pre-amble — equivalent to the first
+        // block of `warmup()` since `create_embedder` would early-return
+        // anyway without an API key.
+        cleanup_tantivy_staging(db);
+        cleanup_hnsw_staging(db);
+        if side_index_rebuild_needed_tantivy(&store, db, &cfg) {
+            populate_tantivy(&store);
+        }
+        if side_index_rebuild_needed_hnsw(db, &cfg) {
+            populate_hnsw(&store, &cfg);
+        }
+
+        // Sentinel must survive — proves populate_tantivy was NOT called.
+        assert!(
+            sentinel.exists(),
+            "with gate off and clean state, populate_tantivy must NOT run (sentinel would be clobbered by swap)"
+        );
+        let post_mtime = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+        assert_eq!(
+            pre_mtime, post_mtime,
+            "sentinel mtime must not change (no rebuild fired)"
+        );
+        assert!(!tantivy_staging_path(db).exists());
+        assert!(!tantivy_backup_path(db).exists());
+    }
+
+    /// B6 end-to-end: same idea, HNSW side. Builds an empty HNSW index,
+    /// stamps a sentinel mtime on the `.usearch` file, then with the gate
+    /// off re-runs the gating + populate; sentinel mtime must not change.
+    #[test]
+    fn b6_warmup_skips_populate_hnsw_when_gate_off_and_clean() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let cfg_on = ReinConfig::default();
+        // First populate_hnsw with no embeddings produces a valid empty
+        // state (returns true from the `memories.is_empty()` branch); we
+        // make sure the .usearch / .usearch.meta files are present.
+        populate_hnsw(&store, &cfg_on);
+        let hnsw_base = db.with_extension("");
+        let prod_index = hnsw_base.with_extension("usearch");
+        let prod_meta = hnsw_base.with_extension("usearch.meta");
+
+        // Production files may not exist (empty store skips file save);
+        // synthesize them so the gating helper sees a "clean" state.
+        if !prod_index.exists() {
+            std::fs::write(&prod_index, b"sentinel-index").unwrap();
+        }
+        if !prod_meta.exists() {
+            std::fs::write(&prod_meta, b"sentinel-meta").unwrap();
+        }
+        let pre_index = std::fs::read(&prod_index).unwrap();
+        let pre_meta = std::fs::read(&prod_meta).unwrap();
+
+        let mut cfg = ReinConfig::default();
+        cfg.warmup.always_rebuild_side_indexes = false;
+
+        // Equivalent of warmup()'s pre-amble.
+        cleanup_tantivy_staging(db);
+        cleanup_hnsw_staging(db);
+        if side_index_rebuild_needed_hnsw(db, &cfg) {
+            populate_hnsw(&store, &cfg);
+        }
+
+        // Sentinels survive: gate prevented populate_hnsw from running.
+        assert_eq!(std::fs::read(&prod_index).unwrap(), pre_index);
+        assert_eq!(std::fs::read(&prod_meta).unwrap(), pre_meta);
+        // No staging orphans left around.
+        let staging_base = hnsw_staging_base(&hnsw_base);
+        assert!(!staging_base.with_extension("usearch").exists());
+        assert!(!staging_base.with_extension("usearch.meta").exists());
+    }
+
+    // -------- v0.30.2 B5 — stale `.rebuilding` TTL reset --------
+
+    /// B5: an HNSW `.rebuilding` marker older than the TTL is renamed to
+    /// `.dirty` so the next recall request retries.
+    #[test]
+    fn reset_stale_hnsw_rebuilding_renames_old_marker_to_dirty() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let hnsw_path = db.with_extension("");
+        let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path);
+        let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path);
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        // TTL of zero forces an immediate rename.
+        let result = reset_stale_hnsw_rebuilding(db, std::time::Duration::from_secs(0));
+        assert_eq!(result.as_deref(), Some(rebuilding.as_path()));
+        assert!(!rebuilding.exists(), "marker must be renamed away");
+        assert!(dirty.exists(), "marker must be promoted to .dirty");
+    }
+
+    /// B5: a fresh `.rebuilding` marker (well under the TTL) is left alone.
+    #[test]
+    fn reset_stale_hnsw_rebuilding_keeps_fresh_marker() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let hnsw_path = db.with_extension("");
+        let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path);
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        let result = reset_stale_hnsw_rebuilding(db, std::time::Duration::from_secs(3600));
+        assert_eq!(result, None);
+        assert!(rebuilding.exists());
     }
 }

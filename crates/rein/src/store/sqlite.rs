@@ -8,7 +8,7 @@ use crate::extract::intelligent_merge::{InsertionVerdict, VerdictResult};
 use crate::extract::DedupAction;
 use crate::types::*;
 
-use super::{fts, schema, vec};
+use super::{fts, pool, schema, vec};
 
 /// Byte cap on canonical `content` after a `MergeInto` append.
 ///
@@ -118,7 +118,10 @@ impl SqliteStore {
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
                 | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // Apply the full pragma set (WAL + NORMAL sync + 5s busy_timeout + FK).
+        // Recall's pool-saturation fallbacks open conns via this path under
+        // contention; without busy_timeout they throw SQLITE_BUSY immediately.
+        pool::apply_rein_pragmas(&conn)?;
         schema::init_schema(&conn, dims)?;
 
         // Check if embedding model changed since last run (warn only, don't auto-rebuild)
@@ -144,7 +147,10 @@ impl SqliteStore {
     pub fn in_memory() -> ReinResult<Self> {
         schema::init_sqlite_vec();
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // Apply the full pragma set so in-memory test conns share the
+        // production busy_timeout / synchronous semantics. WAL is a no-op
+        // for `:memory:` but is harmless and keeps the helper idempotent.
+        pool::apply_rein_pragmas(&conn)?;
         schema::init_schema(&conn, 3072)?;
         Ok(Self {
             conn,
@@ -157,9 +163,12 @@ impl SqliteStore {
     }
 
     /// Build a `SqliteStore` around a pre-opened `Connection` — the v0.22
-    /// pool path. Caller is responsible for having already applied WAL +
-    /// FK pragmas (see `store::pool::open_conn`) and for returning the
-    /// `Connection` to the pool via `into_conn()` after use.
+    /// pool path. Caller is responsible for having already applied the
+    /// full pragma set (`store::pool::apply_rein_pragmas`: WAL +
+    /// `synchronous=NORMAL` + `busy_timeout=5000` + `foreign_keys=ON`)
+    /// and for returning the `Connection` to the pool via `into_conn()`
+    /// after use. Use `from_conn_checked` if you need a defensive
+    /// re-apply of the pragmas plus schema/embedding-model verification.
     ///
     /// Unlike `new()`, this constructor does **not** call `init_schema` —
     /// the schema is assumed to exist (the pool opens against an already
@@ -197,12 +206,20 @@ impl SqliteStore {
     /// that must respect the embedding-model-drift diagnostic (e.g. the
     /// MCP tool entry point). Hot inner recall loops can keep using the
     /// unchecked `from_conn` for latency reasons.
+    ///
+    /// **Caller contract**: `conn` must already have rein's standard
+    /// pragmas applied (WAL + `synchronous=NORMAL` + `busy_timeout=5000`
+    /// + `foreign_keys=ON`). Pool conns from `pool::open_conn` satisfy
+    /// this; raw `Connection::open(...)` does not. As a defensive
+    /// no-op, this constructor re-applies the pragma set on the way in
+    /// — applying the same pragmas twice is idempotent and cheap.
     pub fn from_conn_checked(
         conn: Connection,
         db_path: PathBuf,
         model: &str,
         dims: usize,
     ) -> ReinResult<Self> {
+        pool::apply_rein_pragmas(&conn)?;
         schema::init_schema(&conn, dims)?;
         if schema::check_embedding_model(&conn, model, dims)? {
             eprintln!(
@@ -2429,6 +2446,23 @@ impl SqliteStore {
         content: &str,
         keywords: &str,
     ) {
+        // v0.30.3 codex R19 P2 + R23 P2: if a background rebuild is
+        // Running (its SQLite scan happened but the staging-→-prod
+        // swap hasn't completed), our prod write here is about to be
+        // silently overwritten. Mark dirty AND skip the immediate
+        // write — `with_tantivy`'s `TantivyFts::open` would recreate
+        // `<db>.tantivy/` during the swap window if prod was
+        // already renamed to `.old`, breaking the rebuild's
+        // `rename(staging → prod)` with EEXIST. The follow-up
+        // rebuild (triggered by our dirty marker) will capture this
+        // mutation.
+        if matches!(
+            crate::search::warmup::tantivy_rebuild_state(&self.db_path),
+            crate::search::warmup::TantivyRebuildState::Running
+        ) {
+            self.mark_tantivy_dirty();
+            return;
+        }
         self.with_tantivy(|t| {
             if let Err(error) = t.insert(id, topic, summary, content, keywords) {
                 tracing::warn!("tantivy insert failed for {id}: {error}");
@@ -2557,6 +2591,17 @@ impl SqliteStore {
 
     /// Fire-and-forget: remove from Tantivy index after a delete.
     pub(crate) fn remove_from_tantivy(&self, id: &str) {
+        // v0.30.3 codex R19 P2 + R23 P2: same race-protection +
+        // skip-the-write as `update_tantivy`. Mark dirty AND return
+        // so we don't `TantivyFts::open` mid-swap and break the
+        // rebuild's promotion. Next rebuild captures the missed delete.
+        if matches!(
+            crate::search::warmup::tantivy_rebuild_state(&self.db_path),
+            crate::search::warmup::TantivyRebuildState::Running
+        ) {
+            self.mark_tantivy_dirty();
+            return;
+        }
         self.with_tantivy(|t| {
             let _ = t.delete(id);
         });
@@ -4095,5 +4140,60 @@ enabled = true
                 "explicit rows must be oldest-first by imported_at ASC"
             );
         }
+    }
+
+    /// F6 D-M1: verify `SqliteStore::new` applies the full pragma set —
+    /// not just WAL+FK. Regression guard against the recall-fallback
+    /// `SQLITE_BUSY` storm where non-pool conns had `busy_timeout=0`.
+    #[test]
+    fn new_applies_full_pragma_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("pragma-check.db");
+        let store = SqliteStore::new(&path, "text-embedding-3-large", 8).unwrap();
+        let conn = store.conn();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal", "journal_mode must be WAL");
+
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (1)");
+
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000, "busy_timeout must be 5000ms");
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "foreign_keys must be ON");
+    }
+
+    /// F6 D-M1: same check for `in_memory()`. WAL is a no-op on
+    /// `:memory:` (SQLite silently falls back to `memory`), but the
+    /// other three pragmas must still apply.
+    #[test]
+    fn in_memory_applies_full_pragma_set() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn();
+
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (1)");
+
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000, "busy_timeout must be 5000ms");
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "foreign_keys must be ON");
     }
 }

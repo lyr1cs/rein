@@ -76,6 +76,36 @@ pub struct ReinConfig {
     /// config continues to load identically.
     #[serde(default)]
     pub llm: LlmDefaultsConfig,
+    /// v0.30.2 B3/B6 — `[warmup]` gating for cold-start side-index
+    /// rebuilds. Default preserves prior behavior (always rebuild).
+    #[serde(default)]
+    pub warmup: WarmupConfig,
+}
+
+/// v0.30.2 B3/B6: cold-start side-index rebuild policy. Operators can
+/// opt out of the unconditional Tantivy + HNSW rebuilds that ran on
+/// every cold start; recovery signals (missing index, dirty marker,
+/// stale rebuilding marker) still trigger a rebuild regardless.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmupConfig {
+    /// When true (default), the cold-start warmup unconditionally
+    /// rebuilds the Tantivy and HNSW side indexes from SQLite. When
+    /// false, the rebuild is gated on missing-or-dirty signals only.
+    #[serde(default = "default_always_rebuild_side_indexes")]
+    pub always_rebuild_side_indexes: bool,
+}
+
+fn default_always_rebuild_side_indexes() -> bool {
+    true
+}
+
+impl Default for WarmupConfig {
+    fn default() -> Self {
+        Self {
+            always_rebuild_side_indexes: default_always_rebuild_side_indexes(),
+        }
+    }
 }
 
 /// v0.27 Track 2 config — feature flags + thresholds for the new

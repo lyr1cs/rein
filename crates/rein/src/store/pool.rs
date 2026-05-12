@@ -483,6 +483,40 @@ fn return_conn(pool: &Arc<PoolInner>, conn: Connection) {
         .push(conn);
 }
 
+/// Apply rein's standard SQLite pragmas to a freshly opened connection.
+///
+/// **All four pragmas are required** — partial application has caused
+/// recall pool-saturation fallback paths (`search/recall.rs`) to throw
+/// `SQLITE_BUSY` instantly because `SqliteStore::new` was opening conns
+/// with `busy_timeout=0` (default) while the pool's conns waited 5s.
+///
+/// Pragmas:
+/// - `journal_mode = WAL` — concurrent reader/writer; required for the
+///   per-request connection model.
+/// - `synchronous = NORMAL` — WAL-safe and ~10x faster than FULL.
+/// - `busy_timeout = 5000` — wait 5s on lock contention before giving up.
+/// - `foreign_keys = ON` — enforce FK constraints (off by default in
+///   SQLite for backwards compat).
+///
+/// Idempotent: safe to call on a conn that already has these set.
+/// In-memory DBs (`:memory:`) accept all four pragmas; WAL is a no-op
+/// for them but won't error.
+pub(crate) fn apply_rein_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    // v0.30.3 codex R16 P2: set `busy_timeout` FIRST so the
+    // lock-taking pragmas below (`journal_mode=WAL` flips the journal
+    // mode, requires a write lock briefly) honor the 5-second wait
+    // under contention. Otherwise an existing rollback-journal/
+    // exclusive-write lock from another process causes WAL to return
+    // SQLITE_BUSY immediately — exactly the case this helper exists
+    // to prevent.
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000;
+         PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA foreign_keys=ON;",
+    )
+}
+
 /// Open a single connection with rein's standard pragmas. Exposed for
 /// callers that need a throwaway conn outside the pool (e.g. migrations).
 pub fn open_conn(db_path: &Path) -> ReinResult<Connection> {
@@ -492,12 +526,7 @@ pub fn open_conn(db_path: &Path) -> ReinResult<Connection> {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
     )?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=5000;
-         PRAGMA foreign_keys=ON;",
-    )?;
+    apply_rein_pragmas(&conn)?;
     Ok(conn)
 }
 
@@ -550,6 +579,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fk, 1);
+    }
+
+    /// F6 D-M1: full pragma set check on pool conns. Mirrors the
+    /// equivalent test on `SqliteStore::new` / `in_memory` in
+    /// `store/sqlite.rs` — both paths must agree, otherwise recall
+    /// fallback conns and pool conns drift on contention behavior.
+    #[tokio::test]
+    async fn apply_rein_pragmas_sets_full_set_on_pool_conn() {
+        let (_dir, path) = tmp_db();
+        let pool = ConnPool::new(&path, 1).unwrap();
+        let guard = pool.get().await.unwrap();
+        let synchronous: i64 = guard
+            .interact(|c| Ok(c.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?))
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (1)");
+
+        let guard = pool.get().await.unwrap();
+        let busy: i64 = guard
+            .interact(|c| Ok(c.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))?))
+            .await
+            .unwrap();
+        assert_eq!(busy, 5000, "busy_timeout must be 5000ms");
+    }
+
+    /// F6 D-M1: helper is idempotent — re-applying the same pragmas to
+    /// an already-configured conn must not error or change values.
+    #[test]
+    fn apply_rein_pragmas_is_idempotent() {
+        let (_dir, path) = tmp_db();
+        let conn = open_conn(&path).unwrap();
+        // Re-apply twice. If any PRAGMA returns a row that rusqlite
+        // tries to consume in `execute_batch`, this would error.
+        apply_rein_pragmas(&conn).unwrap();
+        apply_rein_pragmas(&conn).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
     }
 
     #[tokio::test]

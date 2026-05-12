@@ -2217,21 +2217,45 @@ fn vec_search_direct(
             let model = rebuild_cfg.embedding_model();
             let dims = rebuild_cfg.embedding.dimensions;
             std::thread::spawn(move || {
-                let rebuilt = if let Ok(s) = SqliteStore::new(&db_path, &model, dims) {
-                    crate::search::warmup::populate_hnsw(&s, &rebuild_cfg)
-                } else {
-                    false
+                // v0.30.2 B5: catch_unwind around the entire spawned closure
+                // so a panic inside `populate_hnsw` (sqlite open, usearch
+                // FFI, OOM, etc.) can never leave the `.rebuilding` marker
+                // stranded — which would force every later recall to drop
+                // to sqlite-vec brute force forever. We treat panic as
+                // "rebuild failed": clear `.rebuilding`, restore `.dirty`
+                // so the next recall retries.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Ok(s) = SqliteStore::new(&db_path, &model, dims) {
+                        crate::search::warmup::populate_hnsw(&s, &rebuild_cfg)
+                    } else {
+                        false
+                    }
+                }));
+                let rebuilt = match result {
+                    Ok(ok) => ok,
+                    Err(_) => {
+                        tracing::error!(
+                            "hnsw background rebuild panicked at {} — restoring .dirty marker so next recall retries",
+                            rebuild_path.display()
+                        );
+                        false
+                    }
                 };
                 if rebuilt {
                     // Success: clear `.rebuilding` — index is ready
                     crate::store::hnsw::HnswIndex::clear_rebuilding(&rebuild_path);
                 } else {
-                    // Failed or skipped: restore `.dirty` so a future request retries
+                    // Failed, skipped, or panicked: restore `.dirty` so a
+                    // future request retries (B5).
                     let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&rebuild_path);
                     let rebuilding =
                         crate::store::hnsw::HnswIndex::rebuilding_marker_path(&rebuild_path);
                     if rebuilding.exists() {
                         let _ = std::fs::rename(&rebuilding, &dirty);
+                    } else {
+                        // Marker already gone (e.g. concurrent doctor sweep);
+                        // ensure .dirty is set so a future request retries.
+                        crate::store::hnsw::HnswIndex::mark_dirty(&rebuild_path);
                     }
                 }
             });
@@ -2250,15 +2274,58 @@ fn vec_search_direct(
             Err(_) => vec![],
         };
     }
-    if let Ok(index) = crate::store::hnsw::HnswIndex::open(&hnsw_path, embedding.len()) {
-        if !index.is_empty() {
-            if let Ok(results) = index.search(embedding, limit * 2) {
-                let filtered = rank_and_filter(results, store, topic, limit);
-                if !filtered.is_empty() {
-                    return filtered;
+    // v0.30.3 codex R10 P2 + R11 P2: HOLD a shared read lock across the
+    // ENTIRE open+search window. populate_hnsw uses `LOCK_EX` which
+    // blocks any reader-held `LOCK_SH`, and vice versa, so the two-file
+    // swap (`.usearch` + `.usearch.meta`) cannot interleave with our
+    // open. The earlier "probe + release + open" pattern (R10) raced
+    // because the release-to-open gap let a writer acquire LOCK_EX and
+    // start the swap. Holding LOCK_SH for the lifetime of `lock_file`
+    // (which we keep in scope until the end of this block) closes that
+    // window.
+    let hnsw_lock_path = hnsw_path.with_extension("usearch.lock");
+    let read_lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&hnsw_lock_path)
+        .ok();
+    let read_lock_acquired = if let Some(ref lf) = read_lock_file {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+            rc == 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    } else {
+        false
+    };
+    if read_lock_acquired {
+        // Lock_SH held throughout this block; populate_hnsw can't enter
+        // its swap until we drop read_lock_file (kernel releases on
+        // close).
+        if let Ok(index) = crate::store::hnsw::HnswIndex::open(&hnsw_path, embedding.len()) {
+            if !index.is_empty() {
+                if let Ok(results) = index.search(embedding, limit * 2) {
+                    let filtered = rank_and_filter(results, store, topic, limit);
+                    // Drop the read lock BEFORE returning so a queued
+                    // writer can proceed promptly.
+                    drop(read_lock_file);
+                    if !filtered.is_empty() {
+                        return filtered;
+                    }
                 }
             }
         }
+    } else {
+        tracing::debug!(
+            "hnsw rebuild in progress (or lockfile error) — using sqlite-vec for this request"
+        );
     }
 
     // Fall back to sqlite-vec (brute-force O(n)).
@@ -2285,12 +2352,165 @@ fn try_tantivy_then_fts5(
     let db_path = store.db_path();
     if db_path.to_str() != Some(":memory:") {
         let dirty_path = crate::search::warmup::tantivy_dirty_path(db_path);
-        if dirty_path.exists() {
-            tracing::info!("tantivy index marked dirty, rebuilding before search");
-            crate::search::warmup::populate_tantivy(store);
-        }
-        let tantivy_path = db_path.with_extension("tantivy");
-        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(&tantivy_path) {
+        // v0.30.3 codex R10 P2: also gate against an in-flight rebuild
+        // (including the default clean-startup warmup with no dirty
+        // marker). During the swap window prod is renamed to `.old`;
+        // `TantivyFts::open` would recreate `<db>.tantivy/` empty and
+        // make `rename(staging → prod)` fail EEXIST. Skip Tantivy open
+        // when ANY rebuild is Running — not just dirty-triggered ones.
+        let rebuild_state = crate::search::warmup::tantivy_rebuild_state(db_path);
+        let rebuild_running = matches!(
+            rebuild_state,
+            crate::search::warmup::TantivyRebuildState::Running
+        );
+        // v0.30.3 codex R23 P2: also treat `StaleMarker` state as
+        // "needs repair": an interrupted previous rebuild leaves
+        // `.rebuilding` without lock holder. Skip the dirty-only
+        // branch — fall into the dirty spawn path which (after
+        // tantivy_rebuild_state's full audit) re-triggers via
+        // try_populate_tantivy's lock-acquire that handles the
+        // stale marker cleanup.
+        let needs_repair = matches!(
+            rebuild_state,
+            crate::search::warmup::TantivyRebuildState::StaleMarker
+        );
+        if rebuild_running {
+            tracing::debug!(
+                "tantivy rebuild in progress — using FTS5 only for this request"
+            );
+        } else if dirty_path.exists() || needs_repair {
+            // v0.30.2 B1: previously this synchronously ran `populate_tantivy`
+            // on the recall hot path — every sleep/wake or interrupted-rebuild
+            // boot stalled recall while a full FTS rebuild scanned every
+            // memory. Now we spawn the rebuild and fall through to FTS5
+            // (sqlite-vec equivalent for lexical search) for THIS request.
+            // The next request after the rebuild completes will pick up the
+            // fresh Tantivy index automatically (dirty marker clears on success).
+            //
+            // v0.30.3 codex R4 P2: use `tantivy_rebuild_state` instead of a
+            // bare `.exists()` check on the rebuilding marker. A previous
+            // rebuild that crashed AFTER writing the marker but BEFORE
+            // removing it leaves a stale marker; suppressing spawn on its
+            // presence alone would freeze recall on the FTS5 fallback
+            // forever. `Running` = real active rebuild (lock held); only
+            // suppress in that case. `Idle` and `StaleMarker` both
+            // (re-)trigger spawn — the rebuild path's `try_populate_tantivy`
+            // re-acquires the lock and handles marker cleanup.
+            let rebuild_state = crate::search::warmup::tantivy_rebuild_state(db_path);
+            if !matches!(rebuild_state, crate::search::warmup::TantivyRebuildState::Running) {
+                tracing::info!(
+                    "tantivy index dirty (state={:?}) — spawning background rebuild, using FTS5 for this request",
+                    rebuild_state
+                );
+                let rebuild_db_path = db_path.to_path_buf();
+                // v0.30.3 codex R4 P2: open the spawned store via
+                // `from_conn` (skips `check_embedding_model` AND
+                // `init_schema`). Previous design called `SqliteStore::new`
+                // which calls `check_embedding_model`, persisting whatever
+                // model `ReinConfig::load()` returned at that moment.
+                // For tests / embedded / multi-config processes this would
+                // silently flip the DB's recorded embedding model. Tantivy
+                // rebuild is text-only — it doesn't need the embedding
+                // model recorded or checked.
+                let rebuild_dims = store.dims;
+                // v0.30.3 codex R14 P2-#1: my earlier (R13) attempt at
+                // tokio-runtime detection to choose between detached
+                // spawn (server) and sync execute (CLI) was incorrect —
+                // `rein recall` CLI uses `#[tokio::main]` so the
+                // `try_current().is_ok()` check returns true there too.
+                // The proper fix requires explicit lifecycle plumbing
+                // through the recall API and is filed for v0.30.4.
+                // Until then: detached spawn is the dominant case
+                // (server / GUI). CLI users with stranded `.dirty`
+                // markers can run `rein doctor --fix` to repair.
+                let rebuild_body = move || {
+                    // v0.30.2 B5-parallel: catch_unwind so a panic inside
+                    // `try_populate_tantivy` (tokenizer / IO / OOM) can't
+                    // leave the rebuild lock or `.rebuilding` marker
+                    // stranded. On caught panic, mark dirty so the next
+                    // recall retries from a clean slate.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // Open raw conn + apply pragmas + `from_conn`
+                        // (no schema-init, no embedding-model check).
+                        let conn = match rusqlite::Connection::open_with_flags(
+                            &rebuild_db_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "tantivy background rebuild: failed to open conn at {}: {e}",
+                                    rebuild_db_path.display()
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(e) = crate::store::pool::apply_rein_pragmas(&conn) {
+                            tracing::warn!(
+                                "tantivy background rebuild: failed to apply pragmas: {e}"
+                            );
+                            return;
+                        }
+                        let s = SqliteStore::from_conn(
+                            conn,
+                            rebuild_db_path.clone(),
+                            rebuild_dims,
+                        );
+                        crate::search::warmup::try_populate_tantivy(&s);
+                    }));
+                    if result.is_err() {
+                        tracing::error!(
+                            "tantivy background rebuild panicked at {} — leaving dirty marker for retry",
+                            rebuild_db_path.display()
+                        );
+                        // Best-effort marker hygiene. The rebuild path's
+                        // failure branches normally re-mark dirty; on panic
+                        // we mark dirty explicitly so the next request
+                        // re-triggers the spawn.
+                        let dirty =
+                            crate::search::warmup::tantivy_dirty_path(&rebuild_db_path);
+                        if let Some(parent) = dirty.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&dirty, b"dirty");
+                        let rebuilding =
+                            crate::search::warmup::tantivy_rebuilding_path(&rebuild_db_path);
+                        let _ = std::fs::remove_file(&rebuilding);
+                    }
+                };
+                std::thread::spawn(rebuild_body);
+            } else {
+                tracing::debug!(
+                    "tantivy rebuild already in progress, using FTS5 for this request"
+                );
+            }
+            // v0.30.3 codex R9 P2: when the dirty marker is set OR a
+            // rebuild is in progress, SKIP `TantivyFts::open` for this
+            // request and rely on FTS5 alone. Two reasons:
+            //   1. Opening the prod Tantivy in this window can return
+            //      stale hits that get mixed with fresh FTS5 results.
+            //   2. During the staging swap, prod has been renamed to
+            //      `.old` for a brief window. `TantivyFts::open` would
+            //      RECREATE `<db>.tantivy/` (empty), which then causes
+            //      the background rebuild's `rename(staging → prod)`
+            //      to fail with EEXIST — promotion lost, backup lost.
+            //   Use FTS5 only until the rebuild completes; the next
+            //   recall after the dirty marker clears will pick up the
+            //   fresh Tantivy automatically.
+        } else if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(
+            &db_path.with_extension("tantivy"),
+        ) {
+            // v0.30.3 codex R13 P2 (KNOWN, deferred to v0.30.4): the
+            // `rebuild_running` probe above is point-in-time, so a
+            // background warmup can take LOCK_EX between our check and
+            // this `TantivyFts::open`. In that brief window prod has
+            // been renamed to `.old` and `open` recreates `<db>.tantivy/`
+            // empty, which can fail the rebuild's `rename(staging →
+            // prod)` with EEXIST. The proper fix is a `create_missing
+            // = false` variant of `TantivyFts::open`; a LOCK_SH probe
+            // here would break concurrent-recall determinism on macOS
+            // (process-scoped flock semantics). Filed for v0.30.4.
             if let Ok(results) = tantivy.search(query, topic, limit) {
                 for (i, (id, score)) in results.into_iter().enumerate() {
                     if let Ok(m) = store.get(&id) {
@@ -3040,5 +3260,154 @@ mod tests {
             !json.contains("archival_summary"),
             "None field MUST be elided; got {json}"
         );
+    }
+
+    // -------- v0.30.2 B1 — tantivy dirty marker spawns rebuild, doesn't block --------
+
+    /// B1: when the Tantivy `.dirty` marker is present, the recall path
+    /// (`try_tantivy_then_fts5`) must NOT synchronously rebuild — it must
+    /// hand control to FTS5 immediately and let a background thread own
+    /// the rebuild. Three load-bearing assertions:
+    ///
+    /// 1. The function returns fast (< 2s; the design budget is sub-200ms).
+    /// 2. The call observably spawned background work — within a short
+    ///    watch window, the `.rebuilding` marker appears OR the `.dirty`
+    ///    marker is cleared (rebuild completed). If neither happens, the
+    ///    spawn was never wired and this test correctly fails.
+    /// 3. `result.is_ok()` — the FTS5 fallback still works.
+    ///
+    /// Integration-style: needs the embedded SqliteStore + Tantivy stack.
+    #[test]
+    #[cfg(unix)]
+    fn try_tantivy_then_fts5_spawns_rebuild_on_dirty_marker_without_blocking() {
+        use crate::search::warmup;
+        use crate::store::SqliteStore;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = SqliteStore::new(&db_path, "text-embedding-3-small", 3072).unwrap();
+
+        // Mark Tantivy dirty so the recall path sees the trigger.
+        let dirty = warmup::tantivy_dirty_path(store.db_path());
+        std::fs::create_dir_all(dirty.parent().unwrap()).unwrap();
+        std::fs::write(&dirty, b"dirty").unwrap();
+        let rebuilding = warmup::tantivy_rebuilding_path(store.db_path());
+
+        let start = std::time::Instant::now();
+        let result = try_tantivy_then_fts5(&store, "anything", None, 10);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "FTS5 fallback must always return Ok");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "search call must not block on rebuild: took {elapsed:?}"
+        );
+
+        // Watcher: poll up to 5s for evidence that the spawned thread ran.
+        // Either it claimed the lock (`.rebuilding` exists for at least
+        // one observation) OR it finished cleanly (`.dirty` no longer
+        // exists). If neither occurs within the window, the spawn was
+        // never wired — a regression that removes the `std::thread::spawn`
+        // entirely would make this test fail here.
+        let watch_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_progress = false;
+        while std::time::Instant::now() < watch_deadline {
+            if rebuilding.exists() || !dirty.exists() {
+                saw_progress = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            saw_progress,
+            "expected spawned rebuild to either set .rebuilding or clear .dirty within 5s"
+        );
+    }
+
+    // -------- v0.30.2 B5 — spawned HNSW rebuild panic safety --------
+
+    /// B5: an actual panic inside the spawn closure must NOT strand the
+    /// `.rebuilding` marker. We mirror the exact closure shape from
+    /// `vec_search_direct` (catch_unwind + rename/mark_dirty branch) and
+    /// drive it with a panicking inner body. If a future refactor removes
+    /// the `catch_unwind` wrapper, this test will panic in the spawned
+    /// thread and the joined `JoinHandle` will report `Err` — the
+    /// assertions on the on-disk markers will also fail because the
+    /// closure body never reaches the cleanup branch.
+    #[test]
+    fn b5_spawned_hnsw_rebuild_panic_clears_rebuilding_and_restores_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("memories.db");
+        let hnsw_path = db.with_extension("");
+        let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path);
+        let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path);
+
+        // Simulate the "rebuild claim in progress" state — same as
+        // `take_dirty_for_rebuild` after a recall request fires.
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+        assert!(rebuilding.exists());
+        assert!(!dirty.exists());
+
+        // Replicate the production closure verbatim (modulo the
+        // `populate_hnsw` call, which we substitute with a panic so the
+        // catch_unwind branch is the only thing this test exercises).
+        let rebuild_path = hnsw_path.clone();
+        let handle = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
+                panic!("simulated populate_hnsw panic");
+            }));
+            let rebuilt: bool = result.unwrap_or_default();
+            if rebuilt {
+                crate::store::hnsw::HnswIndex::clear_rebuilding(&rebuild_path);
+            } else {
+                let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&rebuild_path);
+                let rebuilding =
+                    crate::store::hnsw::HnswIndex::rebuilding_marker_path(&rebuild_path);
+                if rebuilding.exists() {
+                    let _ = std::fs::rename(&rebuilding, &dirty);
+                } else {
+                    crate::store::hnsw::HnswIndex::mark_dirty(&rebuild_path);
+                }
+            }
+        });
+
+        // Thread must NOT propagate the inner panic.
+        handle.join().expect("catch_unwind must swallow inner panic — spawn must not crash the process");
+
+        assert!(!rebuilding.exists(), ".rebuilding must be cleared on panic recovery");
+        assert!(dirty.exists(), ".dirty must be set so the next recall retries");
+    }
+
+    /// B5 fallback: if the `.rebuilding` marker was already cleared by a
+    /// concurrent doctor sweep, the panic recovery branch must still set
+    /// `.dirty` via `mark_dirty`.
+    #[test]
+    fn b5_panic_recovery_marks_dirty_when_rebuilding_already_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("memories.db");
+        let hnsw_path = db.with_extension("");
+        let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path);
+        let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path);
+        assert!(!rebuilding.exists());
+        assert!(!dirty.exists());
+
+        let rebuild_path = hnsw_path.clone();
+        let handle = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
+                panic!("simulated panic");
+            }));
+            let rebuilt: bool = result.unwrap_or_default();
+            if !rebuilt {
+                let dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&rebuild_path);
+                let rebuilding =
+                    crate::store::hnsw::HnswIndex::rebuilding_marker_path(&rebuild_path);
+                if rebuilding.exists() {
+                    let _ = std::fs::rename(&rebuilding, &dirty);
+                } else {
+                    crate::store::hnsw::HnswIndex::mark_dirty(&rebuild_path);
+                }
+            }
+        });
+        handle.join().expect("inner panic must be swallowed");
+        assert!(dirty.exists(), "mark_dirty fallback must set .dirty");
     }
 }

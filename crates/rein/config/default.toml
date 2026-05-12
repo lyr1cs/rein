@@ -58,6 +58,14 @@ stdio_background_warmup = false  # avoid per-agent MCP stdio index rebuilds
 # the matching Rust struct default in `crates/rein/src/config.rs`.
 allow_unauthenticated_loopback = false
 
+[warmup]
+# v0.30.2 B3/B6: when true (default) the cold-start warmup rebuilds Tantivy
+# and HNSW side indexes from SQLite every time. When false, the rebuild is
+# gated on a concrete recovery signal (missing index, dirty marker, or stale
+# rebuilding marker). Operators with very large indexes can flip this to
+# false to shorten cold-start latency; recovery still triggers when needed.
+always_rebuild_side_indexes = true
+
 [hooks]
 min_turns = 20
 context_before = 3

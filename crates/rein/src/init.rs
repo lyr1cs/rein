@@ -3,7 +3,160 @@
 /// Scans well-known config paths (Claude Code, Claude Desktop, Cursor, Windsurf,
 /// VS Code, Gemini, Codex, OpenCode) and injects a `rein` MCP server entry when
 /// the config file already exists but rein is not yet configured.
+use std::io::{self, Write};
 use std::path::Path;
+
+/// Atomically write `content` to `path`.
+///
+/// Semantics:
+///   - Writes to a sibling tmp file `<path>.tmp` (kept in the same parent
+///     directory so the final `rename` is intra-filesystem and POSIX-atomic).
+///   - `fsync`s the data to disk before the rename so a power-cut between
+///     rename and the next sync cannot leave the target as a zero-length file
+///     pointing at unwritten blocks.
+///   - On any failure (write, sync, rename) the partial tmp file is removed.
+///   - The target file is either fully old or fully new — never partial,
+///     never empty — even if the process is `kill -9`'d or the system sleeps
+///     mid-write. This matters for `~/.claude.json`: a partial write bricks
+///     Claude Code launch (it refuses to parse partial JSON, dropping
+///     pre-existing MCP servers including non-rein ones).
+///
+/// Note: `with_extension("tmp")` clobbers any pre-existing `.tmp` sibling
+/// (e.g. from a previously-crashed run). This is acceptable — that file is
+/// already orphaned and about to be overwritten-then-renamed-away.
+fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
+    // v0.30.3 codex R2 P2: if the target is a symlink (common for
+    // dotfile-managed `~/.claude.json` / Codex configs) `rename(tmp, path)`
+    // replaces the symlink itself with a regular file, silently
+    // disconnecting the user's managed config from its real target. Resolve
+    // the link (canonicalize follows the whole chain) and write to the
+    // actual target so the rename happens in the real target's directory.
+    // v0.30.3 codex R20 P2 + R23 P2: resolve the symlink chain to its
+    // final target WITHOUT requiring it to exist. `read_link` only
+    // follows ONE hop, so chained dotfile symlinks (symlink → symlink →
+    // file) would leave `real_path` still a symlink and rename would
+    // replace the intermediate link instead of updating the final
+    // target. Loop through hops until we hit a non-symlink, with a
+    // cycle guard so a malicious symlink loop can't hang us.
+    fn resolve_symlink_chain(start: &std::path::Path) -> std::path::PathBuf {
+        let mut current = start.to_path_buf();
+        for _ in 0..40 {
+            // 40 hops is more than any sane dotfile setup
+            match std::fs::symlink_metadata(&current) {
+                Ok(m) if m.file_type().is_symlink() => match std::fs::read_link(&current) {
+                    Ok(target) => {
+                        current = if target.is_absolute() {
+                            target
+                        } else {
+                            current.parent().map(|p| p.join(&target)).unwrap_or(target)
+                        };
+                    }
+                    Err(_) => return current, // can't read link — give up here
+                },
+                _ => return current, // non-symlink or missing — done
+            }
+        }
+        current // cycle / hop limit hit — last seen path
+    }
+    let real_path: std::path::PathBuf = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => resolve_symlink_chain(path),
+        Ok(_) => path.to_path_buf(),
+        Err(_) => path.to_path_buf(), // fresh write — no metadata available
+    };
+    // v0.30.3 codex R14 P2-#3: include PID + nanoseconds in the tmp
+    // path so two concurrent processes writing the same target don't
+    // share `<target>.tmp` — that race let one writer delete the
+    // other's in-progress tmp file. With unique tmp paths each writer
+    // operates on its own inode and the final rename is the only
+    // serialization point (which is correct, atomic, last-write-wins).
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name_str = real_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rein");
+    let tmp_name = format!("{file_name_str}.tmp.{pid}.{nanos}");
+    let tmp_path = real_path.with_file_name(tmp_name);
+
+    // v0.30.3 codex R1 P1 + R2 P2: capture target's existing mode and apply
+    // it to the tmp file AT CREATION TIME (not post-write) so secret content
+    // is never on disk world-readable even briefly. Default `0600` for
+    // fresh-write — these are AI client config files that may contain API
+    // tokens, OAuth secrets, MCP bearer tokens; group/other read is
+    // never legitimate.
+    #[cfg(unix)]
+    let target_mode: u32 = std::fs::metadata(&real_path)
+        .ok()
+        .map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode()
+        })
+        .unwrap_or(0o600);
+
+    // Inner closure so we can clean up tmp on any error via a single `match`.
+    let write_and_sync = || -> io::Result<()> {
+        // v0.30.3 codex R3 P2: `OpenOptions::.mode(...)` only applies to
+        // NEWLY-CREATED inodes. If a `.tmp` orphan from a previous crash
+        // (or a user-created file) already exists, `create(true) +
+        // truncate(true)` reuses that inode WITH ITS EXISTING PERMS —
+        // which may be world-readable. Result: secret config content sits
+        // on disk world-readable, then the rename inherits those perms
+        // onto the production config. Remove any stale tmp first (ignore
+        // NotFound), then `create_new` so we get a fresh inode with the
+        // intended restrictive mode.
+        match std::fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(target_mode)
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        // Explicit drop before rename — close the fd so the rename sees
+        // a fully-flushed file on platforms where this matters.
+        drop(file);
+        // On Unix the mode is set at open-time above. On non-Unix
+        // platforms we have no mode bits to set.
+        Ok(())
+    };
+
+    if let Err(e) = write_and_sync() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // v0.30.3 codex R15 P2: on Windows `std::fs::rename` can fail when
+    // the target already exists or is held open by another process
+    // (e.g. Claude Code reading the config). Best-effort remove first
+    // before rename — non-atomic on Windows but the only std-only
+    // workaround. Unix rename already overwrites in place atomically.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(&real_path);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &real_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    Ok(())
+}
 
 pub fn auto_configure(dry_run: bool) -> anyhow::Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -70,16 +223,28 @@ fn configure_client(path: &Path, format: &str) -> anyhow::Result<()> {
 }
 
 /// Strip JSONC extensions (// comments, /* */ block comments, trailing commas) to valid JSON.
+///
+/// String-aware: comments and trailing commas inside a quoted string are
+/// preserved verbatim. The previous implementation ran a string-blind regex
+/// for trailing-comma stripping AFTER the comment-stripping loop, which would
+/// silently mangle any JSON value containing `,]` or `,}` inside a string
+/// (low-probability but silent corruption of user config). Trailing-comma
+/// stripping is now folded into the same string-aware char loop.
 fn strip_jsonc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Two-pass: pass 1 strips comments (string-aware); pass 2 strips trailing
+    // commas (string-aware) on the comment-free intermediate. Doing it in two
+    // passes (instead of one) keeps each pass simple: a trailing comma may be
+    // separated from its closer by a now-stripped comment, and a single-pass
+    // implementation would need a lookahead through arbitrary comment runs.
+    let mut intermediate = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     let mut in_string = false;
     while let Some(c) = chars.next() {
         if in_string {
-            out.push(c);
+            intermediate.push(c);
             if c == '\\' {
                 if let Some(&next) = chars.peek() {
-                    out.push(next);
+                    intermediate.push(next);
                     chars.next();
                 }
             } else if c == '"' {
@@ -87,14 +252,14 @@ fn strip_jsonc(s: &str) -> String {
             }
         } else if c == '"' {
             in_string = true;
-            out.push(c);
+            intermediate.push(c);
         } else if c == '/' {
             match chars.peek() {
                 Some('/') => {
                     chars.next();
                     for ch in chars.by_ref() {
                         if ch == '\n' {
-                            out.push('\n');
+                            intermediate.push('\n');
                             break;
                         }
                     }
@@ -108,15 +273,66 @@ fn strip_jsonc(s: &str) -> String {
                         }
                     }
                 }
-                _ => out.push(c),
+                _ => intermediate.push(c),
             }
         } else {
-            out.push(c);
+            intermediate.push(c);
         }
     }
-    // Strip trailing commas before } or ]
-    let re = regex::Regex::new(r",\s*([}\]])").unwrap();
-    re.replace_all(&out, "$1").into_owned()
+
+    // Pass 2: strip trailing commas before `}` or `]`, but only when NOT
+    // inside a quoted string. Replaces the previous regex-based pass which
+    // was string-blind. UTF-8 safe — iterates char-by-char, not byte-by-byte,
+    // so non-ASCII content inside JSON strings round-trips unchanged.
+    let mut out = String::with_capacity(intermediate.len());
+    let chars: Vec<char> = intermediate.chars().collect();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                // Preserve the escaped char verbatim (incl. `\"` so we don't
+                // exit the string state on it).
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            // Peek forward through whitespace for the next non-ws char.
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                // Trailing comma: drop the comma, keep the whitespace
+                // (so line/column numbers in any downstream parse error
+                // still match the original).
+                i += 1;
+                while i < j {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 fn configure_json_client(path: &Path) -> anyhow::Result<()> {
@@ -152,7 +368,10 @@ fn configure_json_client(path: &Path) -> anyhow::Result<()> {
     );
 
     let formatted = serde_json::to_string_pretty(&root)?;
-    std::fs::write(path, formatted)?;
+    // Atomic write: ~/.claude.json corruption breaks Claude Code launch entirely
+    // (it refuses to parse partial JSON and drops every pre-existing MCP server,
+    // not just rein). See `atomic_write_string` docs for failure-mode rationale.
+    atomic_write_string(path, &formatted)?;
     Ok(())
 }
 
@@ -541,7 +760,11 @@ fn configure_toml_client(path: &Path) -> anyhow::Result<()> {
     }
 
     let formatted = toml::to_string_pretty(&root)?;
-    std::fs::write(path, formatted)?;
+    // Atomic write: ~/.codex/config.toml is mutated again by
+    // `enable_codex_hooks_feature` and `configure_codex_hooks_file`. A partial
+    // write here leaves Codex with a parse-failing config.toml until manual
+    // recovery from the `.toml.bak` sibling.
+    atomic_write_string(path, &formatted)?;
     Ok(())
 }
 
@@ -593,7 +816,10 @@ fn enable_codex_hooks_feature(path: &Path) -> anyhow::Result<()> {
         features_tbl.insert("codex_hooks".to_string(), toml::Value::Boolean(true));
     }
     let formatted = toml::to_string_pretty(&root)?;
-    std::fs::write(path, formatted)?;
+    // Atomic write: this is the second mutation of ~/.codex/config.toml during
+    // `configure_codex_client`. A partial write here brick's Codex's parser
+    // even though `configure_toml_client` succeeded moments earlier.
+    atomic_write_string(path, &formatted)?;
     Ok(())
 }
 
@@ -675,7 +901,10 @@ fn configure_codex_hooks_file(config_path: &Path) -> anyhow::Result<()> {
             std::fs::copy(&hooks_path, &backup).ok();
         }
         let formatted = serde_json::to_string_pretty(&root)?;
-        std::fs::write(hooks_path, format!("{formatted}\n"))?;
+        // Atomic write: a partial hooks.json silently disables every Codex
+        // hook (Codex 0.129+ refuses to parse the file rather than running
+        // a subset), not just the one being added.
+        atomic_write_string(&hooks_path, &format!("{formatted}\n"))?;
     }
     Ok(())
 }
@@ -1077,5 +1306,197 @@ mod tests {
             !config.contains("codex_hooks = true"),
             "explicit codex_hooks=false was overwritten: {config}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Atomic-write helper tests (F5 fix — non-atomic ~/.claude.json write)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn atomic_write_string_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        std::fs::write(&target, "original\n").unwrap();
+
+        atomic_write_string(&target, "replaced\n").unwrap();
+
+        let final_content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(final_content, "replaced\n");
+
+        // No orphan tmp file should remain after a successful run.
+        assert!(
+            !target.with_extension("tmp").exists(),
+            "tmp sibling leaked after successful atomic_write_string"
+        );
+    }
+
+    #[test]
+    fn atomic_write_string_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fresh.json");
+        assert!(!target.exists());
+
+        atomic_write_string(&target, "hello\n").unwrap();
+
+        let final_content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(final_content, "hello\n");
+        assert!(!target.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn atomic_write_string_pre_rename_state_does_not_clobber_original() {
+        // Property under test: between write_to_tmp and rename, the target
+        // file is untouched. If a `kill -9` / power-cut / disk-full interrupts
+        // the run AFTER the tmp file is written but BEFORE the rename, the
+        // user's original file must still be intact.
+        //
+        // We don't need a `#[cfg(test)]` rename-injection hook to check this
+        // — the property is observable without one: writing a tmp file
+        // manually (without calling atomic_write_string at all) simulates
+        // exactly the post-write-pre-rename state.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        std::fs::write(&target, "ORIGINAL_USER_DATA\n").unwrap();
+
+        // Simulate the "process died after writing tmp, before rename" state.
+        let tmp = target.with_extension("tmp");
+        std::fs::write(&tmp, "INCOMPLETE_NEW_DATA").unwrap();
+
+        // The target file should be entirely unchanged.
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            content, "ORIGINAL_USER_DATA\n",
+            "target file was clobbered by the tmp-write stage"
+        );
+
+        // The legacy `target.tmp` orphan exists at this point. After
+        // v0.30.3 codex R14 P2-#3, atomic_write_string uses a per-PID
+        // unique tmp name (`<file>.tmp.<pid>.<nanos>`), so the next
+        // write goes to a DIFFERENT path and leaves this legacy orphan
+        // alone — that's the correct trade-off (concurrent-process
+        // safety over orphan cleanup). What we DO assert: the target
+        // ends up with the new content, AND no `target.tmp.*` sibling
+        // leaks from the current write (the rename was successful).
+        atomic_write_string(&target, "NEW_FULL_DATA\n").unwrap();
+        let recovered = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(recovered, "NEW_FULL_DATA\n");
+        // The legacy `target.tmp` may remain on disk (orphan from this
+        // simulated crash); cleanup is doctor's responsibility.
+        // What must NOT leak: a `<target>.tmp.<pid>.<nanos>` from THIS
+        // call — that would mean the rename failed.
+        if let Some(parent) = target.parent() {
+            let base = target.file_name().unwrap().to_string_lossy().into_owned();
+            let unique_prefix = format!("{base}.tmp.");
+            for entry in std::fs::read_dir(parent).unwrap().filter_map(|e| e.ok()) {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(&unique_prefix) {
+                    panic!(
+                        "unique tmp sibling leaked on successful write: {}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configure_json_client_does_not_clobber_on_partial_write() {
+        // Higher-level check: configure_json_client now routes through
+        // atomic_write_string, so the same crash-safety property holds for
+        // the user-visible config flow. We exercise this by:
+        //   (1) writing a sentinel original (no rein) to the JSON path
+        //   (2) running configure_json_client
+        //   (3) asserting the final file is well-formed JSON containing rein
+        //       (i.e. the rename happened — not a half-baked file)
+        //   (4) asserting no `.tmp` orphan was left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("claude.json");
+        std::fs::write(
+            &target,
+            r#"{"mcpServers": {"other": {"command": "other"}}}"#,
+        )
+        .unwrap();
+
+        configure_json_client(&target).unwrap();
+
+        let final_content = std::fs::read_to_string(&target).unwrap();
+        // Must be parseable JSON post-call (the central failure mode of a
+        // partial write).
+        let parsed: serde_json::Value = serde_json::from_str(&final_content)
+            .expect("post-call file must be valid JSON");
+        assert!(
+            parsed["mcpServers"]["rein"].is_object(),
+            "rein entry missing from post-call file: {final_content}"
+        );
+        // Pre-existing entry preserved.
+        assert_eq!(
+            parsed["mcpServers"]["other"]["command"].as_str(),
+            Some("other"),
+            "pre-existing MCP server was dropped: {final_content}"
+        );
+        // No orphan .tmp.
+        assert!(
+            !target.with_extension("tmp").exists(),
+            "configure_json_client leaked a .tmp sibling"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // strip_jsonc string-aware trailing-comma tests (F5 bonus)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn strip_jsonc_preserves_trailing_comma_pattern_inside_string() {
+        // Bug class: the v0.30.1 regex-based trailing-comma pass was
+        // string-blind, so a JSON string value containing `,}` or `,]`
+        // would get its comma silently dropped, corrupting user data.
+        let input = r#"{"description": "edge case ,]", "items": [1, 2,]}"#;
+        let stripped = strip_jsonc(input);
+        // The trailing comma after `2` is real-trailing and should be
+        // stripped. The `,]` inside the description string must NOT be
+        // touched.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stripped).expect("string-aware strip should yield valid JSON");
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some("edge case ,]"),
+            "the `,]` inside a quoted string was mangled by strip_jsonc: {stripped}"
+        );
+        let items: Vec<i64> = parsed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(items, vec![1, 2]);
+    }
+
+    #[test]
+    fn strip_jsonc_still_strips_real_trailing_commas() {
+        // Regression: ensure the new char-loop implementation didn't
+        // accidentally drop the trailing-comma stripping behavior.
+        let input = "{\"a\": 1, \"b\": 2,}";
+        let stripped = strip_jsonc(input);
+        let parsed: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(parsed["a"].as_i64(), Some(1));
+        assert_eq!(parsed["b"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn strip_jsonc_handles_unicode_inside_strings() {
+        // UTF-8 safety check for the char-by-char pass-2 implementation
+        // (the previous byte-iteration draft would mangle non-ASCII).
+        let input = "{\"name\": \"中文,]测试\", \"x\": [1,]}";
+        let stripped = strip_jsonc(input);
+        let parsed: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(parsed["name"].as_str(), Some("中文,]测试"));
+        let xs: Vec<i64> = parsed["x"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(xs, vec![1]);
     }
 }

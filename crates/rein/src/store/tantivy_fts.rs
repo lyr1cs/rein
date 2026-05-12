@@ -111,10 +111,21 @@ impl TantivyFts {
 
         let reader = index.reader()?;
 
+        // v0.30.3 codex R21 P2: dirty marker MUST live at the SIBLING
+        // path (`<index_path>.dirty`), NOT inside the directory. The
+        // staging-and-swap rebuild path in `search/warmup.rs` renames
+        // the entire index_path dir to `<index_path>.old` on success,
+        // so a marker nested inside it gets swept away (signal lost)
+        // or recreates the dir mid-swap (promotion fails EEXIST).
+        // Compute the sibling: `memories.tantivy/` → `memories.tantivy.dirty`.
+        let dirty_marker_path = match index_path.file_name().and_then(|s| s.to_str()) {
+            Some(name) => index_path.with_file_name(format!("{name}.dirty")),
+            None => index_path.join(".dirty"),
+        };
         Ok(Self {
             index,
             reader,
-            dirty_marker_path: index_path.join(".dirty"),
+            dirty_marker_path,
             id_field,
             topic_field,
             topic_exact_field,

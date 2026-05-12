@@ -361,7 +361,7 @@ fn check_release_metadata_versions() -> DoctorCheck {
         .map(|(name, version)| format!("{name}={version}"))
         .collect::<Vec<_>>()
         .join(", ");
-    warn_with_hint(
+    fail_with_hint(
         DoctorCategory::Architecture,
         "release_metadata_versions",
         format!("Cargo.toml is v{cargo_version}, but release metadata says {summary}"),
@@ -2263,6 +2263,13 @@ fn is_loopback_bind(bind: &str) -> bool {
 fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
     let mut fixes = Vec::new();
 
+    // v0.30.2 B2/B4: clean orphan side-index staging dirs/files from any
+    // prior interrupted rebuild before deciding what to repair. Sequence
+    // matters: stale `.tantivy.new` would otherwise confuse the rebuild
+    // path's own `remove_dir_all` of the staging target.
+    warmup::cleanup_tantivy_staging(store.db_path());
+    warmup::cleanup_hnsw_staging(store.db_path());
+
     let tantivy_path = store.db_path().with_extension("tantivy");
     let tantivy_dirty = warmup::tantivy_dirty_path(store.db_path());
     let tantivy_rebuild_state = warmup::tantivy_rebuild_state(store.db_path());
@@ -2294,6 +2301,23 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
             }
             warmup::TantivyRebuildOutcome::SkippedInMemory => {}
         }
+    }
+
+    // v0.30.2 B5: TTL reset for stranded HNSW `.rebuilding` markers. A
+    // panicked rebuild thread used to leave the marker in place, which
+    // forced every later recall to drop to sqlite-vec O(n) brute force
+    // forever. The spawned closure in `search/recall.rs` now has a
+    // `catch_unwind` guard that restores `.dirty`, but operators upgrading
+    // mid-incident may already have stale markers on disk; the 1-hour
+    // TTL covers that recovery path.
+    if let Some(reset_marker) = warmup::reset_stale_hnsw_rebuilding(
+        store.db_path(),
+        std::time::Duration::from_secs(60 * 60),
+    ) {
+        fixes.push(format!(
+            "reset stale HNSW .rebuilding marker {} (>1h old) — next request triggers retry",
+            reset_marker.display()
+        ));
     }
 
     let hnsw_base = store.db_path().with_extension("");

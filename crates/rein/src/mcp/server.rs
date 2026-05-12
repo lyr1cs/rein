@@ -619,6 +619,48 @@ where
     crate::mcp::rest::collect_body_capped(body).await
 }
 
+/// Collect a request body for an `/mcp` dispatch path, re-wrapping any
+/// failure response from `collect_body_capped` (which emits a plain
+/// `{"error": "..."}` body) into a JSON-RPC 2.0 error envelope so
+/// claude.ai's MCP client can surface the rejection reason instead of a
+/// generic "unknown error". Used for both the >1 MiB cap (413) and
+/// transport read errors (400) on `/mcp` POST bodies.
+///
+/// The originating JSON-RPC `id` is unrecoverable here because the body
+/// was never fully collected, so the envelope `id` is `Null` per
+/// JSON-RPC 2.0 §5. Error code `-32600` (Invalid Request) covers both
+/// payload-too-large and transport-read failures.
+///
+/// Other `/mcp` rejection paths already wrap their responses via
+/// `mcp_jsonrpc_error_response` directly (host guard, auth fail, public
+/// mutation block).
+async fn collect_mcp_body_or_jsonrpc<B>(
+    body: B,
+) -> Result<bytes::Bytes, hyper::Response<HttpBoxBody>>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    match crate::mcp::rest::collect_body_capped(body).await {
+        Ok(bytes) => Ok(bytes),
+        Err(response) => {
+            let status = response.status();
+            let message = match status {
+                hyper::StatusCode::PAYLOAD_TOO_LARGE => "request body exceeds /mcp size cap",
+                hyper::StatusCode::BAD_REQUEST => "failed to read /mcp request body",
+                _ => "failed to read /mcp request body",
+            };
+            Err(mcp_jsonrpc_error_response(
+                status,
+                -32600,
+                message,
+                serde_json::Value::Null,
+                &[],
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 fn constant_time_eq(left: &str, right: &str) -> bool {
     use sha2::{Digest, Sha256};
@@ -1261,8 +1303,15 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                 }
 
                 // /mcp or unmatched path: pass through with original body.
+                // F2 (post-v0.30.1): wrap the body-collect rejection (>1 MiB
+                // cap or transport read error) in a JSON-RPC envelope so
+                // claude.ai surfaces "request body exceeds cap" instead of
+                // the generic "unknown error" produced by the plain
+                // `{"error":"..."}` body from `collect_body_capped`. The
+                // wrap unconditionally targets `/mcp` because non-`/api/`,
+                // non-GUI paths fall through to the MCP service.
                 let (parts, body) = req.into_parts();
-                let body = match collect_mcp_request_body_capped(body).await {
+                let body = match collect_mcp_body_or_jsonrpc(body).await {
                     Ok(body) => body,
                     Err(response) => return Ok::<_, std::convert::Infallible>(response),
                 };
@@ -1917,5 +1966,97 @@ mod tests {
         let response = collect_mcp_request_body_capped(body).await.unwrap_err();
 
         assert_eq!(response.status(), hyper::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// F2 (post-v0.30.1): the `/mcp` body-collect rejection must surface
+    /// as a JSON-RPC 2.0 error envelope so claude.ai's UI can show the
+    /// real reason. The status-only assertion in
+    /// `mcp_body_cap_rejects_chunked_body_without_content_length` covers
+    /// the underlying helper; this test pins the wrapper's body shape +
+    /// Content-Type so a future refactor that drops the envelope wrap
+    /// can't slip through unnoticed.
+    #[tokio::test]
+    async fn mcp_body_cap_oversize_wraps_in_jsonrpc_envelope() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let first_chunk = bytes::Bytes::from(vec![b'a'; 1024 * 1024]);
+        let chunks = tokio_stream::iter(vec![
+            Ok::<_, std::convert::Infallible>(Frame::data(first_chunk)),
+            Ok(Frame::data(bytes::Bytes::from_static(b"x"))),
+        ]);
+        let body = StreamBody::new(chunks);
+        let response = collect_mcp_body_or_jsonrpc(body).await.unwrap_err();
+
+        assert_eq!(response.status(), hyper::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+        );
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect envelope body")
+            .to_bytes();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("envelope must be JSON");
+        assert_eq!(parsed["jsonrpc"], serde_json::Value::String("2.0".into()));
+        assert_eq!(parsed["id"], serde_json::Value::Null);
+        let error = &parsed["error"];
+        assert!(error.is_object(), "envelope must carry an error object");
+        assert_eq!(error["code"], serde_json::json!(-32600));
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|msg| !msg.is_empty()),
+            "envelope error.message must be a non-empty string",
+        );
+    }
+
+    /// Companion to the oversize test: the transport-read-error path
+    /// (`collect_body_capped` returns 400 BAD_REQUEST when the body
+    /// frame stream surfaces an error) must also produce a JSON-RPC
+    /// envelope. Both flavors of `Err` are now wrapped.
+    #[tokio::test]
+    async fn mcp_body_cap_read_error_wraps_in_jsonrpc_envelope() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        #[derive(Debug)]
+        struct StreamError;
+        impl std::fmt::Display for StreamError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "simulated transport failure")
+            }
+        }
+        impl std::error::Error for StreamError {}
+
+        let chunks = tokio_stream::iter(vec![
+            Ok::<_, StreamError>(Frame::data(bytes::Bytes::from_static(b"partial"))),
+            Err(StreamError),
+        ]);
+        let body = StreamBody::new(chunks);
+        let response = collect_mcp_body_or_jsonrpc(body).await.unwrap_err();
+
+        assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+        );
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect envelope body")
+            .to_bytes();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("envelope must be JSON");
+        assert_eq!(parsed["jsonrpc"], serde_json::Value::String("2.0".into()));
+        assert_eq!(parsed["id"], serde_json::Value::Null);
+        assert_eq!(parsed["error"]["code"], serde_json::json!(-32600));
     }
 }
