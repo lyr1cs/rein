@@ -157,6 +157,20 @@ fn sha256_bytes(input: &[u8]) -> [u8; 32] {
     out
 }
 
+/// v0.31.1 candidate (D2): cache key construction that includes the
+/// resolved DB identity so a token cached while verifying against DB A
+/// cannot hit when verifying against DB B in the same process.  The
+/// `\0` separator prevents `(token="abc", db="def")` from colliding
+/// with `(token="abcdef", db="")` etc.  Backed by SHA-256 so a hostile
+/// `db_identity` cannot enlarge the keyspace unboundedly.
+fn bearer_cache_key(token: &str, db_identity: &str) -> [u8; 32] {
+    let mut input = Vec::with_capacity(token.len() + 1 + db_identity.len());
+    input.extend_from_slice(token.as_bytes());
+    input.push(0);
+    input.extend_from_slice(db_identity.as_bytes());
+    sha256_bytes(&input)
+}
+
 fn bearer_cache() -> &'static Mutex<HashMap<[u8; 32], CachedClaim>> {
     static CACHE: std::sync::OnceLock<Mutex<HashMap<[u8; 32], CachedClaim>>> =
         std::sync::OnceLock::new();
@@ -228,17 +242,45 @@ fn mark_client_used_debounced(conn: &rusqlite::Connection, client_id: &str, now:
     }
 }
 
-/// Insert a verified-claims entry into the bearer cache.  Bounded to
-/// `BEARER_CACHE_CAP` entries; when the cap is exceeded we drop a third
-/// of entries in bulk.  Note: `HashMap::keys()` order is unspecified, so
-/// this is *random-sample* eviction, not FIFO/LRU — fine for our threat
-/// model because cache pressure comes from long-lived polling clients
-/// (whose tokens get re-cached on the next miss within seconds) and not
-/// from random-token spray.
-fn bearer_cache_insert(token_hash: [u8; 32], entry: CachedClaim) {
+/// v0.31.1 candidate (D1 from `v0.31.1-oauth-deeper`): atomic insert
+/// that re-reads the invalidation generation **inside** the cache lock.
+///
+/// Closes the R5 P2-#1 sub-microsecond TOCTOU window left by R3 P2.
+/// Old flow: verifier loaded `gen_at_end` outside the lock, then called
+/// `bearer_cache_insert` which acquired the lock separately — a
+/// concurrent `bearer_cache_clear` could bump gen + clear in between,
+/// then this verifier would still insert (against a now-fresh, but
+/// just-cleared map) using the stale `gen_at_end` snapshot.
+///
+/// New flow: lock → re-read gen → compare to `expected_gen` snapshotted
+/// before DB checks → only insert if unchanged.  Returns `true` on
+/// insert, `false` when generation has advanced.  `bearer_cache_clear`
+/// is paired so it bumps gen + clears the map under the SAME lock; any
+/// gen bump observed inside this function implies the prior clear has
+/// already executed (and any prior insert seen by this guard is the
+/// next-epoch state).
+///
+/// Cap-bound eviction matches the pre-D1 behavior (`HashMap::keys()`
+/// random-sample drop of 1/3 when over `BEARER_CACHE_CAP`).
+fn bearer_cache_insert_if_gen_unchanged(
+    cache_key: [u8; 32],
+    entry: CachedClaim,
+    expected_gen: u64,
+) -> bool {
     let mut guard = bearer_cache()
         .lock()
         .expect("OAuth bearer cache mutex poisoned");
+    let current_gen = bearer_cache_generation().load(Ordering::SeqCst);
+    if current_gen != expected_gen {
+        // A revoke / refresh-rotation landed between our snapshot
+        // (gen_at_start in verify_with_conn) and now — declining the
+        // insert prevents the just-invalidated cache from being
+        // immediately re-polluted.  The in-flight request itself still
+        // returns `true` to its caller because the grant was active at
+        // `active_grant_by_jti` time; the protection is only that
+        // FUTURE polls from the same token take the slow path.
+        return false;
+    }
     if guard.len() >= BEARER_CACHE_CAP {
         let drop_count = guard.len() / 3;
         let keys: Vec<[u8; 32]> = guard.keys().take(drop_count).copied().collect();
@@ -246,7 +288,19 @@ fn bearer_cache_insert(token_hash: [u8; 32], entry: CachedClaim) {
             guard.remove(&k);
         }
     }
-    guard.insert(token_hash, entry);
+    guard.insert(cache_key, entry);
+    true
+}
+
+/// Test-only convenience wrapper that snapshots the current generation
+/// and calls `bearer_cache_insert_if_gen_unchanged`.  Production code
+/// must use the explicit-generation API because the generation snapshot
+/// has to happen BEFORE the in-flight DB checks for the race-detection
+/// invariant to hold.
+#[cfg(test)]
+fn bearer_cache_insert(cache_key: [u8; 32], entry: CachedClaim) {
+    let g = bearer_cache_generation().load(Ordering::SeqCst);
+    let _ = bearer_cache_insert_if_gen_unchanged(cache_key, entry, g);
 }
 
 /// Return `true` if the token has a fresh, unexpired entry in the cache.
@@ -284,23 +338,25 @@ fn bearer_cache_hit(token_hash: [u8; 32], now_epoch: i64) -> bool {
 /// which is negligible compared to the security cliff of skipping
 /// invalidation.
 ///
-/// R3 P2: bump the generation counter BEFORE clearing.  Any
-/// `verify_with_conn` already past its initial generation snapshot will
-/// observe `gen_at_end != gen_at_start` and skip the insert that would
-/// otherwise re-pollute the cache with a token whose grant we just
-/// revoked.
+/// R3 P2 + v0.31.1 D1: bump the generation counter AND clear the cache
+/// under the SAME lock.  This serializes against
+/// `bearer_cache_insert_if_gen_unchanged`, which re-reads the generation
+/// inside the cache lock — so any verifier whose `expected_gen` predates
+/// our `fetch_add` will see the bumped value when it acquires the lock
+/// and skip its insert.  Closes the R5 P2-#1 window where the R3
+/// gen-counter-only fix still allowed a verifier to slip an insert in
+/// between its outside-the-lock gen recheck and its insert lock-acquire.
 pub(crate) fn bearer_cache_clear() {
-    // SeqCst pairs with the snapshot+recheck in `verify_with_conn`.  We
-    // bump generation first so the post-check load on a concurrent
-    // verifier sees the bump even if it reads the counter strictly after
-    // we clear the map.  (Reordering the two would create a window where
-    // a verifier could insert into the not-yet-cleared map AND then read
-    // a stale generation, missing the invalidation.)
-    bearer_cache_generation().fetch_add(1, Ordering::SeqCst);
-    bearer_cache()
+    let mut guard = bearer_cache()
         .lock()
-        .expect("OAuth bearer cache mutex poisoned")
-        .clear();
+        .expect("OAuth bearer cache mutex poisoned");
+    // SeqCst pairs with the in-lock load in
+    // `bearer_cache_insert_if_gen_unchanged`.  Bump under the lock so
+    // any concurrent insert that has already passed its outside-the-
+    // lock gen snapshot but not yet acquired the lock will see the
+    // bumped value when it does acquire.
+    bearer_cache_generation().fetch_add(1, Ordering::SeqCst);
+    guard.clear();
 }
 
 /// Verify an OAuth bearer.  Returns `true` iff the token's signature, kid,
@@ -324,7 +380,13 @@ pub fn verify_bearer(config: &crate::config::ReinConfig, headers: &hyper::Header
     else {
         return false;
     };
-    let token_hash = sha256_bytes(token.as_bytes());
+    // v0.31.1 D2: scope the cache key by DB identity so a token cached
+    // while verifying against `config.database.path = A` cannot hit
+    // when verifying against `B` in the same process.  See
+    // `ReinConfig::stable_db_identity` for the identity-derivation
+    // semantics (canonical path, fallback to resolved path).
+    let db_identity = config.stable_db_identity();
+    let cache_key = bearer_cache_key(token, &db_identity);
     let now = chrono::Utc::now().timestamp();
 
     // Fast path: cache hit.  A hit means signature + grant + aud match
@@ -338,7 +400,7 @@ pub fn verify_bearer(config: &crate::config::ReinConfig, headers: &hyper::Header
     //
     // Stale-`now` on this path is harmless: cache TTL is 30 s and any
     // sub-second jitter has no effect on the comparison.
-    if bearer_cache_hit(token_hash, now) {
+    if bearer_cache_hit(cache_key, now) {
         return true;
     }
 
@@ -369,7 +431,7 @@ pub fn verify_bearer(config: &crate::config::ReinConfig, headers: &hyper::Header
     // the pre-wait timestamp would let `jwt::verify_access_token` and
     // `active_grant_by_jti` admit a token that has actually expired.
     let now = chrono::Utc::now().timestamp();
-    verify_with_conn(conn, token, token_hash, now)
+    verify_with_conn(conn, token, cache_key, now)
 }
 
 /// v0.31 candidate (Agent F4 / A-H3): internal verifier that takes a
@@ -379,14 +441,14 @@ pub fn verify_bearer(config: &crate::config::ReinConfig, headers: &hyper::Header
 fn verify_with_conn(
     conn: &rusqlite::Connection,
     token: &str,
-    token_hash: [u8; 32],
+    cache_key: [u8; 32],
     now: i64,
 ) -> bool {
-    // R3 P2: snapshot the invalidation generation BEFORE any DB read.  If
-    // it changes by the time we reach the cache insert below, a
-    // concurrent revoke/refresh already flushed the cache and we must
-    // NOT re-pollute it with a token whose grant may have just been
-    // revoked between our `active_grant_by_jti` check and the insert.
+    // R3 P2: snapshot the invalidation generation BEFORE any DB read.
+    // v0.31.1 D1 moves the post-check INSIDE the cache lock via
+    // `bearer_cache_insert_if_gen_unchanged`, eliminating the
+    // sub-microsecond window between an outside-lock recheck and the
+    // insert that R5 P2-#1 flagged.
     let gen_at_start = bearer_cache_generation().load(Ordering::SeqCst);
 
     let keys = match store::signing_keys_for_verification(conn) {
@@ -419,21 +481,20 @@ fn verify_with_conn(
     // MARK_CLIENT_USED_DEBOUNCE_SECS window per client.
     mark_client_used_debounced(conn, &claims.aud, now);
 
-    // R3 P2: only cache the verified-claims envelope if no invalidation
-    // happened during our in-flight check.  This request itself returns
-    // `true` either way — the grant was active when we read it, and a
-    // revoke that landed in parallel is observed by FUTURE requests
-    // (which take the slow path again because we declined to insert).
-    let gen_at_end = bearer_cache_generation().load(Ordering::SeqCst);
-    if gen_at_start == gen_at_end {
-        bearer_cache_insert(
-            token_hash,
-            CachedClaim {
-                jwt_exp: claims.exp,
-                inserted_at: Instant::now(),
-            },
-        );
-    }
+    // v0.31.1 D1: atomic insert.  The callee re-reads the generation
+    // INSIDE the cache lock and returns `false` if the generation has
+    // advanced since `gen_at_start`.  This request itself still returns
+    // `true` because the grant was active at `active_grant_by_jti`
+    // time; the protection is only that FUTURE polls from the same
+    // token take the slow path (because the insert was suppressed).
+    let _ = bearer_cache_insert_if_gen_unchanged(
+        cache_key,
+        CachedClaim {
+            jwt_exp: claims.exp,
+            inserted_at: Instant::now(),
+        },
+        gen_at_start,
+    );
     true
 }
 
@@ -548,45 +609,168 @@ mod tests {
     }
 
     // R3 P2: prove that `bearer_cache_clear` bumps the generation counter
-    // and that a concurrent `verify_with_conn`-shaped insert path that
-    // straddles the clear declines to repopulate the cache. We test the
-    // generation snapshot/recheck primitive directly rather than spinning
-    // up a SQLite store — the integration test would require a full client
-    // + signing-key + grant fixture and would not give a stronger
-    // guarantee than this targeted check, since the recheck is the only
-    // mutation `verify_with_conn` adds on top of the existing
-    // `bearer_cache_insert`.
+    // and the verifier's insert is suppressed when the generation has
+    // advanced.  v0.31.1 D1 makes the recheck atomic with the insert —
+    // this test now drives the actual production API
+    // (`bearer_cache_insert_if_gen_unchanged`) rather than mimicking it
+    // outside the lock.
     #[test]
     fn bearer_cache_generation_bumps_invalidate_inflight_inserts() {
         let _guard = acquire_cache_test_lock();
         clear_bearer_caches_for_test();
         let token_hash = sha256_bytes(b"inflight-token");
         // Simulate the verify_with_conn shape: snapshot generation, do
-        // "work" (would be DB checks), then recheck before inserting.
+        // "work" (would be DB checks), then attempt the atomic insert.
         let gen_at_start = bearer_cache_generation().load(Ordering::SeqCst);
         // Concurrent revoke lands here.
         bearer_cache_clear();
-        let gen_at_end = bearer_cache_generation().load(Ordering::SeqCst);
-        assert_ne!(
-            gen_at_start, gen_at_end,
-            "bearer_cache_clear must bump the generation counter"
+        // Insert attempt with the now-stale snapshot must return false.
+        let inserted = bearer_cache_insert_if_gen_unchanged(
+            token_hash,
+            CachedClaim {
+                jwt_exp: i64::MAX,
+                inserted_at: Instant::now(),
+            },
+            gen_at_start,
         );
-        // Mimic the gate inside verify_with_conn: only insert when
-        // generation is unchanged.
-        if gen_at_start == gen_at_end {
-            bearer_cache_insert(
-                token_hash,
-                CachedClaim {
-                    jwt_exp: i64::MAX,
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
-        // Without the fix this would hit (the insert ran). With the fix
-        // the gate suppressed the insert, so the entry isn't there.
+        assert!(
+            !inserted,
+            "concurrent revoke must cause insert_if_gen_unchanged to return false"
+        );
+        // Without the fix the entry would be present.  With the fix the
+        // gate suppressed the insert, so the entry isn't there.
         assert!(
             !bearer_cache_hit(token_hash, 100),
             "concurrent revoke must prevent in-flight verifier from re-caching the just-revoked token"
+        );
+    }
+
+    // v0.31.1 D1: prove that the atomic insert is robust against a
+    // revoke landing AFTER an outside-the-lock snapshot but BEFORE the
+    // verifier acquires the cache lock.  The R3-only fix loaded the
+    // generation outside the lock and then called the legacy
+    // `bearer_cache_insert` — there was a window between those two
+    // points where `bearer_cache_clear` could slip its bump+clear in.
+    // The D1 fix re-reads the generation INSIDE the cache lock, so we
+    // simulate that sequence directly and assert the insert is
+    // suppressed.
+    #[test]
+    fn bearer_cache_insert_if_gen_unchanged_rejects_stale_snapshot() {
+        let _guard = acquire_cache_test_lock();
+        clear_bearer_caches_for_test();
+        let token_hash = sha256_bytes(b"d1-stale-snapshot-token");
+
+        // Step 1: verifier records the generation BEFORE any
+        // contention.  This is the same `gen_at_start` snapshot that
+        // `verify_with_conn` captures.
+        let stale_gen = bearer_cache_generation().load(Ordering::SeqCst);
+
+        // Step 2: a concurrent revoke runs to completion — bumps gen
+        // and clears the map under its own lock.
+        bearer_cache_clear();
+
+        // Step 3: verifier reaches its insert attempt with the now-
+        // stale snapshot.  The atomic recheck inside the cache lock
+        // must observe the bumped generation and reject the insert.
+        let inserted = bearer_cache_insert_if_gen_unchanged(
+            token_hash,
+            CachedClaim {
+                jwt_exp: i64::MAX,
+                inserted_at: Instant::now(),
+            },
+            stale_gen,
+        );
+        assert!(
+            !inserted,
+            "D1: insert with a generation-stale snapshot must be suppressed"
+        );
+        assert!(
+            !bearer_cache_hit(token_hash, 100),
+            "D1: the just-revoked token must not be re-cached"
+        );
+
+        // Sanity: a fresh snapshot DOES allow the insert.  This proves
+        // the suppression is conditional on the generation mismatch,
+        // not a hard-coded refusal.
+        let fresh_gen = bearer_cache_generation().load(Ordering::SeqCst);
+        let inserted_fresh = bearer_cache_insert_if_gen_unchanged(
+            token_hash,
+            CachedClaim {
+                jwt_exp: i64::MAX,
+                inserted_at: Instant::now(),
+            },
+            fresh_gen,
+        );
+        assert!(
+            inserted_fresh,
+            "D1: insert with an up-to-date generation snapshot must succeed"
+        );
+        assert!(
+            bearer_cache_hit(token_hash, 100),
+            "D1: post-insert lookup with a fresh snapshot must hit"
+        );
+    }
+
+    // v0.31.1 D2: prove that the bearer cache key is scoped by DB
+    // identity so a token cached while verifying against DB A does not
+    // hit when verifying against DB B in the same process.  Closes the
+    // R5 P2-#2 multi-`ReinConfig` cross-pollination surface.
+    #[test]
+    fn bearer_cache_key_is_db_identity_scoped() {
+        // Pure-function test: no shared cache state, no need for the
+        // test lock.  The construction is `sha256(token || \0 || db)`
+        // so different `db_identity` strings must produce different
+        // keys for the same token, while the same `db_identity`
+        // produces a stable key.
+        let token = "shared-bearer-token";
+        let k_a = bearer_cache_key(token, "/var/db/vault-a/memories.db");
+        let k_b = bearer_cache_key(token, "/var/db/vault-b/memories.db");
+        let k_a2 = bearer_cache_key(token, "/var/db/vault-a/memories.db");
+        assert_ne!(k_a, k_b, "D2: same token + different DB must hash differently");
+        assert_eq!(k_a, k_a2, "D2: same token + same DB must hash identically");
+
+        // The separator byte must prevent (token="abc", db="def") from
+        // colliding with (token="abcdef", db="").  Without `\0` both
+        // would concat to the same 6 bytes.
+        let k_split = bearer_cache_key("abc", "def");
+        let k_concat = bearer_cache_key("abcdef", "");
+        assert_ne!(
+            k_split, k_concat,
+            "D2: domain separator must prevent token||db boundary collisions"
+        );
+    }
+
+    // v0.31.1 D2: integration-shape test — a token inserted against DB
+    // A must NOT be served from a lookup against DB B.  This is the
+    // full attack scenario codex flagged: a bearer cached during a
+    // verify against vault A would falsely return `true` for vault B
+    // for the cache TTL.
+    #[test]
+    fn bearer_cache_does_not_cross_pollinate_between_dbs() {
+        let _guard = acquire_cache_test_lock();
+        clear_bearer_caches_for_test();
+        let token = "d2-cross-pollination-token";
+        let key_a = bearer_cache_key(token, "vault-A");
+        let key_b = bearer_cache_key(token, "vault-B");
+
+        // Cache the token against vault A.
+        bearer_cache_insert(
+            key_a,
+            CachedClaim {
+                jwt_exp: i64::MAX,
+                inserted_at: Instant::now(),
+            },
+        );
+
+        // Lookup against vault A → hits.
+        assert!(
+            bearer_cache_hit(key_a, 100),
+            "D2: token cached for vault A must hit when looked up for vault A"
+        );
+        // Lookup against vault B → MUST miss (different cache key).
+        assert!(
+            !bearer_cache_hit(key_b, 100),
+            "D2: token cached for vault A must NOT hit when looked up for vault B"
         );
     }
 

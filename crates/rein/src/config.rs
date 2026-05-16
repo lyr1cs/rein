@@ -2021,6 +2021,33 @@ impl ReinConfig {
             PathBuf::from(&self.database.path)
         }
     }
+
+    /// v0.31.1 candidate (D2 from `v0.31.1-oauth-deeper`): stable identity
+    /// string for scoping the process-global OAuth bearer cache.
+    ///
+    /// The bearer cache (`auth::oauth::bearer_cache`) lives in a `static`
+    /// and is therefore shared by every `ReinConfig` opened in the same
+    /// process.  Keying entries solely on `sha256(token)` would let a
+    /// token cached against DB A return `true` against DB B for the
+    /// cache TTL — a theoretical cross-vault confusion surface that the
+    /// R5 codex audit flagged.  This identity threads through into the
+    /// cache key (`auth::oauth::bearer_cache_key`) so the two configs
+    /// see disjoint cache namespaces.
+    ///
+    /// Prefer the canonicalised path (resolves symlinks) so the same
+    /// physical DB reached through different access paths still hits
+    /// the same cache namespace.  If canonicalisation fails — typically
+    /// because the file doesn't exist yet during init — fall back to
+    /// the resolved (but non-canonical) path string.  Either form is
+    /// stable across the process lifetime, which is all the cache key
+    /// requires.
+    pub fn stable_db_identity(&self) -> String {
+        let resolved = self.resolve_db_path();
+        match resolved.canonicalize() {
+            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+            Err(_) => resolved.to_string_lossy().into_owned(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
