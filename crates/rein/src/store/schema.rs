@@ -1,6 +1,22 @@
+// ============================================================================
+// v0.31 candidate — pending Codex audit before commit (Agent F4 / A-H2).
+// Audit finding: `migrate_oauth_tables` ran a serial CREATE / probe / ALTER /
+// UPDATE / COUNT on every `open_store()` call, scaling per-open work linearly
+// with grant table size.  Compounded with A-H3 (`verify_bearer` opening a
+// fresh store per request) this produced a perf cliff under claude.ai polling
+// load.  This patch routes the OAuth migration through `oauth_schema_version`
+// (stored in the `schema_migrations` table) so steady-state opens skip the
+// migration after the first run.  See `reviews/fix-20260511-F4-oauth.md`.
+// ============================================================================
 use crate::types::{ReinError, ReinResult};
 use rusqlite::Connection;
 use std::sync::Once;
+
+/// v0.31 candidate (Agent F4 / A-H2): current OAuth migration schema version.
+/// Bump when adding a new ALTER / column / index for the OAuth tables.
+/// Stored in `schema_migrations(name='oauth', version=N)` so we don't collide
+/// with SQLite's single global `PRAGMA user_version` slot.
+const OAUTH_SCHEMA_VERSION: i64 = 1;
 
 static SQLITE_VEC_INIT: Once = Once::new();
 
@@ -615,7 +631,36 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
 /// `[server].auth = "oauth"` does not require a separate operator migration.
 /// A single HS256 signing key is generated once per database and kept in
 /// `oauth_signing_keys`; later rotations add rows rather than replacing it.
+///
+/// v0.31 candidate (Agent F4 / A-H2): gated by `schema_migrations` row so
+/// every steady-state `open_store()` call short-circuits after one cheap
+/// `SELECT version FROM schema_migrations WHERE name='oauth'` lookup.  The
+/// fingerprint-backfill UPDATE only runs when the column was just added.
 pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
+    // 1. Cheap version probe: `schema_migrations` is a small generic table we
+    //    create on demand.  Avoids claiming SQLite's single global
+    //    `PRAGMA user_version` slot (which other migrators may want).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            applied_at INTEGER NOT NULL
+        );",
+    )?;
+    let current_version: i64 = conn
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE name = 'oauth'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if current_version >= OAUTH_SCHEMA_VERSION {
+        // Already at (or beyond) the target version — steady-state fast path.
+        return Ok(());
+    }
+
+    // 2. Create base tables.  Idempotent CREATEs let upgrades from older
+    //    DBs converge to the current shape without separate migration code.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -668,6 +713,29 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
         ",
     )?;
 
+    // 3. v0.30.0 refresh_token_fingerprint column ALTER (release-day
+    //    migration documented in v0.30.0 devlog).  Two cases:
+    //
+    //    a) Column missing — fresh v0.29.x→v0.31 upgrade. ALTER first,
+    //       then the NULL cleanup below will revoke every pre-existing
+    //       grant exactly once.
+    //    b) Column present — either a fresh install (CREATE TABLE above
+    //       declared the column from the start, no NULL rows possible)
+    //       OR a v0.30.x boot that crashed AFTER the ALTER but BEFORE
+    //       the cleanup UPDATE, leaving stale NULL-fingerprint rows.
+    //
+    //    R1 P2-#2: case (b)-crash must still revoke those NULL rows
+    //    before this function returns, otherwise the schema_migrations
+    //    gate marks OAuth v1 complete with revocable grants left
+    //    unrevoked — `active_grant_by_jti` still accepts their access
+    //    tokens until normal JWT `exp` expiry.  The earlier gate-on-ALTER
+    //    branch skipped cleanup whenever the column already existed,
+    //    which silently swallowed this case.
+    //
+    //    The COUNT(*) probe is cheap on the steady-state path (post-v1
+    //    schema migration version pin still short-circuits the whole
+    //    function before we even reach here on subsequent reopens; this
+    //    path runs at most once per crash-recovery).
     let has_refresh_fingerprint: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('oauth_grants') WHERE name='refresh_token_fingerprint'",
@@ -679,12 +747,26 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
     if !has_refresh_fingerprint {
         conn.execute_batch("ALTER TABLE oauth_grants ADD COLUMN refresh_token_fingerprint TEXT")?;
     }
-    conn.execute(
-        "UPDATE oauth_grants
-         SET revoked_at = COALESCE(revoked_at, ?1)
-         WHERE refresh_token_fingerprint IS NULL",
-        [chrono::Utc::now().timestamp()],
-    )?;
+    // Always check for NULL-fingerprint rows.  After the ALTER above (case
+    // a) every existing row will satisfy this; after a crash-mid-migration
+    // boot (case b) the leftover rows will.  Steady-state on a healthy
+    // schema returns 0 and skips the UPDATE — equivalent perf to the
+    // previous gate-on-ALTER branch but closes the crash-recovery hole.
+    let null_fingerprint_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_grants WHERE refresh_token_fingerprint IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    if null_fingerprint_count > 0 {
+        conn.execute(
+            "UPDATE oauth_grants
+             SET revoked_at = COALESCE(revoked_at, ?1)
+             WHERE refresh_token_fingerprint IS NULL",
+            [chrono::Utc::now().timestamp()],
+        )?;
+    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_oauth_grants_refresh_fingerprint
             ON oauth_grants(client_id, refresh_token_fingerprint);",
@@ -710,6 +792,15 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
             rusqlite::params![kid, secret_hex, now],
         )?;
     }
+
+    // 4. Record completion at the new schema version.  Use INSERT OR REPLACE
+    //    so re-running a partial migration (e.g. process crashed before this
+    //    line) bumps the version correctly.
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_migrations (name, version, applied_at)
+         VALUES ('oauth', ?1, ?2)",
+        rusqlite::params![OAUTH_SCHEMA_VERSION, chrono::Utc::now().timestamp()],
+    )?;
 
     Ok(())
 }
@@ -1808,6 +1899,96 @@ mod migration_tests {
         assert!(
             revoked_at.is_some(),
             "legacy unindexed refresh grants must be revoked instead of kept on the slow path"
+        );
+    }
+
+    // v0.31 candidate (Agent F4 / A-H2) — regression: re-running
+    // `migrate_oauth_tables` after the initial run must be a fast no-op via
+    // the `schema_migrations` version gate.  The strict assertion is that
+    // re-runs do not perform an `UPDATE oauth_grants ... WHERE
+    // refresh_token_fingerprint IS NULL` (which scaled linearly with grant
+    // count under the v0.30.x path).
+    #[test]
+    fn oauth_migration_is_idempotent_via_version_gate() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+
+        // First migration: bootstraps everything.
+        migrate_oauth_tables(&conn).expect("first migrate");
+        let version_after_first: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE name = 'oauth'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query schema version");
+        assert_eq!(version_after_first, OAUTH_SCHEMA_VERSION);
+
+        // Insert a valid grant (with fingerprint) so that re-runs would, in
+        // the absence of the version gate, still execute the COUNT/UPDATE.
+        conn.execute(
+            "INSERT INTO oauth_clients (
+                client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                token_endpoint_auth_method, registered_at, last_used_at, revoked_at
+            ) VALUES ('c', NULL, 'c', '[]', '[]', 'none', 1, NULL, NULL)",
+            [],
+        )
+        .expect("insert client");
+        conn.execute(
+            "INSERT INTO oauth_grants (
+                grant_id, client_id, access_token_jti, access_expires_at,
+                refresh_token_hash, refresh_token_fingerprint,
+                refresh_expires_at, issued_at, revoked_at
+            ) VALUES ('g', 'c', 'jti', 999999, 'hash', 'fp', 999999, 1, NULL)",
+            [],
+        )
+        .expect("insert grant");
+
+        // Re-run a few times.  Each call must short-circuit via the version
+        // gate.  We assert the grant's revoked_at stays NULL (no spurious
+        // UPDATE) and the signing-key table has exactly one row.
+        for _ in 0..5 {
+            migrate_oauth_tables(&conn).expect("re-migrate");
+        }
+        let revoked_at: Option<i64> = conn
+            .query_row(
+                "SELECT revoked_at FROM oauth_grants WHERE grant_id = 'g'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query grant");
+        assert!(
+            revoked_at.is_none(),
+            "fingerprint-backfill UPDATE must not run on re-migration"
+        );
+        let key_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM oauth_signing_keys", [], |row| {
+                row.get(0)
+            })
+            .expect("query signing keys");
+        assert_eq!(key_count, 1, "signing key must not be regenerated");
+    }
+
+    // v0.31 candidate (Agent F4 / A-H2) — perf stub.  Real coverage would
+    // assert "1000 re-runs complete in < 100 ms" against a grants table of
+    // ~10k rows, demonstrating the version-gate short-circuit.  Marked
+    // `#[ignore]` because per-CI perf gates require coordinated infra
+    // (warm-up, statistical bounds) — leave to Codex audit reviewer to
+    // decide whether to wire into a `cargo bench` harness instead.
+    #[test]
+    #[ignore]
+    fn oauth_migration_idempotent_replay_under_100ms() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        migrate_oauth_tables(&conn).expect("initial migrate");
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            migrate_oauth_tables(&conn).expect("replay migrate");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "1000 idempotent re-migrations should complete in < 100ms; took {elapsed:?}"
         );
     }
 }

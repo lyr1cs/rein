@@ -723,7 +723,15 @@ fn api_oauth_revoke_client(config: &ReinConfig, client_id: &str) -> BoxedRespons
         Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     };
     match crate::auth::oauth::store::revoke_client(store.conn(), client_id) {
-        Ok(()) => json_response(StatusCode::OK, json!({ "revoked": true })),
+        Ok(()) => {
+            // v0.31 candidate (R1 P2-#1): flush the bearer cache so any
+            // already-cached access token for this client stops verifying
+            // immediately. Without this, the revoke takes effect in SQLite
+            // but cached tokens still pass `verify_bearer` for up to
+            // BEARER_CACHE_TTL_SECS.
+            crate::auth::oauth::bearer_cache_clear();
+            json_response(StatusCode::OK, json!({ "revoked": true }))
+        }
         Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }

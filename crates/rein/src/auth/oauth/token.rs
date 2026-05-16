@@ -352,9 +352,26 @@ fn handle_refresh(
         new_grant,
         chrono::Utc::now().timestamp(),
     ) {
-        Ok(store::RefreshGrantLookup::Active(_grant)) => {}
+        Ok(store::RefreshGrantLookup::Active(_grant)) => {
+            // v0.31 candidate (R2 P2-#1): a successful refresh rotation just
+            // revoked the prior grant in SQLite. The old access token may still
+            // be sitting in `bearer_cache` and would otherwise keep returning
+            // `true` from `verify_bearer` for up to BEARER_CACHE_TTL_SECS —
+            // unacceptable because the DB has already rejected it. Flush the
+            // whole cache; per-jti precision would require augmenting the
+            // cache key schema and isn't worth the complexity for a
+            // refresh-frequency event (≤ once per access-token lifetime per
+            // client).
+            super::bearer_cache_clear();
+        }
         Ok(store::RefreshGrantLookup::ReusedOrExpired) => {
             let _ = store::revoke_grants_for_client(conn, &client_id);
+            // v0.31 candidate (R1 P2-#1): refresh-token replay is the
+            // strongest signal of a compromised client. Flush the bearer
+            // cache so any access tokens already issued to that client
+            // stop verifying immediately rather than persisting up to
+            // BEARER_CACHE_TTL_SECS via cache hits.
+            super::bearer_cache_clear();
             return oauth_error(
                 hyper::StatusCode::BAD_REQUEST,
                 "invalid_grant",

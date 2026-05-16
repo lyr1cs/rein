@@ -13,6 +13,15 @@ struct RevokeRequest {
     client_secret: Option<String>,
 }
 
+/// v0.31 candidate (R4 P2): returns `true` ONLY when the UPDATE actually
+/// flipped an active grant to revoked.  Previously the function returned
+/// `true` whenever the JWT verified + audience matched, even if the grant
+/// was already revoked — letting a holder of an unexpired-but-revoked token
+/// re-POST `/oauth/revoke` indefinitely and claim a successful revoke each
+/// time.  When `handle_revoke` forwarded that signal as `did_revoke`, the
+/// `/oauth/revoke` handler would flush the global bearer cache on every
+/// replay, re-opening the cache-flush DoS amp that R2 closed for the
+/// no-auth case.
 fn revoke_access_token_if_owned(conn: &rusqlite::Connection, client_id: &str, token: &str) -> bool {
     let Ok(keys) = store::signing_keys_for_verification(conn) else {
         return false;
@@ -30,10 +39,15 @@ fn revoke_access_token_if_owned(conn: &rusqlite::Connection, client_id: &str, to
     if claims.aud != client_id {
         return false;
     }
-    let _ = store::revoke_grant_by_access_jti(conn, &claims.jti);
-    true
+    store::revoke_grant_by_access_jti(conn, &claims.jti).unwrap_or(false)
 }
 
+/// v0.31 candidate (R4 P2): same `did_revoke` discipline as the access-token
+/// path.  The refresh-token lookup already filtered to active grants via
+/// `find_active_grant_by_refresh`, but `revoke_grant` itself can still be a
+/// no-op if a peer concurrent revoke beat us; returning `false` in that case
+/// keeps the cache flush semantically tied to "this call observed the
+/// transition from active → revoked".
 fn revoke_refresh_token_if_owned(
     conn: &rusqlite::Connection,
     client_id: &str,
@@ -45,34 +59,47 @@ fn revoke_refresh_token_if_owned(
         token,
         chrono::Utc::now().timestamp(),
     ) {
-        Ok(Some(grant)) => {
-            let _ = store::revoke_grant(conn, &grant.grant_id);
-            true
-        }
+        Ok(Some(grant)) => store::revoke_grant(conn, &grant.grant_id).unwrap_or(false),
         _ => false,
     }
 }
 
+/// v0.31 candidate (R2 P2-#2): return `(OAuthResponse, did_revoke)`.
+///
+/// The boolean is consumed by the `/oauth/revoke` server handler to decide
+/// whether it is safe to invalidate the global bearer cache.  `true`
+/// requires (a) valid client authentication AND (b) a token the
+/// authenticated client actually owned.  This closes the R2-#2 DoS
+/// amplifier where an anonymous attacker could POST malformed revoke bodies
+/// repeatedly and force every legitimate MCP request onto the slow path by
+/// flushing the cache on every `/oauth/revoke` regardless of outcome.
+///
+/// RFC 7009 §2.2 still requires the response body to look identical between
+/// success and "unknown-token" cases — that property is preserved by
+/// always returning HTTP 200 with `{}` on the public success path.  Only
+/// the in-process signal differs.
 pub fn handle_revoke(
     headers: &hyper::HeaderMap,
     body: &[u8],
     config: &ReinConfig,
-) -> OAuthResponse {
+) -> (OAuthResponse, bool) {
+    let empty_ok = || (OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({})), false);
+
     let req = match serde_urlencoded::from_bytes::<RevokeRequest>(body) {
         Ok(req) => req,
-        Err(_) => return OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({})),
+        Err(_) => return empty_ok(),
     };
     let store = match config.open_store() {
         Ok(store) => store,
-        Err(_) => return OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({})),
+        Err(_) => return empty_ok(),
     };
     let Some(client_id) =
         crate::auth::oauth::token::request_client_id(headers, req.client_id.as_deref())
     else {
-        return OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({}));
+        return empty_ok();
     };
     let Ok(Some(client)) = store::get_client(store.conn(), &client_id) else {
-        return OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({}));
+        return empty_ok();
     };
     // RFC 7009 hides token existence, but client authentication must still be enforced.
     if let Err(err) = crate::auth::oauth::token::authenticate_client(
@@ -80,10 +107,13 @@ pub fn handle_revoke(
         headers,
         req.client_secret.as_deref(),
     ) {
-        return crate::auth::oauth::oauth_error(
-            hyper::StatusCode::UNAUTHORIZED,
-            "invalid_client",
-            &err.to_string(),
+        return (
+            crate::auth::oauth::oauth_error(
+                hyper::StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                &err.to_string(),
+            ),
+            false,
         );
     }
 
@@ -106,7 +136,10 @@ pub fn handle_revoke(
         tracing::debug!("OAuth revoke request did not match an active token for client");
     }
 
-    OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({}))
+    (
+        OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({})),
+        revoked,
+    )
 }
 
 #[cfg(test)]
@@ -167,7 +200,7 @@ mod tests {
         drop(store);
 
         let body = serde_urlencoded::to_string([("token", "refresh-to-revoke")]).expect("form");
-        let response = handle_revoke(
+        let (response, _) = handle_revoke(
             &basic_headers(&client.client_id, secret),
             body.as_bytes(),
             &config,
@@ -238,7 +271,7 @@ mod tests {
             ("token_type_hint", "access_token"),
         ])
         .expect("form");
-        let response = handle_revoke(
+        let (response, _) = handle_revoke(
             &basic_headers(
                 &client_b.client_id,
                 client_b.client_secret.as_deref().expect("client b secret"),
@@ -254,7 +287,7 @@ mod tests {
         assert_eq!(active, 1, "client B must not revoke client A's grant");
         drop(store);
 
-        let response = handle_revoke(
+        let (response, _) = handle_revoke(
             &basic_headers(
                 &client_a.client_id,
                 client_a.client_secret.as_deref().expect("client a secret"),
@@ -306,7 +339,7 @@ mod tests {
             ("token_type_hint", "access_token"),
         ])
         .expect("form");
-        let response = handle_revoke(
+        let (response, _) = handle_revoke(
             &basic_headers(&client.client_id, secret),
             body.as_bytes(),
             &config,

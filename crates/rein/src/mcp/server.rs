@@ -1193,7 +1193,20 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                                     return Ok::<_, std::convert::Infallible>(response)
                                 }
                             };
-                            crate::auth::oauth::revoke::handle_revoke(&headers, &body, &cfg)
+                            // v0.31 candidate (R2 P2-#2): only flush the bearer
+                            // cache when `handle_revoke` actually revoked a token
+                            // for the authenticated client. The R1 unconditional
+                            // flush was a DoS amplifier — `/oauth/revoke` is an
+                            // anonymous public endpoint per RFC 7009 and returns
+                            // 200 even for unknown-client/malformed bodies, so a
+                            // remote attacker could spray garbage and force every
+                            // legitimate MCP request onto the DB slow path.
+                            let (response, did_revoke) =
+                                crate::auth::oauth::revoke::handle_revoke(&headers, &body, &cfg);
+                            if did_revoke {
+                                crate::auth::oauth::bearer_cache_clear();
+                            }
+                            response
                         }
                         _ => crate::auth::oauth::oauth_error(
                             hyper::StatusCode::NOT_FOUND,

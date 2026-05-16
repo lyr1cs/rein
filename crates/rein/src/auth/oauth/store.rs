@@ -645,13 +645,20 @@ pub fn active_grant_by_jti(
     .map_err(Into::into)
 }
 
-pub fn revoke_grant(conn: &Connection, grant_id: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "UPDATE oauth_grants SET revoked_at = COALESCE(revoked_at, ?1)
-         WHERE grant_id = ?2",
+/// v0.31 candidate (R4 P2): returns `true` iff this call actually flipped an
+/// active grant to revoked (UPDATE affected ≥ 1 row).  The `AND revoked_at IS
+/// NULL` predicate makes the UPDATE a no-op on already-revoked grants so a
+/// repeated call cannot keep claiming a fresh revoke.  Callers feed this into
+/// the `did_revoke` signal that gates `bearer_cache_clear`, closing the
+/// cache-flush DoS amplifier that an attacker could otherwise drive by
+/// repeating revoke requests on the same already-dead grant.
+pub fn revoke_grant(conn: &Connection, grant_id: &str) -> anyhow::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE oauth_grants SET revoked_at = ?1
+         WHERE grant_id = ?2 AND revoked_at IS NULL",
         params![chrono::Utc::now().timestamp(), grant_id],
     )?;
-    Ok(())
+    Ok(affected > 0)
 }
 
 pub fn revoke_grants_for_client(conn: &Connection, client_id: &str) -> anyhow::Result<()> {
@@ -720,13 +727,15 @@ pub fn mark_client_used(conn: &Connection, client_id: &str) -> anyhow::Result<()
     Ok(())
 }
 
-pub fn revoke_grant_by_access_jti(conn: &Connection, jti: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "UPDATE oauth_grants SET revoked_at = COALESCE(revoked_at, ?1)
-         WHERE access_token_jti = ?2",
+/// v0.31 candidate (R4 P2): returns `true` iff this call actually flipped an
+/// active grant to revoked.  See `revoke_grant` for rationale.
+pub fn revoke_grant_by_access_jti(conn: &Connection, jti: &str) -> anyhow::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE oauth_grants SET revoked_at = ?1
+         WHERE access_token_jti = ?2 AND revoked_at IS NULL",
         params![chrono::Utc::now().timestamp(), jti],
     )?;
-    Ok(())
+    Ok(affected > 0)
 }
 
 pub fn revoke_client(conn: &Connection, client_id: &str) -> anyhow::Result<()> {

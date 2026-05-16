@@ -1,3 +1,12 @@
+// ============================================================================
+// v0.31 candidate — pending Codex audit before commit (Agent F4 / A-H1).
+// Audit finding: `verify_access_token` previously fell through `.chain(keys.iter())`
+// unconditionally after the `kid`-matching filter, allowing a holder of any
+// active signing key (e.g. a retired-but-still-active rotation key) to forge
+// tokens claiming arbitrary `kid` values.  This patch restricts verification
+// to keys whose `kid` matches the JWT header; tokens without `kid` or with an
+// unknown `kid` are rejected outright.  See `reviews/fix-20260511-F4-oauth.md`.
+// ============================================================================
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::hmac;
@@ -81,17 +90,31 @@ pub fn verify_access_token(
     if header_json.get("alg").and_then(Value::as_str) != Some("HS256") {
         anyhow::bail!("unsupported JWT alg");
     }
-    let kid = header_json.get("kid").and_then(Value::as_str).unwrap_or("");
+    let kid = header_json
+        .get("kid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("JWT missing kid header"))?;
+    if kid.is_empty() {
+        anyhow::bail!("JWT kid header is empty");
+    }
     let input = format!("{}.{}", parts[0], parts[1]);
     let sig = URL_SAFE_NO_PAD.decode(parts[2])?;
 
+    // v0.31 candidate (Agent F4 / A-H1): iterate ONLY keys whose kid matches.
+    // The previous `.chain(keys.iter())` fallback let a compromised retired-
+    // but-still-active key forge tokens claiming arbitrary kids.
     let mut verified = false;
-    for key_ref in keys.iter().filter(|key| key.kid == kid).chain(keys.iter()) {
+    let mut kid_known = false;
+    for key_ref in keys.iter().filter(|key| key.kid == kid) {
+        kid_known = true;
         let key = hmac::Key::new(hmac::HMAC_SHA256, &decode_hex_32(key_ref.secret_hex)?);
         if hmac::verify(&key, input.as_bytes(), &sig).is_ok() {
             verified = true;
             break;
         }
+    }
+    if !kid_known {
+        anyhow::bail!("unknown JWT kid");
     }
     if !verified {
         anyhow::bail!("invalid JWT signature");
@@ -138,6 +161,80 @@ mod tests {
         let payload = decode_payload_unverified(&token).expect("decode payload");
         assert!(payload.get("path").is_none());
         assert!(payload.get("memory_count").is_none());
+    }
+
+    // v0.31 candidate (Agent F4 / A-H1) — regression: forge attempt during
+    // signing-key rotation must fail.  Setup: two active keys A and B in the
+    // rotation set.  Attacker holds A's secret.  Attacker signs a token with
+    // A's secret but stamps `kid="future-attacker"` in the JWT header,
+    // hoping the fallback chain finds *some* key that verifies the MAC.
+    // With the fix, the kid is unknown to the keyring and verification fails
+    // before any MAC is checked.
+    #[test]
+    fn verify_rejects_forged_kid_during_rotation() {
+        let key_a_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let key_b_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // Sign a token with key A but lie about the kid.
+        let forged = sign_access_token(
+            "future-attacker",
+            key_a_secret,
+            "client-1",
+            "jti-forge",
+            1_700_000_000,
+            3600,
+        )
+        .expect("sign forged token");
+
+        // Rotation set has both A and B active but NO "future-attacker".
+        let keys = [
+            SigningKeyRef {
+                kid: "key-A",
+                secret_hex: key_a_secret,
+            },
+            SigningKeyRef {
+                kid: "key-B",
+                secret_hex: key_b_secret,
+            },
+        ];
+        let err = verify_access_token(&forged, &keys, 1_700_000_100)
+            .expect_err("forged-kid token must be rejected");
+        assert!(
+            err.to_string().contains("unknown JWT kid"),
+            "expected unknown-kid rejection, got: {err}"
+        );
+    }
+
+    // v0.31 candidate (Agent F4 / A-H1) — sanity: tokens with missing or
+    // empty `kid` header are rejected outright.
+    #[test]
+    fn verify_rejects_kidless_token() {
+        // Hand-build a JWT with no kid header.
+        let secret_hex = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let header = serde_json::json!({ "alg": "HS256", "typ": "JWT" });
+        let claims = AccessTokenClaims {
+            sub: "rein-user".to_string(),
+            jti: "jti-x".to_string(),
+            iat: 1_700_000_000,
+            exp: 1_700_003_600,
+            aud: "client-1".to_string(),
+        };
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let input = format!("{header_b64}.{payload_b64}");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &decode_hex_32(secret_hex).unwrap());
+        let sig = hmac::sign(&key, input.as_bytes());
+        let token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
+
+        let keys = [SigningKeyRef {
+            kid: "key-A",
+            secret_hex,
+        }];
+        let err = verify_access_token(&token, &keys, 1_700_000_100)
+            .expect_err("kidless token must be rejected");
+        assert!(
+            err.to_string().contains("missing kid"),
+            "expected missing-kid rejection, got: {err}"
+        );
     }
 
     #[test]
