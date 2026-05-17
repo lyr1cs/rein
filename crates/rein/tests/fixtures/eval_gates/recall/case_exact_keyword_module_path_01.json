@@ -1,0 +1,30 @@
+{
+  "id": "exact_keyword_module_path_01",
+  "query": "search::classify",
+  "topic": null,
+  "keyword": "classify",
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "The search::classify module implements a rule-based query classifier that routes each query to one of six types (Episodic, Temporal, Preference, ExactKeyword, Semantic, Exploratory) and produces a QueryStrategy with cc_alpha and limit_multiplier overrides.",
+      "topic": "rein-internals",
+      "keywords": ["classify", "router", "query-type"],
+      "summary": "search::classify query router overview."
+    },
+    {
+      "id": "m2",
+      "content": "Memory of the trip to the orchard: picked two pecks of honeycrisp, drank fresh cider on the hayride, kids fell asleep in the car on the way home.",
+      "topic": "personal",
+      "keywords": ["apples", "family"],
+      "summary": "Apple orchard family trip."
+    },
+    {
+      "id": "m3",
+      "content": "Note on framing the bathroom mirror: 1x4 poplar, mitered corners, dark walnut stain, hung with sawtooth hangers for level adjustment.",
+      "topic": "personal",
+      "keywords": ["diy", "framing"],
+      "summary": "Bathroom mirror frame DIY notes."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "preference_prefer_format_01",
+  "query": "what format do I prefer for application logs",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What format do I prefer for application logs: structured JSON, one event per line, with ISO-8601 timestamps in UTC, an explicit level field, and the request id propagated from the inbound trace header so we can join across services in Loki.",
+      "topic": "observability",
+      "keywords": ["logs", "json", "preference", "format", "application", "prefer", "do", "what", "for"],
+      "summary": "Preferred application log format: JSON-per-line plus ISO-8601 plus trace id."
+    },
+    {
+      "id": "m2",
+      "content": "Yoga class schedule: vinyasa flow on Tuesdays at 6:30am, restorative on Thursdays at 7pm, both at the studio on Maple Street.",
+      "topic": "personal",
+      "keywords": ["yoga", "schedule"],
+      "summary": "Weekly yoga class schedule."
+    },
+    {
+      "id": "m3",
+      "content": "Trail conditions report from the local hiking club: the upper switchbacks are still icy in the mornings; bring traction for the next two weeks.",
+      "topic": "personal",
+      "keywords": ["hiking", "trails"],
+      "summary": "Trail icy-conditions report."
+    },
+    {
+      "id": "m4",
+      "content": "Bookshelf reorganization plan: move technical books to the upstairs study, keep poetry and essays in the living room near the reading chair.",
+      "topic": "personal",
+      "keywords": ["books", "organizing"],
+      "summary": "Bookshelf reorganization plan."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

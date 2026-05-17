@@ -6,13 +6,13 @@
     "email": "42969110+lyr1cs@users.noreply.github.com"
   },
   "description": "Multi-source cross-validated memory MCP for AI agents",
-  "version": "0.31.4",
+  "version": "0.32.0",
   "plugins": [
     {
       "name": "rein",
       "source": "./plugins/rein",
       "description": "rein memory MCP server (40 tools, knowledge graph, adaptive engine, temporal recall, OAuth remote MCP)",
-      "version": "0.31.4",
+      "version": "0.32.0",
       "author": { "name": "lyr1cs" },
       "homepage": "https://github.com/lyr1cs/rein",
       "repository": "https://github.com/lyr1cs/rein",

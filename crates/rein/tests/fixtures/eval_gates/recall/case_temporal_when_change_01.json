@@ -1,0 +1,30 @@
+{
+  "id": "temporal_when_change_01",
+  "query": "when did we change the embedding model for recall",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "When did we change the embedding model for recall? We did the change in v0.18, swapping from text-embedding-ada-002 to text-embedding-3-small. The swap doubled vector dimensions from 1536 to 3072 and required a full reindex via 'rein migrate --reindex'.",
+      "topic": "embedding",
+      "keywords": ["embedding", "model", "reindex", "recall", "change", "when", "did", "we", "v018"],
+      "summary": "When the embedding model changed for recall: v0.18 swap to text-embedding-3-small."
+    },
+    {
+      "id": "m2",
+      "content": "Sourdough starter feeding schedule: 1:1:1 ratio at room temperature, refresh every 8 hours during the active build leading up to a bake.",
+      "topic": "personal",
+      "keywords": ["sourdough", "baking"],
+      "summary": "Sourdough starter feeding schedule."
+    },
+    {
+      "id": "m3",
+      "content": "Trip notes from the weekend at the cabin: hiked the ridge loop on Saturday, made venison chili Saturday night, played cards by the woodstove.",
+      "topic": "personal",
+      "keywords": ["cabin", "trip"],
+      "summary": "Cabin weekend trip notes."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

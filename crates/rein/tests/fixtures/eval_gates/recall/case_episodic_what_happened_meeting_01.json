@@ -1,0 +1,30 @@
+{
+  "id": "episodic_what_happened_meeting_01",
+  "query": "what happened in our deployment planning meeting",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What happened in our deployment planning meeting: we walked through the blue/green cutover for the v0.32 release, agreed on a 2pm UTC traffic shift, and assigned on-call coverage to the platform team for the first 24 hours.",
+      "topic": "deployment",
+      "keywords": ["deployment", "meeting", "release", "cutover", "what", "happened", "our"],
+      "summary": "Deployment planning meeting: blue/green cutover at 2pm UTC."
+    },
+    {
+      "id": "m2",
+      "content": "Tasting note for the natural wine from Beaujolais; bright cherry, low tannin, very gluggable on a warm afternoon.",
+      "topic": "personal",
+      "keywords": ["wine", "tasting"],
+      "summary": "Beaujolais natural wine tasting note."
+    },
+    {
+      "id": "m3",
+      "content": "Garden planning sketch: tomatoes along the south fence, basil interplanted, and a raised bed for greens by the kitchen door.",
+      "topic": "personal",
+      "keywords": ["garden", "sketch"],
+      "summary": "Spring garden planning sketch."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

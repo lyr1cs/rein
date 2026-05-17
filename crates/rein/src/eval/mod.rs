@@ -17,6 +17,7 @@
 //! defining the shapes and the decision math.
 
 pub mod concept_summary;
+pub mod gates;
 pub mod llm_judge;
 pub mod mcnemar;
 pub mod scorecard;

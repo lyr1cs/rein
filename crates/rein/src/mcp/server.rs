@@ -2022,9 +2022,7 @@ mod tests {
         assert!(error.is_object(), "envelope must carry an error object");
         assert_eq!(error["code"], serde_json::json!(-32600));
         assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|msg| !msg.is_empty()),
+            error["message"].as_str().is_some_and(|msg| !msg.is_empty()),
             "envelope error.message must be a non-empty string",
         );
     }

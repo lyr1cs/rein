@@ -726,7 +726,10 @@ mod tests {
         let k_a = bearer_cache_key(token, "/var/db/vault-a/memories.db");
         let k_b = bearer_cache_key(token, "/var/db/vault-b/memories.db");
         let k_a2 = bearer_cache_key(token, "/var/db/vault-a/memories.db");
-        assert_ne!(k_a, k_b, "D2: same token + different DB must hash differently");
+        assert_ne!(
+            k_a, k_b,
+            "D2: same token + different DB must hash differently"
+        );
         assert_eq!(k_a, k_a2, "D2: same token + same DB must hash identically");
 
         // The separator byte must prevent (token="abc", db="def") from

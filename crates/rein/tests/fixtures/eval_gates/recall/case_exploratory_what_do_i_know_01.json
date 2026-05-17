@@ -1,0 +1,30 @@
+{
+  "id": "exploratory_what_do_i_know_01",
+  "query": "what do I know about pgvector for similarity search",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What I know about pgvector for similarity search: pgvector adds a vector column type to PostgreSQL and supports IVFFlat plus HNSW indexes for approximate similarity search. The IVFFlat index needs to be built after data is loaded for the centroids to be representative, while HNSW indexes can be built incrementally.",
+      "topic": "embedding-stores",
+      "keywords": ["pgvector", "postgres", "similarity", "hnsw", "know", "what", "do", "i", "about"],
+      "summary": "What I know about pgvector for similarity search: IVFFlat vs HNSW indexing."
+    },
+    {
+      "id": "m2",
+      "content": "Sketch list for the weekend bike ride: pump up the tires, check the chain wax, bring two bottles and a couple of energy bars.",
+      "topic": "personal",
+      "keywords": ["cycling", "checklist"],
+      "summary": "Bike ride prep checklist."
+    },
+    {
+      "id": "m3",
+      "content": "Book club selection for May: a translated Korean novel about an elderly bookbinder and the apprentice who comes to learn the craft.",
+      "topic": "personal",
+      "keywords": ["books", "club"],
+      "summary": "May book club selection."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

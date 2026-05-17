@@ -1,0 +1,37 @@
+{
+  "id": "episodic_meeting_decision_02",
+  "query": "what did we decide about the recall pipeline architecture",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What did we decide about the recall pipeline architecture in the engineering meeting? We decided to keep the three-channel waterfall of FTS5 BM25, HNSW vector search, and KG concept fanout, then add a learned reranker on top of the RRF or CC fusion stage.",
+      "topic": "architecture",
+      "keywords": ["recall", "pipeline", "architecture", "fusion", "reranker", "decide", "what", "did", "we", "about"],
+      "summary": "Recall pipeline architecture decision: keep three-channel waterfall, add learned reranker."
+    },
+    {
+      "id": "m2",
+      "content": "Booking confirmation for the dentist appointment on Thursday morning at the downtown clinic.",
+      "topic": "personal",
+      "keywords": ["dentist", "appointment"],
+      "summary": "Dentist appointment booking."
+    },
+    {
+      "id": "m3",
+      "content": "Grocery list for the cookout: chicken thighs, charcoal, brioche buns, dill pickles, and two limes for the marinade.",
+      "topic": "personal",
+      "keywords": ["groceries", "cookout"],
+      "summary": "Cookout grocery list."
+    },
+    {
+      "id": "m4",
+      "content": "Note on a stargazing trip to Cherry Springs State Park; best viewing window is around new moon in late summer.",
+      "topic": "personal",
+      "keywords": ["stargazing", "travel"],
+      "summary": "Cherry Springs stargazing notes."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

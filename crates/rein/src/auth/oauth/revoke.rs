@@ -83,7 +83,12 @@ pub fn handle_revoke(
     body: &[u8],
     config: &ReinConfig,
 ) -> (OAuthResponse, bool) {
-    let empty_ok = || (OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({})), false);
+    let empty_ok = || {
+        (
+            OAuthResponse::json(hyper::StatusCode::OK, serde_json::json!({})),
+            false,
+        )
+    };
 
     let req = match serde_urlencoded::from_bytes::<RevokeRequest>(body) {
         Ok(req) => req,

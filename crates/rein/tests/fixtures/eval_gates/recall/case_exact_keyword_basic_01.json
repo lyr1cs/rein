@@ -1,0 +1,30 @@
+{
+  "id": "exact_keyword_basic_01",
+  "query": "SqliteStore",
+  "topic": null,
+  "keyword": "SqliteStore",
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "SqliteStore is the per-request storage layer in rein; it owns a single rusqlite Connection, a Tantivy singleton cache, and the HNSW index handle, and is constructed once per recall request via from_conn.",
+      "topic": "rein-internals",
+      "keywords": ["SqliteStore", "storage", "tantivy"],
+      "summary": "SqliteStore design overview."
+    },
+    {
+      "id": "m2",
+      "content": "Recipe note: braised short ribs work best when seared hard, then deglazed with red wine and finished in a 300F oven for three hours.",
+      "topic": "personal",
+      "keywords": ["braising", "recipe", "beef"],
+      "summary": "Short rib braising recipe."
+    },
+    {
+      "id": "m3",
+      "content": "Birthday card sketch for Alex: watercolor of the lighthouse at Pemaquid Point, with a stamped envelope from the maritime museum gift shop.",
+      "topic": "personal",
+      "keywords": ["birthday", "art"],
+      "summary": "Pemaquid lighthouse birthday card."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

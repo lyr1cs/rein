@@ -1,0 +1,30 @@
+{
+  "id": "exploratory_tell_me_about_01",
+  "query": "tell me about the dedup engine in rein",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Tell me about the dedup engine in rein: it uses a hybrid lexical pipeline with whitespace tokens for English, jieba-rs segmentation for Chinese, and character bigrams for CJK fallback. Candidate pairs above the lexical threshold get an embedding cross-check, then an optional LLM verdict resolves the gray zone before merging into a canonical row.",
+      "topic": "rein-internals",
+      "keywords": ["dedup", "engine", "jieba", "canonical", "rein", "tell", "me", "about", "in"],
+      "summary": "Tell me about the dedup engine in rein: lexical plus embedding plus LLM verdict."
+    },
+    {
+      "id": "m2",
+      "content": "Tasting room visit: dry rose with a strawberry-rhubarb nose and a fresh, citrus-driven finish; bought a bottle for the deck this summer.",
+      "topic": "personal",
+      "keywords": ["wine", "tasting"],
+      "summary": "Dry rose tasting note."
+    },
+    {
+      "id": "m3",
+      "content": "Note on the cat's new litter routine: scoop morning and night, swap clay for the unscented walnut blend, monitor for scatter.",
+      "topic": "personal",
+      "keywords": ["cat", "litter"],
+      "summary": "Cat litter routine adjustment."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

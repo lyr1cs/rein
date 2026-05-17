@@ -1,0 +1,30 @@
+{
+  "id": "semantic_paraphrase_memory_01",
+  "query": "memory management strategies for long-running sessions",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Memory management strategies for long-running sessions in rein layer a strength-based Ebbinghaus decay with per-cluster Kaplan-Meier survival curves, promote STM to LTM on repeated access, and tier cold material into archival summaries so the active working set stays bounded.",
+      "topic": "architecture",
+      "keywords": ["memory", "management", "decay", "tiering", "strategies", "sessions", "long-running", "for"],
+      "summary": "Memory management strategies for long-running sessions: decay plus survival plus tiering."
+    },
+    {
+      "id": "m2",
+      "content": "Sandwich shop order routine: hot pastrami on rye, deli mustard, pickle on the side, root beer to drink, no chips.",
+      "topic": "personal",
+      "keywords": ["food", "habits"],
+      "summary": "Usual deli order."
+    },
+    {
+      "id": "m3",
+      "content": "Carpentry log: re-flattened the workbench top with a No.7 jointer plane, then re-applied a coat of paste wax.",
+      "topic": "personal",
+      "keywords": ["woodworking", "tools"],
+      "summary": "Workbench top refresh."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

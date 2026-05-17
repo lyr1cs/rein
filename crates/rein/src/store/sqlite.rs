@@ -4155,7 +4155,11 @@ enabled = true
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(journal_mode.to_lowercase(), "wal", "journal_mode must be WAL");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "journal_mode must be WAL"
+        );
 
         let synchronous: i64 = conn
             .query_row("PRAGMA synchronous", [], |r| r.get(0))

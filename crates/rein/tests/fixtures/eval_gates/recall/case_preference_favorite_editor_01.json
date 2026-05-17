@@ -1,0 +1,30 @@
+{
+  "id": "preference_favorite_editor_01",
+  "query": "what is my favorite editor for Rust development",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What is my favorite editor for Rust development: Neovim with rust-analyzer plus telescope.nvim. I keep a personal Lua config and prefer LSP-driven navigation over fuzzy file pickers for code search.",
+      "topic": "tools",
+      "keywords": ["editor", "neovim", "rust", "favorite", "development", "what"],
+      "summary": "Favorite editor for Rust development: Neovim plus rust-analyzer."
+    },
+    {
+      "id": "m2",
+      "content": "Recipe note: hand-cut pappardelle works well with a slow-cooked wild boar ragu, finished with shaved pecorino and torn basil.",
+      "topic": "personal",
+      "keywords": ["pasta", "recipe"],
+      "summary": "Pappardelle and boar ragu recipe."
+    },
+    {
+      "id": "m3",
+      "content": "Weekend playlist: a mix of bossa nova classics and Japanese city pop for slow Sunday mornings.",
+      "topic": "personal",
+      "keywords": ["music", "playlist"],
+      "summary": "Sunday morning playlist."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

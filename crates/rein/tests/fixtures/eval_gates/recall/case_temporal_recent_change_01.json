@@ -1,0 +1,30 @@
+{
+  "id": "temporal_recent_change_01",
+  "query": "what changed in the auth config recently",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What changed in the auth config recently: we tightened CORS allow_origins to an explicit allowlist (previously '*'), enabled SameSite=Strict on the session cookie, and bumped the refresh-token rotation interval from 12 to 6 hours.",
+      "topic": "auth",
+      "keywords": ["auth", "config", "cors", "cookie", "changed", "recently", "what", "in", "the"],
+      "summary": "What changed in the auth config recently: CORS allowlist + SameSite=Strict + 6h refresh."
+    },
+    {
+      "id": "m2",
+      "content": "Book recommendation from a friend: a slow-burn literary thriller set on a remote Scottish island, narrated by an unreliable lighthouse keeper.",
+      "topic": "personal",
+      "keywords": ["book", "recommendation"],
+      "summary": "Scottish island thriller book rec."
+    },
+    {
+      "id": "m3",
+      "content": "Stretching routine for tight hip flexors: half-kneeling lunge, couch stretch, 90/90 hip rotation, 60 seconds each side.",
+      "topic": "personal",
+      "keywords": ["mobility", "stretching"],
+      "summary": "Hip flexor stretching routine."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

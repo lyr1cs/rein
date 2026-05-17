@@ -1,0 +1,30 @@
+{
+  "id": "preference_go_to_db_01",
+  "query": "what is my go-to database for prototyping a side project",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What is my go-to database for prototyping a side project: SQLite via rusqlite. Zero ops, file-backed, WAL gives plenty of concurrency for read-heavy hobby projects, and migrating to Postgres later is straightforward if scale demands it.",
+      "topic": "tools",
+      "keywords": ["database", "sqlite", "prototyping", "preference", "go-to", "goto", "side", "project", "a", "what"],
+      "summary": "Go-to prototyping database for a side project: SQLite plus rusqlite."
+    },
+    {
+      "id": "m2",
+      "content": "Spring cleaning: rotated the mattress, washed all the linens, and replaced the air filters in both bedrooms.",
+      "topic": "personal",
+      "keywords": ["cleaning", "chores"],
+      "summary": "Spring cleaning chores done."
+    },
+    {
+      "id": "m3",
+      "content": "Travel itinerary for the trip to Iceland: 3 nights in Reykjavik, 2 nights at the south coast guesthouse, ring road loop the final 4 days.",
+      "topic": "personal",
+      "keywords": ["travel", "iceland"],
+      "summary": "Iceland trip itinerary."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

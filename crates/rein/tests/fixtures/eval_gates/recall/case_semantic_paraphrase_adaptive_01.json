@@ -1,0 +1,30 @@
+{
+  "id": "semantic_paraphrase_adaptive_01",
+  "query": "data-driven parameter tuning approach for retrieval quality",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "The data-driven parameter tuning approach for retrieval quality replaces hardcoded knobs with feedback-driven optimization: counterfactual replay learns the fusion alpha that would have maximized relevance, per-cluster Kaplan-Meier survival curves replace fixed half-lives, and tier boundaries float on a streaming t-digest of cluster strength.",
+      "topic": "architecture",
+      "keywords": ["adaptive", "tuning", "counterfactual", "quality", "data-driven", "parameter", "approach", "for"],
+      "summary": "Data-driven parameter tuning approach for retrieval quality: counterfactual plus survival plus tiering."
+    },
+    {
+      "id": "m2",
+      "content": "Recipe note: green Thai curry with eggplant and Thai basil works best with kaffir lime leaves added in the last two minutes, not at the start.",
+      "topic": "personal",
+      "keywords": ["recipe", "thai"],
+      "summary": "Thai green curry timing note."
+    },
+    {
+      "id": "m3",
+      "content": "Sketch idea for the next zine: pen-and-ink illustrations of overlooked corners of the city, each paired with a haiku.",
+      "topic": "personal",
+      "keywords": ["zine", "art"],
+      "summary": "Pen-and-ink zine idea."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

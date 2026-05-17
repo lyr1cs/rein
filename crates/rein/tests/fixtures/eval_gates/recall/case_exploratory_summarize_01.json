@@ -1,0 +1,30 @@
+{
+  "id": "exploratory_summarize_01",
+  "query": "summarize the v0.30 OAuth provider changes",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "To summarize the v0.30 OAuth provider changes: rein added a built-in OAuth 2.0 provider with explicit auth policy (loopback_only / bearer_required / oauth / public), authorization-code flow with PKCE S256, dynamic client registration, SQLite-backed clients and grants, and signed metadata at /.well-known/oauth-authorization-server.",
+      "topic": "auth",
+      "keywords": ["oauth", "provider", "pkce", "summarize", "changes", "the", "v030"],
+      "summary": "Summarize of v0.30 OAuth provider changes: policy, PKCE, DCR, and .well-known."
+    },
+    {
+      "id": "m2",
+      "content": "Reminder to pick up the dry cleaning on Friday afternoon before the suit needs to come along for the rehearsal dinner.",
+      "topic": "personal",
+      "keywords": ["chores", "errands"],
+      "summary": "Dry cleaning pickup reminder."
+    },
+    {
+      "id": "m3",
+      "content": "Garden journal: the snap peas are climbing the new trellis well, but the lettuce bed needs more shade cloth as the afternoons warm up.",
+      "topic": "personal",
+      "keywords": ["garden", "vegetables"],
+      "summary": "Garden snap peas plus lettuce notes."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

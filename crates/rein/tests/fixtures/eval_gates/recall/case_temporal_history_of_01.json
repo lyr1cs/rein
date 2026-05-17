@@ -1,0 +1,30 @@
+{
+  "id": "temporal_history_of_01",
+  "query": "history of token caching decisions in the gateway",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "History of token caching decisions in the gateway: we started with a naive 5-minute TTL, moved to a sliding window keyed by user id when the auth provider rate-limited us, then settled on a two-tier cache with per-token TTL plus a revocation bus on Redis pub/sub.",
+      "topic": "gateway",
+      "keywords": ["token", "cache", "caching", "history", "gateway", "decisions", "of"],
+      "summary": "History of token caching decisions in the gateway: TTL, sliding, two-tier + revocation bus."
+    },
+    {
+      "id": "m2",
+      "content": "Birthday gift idea for Jamie: a hand-thrown ceramic pour-over from the local potter, plus a tin of single-origin beans.",
+      "topic": "personal",
+      "keywords": ["gift", "birthday"],
+      "summary": "Birthday gift idea for Jamie."
+    },
+    {
+      "id": "m3",
+      "content": "Reminder to renew the car registration before the end of the month; tabs are in the glove compartment.",
+      "topic": "personal",
+      "keywords": ["car", "renewal"],
+      "summary": "Car registration renewal reminder."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

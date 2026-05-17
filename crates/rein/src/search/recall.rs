@@ -2387,9 +2387,7 @@ fn try_tantivy_then_fts5(
             crate::search::warmup::TantivyRebuildState::StaleMarker
         );
         if rebuild_running {
-            tracing::debug!(
-                "tantivy rebuild in progress — using FTS5 only for this request"
-            );
+            tracing::debug!("tantivy rebuild in progress — using FTS5 only for this request");
         } else if dirty_path.exists() || needs_repair {
             // v0.30.2 B1: previously this synchronously ran `populate_tantivy`
             // on the recall hot path — every sleep/wake or interrupted-rebuild
@@ -2409,7 +2407,10 @@ fn try_tantivy_then_fts5(
             // (re-)trigger spawn — the rebuild path's `try_populate_tantivy`
             // re-acquires the lock and handles marker cleanup.
             let rebuild_state = crate::search::warmup::tantivy_rebuild_state(db_path);
-            if !matches!(rebuild_state, crate::search::warmup::TantivyRebuildState::Running) {
+            if !matches!(
+                rebuild_state,
+                crate::search::warmup::TantivyRebuildState::Running
+            ) {
                 tracing::info!(
                     "tantivy index dirty (state={:?}) — spawning background rebuild, using FTS5 for this request",
                     rebuild_state
@@ -2464,11 +2465,7 @@ fn try_tantivy_then_fts5(
                             );
                             return;
                         }
-                        let s = SqliteStore::from_conn(
-                            conn,
-                            rebuild_db_path.clone(),
-                            rebuild_dims,
-                        );
+                        let s = SqliteStore::from_conn(conn, rebuild_db_path.clone(), rebuild_dims);
                         crate::search::warmup::try_populate_tantivy(&s);
                     }));
                     if result.is_err() {
@@ -2480,8 +2477,7 @@ fn try_tantivy_then_fts5(
                         // failure branches normally re-mark dirty; on panic
                         // we mark dirty explicitly so the next request
                         // re-triggers the spawn.
-                        let dirty =
-                            crate::search::warmup::tantivy_dirty_path(&rebuild_db_path);
+                        let dirty = crate::search::warmup::tantivy_dirty_path(&rebuild_db_path);
                         if let Some(parent) = dirty.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
@@ -2493,9 +2489,7 @@ fn try_tantivy_then_fts5(
                 };
                 std::thread::spawn(rebuild_body);
             } else {
-                tracing::debug!(
-                    "tantivy rebuild already in progress, using FTS5 for this request"
-                );
+                tracing::debug!("tantivy rebuild already in progress, using FTS5 for this request");
             }
             // v0.30.3 codex R9 P2: when the dirty marker is set OR a
             // rebuild is in progress, SKIP `TantivyFts::open` for this
@@ -2510,9 +2504,9 @@ fn try_tantivy_then_fts5(
             //   Use FTS5 only until the rebuild completes; the next
             //   recall after the dirty marker clears will pick up the
             //   fresh Tantivy automatically.
-        } else if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open_existing(
-            &db_path.with_extension("tantivy"),
-        ) {
+        } else if let Ok(tantivy) =
+            crate::store::tantivy_fts::TantivyFts::open_existing(&db_path.with_extension("tantivy"))
+        {
             // v0.30.4 D1 (closes v0.30.3 codex R13 P2-#2): use
             // `open_existing` instead of `open` so this read path does
             // NOT recreate `<db>.tantivy/` empty when the dir is
@@ -3383,10 +3377,18 @@ mod tests {
         });
 
         // Thread must NOT propagate the inner panic.
-        handle.join().expect("catch_unwind must swallow inner panic — spawn must not crash the process");
+        handle
+            .join()
+            .expect("catch_unwind must swallow inner panic — spawn must not crash the process");
 
-        assert!(!rebuilding.exists(), ".rebuilding must be cleared on panic recovery");
-        assert!(dirty.exists(), ".dirty must be set so the next recall retries");
+        assert!(
+            !rebuilding.exists(),
+            ".rebuilding must be cleared on panic recovery"
+        );
+        assert!(
+            dirty.exists(),
+            ".dirty must be set so the next recall retries"
+        );
     }
 
     /// B5 fallback: if the `.rebuilding` marker was already cleared by a

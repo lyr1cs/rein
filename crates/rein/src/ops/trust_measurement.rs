@@ -90,33 +90,122 @@ pub fn collect(store: &SqliteStore, config: &ReinConfig) -> TrustMeasurementRepo
     }
 }
 
+/// v0.32 (T&M Phase 2): each `MeasurementGate` is now populated from a real
+/// eval-gate harness round-trip — `docs/eval-baselines/{name}.json` (baseline
+/// scorecard committed to the repo) compared against
+/// `target/eval-gates/{name}-run.json` (last `rein-eval gate run` artifact)
+/// via paired McNemar.  When either side is missing the status falls back to
+/// `no_baseline` / `no_run` / `stub` so the report still serializes cleanly
+/// for the doctor + GUI consumers.
+///
+/// The CWD used for scorecard lookup is `env::current_dir()` — the typical
+/// invocation pattern is `cd source/rein && rein trust-measurement`.  In a
+/// deployed binary running far from the source repo the scorecards won't be
+/// found and every gate degrades to `no_baseline`; that's the honest answer
+/// because nothing has been measured there.
 fn eval_gates() -> Vec<MeasurementGate> {
-    vec![
-        MeasurementGate {
-            name: "recall".to_string(),
-            status: "available".to_string(),
-            signal: "paired recall/synthesis hit scorecard".to_string(),
-            command: "rein-eval synthesis compare".to_string(),
-        },
-        MeasurementGate {
-            name: "dedup".to_string(),
-            status: "available".to_string(),
-            signal: "cluster-aware dedup thresholds and doctor/index checks".to_string(),
-            command: "rein adaptive-status --json".to_string(),
-        },
-        MeasurementGate {
-            name: "admission".to_string(),
-            status: "available".to_string(),
-            signal: "cluster admission and promotion decisions".to_string(),
-            command: "rein adaptive-status --json".to_string(),
-        },
-        MeasurementGate {
-            name: "latency".to_string(),
-            status: "available".to_string(),
-            signal: "health queue lag plus release-gate policy readiness".to_string(),
-            command: "rein health --json".to_string(),
-        },
-    ]
+    use crate::eval::gates::{self, ScorecardLoad, ScorecardStatus};
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let target_dir = repo_root.join("target");
+
+    let mut gates_out = Vec::new();
+    for gate in gates::all_gates() {
+        let name = gate.name().to_string();
+        let baseline_path = gates::baseline_path(&repo_root, &name);
+        let run_path = gates::run_path(&target_dir, &name);
+
+        // v0.32 R4 P2-#2: corrupt scorecard short-circuits to a
+        // dedicated "corrupt" status — caller knows to repair the
+        // file rather than treating it as merely absent.
+        //
+        // v0.32 R9 P2-#1: `signal` is serialized over the PUBLIC
+        // `/api/trust-measurement` route, so it must NOT include
+        // absolute filesystem paths, the process CWD, or any other
+        // host-local detail.  Operators who need the full path can
+        // get it via `rein doctor` (local-only).  We deliberately
+        // drop the underlying `read_scorecard` error message from the
+        // corrupt branch for the same reason — it embeds the
+        // absolute scorecard path via `with_context(...)`.
+        let baseline_load = gates::load_scorecard(&baseline_path);
+        let current_load = gates::load_scorecard(&run_path);
+        if matches!(baseline_load, ScorecardLoad::Corrupt(_)) {
+            gates_out.push(MeasurementGate {
+                name: name.clone(),
+                status: "corrupt".to_string(),
+                signal: "baseline scorecard exists but failed to parse — run \
+                         `rein doctor` for the full diagnostic"
+                    .to_string(),
+                command: format!("rein-eval gate baseline --gate {name}"),
+            });
+            continue;
+        }
+        if matches!(current_load, ScorecardLoad::Corrupt(_)) {
+            gates_out.push(MeasurementGate {
+                name: name.clone(),
+                status: "corrupt".to_string(),
+                signal: "run scorecard exists but failed to parse — run \
+                         `rein doctor` for the full diagnostic"
+                    .to_string(),
+                command: format!("rein-eval gate run --gate {name}"),
+            });
+            continue;
+        }
+        let baseline = match baseline_load {
+            ScorecardLoad::Loaded(sc) => Some(sc),
+            _ => None,
+        };
+        let current = match current_load {
+            ScorecardLoad::Loaded(sc) => Some(sc),
+            _ => None,
+        };
+
+        let (status, signal, command) = if gate.is_stub() {
+            (
+                "stub".to_string(),
+                "placeholder for v0.32 — full gate impl deferred to v0.33+".to_string(),
+                format!("rein-eval gate run --gate {name}"),
+            )
+        } else if baseline.is_none() {
+            (
+                "no_baseline".to_string(),
+                // v0.32 R9 P2-#1: generic message — see comment block above.
+                "no baseline scorecard committed for this gate".to_string(),
+                format!("rein-eval gate baseline --gate {name}"),
+            )
+        } else if current.is_none() {
+            (
+                "no_run".to_string(),
+                // v0.32 R9 P2-#1: generic message — see comment block above.
+                "baseline exists; run scorecard not yet generated for this build".to_string(),
+                format!("rein-eval gate run --gate {name}"),
+            )
+        } else {
+            let cmp = gates::compare_scorecards(
+                &name,
+                baseline.as_ref(),
+                current.as_ref(),
+                gates::DEFAULT_NOISE_FLOOR,
+            );
+            let status = match cmp.status {
+                ScorecardStatus::Ship => "ship".to_string(),
+                ScorecardStatus::Bail => "bail".to_string(),
+                ScorecardStatus::NoData => "no_data".to_string(),
+            };
+            (
+                status,
+                cmp.reason,
+                format!("rein-eval gate compare --gate {name}"),
+            )
+        };
+
+        gates_out.push(MeasurementGate {
+            name,
+            status,
+            signal,
+            command,
+        });
+    }
+    gates_out
 }
 
 fn collect_index_consistency(store: &SqliteStore) -> IndexConsistencyReport {

@@ -124,10 +124,7 @@ impl TantivyFts {
     /// handle derivation, dirty-marker sibling path computation.
     /// Used by both `open` (create-if-missing) and `open_existing`
     /// (read-only) so the field-derivation logic stays in one place.
-    fn from_opened_index(
-        index: Index,
-        index_path: &Path,
-    ) -> Result<Self, tantivy::TantivyError> {
+    fn from_opened_index(index: Index, index_path: &Path) -> Result<Self, tantivy::TantivyError> {
         // Register the jieba tokenizer so the index (and QueryParser) can use it
         index.tokenizers().register(TOKENIZER_NAME, JiebaTokenizer);
 

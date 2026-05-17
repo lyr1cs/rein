@@ -1,0 +1,30 @@
+{
+  "id": "episodic_recap_session_01",
+  "query": "recap of the auth design session",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Recap of the auth design session: we chose short-lived JWT access tokens with 15-minute TTL, refresh tokens stored server-side, sliding-expiry refresh, and an OIDC-compatible discovery endpoint at /.well-known/openid-configuration.",
+      "topic": "auth",
+      "keywords": ["auth", "jwt", "oidc", "design", "session", "recap"],
+      "summary": "Recap of the auth design session: JWT, refresh, OIDC discovery."
+    },
+    {
+      "id": "m2",
+      "content": "Trail running log: ran 12km on the river loop, average pace 5:45 per kilometre, felt strong on the climbs.",
+      "topic": "fitness",
+      "keywords": ["running", "training"],
+      "summary": "12km trail run log."
+    },
+    {
+      "id": "m3",
+      "content": "Sketch for the new logo emphasising negative space; a koi fish silhouette wrapped around a circular gradient.",
+      "topic": "design-art",
+      "keywords": ["logo", "sketch"],
+      "summary": "Koi-fish logo sketch concept."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

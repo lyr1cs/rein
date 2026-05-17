@@ -114,6 +114,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_proxy_runtime(config));
     checks.push(check_overview_version());
     checks.push(check_release_metadata_versions());
+    checks.push(check_eval_gates());
     checks.push(check_cli_registry());
     checks.push(check_mcp_registry());
     checks.push(check_rest_registry());
@@ -430,6 +431,143 @@ fn collect_json_version(
 // compare inventory counts (authoritative) against source-scanned derived
 // counts directly. The MCP check retains the doc-drift warning against
 // README / AGENTS.md MCP tool counts.
+
+/// v0.32 T&M Phase 2 — surfaces eval-gate freshness + ship/bail status.
+///
+/// Reads `docs/eval-baselines/{name}.json` (committed) and
+/// `target/eval-gates/{name}-run.json` (gitignored, per-build) anchored at
+/// `env::current_dir()` — operators are expected to invoke `rein doctor`
+/// from the source-repo root.  In a deployed binary far from source
+/// repos the scorecards won't be found and every gate degrades to
+/// `no_baseline`; the check then surfaces that as informational rather
+/// than failing the doctor sequence.
+///
+/// Aggregation rules:
+/// - any non-stub gate in `Bail` → WARN
+/// - any non-stub gate with a baseline > 30 days old → WARN
+/// - all non-stub gates `Ship` or `no_run` or stubs → OK
+/// - no baselines exist for any non-stub gate → OK (with hint to run
+///   `rein-eval gate baseline --gate all`)
+fn check_eval_gates() -> DoctorCheck {
+    use crate::eval::gates::{self, ScorecardStatus};
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let target_dir = repo_root.join("target");
+    let now = chrono::Utc::now().timestamp();
+    const STALE_DAYS: i64 = 30;
+
+    let mut concerns: Vec<String> = Vec::new();
+    let mut ship_count = 0usize;
+    let mut no_baseline_count = 0usize;
+    let mut stub_count = 0usize;
+    let mut total_non_stub = 0usize;
+
+    for gate in gates::all_gates() {
+        let name = gate.name();
+        if gate.is_stub() {
+            stub_count += 1;
+            continue;
+        }
+        total_non_stub += 1;
+        let baseline_path = gates::baseline_path(&repo_root, name);
+        let run_path = gates::run_path(&target_dir, name);
+        // v0.32 R4 P2-#2: distinguish "file does not exist" from "file
+        // exists but is unparseable".  Earlier `.ok()` swallowed both as
+        // `None` and the doctor reported no_baseline / OK for a corrupt
+        // committed JSON file.  Now corrupt artifacts are surfaced as
+        // explicit concerns.
+        let baseline = match gates::load_scorecard(&baseline_path) {
+            gates::ScorecardLoad::Loaded(sc) => Some(sc),
+            gates::ScorecardLoad::Missing => None,
+            gates::ScorecardLoad::Corrupt(msg) => {
+                concerns.push(format!("{name} baseline scorecard corrupt: {msg}"));
+                None
+            }
+        };
+        let current = match gates::load_scorecard(&run_path) {
+            gates::ScorecardLoad::Loaded(sc) => Some(sc),
+            gates::ScorecardLoad::Missing => None,
+            gates::ScorecardLoad::Corrupt(msg) => {
+                concerns.push(format!("{name} run scorecard corrupt: {msg}"));
+                None
+            }
+        };
+
+        let Some(b) = baseline.as_ref() else {
+            no_baseline_count += 1;
+            continue;
+        };
+
+        // Stale baseline check.
+        let age_days = (now - b.created_at).max(0) / 86_400;
+        if age_days > STALE_DAYS {
+            concerns.push(format!(
+                "{name} baseline is {age_days}d old (>{STALE_DAYS}d)"
+            ));
+        }
+
+        // Bail check (requires both sides).
+        if current.is_some() {
+            let cmp = gates::compare_scorecards(
+                name,
+                baseline.as_ref(),
+                current.as_ref(),
+                gates::DEFAULT_NOISE_FLOOR,
+            );
+            match cmp.status {
+                ScorecardStatus::Ship => ship_count += 1,
+                ScorecardStatus::Bail => {
+                    concerns.push(format!("{name} run is in Bail vs baseline"));
+                }
+                ScorecardStatus::NoData => {
+                    // v0.32 R6 P2: distinguish "comparison ran but
+                    // McNemar CI is too wide to call" (mcnemar.is_some
+                    // — informational, more samples would help) from
+                    // "comparison rejected before McNemar could run
+                    // due to mismatched gate_name / kind / schema /
+                    // fixture-id sets" (mcnemar.is_none — the
+                    // committed/generated scorecards are miswired and
+                    // need operator intervention to repair).  Earlier
+                    // we dropped both cases as informational, so a
+                    // stale or wrong-gate scorecard would silently
+                    // pass `rein doctor` even though the comparison
+                    // layer caught it.
+                    if cmp.mcnemar.is_none() {
+                        concerns.push(format!("{name} comparison invalid: {}", cmp.reason));
+                    }
+                    // mcnemar.is_some() with NoData = legitimately
+                    // underpowered (CI straddles the noise floor).
+                    // Informational — doctor surfaces the count via
+                    // the existing total message rather than as a
+                    // per-gate concern.
+                }
+            }
+        }
+    }
+
+    let message = format!(
+        "{} gate(s): {ship_count} ship, {no_baseline_count} no_baseline, {stub_count} stub",
+        total_non_stub + stub_count,
+    );
+
+    if !concerns.is_empty() {
+        warn_in(
+            DoctorCategory::Architecture,
+            "eval_gates",
+            format!("{message}; concerns: {}", concerns.join("; ")),
+        )
+    } else if no_baseline_count == total_non_stub && total_non_stub > 0 {
+        let mut check = ok_in(
+            DoctorCategory::Architecture,
+            "eval_gates",
+            format!("{message} (no baselines yet — run `rein-eval gate baseline --gate all`)"),
+        );
+        check.repair_hint =
+            Some("cargo run -p rein --bin rein-eval -- gate baseline --gate all".to_string());
+        check
+    } else {
+        ok_in(DoctorCategory::Architecture, "eval_gates", message)
+    }
+}
 
 fn check_cli_registry() -> DoctorCheck {
     let duplicates = crate::ops::inventory::duplicate_report();

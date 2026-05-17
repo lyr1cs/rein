@@ -1484,11 +1484,7 @@ mod tests {
             expected_ids.len(),
             "callback must fire exactly once per distinct row"
         );
-        assert_eq!(
-            seen.len(),
-            expected_ids.len(),
-            "every stored id is visited"
-        );
+        assert_eq!(seen.len(), expected_ids.len(), "every stored id is visited");
     }
 
     /// F6 D-M3: callback `Err` aborts iteration. Proves the new API

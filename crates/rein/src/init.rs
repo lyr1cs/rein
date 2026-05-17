@@ -160,12 +160,10 @@ fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
         })
         .unwrap_or(0o600);
     #[cfg(unix)]
-    let target_uid_gid: Option<(u32, u32)> = std::fs::metadata(&real_path)
-        .ok()
-        .map(|m| {
-            use std::os::unix::fs::MetadataExt;
-            (m.uid(), m.gid())
-        });
+    let target_uid_gid: Option<(u32, u32)> = std::fs::metadata(&real_path).ok().map(|m| {
+        use std::os::unix::fs::MetadataExt;
+        (m.uid(), m.gid())
+    });
 
     // Inner closure so we can clean up tmp on any error via a single `match`.
     let write_and_sync = || -> io::Result<()> {
@@ -1524,8 +1522,8 @@ mod tests {
         let final_content = std::fs::read_to_string(&target).unwrap();
         // Must be parseable JSON post-call (the central failure mode of a
         // partial write).
-        let parsed: serde_json::Value = serde_json::from_str(&final_content)
-            .expect("post-call file must be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&final_content).expect("post-call file must be valid JSON");
         assert!(
             parsed["mcpServers"]["rein"].is_object(),
             "rein entry missing from post-call file: {final_content}"
@@ -1566,8 +1564,14 @@ mod tests {
         symlink(&a, &b).unwrap();
         symlink(&b, &a).unwrap();
         // Sanity: both are symlinks
-        assert!(std::fs::symlink_metadata(&a).unwrap().file_type().is_symlink());
-        assert!(std::fs::symlink_metadata(&b).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&a)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&b)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         // Must complete without hanging (the 256-hop ceiling + visited-set
         // cycle detection both terminate finite-time).  Without the fix

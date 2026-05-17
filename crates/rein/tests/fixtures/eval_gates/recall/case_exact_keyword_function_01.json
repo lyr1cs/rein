@@ -1,0 +1,37 @@
+{
+  "id": "exact_keyword_function_01",
+  "query": "recall_fast",
+  "topic": null,
+  "keyword": "recall_fast",
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "recall_fast is the proxy-mode entry point: it calls recall_temporal with fast=true, which skips Supermemory cross-validation, query expansion, and the LLM reranker, keeping latency around 50-100ms for hot prompts.",
+      "topic": "rein-internals",
+      "keywords": ["recall_fast", "proxy", "latency"],
+      "summary": "recall_fast: hot-path local-only recall."
+    },
+    {
+      "id": "m2",
+      "content": "Travel reminder to mail the postcards from the museum gift shop before checking out on Sunday morning.",
+      "topic": "personal",
+      "keywords": ["travel", "postcards"],
+      "summary": "Postcard mailing reminder."
+    },
+    {
+      "id": "m3",
+      "content": "Notes from the carpentry workshop: a Japanese pull saw cuts on the back stroke, leaves a cleaner kerf than a Western push saw on thin stock.",
+      "topic": "personal",
+      "keywords": ["woodworking", "tools"],
+      "summary": "Japanese pull saw notes."
+    },
+    {
+      "id": "m4",
+      "content": "Plant care log: the fiddle leaf fig finally pushed out a new leaf after I moved it closer to the south window.",
+      "topic": "personal",
+      "keywords": ["plants", "houseplants"],
+      "summary": "Fiddle leaf fig progress note."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

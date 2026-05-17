@@ -378,8 +378,9 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
     // (no `.dirty` to take), and recall permanently bypasses HNSW.
     if rebuild_ok {
         let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_path));
-        let _ =
-            std::fs::remove_file(crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path));
+        let _ = std::fs::remove_file(crate::store::hnsw::HnswIndex::rebuilding_marker_path(
+            &hnsw_path,
+        ));
     }
 
     #[cfg(unix)]
@@ -482,7 +483,10 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
             let _ = std::fs::remove_file(&rebuilding_path);
             unlock_tantivy_rebuild_lock(&lock_file);
             return TantivyRebuildOutcome::Failed {
-                reason: format!("failed to open staging index {}: {e}", staging_path.display()),
+                reason: format!(
+                    "failed to open staging index {}: {e}",
+                    staging_path.display()
+                ),
             };
         }
     };
@@ -495,7 +499,13 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
     let stream_result = store.for_each_for_warmup(|row| {
         total_rows += 1;
         if tantivy
-            .insert_strict(&row.id, &row.topic, &row.summary, &row.content, &row.keywords)
+            .insert_strict(
+                &row.id,
+                &row.topic,
+                &row.summary,
+                &row.content,
+                &row.keywords,
+            )
             .is_ok()
         {
             indexed += 1;
@@ -562,10 +572,7 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
     // it permanently. If backup has real segments and prod is unusable,
     // restore it to prod first; then proceed.
     let prod_currently_has_segments = tantivy_has_segments(&tantivy_path);
-    if backup_path.exists()
-        && tantivy_has_segments(&backup_path)
-        && !prod_currently_has_segments
-    {
+    if backup_path.exists() && tantivy_has_segments(&backup_path) && !prod_currently_has_segments {
         if tantivy_path.exists() {
             let _ = std::fs::remove_dir_all(&tantivy_path);
         }
@@ -710,11 +717,8 @@ fn tantivy_has_segments(tantivy_path: &Path) -> bool {
     tantivy_path
         .read_dir()
         .map(|it| {
-            it.filter_map(|e| e.ok()).any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".idx")
-            })
+            it.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().ends_with(".idx"))
         })
         .unwrap_or(false)
 }
@@ -1013,10 +1017,7 @@ fn side_index_rebuild_needed_tantivy(
     // index on an empty DB is not a defect and rebuilding it every cold
     // start would be wasteful. Only fire the rebuild signal when there's
     // an observable mismatch (memories exist but index is empty).
-    let store_has_memories = store
-        .stats()
-        .map(|s| s.total_memories > 0)
-        .unwrap_or(false);
+    let store_has_memories = store.stats().map(|s| s.total_memories > 0).unwrap_or(false);
     let empty_but_marked_with_data = tantivy_path.exists()
         && tokenizer_marker.exists()
         && !tantivy_has_segments(&tantivy_path)
@@ -1051,10 +1052,7 @@ fn side_index_rebuild_needed_hnsw(db_path: &Path, config: &ReinConfig) -> bool {
 /// rebuild (worker panicked without restoring `.dirty`). Returns the
 /// marker path that was reset to `.dirty`, or `None` if nothing needed
 /// to be done.
-pub fn reset_stale_hnsw_rebuilding(
-    db_path: &Path,
-    ttl: std::time::Duration,
-) -> Option<PathBuf> {
+pub fn reset_stale_hnsw_rebuilding(db_path: &Path, ttl: std::time::Duration) -> Option<PathBuf> {
     let hnsw_path = db_path.with_extension("");
     let rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_path);
     let metadata = std::fs::metadata(&rebuilding).ok()?;
@@ -1133,10 +1131,7 @@ pub fn tantivy_rebuild_state(db_path: &Path) -> TantivyRebuildState {
 ///
 /// Returns the path of the marker that was renamed (for caller
 /// logging), or `None` if no action was taken.
-pub fn reset_stale_tantivy_rebuilding(
-    db_path: &Path,
-    ttl: std::time::Duration,
-) -> Option<PathBuf> {
+pub fn reset_stale_tantivy_rebuilding(db_path: &Path, ttl: std::time::Duration) -> Option<PathBuf> {
     let rebuilding = tantivy_rebuilding_path(db_path);
     let metadata = std::fs::metadata(&rebuilding).ok()?;
     let modified = metadata.modified().ok()?;
@@ -1203,7 +1198,7 @@ fn finish_tantivy_rebuild_markers(
         ) {
             (Some(scan_ts), Some(cur_ts)) => cur_ts <= scan_ts,
             (None, Some(_)) => false, // marker appeared after scan started
-            _ => true,                 // no current marker, nothing to preserve
+            _ => true,                // no current marker, nothing to preserve
         };
         if safe_to_remove {
             let _ = std::fs::remove_file(&dirty);
@@ -1358,9 +1353,18 @@ mod tests {
         let prod = db.with_extension("tantivy");
         let staging = tantivy_staging_path(db);
         let backup = tantivy_backup_path(db);
-        assert!(prod.exists(), "production tantivy dir must exist after success");
-        assert!(!staging.exists(), "staging dir must not survive a successful swap");
-        assert!(!backup.exists(), "backup dir must not survive a successful swap");
+        assert!(
+            prod.exists(),
+            "production tantivy dir must exist after success"
+        );
+        assert!(
+            !staging.exists(),
+            "staging dir must not survive a successful swap"
+        );
+        assert!(
+            !backup.exists(),
+            "backup dir must not survive a successful swap"
+        );
     }
 
     /// B2: when the previous index exists, the rebuild keeps it accessible
@@ -1382,7 +1386,10 @@ mod tests {
         // (staging swap is atomic-ish — the previous index is renamed to
         // `.tantivy.old` only briefly, then deleted after promotion).
         let _ = try_populate_tantivy(&store);
-        assert!(prod.exists(), "second rebuild must leave production dir in place");
+        assert!(
+            prod.exists(),
+            "second rebuild must leave production dir in place"
+        );
         assert!(!tantivy_staging_path(db).exists());
         assert!(!tantivy_backup_path(db).exists());
     }
@@ -1505,8 +1512,14 @@ mod tests {
 
         cleanup_hnsw_staging(db);
 
-        assert!(!staging_index.exists(), "orphan _new.usearch must be cleaned");
-        assert!(!staging_meta.exists(), "orphan _new.usearch.meta must be cleaned");
+        assert!(
+            !staging_index.exists(),
+            "orphan _new.usearch must be cleaned"
+        );
+        assert!(
+            !staging_meta.exists(),
+            "orphan _new.usearch.meta must be cleaned"
+        );
     }
 
     /// v0.30.3 codex R16 P2 regression: for a DB filename with a dot in

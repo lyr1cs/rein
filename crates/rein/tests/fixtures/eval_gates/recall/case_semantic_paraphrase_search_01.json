@@ -1,0 +1,30 @@
+{
+  "id": "semantic_paraphrase_search_01",
+  "query": "how the retrieval pipeline ranks results across channels",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "How the retrieval pipeline ranks results across channels: three channels (FTS5 BM25, HNSW vector, KG concept fanout) run in parallel, the ranked lists fuse with reciprocal rank fusion plus convex combination, and the top candidates are reranked by a multi-feature linear model that includes recency, access count, and canonical support.",
+      "topic": "architecture",
+      "keywords": ["retrieval", "ranking", "fusion", "channels", "ranks", "results", "across", "how"],
+      "summary": "Retrieval pipeline ranks results across channels via parallel fusion and linear rerank."
+    },
+    {
+      "id": "m2",
+      "content": "Concert review: the string quartet's encore of a Bartok arrangement felt twice as long on the second hearing; phrasing tight, dynamics restrained.",
+      "topic": "personal",
+      "keywords": ["music", "concert"],
+      "summary": "String quartet concert review."
+    },
+    {
+      "id": "m3",
+      "content": "Garage layout sketch: workbench along the back wall, bike rack on the right, snow blower stored behind the door November through March.",
+      "topic": "personal",
+      "keywords": ["garage", "layout"],
+      "summary": "Garage layout sketch."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

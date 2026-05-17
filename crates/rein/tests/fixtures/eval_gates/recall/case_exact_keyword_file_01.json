@@ -1,0 +1,30 @@
+{
+  "id": "exact_keyword_file_01",
+  "query": "mcnemar.rs",
+  "topic": null,
+  "keyword": "mcnemar",
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "eval/mcnemar.rs implements paired McNemar non-inferiority testing for the eval harness: it counts discordant pairs, computes the Wilson score confidence interval for the proportion of B-wins, and exposes a single mcnemar(slices) entrypoint used by both rein-eval and the trust measurement op.",
+      "topic": "rein-internals",
+      "keywords": ["mcnemar", "eval", "non-inferiority"],
+      "summary": "mcnemar.rs implements paired non-inferiority test."
+    },
+    {
+      "id": "m2",
+      "content": "Reminder to swap the snow tires off the car next weekend and store them on the rack in the garage.",
+      "topic": "personal",
+      "keywords": ["car", "seasonal"],
+      "summary": "Snow tire swap reminder."
+    },
+    {
+      "id": "m3",
+      "content": "Tasting notes from the new local roaster: a washed Ethiopian Yirgacheffe, bright with bergamot and stone fruit, best at 1:16 brew ratio on a V60.",
+      "topic": "personal",
+      "keywords": ["coffee", "tasting"],
+      "summary": "Yirgacheffe tasting notes."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

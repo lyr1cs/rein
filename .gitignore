@@ -41,3 +41,12 @@ THIRD_PARTY_NOTICES.yaml
 *.pem
 *.p12
 *.pfx
+
+# macOS Finder " 2"-style duplicates produced by cmd+D / drag-copy.
+# Repeatedly bitten v0.25.2 / v0.26.2 / v0.30.2 / v0.31.0 / v0.32.0 release
+# cycles — these patterns block them from creeping into commits.
+* 2.*
+* 3.*
+* 4.*
+* copy.*
+* copy 2.*

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "gate_name": "recall",
+  "kind": "baseline",
+  "created_at": 1779033196,
+  "rein_version": "0.32.0",
+  "fixture_count": 20,
+  "score": 1.0,
+  "per_fixture": [
+    {
+      "fixture_id": "episodic_meeting_decision_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "episodic_meeting_decision_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "episodic_recap_session_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "episodic_what_happened_meeting_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exact_keyword_basic_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exact_keyword_file_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exact_keyword_function_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exact_keyword_module_path_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exploratory_summarize_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exploratory_tell_me_about_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "exploratory_what_do_i_know_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "preference_favorite_editor_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "preference_go_to_db_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "preference_prefer_format_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "semantic_paraphrase_adaptive_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "semantic_paraphrase_memory_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "semantic_paraphrase_search_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "temporal_history_of_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "temporal_recent_change_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "temporal_when_change_01",
+      "hit": true
+    }
+  ]
+}

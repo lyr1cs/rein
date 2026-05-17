@@ -1,0 +1,30 @@
+{
+  "id": "episodic_meeting_decision_01",
+  "query": "what did we decide about billing migration",
+  "topic": null,
+  "keyword": null,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "What we decided about the billing migration: we did agree to route storage to a dedicated PostgreSQL cluster, keep Stripe webhook ingestion on the existing service, and migrate legacy MySQL rows in nightly batches over the next two weeks.",
+      "topic": "billing",
+      "keywords": ["billing", "migration", "postgresql", "decision", "decide"],
+      "summary": "Billing migration decision: PostgreSQL cluster, nightly batch migration."
+    },
+    {
+      "id": "m2",
+      "content": "Cookbook entry on how to brine pork shoulder before slow roasting — uses a 5% salt solution for 18 hours.",
+      "topic": "personal",
+      "keywords": ["cooking", "recipe", "brine"],
+      "summary": "Pork shoulder brine recipe."
+    },
+    {
+      "id": "m3",
+      "content": "Reminder: the spring cleaning checklist still has dusting blinds and washing curtains pending for the weekend.",
+      "topic": "personal",
+      "keywords": ["chores", "cleaning"],
+      "summary": "Spring cleaning chores list."
+    }
+  ],
+  "expected_memory_ids": ["m1"]
+}

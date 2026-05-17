@@ -27,12 +27,14 @@ use clap::{Parser, Subcommand};
 use rein::compression::contract::{self, ContractInput, EvidenceEntry};
 use rein::config::ReinConfig;
 use rein::eval::concept_summary::score_concept_case;
+use rein::eval::gates::{self, all_gates, gate_by_name, GateScorecard, ScorecardKind};
 use rein::eval::{
     decide_ship, mcnemar, CategoryStats, DecideShipKind, HitChecker, JudgeMode,
     KeywordOverlapHitChecker, LlmJudgeHitChecker, McNemarResult, PairedOutcome, Scorecard,
     ShipDecision, ShipReason, DEFAULT_SEMANTIC_THRESHOLD, LLM_JUDGE_VERSION,
 };
 use rein::extract::llm::{strip_code_fences, ExtractorKind};
+use rein::store::SqliteStore;
 // NOTE: `call_llm_sync` in ops::resummerize uses SYSTEM_PROMPT internally —
 // the eval bin doesn't need to import it directly. Importing `build_prompt`
 // and `call_llm_sync` is enough; the system prompt travels with the call.
@@ -107,6 +109,15 @@ enum Commands {
     ColdArchive {
         #[command(subcommand)]
         action: ColdArchiveAction,
+    },
+    /// v0.32 Trust & Measurement Phase 2 — eval-gate harness for the four
+    /// registered gates (recall, dedup, admission, latency).  Each gate
+    /// has a fixture corpus + scoring function; baseline and run
+    /// scorecards round-trip via JSON files on disk; `compare` produces a
+    /// Ship / Bail / NoData verdict via paired McNemar non-inferiority.
+    Gate {
+        #[command(subcommand)]
+        action: GateAction,
     },
 }
 
@@ -261,6 +272,65 @@ enum ColdArchiveAction {
         /// synthesis; Cap C is also expected additive, not regressive).
         #[arg(long, default_value_t = 0.02)]
         noise_floor: f64,
+    },
+}
+
+#[derive(Subcommand)]
+enum GateAction {
+    /// Run the named gate and write its scorecard as the baseline.
+    /// `gate=all` iterates every registered gate (recall + dedup +
+    /// admission + latency).  Defaults to `docs/eval-baselines/{name}.json`
+    /// in the current working directory.
+    Baseline {
+        /// Gate name: `recall` | `dedup` | `admission` | `latency` | `all`.
+        #[arg(long)]
+        gate: String,
+        /// Override output path. Default: `docs/eval-baselines/{gate}.json`.
+        /// Ignored when `gate=all` (each gate writes to its conventional
+        /// path so `compare`/`status` find them later).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Run the named gate and write its scorecard to the run path.
+    /// Defaults to `target/eval-gates/{name}-run.json`.
+    Run {
+        /// Gate name: `recall` | `dedup` | `admission` | `latency` | `all`.
+        #[arg(long)]
+        gate: String,
+        /// Override output path. Default: `target/eval-gates/{gate}-run.json`.
+        /// Ignored when `gate=all`.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Compare baseline vs run for the named gate.  Reads both scorecards
+    /// from their conventional paths (or from `--baseline`/`--run` if
+    /// provided), runs paired McNemar over the fixture-id intersection,
+    /// and prints a `GateComparison` as pretty JSON.
+    Compare {
+        /// Gate name (or `all`).
+        #[arg(long)]
+        gate: String,
+        /// Override baseline scorecard path.  Default:
+        /// `docs/eval-baselines/{gate}.json`.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Override run scorecard path.  Default:
+        /// `target/eval-gates/{gate}-run.json`.
+        #[arg(long)]
+        run: Option<PathBuf>,
+        /// Hit-rate difference tolerated as noise for ship/bail.
+        /// Default: `gates::DEFAULT_NOISE_FLOOR` (0.02).
+        #[arg(long, default_value_t = gates::DEFAULT_NOISE_FLOOR)]
+        noise_floor: f64,
+    },
+    /// Print scorecard age + classification status for one gate or all
+    /// gates.  Reads existing scorecards from their conventional paths
+    /// without re-running anything.  Useful as a fast preflight before
+    /// tagging a release.
+    Status {
+        /// Gate name (default `all`).
+        #[arg(long, default_value = "all")]
+        gate: String,
     },
 }
 
@@ -804,6 +874,17 @@ fn main() -> Result<()> {
                 noise_floor,
                 DecideShipKind::Synthesis,
             ),
+        },
+        Commands::Gate { action } => match action {
+            GateAction::Baseline { gate, output } => cmd_gate_baseline(&gate, output.as_deref()),
+            GateAction::Run { gate, output } => cmd_gate_run(&gate, output.as_deref()),
+            GateAction::Compare {
+                gate,
+                baseline,
+                run,
+                noise_floor,
+            } => cmd_gate_compare(&gate, baseline.as_deref(), run.as_deref(), noise_floor),
+            GateAction::Status { gate } => cmd_gate_status(&gate),
         },
     }
 }
@@ -3541,5 +3622,287 @@ mod tests {
             );
         }
         let _ = fs::remove_file(&out_path);
+    }
+}
+
+// ============================================================================
+// v0.32 — eval-gate harness handlers
+// ============================================================================
+
+/// Workspace-root-anchored default location for baseline scorecards.
+/// Computed once per `rein-eval` invocation using `env::current_dir()`,
+/// which `Commands::Gate` users are expected to set to the source-repo
+/// root.  Documented in the `Baseline`/`Compare` action help text.
+fn gate_repo_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// `target/` directory anchored at `gate_repo_root`.  Used as the parent
+/// for `run` scorecards (gitignored — these are per-build artifacts).
+fn gate_target_dir() -> PathBuf {
+    gate_repo_root().join("target")
+}
+
+/// Hand the `Gate` trait a store + config it can ignore (RecallGate seeds
+/// its own `:memory:` store) or use (future non-hermetic gates).  Returning
+/// an in-memory store keeps the bin standalone — no `~/.rein/memories.db`
+/// dependency for gate runs.
+fn build_gate_context() -> Result<(SqliteStore, ReinConfig)> {
+    let store = SqliteStore::in_memory()
+        .map_err(|e| anyhow!("rein-eval gate: failed to open in-memory store: {e}"))?;
+    let config = ReinConfig::default();
+    Ok((store, config))
+}
+
+/// Run one gate by name and write its scorecard.  Used by both Baseline
+/// and Run handlers — the only difference is the `kind` field on the
+/// scorecard and the default output path.
+fn run_one_gate_to_path(
+    gate_name: &str,
+    kind: ScorecardKind,
+    output: &Path,
+) -> Result<GateScorecard> {
+    let gate = gate_by_name(gate_name).ok_or_else(|| {
+        anyhow!(
+            "unknown gate '{}'; valid: recall, dedup, admission, latency",
+            gate_name
+        )
+    })?;
+    let (store, config) = build_gate_context()?;
+    let mut scorecard = gate
+        .run(&store, &config)
+        .with_context(|| format!("gate '{}' run failed", gate_name))?;
+    scorecard.kind = kind;
+    gates::write_scorecard(output, &scorecard)
+        .with_context(|| format!("write {} scorecard to {}", gate_name, output.display()))?;
+    Ok(scorecard)
+}
+
+fn cmd_gate_baseline(gate: &str, output: Option<&Path>) -> Result<()> {
+    if gate == "all" {
+        if output.is_some() {
+            bail!("--output cannot be combined with --gate all (each gate has its own path)");
+        }
+        let root = gate_repo_root();
+        let names: Vec<String> = all_gates().iter().map(|g| g.name().to_string()).collect();
+        let mut wrote = Vec::new();
+        for name in &names {
+            let out_path = gates::baseline_path(&root, name);
+            let sc = run_one_gate_to_path(name, ScorecardKind::Baseline, &out_path)?;
+            wrote.push((name.clone(), out_path, sc.fixture_count, sc.score));
+        }
+        println!(
+            "wrote {} baseline scorecard{}:",
+            wrote.len(),
+            if wrote.len() == 1 { "" } else { "s" }
+        );
+        for (name, path, n, score) in &wrote {
+            println!(
+                "  {name:<10} {n:>3} fixtures  score={score:.3}  {}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let default_path = gates::baseline_path(&gate_repo_root(), gate);
+    let path = output.unwrap_or(&default_path);
+    let sc = run_one_gate_to_path(gate, ScorecardKind::Baseline, path)?;
+    println!(
+        "wrote {} baseline scorecard to {} ({} fixtures, score={:.3})",
+        gate,
+        path.display(),
+        sc.fixture_count,
+        sc.score
+    );
+    Ok(())
+}
+
+fn cmd_gate_run(gate: &str, output: Option<&Path>) -> Result<()> {
+    if gate == "all" {
+        if output.is_some() {
+            bail!("--output cannot be combined with --gate all (each gate has its own path)");
+        }
+        let target = gate_target_dir();
+        let names: Vec<String> = all_gates().iter().map(|g| g.name().to_string()).collect();
+        let mut wrote = Vec::new();
+        for name in &names {
+            let out_path = gates::run_path(&target, name);
+            let sc = run_one_gate_to_path(name, ScorecardKind::Run, &out_path)?;
+            wrote.push((name.clone(), out_path, sc.fixture_count, sc.score));
+        }
+        println!(
+            "wrote {} run scorecard{}:",
+            wrote.len(),
+            if wrote.len() == 1 { "" } else { "s" }
+        );
+        for (name, path, n, score) in &wrote {
+            println!(
+                "  {name:<10} {n:>3} fixtures  score={score:.3}  {}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let default_path = gates::run_path(&gate_target_dir(), gate);
+    let path = output.unwrap_or(&default_path);
+    let sc = run_one_gate_to_path(gate, ScorecardKind::Run, path)?;
+    println!(
+        "wrote {} run scorecard to {} ({} fixtures, score={:.3})",
+        gate,
+        path.display(),
+        sc.fixture_count,
+        sc.score
+    );
+    Ok(())
+}
+
+fn cmd_gate_compare(
+    gate: &str,
+    baseline_override: Option<&Path>,
+    run_override: Option<&Path>,
+    noise_floor: f64,
+) -> Result<()> {
+    let names: Vec<String> = if gate == "all" {
+        // v0.32 R2 P2: reject `--baseline` / `--run` overrides when iterating
+        // every gate.  Without this guard the same override path is reused
+        // for each iteration (e.g. a recall scorecard path makes the dedup
+        // / admission / latency comparisons read recall's file but emit
+        // them under those gate names) — false ship/bail output.
+        if baseline_override.is_some() || run_override.is_some() {
+            bail!(
+                "--baseline / --run cannot be combined with --gate all \
+                 (each gate has its own conventional path); run \
+                 'rein-eval gate compare --gate <name>' per gate to use overrides"
+            );
+        }
+        all_gates().iter().map(|g| g.name().to_string()).collect()
+    } else {
+        if gate_by_name(gate).is_none() {
+            bail!(
+                "unknown gate '{}'; valid: recall, dedup, admission, latency, all",
+                gate
+            );
+        }
+        vec![gate.to_string()]
+    };
+    let root = gate_repo_root();
+    let target = gate_target_dir();
+
+    let mut comparisons = Vec::with_capacity(names.len());
+    for name in &names {
+        let baseline_path = baseline_override
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| gates::baseline_path(&root, name));
+        let run_path = run_override
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| gates::run_path(&target, name));
+
+        let baseline =
+            if baseline_path.exists() {
+                Some(gates::read_scorecard(&baseline_path).with_context(|| {
+                    format!("read baseline scorecard {}", baseline_path.display())
+                })?)
+            } else {
+                None
+            };
+        let current = if run_path.exists() {
+            Some(
+                gates::read_scorecard(&run_path)
+                    .with_context(|| format!("read run scorecard {}", run_path.display()))?,
+            )
+        } else {
+            None
+        };
+        comparisons.push(gates::compare_scorecards(
+            name,
+            baseline.as_ref(),
+            current.as_ref(),
+            noise_floor,
+        ));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&comparisons)
+            .with_context(|| "serialize GateComparison as JSON")?
+    );
+    Ok(())
+}
+
+fn cmd_gate_status(gate: &str) -> Result<()> {
+    let names: Vec<String> = if gate == "all" {
+        all_gates().iter().map(|g| g.name().to_string()).collect()
+    } else {
+        if gate_by_name(gate).is_none() {
+            bail!(
+                "unknown gate '{}'; valid: recall, dedup, admission, latency, all",
+                gate
+            );
+        }
+        vec![gate.to_string()]
+    };
+    let root = gate_repo_root();
+    let target = gate_target_dir();
+    let now = chrono::Utc::now().timestamp();
+
+    println!("gate         baseline_age    run_age         status");
+    println!("----         ------------    -------         ------");
+    for name in &names {
+        let baseline_path = gates::baseline_path(&root, name);
+        let run_path = gates::run_path(&target, name);
+        // v0.32 R4 P2-#2: surface corrupt scorecards via stderr WARN
+        // (status row treats the side as missing so the table renders).
+        let baseline = match gates::load_scorecard(&baseline_path) {
+            gates::ScorecardLoad::Loaded(sc) => Some(sc),
+            gates::ScorecardLoad::Missing => None,
+            gates::ScorecardLoad::Corrupt(msg) => {
+                eprintln!("warning: {name} baseline scorecard corrupt: {msg}");
+                None
+            }
+        };
+        let current = match gates::load_scorecard(&run_path) {
+            gates::ScorecardLoad::Loaded(sc) => Some(sc),
+            gates::ScorecardLoad::Missing => None,
+            gates::ScorecardLoad::Corrupt(msg) => {
+                eprintln!("warning: {name} run scorecard corrupt: {msg}");
+                None
+            }
+        };
+        let baseline_age = baseline
+            .as_ref()
+            .map(|s| age_days(now - s.created_at))
+            .unwrap_or_else(|| "—".into());
+        let run_age = current
+            .as_ref()
+            .map(|s| age_days(now - s.created_at))
+            .unwrap_or_else(|| "—".into());
+        let cmp = gates::compare_scorecards(
+            name,
+            baseline.as_ref(),
+            current.as_ref(),
+            gates::DEFAULT_NOISE_FLOOR,
+        );
+        let status_str = match cmp.status {
+            gates::ScorecardStatus::Ship => "ship",
+            gates::ScorecardStatus::Bail => "bail",
+            gates::ScorecardStatus::NoData => "no_data",
+        };
+        println!("{name:<12} {baseline_age:<15} {run_age:<15} {status_str}",);
+    }
+    Ok(())
+}
+
+/// Format a duration (seconds) as "Nd" for days or "Nh" for sub-day,
+/// or "—" when the input is negative (clock skew).
+fn age_days(seconds: i64) -> String {
+    if seconds < 0 {
+        return "—".into();
+    }
+    let days = seconds / 86_400;
+    if days >= 1 {
+        format!("{days}d")
+    } else {
+        let hours = seconds / 3_600;
+        format!("{hours}h")
     }
 }
