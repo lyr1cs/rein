@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "rein",
   "display_name": "rein — Multi-source Memory MCP",
-  "version": "0.31.2",
+  "version": "0.31.3",
   "description": "Persistent cross-session memory MCP server with built-in OAuth for remote connectors",
   "long_description": "rein is a self-adaptive memory MCP server for AI agents. Multi-source cross-validated memory with embedding-based semantic dedup, Kaplan-Meier survival decay, knowledge graph (Memoir / Concept / ConceptLink with temporal validity windows), HDBSCAN clustering, and a self-learning loop replacing fixed parameters with learned values. Exposes 40 MCP tools across core memory ops, knowledge graph, temporal recall, adaptive engine, ARS feedback (Cap A mirror, Cap B synthesis, Cap C archival summary), runtime LLM judge, and Trust & Measurement. v0.30 adds an explicit HTTP auth policy and a built-in OAuth provider for Claude Cowork / claude.ai / mobile remote MCP connectors.\n\nThis extension targets macOS Apple Silicon. Other platforms: see the project README for the Claude Code plugin marketplace path or `cargo install`.",
   "author": {

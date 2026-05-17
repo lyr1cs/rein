@@ -18,6 +18,30 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Build hygiene: normalize the absolute filesystem paths Rust's
+# `file!()` macro expands into release binaries (panic locations,
+# `tracing::event!` callsites) so the binary doesn't embed
+# build-environment-specific path strings.
+#
+# `CARGO_ENCODED_RUSTFLAGS` (not plain `RUSTFLAGS`) is used so the
+# replacement string can contain whitespace if desired — the encoded
+# form delimits flags with ASCII Unit Separator (\x1f) instead of
+# whitespace.
+#
+# Override the default replacement via env var:
+#   HOME_REMAP=your-handle ./scripts/build-dxt.sh
+#
+# If either `CARGO_ENCODED_RUSTFLAGS` or `RUSTFLAGS` is already set in
+# the environment, leave it alone — the caller has explicit control.
+# Setting both is a cargo error, so a default is only applied when
+# neither is present.
+: "${HOME_REMAP:=user}"
+if [ -z "${CARGO_ENCODED_RUSTFLAGS:-}" ] && [ -z "${RUSTFLAGS:-}" ]; then
+  CARGO_HOME_PATH="${CARGO_HOME:-$HOME/.cargo}"
+  # Each `--remap-path-prefix=…` is one flag, joined by `\x1f`.
+  export CARGO_ENCODED_RUSTFLAGS=$'--remap-path-prefix='"$HOME"'='"$HOME_REMAP"$'\x1f''--remap-path-prefix='"$CARGO_HOME_PATH"'='"$HOME_REMAP"'/.cargo'
+fi
+
 # Sanity: are we on Apple Silicon?
 if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
   echo "error: build-dxt.sh only supports macOS Apple Silicon (uname=$(uname -sm))." >&2
