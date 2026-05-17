@@ -38,10 +38,52 @@ fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
     // replace the intermediate link instead of updating the final
     // target. Loop through hops until we hit a non-symlink, with a
     // cycle guard so a malicious symlink loop can't hang us.
+    /// v0.30.4 D3 (deferred from codex R23 P2-#3 follow-up prediction):
+    /// the v0.30.3 implementation used a fixed `for _ in 0..40` hop
+    /// counter as a coarse cycle guard.  Two problems:
+    ///
+    ///   1. A symlink at hop 41 of a *legitimate* deep chain would
+    ///      silently return the wrong path (the 40th-hop intermediate
+    ///      symlink), and the subsequent rename would replace that
+    ///      intermediate link instead of the real target.
+    ///   2. A cycle of length > 40 would still detect via the counter,
+    ///      but a cycle of length ≤ 40 would also exhaust the counter
+    ///      without distinguishing "legitimate long chain" from
+    ///      "malicious loop".
+    ///
+    /// Fix: visited-set cycle detection using the **raw constructed
+    /// path string** of each hop as the dedup key, plus a 256-hop
+    /// safety ceiling for chains that evade string-equality cycle
+    /// detection (e.g. a chain that laundered through `..` segments
+    /// each iteration).
+    ///
+    /// We intentionally do NOT use `Path::canonicalize` for the dedup
+    /// key.  `canonicalize` resolves the *entire* chain at once: in a
+    /// non-cyclic chain `A → B → C → target` where the terminal target
+    /// exists, `canonicalize(A) == canonicalize(B) == canonicalize(C)
+    /// == canonical_target`, so a string-based set would false-detect
+    /// every multi-hop chain as a cycle on hop 2.  The raw constructed
+    /// path is the only key that gives O(1) literal cycle detection
+    /// without breaking legitimate chains.
+    ///
+    /// This catches the common `A → B → A` cycle form (the failure
+    /// mode codex flagged); cycles that exploit equivalent-but-
+    /// distinct path representations (e.g., `./A` vs the absolute
+    /// `/full/A` reachable via parent-join) are caught by the 256-hop
+    /// safety ceiling rather than the visited-set.
     fn resolve_symlink_chain(start: &std::path::Path) -> std::path::PathBuf {
         let mut current = start.to_path_buf();
-        for _ in 0..40 {
-            // 40 hops is more than any sane dotfile setup
+        let mut visited: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        const SAFETY_HOP_CEILING: usize = 256;
+        for _ in 0..SAFETY_HOP_CEILING {
+            if !visited.insert(current.clone()) {
+                tracing::warn!(
+                    "atomic_write: symlink cycle detected at {}, returning last hop",
+                    current.display()
+                );
+                return current;
+            }
             match std::fs::symlink_metadata(&current) {
                 Ok(m) if m.file_type().is_symlink() => match std::fs::read_link(&current) {
                     Ok(target) => {
@@ -56,7 +98,12 @@ fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
                 _ => return current, // non-symlink or missing — done
             }
         }
-        current // cycle / hop limit hit — last seen path
+        tracing::warn!(
+            "atomic_write: symlink chain exceeded {} hops at {}, returning last hop",
+            SAFETY_HOP_CEILING,
+            current.display()
+        );
+        current
     }
     let real_path: std::path::PathBuf = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => resolve_symlink_chain(path),
@@ -87,6 +134,23 @@ fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
     // fresh-write — these are AI client config files that may contain API
     // tokens, OAuth secrets, MCP bearer tokens; group/other read is
     // never legitimate.
+    //
+    // v0.30.4 D5 (deferred from v0.30.3 audit cycle): also capture the
+    // target's owning uid:gid so a sudo-installed rein binary writing a
+    // user-owned config (e.g., `~/.claude.json` initially created by the
+    // user) does not silently change ownership to root.  The pre-D5
+    // behavior preserved mode bits via `OpenOptionsExt::mode` but the
+    // `rename(tmp, target)` step replaced the inode and therefore the
+    // ownership.  In a non-sudo run uid/gid match the writer's
+    // identity so the post-write `chown` is a no-op; in a sudo run
+    // (writer = root, target was user-owned) the explicit `chown`
+    // restores the user's ownership before the rename.
+    //
+    // Capture order matches mode: read once via metadata, used at chown
+    // time below.  `MetadataExt::uid` / `gid` return `u32`; fresh-write
+    // case (no target) leaves the capture as `None` and the post-write
+    // chown is skipped (writer's identity is the only meaningful default
+    // and `OpenOptions` already gives us that).
     #[cfg(unix)]
     let target_mode: u32 = std::fs::metadata(&real_path)
         .ok()
@@ -95,6 +159,13 @@ fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
             m.permissions().mode()
         })
         .unwrap_or(0o600);
+    #[cfg(unix)]
+    let target_uid_gid: Option<(u32, u32)> = std::fs::metadata(&real_path)
+        .ok()
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.uid(), m.gid())
+        });
 
     // Inner closure so we can clean up tmp on any error via a single `match`.
     let write_and_sync = || -> io::Result<()> {
@@ -139,6 +210,36 @@ fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
     if let Err(e) = write_and_sync() {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
+    }
+
+    // v0.30.4 D5: preserve original ownership via post-write chown.
+    // Only invoked when we captured a `target_uid_gid` above (i.e., the
+    // target file existed before our write).  In a fresh-write case the
+    // tmp file inherits the writer's identity, which is the only
+    // sensible default.  In a sudo install (root writing a user-owned
+    // config) this restores the user's uid:gid before the atomic
+    // rename so the production file remains user-owned.
+    //
+    // Failure is non-fatal: cross-user `chown` without CAP_CHOWN
+    // returns EPERM, which is the expected outcome when a non-root
+    // process is asked to write a config it doesn't own.  In that
+    // case we log a WARN and proceed with the writer's identity —
+    // the alternative (bailing on the write) would be worse for the
+    // common in-place edit case where the writer IS the target's
+    // owner and the chown is a no-op anyway.
+    #[cfg(unix)]
+    if let Some((uid, gid)) = target_uid_gid {
+        use std::os::unix::fs::chown;
+        if let Err(e) = chown(&tmp_path, Some(uid), Some(gid)) {
+            tracing::warn!(
+                "atomic_write: chown {} -> {}:{} failed: {} (cross-user install? \
+                 proceeding without ownership preservation)",
+                tmp_path.display(),
+                uid,
+                gid,
+                e
+            );
+        }
     }
 
     // v0.30.3 codex R15 P2: on Windows `std::fs::rename` can fail when
@@ -1439,6 +1540,194 @@ mod tests {
         assert!(
             !target.with_extension("tmp").exists(),
             "configure_json_client leaked a .tmp sibling"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // v0.30.4 D3: symlink chain cycle detection + long-chain support
+    // -------------------------------------------------------------------
+
+    /// D3 repro: a literal symlink cycle `A → B → A` must NOT hang
+    /// `atomic_write_string` and must NOT panic.  The exact path the
+    /// resolver returns is implementation-defined (either A or B —
+    /// whichever was the last `current` before the cycle was detected);
+    /// what we test is that the call completes and writes a regular
+    /// file at one of the cycle members.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_handles_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        // Build a → b → a.  Order matters: create `b` pointing to `a`
+        // first (target doesn't exist yet — symlinks allow that), then
+        // `a` pointing to `b`.
+        symlink(&a, &b).unwrap();
+        symlink(&b, &a).unwrap();
+        // Sanity: both are symlinks
+        assert!(std::fs::symlink_metadata(&a).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&b).unwrap().file_type().is_symlink());
+
+        // Must complete without hanging (the 256-hop ceiling + visited-set
+        // cycle detection both terminate finite-time).  Without the fix
+        // the v0.30.3 40-hop loop would also terminate, but on a
+        // longer cycle (>40) it would silently return the wrong path.
+        atomic_write_string(&a, "cycle-resolved\n").unwrap();
+
+        // One of (a, b) is now a regular file containing the payload.
+        // The other is either still the original symlink or also got
+        // replaced — implementation-defined under cycle.
+        let final_a = std::fs::read_to_string(&a)
+            .or_else(|_| std::fs::read_to_string(&b))
+            .expect("atomic_write must have written content somewhere in the cycle");
+        assert_eq!(final_a, "cycle-resolved\n");
+    }
+
+    /// D3 repro: a non-cyclic symlink chain of length > 40 must
+    /// resolve to its real terminal target and write THERE, not to an
+    /// intermediate symlink.  This is the exact failure the v0.30.3
+    /// 40-hop counter caused: a chain of 50 links would silently stop
+    /// at hop 40 (still a symlink) and replace that symlink with a
+    /// regular file, breaking the chain for downstream readers.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_follows_long_symlink_chain() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // Real target file at the end of the chain.
+        let target = dir.path().join("real_target");
+        std::fs::write(&target, "original\n").unwrap();
+
+        // Build chain hop_50 → hop_49 → ... → hop_1 → target.
+        // The user-facing entrypoint we'll write through is hop_50.
+        const HOPS: usize = 50; // > 40 (the v0.30.3 ceiling)
+        let mut prev = target.clone();
+        let mut hops_created = Vec::with_capacity(HOPS);
+        for i in 1..=HOPS {
+            let link = dir.path().join(format!("hop_{i}"));
+            symlink(&prev, &link).unwrap();
+            prev = link.clone();
+            hops_created.push(link);
+        }
+        let entry = hops_created.last().unwrap();
+
+        // Note: we deliberately do NOT use `std::fs::canonicalize` here
+        // as a sanity check — it traverses the entire chain in a single
+        // syscall and the OS imposes a hard ELOOP limit (32 on macOS,
+        // 40 on Linux).  That's exactly the limit D3 was filed to
+        // *bypass* via per-hop `read_link` walking.  Manual one-hop
+        // verification: the entry symlink's immediate target is the
+        // hop directly below it in our construction.
+        let entry_immediate_target = std::fs::read_link(entry).unwrap();
+        assert_eq!(
+            entry_immediate_target,
+            hops_created[HOPS - 2],
+            "entry symlink must point to the hop below it"
+        );
+
+        // Now write through the entry symlink.  Pre-D3 (40-hop limit)
+        // this would either stop at hop 40 and replace that intermediate
+        // symlink with a regular file (breaking the chain), or — on
+        // macOS — also hit ELOOP somewhere along the way.  Post-D3
+        // (per-hop `read_link` with visited-set cycle detection +
+        // 256-hop safety ceiling) the resolver walks the whole chain
+        // and writes to `target` itself, NOT subject to OS ELOOP since
+        // each hop is a single syscall.
+        atomic_write_string(entry, "chain-resolved\n").unwrap();
+
+        // Assertion 1: the real target file received the write.
+        let final_target = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            final_target, "chain-resolved\n",
+            "D3: a long symlink chain must resolve all the way to the real target"
+        );
+        // Assertion 2: every intermediate hop is still a symlink (not
+        // replaced with a regular file).  This is what the pre-D3 bug
+        // would have broken.
+        for hop in &hops_created {
+            let meta = std::fs::symlink_metadata(hop)
+                .unwrap_or_else(|e| panic!("hop {} must still exist: {e}", hop.display()));
+            assert!(
+                meta.file_type().is_symlink(),
+                "D3 regression: hop {} was replaced with a regular file (chain broken)",
+                hop.display()
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // v0.30.4 D5: ownership preservation via post-write chown
+    // -------------------------------------------------------------------
+
+    /// D5 same-user invariant: when the writer's uid:gid matches the
+    /// target's uid:gid (the common in-place edit case), uid/gid must
+    /// be unchanged after the write.  Cross-user chown can't be
+    /// exercised in CI without elevated privileges; this test proves
+    /// the chown code path runs without errors AND preserves the
+    /// invariant on the path that doesn't need privilege escalation.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_preserves_ownership_same_user() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("owned_config.json");
+        std::fs::write(&target, "{\"original\": true}").unwrap();
+        // Snapshot uid:gid before our write.  Whatever uid the test
+        // process is running as, the file metadata reflects it.
+        let pre = std::fs::metadata(&target).unwrap();
+        let pre_uid = pre.uid();
+        let pre_gid = pre.gid();
+
+        atomic_write_string(&target, "{\"updated\": true}\n").unwrap();
+
+        let post = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            post.uid(),
+            pre_uid,
+            "D5: post-write uid changed from {} to {}",
+            pre_uid,
+            post.uid()
+        );
+        assert_eq!(
+            post.gid(),
+            pre_gid,
+            "D5: post-write gid changed from {} to {}",
+            pre_gid,
+            post.gid()
+        );
+        // Sanity: content was actually replaced (proving the rename ran)
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{\"updated\": true}\n"
+        );
+    }
+
+    /// D5 fresh-write path: when the target doesn't exist before our
+    /// write, `target_uid_gid` is `None` and the chown block is
+    /// skipped entirely.  The resulting file is owned by the writer
+    /// (the only sensible default).  This test asserts the fresh
+    /// path doesn't trip an error from the missing-target metadata
+    /// lookup.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_string_fresh_write_skips_chown() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("brand_new.json");
+        assert!(!target.exists());
+
+        atomic_write_string(&target, "{\"fresh\": true}\n").unwrap();
+
+        // File exists and is owned by the writer.
+        let meta = std::fs::metadata(&target).unwrap();
+        // We can't assert specific uid (depends on whoever runs the
+        // test) but uid should be readable + nonzero on a real user.
+        let _uid = meta.uid();
+        let _gid = meta.gid();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{\"fresh\": true}\n"
         );
     }
 

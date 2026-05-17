@@ -2320,6 +2320,23 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
         ));
     }
 
+    // v0.30.4 D4: symmetric Tantivy TTL reset.  See
+    // `warmup::reset_stale_tantivy_rebuilding` for rationale — same 1h
+    // TTL as HNSW for cross-index consistency.  Pre-D4, an interrupted
+    // tantivy rebuild that left a `.rebuilding` marker without `.dirty`
+    // would drop recall to FTS5 forever; the recall-path `StaleMarker`
+    // re-trigger added in R23 couldn't always recover because a zombie
+    // worker holding the flock blocked the spawn-time lock-acquire.
+    if let Some(reset_marker) = warmup::reset_stale_tantivy_rebuilding(
+        store.db_path(),
+        std::time::Duration::from_secs(60 * 60),
+    ) {
+        fixes.push(format!(
+            "reset stale Tantivy .rebuilding marker {} (>1h old) — next request triggers retry",
+            reset_marker.display()
+        ));
+    }
+
     let hnsw_base = store.db_path().with_extension("");
     let hnsw_path = hnsw_base.with_extension("usearch");
     let hnsw_meta = hnsw_base.with_extension("usearch.meta");

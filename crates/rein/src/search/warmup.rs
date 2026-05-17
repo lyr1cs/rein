@@ -1115,6 +1115,60 @@ pub fn tantivy_rebuild_state(db_path: &Path) -> TantivyRebuildState {
     }
 }
 
+/// v0.30.4 D4 (deferred from v0.30.3 audit cycle): symmetric helper to
+/// `reset_stale_hnsw_rebuilding` for the Tantivy side.
+///
+/// Background: HNSW already has a TTL-based stale-marker recovery
+/// helper (see `reset_stale_hnsw_rebuilding`) wired into
+/// `rein doctor --fix`.  Tantivy did not, so an interrupted rebuild
+/// that left a stale `.rebuilding` marker without `.dirty` could
+/// strand the index in `StaleMarker` state — the recall path's
+/// R23-era partial fix re-triggers spawn on `StaleMarker` but the
+/// spawn lock-acquire can keep failing if a zombie process is
+/// holding the flock.  This helper closes the gap by mirroring the
+/// HNSW approach: if the `.rebuilding` marker is older than `ttl`
+/// AND the rebuild lock is NOT held by an active worker, rename
+/// the marker to `.dirty` so the next recall re-triggers a fresh
+/// rebuild from a clean slate.
+///
+/// Returns the path of the marker that was renamed (for caller
+/// logging), or `None` if no action was taken.
+pub fn reset_stale_tantivy_rebuilding(
+    db_path: &Path,
+    ttl: std::time::Duration,
+) -> Option<PathBuf> {
+    let rebuilding = tantivy_rebuilding_path(db_path);
+    let metadata = std::fs::metadata(&rebuilding).ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = modified.elapsed().unwrap_or_default();
+    if age < ttl {
+        return None;
+    }
+    // Probe the rebuild lock — don't touch the marker if a live
+    // worker holds it.  An active rebuild that started from an old
+    // `.dirty` (and thus has an old `.rebuilding` mtime) is still
+    // legitimate; resetting the marker out from under it would leave
+    // tantivy dirty after the worker finishes (it would clear
+    // `.rebuilding`, which would then be a no-op).
+    let lock_path = tantivy_rebuild_lock_path(db_path);
+    if lock_path.exists() && tantivy_rebuild_lock_is_held(&lock_path) {
+        tracing::debug!(
+            "warmup: skipping stale-tantivy reset — rebuild lock held by another worker"
+        );
+        return None;
+    }
+    let dirty = tantivy_dirty_path(db_path);
+    if let Some(parent) = dirty.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Use `rename` (atomic on Unix) so the next recall sees either the
+    // old `.rebuilding` or the new `.dirty`, never neither.
+    if std::fs::rename(&rebuilding, &dirty).is_err() {
+        return None;
+    }
+    Some(rebuilding)
+}
+
 fn mark_tantivy_dirty(db_path: &Path) {
     let dirty_path = tantivy_dirty_path(db_path);
     if let Some(parent) = dirty_path.parent() {
@@ -1692,5 +1746,82 @@ mod tests {
         let result = reset_stale_hnsw_rebuilding(db, std::time::Duration::from_secs(3600));
         assert_eq!(result, None);
         assert!(rebuilding.exists());
+    }
+
+    // -------- v0.30.4 D4 — symmetric stale tantivy `.rebuilding` TTL reset --
+
+    /// D4: a Tantivy `.rebuilding` marker older than the TTL is renamed to
+    /// `.dirty` so the next recall re-triggers a fresh rebuild from a clean
+    /// slate.  Mirror of `reset_stale_hnsw_rebuilding_renames_old_marker_to_dirty`.
+    #[test]
+    fn reset_stale_tantivy_rebuilding_renames_old_marker_to_dirty() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let rebuilding = tantivy_rebuilding_path(db);
+        let dirty = tantivy_dirty_path(db);
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        // TTL of zero forces an immediate rename.
+        let result = reset_stale_tantivy_rebuilding(db, std::time::Duration::from_secs(0));
+        assert_eq!(result.as_deref(), Some(rebuilding.as_path()));
+        assert!(!rebuilding.exists(), "marker must be renamed away");
+        assert!(dirty.exists(), "marker must be promoted to .dirty");
+    }
+
+    /// D4: a fresh Tantivy `.rebuilding` marker (well under the TTL) is left
+    /// alone.  Mirror of `reset_stale_hnsw_rebuilding_keeps_fresh_marker`.
+    #[test]
+    fn reset_stale_tantivy_rebuilding_keeps_fresh_marker() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let rebuilding = tantivy_rebuilding_path(db);
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        let result = reset_stale_tantivy_rebuilding(db, std::time::Duration::from_secs(3600));
+        assert_eq!(result, None);
+        assert!(rebuilding.exists());
+    }
+
+    /// D4: when an active rebuild worker is holding the flock on the
+    /// `tantivy.rebuild.lock` file, the helper MUST NOT rename the marker
+    /// out from under it — doing so would leave the index in `Idle` state
+    /// after the live worker eventually clears its `.rebuilding` (which
+    /// would then be a no-op), without the `.dirty` marker, so the next
+    /// recall would NOT trigger a rebuild.
+    #[cfg(unix)]
+    #[test]
+    fn reset_stale_tantivy_rebuilding_skips_when_lock_held() {
+        let (_dir, store) = test_store();
+        let db = store.db_path();
+        let rebuilding = tantivy_rebuilding_path(db);
+        let lock_path = tantivy_rebuild_lock_path(db);
+        std::fs::write(&rebuilding, b"rebuilding").unwrap();
+
+        // Hold the rebuild lock exclusively for the duration of the test.
+        // Use the same flock pattern as the real rebuild path.
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test setup: failed to acquire lock");
+
+        // TTL=0 would normally force a rename, but the held lock must
+        // suppress the action.
+        let result = reset_stale_tantivy_rebuilding(db, std::time::Duration::from_secs(0));
+        assert_eq!(
+            result, None,
+            "D4: must not reset the marker while a live rebuild holds the lock"
+        );
+        assert!(rebuilding.exists(), "marker must be preserved");
+
+        // Release lock for cleanup.
+        let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+        drop(lock_file);
     }
 }

@@ -2352,6 +2352,18 @@ fn try_tantivy_then_fts5(
     let db_path = store.db_path();
     if db_path.to_str() != Some(":memory:") {
         let dirty_path = crate::search::warmup::tantivy_dirty_path(db_path);
+        // v0.30.4 D4: best-effort entry-time TTL reset for a stranded
+        // tantivy `.rebuilding` marker.  Operators who haven't run
+        // `rein doctor --fix` since an interrupted rebuild can still
+        // self-recover here — the call is a no-op (one stat syscall)
+        // when no marker exists or the marker is fresh.  This mirrors
+        // the entry-time HNSW self-repair philosophy: a recall request
+        // shouldn't sit on a stale marker forever just because
+        // background recovery hasn't been invoked.
+        let _ = crate::search::warmup::reset_stale_tantivy_rebuilding(
+            db_path,
+            std::time::Duration::from_secs(60 * 60),
+        );
         // v0.30.3 codex R10 P2: also gate against an in-flight rebuild
         // (including the default clean-startup warmup with no dirty
         // marker). During the swap window prod is renamed to `.old`;
@@ -2498,19 +2510,19 @@ fn try_tantivy_then_fts5(
             //   Use FTS5 only until the rebuild completes; the next
             //   recall after the dirty marker clears will pick up the
             //   fresh Tantivy automatically.
-        } else if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open(
+        } else if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open_existing(
             &db_path.with_extension("tantivy"),
         ) {
-            // v0.30.3 codex R13 P2 (KNOWN, deferred to v0.30.4): the
-            // `rebuild_running` probe above is point-in-time, so a
-            // background warmup can take LOCK_EX between our check and
-            // this `TantivyFts::open`. In that brief window prod has
-            // been renamed to `.old` and `open` recreates `<db>.tantivy/`
-            // empty, which can fail the rebuild's `rename(staging →
-            // prod)` with EEXIST. The proper fix is a `create_missing
-            // = false` variant of `TantivyFts::open`; a LOCK_SH probe
-            // here would break concurrent-recall determinism on macOS
-            // (process-scoped flock semantics). Filed for v0.30.4.
+            // v0.30.4 D1 (closes v0.30.3 codex R13 P2-#2): use
+            // `open_existing` instead of `open` so this read path does
+            // NOT recreate `<db>.tantivy/` empty when the dir is
+            // missing — the case where the background rebuild has
+            // renamed prod to `.old` mid-swap.  Recreating prod-empty
+            // in that window would make the rebuild's
+            // `rename(staging → prod)` fail with EEXIST, losing the
+            // promotion AND the backup.  With `open_existing` the
+            // recall just gets `Err` and falls through to FTS5 until
+            // the swap completes.
             if let Ok(results) = tantivy.search(query, topic, limit) {
                 for (i, (id, score)) in results.into_iter().enumerate() {
                     if let Ok(m) = store.get(&id) {

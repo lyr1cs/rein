@@ -85,6 +85,49 @@ impl TantivyFts {
             }
         };
 
+        Self::from_opened_index(index, &index_path)
+    }
+
+    /// v0.30.4 D1 (deferred from v0.30.3 codex R13 P2-#2): non-creating
+    /// variant of `open` for the recall read path.  Returns `Err` instead
+    /// of recreating `<index_path>/` empty when the dir is missing.
+    ///
+    /// Why this matters: the warmup rebuild path renames the production
+    /// tantivy dir to `.old` for a brief window during the staging→prod
+    /// swap.  If `recall` calls `TantivyFts::open` in that window, the
+    /// `std::fs::create_dir_all` at the top of `open` recreates an empty
+    /// `<index_path>/`, which then makes the rebuild's
+    /// `rename(staging → prod)` fail with EEXIST — promotion is lost,
+    /// the backup is lost, and tantivy stays empty until the next
+    /// rebuild trigger.  `open_existing` lets `recall` fall through to
+    /// FTS5 in that window instead of corrupting the swap.
+    ///
+    /// Does NOT perform the jieba-tokenizer-marker migration (only the
+    /// rebuild path needs that; reader path just opens what's there).
+    pub fn open_existing(path: &Path) -> Result<Self, tantivy::TantivyError> {
+        let index_path = path.to_path_buf();
+        if !index_path.is_dir() {
+            return Err(tantivy::TantivyError::SystemError(format!(
+                "tantivy index dir does not exist: {}",
+                index_path.display()
+            )));
+        }
+        // `Index::open_in_dir` itself does NOT create the dir (only
+        // `create_in_dir` does), so this is a pure read open.  Any
+        // failure here (missing meta.json, corrupt segments) bubbles
+        // up to the recall caller, which then falls back to FTS5.
+        let index = Index::open_in_dir(&index_path)?;
+        Self::from_opened_index(index, &index_path)
+    }
+
+    /// Shared post-open setup: jieba tokenizer registration, field
+    /// handle derivation, dirty-marker sibling path computation.
+    /// Used by both `open` (create-if-missing) and `open_existing`
+    /// (read-only) so the field-derivation logic stays in one place.
+    fn from_opened_index(
+        index: Index,
+        index_path: &Path,
+    ) -> Result<Self, tantivy::TantivyError> {
         // Register the jieba tokenizer so the index (and QueryParser) can use it
         index.tokenizers().register(TOKENIZER_NAME, JiebaTokenizer);
 
@@ -420,6 +463,56 @@ mod tests {
         assert!(
             dir.path().join(TOKENIZER_MARKER).exists(),
             "marker file should be created on first open"
+        );
+    }
+
+    /// v0.30.4 D1: `open_existing` MUST return `Err` when the index
+    /// dir does not exist.  This is the whole point: the recall read
+    /// path falls back to FTS5 instead of recreating an empty dir
+    /// mid-swap (which would corrupt the warmup rebuild's promotion).
+    #[test]
+    fn open_existing_returns_err_when_dir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never_created.tantivy");
+        assert!(!missing.exists(), "test setup: path must not pre-exist");
+        let result = TantivyFts::open_existing(&missing);
+        assert!(
+            result.is_err(),
+            "D1: open_existing must reject a missing index dir, not silently create it"
+        );
+        // And critically, it must NOT have created the dir as a side
+        // effect — that was the v0.30.3 bug.
+        assert!(
+            !missing.exists(),
+            "D1: open_existing must not create the index dir as a side effect"
+        );
+    }
+
+    /// v0.30.4 D1: `open_existing` MUST succeed against a directory
+    /// previously initialized by `open`.  This proves the refactor
+    /// (extracting `from_opened_index`) didn't break the happy path.
+    #[test]
+    fn open_existing_succeeds_against_initialized_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("inited.tantivy");
+        // Use `open` to do the first-time setup (creates dir + writes
+        // marker + creates fresh index).
+        {
+            let fts = TantivyFts::open(&index_path).unwrap();
+            // Insert a doc so the index has segments
+            fts.insert("d1", "Rust topic", "Summary text", "Content text", "k1,k2")
+                .unwrap();
+        }
+        // Now `open_existing` must succeed and behave the same as
+        // `open` would for the read path.
+        let fts2 = TantivyFts::open_existing(&index_path)
+            .expect("D1: open_existing must succeed against an initialized index");
+        let results = fts2
+            .search("Rust", None, 10)
+            .expect("D1: search must work against an open_existing handle");
+        assert!(
+            results.iter().any(|(id, _)| id == "d1"),
+            "D1: open_existing handle must see previously-inserted docs"
         );
     }
 }
