@@ -1,9 +1,9 @@
 {
   "name": "rein",
   "description": "Persistent multi-source cross-validated memory across sessions, with knowledge graph, adaptive learning, and OAuth remote MCP",
-  "version": "0.31.3",
+  "version": "0.31.4",
   "author": {
-    "name": "Eric Lee",
+    "name": "lyr1cs",
     "email": "42969110+lyr1cs@users.noreply.github.com"
   },
   "homepage": "https://github.com/lyr1cs/rein",

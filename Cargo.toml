@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0-or-later"
-authors = ["Eric Lee <42969110+lyr1cs@users.noreply.github.com>"]
+authors = ["lyr1cs <42969110+lyr1cs@users.noreply.github.com>"]
 
 [workspace.dependencies]
 syn = { version = "2", features = ["full", "extra-traits"] }

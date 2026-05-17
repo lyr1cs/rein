@@ -1178,13 +1178,13 @@ This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, whi
 
 ### License
 
-**Copyright (C) 2026 Eric Lee.** All rights reserved except as licensed under AGPL-3.0-or-later.
+**Copyright (C) 2026 lyr1cs.** All rights reserved except as licensed under AGPL-3.0-or-later.
 
 **AGPL-3.0-or-later** — see [LICENSE](LICENSE).
 
 rein is a server (MCP / REST / GUI). The AGPL §13 network-use clause means: if you run a modified version of rein **as a service that users interact with over a network**, you must provide those users access to the modified source code. Self-hosted personal use, internal-only deployment within your organization, and integrations that talk to rein over its public API (Claude Code, Cursor, IDE plugins, etc.) are all unaffected.
 
-If you need a non-AGPL license for commercial / proprietary use, the project's copyright holder (`Eric Lee`) retains the right to dual-license — open an issue.
+If you need a non-AGPL license for commercial / proprietary use, the project's copyright holder (`lyr1cs`) retains the right to dual-license — open an issue.
 
 ---
 
@@ -2007,12 +2007,12 @@ OMLX 后端使用 OpenAI `/v1/embeddings` 格式，兼容 OpenRouter、LiteLLM �
 
 ### 许可证
 
-**Copyright (C) 2026 Eric Lee.** 保留所有权利，除非依 AGPL-3.0-or-later 授权。
+**Copyright (C) 2026 lyr1cs.** 保留所有权利，除非依 AGPL-3.0-or-later 授权。
 
 **AGPL-3.0-or-later** — 见 [LICENSE](LICENSE)。
 
 rein 是一个 server（MCP / REST / GUI）。AGPL §13 网络使用条款要求：如果你**改造 rein 后以网络服务形式提供给用户**（SaaS / 公开 endpoint），必须把修改后的源代码让那些用户能拿到。**自托管个人使用、组织内部部署、以及通过 API 调用 rein 的集成（Claude Code / Cursor / IDE 插件等）都不受影响。**
 
-如果需要非 AGPL 的 license 用于商业 / 闭源场景，本项目 copyright holder（`Eric Lee`）保留 dual-license 权利——开 issue 联系。
+如果需要非 AGPL 的 license 用于商业 / 闭源场景，本项目 copyright holder（`lyr1cs`）保留 dual-license 权利——开 issue 联系。
 
 </details>
