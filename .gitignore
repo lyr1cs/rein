@@ -1,5 +1,9 @@
 .DS_Store
 target/
+# Linked git worktrees (each large audit cycle gets one). They are full
+# nested checkouts — a stray `git add -A` would commit an entire duplicate
+# repo + its `.git` pointer (codex v0.32.1 R1 P2).
+.worktrees/
 .claude/*.local.md
 .claude/*.log
 bench/

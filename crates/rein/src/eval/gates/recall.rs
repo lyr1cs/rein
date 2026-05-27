@@ -77,7 +77,7 @@ impl Gate for RecallGate {
         // makes results reproducible across machines & DB states. The signature
         // takes &SqliteStore + &ReinConfig for Gate-trait uniformity; we ignore
         // them here.
-        let fixtures = load_recall_fixtures()?;
+        let (fixtures, fixture_fingerprint) = load_recall_fixtures()?;
         let mut per_fixture = Vec::with_capacity(fixtures.len());
 
         for fx in &fixtures {
@@ -98,6 +98,10 @@ impl Gate for RecallGate {
             kind: ScorecardKind::Run,
             created_at: Utc::now().timestamp(),
             rein_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_fingerprint: env!("REIN_BUILD_FINGERPRINT").to_string(),
+            // Runtime fingerprint of the corpus this run actually read
+            // (codex v0.32.1 R3 P2) — not a build-time env value.
+            fixture_fingerprint,
             fixture_count: per_fixture.len(),
             score,
             per_fixture,
@@ -153,7 +157,7 @@ fn fixture_dir() -> PathBuf {
 /// the recall gate effectively disables itself.  Failing here forces the
 /// caller (rein-eval / trust_measurement / doctor) to surface "no fixtures
 /// available" explicitly.
-fn load_recall_fixtures() -> Result<Vec<RecallFixture>> {
+fn load_recall_fixtures() -> Result<(Vec<RecallFixture>, String)> {
     let dir = fixture_dir();
     // v0.32 R4 P3: use `read_dir` + filename filter instead of
     // `glob::glob(format!("{dir}/case_*.json"))`.  Interpolating
@@ -191,18 +195,29 @@ fn load_recall_fixtures() -> Result<Vec<RecallFixture>> {
     }
 
     let mut fixtures = Vec::with_capacity(paths.len());
+    // (file name, raw bytes) for the runtime corpus fingerprint — captured
+    // from the bytes we actually parse so the fingerprint reflects the
+    // fixtures THIS run loaded, not a stale build-time snapshot.
+    let mut corpus: Vec<(String, Vec<u8>)> = Vec::with_capacity(paths.len());
     for path in paths {
-        let text = std::fs::read_to_string(&path)
+        let bytes = std::fs::read(&path)
             .with_context(|| format!("read recall fixture {}", path.display()))?;
-        let fx: RecallFixture = serde_json::from_str(&text)
+        let fx: RecallFixture = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse recall fixture {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        corpus.push((name, bytes));
         fixtures.push(fx);
     }
 
     // Deterministic ordering for stable scorecard `per_fixture` serialization
     // and for the harness's McNemar pairing on `fixture_id` intersection.
     fixtures.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(fixtures)
+    let fingerprint = crate::eval::gates::fixture_corpus_fingerprint(corpus);
+    Ok((fixtures, fingerprint))
 }
 
 /// Build a `Memory` row from a `SeedMemory`. Mirrors `make_memory` in
@@ -319,7 +334,12 @@ mod tests {
 
     #[test]
     fn recall_gate_loads_fixtures() {
-        let fixtures = load_recall_fixtures().expect("fixture dir must be readable");
+        let (fixtures, fingerprint) = load_recall_fixtures().expect("fixture dir must be readable");
+        assert_eq!(
+            fingerprint.len(),
+            32,
+            "runtime corpus fingerprint must be a 32-hex-char FNV-1a/128 digest, got {fingerprint:?}"
+        );
         assert!(
             !fixtures.is_empty(),
             "recall fixture corpus is empty — gate would produce score=0"
@@ -366,8 +386,11 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
         let scorecard = RecallGate.run(&store, &config).unwrap();
-        let fixtures = load_recall_fixtures().unwrap();
+        let (fixtures, fingerprint) = load_recall_fixtures().unwrap();
 
+        // The scorecard must carry the runtime corpus fingerprint, and it
+        // must equal a fresh load of the same corpus (stability).
+        assert_eq!(scorecard.fixture_fingerprint, fingerprint);
         assert_eq!(scorecard.gate_name, "recall");
         assert_eq!(scorecard.schema_version, SCORECARD_SCHEMA_VERSION);
         assert_eq!(scorecard.kind, ScorecardKind::Run);
@@ -446,7 +469,7 @@ mod tests {
         // preference ×3, exact_keyword ×4, semantic ×3, exploratory ×3.
         // The fixture id naming convention encodes the query type in the
         // prefix, so we can count by parsing.
-        let fixtures = load_recall_fixtures().unwrap();
+        let (fixtures, _fingerprint) = load_recall_fixtures().unwrap();
         let mut counts = std::collections::HashMap::<&str, usize>::new();
         for fx in &fixtures {
             // Identify the prefix family. Order matters — exact_keyword has a

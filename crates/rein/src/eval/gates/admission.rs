@@ -24,6 +24,9 @@ impl Gate for AdmissionGate {
             kind: ScorecardKind::Run,
             created_at: chrono::Utc::now().timestamp(),
             rein_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_fingerprint: env!("REIN_BUILD_FINGERPRINT").to_string(),
+            // Stub loads no corpus → empty fingerprint.
+            fixture_fingerprint: String::new(),
             fixture_count: 0,
             score: 0.0,
             per_fixture: vec![],

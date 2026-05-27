@@ -1,9 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "gate_name": "recall",
   "kind": "baseline",
-  "created_at": 1779033196,
-  "rein_version": "0.32.0",
+  "created_at": 1779901625,
+  "rein_version": "0.32.1",
+  "build_fingerprint": "e82b17fa0666a49ed33916ecbb83f52a",
+  "fixture_fingerprint": "5348b507645d22d1aa065b48a5b139b4",
   "fixture_count": 20,
   "score": 1.0,
   "per_fixture": [

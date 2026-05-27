@@ -22,7 +22,49 @@ pub mod dedup;
 pub mod latency;
 pub mod recall;
 
-pub const SCORECARD_SCHEMA_VERSION: u32 = 1;
+/// v0.32.1: bumped 1 → 2 when `build_fingerprint` was added.  A v0.32.0
+/// baseline (schema 1, no fingerprint) is now classified `NoData` by the
+/// schema-version rule in `compare_scorecards`, forcing a re-baseline that
+/// captures the fingerprint field.
+pub const SCORECARD_SCHEMA_VERSION: u32 = 2;
+
+/// FNV-1a 128-bit offset basis (shared with `build.rs`'s build fingerprint).
+const FNV_OFFSET_128: u128 = 0x6c62272e07bb014262b821756295c58d;
+/// FNV-1a 128-bit prime.
+const FNV_PRIME_128: u128 = 0x0000000001000000000000000000013B;
+
+/// Runtime fingerprint of the fixture corpus a gate ACTUALLY loaded.
+///
+/// codex v0.32.1 R3 P2: a build-time env fingerprint (`REIN_FIXTURE_*`) is
+/// blind to fixtures edited *after* the binary was built and then run via a
+/// direct/installed `rein-eval` (no `cargo` rebuild → no `rerun-if-changed`).
+/// In that workflow the gate reads the edited corpus at runtime but would
+/// stamp the stale compile-time value, letting an old baseline and a
+/// new-corpus run share a fingerprint and slip past the corpus-drift check.
+/// Hashing the bytes the gate just read closes that hole.
+///
+/// `entries` = (stable file name, raw file bytes).  Sorted by name internally
+/// so the result is independent of directory-iteration order; identical
+/// corpora always produce identical fingerprints.  FNV-1a/128 — the same
+/// non-cryptographic family as the build fingerprint; collision risk for
+/// change-detection is negligible.
+pub(crate) fn fixture_corpus_fingerprint(mut entries: Vec<(String, Vec<u8>)>) -> String {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut state = FNV_OFFSET_128;
+    let mut fold = |bytes: &[u8]| {
+        for &b in bytes {
+            state ^= b as u128;
+            state = state.wrapping_mul(FNV_PRIME_128);
+        }
+    };
+    for (name, bytes) in &entries {
+        fold(name.as_bytes());
+        fold(&[0]); // name/content separator
+        fold(bytes);
+        fold(&[0]); // entry separator
+    }
+    format!("{state:032x}")
+}
 
 /// Default noise floor for ship/bail decisions: 0.02 (2pp hit-rate move).
 /// `mcnemar.ci_lower >= -NOISE_FLOOR` → Ship (non-inferior).
@@ -61,6 +103,27 @@ pub struct GateScorecard {
     pub kind: ScorecardKind,
     pub created_at: i64,      // Unix seconds
     pub rein_version: String, // env!("CARGO_PKG_VERSION")
+    /// v0.32.1: content fingerprint of `src/` + the eval-gate fixture corpus
+    /// at build time (`env!("REIN_BUILD_FINGERPRINT")`, computed by
+    /// `build.rs`).  Catches same-version source drift that `rein_version`
+    /// alone misses (codex v0.32.0 R9 P2-#2).  `#[serde(default)]` so a
+    /// schema-1 scorecard (which lacks the field) still deserializes — the
+    /// schema-version rule in `compare_scorecards` then surfaces the
+    /// mismatch as a re-baseline prompt rather than a hard parse error.
+    #[serde(default)]
+    pub build_fingerprint: String,
+    /// v0.32.1 (codex R2/R3 P2): runtime fingerprint of the eval-gate FIXTURE
+    /// corpus the gate actually loaded (`fixture_corpus_fingerprint`, computed
+    /// from the bytes read — NOT a build-time value, so it catches fixtures
+    /// edited after build then run via a direct/installed binary).  Baseline
+    /// and current must agree: a fixture edited in place (same `fixture_id`,
+    /// changed `query`/`seed_memories`) changes the corpus without changing
+    /// the id-set, so without this check McNemar would pair results computed
+    /// over two different corpora.  Kept distinct from `build_fingerprint` so
+    /// legitimate `src/` scoring-logic drift between baseline and run (the
+    /// experiment) still compares.  Empty for stub gates (no corpus).
+    #[serde(default)]
+    pub fixture_fingerprint: String,
     pub fixture_count: usize,
     pub score: f64,                      // hit-rate in [0.0, 1.0]
     pub per_fixture: Vec<FixtureResult>, // ordered, parallel for paired McNemar
@@ -105,6 +168,20 @@ pub trait Gate: Send + Sync {
 /// or `current.gate_name`, else empty string" fallback produced
 /// indistinguishable `gate_name: ""` entries in `rein-eval gate compare
 /// --gate all` output when no scorecards had been generated yet.
+/// Shorten a 32-hex-char fingerprint to a readable prefix for diagnostics.
+/// Empty (a schema-1 default that somehow reached the check) renders as
+/// `<none>`.  Truncates by `char` rather than byte (codex v0.32.1 R1 P2):
+/// a hand-edited / malformed scorecard could carry a non-ASCII
+/// `build_fingerprint`, and a byte slice at index 12 could fall inside a
+/// UTF-8 code point and panic while building the NoData diagnostic — turning
+/// "report the bad scorecard" into "abort `doctor` / `compare`".
+fn short_fp(fp: &str) -> String {
+    if fp.is_empty() {
+        return "<none>".to_string();
+    }
+    fp.chars().take(12).collect()
+}
+
 pub fn compare_scorecards(
     gate_name: &str,
     baseline: Option<&GateScorecard>,
@@ -255,6 +332,68 @@ pub fn compare_scorecards(
                 "run scorecard was generated for rein v{} but the current binary is v{}; \
                  re-run `rein-eval gate run --gate {}` before comparing",
                 current.rein_version, expected_version, gate_name
+            ),
+            mcnemar: None,
+        };
+    }
+
+    // v0.32.1 (codex v0.32.0 R9 P2-#2): version alone misses same-version
+    // source drift.  After the crate version is bumped but before release —
+    // or any time a dev edits scoring logic / fixtures on master without a
+    // version change — a stale `target/eval-gates/<gate>-run.json` still
+    // carries the matching `rein_version` and would slip past the check
+    // above.  Compare the run's build fingerprint (content hash of `src/` +
+    // the fixture corpus, embedded by `build.rs`) against the current
+    // binary's.  As with the version check, only the run side is validated:
+    // baselines are committed from an intentionally-older tree, so their
+    // fingerprint is expected to differ.
+    let expected_fingerprint = env!("REIN_BUILD_FINGERPRINT");
+    if current.build_fingerprint != expected_fingerprint {
+        return GateComparison {
+            gate_name: gate_name.clone(),
+            baseline_scorecard: Some(baseline.clone()),
+            current_scorecard: Some(current.clone()),
+            status: ScorecardStatus::NoData,
+            reason: format!(
+                "run scorecard was generated from a different source tree \
+                 (fingerprint {} != current {}); the binary's scoring logic or \
+                 fixture corpus changed since this run — re-run \
+                 `rein-eval gate run --gate {}` before comparing",
+                short_fp(&current.build_fingerprint),
+                short_fp(expected_fingerprint),
+                gate_name
+            ),
+            mcnemar: None,
+        };
+    }
+
+    // v0.32.1 (codex R2 P2): corpus-identity check.  The run-side build
+    // check above only proves the RUN matches the current binary; the
+    // baseline is intentionally exempt (its `src/` may legitimately predate
+    // current scoring logic — that's the experiment).  But if a fixture's
+    // content changed in place while its `fixture_id` stayed the same, the
+    // committed baseline holds results from the OLD corpus and a fresh run
+    // holds results from the NEW one; the strict id-set check (below) still
+    // passes because the ids match.  Require baseline and current to carry
+    // the same fixture-corpus fingerprint so in-place fixture edits force a
+    // re-baseline instead of producing a Ship/Bail over mismatched corpora.
+    // (Empty on both sides — e.g. stub gates that load no fixtures, or a
+    // schema-1 scorecard's serde default — trivially matches and falls
+    // through to the stub/id-set rules.)
+    if baseline.fixture_fingerprint != current.fixture_fingerprint {
+        return GateComparison {
+            gate_name: gate_name.clone(),
+            baseline_scorecard: Some(baseline.clone()),
+            current_scorecard: Some(current.clone()),
+            status: ScorecardStatus::NoData,
+            reason: format!(
+                "fixture corpus changed between baseline ({}) and run ({}): \
+                 a fixture was edited in place (same ids, different content), \
+                 so the paired comparison would mix two corpora — \
+                 re-baseline with `rein-eval gate baseline --gate {}`",
+                short_fp(&baseline.fixture_fingerprint),
+                short_fp(&current.fixture_fingerprint),
+                gate_name
             ),
             mcnemar: None,
         };
@@ -584,6 +723,13 @@ mod tests {
             // the stale-run path override this field inline after
             // creation.
             rein_version: env!("CARGO_PKG_VERSION").to_string(),
+            // v0.32.1: healthy test fixtures use the current binary's
+            // fingerprint so the new freshness check passes.  Tests that
+            // exercise the stale-build path override this field inline.
+            build_fingerprint: env!("REIN_BUILD_FINGERPRINT").to_string(),
+            // Fixed corpus fingerprint so baseline + current match by
+            // default; corpus-drift tests override one side inline.
+            fixture_fingerprint: "test-fixture-corpus".to_string(),
             fixture_count,
             score,
             per_fixture,
@@ -778,6 +924,99 @@ mod tests {
         );
     }
 
+    /// v0.32.1 (codex v0.32.0 R9 P2-#2): a run scorecard whose
+    /// `rein_version` MATCHES the current binary but whose
+    /// `build_fingerprint` differs is the same-version drift case the
+    /// version check can't catch — a dev edited scoring logic / fixtures on
+    /// master without bumping the crate version.  It must classify as
+    /// NoData so `doctor` / `trust_measurement` never report Ship for a
+    /// binary that hasn't actually re-run the gate.
+    #[test]
+    fn compare_scorecards_rejects_stale_build_fingerprint_same_version() {
+        let baseline = make_scorecard(
+            "recall",
+            ScorecardKind::Baseline,
+            vec![("a", true), ("b", true)],
+        );
+        let mut current =
+            make_scorecard("recall", ScorecardKind::Run, vec![("a", true), ("b", true)]);
+        // Version still matches the binary (make_scorecard set it to
+        // CARGO_PKG_VERSION); only the source fingerprint is stale.
+        assert_eq!(current.rein_version, env!("CARGO_PKG_VERSION"));
+        current.build_fingerprint = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+
+        let cmp = compare_scorecards(
+            "recall",
+            Some(&baseline),
+            Some(&current),
+            DEFAULT_NOISE_FLOOR,
+        );
+        assert_eq!(cmp.status, ScorecardStatus::NoData);
+        assert!(cmp.mcnemar.is_none());
+        assert!(
+            cmp.reason.contains("different source tree") && cmp.reason.contains("re-run"),
+            "diagnostic should explain the fingerprint drift and recommend re-run: {}",
+            cmp.reason
+        );
+    }
+
+    /// Baselines are exempt from the fingerprint freshness check (they are
+    /// committed from an intentionally-older tree).  A baseline with a
+    /// non-matching fingerprint must NOT block the comparison.
+    #[test]
+    fn compare_scorecards_baseline_fingerprint_drift_is_exempt() {
+        let mut baseline = make_scorecard(
+            "recall",
+            ScorecardKind::Baseline,
+            vec![("a", true), ("b", true)],
+        );
+        baseline.build_fingerprint = "0ldbas3l1nef1ngerpr1nt0000000000".to_string();
+        let current = make_scorecard("recall", ScorecardKind::Run, vec![("a", true), ("b", true)]);
+        let cmp = compare_scorecards(
+            "recall",
+            Some(&baseline),
+            Some(&current),
+            DEFAULT_NOISE_FLOOR,
+        );
+        // Current fingerprint matches the binary, baseline's is stale-but-ok.
+        assert_eq!(cmp.status, ScorecardStatus::Ship, "reason: {}", cmp.reason);
+        assert!(cmp.mcnemar.is_some());
+    }
+
+    /// v0.32.1 (codex R2 P2): a fixture edited in place (same `fixture_id`,
+    /// changed content) leaves the id-set equal but the corpus different.
+    /// Baseline holds OLD-corpus results, current holds NEW-corpus results;
+    /// pairing them would be invalid.  Differing fixture fingerprints must
+    /// force NoData with a re-baseline prompt, NOT a Ship/Bail.
+    #[test]
+    fn compare_scorecards_rejects_fixture_corpus_drift_same_ids() {
+        let mut baseline = make_scorecard(
+            "recall",
+            ScorecardKind::Baseline,
+            vec![("a", true), ("b", true)],
+        );
+        // Same ids, but the baseline was built over a different corpus.
+        baseline.fixture_fingerprint = "0ldc0rpusf1ngerpr1nt000000000000".to_string();
+        let current = make_scorecard("recall", ScorecardKind::Run, vec![("a", true), ("b", true)]);
+        // Sanity: ids match, versions/build match — only the corpus differs.
+        assert_eq!(current.rein_version, env!("CARGO_PKG_VERSION"));
+        assert_ne!(baseline.fixture_fingerprint, current.fixture_fingerprint);
+
+        let cmp = compare_scorecards(
+            "recall",
+            Some(&baseline),
+            Some(&current),
+            DEFAULT_NOISE_FLOOR,
+        );
+        assert_eq!(cmp.status, ScorecardStatus::NoData);
+        assert!(cmp.mcnemar.is_none());
+        assert!(
+            cmp.reason.contains("fixture corpus changed") && cmp.reason.contains("re-baseline"),
+            "diagnostic should explain corpus drift and recommend re-baseline: {}",
+            cmp.reason
+        );
+    }
+
     #[test]
     fn compare_scorecards_rejects_duplicate_fixture_ids_in_current() {
         let baseline = make_scorecard(
@@ -938,6 +1177,8 @@ mod tests {
         assert_eq!(loaded.kind, original.kind);
         assert_eq!(loaded.created_at, original.created_at);
         assert_eq!(loaded.rein_version, original.rein_version);
+        assert_eq!(loaded.build_fingerprint, original.build_fingerprint);
+        assert_eq!(loaded.fixture_fingerprint, original.fixture_fingerprint);
         assert_eq!(loaded.fixture_count, original.fixture_count);
         assert!((loaded.score - original.score).abs() < 1e-12);
         assert_eq!(loaded.per_fixture.len(), original.per_fixture.len());

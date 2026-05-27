@@ -24,6 +24,10 @@ impl Gate for DedupGate {
             kind: ScorecardKind::Run,
             created_at: chrono::Utc::now().timestamp(),
             rein_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_fingerprint: env!("REIN_BUILD_FINGERPRINT").to_string(),
+            // Stub loads no corpus → empty fingerprint (matches the other
+            // side's empty default; the stub rule short-circuits anyway).
+            fixture_fingerprint: String::new(),
             fixture_count: 0,
             score: 0.0,
             per_fixture: vec![],
