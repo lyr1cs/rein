@@ -1581,7 +1581,7 @@ fn check_auth_policy_consistency(config: &ReinConfig) -> DoctorCheck {
         return ok_in(
             DoctorCategory::Configuration,
             "auth_policy",
-            "[server].allow_unauthenticated_loopback is deprecated; use [server].auth = \"public\" for the legacy remote read-only tunnel mode, or [server].auth = \"loopback_only\" for local-only access. Will be removed in v0.31.",
+            "[server].allow_unauthenticated_loopback is deprecated; use [server].auth = \"public\" for the legacy remote read-only tunnel mode, or [server].auth = \"loopback_only\" for local-only access. It remains supported for now and is targeted for removal in a future minor release once the explicit-auth migration completes.",
         );
     }
 
@@ -3571,6 +3571,14 @@ provider = "inherit"
         assert!(check.message.contains("deprecated"));
         assert!(check.message.contains("auth = \"public\""));
         assert!(check.message.contains("auth = \"loopback_only\""));
+        // v0.33.1: the notice must not pin a stale removal version — it
+        // claimed "removed in v0.31" through v0.32/v0.33 without ever firing.
+        assert!(
+            !check.message.contains("v0.31"),
+            "deprecation notice must not carry the stale v0.31 removal pin: {}",
+            check.message
+        );
+        assert!(check.message.contains("targeted for removal in a future"));
     }
 
     #[test]
