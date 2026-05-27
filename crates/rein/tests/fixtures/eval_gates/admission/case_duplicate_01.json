@@ -1,0 +1,18 @@
+{
+  "id": "duplicate_01",
+  "topic": "incoming-note",
+  "content": "Connection pooling reuses open database connections across requests to avoid repeated handshake overhead.",
+  "existing": [
+    {
+      "id": "ex_d1",
+      "topic": "store-record",
+      "content": "Connection pooling reuses open database connections across requests to avoid repeated handshake overhead."
+    },
+    {
+      "id": "ex_d2",
+      "topic": "store-history",
+      "content": "The frontend renders a dashboard with three charts and a sidebar."
+    }
+  ],
+  "expected_decision": "duplicate"
+}

@@ -1,0 +1,33 @@
+{
+  "id": "latency_medium_01",
+  "query": "what indexing strategy does the search layer use",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "The search layer indexes documents in Tantivy and scores them with BM25 over tokenized fields.",
+      "topic": "search",
+      "keywords": ["tantivy", "bm25", "index"]
+    },
+    {
+      "id": "m2",
+      "content": "Vector recall uses an HNSW graph for approximate nearest neighbor lookup over embeddings.",
+      "topic": "search",
+      "keywords": ["hnsw", "vector", "embedding"]
+    },
+    {
+      "id": "m3",
+      "content": "Reciprocal rank fusion merges the BM25 and vector result lists into a single ranking.",
+      "topic": "search",
+      "keywords": ["fusion", "rank", "merge"]
+    },
+    {
+      "id": "m4",
+      "content": "Knowledge graph signals expand the candidate set by following concept links during recall.",
+      "topic": "search",
+      "keywords": ["graph", "concept", "recall"]
+    }
+  ]
+}

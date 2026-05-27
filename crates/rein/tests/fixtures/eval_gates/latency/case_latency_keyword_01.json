@@ -1,0 +1,21 @@
+{
+  "id": "latency_keyword_01",
+  "query": "SqliteStore",
+  "topic": null,
+  "keyword": "SqliteStore",
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "SqliteStore implements the storage layer with a per-request connection model and a Tantivy singleton cache.",
+      "topic": "rein-internals",
+      "keywords": ["SqliteStore", "storage", "tantivy"]
+    },
+    {
+      "id": "m2",
+      "content": "The proxy server forwards MCP requests over server-sent events to the local backend.",
+      "topic": "rein-internals",
+      "keywords": ["proxy", "mcp", "sse"]
+    }
+  ]
+}

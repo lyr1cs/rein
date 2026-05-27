@@ -1,0 +1,33 @@
+{
+  "id": "latency_topic_01",
+  "query": "what authentication policy applies to remote requests",
+  "topic": "auth",
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "The server auth policy can be loopback_only, bearer_required, oauth, or public depending on deployment.",
+      "topic": "auth",
+      "keywords": ["auth", "policy", "bearer"]
+    },
+    {
+      "id": "m2",
+      "content": "OAuth grants are persisted in SQLite with a refresh token fingerprint column for revocation.",
+      "topic": "auth",
+      "keywords": ["oauth", "grant", "token"]
+    },
+    {
+      "id": "m3",
+      "content": "Bearer verification caches results for thirty seconds keyed by a SHA-256 of the token.",
+      "topic": "auth",
+      "keywords": ["bearer", "cache", "sha256"]
+    },
+    {
+      "id": "m4",
+      "content": "Non-loopback HTTP requests are rejected unless a token or explicit allow flag is configured.",
+      "topic": "auth",
+      "keywords": ["loopback", "http", "reject"]
+    }
+  ]
+}

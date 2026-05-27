@@ -1,0 +1,6 @@
+{
+  "id": "dup_exact_01",
+  "text_a": "Connection pooling reuses open database connections across requests to avoid repeated handshake overhead.",
+  "text_b": "Connection pooling reuses open database connections across requests to avoid repeated handshake overhead.",
+  "is_duplicate": true
+}

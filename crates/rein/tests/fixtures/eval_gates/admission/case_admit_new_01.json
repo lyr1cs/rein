@@ -1,0 +1,18 @@
+{
+  "id": "admit_new_01",
+  "topic": "incoming-note",
+  "content": "Quantum annealing hardware samples low-energy spin configurations to approximate combinatorial optimization solutions.",
+  "existing": [
+    {
+      "id": "ex_a1",
+      "topic": "store-record",
+      "content": "I repotted the basil and watered the tomatoes on the balcony this morning."
+    },
+    {
+      "id": "ex_a2",
+      "topic": "store-history",
+      "content": "Slow-roasting the brisket overnight keeps the meat tender before the barbecue."
+    }
+  ],
+  "expected_decision": "admit_new"
+}

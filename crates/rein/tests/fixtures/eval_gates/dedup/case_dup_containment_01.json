@@ -1,0 +1,6 @@
+{
+  "id": "dup_containment_01",
+  "text_a": "Rust async runtime built on tokio",
+  "text_b": "Rust async runtime built on tokio with a work-stealing scheduler and a multi-threaded executor for high throughput.",
+  "is_duplicate": true
+}

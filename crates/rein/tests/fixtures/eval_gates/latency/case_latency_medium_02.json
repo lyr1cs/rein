@@ -1,0 +1,39 @@
+{
+  "id": "latency_medium_02",
+  "query": "how is memory tiering and decay handled",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Memory tiering classifies rows into hot, warm, and cold using a streaming quantile estimator.",
+      "topic": "adaptive",
+      "keywords": ["tiering", "hot", "cold"]
+    },
+    {
+      "id": "m2",
+      "content": "Per-cluster Kaplan-Meier survival curves replace fixed Ebbinghaus decay half-lives.",
+      "topic": "adaptive",
+      "keywords": ["decay", "survival", "kaplan-meier"]
+    },
+    {
+      "id": "m3",
+      "content": "HDBSCAN groups memories into semantic clusters for per-cluster learning.",
+      "topic": "adaptive",
+      "keywords": ["hdbscan", "cluster", "semantic"]
+    },
+    {
+      "id": "m4",
+      "content": "Cold tier memories are excluded from non-exploratory queries to keep recall focused.",
+      "topic": "adaptive",
+      "keywords": ["cold", "tier", "filter"]
+    },
+    {
+      "id": "m5",
+      "content": "Promotion from short-term to long-term memory uses cluster-aware strength signals.",
+      "topic": "adaptive",
+      "keywords": ["promotion", "strength", "ltm"]
+    }
+  ]
+}

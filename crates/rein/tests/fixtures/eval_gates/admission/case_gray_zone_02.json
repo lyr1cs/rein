@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_02",
+  "topic": "incoming-note",
+  "content": "rust borrow checker prevents data races during concurrent task scheduling",
+  "existing": [
+    {
+      "id": "ex_h1",
+      "topic": "store-record",
+      "content": "rust borrow checker reports data lifetimes inside generic helper functions"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

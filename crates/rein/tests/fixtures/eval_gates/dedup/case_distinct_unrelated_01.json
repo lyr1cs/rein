@@ -1,0 +1,6 @@
+{
+  "id": "distinct_unrelated_01",
+  "text_a": "I adopted a cat from the shelter last weekend and named her Mochi.",
+  "text_b": "The Kubernetes cluster runs three worker nodes behind a load balancer.",
+  "is_duplicate": false
+}

@@ -1,0 +1,15 @@
+{
+  "id": "latency_small_01",
+  "query": "connection pooling reuses database connections",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Connection pooling reuses open database connections so each request avoids the TCP and TLS handshake cost.",
+      "topic": "infra",
+      "keywords": ["connection", "pooling", "database"]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "id": "duplicate_03",
+  "topic": "incoming-note",
+  "content": "The reranker rescopes the top retrieved candidates using a small learned model before final fusion.",
+  "existing": [
+    {
+      "id": "ex_f1",
+      "topic": "store-record",
+      "content": "The reranker rescopes the top retrieved candidates using a small learned model prior to final fusion."
+    }
+  ],
+  "expected_decision": "duplicate"
+}

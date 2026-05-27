@@ -1,0 +1,13 @@
+{
+  "id": "duplicate_02",
+  "topic": "incoming-note",
+  "content": "The Rust async runtime is built on tokio with a work-stealing scheduler and a multi-threaded executor for high throughput across many concurrent tasks.",
+  "existing": [
+    {
+      "id": "ex_e1",
+      "topic": "store-record",
+      "content": "The Rust async runtime is built on tokio."
+    }
+  ],
+  "expected_decision": "duplicate"
+}

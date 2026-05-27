@@ -1,0 +1,6 @@
+{
+  "id": "distinct_nearmiss_01",
+  "text_a": "The proxy decodes percent-encoded path segments before routing.",
+  "text_b": "The reranker rescopes the top candidates using a learned model.",
+  "is_duplicate": false
+}

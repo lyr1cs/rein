@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_01",
+  "topic": "incoming-note",
+  "content": "the database connection pool reuses open sockets across query batches",
+  "existing": [
+    {
+      "id": "ex_g1",
+      "topic": "store-record",
+      "content": "the database connection pool feeds metrics into dashboards every minute"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "gate_name": "latency",
+  "kind": "baseline",
+  "created_at": 1779905497,
+  "rein_version": "0.33.0",
+  "build_fingerprint": "1d41bf4c949e887fe362ab1d35606864",
+  "fixture_fingerprint": "7917aba23727224e2e355d9f9b72308e",
+  "fixture_count": 6,
+  "score": 1.0,
+  "per_fixture": [
+    {
+      "fixture_id": "latency_keyword_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_medium_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_medium_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_small_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_small_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_topic_01",
+      "hit": true
+    }
+  ]
+}

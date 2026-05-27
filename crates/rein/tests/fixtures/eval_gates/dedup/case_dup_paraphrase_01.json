@@ -1,0 +1,6 @@
+{
+  "id": "dup_paraphrase_01",
+  "text_a": "The release build embeds absolute builder paths via the file macro into the binary.",
+  "text_b": "The release build embeds absolute builder paths into the binary via the file macro.",
+  "is_duplicate": true
+}

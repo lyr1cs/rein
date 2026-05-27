@@ -1,0 +1,21 @@
+{
+  "id": "latency_small_02",
+  "query": "how does the retry backoff schedule work",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "The retry backoff uses exponential delays doubling from 100ms up to a 30 second ceiling with jitter.",
+      "topic": "infra",
+      "keywords": ["retry", "backoff", "exponential"]
+    },
+    {
+      "id": "m2",
+      "content": "A circuit breaker opens after five consecutive failures and half-opens after a cooldown window.",
+      "topic": "infra",
+      "keywords": ["circuit", "breaker", "failure"]
+    }
+  ]
+}

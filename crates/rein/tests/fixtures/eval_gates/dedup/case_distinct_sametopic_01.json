@@ -1,0 +1,6 @@
+{
+  "id": "distinct_sametopic_01",
+  "text_a": "Cache entries expire after thirty seconds.",
+  "text_b": "Cache memory is reclaimed using a least-recently-used eviction policy.",
+  "is_duplicate": false
+}

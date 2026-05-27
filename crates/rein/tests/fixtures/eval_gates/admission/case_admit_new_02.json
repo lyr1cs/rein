@@ -1,0 +1,13 @@
+{
+  "id": "admit_new_02",
+  "topic": "incoming-note",
+  "content": "Tidal cycles along the northern coast peak twice daily as the moon orbits overhead.",
+  "existing": [
+    {
+      "id": "ex_b1",
+      "topic": "store-record",
+      "content": "Filing quarterly estimated taxes early avoids penalties from the revenue service."
+    }
+  ],
+  "expected_decision": "admit_new"
+}

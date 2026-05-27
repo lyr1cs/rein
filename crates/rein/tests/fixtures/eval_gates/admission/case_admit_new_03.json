@@ -1,0 +1,18 @@
+{
+  "id": "admit_new_03",
+  "topic": "incoming-note",
+  "content": "The summer jazz festival booked three brass ensembles for the riverside stage.",
+  "existing": [
+    {
+      "id": "ex_c1",
+      "topic": "store-record",
+      "content": "Kubernetes schedules pods onto worker nodes using resource requests and limits."
+    },
+    {
+      "id": "ex_c2",
+      "topic": "store-history",
+      "content": "Knitting a wool scarf needs roughly four hundred grams of chunky yarn."
+    }
+  ],
+  "expected_decision": "admit_new"
+}
