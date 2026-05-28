@@ -451,6 +451,49 @@ pub fn recall_temporal(
     )
 }
 
+/// v0.36 P1 baseline (2026-05-28) — channel parallelism inventory.
+///
+/// The recall pipeline already implements substantial parallelism across the
+/// retrieval channels. This comment block exists so future P1 redesign work
+/// has a single explicit reference for the current state; keep it in sync
+/// when channels move.
+///
+/// **Original-query phase (parallel layout)**:
+/// 1. **Supermemory** (`SupermemoryClient`) — spawned at line ~497 as a
+///    detached `std::thread` when `!fast && config.sync.supermemory_enabled`.
+///    Runs concurrently with everything below; joined at the original-query
+///    Phase 2 boundary. Cancellation: none today (network round-trip,
+///    candidate for v0.36+ cancel token).
+/// 2. **FTS / BM25** (`try_tantivy_then_fts5`) — sync on the main thread
+///    (~1 ms typical). Strong-signal detection runs immediately after.
+/// 3. **Expand query** (`expand::expand_query_cancellable`) — spawned at
+///    line ~570 as a `std::thread` when `should_expand` (gated on
+///    `!strong_signal` + not Exact-Keyword). Carries an `Arc<AtomicBool>`
+///    cancel token; strong-signal detection at the Phase 2 join site
+///    flips the flag so an in-flight LLM call shortcuts without writing
+///    its expansion.
+/// 4. **Vec / HNSW** (`try_vector_search`) — speculatively executed:
+///    cache-hit runs sync on the main thread; cache-miss + normal mode +
+///    `!strong_signal` spawns a `std::thread` (line ~644), pool-backed via
+///    `try_get` non-blocking checkout with fresh-conn fallback. Skipped
+///    on fast mode or strong signal.
+/// 5. **KG** (`run_kg_search`) — sync in fast / in-memory paths; otherwise
+///    spawned at line ~795 with an 80 ms `mpsc::Receiver::recv_timeout`
+///    budget. Pool-backed identically to Vec. Episode-score collection
+///    runs as part of `run_kg_search` regardless of strong signal so
+///    episodic / temporal queries keep the episode channel.
+///
+/// **Expanded-query phase**: each surviving expanded query fans Vec + KG
+/// into parallel threads (file-backed) or runs sequentially (in-memory).
+/// Skipped entirely when strong signal cancels expansion.
+///
+/// **What's NOT yet cancellable**: Vec + KG + SM threads carry no
+/// cancel token, so a strong-signal detection that arrives after their
+/// spawn cannot short-circuit them. P1 redesign target = cooperative
+/// cancel tokens on Vec / KG / SM, with the strong-signal join site
+/// flipping the flags. See `docs/backlog/v0.36-plan.md` for the
+/// post-filter strong-signal detection constraint that codex caught
+/// during the 2026-05-28 first-impl attempt.
 pub fn recall_temporal_with_request_id(
     store: &SqliteStore,
     config: &ReinConfig,
