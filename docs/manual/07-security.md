@@ -54,11 +54,34 @@ one of these local-only options:
 
 ```toml
 [server]
-allow_unauthenticated_loopback = true
+auth = "loopback_only"   # strict local-only HTTP/SSE
+# OR auth = "public"     # if non-discoverable tunnel hostname will route
+                         # claude.ai connector reads through the bind
 
 [proxy]
 allow_unauthenticated_loopback = true
 ```
+
+The `[server].auth` policy values are `"loopback_only"`, `"public"`,
+`"bearer_required"`, and `"oauth"`. **v0.35.0 removed the legacy
+`[server].allow_unauthenticated_loopback` bool.** Configs that still carry
+it are handled by a load-time migration:
+
+- bool true + loopback bind + no token → translated to `auth = "public"`.
+- bool true + any bind + `REIN_HTTP_TOKEN` set → translated to
+  `auth = "bearer_required"` (token auth always won over the bool at
+  runtime; the migration preserves that).
+- bool true + non-loopback bind + no token → the bool is stripped and a
+  deprecation WARN is logged; `[server].auth` stays unset so stdio / CLI /
+  `rein doctor` keep working. HTTP/SSE startup (`rein serve --sse`) then
+  refuses with an explicit error pointing at `[server].auth` so the
+  operator picks a policy.
+- bool false (the old default) → silently stripped.
+
+In every migration branch a one-time WARN is logged so the operator removes
+the legacy key from their config. The `[proxy].allow_unauthenticated_loopback`
+opt-in still works as before for the proxy surface and is unaffected by
+this migration.
 
 This opt-in only applies to loopback binds such as `127.0.0.1`, `localhost`, or
 `::1`. Wildcard HTTP binds require a token or explicit host allowlist. Docker's

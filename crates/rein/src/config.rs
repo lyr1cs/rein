@@ -1010,8 +1010,6 @@ pub struct ServerConfig {
     pub stdio_background_warmup: bool,
     #[serde(default)]
     pub gui_enabled: bool,
-    #[serde(default)]
-    pub allow_unauthenticated_loopback: bool,
     /// v0.27.3 F5/C3: optional explicit Host-header allowlist used by the
     /// HTTP guard. Required when binding to a wildcard address
     /// (`0.0.0.0`, `::`, `*`) to defend against DNS-rebinding. When `None`
@@ -1047,13 +1045,13 @@ pub(crate) fn is_loopback_bind_host(bind: &str) -> bool {
     matches!(bind, "127.0.0.1" | "::1" | "localhost")
 }
 
-impl ServerConfig {
-    /// Whether `[server].allow_unauthenticated_loopback` can take effect for
-    /// the configured bind address.
-    pub(crate) fn loopback_unauth_requested(&self) -> bool {
-        self.allow_unauthenticated_loopback && is_loopback_bind_host(&self.sse_bind)
-    }
-}
+// v0.35 Phase 3: `ServerConfig::loopback_unauth_requested` and the
+// `allow_unauthenticated_loopback` field it gated were removed. The legacy
+// bool no longer participates in runtime auth resolution — callers must use
+// `[server].auth` explicitly. Configs that still carry the legacy bool are
+// transformed by `migrate_legacy_server_auth` at TOML load time (see
+// `merge_toml`). Lookup of "what is the runtime policy" is now solely
+// `ReinConfig::resolve_auth_policy`.
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1363,10 +1361,6 @@ impl Default for ServerConfig {
             background_warmup: default_server_background_warmup(),
             stdio_background_warmup: false,
             gui_enabled: false,
-            // v0.27.3 F5/C1: default-deny. Operators must opt in to
-            // unauthenticated loopback or set REIN_HTTP_TOKEN. The doctor
-            // template already writes `false` (see doctor.rs:1742).
-            allow_unauthenticated_loopback: false,
             // v0.27.3 F5/C3: when [server].sse_bind is a wildcard
             // (0.0.0.0, ::, *, empty), startup refuses unless allowed_hosts
             // is set. None means "derive allowlist from bind", which is
@@ -1628,14 +1622,20 @@ impl ReinConfig {
         if has_http_token {
             return Ok(crate::auth::AuthPolicy::BearerRequired);
         }
-        if self.server.loopback_unauth_requested() {
-            return Ok(crate::auth::AuthPolicy::Public);
-        }
 
+        // v0.35 Phase 3: the implicit `allow_unauthenticated_loopback` bool
+        // was removed. If neither `[server].auth` nor `REIN_HTTP_TOKEN` is
+        // set, the only valid posture is to refuse to start — operators
+        // must choose an explicit policy. Legacy configs that still carry
+        // the bool are transformed by `migrate_legacy_server_auth` at TOML
+        // load time, so this branch is unreachable for them.
         Err(anyhow::anyhow!(
             "REIN_HTTP_TOKEN must be set for HTTP/SSE access on '{}'. \
-             Set REIN_HTTP_TOKEN=<secret>, set [server].auth explicitly, \
-             or opt into loopback-only access with [server].allow_unauthenticated_loopback=true",
+             Set REIN_HTTP_TOKEN=<secret>, or set [server].auth explicitly: \
+             \"public\" for non-discoverable read-only tunnels, \
+             \"loopback_only\" for strict local-only access, \
+             \"bearer_required\" for token auth (paired with REIN_HTTP_TOKEN), \
+             or \"oauth\" for multi-user remote auth.",
             self.server.sse_bind
         ))
     }
@@ -2982,9 +2982,107 @@ fn merge_toml(base: ReinConfig, toml_str: &str) -> anyhow::Result<ReinConfig> {
     // Deep-merge user over base
     deep_merge(&mut base_val, &user_val);
 
+    // v0.35 Phase 3: transform any surviving legacy
+    // `[server].allow_unauthenticated_loopback` into an explicit
+    // `[server].auth` policy before serde decode (the field was removed
+    // from ServerConfig + `deny_unknown_fields` would otherwise reject the
+    // load). See `migrate_legacy_server_auth` for the mapping rules.
+    migrate_legacy_server_auth(&mut base_val)?;
+
     // Deserialize the merged table back into ReinConfig
     let merged: ReinConfig = base_val.try_into()?;
     Ok(merged)
+}
+
+/// v0.35 Phase 3 — TOML load-time migration of the removed
+/// `[server].allow_unauthenticated_loopback` bool into an explicit
+/// `[server].auth` policy.
+///
+/// Mapping rules (all derived from the v0.34 runtime semantics of
+/// `ReinConfig::resolve_auth_policy` so behavior is preserved across the
+/// upgrade for every config shape that previously resolved):
+///
+/// - bool absent or false → no-op (the key is stripped; defaults take over).
+/// - bool true + explicit `[server].auth` set → the legacy bool was always
+///   silently overridden by explicit policy; strip it and emit a one-time
+///   WARN so the operator removes the dead key from their config.
+/// - bool true + `REIN_HTTP_TOKEN` set → bearer auth always won over the
+///   bool at runtime; map to `auth = "bearer_required"` and emit WARN.
+/// - bool true + loopback bind + no token → previous runtime resolved to
+///   `Public`; map to `auth = "public"` and emit WARN.
+/// - bool true + non-loopback bind + no token → the v0.34 doctor already
+///   reported FAIL for this (the bool could not take effect anyway); fail
+///   the load with a clear migration message instead of letting an
+///   ambiguous startup proceed.
+fn migrate_legacy_server_auth(val: &mut toml::Value) -> anyhow::Result<()> {
+    let Some(server_table) = val.get_mut("server").and_then(|v| v.as_table_mut()) else {
+        return Ok(());
+    };
+    let Some(legacy) = server_table.remove("allow_unauthenticated_loopback") else {
+        return Ok(());
+    };
+    let opted_in = legacy.as_bool().unwrap_or(false);
+    if !opted_in {
+        // bool=false was the default; the key is removed silently so the
+        // strict `deny_unknown_fields` decoder accepts the merged table.
+        return Ok(());
+    }
+    if server_table.contains_key("auth") {
+        tracing::warn!(
+            target: "rein::config::migration",
+            "[server].allow_unauthenticated_loopback = true was ignored because [server].auth is set explicitly; remove the legacy bool from your config (it is no longer recognized as of v0.35.0)"
+        );
+        return Ok(());
+    }
+    let has_token = nonempty_env("REIN_HTTP_TOKEN").is_some();
+    // The effective bind at runtime is `REIN_SSE_BIND` env (applied later in
+    // `load()`) when set, falling back to the TOML `[server].sse_bind`,
+    // falling back to the loopback default. Reading the env var here means
+    // a legacy bool combined with `REIN_SSE_BIND=0.0.0.0` cannot silently
+    // migrate to `auth = "public"` based on a stale loopback default. See
+    // codex review feedback on the v0.35 Phase 3 patch.
+    let bind = nonempty_env("REIN_SSE_BIND").unwrap_or_else(|| {
+        server_table
+            .get("sse_bind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1")
+            .to_string()
+    });
+    let bind = bind.as_str();
+    if has_token {
+        server_table.insert(
+            "auth".to_string(),
+            toml::Value::String("bearer_required".to_string()),
+        );
+        tracing::warn!(
+            target: "rein::config::migration",
+            migrated_to = "bearer_required",
+            "[server].allow_unauthenticated_loopback = true was migrated to [server].auth = \"bearer_required\" (REIN_HTTP_TOKEN is set, so token auth wins); remove the legacy bool from your config (it is no longer recognized as of v0.35.0)"
+        );
+    } else if is_loopback_bind_host(bind) {
+        server_table.insert(
+            "auth".to_string(),
+            toml::Value::String("public".to_string()),
+        );
+        tracing::warn!(
+            target: "rein::config::migration",
+            migrated_to = "public",
+            "[server].allow_unauthenticated_loopback = true was migrated to [server].auth = \"public\" (loopback bind, no token); remove the legacy bool from your config (it is no longer recognized as of v0.35.0)"
+        );
+    } else {
+        // Codex P1 v2: do NOT bail at config load. The legacy bool could
+        // never take effect on a non-loopback bind without a token even
+        // under v0.34 (`loopback_unauth_requested()` returned false), and
+        // failing the load now would brick stdio/CLI commands that don't
+        // touch the HTTP surface. Instead leave `[server].auth` unset
+        // and let `resolve_auth_policy` produce the actionable error at
+        // the point the HTTP surface is actually requested.
+        tracing::warn!(
+            target: "rein::config::migration",
+            "[server].allow_unauthenticated_loopback = true was stripped but NOT migrated: bind '{bind}' is not loopback and REIN_HTTP_TOKEN is not set, so no safe policy can be inferred automatically. HTTP/SSE will refuse to start until you set [server].auth explicitly (\"public\", \"loopback_only\", \"bearer_required\", or \"oauth\")."
+        );
+    }
+    Ok(())
 }
 
 /// Convert a ReinConfig to a toml::Value via serde_json round-trip
@@ -3326,33 +3424,11 @@ max_input_chars = 512
         );
     }
 
-    #[test]
-    fn server_loopback_unauth_requested_requires_loopback_bind() {
-        let mut server = ServerConfig {
-            allow_unauthenticated_loopback: true,
-            ..ServerConfig::default()
-        };
-
-        for bind in ["127.0.0.1", "::1", "localhost"] {
-            server.sse_bind = bind.to_string();
-            assert!(
-                server.loopback_unauth_requested(),
-                "{bind} should allow the loopback unauth flag to take effect"
-            );
-        }
-
-        for bind in ["0.0.0.0", "::", "192.168.1.10", "example.com"] {
-            server.sse_bind = bind.to_string();
-            assert!(
-                !server.loopback_unauth_requested(),
-                "{bind} must not be treated as loopback"
-            );
-        }
-
-        server.sse_bind = "127.0.0.1".to_string();
-        server.allow_unauthenticated_loopback = false;
-        assert!(!server.loopback_unauth_requested());
-    }
+    // v0.35 Phase 3: `server_loopback_unauth_requested_requires_loopback_bind`
+    // was deleted. Both the bool and its `loopback_unauth_requested()` helper
+    // are gone; the equivalent semantics live in the TOML-load-time
+    // `migrate_legacy_server_auth` transformation, exercised by the
+    // `legacy_server_auth_*` migration tests below.
 
     #[test]
     fn auth_policy_parses_explicit_server_auth_values() {
@@ -3431,6 +3507,10 @@ allow_unauthenticated_loopback = true
     #[serial_test::serial(global_state)]
     fn auth_policy_preserves_legacy_public_read_from_loopback_flag() {
         let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        // v0.35 Phase 3: migration reads REIN_SSE_BIND env to decide
+        // loopback vs non-loopback; isolate the test from an externally
+        // set value.
+        let _bind = EnvGuard::remove("REIN_SSE_BIND");
         let cfg = ReinConfig::load_from_str(
             r#"
 [server]
@@ -3503,6 +3583,166 @@ auth = "oauth"
             .resolve_auth_policy()
             .expect_err("oauth without owner token must fail");
         assert!(err.to_string().contains("OAuth owner approval"));
+    }
+
+    // v0.35 Phase 3 — legacy `[server].allow_unauthenticated_loopback`
+    // migration. The bool was removed from `ServerConfig`; configs that
+    // still carry it are transformed by `migrate_legacy_server_auth` at
+    // TOML load time. The migration target is chosen to preserve the
+    // v0.34 runtime semantics of `resolve_auth_policy` (see the function
+    // doc comment for the full mapping table).
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_server_auth_migrates_loopback_unauth_to_public_when_no_token() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_SSE_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy bool on loopback bind should migrate to public");
+
+        assert_eq!(cfg.server.auth, Some(AuthPolicyConfig::Public));
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy resolves"),
+            crate::auth::AuthPolicy::Public
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_server_auth_migrates_loopback_unauth_to_bearer_when_token_set() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "migration-token");
+        let _bind = EnvGuard::remove("REIN_SSE_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy bool + token should migrate to bearer_required");
+
+        assert_eq!(cfg.server.auth, Some(AuthPolicyConfig::BearerRequired));
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy resolves"),
+            crate::auth::AuthPolicy::BearerRequired
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_server_auth_migration_strips_bool_without_safe_inference_on_non_loopback() {
+        // Codex P1 v2 (v0.35 Phase 3): the migration must NOT bail at load
+        // time for the non-loopback + no-token case, because that would
+        // brick stdio/CLI commands (`rein doctor`, `rein recall`, …) that
+        // don't touch the HTTP surface. Strip the legacy bool; leave
+        // `[server].auth` unset; the actionable failure surfaces only when
+        // `resolve_auth_policy` is actually called by `rein serve --sse`.
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_SSE_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "0.0.0.0"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy bool on non-loopback bind without token must still load");
+
+        assert!(
+            cfg.server.auth.is_none(),
+            "no safe policy can be inferred; auth must stay None"
+        );
+        let err = cfg
+            .resolve_auth_policy()
+            .expect_err("resolve_auth_policy must reject the no-policy + no-token shape");
+        let err_str = err.to_string();
+        assert!(err_str.contains("REIN_HTTP_TOKEN must be set"));
+        assert!(err_str.contains("[server].auth explicitly"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_server_auth_migrates_silently_when_bool_is_false() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "false-flag-token");
+        let _bind = EnvGuard::remove("REIN_SSE_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+allow_unauthenticated_loopback = false
+"#,
+        )
+        .expect("legacy bool = false should be stripped silently");
+
+        // No explicit policy set (bool was the only [server] auth-shaping
+        // directive); token presence still routes to bearer_required at
+        // resolve time.
+        assert!(cfg.server.auth.is_none());
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy resolves"),
+            crate::auth::AuthPolicy::BearerRequired
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_server_auth_migration_honors_rein_sse_bind_env_override() {
+        // Codex P1 (v0.35 Phase 3): when REIN_SSE_BIND points at a
+        // non-loopback address but the TOML still has `sse_bind = "127.0.0.1"`
+        // alongside the legacy bool, the migration must use the env bind to
+        // decide loopback vs non-loopback — otherwise it would silently map
+        // to `auth = "public"` and start an unauthenticated listener on the
+        // env-overridden non-loopback bind.
+        //
+        // Codex P1 v2: load must still succeed (so stdio/CLI commands keep
+        // working with an old config). The migration strips the bool;
+        // resolve_auth_policy catches the bad posture at HTTP startup.
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::set("REIN_SSE_BIND", "0.0.0.0");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("load must succeed even when REIN_SSE_BIND overrides to non-loopback");
+        assert!(
+            cfg.server.auth.is_none(),
+            "REIN_SSE_BIND override must defeat the legacy-bool->public migration; auth stays None"
+        );
+        let err = cfg
+            .resolve_auth_policy()
+            .expect_err("HTTP/SSE startup must refuse the unauthenticated non-loopback posture");
+        assert!(err.to_string().contains("REIN_HTTP_TOKEN must be set"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_server_auth_migration_yields_to_explicit_auth_policy() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_SSE_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[server]
+sse_bind = "127.0.0.1"
+auth = "loopback_only"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("explicit auth should win, legacy bool stripped silently");
+
+        assert_eq!(cfg.server.auth, Some(AuthPolicyConfig::LoopbackOnly));
+        assert_eq!(
+            cfg.resolve_auth_policy().expect("policy resolves"),
+            crate::auth::AuthPolicy::LoopbackOnly
+        );
     }
 
     #[test]

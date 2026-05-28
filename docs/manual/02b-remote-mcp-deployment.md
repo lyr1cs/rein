@@ -288,7 +288,7 @@ service. No Cloudflare account needed; no domain needed. You install
 
 - **No auth layer** — `*.trycloudflare.com` URL is the only secret.
   Anyone who learns it has rein access. Pair with rein's
-  `allow_unauthenticated_loopback = true` only if your memory
+  `auth = "public"` only if your memory
   database doesn't contain anything sensitive.
 - **URL changes every time `cloudflared` restarts.** You'll re-edit
   `[server].allowed_hosts` in `~/.rein/config.toml` and re-add the
@@ -315,7 +315,7 @@ service. No Cloudflare account needed; no domain needed. You install
 brew install cloudflared        # macOS
 # Linux: see https://pkg.cloudflare.com/index.html
 
-# 2. Make sure rein is up with allow_unauthenticated_loopback = true.
+# 2. Make sure rein is up with auth = "public".
 #    See Recipe B Step 2-3 for the config rationale. Use `env -u
 #    REIN_HTTP_TOKEN` (NOT just `unset`) so the inheritance is blocked
 #    even when this command runs from a shell that has the token
@@ -336,7 +336,7 @@ grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1
 
 # 5. Add that hostname to ~/.rein/config.toml:
 #      [server]
-#      allow_unauthenticated_loopback = true
+#      auth = "public"
 #      allowed_hosts = ["<your-tunnel-id>.trycloudflare.com"]
 #    Restart rein after editing (kill the rein serve --sse process and
 #    relaunch it; config is read at startup, not hot-reloaded).
@@ -405,7 +405,7 @@ machine and forwarding from your tunnel. Edit `~/.rein/config.toml`:
 
 ```toml
 [server]
-allow_unauthenticated_loopback = true
+auth = "public"
 # Required: rein validates the incoming Host header. Cloudflare Tunnel
 # forwards the public hostname (e.g. rein.your-domain.com), which is
 # NOT in the default localhost-only allowlist. Add every hostname that
@@ -604,7 +604,7 @@ rein through the connector. The legacy options with Tailscale Funnel
 are:
 
 1. **Accept unauthenticated public exposure** — set
-   `allow_unauthenticated_loopback = true` in `~/.rein/config.toml`
+   `auth = "public"` in `~/.rein/config.toml`
    (loopback bind only), AND add the funnel hostname to
    `allowed_hosts` (e.g.,
    `allowed_hosts = ["<machine>.<tailnet>.ts.net"]` — without this
@@ -651,33 +651,32 @@ up` and retry.
 
 **Step 2 — Edit `~/.rein/config.toml`.**
 
-Add or amend the `[server]` section so it has BOTH
-`allow_unauthenticated_loopback` AND `allowed_hosts`:
+Add or amend the `[server]` section so it has BOTH the explicit
+`auth = "public"` policy AND a matching `allowed_hosts`:
 
 ```toml
 [server]
-allow_unauthenticated_loopback = true
+auth = "public"
 allowed_hosts = ["<your-machine>.<your-tailnet>.ts.net"]   # ← your FQDN
 ```
 
 The `allowed_hosts` entry is mandatory. Without it rein returns
-`403 Host header is not allowed` for every Funnel request, even
-though `allow_unauthenticated_loopback` is on. The default Host
-allowlist is localhost-only; the Funnel forwards `Host:` set to your
-public FQDN, which doesn't match.
+`403 Host header is not allowed` for every Funnel request, even with
+`auth = "public"` set. The default Host allowlist is localhost-only;
+the Funnel forwards `Host:` set to your public FQDN, which doesn't
+match.
 
-**Step 3 — Start `rein serve --sse` with `REIN_HTTP_TOKEN` unset and
-verbose logging.**
+**Step 3 — Start `rein serve --sse` with verbose logging.**
 
 ```bash
-# Critical: explicitly unset REIN_HTTP_TOKEN before starting. Many users
-# (including many setups) have REIN_HTTP_TOKEN exported
-# in their shell so other rein clients can authenticate locally; rein
-# inherits that env var on spawn and switches to bearer-required mode,
-# overriding `allow_unauthenticated_loopback = true`. Anthropic's
-# connector won't supply a bearer header (no UI field for it), so
-# requests would 401. `env -u` inherits the rest of the environment
-# but unsets just this one var.
+# With explicit `auth = "public"`, an inherited REIN_HTTP_TOKEN does
+# NOT switch the server to bearer-required — `resolve_auth_policy`
+# honors the explicit policy and emits a startup warning that the
+# token has no effect. So unlike the legacy bool-based posture, you
+# don't strictly need `env -u REIN_HTTP_TOKEN` here. It's still good
+# hygiene if you don't want a stray bearer log line, and `env -u` is
+# left in the command below for that reason; if you skip it, claude.ai
+# requests will still work.
 #
 # REIN_LOG=info is set so the server emits per-request lines for the
 # initialize / tools / call traffic that Anthropic's connector
@@ -873,9 +872,9 @@ rein.<your-domain>.com {
 ```
 
 Use only when you accept that anyone who learns the URL has rein
-access. rein must be running with `allow_unauthenticated_loopback =
-true` (Option 1a) and an `allowed_hosts = ["rein.<your-domain>.com"]`
-entry in `~/.rein/config.toml`.
+access. rein must be running with `auth = "public"` (Option 1a) and
+an `allowed_hosts = ["rein.<your-domain>.com"]` entry in
+`~/.rein/config.toml`.
 
 **Caddyfile B — Option 1b (real inbound auth + upstream bearer
 injection):**
@@ -954,7 +953,7 @@ server {
 ```
 
 Same caveats as Caddyfile A: rein needs
-`allow_unauthenticated_loopback = true` plus
+`auth = "public"` plus
 `allowed_hosts = ["rein.your-domain.com"]` in `~/.rein/config.toml`,
 and you accept that anyone who knows the URL is authenticated.
 
@@ -1152,15 +1151,15 @@ rein's own bearer auth (`REIN_HTTP_TOKEN`) is enforced **at the rein
 HTTP listener**. For the remote-MCP path it works only if you can also
 get the bearer header onto the request — which means the proxy must
 add it (the connector won't), or you must use Option 1a above
-(`allow_unauthenticated_loopback = true`) and rely on edge-level auth
+(`auth = "public"`) and rely on edge-level auth
 or URL obscurity instead.
 
 Quick reference of the practical combinations:
 
 | Posture | Edge auth | rein auth | Anthropic connector UI |
 | --- | --- | --- | --- |
-| Loopback-only (URL obscurity) | none | `allow_unauthenticated_loopback = true` | URL only |
-| Cloudflare Access OIDC | OIDC IdP | `allow_unauthenticated_loopback = true` | URL + OAuth Client ID/Secret |
+| Loopback-only (URL obscurity) | none | `auth = "public"` | URL only |
+| Cloudflare Access OIDC | OIDC IdP | `auth = "public"` | URL + OAuth Client ID/Secret |
 | Caddy bearer injection | Caddy header check | `REIN_HTTP_TOKEN` enforced | URL only (Caddy still gates) |
 | OAuth gateway in front | gateway OAuth | either | URL + OAuth Client ID/Secret |
 | Built-in OAuth | rein OAuth | `auth = "oauth"` + owner `REIN_HTTP_TOKEN` | URL only / DCR |

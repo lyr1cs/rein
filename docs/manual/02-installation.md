@@ -315,8 +315,13 @@ rein gui off
 ```
 
 HTTP/SSE and GUI API routes require `REIN_HTTP_TOKEN` unless you explicitly set
-`[server].allow_unauthenticated_loopback = true` on a loopback bind. Wildcard
-binds also require either a bearer token or explicit `allowed_hosts`.
+`[server].auth = "public"` or `"loopback_only"` on a loopback bind. The other
+two policies are `"bearer_required"` (token required) and `"oauth"` (built-in
+OAuth provider). Wildcard binds also require either a bearer token or explicit
+`allowed_hosts`. (v0.35.0 removed the legacy
+`[server].allow_unauthenticated_loopback` bool; older configs that still set
+it are migrated automatically to the equivalent `auth = "public"` /
+`"bearer_required"` at TOML load time.)
 
 ## Proxy
 

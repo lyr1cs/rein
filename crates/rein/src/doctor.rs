@@ -1448,72 +1448,32 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
             ),
         };
     }
-    let allow_unauth = config.server.loopback_unauth_requested();
-
+    // v0.35 Phase 3: the legacy `allow_unauthenticated_loopback` bool was
+    // removed; the only remaining branches are "explicit policy set" (handled
+    // above) and "no explicit policy set, no token" — which is now an outright
+    // FAIL because the implicit fallback path is gone. Configs that previously
+    // relied on the bool are transformed at TOML load time by
+    // `config::migrate_legacy_server_auth` into an explicit policy, so by the
+    // time this check runs the only way to land in the no-policy branch is a
+    // fresh-install config that never set anything.
     if token_present {
-        if allow_unauth {
-            warn_with_hint(
-                DoctorCategory::Configuration,
-                "http_auth",
-                format!(
-                    "REIN_HTTP_TOKEN is set for {}:{} and \
-                     [server].allow_unauthenticated_loopback=true; token auth wins, \
-                     so loopback unauth is disabled at runtime",
-                    config.server.sse_bind, config.server.sse_port
-                ),
-                "unset REIN_HTTP_TOKEN for public/loopback-unauth testing, or set allow_unauthenticated_loopback=false when bearer auth is intended",
-            )
-        } else if config.server.allow_unauthenticated_loopback {
-            warn_with_hint(
-                DoctorCategory::Configuration,
-                "http_auth",
-                format!(
-                    "REIN_HTTP_TOKEN is set for {}:{} and \
-                     [server].allow_unauthenticated_loopback=true cannot take effect because the bind host is not loopback; \
-                     bearer auth remains required",
-                    config.server.sse_bind, config.server.sse_port
-                ),
-                "keep REIN_HTTP_TOKEN for this bind, or bind to 127.0.0.1, ::1, or localhost for loopback-unauth testing",
-            )
-        } else {
-            ok_in(
-                DoctorCategory::Configuration,
-                "http_auth",
-                format!(
-                    "token configured for {}:{}",
-                    config.server.sse_bind, config.server.sse_port
-                ),
-            )
-        }
-    } else if allow_unauth {
         ok_in(
             DoctorCategory::Configuration,
             "http_auth",
             format!(
-                "loopback-only unauthenticated access allowed for {}:{}",
+                "token configured for {}:{}",
                 config.server.sse_bind, config.server.sse_port
             ),
-        )
-    } else if config.server.allow_unauthenticated_loopback {
-        fail_with_hint(
-            DoctorCategory::Configuration,
-            "http_auth",
-            format!(
-                "HTTP/SSE is enabled on {}:{} without REIN_HTTP_TOKEN; \
-                 [server].allow_unauthenticated_loopback=true cannot take effect because the bind host is not loopback",
-                config.server.sse_bind, config.server.sse_port
-            ),
-            "bind to 127.0.0.1, ::1, or localhost for loopback-unauth testing, or set REIN_HTTP_TOKEN=<secret>",
         )
     } else {
         fail_with_hint(
             DoctorCategory::Configuration,
             "http_auth",
             format!(
-                "HTTP/SSE is enabled on {}:{} without REIN_HTTP_TOKEN",
+                "HTTP/SSE is enabled on {}:{} without REIN_HTTP_TOKEN and no explicit [server].auth",
                 config.server.sse_bind, config.server.sse_port
             ),
-            "set REIN_HTTP_TOKEN=<secret> or enable [server].allow_unauthenticated_loopback for loopback-only access",
+            "set [server].auth = \"public\" / \"loopback_only\" / \"bearer_required\" / \"oauth\", or set REIN_HTTP_TOKEN=<secret> for bearer auth",
         )
     }
 }
@@ -1577,28 +1537,12 @@ fn check_auth_policy_consistency(config: &ReinConfig) -> DoctorCheck {
         );
     }
 
-    if config.server.auth.is_none() && config.server.allow_unauthenticated_loopback {
-        // v0.34 Phase 1 (per `docs/backlog/v0.34-bearer-auth-migration.md`):
-        // flip the legacy-bool branch from OK → WARN so operators see the
-        // deprecation in `rein doctor` and have time to migrate before the
-        // bool is removed in a future minor. `fixable: false` because the
-        // migration target depends on the operator's threat model
-        // (`public` vs `loopback_only` vs `bearer_required` / `oauth`) and
-        // `doctor --fix` cannot make that choice for them.
-        return DoctorCheck {
-            name: "auth_policy",
-            category: DoctorCategory::Configuration,
-            severity: DoctorSeverity::Warning,
-            status: CheckStatus::Warn,
-            fixable: false,
-            message:
-                "[server].allow_unauthenticated_loopback is deprecated; set an explicit [server].auth policy. It remains supported for now and is targeted for removal in a future minor release once the explicit-auth migration completes."
-                    .into(),
-            repair_hint: Some(
-                "set [server].auth = \"public\" for the legacy remote read-only tunnel mode, [server].auth = \"loopback_only\" for local-only access, [server].auth = \"bearer_required\" for token auth, or [server].auth = \"oauth\" for multi-user remote auth".into(),
-            ),
-        };
-    }
+    // v0.35 Phase 3: the legacy `auth.is_none() && allow_unauthenticated_loopback`
+    // branch is gone — the field was removed from ServerConfig and configs
+    // that still carry the bool are transformed at TOML load time
+    // (`config::migrate_legacy_server_auth`). By the time this check runs,
+    // either `[server].auth` is set explicitly or `resolve_auth_policy`
+    // would have errored above.
 
     ok_in(
         DoctorCategory::Configuration,
@@ -2993,7 +2937,6 @@ sse_bind = "0.0.0.0"
 sse_port = 8765
 compact = false
 gui_enabled = false
-allow_unauthenticated_loopback = false
 
 [hooks]
 buffer_dir = "{}"
@@ -3448,9 +3391,17 @@ provider = "inherit"
         assert!(check.message.contains("stdio"));
     }
 
+    // v0.35 Phase 3: the two tests
+    // `test_doctor_warns_when_loopback_unauth_cannot_apply_to_non_loopback_bind`
+    // and `test_doctor_warns_when_http_token_overrides_loopback_unauth` were
+    // removed alongside the `[server].allow_unauthenticated_loopback` field
+    // they exercised. The remaining failure paths (no token + no explicit
+    // policy) are covered by the new fresh-install assertion below and the
+    // migration tests in `config.rs::migrate_legacy_server_auth`.
+
     #[test]
     #[serial_test::serial(global_state)]
-    fn test_doctor_warns_when_loopback_unauth_cannot_apply_to_non_loopback_bind() {
+    fn test_doctor_fails_when_no_token_and_no_explicit_policy() {
         let _guard = EnvRestore {
             key: "REIN_HTTP_TOKEN",
             value: std::env::var("REIN_HTTP_TOKEN").ok(),
@@ -3458,46 +3409,23 @@ provider = "inherit"
         std::env::remove_var("REIN_HTTP_TOKEN");
         let mut config = ReinConfig::default();
         config.server.sse_enabled = true;
-        config.server.sse_bind = "0.0.0.0".to_string();
-        config.server.allow_unauthenticated_loopback = true;
+        config.server.sse_bind = "127.0.0.1".to_string();
+        // Default ServerConfig has auth=None and no legacy bool anymore.
 
         let check = check_http_auth(&config);
 
         assert_eq!(check.name, "http_auth");
         assert_eq!(check.status, CheckStatus::Fail);
-        assert!(check.message.contains("cannot take effect"));
-        assert!(check.repair_hint.as_deref().unwrap().contains("127.0.0.1"));
-    }
-
-    #[test]
-    #[serial_test::serial(global_state)]
-    fn test_doctor_warns_when_http_token_overrides_loopback_unauth() {
-        let _guard = EnvRestore {
-            key: "REIN_HTTP_TOKEN",
-            value: std::env::var("REIN_HTTP_TOKEN").ok(),
-        };
-        std::env::set_var("REIN_HTTP_TOKEN", "doctor-test-token");
-        let mut config = ReinConfig::default();
-        config.server.sse_enabled = true;
-        config.server.sse_bind = "127.0.0.1".to_string();
-        config.server.allow_unauthenticated_loopback = true;
-
-        let check = check_http_auth(&config);
-
-        assert_eq!(check.name, "http_auth");
-        assert_eq!(check.status, CheckStatus::Warn);
-        assert!(check.message.contains("token auth wins"));
-        assert!(check
-            .repair_hint
-            .as_deref()
-            .unwrap()
-            .contains("unset REIN_HTTP_TOKEN"));
-
-        config.server.sse_bind = "0.0.0.0".to_string();
-        let check = check_http_auth(&config);
-        assert_eq!(check.status, CheckStatus::Warn);
-        assert!(check.message.contains("cannot take effect"));
-        assert!(check.message.contains("bearer auth remains required"));
+        assert!(check.message.contains("without REIN_HTTP_TOKEN"));
+        assert!(check.message.contains("no explicit [server].auth"));
+        let hint = check.repair_hint.as_deref().unwrap_or("");
+        // The hint enumerates all four policies inline so operators see the
+        // migration matrix without leaving the doctor output.
+        assert!(hint.contains("\"public\""));
+        assert!(hint.contains("\"loopback_only\""));
+        assert!(hint.contains("\"bearer_required\""));
+        assert!(hint.contains("\"oauth\""));
+        assert!(hint.contains("REIN_HTTP_TOKEN"));
     }
 
     #[test]
@@ -3566,44 +3494,13 @@ provider = "inherit"
         assert!(check.message.contains("requires [server].allowed_hosts"));
     }
 
-    #[test]
-    #[serial_test::serial(global_state)]
-    fn test_doctor_reports_legacy_loopback_flag_as_deprecated() {
-        let _guard = EnvRestore {
-            key: "REIN_HTTP_TOKEN",
-            value: std::env::var("REIN_HTTP_TOKEN").ok(),
-        };
-        std::env::remove_var("REIN_HTTP_TOKEN");
-        let mut config = ReinConfig::default();
-        config.server.sse_enabled = true;
-        config.server.allow_unauthenticated_loopback = true;
-
-        let check = check_auth_policy_consistency(&config);
-
-        assert_eq!(check.name, "auth_policy");
-        // v0.34 Phase 1: flipped from OK→WARN so the deprecation surfaces in
-        // `rein doctor` for operators still relying on the legacy bool.
-        assert_eq!(check.status, CheckStatus::Warn);
-        assert_eq!(check.severity, DoctorSeverity::Warning);
-        // doctor --fix must not touch this; the migration target is operator
-        // policy choice, not mechanical.
-        assert!(!check.fixable);
-        assert!(check.message.contains("deprecated"));
-        assert!(check.message.contains("explicit [server].auth"));
-        let hint = check.repair_hint.as_deref().unwrap_or("");
-        assert!(hint.contains("auth = \"public\""));
-        assert!(hint.contains("auth = \"loopback_only\""));
-        assert!(hint.contains("auth = \"bearer_required\""));
-        assert!(hint.contains("auth = \"oauth\""));
-        // v0.33.1: the notice must not pin a stale removal version — it
-        // claimed "removed in v0.31" through v0.32/v0.33 without ever firing.
-        assert!(
-            !check.message.contains("v0.31"),
-            "deprecation notice must not carry the stale v0.31 removal pin: {}",
-            check.message
-        );
-        assert!(check.message.contains("targeted for removal in a future"));
-    }
+    // v0.35 Phase 3: `test_doctor_reports_legacy_loopback_flag_as_deprecated`
+    // was removed alongside the bool itself. The deprecation surface is now
+    // a load-time WARN via `tracing::warn!` in
+    // `config::migrate_legacy_server_auth`, not a doctor check, because the
+    // bool is stripped from the merged TOML before deserialize. The
+    // migration is exercised by the `legacy_server_auth_migrates_*` tests
+    // in `crates/rein/src/config.rs`.
 
     #[test]
     fn test_format_human_reports_overall_status() {

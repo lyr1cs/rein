@@ -52,11 +52,12 @@ sse_port = 8680
 sse_bind = "127.0.0.1"    # use 0.0.0.0 for Tailscale/LAN access
 background_warmup = true  # HTTP/GUI service startup may repair side indexes
 stdio_background_warmup = false  # avoid per-agent MCP stdio index rebuilds
-# v0.27.4 F5/C1: default-deny. Operators must opt in to unauthenticated
-# loopback or set REIN_HTTP_TOKEN. Existing fresh-install and
-# file-backed configs that omit this field also resolve to false via
-# the matching Rust struct default in `crates/rein/src/config.rs`.
-allow_unauthenticated_loopback = false
+# v0.35.0: [server].allow_unauthenticated_loopback was removed. Use the
+# explicit [server].auth policy ("public" / "loopback_only" /
+# "bearer_required" / "oauth") instead. Legacy configs that still carry
+# the bool are transformed automatically by the load-time migration in
+# `crates/rein/src/config.rs::migrate_legacy_server_auth` and a deprecation
+# WARN is emitted to the logs.
 
 [warmup]
 # v0.30.2 B3/B6: when true (default) the cold-start warmup rebuilds Tantivy

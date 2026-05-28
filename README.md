@@ -150,10 +150,13 @@ rein already implements the **Streamable HTTP** transport (current MCP
 standard) at `/mcp` on its built-in HTTP server. Three prerequisites
 before exposing it:
 
-1. Set `[server].allow_unauthenticated_loopback = true` in
-   `~/.rein/config.toml` (loopback-only bind, opt-in unauth) **OR**
+1. Set `[server].auth = "public"` in `~/.rein/config.toml` (loopback bind,
+   non-discoverable public hostname will forward through) **OR**
    set `REIN_HTTP_TOKEN` to a strong secret and have your reverse
-   proxy inject `Authorization: Bearer …` upstream.
+   proxy inject `Authorization: Bearer …` upstream. The other policies
+   are `"loopback_only"` (strict local), `"bearer_required"` (token
+   required), and `"oauth"` (built-in OAuth provider, recommended for
+   multi-user remote MCP).
 2. Add the public hostname to `[server].allowed_hosts` in
    `~/.rein/config.toml`, e.g.,
    `allowed_hosts = ["rein.your-domain.com"]`. Without this, rein

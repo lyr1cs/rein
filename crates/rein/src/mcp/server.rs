@@ -99,7 +99,10 @@ impl HttpGuardRejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupAuthPolicyWarning {
-    LegacyLoopbackTokenWins,
+    // v0.35 Phase 3: the LegacyLoopbackTokenWins variant was removed —
+    // `[server].allow_unauthenticated_loopback` no longer exists at runtime,
+    // so the only remaining mid-startup auth warning is the explicit-policy
+    // mismatch case below.
     ExplicitTokenIgnored,
 }
 
@@ -111,9 +114,9 @@ fn startup_auth_policy_warning(
     if !auth_token_configured {
         return None;
     }
-    if config.server.auth.is_none() && config.server.allow_unauthenticated_loopback {
-        return Some(StartupAuthPolicyWarning::LegacyLoopbackTokenWins);
-    }
+    // v0.35 Phase 3: the legacy auth.is_none() + allow_unauthenticated_loopback
+    // branch was removed alongside the bool itself. By the time this runs the
+    // policy has either been set explicitly or the load already failed.
     if config.server.auth.is_some()
         && !matches!(
             auth_policy,
@@ -926,12 +929,6 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
         .filter(|token| !token.trim().is_empty());
     let auth_policy = config.resolve_auth_policy()?;
     match startup_auth_policy_warning(auth_token.is_some(), &config, auth_policy) {
-        Some(StartupAuthPolicyWarning::LegacyLoopbackTokenWins) => {
-            tracing::warn!(
-                "REIN_HTTP_TOKEN is set and [server].allow_unauthenticated_loopback=true; \
-                 token auth wins, loopback flag is no-op at runtime"
-            );
-        }
         Some(StartupAuthPolicyWarning::ExplicitTokenIgnored) => {
             tracing::warn!(
                 policy = auth_policy.as_str(),
@@ -1548,17 +1545,11 @@ mod tests {
         assert!(request_has_valid_http_auth(&headers, "secret-token"));
     }
 
-    #[test]
-    fn startup_warning_preserves_legacy_loopback_token_trap() {
-        let mut config = ReinConfig::default();
-        config.server.auth = None;
-        config.server.allow_unauthenticated_loopback = true;
-
-        assert_eq!(
-            startup_auth_policy_warning(true, &config, crate::auth::AuthPolicy::BearerRequired),
-            Some(StartupAuthPolicyWarning::LegacyLoopbackTokenWins)
-        );
-    }
+    // v0.35 Phase 3: `startup_warning_preserves_legacy_loopback_token_trap`
+    // was removed alongside the LegacyLoopbackTokenWins variant — the bool
+    // it tested no longer exists at runtime, and the load-time migration
+    // (`config::migrate_legacy_server_auth`) transforms configs that still
+    // carry it into an explicit policy before they reach this code.
 
     #[test]
     fn startup_warning_reports_explicit_policy_ignoring_token() {
@@ -1856,13 +1847,15 @@ mod tests {
 
     #[test]
     fn c1_default_loopback_is_authenticated() {
-        // v0.27.3 F5/C1: fresh ServerConfig and ProxyConfig must default
-        // to authenticated mode. Operators must explicitly opt into
-        // unauthenticated loopback by writing the flag.
+        // v0.27.3 F5/C1 (revised v0.35 Phase 3): fresh ServerConfig must
+        // default to no explicit policy (operator must choose at config
+        // time), and ProxyConfig must default to authenticated mode. The
+        // legacy `allow_unauthenticated_loopback` bool on ServerConfig was
+        // removed entirely in v0.35.0 — its assertion is gone with it.
         let server = crate::config::ServerConfig::default();
         assert!(
-            !server.allow_unauthenticated_loopback,
-            "ServerConfig::default().allow_unauthenticated_loopback must be false"
+            server.auth.is_none(),
+            "ServerConfig::default().auth must be None — operators choose at config time"
         );
         let proxy = crate::config::ProxyConfig::default();
         assert!(
