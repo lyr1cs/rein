@@ -216,6 +216,29 @@ fn csrf_cookie_secure_suffix(config: &ReinConfig) -> &'static str {
     }
 }
 
+/// v0.35 — Owner cookie sliding-window renewal.
+///
+/// Builds a `Set-Cookie` line that re-stamps the owner cookie with the
+/// current `REIN_HTTP_TOKEN` and a fresh 600-second `Max-Age`. Returns
+/// `None` if `REIN_HTTP_TOKEN` is unset, in which case there is nothing
+/// to renew. Attached by `handle_authorize_get` whenever a request
+/// already carries a valid owner cookie, so each authorize visit slides
+/// the 10-minute window forward instead of forcing the operator to
+/// `POST /api/session` every time the cookie expires mid-flow (the v0.30.1
+/// "claude.ai connector keeps showing ofid_*" footgun documented in
+/// `docs/devlog/2026-05-11-v0.30.1.md`).
+pub(crate) fn owner_cookie_renewal_header(config: &ReinConfig) -> Option<(&'static str, String)> {
+    let token = std::env::var("REIN_HTTP_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())?;
+    let secure = csrf_cookie_secure_suffix(config);
+    Some((
+        hyper::header::SET_COOKIE.as_str(),
+        format!("{OAUTH_OWNER_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{secure}"),
+    ))
+}
+
 pub fn handle_authorize_get(
     headers: &hyper::HeaderMap,
     query: &str,
@@ -275,17 +298,22 @@ pub fn handle_authorize_get(
         state = html_escape(&parsed.state),
         csrf = html_escape(&csrf_token),
     );
-    OAuthResponse::html(
-        hyper::StatusCode::OK,
-        html,
-        vec![(
-            hyper::header::SET_COOKIE.as_str(),
-            format!(
-                "{CSRF_COOKIE}={nonce}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{}",
-                csrf_cookie_secure_suffix(config)
-            ),
-        )],
-    )
+    // v0.35: build the response headers — CSRF cookie plus an optional
+    // owner-cookie renewal that slides the 10-minute approval window
+    // forward whenever the operator hits /oauth/authorize while still
+    // authenticated. owner_cookie_renewal_header returns None when
+    // REIN_HTTP_TOKEN is unset (no cookie to renew).
+    let mut response_headers = vec![(
+        hyper::header::SET_COOKIE.as_str(),
+        format!(
+            "{CSRF_COOKIE}={nonce}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{}",
+            csrf_cookie_secure_suffix(config)
+        ),
+    )];
+    if let Some(renewal) = owner_cookie_renewal_header(config) {
+        response_headers.push(renewal);
+    }
+    OAuthResponse::html(hyper::StatusCode::OK, html, response_headers)
 }
 
 pub fn handle_authorize_post(
@@ -623,5 +651,83 @@ mod tests {
             })
             .expect("count auth codes");
         assert_eq!(code_count, 0);
+    }
+
+    // v0.35: owner_cookie_renewal_header returns None when REIN_HTTP_TOKEN
+    // is unset (no token to renew), and a Set-Cookie line with Max-Age=600
+    // when set. The Max-Age must be the literal 600 so claude.ai's broker
+    // gets a sliding 10-minute window on each authorize visit.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn owner_cookie_renewal_returns_none_when_token_unset() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let (_dir, config) = temp_config();
+        assert!(owner_cookie_renewal_header(&config).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn owner_cookie_renewal_emits_fresh_max_age_when_token_set() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "owner-secret-renewal");
+        let (_dir, config) = temp_config();
+        let (name, value) =
+            owner_cookie_renewal_header(&config).expect("renewal header issued when token set");
+        assert_eq!(name, hyper::header::SET_COOKIE.as_str());
+        assert!(value.starts_with(&format!("{OAUTH_OWNER_COOKIE}=owner-secret-renewal;")));
+        assert!(value.contains("Max-Age=600"));
+        assert!(value.contains("Path=/oauth/authorize"));
+        assert!(value.contains("HttpOnly"));
+        assert!(value.contains("SameSite=Lax"));
+        // Default config has no https public_url, so the Secure attribute
+        // must NOT be emitted (browser would drop a Secure cookie on
+        // plaintext local-host bootstrap).
+        assert!(!value.contains("Secure"));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn owner_cookie_renewal_marks_secure_when_public_url_is_https() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "owner-secret-https");
+        let (_dir, mut config) = temp_config();
+        config.server.public_url = Some("https://rein.example.com".to_string());
+        let (_, value) =
+            owner_cookie_renewal_header(&config).expect("renewal header issued when token set");
+        assert!(value.contains("Secure"));
+    }
+
+    // v0.35: handle_authorize_get attaches the owner renewal cookie when
+    // REIN_HTTP_TOKEN is set, so each authorize visit slides the 10-minute
+    // window forward instead of expiring mid-flow (the v0.30.1
+    // "claude.ai connector keeps showing ofid_*" footgun).
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn authorize_get_renews_owner_cookie_on_each_visit() {
+        let _token = EnvGuard::set("REIN_HTTP_TOKEN", "owner-secret-sliding");
+        let (_dir, config) = temp_config();
+        let client = register_client(&config);
+        let query = authorize_query(&client.client_id, "https://claude.ai/callback");
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::COOKIE,
+            hyper::header::HeaderValue::from_static("rein_oauth_owner=owner-secret-sliding"),
+        );
+
+        let response = handle_authorize_get(&headers, &query, &config);
+
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        let set_cookies: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| *name == hyper::header::SET_COOKIE.as_str())
+            .map(|(_, value)| value.as_str())
+            .collect();
+        // CSRF cookie + owner-renewal cookie = 2 Set-Cookie headers.
+        assert_eq!(set_cookies.len(), 2);
+        let renewal = set_cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{OAUTH_OWNER_COOKIE}=")))
+            .expect("owner renewal cookie present");
+        assert!(renewal.contains("owner-secret-sliding"));
+        assert!(renewal.contains("Max-Age=600"));
     }
 }

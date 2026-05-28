@@ -1220,6 +1220,62 @@ If the connector shows "failed to connect", check:
 - For self-host: confirm `127.0.0.1:8680/mcp` works locally first
   before adding the proxy layer.
 
+### `unknown error` in claude.ai connector dialog after rein upgrade (OAuth posture only)
+
+Symptom: after upgrading rein on the server, the existing claude.ai
+Custom Connector starts surfacing `An unknown error occurred connecting
+to the MCP server` (`ofid_*`). Calls were working before the upgrade.
+
+Cause: the v0.30.0 `refresh_token_fingerprint` schema migration backfills
+the new column on every grant created before v0.30.0 and revokes them at
+the same time. Anthropic's connector broker does not always fall back from
+a revoked refresh-token to a fresh authorization-code flow, so the
+connector stays broken until the operator manually re-authorizes.
+
+`rein doctor` surfaces this explicitly when `[server].auth = "oauth"`:
+
+```
+WARN  oauth_provider  auth_policy=oauth; oauth_clients=N; active_grants=0;
+                       expired_oauth_records=M — DCR clients exist but every
+                       grant is revoked
+      → in claude.ai → Settings → Connectors, remove the rein connector
+        and re-add it (same URL); this re-runs DCR + authorization-code
+        and issues a fresh grant
+```
+
+Recovery: follow the repair hint. The Custom Connector configuration
+(URL, OAuth Client ID/Secret) does **not** need to change — claude.ai
+re-runs Dynamic Client Registration when you re-add the connector with
+the same URL, and the broker walks the full authorize → token flow on
+the next reconnect. This typically resolves within 1–2 minutes.
+
+If `oauth_clients=0` is also reported, your install never completed an
+authorize flow against this rein database (fresh install, new database,
+or a `~/.rein/memories.db` swap). In that case the recovery is the
+same — add the connector for the first time.
+
+### `An unknown error occurred` mid-flow with `auth = "oauth"` (cookie expired)
+
+Symptom: an existing connector that's been working stops working a few
+minutes into a session; refreshing the connector dialog or restarting
+the conversation makes it work again briefly.
+
+Cause: the owner-approval cookie that lets the operator's browser
+approve claude.ai's authorization request has a 10-minute `Max-Age` and
+was originally only set by `POST /api/session`. If the browser tab
+holding the cookie was idle for more than 10 minutes, the next
+`/oauth/authorize` redirect from claude.ai found no valid cookie and
+bounced back as `access_denied`, which the broker surfaced as a
+generic `ofid_*` error.
+
+Recovery (rein v0.35+): each successful `GET /oauth/authorize` now
+re-emits the cookie with a fresh 600-second `Max-Age`, so the window
+slides as long as the operator visits the authorize URL at least once
+every 10 minutes. **Pre-v0.35**: `POST /api/session` again with the
+bearer token to re-stamp the cookie, then retry the connector.
+
+`rein --version` to verify which behavior applies.
+
 ### `403 Forbidden — Host header is not allowed`
 
 The most common failure mode after a fresh deployment: rein returns

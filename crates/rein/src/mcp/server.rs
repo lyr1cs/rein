@@ -1096,9 +1096,24 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                 if method == hyper::Method::GET && path == "/.well-known/oauth-authorization-server"
                 {
                     if runtime_auth_policy != crate::auth::AuthPolicy::OAuth {
-                        return Ok::<_, std::convert::Infallible>(plain_http_response(
+                        // v0.35: surface a JSON body instead of plain "Not
+                        // Found" so claude.ai / Cowork / mobile see the
+                        // actual reason (OAuth provider disabled by config)
+                        // rather than a generic 404 in the connector
+                        // dialog. Returns 404 so the discovery client treats
+                        // the endpoint as unavailable (RFC 8414 §3
+                        // compliant — discovery is optional), but with
+                        // diagnostic context.
+                        return Ok::<_, std::convert::Infallible>(json_http_response(
                             hyper::StatusCode::NOT_FOUND,
-                            "Not Found",
+                            serde_json::json!({
+                                "error": "oauth_provider_disabled",
+                                "error_description": format!(
+                                    "[server].auth = \"{}\"; OAuth Authorization Server metadata is only served when [server].auth = \"oauth\"",
+                                    runtime_auth_policy.as_str()
+                                ),
+                                "active_policy": runtime_auth_policy.as_str(),
+                            }),
                         ));
                     }
                     return Ok::<_, std::convert::Infallible>(json_http_response(
@@ -1113,9 +1128,20 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                     && oauth_resource_path_from_metadata_path(&path).is_some()
                 {
                     if runtime_auth_policy != crate::auth::AuthPolicy::OAuth {
-                        return Ok::<_, std::convert::Infallible>(plain_http_response(
+                        // v0.35: same treatment as the authorization-server
+                        // metadata endpoint above — JSON body so OAuth-aware
+                        // clients (and human curl operators) see why
+                        // discovery returns 404.
+                        return Ok::<_, std::convert::Infallible>(json_http_response(
                             hyper::StatusCode::NOT_FOUND,
-                            "Not Found",
+                            serde_json::json!({
+                                "error": "oauth_provider_disabled",
+                                "error_description": format!(
+                                    "[server].auth = \"{}\"; Protected Resource Metadata is only served when [server].auth = \"oauth\"",
+                                    runtime_auth_policy.as_str()
+                                ),
+                                "active_policy": runtime_auth_policy.as_str(),
+                            }),
                         ));
                     }
                     let resource_path = oauth_resource_path_from_metadata_path(&path).unwrap_or("");
