@@ -47,8 +47,24 @@ surface. Public tunnels and reverse proxies should use `oauth`,
 
 ## Consequences
 
-Operators can inspect one setting to know the auth posture. `auth = "oauth"` is
-the recommended remote MCP posture for Claude Cowork / claude.ai / mobile.
+Operators can inspect one setting to know the auth posture. Recommended remote
+MCP postures depend on deployment shape:
+
+- **Private single-user tunnel** (non-discoverable Funnel/Tunnel hostname,
+  read-only memory access from claude.ai, all writes happen locally over
+  stdio): use `auth = "public"`. The v0.28.18 mutation gate continues to block
+  `rein_store` / `rein_forget` / `rein_update` on non-loopback Hosts, so the
+  residual threat model is read-only leak only, and there is no per-restart
+  re-authorization cost. This is the documented posture in
+  `docs/manual/02b-remote-mcp-deployment.md` for the operator's own
+  deployment.
+- **Multi-user, shared deployment, or any setup that needs claude.ai to call
+  mutating tools**: use `auth = "oauth"`. The owner browser must hold the
+  `rein_oauth_owner` cookie (10-minute window per authorize flow), and the
+  v0.30.0 grant-table migration revokes pre-existing grants on first restart
+  after upgrade — both are documented in 02b.
+- **Strict local-only**: use `auth = "loopback_only"`.
+
 `REIN_HTTP_TOKEN` remains supported for `bearer_required` and as the
 OAuth-mode owner credential for GUI `/api/*` routes and approval pages, but it
 does not authenticate `/mcp` when `auth = "oauth"` and it no longer silently

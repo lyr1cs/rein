@@ -29,9 +29,7 @@ use crate::eval::gates::{
 };
 use crate::extract::dedup::{gray_zone_lower_bound, score_candidate};
 use crate::store::SqliteStore;
-use crate::types::{
-    Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source,
-};
+use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source};
 
 pub struct AdmissionGate;
 
@@ -294,7 +292,11 @@ mod tests {
         assert_eq!(sc.fixture_fingerprint, fingerprint);
         assert!(sc.score >= 0.0 && sc.score <= 1.0);
         // per_fixture emitted in sorted id order (stable McNemar pairing).
-        let ids: Vec<String> = sc.per_fixture.iter().map(|f| f.fixture_id.clone()).collect();
+        let ids: Vec<String> = sc
+            .per_fixture
+            .iter()
+            .map(|f| f.fixture_id.clone())
+            .collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
@@ -307,7 +309,11 @@ mod tests {
         assert_eq!(decide(0.9), "duplicate", "> 0.70 → duplicate");
         // codex v0.33 R2 P3: live check_dedup auto-merges on `> threshold`
         // (strict); an exactly-0.70 pair falls through to GrayZone.
-        assert_eq!(decide(0.7), "gray_zone", "exactly 0.70 (boundary) → gray_zone");
+        assert_eq!(
+            decide(0.7),
+            "gray_zone",
+            "exactly 0.70 (boundary) → gray_zone"
+        );
         // codex v0.33 R1 P2: the 0.50–0.70 band is GrayZone (LLM review) in
         // the live path, NOT an automatic duplicate.
         assert_eq!(decide(0.6), "gray_zone", "0.50–0.70 band → gray_zone");

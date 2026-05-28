@@ -294,10 +294,7 @@ fn run_one_fixture(fx: &LatencyFixture) -> Result<bool> {
     }
 
     // `min_elapsed` is always `Some` because TIMED_RUNS >= 1.
-    let min_ms = min_elapsed
-        .expect("at least one timed run")
-        .as_secs_f64()
-        * 1000.0;
+    let min_ms = min_elapsed.expect("at least one timed run").as_secs_f64() * 1000.0;
     Ok(min_ms < (fx.budget_ms as f64))
 }
 
@@ -329,7 +326,11 @@ mod tests {
                 "fixture {} has no seed memories",
                 fx.id
             );
-            assert!(fx.budget_ms > 0, "fixture {} has a non-positive budget", fx.id);
+            assert!(
+                fx.budget_ms > 0,
+                "fixture {} has a non-positive budget",
+                fx.id
+            );
         }
     }
 
@@ -348,7 +349,11 @@ mod tests {
         assert!(sc.score >= 0.0 && sc.score <= 1.0);
         // per_fixture emitted in sorted id order (stable McNemar pairing). We do
         // NOT assert all-hit — wall-time is machine-dependent.
-        let ids: Vec<String> = sc.per_fixture.iter().map(|f| f.fixture_id.clone()).collect();
+        let ids: Vec<String> = sc
+            .per_fixture
+            .iter()
+            .map(|f| f.fixture_id.clone())
+            .collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);

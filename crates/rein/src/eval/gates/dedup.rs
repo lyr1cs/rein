@@ -185,7 +185,11 @@ mod tests {
         assert_eq!(sc.fixture_fingerprint, fingerprint);
         assert!(sc.score >= 0.0 && sc.score <= 1.0);
         // per_fixture emitted in sorted id order (stable McNemar pairing).
-        let ids: Vec<String> = sc.per_fixture.iter().map(|f| f.fixture_id.clone()).collect();
+        let ids: Vec<String> = sc
+            .per_fixture
+            .iter()
+            .map(|f| f.fixture_id.clone())
+            .collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
@@ -199,7 +203,10 @@ mod tests {
             text_b: "Connection pooling reuses open database connections".to_string(),
             is_duplicate: true,
         };
-        assert!(classify_one(&dup), "identical text must classify as duplicate");
+        assert!(
+            classify_one(&dup),
+            "identical text must classify as duplicate"
+        );
 
         let distinct = DedupFixture {
             id: "t_distinct".to_string(),

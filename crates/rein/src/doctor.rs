@@ -1578,11 +1578,26 @@ fn check_auth_policy_consistency(config: &ReinConfig) -> DoctorCheck {
     }
 
     if config.server.auth.is_none() && config.server.allow_unauthenticated_loopback {
-        return ok_in(
-            DoctorCategory::Configuration,
-            "auth_policy",
-            "[server].allow_unauthenticated_loopback is deprecated; use [server].auth = \"public\" for the legacy remote read-only tunnel mode, or [server].auth = \"loopback_only\" for local-only access. It remains supported for now and is targeted for removal in a future minor release once the explicit-auth migration completes.",
-        );
+        // v0.34 Phase 1 (per `docs/backlog/v0.34-bearer-auth-migration.md`):
+        // flip the legacy-bool branch from OK → WARN so operators see the
+        // deprecation in `rein doctor` and have time to migrate before the
+        // bool is removed in a future minor. `fixable: false` because the
+        // migration target depends on the operator's threat model
+        // (`public` vs `loopback_only` vs `bearer_required` / `oauth`) and
+        // `doctor --fix` cannot make that choice for them.
+        return DoctorCheck {
+            name: "auth_policy",
+            category: DoctorCategory::Configuration,
+            severity: DoctorSeverity::Warning,
+            status: CheckStatus::Warn,
+            fixable: false,
+            message:
+                "[server].allow_unauthenticated_loopback is deprecated; set an explicit [server].auth policy. It remains supported for now and is targeted for removal in a future minor release once the explicit-auth migration completes."
+                    .into(),
+            repair_hint: Some(
+                "set [server].auth = \"public\" for the legacy remote read-only tunnel mode, [server].auth = \"loopback_only\" for local-only access, [server].auth = \"bearer_required\" for token auth, or [server].auth = \"oauth\" for multi-user remote auth".into(),
+            ),
+        };
     }
 
     ok_in(
@@ -3566,11 +3581,20 @@ provider = "inherit"
         let check = check_auth_policy_consistency(&config);
 
         assert_eq!(check.name, "auth_policy");
-        assert_eq!(check.status, CheckStatus::Ok);
-        assert_eq!(check.severity, DoctorSeverity::Info);
+        // v0.34 Phase 1: flipped from OK→WARN so the deprecation surfaces in
+        // `rein doctor` for operators still relying on the legacy bool.
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.severity, DoctorSeverity::Warning);
+        // doctor --fix must not touch this; the migration target is operator
+        // policy choice, not mechanical.
+        assert!(!check.fixable);
         assert!(check.message.contains("deprecated"));
-        assert!(check.message.contains("auth = \"public\""));
-        assert!(check.message.contains("auth = \"loopback_only\""));
+        assert!(check.message.contains("explicit [server].auth"));
+        let hint = check.repair_hint.as_deref().unwrap_or("");
+        assert!(hint.contains("auth = \"public\""));
+        assert!(hint.contains("auth = \"loopback_only\""));
+        assert!(hint.contains("auth = \"bearer_required\""));
+        assert!(hint.contains("auth = \"oauth\""));
         // v0.33.1: the notice must not pin a stale removal version — it
         // claimed "removed in v0.31" through v0.32/v0.33 without ever firing.
         assert!(
