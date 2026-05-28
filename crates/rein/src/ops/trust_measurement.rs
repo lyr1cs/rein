@@ -24,6 +24,13 @@ pub struct IndexConsistencyReport {
     pub vector_row_count: u64,
     pub missing_embeddings: u64,
     pub orphan_embeddings: u64,
+    /// v0.35 T&M Phase 3 — repair advice. Each entry is an operator-facing
+    /// hint derived from the counts above (e.g. "run `rein doctor --fix`
+    /// to backfill missing embeddings"). Empty when `status == "ok"`. Pure
+    /// semantic strings — no paths, secrets, or host-local details so the
+    /// vector is safe for the public `/api/trust-measurement` route.
+    #[serde(default)]
+    pub repair_advice: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,6 +53,16 @@ pub struct ActiveLearningReport {
     pub sample_rate_cold_start: f64,
     pub sample_rate_warm: f64,
     pub nightly_cron_sample_rate: f64,
+    /// v0.35 T&M Phase 3 — canary drift signal aggregated across the three
+    /// per-surface counters
+    /// (`judge_drift_alert` + `judge_drift_alert_synthesis` +
+    /// `judge_drift_alert_concept`) maintained by the judge calibration
+    /// state. Non-zero values indicate the runtime LLM judge's recent
+    /// decisions diverged from the deterministic baseline often enough to
+    /// be worth investigation. Reported here as a single observability
+    /// number; the doctor surface still distinguishes per-surface.
+    #[serde(default)]
+    pub judge_drift_alert_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,7 +103,7 @@ pub fn collect(store: &SqliteStore, config: &ReinConfig) -> TrustMeasurementRepo
             consumer_offset_count: count_table(store, "consumer_offsets"),
             system,
         },
-        active_learning: active_learning_report(config),
+        active_learning: active_learning_report(store, config),
     }
 }
 
@@ -234,19 +251,80 @@ fn collect_index_consistency(store: &SqliteStore) -> IndexConsistencyReport {
     } else {
         "attention"
     };
+    // v0.35 T&M Phase 3 codex P2 v4: `store::migrate::reindex` SELECTs
+    // every row from `memories` regardless of status, so the empty-store
+    // check that gates the orphan repair advice must look at the total
+    // row count (active + deprecated + ...). Querying
+    // `active_memory_count` here would mis-flag a deprecated-only store
+    // as un-fixable when `rein migrate --reindex` would in fact clear
+    // the orphans.
+    let total_memory_count = query_count(store, "SELECT COUNT(*) FROM memories");
+    let repair_advice = build_index_consistency_repair_advice(
+        total_memory_count,
+        missing_embeddings,
+        orphan_embeddings,
+    );
     IndexConsistencyReport {
         status: status.to_string(),
         active_memory_count,
         vector_row_count,
         missing_embeddings,
         orphan_embeddings,
+        repair_advice,
     }
 }
 
-fn active_learning_report(config: &ReinConfig) -> ActiveLearningReport {
+/// v0.35 T&M Phase 3 — translate the two index-consistency counters into
+/// operator-facing repair advice. Returns an empty vec when both counters
+/// are zero so consumers can use `repair_advice.is_empty()` as the
+/// canonical "nothing to do" signal. Strings are pure semantic — no
+/// paths, no secrets, safe for the public REST surface.
+fn build_index_consistency_repair_advice(
+    total_memory_count: u64,
+    missing_embeddings: u64,
+    orphan_embeddings: u64,
+) -> Vec<String> {
+    let mut advice = Vec::new();
+    if missing_embeddings > 0 {
+        // `rein migrate --reindex` drops the old `vec_memories` table,
+        // re-creates it at the current embedding dimensions, and re-embeds
+        // every memory row. Documented in `store::migrate::reindex`.
+        // `rein doctor --fix` is deliberately NOT cited: it only rebuilds
+        // Tantivy + HNSW side indexes from existing rows.
+        advice.push(format!(
+            "{missing_embeddings} memories have no vector embedding row — run `rein migrate --reindex` to drop `vec_memories`, recreate it at the current embedding dimensions, and re-embed every memory (single atomic repair path)"
+        ));
+    }
+    if orphan_embeddings > 0 {
+        if total_memory_count == 0 {
+            // Codex P2 v3 edge case: `store::migrate::reindex` returns
+            // early when `total == 0` (no memories to embed), so it does
+            // NOT drop/recreate `vec_memories`. An orphan-only state on an
+            // empty store therefore can't be cleared via the public CLI.
+            //
+            // Codex P2 v4: the empty-store check must use the TOTAL row
+            // count (any status), not active+updated, because `reindex`
+            // SELECTs every row from `memories`. A deprecated-only store
+            // still has rows for reindex to drop+recreate from.
+            advice.push(format!(
+                "{orphan_embeddings} vector rows have no matching memory AND the memories table is empty — `rein migrate --reindex` returns early on empty stores and will NOT clear these orphans. No public CLI handles this edge case; tracked in `docs/backlog/manual-review-optimization.md` under index consistency."
+            ));
+        } else {
+            // Standard path: memories non-empty → `reindex` drops +
+            // recreates vec_memories, atomically discarding orphans.
+            advice.push(format!(
+                "{orphan_embeddings} vector rows have no matching memory — run `rein migrate --reindex` (the drop-and-recreate of `vec_memories` discards rows that no longer have a corresponding memory). `rein gc` alone does NOT remove pre-existing orphans."
+            ));
+        }
+    }
+    advice
+}
+
+fn active_learning_report(store: &SqliteStore, config: &ReinConfig) -> ActiveLearningReport {
     let active = config.ars.llm_judge.enabled
         && (config.ars.llm_judge.synthesis_enabled || config.ars.llm_judge.concept_summary_enabled)
         && config.ars.llm_judge.nightly_cron.enabled;
+    let judge_drift_alert_total = collect_judge_drift_alert_total(store);
     ActiveLearningReport {
         status: if active { "active" } else { "disabled" }.to_string(),
         llm_judge_enabled: config.ars.llm_judge.enabled,
@@ -256,7 +334,25 @@ fn active_learning_report(config: &ReinConfig) -> ActiveLearningReport {
         sample_rate_cold_start: config.ars.llm_judge.sample_rate_cold_start,
         sample_rate_warm: config.ars.llm_judge.sample_rate_warm,
         nightly_cron_sample_rate: config.ars.llm_judge.nightly_cron.sample_rate,
+        judge_drift_alert_total,
     }
+}
+
+/// v0.35 T&M Phase 3 — pull the three per-surface drift counters from the
+/// judge calibration state on the AdaptiveState snapshot and aggregate
+/// them into a single observability number. Returns 0 when no calibration
+/// row exists yet (fresh install or LLM judge never enabled). The doctor
+/// surface continues to read each counter separately for per-surface
+/// diagnosis.
+fn collect_judge_drift_alert_total(store: &SqliteStore) -> u64 {
+    let state =
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
+    let Some(cal) = state.judge_calibration_state.as_ref() else {
+        return 0;
+    };
+    cal.judge_drift_alert
+        .saturating_add(cal.judge_drift_alert_synthesis)
+        .saturating_add(cal.judge_drift_alert_concept)
 }
 
 fn count_table(store: &SqliteStore, table: &str) -> u64 {
@@ -301,8 +397,114 @@ mod tests {
             );
         }
         assert_eq!(report.index_consistency.missing_embeddings, 0);
+        // v0.35 T&M Phase 3: fresh stores have no orphans / no missing,
+        // so the advice vector must be empty.
+        assert!(
+            report.index_consistency.repair_advice.is_empty(),
+            "fresh store should not emit repair advice; got {:?}",
+            report.index_consistency.repair_advice
+        );
         assert!(report.background_observability.system.status.ok);
         assert!(report.active_learning.llm_judge_enabled);
         assert!(report.active_learning.nightly_cron_enabled);
+        // No judge calibration row yet on this fresh store.
+        assert_eq!(report.active_learning.judge_drift_alert_total, 0);
+    }
+
+    // v0.35 T&M Phase 3 — index-consistency repair advice builder.
+    #[test]
+    fn repair_advice_is_empty_when_counts_are_zero() {
+        let advice = build_index_consistency_repair_advice(100, 0, 0);
+        assert!(advice.is_empty());
+    }
+
+    #[test]
+    fn repair_advice_flags_missing_embeddings_with_migrate_reindex() {
+        let advice = build_index_consistency_repair_advice(50, 3, 0);
+        assert_eq!(advice.len(), 1);
+        assert!(advice[0].contains("3"));
+        // Codex P2 v3: `rein migrate --reindex` is the documented atomic
+        // repair (drop + recreate vec_memories + re-embed everything).
+        assert!(advice[0].contains("rein migrate --reindex"));
+        assert!(advice[0].contains("vec_memories"));
+        // Known no-ops must not appear.
+        assert!(!advice[0].contains("doctor --fix"));
+        assert!(!advice[0].contains("rein worker memory"));
+        assert!(!advice[0].contains("rein consolidate"));
+    }
+
+    #[test]
+    fn repair_advice_flags_orphan_embeddings_with_migrate_reindex_when_memories_present() {
+        let advice = build_index_consistency_repair_advice(50, 0, 7);
+        assert_eq!(advice.len(), 1);
+        assert!(advice[0].contains("7"));
+        assert!(advice[0].contains("rein migrate --reindex"));
+        assert!(advice[0].contains("does NOT remove pre-existing orphans"));
+    }
+
+    #[test]
+    fn repair_advice_flags_orphan_only_on_empty_store_as_unfixable_via_cli() {
+        // Codex P2 v3 edge case: `reindex` returns early on empty stores
+        // so following `rein migrate --reindex` here would be a no-op.
+        // The advice must say so + point at the backlog.
+        let advice = build_index_consistency_repair_advice(0, 0, 4);
+        assert_eq!(advice.len(), 1);
+        assert!(advice[0].contains("4"));
+        assert!(advice[0].contains("memories table is empty"));
+        assert!(advice[0].contains("returns early"));
+        assert!(advice[0].contains("manual-review-optimization"));
+        // Critically, the empty-store branch must NOT direct operators
+        // toward the no-op `rein migrate --reindex` invocation.
+        assert!(
+            advice[0].contains("will NOT clear"),
+            "advice must surface the reindex no-op for empty stores: {}",
+            advice[0]
+        );
+    }
+
+    #[test]
+    fn repair_advice_recommends_reindex_for_deprecated_only_store_with_orphans() {
+        // Codex P2 v4: the empty-store check must use TOTAL memory rows,
+        // not just active+updated. A deprecated-only store still has
+        // rows for `reindex` to clear orphans from. Total > 0 with
+        // orphans > 0 must take the standard reindex branch.
+        let advice = build_index_consistency_repair_advice(5, 0, 3);
+        assert_eq!(advice.len(), 1);
+        assert!(advice[0].contains("3"));
+        assert!(advice[0].contains("rein migrate --reindex"));
+        assert!(advice[0].contains("does NOT remove pre-existing orphans"));
+        // The empty-store no-op branch must NOT fire.
+        assert!(!advice[0].contains("memories table is empty"));
+        assert!(!advice[0].contains("returns early"));
+    }
+
+    #[test]
+    fn repair_advice_emits_both_lines_when_both_counters_are_nonzero() {
+        let advice = build_index_consistency_repair_advice(50, 2, 5);
+        assert_eq!(advice.len(), 2);
+        assert!(advice
+            .iter()
+            .any(|s| s.contains("rein migrate --reindex") && s.contains("2")));
+        assert!(advice
+            .iter()
+            .any(|s| s.contains("rein migrate --reindex") && s.contains("5")));
+    }
+
+    #[test]
+    fn repair_advice_strings_carry_no_paths_or_secrets() {
+        // The advice vector is exposed on the public REST surface, so it
+        // must not embed host-local paths, tokens, or any
+        // deployment-specific identifiers. The builder strings should not
+        // contain `/Users/`, `/home/`, `/var/`, or env-shaped tokens.
+        for (m, miss, orph) in [(50, 1, 1), (0, 0, 1)] {
+            let advice = build_index_consistency_repair_advice(m, miss, orph);
+            for line in &advice {
+                assert!(!line.contains("/Users/"), "leaked $HOME path: {line}");
+                assert!(!line.contains("/home/"), "leaked $HOME path: {line}");
+                assert!(!line.contains("/var/"), "leaked tmp/cache path: {line}");
+                assert!(!line.contains("REIN_HTTP_TOKEN"), "leaked env name: {line}");
+                assert!(!line.contains("GEMINI_API_KEY"), "leaked env name: {line}");
+            }
+        }
     }
 }
