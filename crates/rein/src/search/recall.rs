@@ -380,6 +380,35 @@ fn matches_external_filters(
     true
 }
 
+/// v0.36 #P1: returns true iff the dominant BM25 hit `memory` is guaranteed to
+/// survive every post-fusion drop-filter, so the KG / episode / Supermemory
+/// fallback channels can be skipped without risking a degraded/empty result.
+/// Mirrors the live-status retain (~1459), the M5 cold-tier filter (~1538), and
+/// the external topic/keyword/time filters. Keep in sync with those sites.
+fn strong_hit_survives_filters(
+    memory: &Memory,
+    query_type: crate::search::classify::QueryType,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    // live-status retain: Deprecated rows are dropped before fusion.
+    if !matches!(
+        memory.status,
+        crate::types::MemoryStatus::Active | crate::types::MemoryStatus::Updated
+    ) {
+        return false;
+    }
+    // M5 tier filter: Cold memories are excluded unless the query is Exploratory.
+    let include_cold = query_type == crate::search::classify::QueryType::Exploratory;
+    if !include_cold && memory.tier == crate::store::tiering::MemoryTier::Cold {
+        return false;
+    }
+    // topic / keyword / time external filters.
+    matches_external_filters(memory, topic, keyword, time_from, time_to)
+}
+
 /// Full recall pipeline: waterfall search + optional cross-validation.
 ///
 /// This is sync-safe: embedding uses reqwest::blocking if needed.
@@ -530,34 +559,16 @@ pub fn recall_temporal_with_request_id(
     // Apply limit multiplier from strategy
     let effective_limit = (limit as f32 * strategy.limit_multiplier) as usize;
 
-    // === Early-launch: Supermemory search (200-500ms network I/O) ===
-    // Skip in fast mode (proxy/hook_prompt) — store-local only.
+    // === Supermemory config (channel launched after the strong-signal decision) ===
+    // Skip in fast mode (proxy/hook_prompt) — store-local only. The thread is
+    // spawned below, only when the strong signal is NOT confirmed (v0.36 #P1):
+    // a confirmed dominant local hit needs no cloud cross-validation, so we
+    // never start a request we would discard.
     let sm_enabled = !fast && config.sync.supermemory_enabled;
     let am_enabled = !fast && config.sync.auto_memory_enabled;
     let sm_api_key = config.sync.api_key.clone();
     let sm_endpoint = config.sync.endpoint.clone();
     let q_sm = query.to_string();
-    let sm_handle = if sm_enabled {
-        sm_api_key.map(|api_key| {
-            std::thread::spawn(move || {
-                let client = SupermemoryClient::new(api_key, sm_endpoint);
-                // Reuse existing tokio runtime if available, else create a temporary one
-                let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    std::thread::scope(|_| handle.block_on(client.search(&q_sm, effective_limit)))
-                } else {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .ok();
-                    rt.map(|rt| rt.block_on(client.search(&q_sm, effective_limit)))
-                        .unwrap_or_default()
-                };
-                result
-            })
-        })
-    } else {
-        None
-    };
 
     // === Phase 1a: FTS search with ORIGINAL query (fast, ~1ms) ===
     let (mut fts_results, mut fts_scores, strong_signal) = if strategy.skip_fts {
@@ -585,6 +596,97 @@ pub fn recall_temporal_with_request_id(
             tracing::info!("strong BM25 signal — will skip expansion + LLM reranker");
         }
         (results, scores, ss)
+    };
+
+    // === v0.36 #P1: confirm the strong signal survives post-fusion filters ===
+    // `strong_signal` is detected from the *raw* BM25 top-1 (pre-filter). The
+    // KG / episode / Supermemory fallback channels may only be skipped when the
+    // dominant hit is GUARANTEED to survive every downstream drop-filter AND the
+    // query needs no episode channel — otherwise a filtered-out strong hit would
+    // leave a degraded/empty result with no fallback (closes the 2026-05-28
+    // codex R1–R3 findings). Episodic queries and any time-bounded query need
+    // the episode channel, so they never confirm. The dominant hit is the max
+    // *positive* BM25 score (matching `detect_strong_signal`'s basis) — found by
+    // argmax over `fts_scores`, NOT `fts_results[0]` (that Vec is not score-sorted).
+    //
+    // Completeness guard (codex v2/v3): the bypass skips Supermemory and KG, so
+    // it must only fire when the surviving local FTS hits ALREADY satisfy the
+    // requested `limit`. Then KG/SM could only contribute ranks beyond what the
+    // caller asked for, and skipping them cannot truncate the result set. For
+    // sparse local matches we keep the full pipeline so KG/SM can fill the
+    // request. We count DISTINCT CANONICALS (not raw rows): `collapse_results_to_canonicals`
+    // later merges rows sharing a canonical, so a raw-row count could satisfy
+    // `limit` while the post-collapse local set falls short (codex v3 #1).
+    let surviving_local = {
+        let mut canonicals = std::collections::HashSet::new();
+        for m in &fts_results {
+            if strong_hit_survives_filters(
+                m,
+                strategy.query_type,
+                topic,
+                keyword,
+                time_from,
+                time_to,
+            ) {
+                canonicals.insert(m.canonical_id.as_deref().unwrap_or(m.id.as_str()));
+            }
+        }
+        canonicals.len()
+    };
+    let strong_signal_confirmed = strong_signal
+        && strategy.query_type != crate::search::classify::QueryType::Episodic
+        && time_from.is_none()
+        && time_to.is_none()
+        && surviving_local >= limit
+        && {
+            // The dominant hit (max positive BM25) must itself survive filters,
+            // else the "strong" signal rests on a row that gets dropped.
+            fts_scores
+                .iter()
+                .filter(|(_, s)| **s > 0.0)
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| id.clone())
+                .and_then(|id| fts_results.iter().find(|m| m.id == id))
+                .map(|m| {
+                    strong_hit_survives_filters(
+                        m,
+                        strategy.query_type,
+                        topic,
+                        keyword,
+                        time_from,
+                        time_to,
+                    )
+                })
+                .unwrap_or(false)
+        };
+    if strong_signal_confirmed {
+        tracing::info!("strong signal confirmed past filters — skipping Supermemory + KG wait");
+    }
+
+    // === Supermemory launch (v0.36 #P1: only when NOT a confirmed strong signal) ===
+    // Launched here — after the strong-signal decision but before expansion /
+    // Vec / KG — so it still overlaps the slow channels below, yet never starts
+    // a request we would discard for a confirmed dominant local hit. The thread
+    // is self-contained (own client, moved strings); it does not touch `store`.
+    let sm_handle = if sm_enabled && !strong_signal_confirmed {
+        sm_api_key.map(|api_key| {
+            std::thread::spawn(move || {
+                let client = SupermemoryClient::new(api_key, sm_endpoint);
+                // Reuse existing tokio runtime if available, else a temporary one.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    std::thread::scope(|_| handle.block_on(client.search(&q_sm, effective_limit)))
+                } else {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok();
+                    rt.map(|rt| rt.block_on(client.search(&q_sm, effective_limit)))
+                        .unwrap_or_default()
+                }
+            })
+        })
+    } else {
+        None
     };
 
     // === Query expansion: launch AFTER strong signal check to avoid unnecessary LLM calls ===
@@ -780,7 +882,17 @@ pub fn recall_temporal_with_request_id(
 
     let kg_is_episodic = strategy.query_type == crate::search::classify::QueryType::Episodic;
     let is_memory_db = store.db_path().to_str() == Some(":memory:");
-    let kg_state: KgState = if fast || is_memory_db {
+    let kg_state: KgState = if strong_signal_confirmed {
+        // v0.36 #P1: deterministically skip KG on a confirmed strong signal.
+        // The completeness guard above already proved ≥`limit` distinct local
+        // canonicals survive, so KG could only add beyond-limit ranks; skipping
+        // it (rather than racing a non-blocking poll) keeps the fused top-K
+        // deterministic regardless of thread scheduling (codex v3 #2).
+        KgState::Sync(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+    } else if fast || is_memory_db {
         // Fast mode or in-memory DB: run synchronously on main thread.
         // In-memory DBs cannot be shared across threads (each new connection gets an empty DB).
         let kg_start = std::time::Instant::now();
@@ -1778,7 +1890,9 @@ pub fn recall_temporal_with_request_id(
     .filter(|memory| matches_external_filters(memory, topic, keyword, time_from, time_to))
     .collect::<Vec<_>>();
 
-    // Join early-launched Supermemory thread (has been running since pipeline start)
+    // Join the Supermemory thread. v0.36 #P1: `sm_handle` is `None` for a
+    // confirmed strong signal (the channel is never launched), so this yields
+    // an empty set without blocking — no detached in-flight request.
     let supermemory_results = sm_handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default()
@@ -2694,6 +2808,154 @@ mod tests {
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
         }
+    }
+
+    // ---- v0.36 #P1: strong_hit_survives_filters gate (closes R1–R3) ----
+    use crate::search::classify::QueryType;
+
+    #[test]
+    fn strong_hit_survives_when_active_warm_no_filters() {
+        let m = test_memory("a", 1, 1.0);
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn strong_hit_dropped_when_deprecated() {
+        let mut m = test_memory("a", 1, 1.0);
+        m.status = MemoryStatus::Deprecated;
+        assert!(!strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn strong_hit_updated_status_survives() {
+        let mut m = test_memory("a", 1, 1.0);
+        m.status = MemoryStatus::Updated;
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn strong_hit_cold_dropped_unless_exploratory() {
+        let mut m = test_memory("a", 1, 1.0);
+        m.tier = MemoryTier::Cold;
+        // non-Exploratory → M5 drops Cold, so the fast-path must NOT engage.
+        assert!(!strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            None,
+            None,
+            None
+        ));
+        // Exploratory includes Cold.
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Exploratory,
+            None,
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn strong_hit_keyword_filter() {
+        let mut m = test_memory("a", 1, 1.0);
+        m.keywords = vec!["rust".into()];
+        m.content = "content about systems".into();
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            Some("rust"),
+            None,
+            None
+        ));
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            Some("systems"),
+            None,
+            None
+        ));
+        assert!(!strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            Some("python"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn strong_hit_topic_mismatch_dropped() {
+        let m = test_memory("a", 1, 1.0); // topic = "docker"
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            Some("docker"),
+            None,
+            None,
+            None
+        ));
+        assert!(!strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            Some("kubernetes"),
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn strong_hit_time_bound_filter() {
+        let mut m = test_memory("a", 1, 1.0);
+        let t = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        m.created_at = t;
+        let before = t - chrono::Duration::days(1);
+        let after = t + chrono::Duration::days(1);
+        assert!(strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            None,
+            Some(before),
+            Some(after)
+        ));
+        // created_at precedes time_from → filtered out.
+        assert!(!strong_hit_survives_filters(
+            &m,
+            QueryType::Semantic,
+            None,
+            None,
+            Some(after),
+            None
+        ));
     }
 
     #[test]
