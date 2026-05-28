@@ -1,0 +1,15 @@
+{
+  "id": "latency_small_04",
+  "query": "Kalman filter recursive state estimate",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Kalman filter recursively combines a process model prediction with a noisy measurement to estimate state.",
+      "topic": "control",
+      "keywords": ["kalman", "filter"]
+    }
+  ]
+}

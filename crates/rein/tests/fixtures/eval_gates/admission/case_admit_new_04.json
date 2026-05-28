@@ -1,0 +1,18 @@
+{
+  "id": "admit_new_04",
+  "topic": "incoming-note",
+  "content": "The Cayley-Hamilton theorem states that every square matrix satisfies its own characteristic polynomial.",
+  "existing": [
+    {
+      "id": "ex_n1",
+      "topic": "store-record",
+      "content": "I bought a new pair of running shoes for the marathon training."
+    },
+    {
+      "id": "ex_n2",
+      "topic": "store-history",
+      "content": "The neighborhood farmers market opens at 8 every Sunday morning."
+    }
+  ],
+  "expected_decision": "admit_new"
+}

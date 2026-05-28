@@ -1,0 +1,6 @@
+{
+  "id": "distinct_negation_01",
+  "text_a": "v0.34.0 introduces a load-time migration that translates the legacy bool into an explicit policy.",
+  "text_b": "v0.34.0 ships a doctor warning for the legacy bool but does not introduce a load-time migration; that arrives in v0.35.0.",
+  "is_duplicate": false
+}

@@ -1,0 +1,6 @@
+{
+  "id": "distinct_unrelated_02",
+  "text_a": "The garlic chicken recipe roasts at 220 Celsius for 35 minutes.",
+  "text_b": "The Kalman filter recursively estimates the state of a noisy linear dynamic system.",
+  "is_duplicate": false
+}

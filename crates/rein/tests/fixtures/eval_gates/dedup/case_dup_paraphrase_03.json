@@ -1,0 +1,6 @@
+{
+  "id": "dup_paraphrase_03",
+  "text_a": "Kaplan-Meier estimates the survival function nonparametrically from censored time-to-event data.",
+  "text_b": "The Kaplan-Meier estimator derives a nonparametric survival curve from time-to-event observations that may be right-censored.",
+  "is_duplicate": true
+}

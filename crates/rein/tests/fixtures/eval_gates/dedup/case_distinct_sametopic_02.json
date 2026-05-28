@@ -1,0 +1,6 @@
+{
+  "id": "distinct_sametopic_02",
+  "text_a": "OAuth 2.0 authorization code flow exchanges a one-time code for an access token at the token endpoint.",
+  "text_b": "OAuth 2.0 dynamic client registration lets unknown clients register themselves with the authorization server before requesting tokens.",
+  "is_duplicate": false
+}

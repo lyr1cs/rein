@@ -2,15 +2,19 @@
   "schema_version": 2,
   "gate_name": "dedup",
   "kind": "baseline",
-  "created_at": 1779905496,
-  "rein_version": "0.33.0",
-  "build_fingerprint": "1d41bf4c949e887fe362ab1d35606864",
-  "fixture_fingerprint": "97d67744344b23eecc6a8aae908976aa",
-  "fixture_count": 8,
-  "score": 1.0,
+  "created_at": 1779972031,
+  "rein_version": "0.34.0",
+  "build_fingerprint": "0f66b3fa29107fc9c057153470ea3637",
+  "fixture_fingerprint": "3ce33481cf28928b46f3eecedab18f46",
+  "fixture_count": 20,
+  "score": 0.85,
   "per_fixture": [
     {
       "fixture_id": "distinct_cjk_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "distinct_cjk_02",
       "hit": true
     },
     {
@@ -18,7 +22,23 @@
       "hit": true
     },
     {
+      "fixture_id": "distinct_nearmiss_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "distinct_negation_01",
+      "hit": false
+    },
+    {
+      "fixture_id": "distinct_paraphrase_trap_01",
+      "hit": false
+    },
+    {
       "fixture_id": "distinct_sametopic_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "distinct_sametopic_02",
       "hit": true
     },
     {
@@ -26,7 +46,15 @@
       "hit": true
     },
     {
+      "fixture_id": "distinct_unrelated_02",
+      "hit": true
+    },
+    {
       "fixture_id": "dup_cjk_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "dup_cjk_02",
       "hit": true
     },
     {
@@ -34,11 +62,31 @@
       "hit": true
     },
     {
+      "fixture_id": "dup_containment_02",
+      "hit": true
+    },
+    {
       "fixture_id": "dup_exact_01",
       "hit": true
     },
     {
+      "fixture_id": "dup_exact_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "dup_multilingual_01",
+      "hit": false
+    },
+    {
       "fixture_id": "dup_paraphrase_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "dup_paraphrase_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "dup_paraphrase_03",
       "hit": true
     }
   ]

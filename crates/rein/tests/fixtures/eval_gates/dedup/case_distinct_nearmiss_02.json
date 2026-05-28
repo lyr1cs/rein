@@ -1,0 +1,6 @@
+{
+  "id": "distinct_nearmiss_02",
+  "text_a": "Tantivy uses BM25 for full-text search over inverted indexes.",
+  "text_b": "BM25 is a probabilistic relevance ranking function; Tantivy adopts it as a default scorer.",
+  "is_duplicate": false
+}

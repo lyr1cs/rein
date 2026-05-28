@@ -1,0 +1,11 @@
+{
+  "id": "latency_keyword_02",
+  "query": "HNSW",
+  "topic": null,
+  "keyword": "hnsw",
+  "budget_ms": 60,
+  "seed_memories": [
+    {"id": "m1", "content": "HNSW is a graph-based nearest-neighbor index with logarithmic search behavior.", "topic": "vector", "keywords": ["hnsw", "graph"]},
+    {"id": "m2", "content": "rein wraps the usearch HNSW implementation with a dirty-marker rebuild flow.", "topic": "vector", "keywords": ["hnsw", "usearch"]}
+  ]
+}

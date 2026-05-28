@@ -1,0 +1,6 @@
+{
+  "id": "dup_exact_02",
+  "text_a": "User prefers tabs over spaces for indentation in all source files.",
+  "text_b": "User prefers tabs over spaces for indentation in all source files.",
+  "is_duplicate": true
+}

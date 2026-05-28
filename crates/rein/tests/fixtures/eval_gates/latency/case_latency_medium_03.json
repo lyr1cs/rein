@@ -1,0 +1,12 @@
+{
+  "id": "latency_medium_03",
+  "query": "ARS Cap A concept living summary update path",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 120,
+  "seed_memories": [
+    {"id": "m1", "content": "ARS Cap A maintains a per-concept living summary refreshed on bucket events.", "topic": "ars", "keywords": ["ars", "concept"]},
+    {"id": "m2", "content": "Concept summary refresh uses CAS to detect peer collisions.", "topic": "ars", "keywords": ["ars", "cas"]},
+    {"id": "m3", "content": "L3 adaptive wiring scopes adoption weight per cluster.", "topic": "ars", "keywords": ["ars", "l3"]}
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "id": "admit_new_07",
+  "topic": "incoming-note",
+  "content": "Apple Silicon's unified memory architecture removes the GPU-CPU copy step for tensor operations.",
+  "existing": [],
+  "expected_decision": "admit_new"
+}

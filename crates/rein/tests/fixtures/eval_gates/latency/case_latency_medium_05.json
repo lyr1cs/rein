@@ -1,0 +1,12 @@
+{
+  "id": "latency_medium_05",
+  "query": "trust measurement gate scorecard pipeline",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 120,
+  "seed_memories": [
+    {"id": "m1", "content": "GateScorecard compares baseline and run via 8-rule pipeline ending in paired McNemar.", "topic": "tm", "keywords": ["scorecard", "mcnemar"]},
+    {"id": "m2", "content": "compare_scorecards bails on schema mismatch before metric comparison.", "topic": "tm", "keywords": ["compare", "schema"]},
+    {"id": "m3", "content": "Each gate stamps a fixture fingerprint over loaded bytes.", "topic": "tm", "keywords": ["fingerprint"]}
+  ]
+}

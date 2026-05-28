@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_06",
+  "topic": "incoming-note",
+  "content": "the adaptive engine maintains a per-cluster Kaplan-Meier survival curve for decay",
+  "existing": [
+    {
+      "id": "ex_g6",
+      "topic": "store-record",
+      "content": "the adaptive engine estimates per-cluster survival curves to drive memory decay"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

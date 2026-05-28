@@ -1,0 +1,11 @@
+{
+  "id": "latency_cjk_02",
+  "query": "Resummerize 操作的原子性约束",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 100,
+  "seed_memories": [
+    {"id": "m1", "content": "Resummerize 使用 BEGIN DEFERRED 抓快照，apply 时用 5 路 CAS 确认 claim token、updated_at、status 一致。", "topic": "resummerize", "keywords": ["cas", "snapshot"]},
+    {"id": "m2", "content": "Lossless Contract 在 apply 之前校验七条不变量，任一不满足都阻止 commit。", "topic": "resummerize", "keywords": ["contract", "invariant"]}
+  ]
+}

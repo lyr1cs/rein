@@ -1,0 +1,13 @@
+{
+  "id": "duplicate_05",
+  "topic": "incoming-note",
+  "content": "The release pipeline runs cargo test, cargo clippy, and cargo fmt before tagging.",
+  "existing": [
+    {
+      "id": "ex_d2",
+      "topic": "store-record",
+      "content": "Before tagging, the release pipeline runs cargo test, cargo clippy, and cargo fmt."
+    }
+  ],
+  "expected_decision": "duplicate"
+}

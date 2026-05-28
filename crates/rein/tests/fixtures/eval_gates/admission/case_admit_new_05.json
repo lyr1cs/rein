@@ -1,0 +1,13 @@
+{
+  "id": "admit_new_05",
+  "topic": "incoming-note",
+  "content": "FAISS-IVF partitions vectors into Voronoi cells using k-means and probes a subset at query time.",
+  "existing": [
+    {
+      "id": "ex_n3",
+      "topic": "store-record",
+      "content": "The seasonal allergy peak is usually in late April for this region."
+    }
+  ],
+  "expected_decision": "admit_new"
+}

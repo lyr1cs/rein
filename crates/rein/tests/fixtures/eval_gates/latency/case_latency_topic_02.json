@@ -1,0 +1,11 @@
+{
+  "id": "latency_topic_02",
+  "query": "stratified flow simulation",
+  "topic": "fluidsim",
+  "keyword": null,
+  "budget_ms": 80,
+  "seed_memories": [
+    {"id": "m1", "content": "Stratified flow simulations couple temperature with momentum equations.", "topic": "fluidsim", "keywords": ["stratified", "flow"]},
+    {"id": "m2", "content": "Pseudospectral methods rely on FFT for spatial derivatives.", "topic": "fluidsim", "keywords": ["pseudospectral", "fft"]}
+  ]
+}

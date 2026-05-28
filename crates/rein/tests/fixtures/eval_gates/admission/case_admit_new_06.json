@@ -1,0 +1,13 @@
+{
+  "id": "admit_new_06",
+  "topic": "incoming-note",
+  "content": "rein 的 ARS Cap C 把冷层记忆做 archival summary 以保留高层语义而不长期保留原文。",
+  "existing": [
+    {
+      "id": "ex_n4",
+      "topic": "store-record",
+      "content": "今天下午会议讨论了下周的产品发布节奏和市场反馈。"
+    }
+  ],
+  "expected_decision": "admit_new"
+}

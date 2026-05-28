@@ -1,0 +1,6 @@
+{
+  "id": "distinct_paraphrase_trap_01",
+  "text_a": "The user prefers fewer commits with detailed messages.",
+  "text_b": "The user prefers many commits with short, terse messages.",
+  "is_duplicate": false
+}

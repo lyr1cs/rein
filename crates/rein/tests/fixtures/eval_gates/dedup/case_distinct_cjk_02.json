@@ -1,0 +1,6 @@
+{
+  "id": "distinct_cjk_02",
+  "text_a": "Funnel 提供面向公网的 HTTPS 入口，必须明确开启才能对外可访问。",
+  "text_b": "Cloudflare Tunnel 通过出向 connection 连接到边缘，无需开放任何入站端口。",
+  "is_duplicate": false
+}

@@ -1,0 +1,11 @@
+{
+  "id": "latency_cjk_01",
+  "query": "面向公网部署 rein 的关键步骤",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 100,
+  "seed_memories": [
+    {"id": "m1", "content": "公网部署 rein 需要先设定 [server].auth 政策并加入 allowed_hosts。", "topic": "deploy", "keywords": ["公网", "部署"]},
+    {"id": "m2", "content": "Tailscale Funnel 提供稳定的 ts.net 域名，可作为非可猜测的公网入口。", "topic": "deploy", "keywords": ["funnel", "tailscale"]}
+  ]
+}

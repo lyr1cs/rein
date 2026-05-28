@@ -1,0 +1,13 @@
+{
+  "id": "duplicate_04",
+  "topic": "incoming-note",
+  "content": "User prefers descriptive commit messages with a single subject line and a wrapped body.",
+  "existing": [
+    {
+      "id": "ex_d1",
+      "topic": "store-record",
+      "content": "User prefers descriptive commit messages with a single subject line and a wrapped body."
+    }
+  ],
+  "expected_decision": "duplicate"
+}

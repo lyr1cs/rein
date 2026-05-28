@@ -1,0 +1,13 @@
+{
+  "id": "duplicate_06",
+  "topic": "incoming-note",
+  "content": "claude.ai 的 Custom Connector UI 只支持 URL 加 OAuth Client ID / Secret，不支持自定义 bearer。",
+  "existing": [
+    {
+      "id": "ex_d3",
+      "topic": "store-record",
+      "content": "claude.ai 的 Custom Connector UI 只支持 URL 加 OAuth Client ID / Secret，不支持自定义 bearer。"
+    }
+  ],
+  "expected_decision": "duplicate"
+}

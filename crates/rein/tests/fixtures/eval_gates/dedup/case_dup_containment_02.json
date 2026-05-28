@@ -1,0 +1,6 @@
+{
+  "id": "dup_containment_02",
+  "text_a": "HDBSCAN extracts density-based clusters from a hierarchy without requiring a fixed cluster count.",
+  "text_b": "HDBSCAN extracts density-based clusters from a hierarchy without requiring a fixed cluster count, and labels points with low membership as noise.",
+  "is_duplicate": true
+}

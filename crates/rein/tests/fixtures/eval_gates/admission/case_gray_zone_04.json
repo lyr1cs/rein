@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_04",
+  "topic": "incoming-note",
+  "content": "the canonical-first recall returns one collapsed row plus its superseded evidence ids",
+  "existing": [
+    {
+      "id": "ex_g4",
+      "topic": "store-record",
+      "content": "the canonical-first recall keeps a single row visible while tracking its superseded duplicates underneath"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

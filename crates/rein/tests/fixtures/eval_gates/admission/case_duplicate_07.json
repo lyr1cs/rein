@@ -1,0 +1,18 @@
+{
+  "id": "duplicate_07",
+  "topic": "incoming-note",
+  "content": "HNSW indices live at `~/.rein/index/hnsw/` and are rebuilt on a dirty-marker recovery.",
+  "existing": [
+    {
+      "id": "ex_d4",
+      "topic": "store-record",
+      "content": "HNSW indices live at `~/.rein/index/hnsw/` and are rebuilt on a dirty-marker recovery."
+    },
+    {
+      "id": "ex_d5",
+      "topic": "store-record",
+      "content": "Unrelated note about garden chores and the basil seedlings."
+    }
+  ],
+  "expected_decision": "duplicate"
+}

@@ -2,15 +2,39 @@
   "schema_version": 2,
   "gate_name": "latency",
   "kind": "baseline",
-  "created_at": 1779905497,
-  "rein_version": "0.33.0",
-  "build_fingerprint": "1d41bf4c949e887fe362ab1d35606864",
-  "fixture_fingerprint": "7917aba23727224e2e355d9f9b72308e",
-  "fixture_count": 6,
+  "created_at": 1779972043,
+  "rein_version": "0.34.0",
+  "build_fingerprint": "0f66b3fa29107fc9c057153470ea3637",
+  "fixture_fingerprint": "104b8aab5e90fd674810465e0b07f6ad",
+  "fixture_count": 20,
   "score": 1.0,
   "per_fixture": [
     {
+      "fixture_id": "latency_cjk_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_cjk_02",
+      "hit": true
+    },
+    {
       "fixture_id": "latency_keyword_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_keyword_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_keyword_03",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_large_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_large_02",
       "hit": true
     },
     {
@@ -22,6 +46,18 @@
       "hit": true
     },
     {
+      "fixture_id": "latency_medium_03",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_medium_04",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_medium_05",
+      "hit": true
+    },
+    {
       "fixture_id": "latency_small_01",
       "hit": true
     },
@@ -30,7 +66,27 @@
       "hit": true
     },
     {
+      "fixture_id": "latency_small_03",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_small_04",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_small_05",
+      "hit": true
+    },
+    {
       "fixture_id": "latency_topic_01",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_topic_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "latency_topic_03",
       "hit": true
     }
   ]

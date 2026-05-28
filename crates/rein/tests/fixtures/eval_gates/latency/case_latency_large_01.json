@@ -1,0 +1,15 @@
+{
+  "id": "latency_large_01",
+  "query": "comprehensive overview of the rein memory pipeline",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 250,
+  "seed_memories": [
+    {"id": "m1", "content": "Memory pipeline: extract, embed, dedup, store, decay, recall.", "topic": "pipeline", "keywords": ["pipeline"]},
+    {"id": "m2", "content": "Extract uses Gemini Flash Lite with rule-based fallback.", "topic": "pipeline", "keywords": ["extract"]},
+    {"id": "m3", "content": "Embed routes through Gemini embedding-001 by default.", "topic": "pipeline", "keywords": ["embed"]},
+    {"id": "m4", "content": "Dedup runs hybrid lexical and semantic verdict via path C.", "topic": "pipeline", "keywords": ["dedup"]},
+    {"id": "m5", "content": "Decay schedule blends base lambda with per-cluster survival.", "topic": "pipeline", "keywords": ["decay"]},
+    {"id": "m6", "content": "Recall waterfall: BM25 → HNSW → cloud API fallback.", "topic": "pipeline", "keywords": ["recall"]}
+  ]
+}

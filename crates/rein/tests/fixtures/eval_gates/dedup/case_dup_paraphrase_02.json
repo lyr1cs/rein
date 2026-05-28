@@ -1,0 +1,6 @@
+{
+  "id": "dup_paraphrase_02",
+  "text_a": "The McNemar test compares paired binary outcomes to detect significant differences between two classifiers on the same dataset.",
+  "text_b": "McNemar's test detects whether two classifiers differ significantly on the same dataset by comparing paired binary outcomes.",
+  "is_duplicate": true
+}

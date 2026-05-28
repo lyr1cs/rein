@@ -1,0 +1,15 @@
+{
+  "id": "latency_small_05",
+  "query": "OAuth refresh token rotation",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "Refresh tokens rotate on each successful exchange; replay revokes the whole grant family.",
+      "topic": "auth",
+      "keywords": ["oauth", "refresh"]
+    }
+  ]
+}

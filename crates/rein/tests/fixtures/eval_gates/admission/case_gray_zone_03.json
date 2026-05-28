@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_03",
+  "topic": "incoming-note",
+  "content": "the tantivy index runs side-by-side with sqlite-vec for hybrid lexical and vector recall",
+  "existing": [
+    {
+      "id": "ex_g3",
+      "topic": "store-record",
+      "content": "the tantivy index serves the lexical channel of the hybrid recall pipeline"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

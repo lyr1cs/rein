@@ -2,11 +2,11 @@
   "schema_version": 2,
   "gate_name": "admission",
   "kind": "baseline",
-  "created_at": 1779905496,
-  "rein_version": "0.33.0",
-  "build_fingerprint": "1d41bf4c949e887fe362ab1d35606864",
-  "fixture_fingerprint": "7b60ec0e2075a19ced37bca0f4bd60b4",
-  "fixture_count": 8,
+  "created_at": 1779972063,
+  "rein_version": "0.34.0",
+  "build_fingerprint": "8ee2c477e080f92e2bcb48dc503c20f8",
+  "fixture_fingerprint": "385c3de1b492114b52cff765f3315eb0",
+  "fixture_count": 20,
   "score": 1.0,
   "per_fixture": [
     {
@@ -22,6 +22,22 @@
       "hit": true
     },
     {
+      "fixture_id": "admit_new_04",
+      "hit": true
+    },
+    {
+      "fixture_id": "admit_new_05",
+      "hit": true
+    },
+    {
+      "fixture_id": "admit_new_06",
+      "hit": true
+    },
+    {
+      "fixture_id": "admit_new_07",
+      "hit": true
+    },
+    {
       "fixture_id": "duplicate_01",
       "hit": true
     },
@@ -34,11 +50,43 @@
       "hit": true
     },
     {
+      "fixture_id": "duplicate_04",
+      "hit": true
+    },
+    {
+      "fixture_id": "duplicate_05",
+      "hit": true
+    },
+    {
+      "fixture_id": "duplicate_06",
+      "hit": true
+    },
+    {
+      "fixture_id": "duplicate_07",
+      "hit": true
+    },
+    {
       "fixture_id": "gray_zone_01",
       "hit": true
     },
     {
       "fixture_id": "gray_zone_02",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_03",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_04",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_05",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_06",
       "hit": true
     }
   ]

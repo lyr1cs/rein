@@ -1,0 +1,15 @@
+{
+  "id": "latency_large_02",
+  "query": "OAuth provider lifecycle end-to-end",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 250,
+  "seed_memories": [
+    {"id": "m1", "content": "Authorization-server metadata advertises endpoints under /.well-known/oauth-authorization-server.", "topic": "oauth", "keywords": ["metadata"]},
+    {"id": "m2", "content": "Dynamic client registration accepts new public clients without prior secret.", "topic": "oauth", "keywords": ["dcr"]},
+    {"id": "m3", "content": "Authorization code with PKCE S256 binds the code to the verifier.", "topic": "oauth", "keywords": ["pkce"]},
+    {"id": "m4", "content": "Token endpoint exchanges the code for access + refresh tokens.", "topic": "oauth", "keywords": ["token"]},
+    {"id": "m5", "content": "Refresh tokens rotate on each use and revoke the family on replay.", "topic": "oauth", "keywords": ["refresh"]},
+    {"id": "m6", "content": "Owner cookie at /oauth/authorize bootstraps the approval session.", "topic": "oauth", "keywords": ["cookie"]}
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "id": "latency_keyword_03",
+  "query": "Tantivy",
+  "topic": null,
+  "keyword": "tantivy",
+  "budget_ms": 60,
+  "seed_memories": [
+    {"id": "m1", "content": "Tantivy is a Rust full-text search library that uses BM25 by default.", "topic": "search", "keywords": ["tantivy", "bm25"]}
+  ]
+}

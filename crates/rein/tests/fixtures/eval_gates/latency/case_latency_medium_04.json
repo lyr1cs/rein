@@ -1,0 +1,12 @@
+{
+  "id": "latency_medium_04",
+  "query": "recall waterfall channels and fusion",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 120,
+  "seed_memories": [
+    {"id": "m1", "content": "Recall fuses BM25, vector, and KG channels via reciprocal rank fusion.", "topic": "recall", "keywords": ["recall", "fusion"]},
+    {"id": "m2", "content": "BM25 lives in Tantivy and runs first to anchor the rest.", "topic": "recall", "keywords": ["bm25", "tantivy"]},
+    {"id": "m3", "content": "Vector channel uses usearch HNSW with cosine similarity.", "topic": "recall", "keywords": ["hnsw", "vector"]}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "latency_small_03",
+  "query": "preferred indentation style",
+  "topic": null,
+  "keyword": null,
+  "budget_ms": 50,
+  "seed_memories": [
+    {
+      "id": "m1",
+      "content": "User prefers four-space indentation in Python and two-space in TypeScript.",
+      "topic": "prefs",
+      "keywords": ["indentation", "style"]
+    }
+  ]
+}

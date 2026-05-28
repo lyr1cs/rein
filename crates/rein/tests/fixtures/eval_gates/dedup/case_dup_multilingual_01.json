@@ -1,0 +1,6 @@
+{
+  "id": "dup_multilingual_01",
+  "text_a": "The reranker calls the LLM with a structured prompt and applies a strong-signal bypass.",
+  "text_b": "Reranker 用结构化 prompt 调用 LLM，并且加上 strong-signal bypass。",
+  "is_duplicate": true
+}

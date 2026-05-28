@@ -1,0 +1,11 @@
+{
+  "id": "latency_topic_03",
+  "query": "memoir concept linking",
+  "topic": "memoir",
+  "keyword": null,
+  "budget_ms": 80,
+  "seed_memories": [
+    {"id": "m1", "content": "ConceptLink records source, target, type, and a temporal validity window.", "topic": "memoir", "keywords": ["link", "concept"]},
+    {"id": "m2", "content": "BFS traversal skips expired links to honor the validity window.", "topic": "memoir", "keywords": ["bfs", "traversal"]}
+  ]
+}
