@@ -307,7 +307,7 @@ fn build_index_consistency_repair_advice(
             // SELECTs every row from `memories`. A deprecated-only store
             // still has rows for reindex to drop+recreate from.
             advice.push(format!(
-                "{orphan_embeddings} vector rows have no matching memory AND the memories table is empty — `rein migrate --reindex` returns early on empty stores and will NOT clear these orphans. No public CLI handles this edge case; tracked in `docs/backlog/manual-review-optimization.md` under index consistency."
+                "{orphan_embeddings} vector rows have no matching memory AND the memories table is empty — `rein migrate --reindex` returns early on empty stores and will NOT clear these orphans. No public CLI handles this edge case; track via the project issue tracker under index consistency."
             ));
         } else {
             // Standard path: memories non-empty → `reindex` drops +
@@ -452,7 +452,7 @@ mod tests {
         assert!(advice[0].contains("4"));
         assert!(advice[0].contains("memories table is empty"));
         assert!(advice[0].contains("returns early"));
-        assert!(advice[0].contains("manual-review-optimization"));
+        assert!(advice[0].contains("issue tracker"));
         // Critically, the empty-store branch must NOT direct operators
         // toward the no-op `rein migrate --reindex` invocation.
         assert!(
