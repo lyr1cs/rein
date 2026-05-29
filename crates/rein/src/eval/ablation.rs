@@ -177,8 +177,12 @@ pub fn run_ablation(
     if arms.len() < 2 {
         bail!("ablation needs >= 2 arms (a baseline + at least one treatment)");
     }
-    if !(0.0..1.0).contains(&confidence) {
-        bail!("confidence must be in (0, 1), got {confidence}");
+    if !(0.0 < confidence && confidence < 1.0) {
+        // OPEN interval: `(0.0..1.0).contains` is half-open and would admit
+        // confidence==0.0, which makes tail=0.5 → a zero-width CI (lo==hi==
+        // median) → fake significance — the same failure the resamples==0 guard
+        // blocks (codex audit v0.36).
+        bail!("confidence must be in the open interval (0, 1), got {confidence}");
     }
     if resamples == 0 {
         // 0 makes the bootstrap CI collapse to the point estimate, which would
@@ -472,6 +476,21 @@ mod tests {
             1
         )
         .is_err());
+        // confidence at either open-interval endpoint must be rejected
+        // (confidence==0.0 → tail 0.5 → zero-width CI → fake significance).
+        for bad in [0.0_f64, 1.0_f64] {
+            assert!(
+                run_ablation(
+                    vec![("full".into(), a.clone()), ("arm".into(), b.clone())],
+                    "full",
+                    100,
+                    bad,
+                    1
+                )
+                .is_err(),
+                "confidence {bad} must be rejected (open interval)"
+            );
+        }
         // duplicate arm label
         assert!(run_ablation(
             vec![("full".into(), a.clone()), ("full".into(), b.clone())],

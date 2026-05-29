@@ -313,7 +313,7 @@ pub fn run_dedup_sweep() -> Result<DedupSweepReport> {
          cosine path + gray-zone LLM verdict) and per-cluster adaptive (M6), so \
          this calibrates the lexical bound in isolation, NOT the full merge \
          decision. Threshold defaults are left UNCHANGED pending a production- \
-         traffic sample (see docs/backlog/v0.33-eval-gate-calibration.md).",
+         traffic recalibration sample.",
         fixtures.len(),
         positives,
         negatives
