@@ -115,6 +115,20 @@ pub struct QueueGroupDiagnostics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RecentEventEntry {
     fingerprint: String,
+    /// v0.37 hook-dup fix: sha256 of the FULL normalized event text (not the
+    /// 2000-char preview `fingerprint`). Used for the cross-agent-label exact
+    /// duplicate check so a shared preamble with a differing tail cannot
+    /// false-suppress a distinct event. `#[serde(default)]` → legacy cache
+    /// rows deserialize to "" and never cross-match.
+    #[serde(default)]
+    full_fingerprint: String,
+    /// v0.37 hook-dup fix: whether the event was queued as a Full extraction.
+    /// The cross-agent exact-duplicate path must NOT let an incoming Full job
+    /// be suppressed by a stored Quick one (Full is higher fidelity), mirroring
+    /// the pending-queue Full-over-Quick exception. `#[serde(default)]` → legacy
+    /// rows default to `false` (Quick), which only ever loosens suppression.
+    #[serde(default)]
+    is_full: bool,
     preview: String,
     agent_label: String,
     created_at: DateTime<Utc>,
@@ -217,6 +231,7 @@ fn _queue_memory_job(
             source,
             &agent_label,
             is_subagent,
+            matches!(mode, MemoryJobMode::Full),
             source_query.as_deref(),
             &text,
         )? {
@@ -1757,6 +1772,7 @@ fn suppress_duplicate_event(
     source: &str,
     agent_label: &str,
     is_subagent: bool,
+    is_full: bool,
     source_query: Option<&str>,
     text: &str,
 ) -> anyhow::Result<bool> {
@@ -1772,8 +1788,41 @@ fn suppress_duplicate_event(
     let normalized = normalized_event_text(source, source_query, text);
     let preview: String = normalized.chars().take(2000).collect();
     let fingerprint = sha256_hex(&preview);
+    // Cross-agent exact-duplicate fingerprint: hash the RAW (already
+    // secret-redacted) event text verbatim — NOT the lossy
+    // `normalized_event_text`, which lowercases and strips punctuation /
+    // operators (so `if x == y` and `if x != y` would collide). Raw bytes give
+    // a true content identity that is:
+    //   - exact   → distinct code-bearing events never collide;
+    //   - full    → no truncation-prefix collision;
+    //   - source-agnostic → the same buffered content re-queued by different
+    //     hooks (mid-session `hook_post` flush vs `hook_stop` /
+    //     `hook_stop_incremental`) hashes identically and IS caught.
+    // Byte-identical text across agent labels within the window can only be a
+    // double-capture, never two independent observations.
+    let full_fingerprint = sha256_hex(text);
 
     let duplicate = state.items.iter().any(|item| {
+        // v0.37 hook-dup fix — Full-over-Quick, applied UNIFORMLY first: an
+        // incoming Full job is never suppressed by a stored Quick entry on ANY
+        // match path (mirrors the pending-queue exception). A Full extraction
+        // is higher fidelity than the Quick one it may share content with, so
+        // it must always be allowed through.
+        if is_full && !item.is_full {
+            return false;
+        }
+        // FULL-content, cross-agent exact match: catches the post-flush + stop
+        // re-queue of identical buffered content even when the two firings
+        // carry different hook sources / agent labels. Hashing the full text
+        // (not the truncated preview) means a shared preamble with a differing
+        // tail cannot false-suppress a distinct event. Guarded on non-empty so
+        // legacy cache rows (no `full_fingerprint`) never cross-match.
+        if !item.full_fingerprint.is_empty() && item.full_fingerprint == full_fingerprint {
+            return true;
+        }
+        // Within-agent path: truncated-preview fingerprint + fuzzy similarity,
+        // scoped to the same agent so genuinely distinct agents' similar
+        // content is not cross-suppressed.
         if item.agent_label != agent_label {
             return false;
         }
@@ -1788,6 +1837,8 @@ fn suppress_duplicate_event(
 
     state.items.push(RecentEventEntry {
         fingerprint,
+        full_fingerprint,
+        is_full,
         preview,
         agent_label: agent_label.to_string(),
         created_at: now,
@@ -1912,6 +1963,55 @@ mod tests {
         let a = normalized_event_text("hook_stop", Some("hello"), "Fixed sqlite-locking!");
         let b = normalized_event_text("hook_stop", Some("hello"), "Fixed sqlite locking.");
         assert!(crate::extract::similarity(&a, &b) > 0.94);
+    }
+
+    #[test]
+    fn raw_full_fingerprint_distinguishes_shared_preview_different_tail() {
+        // v0.37 hook-dup safety: two events sharing the first 2000 normalized
+        // chars but differing in the tail collide on the truncated preview
+        // fingerprint yet must produce DIFFERENT RAW full fingerprints — so the
+        // cross-agent exact-dup check (which keys off the raw full fingerprint)
+        // can never false-suppress a distinct long event with a shared preamble.
+        let shared = "x ".repeat(1500); // ~3000 chars >> the 2000-char preview cap
+        let a = format!("{shared} alpha tail");
+        let b = format!("{shared} beta tail");
+        let a_preview: String = normalized_event_text("hook_post", None, &a)
+            .chars()
+            .take(2000)
+            .collect();
+        let b_preview: String = normalized_event_text("hook_post", None, &b)
+            .chars()
+            .take(2000)
+            .collect();
+        assert_eq!(
+            sha256_hex(&a_preview),
+            sha256_hex(&b_preview),
+            "previews must collide on the shared 2000-char prefix"
+        );
+        assert_ne!(
+            sha256_hex(&a),
+            sha256_hex(&b),
+            "raw full fingerprints must differ on the distinct tails"
+        );
+    }
+
+    #[test]
+    fn raw_full_fingerprint_preserves_code_operators() {
+        // The raw (unnormalized) hash must distinguish code-bearing events that
+        // differ only in operators — `normalized_event_text` strips `==`/`!=`
+        // to the same text, so the cross-agent exact path MUST hash raw bytes.
+        let a = "if x == y { merge() }";
+        let b = "if x != y { merge() }";
+        assert_eq!(
+            normalized_event_text("", None, a),
+            normalized_event_text("", None, b),
+            "normalization collapses the operators (why raw hashing is required)"
+        );
+        assert_ne!(
+            sha256_hex(a),
+            sha256_hex(b),
+            "raw full fingerprints must NOT collide on distinct operators"
+        );
     }
 
     #[test]

@@ -535,4 +535,39 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].kind, "always_on_memory");
     }
+
+    #[test]
+    fn merge_keeps_distinct_content_across_agent_labels() {
+        // Guard: the cross-label collapse is EXACT-only — genuinely distinct
+        // content from different agents is preserved (no over-merging).
+        let now = Utc::now();
+        let items = vec![
+            WorkingSetItem {
+                kind: "memory".into(),
+                topic: "a".into(),
+                summary: "x".into(),
+                detail: "Parser handles CJK input via jieba segmentation.".into(),
+                agent_label: "claude-code".into(),
+                is_subagent: false,
+                score: 0.7,
+                updated_at: now,
+            },
+            WorkingSetItem {
+                kind: "memory".into(),
+                topic: "b".into(),
+                summary: "y".into(),
+                detail: "Deployment uses cargo install on the target host.".into(),
+                agent_label: "codex".into(),
+                is_subagent: false,
+                score: 0.8,
+                updated_at: now,
+            },
+        ];
+        let merged = merge_items(items, 40);
+        assert_eq!(
+            merged.len(),
+            2,
+            "distinct content across labels must be preserved"
+        );
+    }
 }
