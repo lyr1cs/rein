@@ -16,6 +16,7 @@
 //! `HitChecker`) is the main thread's responsibility. This module stops at
 //! defining the shapes and the decision math.
 
+pub mod ablation;
 pub mod concept_summary;
 pub mod gates;
 pub mod llm_judge;

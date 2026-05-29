@@ -119,6 +119,32 @@ enum Commands {
         #[command(subcommand)]
         action: GateAction,
     },
+    /// v0.36 #ablation-harness — multi-arm ablation analysis over saved
+    /// gate scorecards. Each arm is a scorecard JSON (e.g. produced by
+    /// `gate run` under a different build / config / feature flag). Reports
+    /// per-arm score + bootstrap 95% CI and the paired delta of each arm vs the
+    /// baseline, with a `significant` flag (delta CI excludes 0). Arms are
+    /// paired over their shared fixture-id intersection. Reproducible: same
+    /// `--seed` → identical CIs. Diagnostic only; writes no scorecard.
+    Ablate {
+        /// Comma-separated `label=path` arms, e.g.
+        /// `full=docs/eval-baselines/recall.json,run=target/eval-gates/recall-run.json`.
+        /// At least two arms required.
+        #[arg(long)]
+        arms: String,
+        /// Which arm label is the baseline every other arm is compared against.
+        #[arg(long)]
+        baseline: String,
+        /// Bootstrap replicate count. Default 2000.
+        #[arg(long, default_value_t = 2000)]
+        resamples: usize,
+        /// CI confidence in (0, 1). Default 0.95.
+        #[arg(long, default_value_t = 0.95)]
+        confidence: f64,
+        /// PRNG seed for reproducible CIs. Default 42.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -897,7 +923,45 @@ fn main() -> Result<()> {
             GateAction::Status { gate } => cmd_gate_status(&gate),
             GateAction::Sweep { gate } => cmd_gate_sweep(&gate),
         },
+        Commands::Ablate {
+            arms,
+            baseline,
+            resamples,
+            confidence,
+            seed,
+        } => cmd_ablate(&arms, &baseline, resamples, confidence, seed),
     }
+}
+
+/// v0.36 #ablation-harness — parse `label=path` arms, load each scorecard,
+/// run the bootstrap ablation, and print the report as pretty JSON.
+fn cmd_ablate(
+    arms_spec: &str,
+    baseline: &str,
+    resamples: usize,
+    confidence: f64,
+    seed: u64,
+) -> Result<()> {
+    let mut arms: Vec<(String, GateScorecard)> = Vec::new();
+    for spec in arms_spec.split(',') {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let (label, path) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("arm `{spec}` must be `label=path`"))?;
+        let label = label.trim();
+        let path = path.trim();
+        let bytes = fs::read_to_string(path)
+            .with_context(|| format!("read scorecard for arm `{label}` from {path}"))?;
+        let sc: GateScorecard = serde_json::from_str(&bytes)
+            .with_context(|| format!("parse scorecard for arm `{label}` from {path}"))?;
+        arms.push((label.to_string(), sc));
+    }
+    let report = rein::eval::ablation::run_ablation(arms, baseline, resamples, confidence, seed)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 /// v0.36 #C2 — print the dedup threshold sweep as pretty JSON.
