@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ReinConfig;
 use crate::eval::gates::{
@@ -143,6 +143,195 @@ fn load_dedup_fixtures() -> Result<(Vec<DedupFixture>, String)> {
     Ok((fixtures, fingerprint))
 }
 
+// ---------------------------------------------------------------------------
+// v0.36 #C2 — data-driven threshold sweep
+// ---------------------------------------------------------------------------
+
+/// The production global-fallback dedup threshold (`AdaptiveState::
+/// default_global_dedup_threshold`). Surfaced in the sweep report so the
+/// operator can compare the corpus-optimal point against what cold-start
+/// production actually uses. Kept in sync with that constant.
+pub const PRODUCTION_DEFAULT_THRESHOLD: f32 = 0.70;
+
+/// One row of the precision/recall sweep at a fixed similarity threshold.
+/// "Positive" = duplicate. Pure function of the labeled corpus, so the same
+/// corpus always yields the same curve (no LLM, no store).
+#[derive(Debug, Clone, Serialize)]
+pub struct ThresholdStat {
+    pub threshold: f32,
+    pub tp: usize,
+    pub fp: usize,
+    pub tn: usize,
+    pub false_neg: usize,
+    pub precision: f64,
+    pub recall: f64,
+    pub f1: f64,
+    pub accuracy: f64,
+}
+
+/// Full sweep report: the per-threshold curve plus the data-derived optimum.
+#[derive(Debug, Clone, Serialize)]
+pub struct DedupSweepReport {
+    pub fixture_count: usize,
+    pub positives: usize,
+    pub negatives: usize,
+    pub fixture_fingerprint: String,
+    /// The gate's classifier threshold today (`DEDUP_THRESHOLD`).
+    pub current_gate_threshold: f32,
+    /// Production cold-start global fallback (`PRODUCTION_DEFAULT_THRESHOLD`).
+    pub production_default_threshold: f32,
+    pub curve: Vec<ThresholdStat>,
+    /// HEADLINE recommendation for a hard auto-merge bound: the threshold with
+    /// the highest recall among those achieving precision == 1.0 (zero false
+    /// merges on the corpus). A false merge destroys data, while a miss falls
+    /// through to the gray-zone / LLM path — so precision is the priority for a
+    /// merge bound, NOT F1. `None` if no threshold reaches precision 1.0.
+    pub merge_safe_optimal: Option<ThresholdStat>,
+    /// SECONDARY, informational only: the max-F1 point. Do NOT use this as a
+    /// merge bound — it can carry false positives (here it does), i.e. data
+    /// loss. Reported so the precision/recall trade-off is visible.
+    pub max_f1_point: ThresholdStat,
+    pub power_note: String,
+}
+
+/// Sweep similarity thresholds over `[0.30, 0.95]` step `0.05`, scoring the
+/// labeled corpus at each. `similarity` is computed once per pair.
+pub fn sweep_thresholds(sims: &[(f32, bool)]) -> Vec<ThresholdStat> {
+    let n = sims.len();
+    let mut curve = Vec::new();
+    // Integer stepping avoids f32 accumulation drift: 30, 35, … 95.
+    let mut step = 30u32;
+    while step <= 95 {
+        let threshold = step as f32 / 100.0;
+        let (mut tp, mut fp, mut tn, mut false_neg) = (0usize, 0usize, 0usize, 0usize);
+        for (sim, is_dup) in sims {
+            match (*sim >= threshold, *is_dup) {
+                (true, true) => tp += 1,
+                (true, false) => fp += 1,
+                (false, false) => tn += 1,
+                (false, true) => false_neg += 1,
+            }
+        }
+        let precision = if tp + fp > 0 {
+            tp as f64 / (tp + fp) as f64
+        } else {
+            0.0
+        };
+        let recall = if tp + false_neg > 0 {
+            tp as f64 / (tp + false_neg) as f64
+        } else {
+            0.0
+        };
+        let f1 = if precision + recall > 0.0 {
+            2.0 * precision * recall / (precision + recall)
+        } else {
+            0.0
+        };
+        let accuracy = if n > 0 {
+            (tp + tn) as f64 / n as f64
+        } else {
+            0.0
+        };
+        curve.push(ThresholdStat {
+            threshold,
+            tp,
+            fp,
+            tn,
+            false_neg,
+            precision,
+            recall,
+            f1,
+            accuracy,
+        });
+        step += 5;
+    }
+    curve
+}
+
+/// Pick the optimum: max F1, tie-broken by higher accuracy then HIGHER
+/// threshold (conservative — prefers the bound less likely to over-merge).
+pub fn optimal_threshold(curve: &[ThresholdStat]) -> ThresholdStat {
+    curve
+        .iter()
+        .cloned()
+        .max_by(|a, b| {
+            a.f1.partial_cmp(&b.f1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    a.accuracy
+                        .partial_cmp(&b.accuracy)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then(
+                    a.threshold
+                        .partial_cmp(&b.threshold)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        })
+        .expect("sweep curve is never empty (fixed 0.30..=0.95 grid)")
+}
+
+/// Pick the merge-safe optimum: among thresholds with precision == 1.0 (zero
+/// false merges), the one with the highest recall; tie-break LOWER threshold
+/// (merge as much as is provably safe). `None` if no threshold is false-merge
+/// free on this corpus. This is the correct objective for a HARD auto-merge
+/// bound, where a false positive is data loss.
+pub fn merge_safe_threshold(curve: &[ThresholdStat]) -> Option<ThresholdStat> {
+    curve
+        .iter()
+        .filter(|s| s.precision >= 1.0 - 1e-9 && s.tp + s.fp > 0)
+        .cloned()
+        .max_by(|a, b| {
+            a.recall
+                .partial_cmp(&b.recall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    b.threshold
+                        .partial_cmp(&a.threshold)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        })
+}
+
+/// Load the dedup corpus and run the full sweep. Pure + hermetic (same
+/// fixtures → same report).
+pub fn run_dedup_sweep() -> Result<DedupSweepReport> {
+    let (fixtures, fixture_fingerprint) = load_dedup_fixtures()?;
+    let positives = fixtures.iter().filter(|f| f.is_duplicate).count();
+    let negatives = fixtures.len() - positives;
+    let sims: Vec<(f32, bool)> = fixtures
+        .iter()
+        .map(|f| (similarity(&f.text_a, &f.text_b), f.is_duplicate))
+        .collect();
+    let curve = sweep_thresholds(&sims);
+    let max_f1_point = optimal_threshold(&curve);
+    let merge_safe_optimal = merge_safe_threshold(&curve);
+    let power_note = format!(
+        "n={} ({} duplicate / {} distinct) — power-limited; directional only. \
+         This sweeps LEXICAL similarity (max Jaccard/containment) separability on \
+         the corpus. Production dedup is MULTI-SIGNAL (lexical bound + embedding- \
+         cosine path + gray-zone LLM verdict) and per-cluster adaptive (M6), so \
+         this calibrates the lexical bound in isolation, NOT the full merge \
+         decision. Threshold defaults are left UNCHANGED pending a production- \
+         traffic sample (see docs/backlog/v0.33-eval-gate-calibration.md).",
+        fixtures.len(),
+        positives,
+        negatives
+    );
+    Ok(DedupSweepReport {
+        fixture_count: fixtures.len(),
+        positives,
+        negatives,
+        fixture_fingerprint,
+        current_gate_threshold: DEDUP_THRESHOLD,
+        production_default_threshold: PRODUCTION_DEFAULT_THRESHOLD,
+        curve,
+        merge_safe_optimal,
+        max_f1_point,
+        power_note,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +342,86 @@ mod tests {
     fn dedup_gate_is_not_stub() {
         assert!(!DedupGate.is_stub());
         assert_eq!(DedupGate.name(), "dedup");
+    }
+
+    // ---- v0.36 #C2 sweep ----
+
+    #[test]
+    fn sweep_produces_full_grid_030_to_095() {
+        let curve = sweep_thresholds(&[(1.0, true), (0.0, false)]);
+        assert_eq!(curve.len(), 14, "0.30..=0.95 step 0.05 → 14 rows");
+        assert!((curve.first().unwrap().threshold - 0.30).abs() < 1e-6);
+        assert!((curve.last().unwrap().threshold - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sweep_metrics_correct_at_050() {
+        // sims chosen so threshold 0.50 classifies all four correctly.
+        let sims = [(1.0, true), (0.0, false), (0.6, true), (0.4, false)];
+        let curve = sweep_thresholds(&sims);
+        let row = curve
+            .iter()
+            .find(|r| (r.threshold - 0.50).abs() < 1e-6)
+            .expect("0.50 row exists");
+        assert_eq!((row.tp, row.fp, row.tn, row.false_neg), (2, 0, 2, 0));
+        assert!((row.precision - 1.0).abs() < 1e-9);
+        assert!((row.recall - 1.0).abs() < 1e-9);
+        assert!((row.f1 - 1.0).abs() < 1e-9);
+        assert!((row.accuracy - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn optimal_prefers_higher_threshold_on_f1_tie() {
+        // Perfectly separable → F1 == 1.0 at every threshold in (0.0, 1.0].
+        // Conservative tie-break must pick the HIGHEST such threshold.
+        let curve = sweep_thresholds(&[(1.0, true), (0.0, false)]);
+        let opt = optimal_threshold(&curve);
+        assert!((opt.f1 - 1.0).abs() < 1e-9);
+        assert!(
+            (opt.threshold - 0.95).abs() < 1e-6,
+            "tie-break should prefer the most conservative (highest) threshold, got {}",
+            opt.threshold
+        );
+    }
+
+    #[test]
+    fn production_default_constant_documents_070() {
+        // Guards against silent drift from `default_global_dedup_threshold`.
+        assert!((PRODUCTION_DEFAULT_THRESHOLD - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn run_dedup_sweep_on_real_corpus_is_sane() {
+        let report = run_dedup_sweep().expect("sweep runs on the bundled corpus");
+        assert_eq!(report.curve.len(), 14);
+        assert!(report.positives > 0 && report.negatives > 0);
+        assert_eq!(report.fixture_count, report.positives + report.negatives);
+        assert!(report.max_f1_point.f1 >= 0.0 && report.max_f1_point.f1 <= 1.0);
+        assert!((report.current_gate_threshold - DEDUP_THRESHOLD).abs() < 1e-6);
+        // If a merge-safe point exists, it must have zero false positives.
+        if let Some(ref ms) = report.merge_safe_optimal {
+            assert_eq!(ms.fp, 0, "merge-safe optimum must have precision 1.0");
+        }
+    }
+
+    #[test]
+    fn merge_safe_prefers_lowest_zero_fp_threshold() {
+        // Perfectly separable → precision 1.0 and recall 1.0 at every threshold;
+        // merge-safe tie-break picks the LOWEST (merge as much as is safe).
+        let curve = sweep_thresholds(&[(1.0, true), (0.0, false)]);
+        let ms = merge_safe_threshold(&curve).expect("a zero-FP threshold exists");
+        assert_eq!(ms.fp, 0);
+        assert!((ms.recall - 1.0).abs() < 1e-9);
+        assert!((ms.threshold - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merge_safe_is_none_when_no_threshold_is_clean() {
+        // A lone distinct pair with high lexical similarity: every threshold
+        // that predicts it a duplicate is a false positive, and the thresholds
+        // above it make no positive prediction at all → no merge-safe point.
+        let curve = sweep_thresholds(&[(0.9, false)]);
+        assert!(merge_safe_threshold(&curve).is_none());
     }
 
     #[test]

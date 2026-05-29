@@ -332,6 +332,16 @@ enum GateAction {
         #[arg(long, default_value = "all")]
         gate: String,
     },
+    /// v0.36 #C2 — data-driven threshold sweep. Scores the labeled fixture
+    /// corpus across similarity thresholds `[0.30, 0.95]` step `0.05`, prints
+    /// the precision/recall/F1/accuracy curve plus the max-F1 optimum as JSON.
+    /// Diagnostic only — does not write a scorecard. Currently `dedup` only.
+    Sweep {
+        /// Gate name. Only `dedup` is supported (the only gate with a labeled
+        /// pairwise corpus to sweep a classification threshold over).
+        #[arg(long)]
+        gate: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -885,8 +895,22 @@ fn main() -> Result<()> {
                 noise_floor,
             } => cmd_gate_compare(&gate, baseline.as_deref(), run.as_deref(), noise_floor),
             GateAction::Status { gate } => cmd_gate_status(&gate),
+            GateAction::Sweep { gate } => cmd_gate_sweep(&gate),
         },
     }
+}
+
+/// v0.36 #C2 — print the dedup threshold sweep as pretty JSON.
+fn cmd_gate_sweep(gate: &str) -> Result<()> {
+    if gate != "dedup" {
+        bail!(
+            "sweep is only supported for the `dedup` gate (got `{gate}`); it is the \
+             only gate with a labeled pairwise corpus to sweep a threshold over"
+        );
+    }
+    let report = gates::dedup::run_dedup_sweep()?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 // --- baseline / run -------------------------------------------------------
