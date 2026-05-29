@@ -33,6 +33,16 @@ pub struct RecallEvent {
     pub candidates: Vec<CandidateLog>,
     /// Which memories were actually accessed/used after recall.
     pub accessed_ids: Vec<String>,
+    /// v0.37 #A18 — memories the user explicitly flagged as NOT helpful
+    /// (`helpful == false` on the access-feedback event). Negative training
+    /// samples: the optimizer is rewarded for ranking them LOWER via a
+    /// parameter-free symmetric term (`Σ_pos 1/rank − Σ_neg 1/rank`). A
+    /// memory id appears in EITHER `accessed_ids` OR `negative_ids`, never
+    /// both (an explicit thumb-down dominates on conflict). Empty for all
+    /// pre-v0.37 feedback and any recall without an explicit thumb-down, in
+    /// which case the objective collapses bit-for-bit to the prior
+    /// positives-only reciprocal-rank sum.
+    pub negative_ids: Vec<String>,
     pub timestamp: DateTime<Utc>,
     /// v0.28.7+ audit M-8 R2 P2 follow-up — the cluster id production
     /// recall actually used to bucket per-cluster fusion lookups
@@ -99,6 +109,18 @@ pub struct RecallEvent {
     /// misses, fall back to candidates-derived (the original M-8 R3
     /// derived path, unchanged).
     pub query_top_vec_memory_id_at_recall: Option<String>,
+}
+
+impl RecallEvent {
+    /// True when the event carries a usable training signal — at least one
+    /// accessed (positive) OR explicitly-unhelpful (#A18 negative) memory.
+    /// Replaces the legacy `!accessed_ids.is_empty()` checks at every learn /
+    /// eligibility / offset-advancement site so negative-only feedback also
+    /// reaches the optimizer and advances replay offsets (rather than
+    /// stalling the consumer prefix until the 24h expiry).
+    pub fn has_training_signal(&self) -> bool {
+        !self.accessed_ids.is_empty() || !self.negative_ids.is_empty()
+    }
 }
 
 /// Learned alpha with metadata.
@@ -218,14 +240,16 @@ const SHADOW_GP_EI_SOFT_RANK_SCALE: f64 = 0.05;
 ///
 /// Returns `None` if there are no candidates or no accessed memories.
 pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
-    if event.candidates.is_empty() || event.accessed_ids.is_empty() {
+    if event.candidates.is_empty() || !event.has_training_signal() {
         return None;
     }
 
-    // Check that at least one accessed id exists in candidates.
+    // Check that at least one accessed OR explicitly-unhelpful (#A18) id
+    // exists in candidates — either side provides a usable ranking signal.
     let has_match = event
         .accessed_ids
         .iter()
+        .chain(event.negative_ids.iter())
         .any(|id| event.candidates.iter().any(|c| c.memory_id == *id));
     if !has_match {
         return None;
@@ -249,12 +273,15 @@ pub fn optimal_alpha_for_event(event: &RecallEvent) -> Option<f64> {
         let mut mrr_sum = 0.0_f64;
         for (rank_0, &(_score, idx)) in scored.iter().enumerate() {
             let rank = rank_0 + 1;
-            if event
-                .accessed_ids
-                .iter()
-                .any(|id| *id == event.candidates[idx].memory_id)
-            {
+            let mem_id = &event.candidates[idx].memory_id;
+            if event.accessed_ids.iter().any(|id| id == mem_id) {
                 mrr_sum += 1.0 / rank as f64;
+            } else if event.negative_ids.iter().any(|id| id == mem_id) {
+                // #A18 parameter-free symmetric penalty: reward the alpha
+                // that pushes explicitly-unhelpful memories DOWN. Empty
+                // `negative_ids` ⇒ this branch never fires ⇒ identical to
+                // the prior positives-only sum.
+                mrr_sum -= 1.0 / rank as f64;
             }
         }
         mrr_sum
@@ -350,7 +377,7 @@ pub fn score_candidate_with_shadow_weights(
 /// path, then average tied winners. It is broad enough to learn basic blended
 /// weights without stochastic optimization or changing online recall behavior.
 pub fn optimal_shadow_weights_for_event(event: &RecallEvent) -> Option<ShadowFusionWeights> {
-    if event.candidates.is_empty() || event.accessed_ids.is_empty() {
+    if event.candidates.is_empty() || !event.has_training_signal() {
         return None;
     }
     if !has_matching_accessed_candidate(event) || !has_shadow_feature_variance(event) {
@@ -840,12 +867,18 @@ pub fn shrink_shadow_weights_toward_parent(
 }
 
 fn has_matching_accessed_candidate(event: &RecallEvent) -> bool {
-    event.accessed_ids.iter().any(|id| {
-        event
-            .candidates
-            .iter()
-            .any(|candidate| candidate.memory_id == *id)
-    })
+    // #A18 — a candidate matched by an accessed OR an explicitly-unhelpful
+    // id both yield a usable shadow-weight ranking signal.
+    event
+        .accessed_ids
+        .iter()
+        .chain(event.negative_ids.iter())
+        .any(|id| {
+            event
+                .candidates
+                .iter()
+                .any(|candidate| candidate.memory_id == *id)
+        })
 }
 
 fn has_shadow_feature_variance(event: &RecallEvent) -> bool {
@@ -881,12 +914,12 @@ fn shadow_reciprocal_rank_sum(event: &RecallEvent, weights: ShadowFusionWeights)
             .sum::<f64>()
             / (group_end - group_start) as f64;
         for &(_score, idx) in &scored[group_start..group_end] {
-            if event
-                .accessed_ids
-                .iter()
-                .any(|id| *id == event.candidates[idx].memory_id)
-            {
+            let mem_id = &event.candidates[idx].memory_id;
+            if event.accessed_ids.iter().any(|id| id == mem_id) {
                 mrr_sum += avg_reciprocal_rank;
+            } else if event.negative_ids.iter().any(|id| id == mem_id) {
+                // #A18 symmetric negative term (mirrors optimal_alpha_for_event).
+                mrr_sum -= avg_reciprocal_rank;
             }
         }
         group_start = group_end;
@@ -1042,6 +1075,7 @@ mod tests {
                 })
                 .collect(),
             accessed_ids: accessed.iter().map(|s| s.to_string()).collect(),
+            negative_ids: Vec::new(),
             timestamp: Utc::now() - Duration::days(days_ago),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -1090,6 +1124,93 @@ mod tests {
         assert!(
             alpha <= 0.5,
             "Vector-dominant target should yield low alpha, got {alpha}"
+        );
+    }
+
+    // ── #A18 explicit-negative feedback ───────────────────────────────────
+
+    /// Helper: build a RecallEvent with explicit positive + negative ids.
+    fn make_event_pn(
+        candidates: &[(&str, f32, f32)],
+        accessed: &[&str],
+        negative: &[&str],
+    ) -> RecallEvent {
+        RecallEvent {
+            request_id: "test".to_string(),
+            candidates: candidates
+                .iter()
+                .map(|(id, bm25, vec)| CandidateLog {
+                    memory_id: id.to_string(),
+                    bm25_norm: *bm25,
+                    vec_norm: *vec,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                })
+                .collect(),
+            accessed_ids: accessed.iter().map(|s| s.to_string()).collect(),
+            negative_ids: negative.iter().map(|s| s.to_string()).collect(),
+            timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        }
+    }
+
+    #[test]
+    fn a18_negative_sample_flips_preferred_alpha() {
+        // A is vector-dominant. As a POSITIVE sample the optimizer favors
+        // vector (low alpha) to rank A high; as an explicit NEGATIVE it
+        // favors BM25 (high alpha) to rank A low. The flip proves the
+        // parameter-free symmetric penalty steers alpha the opposite way.
+        let cands = [("A", 0.1_f32, 0.9_f32), ("B", 0.9_f32, 0.1_f32)];
+        let pos = optimal_alpha_for_event(&make_event_pn(&cands, &["A"], &[]))
+            .expect("positive event is informative");
+        let neg = optimal_alpha_for_event(&make_event_pn(&cands, &[], &["A"]))
+            .expect("negative-only event is informative");
+        assert!(
+            neg > pos,
+            "explicit thumb-down must push preferred alpha toward BM25: neg={neg} pos={pos}"
+        );
+    }
+
+    #[test]
+    fn a18_mixed_ranks_positive_above_negative() {
+        // With A positive and B negative, the learned alpha must score the
+        // positive strictly above the negative.
+        let cands = [("A", 0.2_f32, 0.8_f32), ("B", 0.8_f32, 0.2_f32)];
+        let event = make_event_pn(&cands, &["A"], &["B"]);
+        let alpha = optimal_alpha_for_event(&event).expect("informative");
+        let score =
+            |c: &CandidateLog| alpha * c.bm25_norm as f64 + (1.0 - alpha) * c.vec_norm as f64;
+        assert!(
+            score(&event.candidates[0]) > score(&event.candidates[1]),
+            "positive A must outrank negative B at learned alpha={alpha}"
+        );
+    }
+
+    #[test]
+    fn a18_all_candidates_negative_returns_none() {
+        // Every candidate flagged unhelpful ⇒ Σ 1/rank is constant across
+        // alpha (no ordering preference) ⇒ zero-variance guard returns None.
+        let cands = [("A", 0.1_f32, 0.9_f32), ("B", 0.9_f32, 0.1_f32)];
+        let event = make_event_pn(&cands, &[], &["A", "B"]);
+        assert!(
+            optimal_alpha_for_event(&event).is_none(),
+            "all-negative event carries no alpha preference"
+        );
+    }
+
+    #[test]
+    fn a18_shadow_weights_respect_negative_only_event() {
+        // The 6-dim shadow optimizer mirrors the scalar path: a negative-only
+        // event with feature variance is informative (not skipped).
+        let cands = [("A", 0.1_f32, 0.9_f32), ("B", 0.9_f32, 0.1_f32)];
+        let neg_event = make_event_pn(&cands, &[], &["A"]);
+        assert!(
+            optimal_shadow_weights_for_event(&neg_event).is_some(),
+            "negative-only event must drive shadow weight learning"
         );
     }
 
@@ -1236,6 +1357,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["episodic".to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -1275,6 +1397,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["a".to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -1317,6 +1440,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -1455,6 +1579,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["a".to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -1515,6 +1640,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -1571,6 +1697,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,

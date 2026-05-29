@@ -322,6 +322,13 @@ impl OpsRuntime {
 }
 
 impl OpsRuntime {
+    /// v0.37 #A18 scope note: `params.helpful == Some(false)` is recorded in
+    /// each RecallAccess event payload and consumed as a NEGATIVE training
+    /// sample by the M2 alpha optimizer + shadow-weight learner ONLY (see
+    /// `ops/adaptive.rs::parse_candidates_from_event`). `record_access` below
+    /// still bumps `access_count` unconditionally, so M5 tiering, quality
+    /// scoring, and the post-fusion reranker continue to treat a thumb-down as
+    /// an ordinary access — a deliberate v0.37 boundary, not an oversight.
     fn feedback_access(&self, params: AccessFeedbackParams) -> ReinResult<FeedbackOutput> {
         if params.memory_ids.is_empty() {
             return Err(ReinError::Config("memory_ids cannot be empty".into())

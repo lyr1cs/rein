@@ -1642,6 +1642,22 @@ fn peek_recall_events(conn: &rusqlite::Connection) -> Vec<crate::store::adaptive
 
 /// Parse candidate score logs from a recall_complete event payload.
 /// Returns a list of CandidateLog structs extracted from the JSON payload.
+/// v0.37 #A18 — true when an access feedback event explicitly marks the
+/// recall as NOT helpful (`payload.helpful == false`). Shared by the M2
+/// training-event assembly (routes the memory to `negative_ids`) and the
+/// reranker weight learner (excludes the memory from its positive set) so
+/// the two consumers can never disagree on whether an access was a
+/// thumb-down. `helpful` absent/true/null ⇒ not unhelpful (pre-v0.37
+/// back-compat).
+fn access_event_marks_unhelpful(event: &crate::store::adaptive::StoredEvent) -> bool {
+    event
+        .payload
+        .as_deref()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("helpful").and_then(|h| h.as_bool()))
+        == Some(false)
+}
+
 fn parse_candidates_from_event(
     event: &crate::store::adaptive::StoredEvent,
     access_events: &[crate::store::adaptive::StoredEvent],
@@ -1702,29 +1718,51 @@ fn parse_candidates_from_event(
     let recall_request_id: Option<&str> = event.request_id.as_deref();
     let candidate_ids: std::collections::HashSet<&str> =
         candidates.iter().map(|c| c.memory_id.as_str()).collect();
-    let accessed_ids: Vec<String> = access_events
-        .iter()
-        .filter(|a| {
-            match (a.request_id.as_deref(), recall_request_id) {
-                // Strong match: same originating request — attribute regardless
-                // of timestamp (handles delayed access logging within a single
-                // session).
-                (Some(a_rid), Some(r_rid)) => a_rid == r_rid,
-                // One side missing request_id — fall back to the time window.
-                _ => {
-                    let access_ts = chrono::DateTime::parse_from_rfc3339(&a.ts)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or(ts);
-                    (access_ts - ts).num_seconds().abs() < 600
-                }
+    // v0.37 #A18 — split correlated accesses into positive (implicitly
+    // helpful) vs explicit-negative (`helpful == false` on the feedback
+    // payload). A memory flagged unhelpful even once is a negative training
+    // sample and is removed from the positive set: an explicit thumb-down
+    // dominates an implicit access. Empty negatives reproduce the prior
+    // positives-only behavior bit-for-bit (the `helpful` field was a
+    // dead signal before v0.37). Note: `helpful` is documented as
+    // overall-recall quality, emitted per used-memory — used here as the
+    // best-available per-memory negative proxy.
+    let mut positive_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut negative_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in access_events.iter().filter(|a| {
+        match (a.request_id.as_deref(), recall_request_id) {
+            // Strong match: same originating request — attribute regardless
+            // of timestamp (handles delayed access logging within a single
+            // session).
+            (Some(a_rid), Some(r_rid)) => a_rid == r_rid,
+            // One side missing request_id — fall back to the time window.
+            _ => {
+                let access_ts = chrono::DateTime::parse_from_rfc3339(&a.ts)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(ts);
+                (access_ts - ts).num_seconds().abs() < 600
             }
-        })
-        .filter_map(|a| a.memory_id.as_deref())
-        .filter(|mid| candidate_ids.contains(mid))
-        .map(|s| s.to_string())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+        }
+    }) {
+        let Some(mid) = a.memory_id.as_deref() else {
+            continue;
+        };
+        if !candidate_ids.contains(mid) {
+            continue;
+        }
+        if access_event_marks_unhelpful(a) {
+            negative_set.insert(mid.to_string());
+        } else {
+            positive_set.insert(mid.to_string());
+        }
+    }
+    // Negative dominates: a memory thumbed-down at least once never counts
+    // as a positive, even if another access of the same memory was neutral.
+    for neg in &negative_set {
+        positive_set.remove(neg);
+    }
+    let accessed_ids: Vec<String> = positive_set.into_iter().collect();
+    let negative_ids: Vec<String> = negative_set.into_iter().collect();
 
     // v0.28.7+ audit M-8 R2 P2 follow-up — extract the read-time
     // `query_cluster_id` recorded at recall emit time. Pre-fix events
@@ -1755,6 +1793,7 @@ fn parse_candidates_from_event(
         request_id,
         candidates,
         accessed_ids,
+        negative_ids,
         timestamp: ts,
         query_cluster_id_at_recall,
         cluster_version_at_recall,
@@ -2229,7 +2268,7 @@ pub fn shadow_fusion_status(store: &SqliteStore, config: &ReinConfig) -> serde_j
         &recall_events,
         parsed_recall_events
             .iter()
-            .filter(|event| !event.accessed_ids.is_empty()),
+            .filter(|event| event.has_training_signal()),
     );
     let eligible_samples = events_with_access.len();
     if eligible_samples < min_samples {
@@ -2560,10 +2599,12 @@ fn run_alpha_learning(
         .filter_map(|event| parse_candidates_from_event(event, &access_events))
         .collect();
 
-    // Only learn from events that have actual access data
+    // Only learn from events that carry a usable training signal — positive
+    // accesses OR explicit #A18 negatives (negative-only events steer alpha
+    // away from the unhelpful memory and must not be dropped here).
     let events_with_access: Vec<_> = recall_events
         .iter()
-        .filter(|e| !e.accessed_ids.is_empty())
+        .filter(|e| e.has_training_signal())
         .cloned()
         .collect();
 
@@ -2573,7 +2614,7 @@ fn run_alpha_learning(
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
     let matched_request_ids: std::collections::HashSet<&str> = recall_events
         .iter()
-        .filter(|re| !re.accessed_ids.is_empty())
+        .filter(|re| re.has_training_signal())
         .map(|re| re.request_id.as_str())
         .collect();
 
@@ -2900,7 +2941,17 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
         );
     }
 
-    // Collect confirmed-used memory IDs
+    // Collect confirmed-used memory IDs.
+    //
+    // v0.37 #A18 scope boundary: a `helpful:false` access is intentionally NOT
+    // special-cased here. The explicit-negative signal is consumed by the M2
+    // alpha optimizer + shadow-weight learner ONLY (see
+    // `parse_candidates_from_event`). The reranker — like M5 tiering and
+    // quality scoring, which all key off `record_access` — still treats the
+    // underlying access uniformly. Making the reranker negative-aware means
+    // coordinating its dual access/recall consumer offsets (a first-class
+    // negative event), deliberately deferred to a future slice rather than
+    // special-cased into this replay machinery.
     let used_ids: std::collections::HashSet<String> = feedback_events
         .iter()
         .filter_map(|e| e.memory_id.clone())
@@ -4103,6 +4154,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec![accessed_id.to_string()],
+            negative_ids: Vec::new(),
             timestamp: Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -4608,6 +4660,156 @@ mod tests {
             parsed.accessed_ids
         );
         assert_eq!(parsed.accessed_ids[0], "mem-x");
+    }
+
+    /// #A18 — an access event whose payload carries `helpful: false` must
+    /// land in `negative_ids` (and NOT `accessed_ids`); a helpful access
+    /// stays positive. Proves the previously-dead `helpful` signal is now
+    /// wired into the M2 training event.
+    #[test]
+    fn test_parse_candidates_routes_unhelpful_access_to_negative_ids() {
+        use crate::store::adaptive::StoredEvent;
+
+        let candidates_payload = serde_json::json!({
+            "candidates": [
+                {"id": "mem-pos", "bm25_norm": 0.5, "vec_norm": 0.5},
+                {"id": "mem-neg", "bm25_norm": 0.4, "vec_norm": 0.6},
+            ]
+        });
+        let now = chrono::Utc::now();
+        let recall = StoredEvent {
+            id: 1,
+            ts: now.to_rfc3339(),
+            event_type: "recall_complete".into(),
+            request_id: Some("req-1".into()),
+            memory_id: None,
+            concept_id: None,
+            query: None,
+            query_type: Some("semantic".into()),
+            topic: None,
+            payload: Some(candidates_payload.to_string()),
+        };
+        let access_pos = StoredEvent {
+            id: 2,
+            ts: now.to_rfc3339(),
+            event_type: "recall_access".into(),
+            request_id: Some("req-1".into()),
+            memory_id: Some("mem-pos".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: Some(
+                serde_json::json!({"source": "agent_feedback", "helpful": true}).to_string(),
+            ),
+        };
+        let access_neg = StoredEvent {
+            id: 3,
+            ts: now.to_rfc3339(),
+            event_type: "recall_access".into(),
+            request_id: Some("req-1".into()),
+            memory_id: Some("mem-neg".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: Some(
+                serde_json::json!({"source": "agent_feedback", "helpful": false}).to_string(),
+            ),
+        };
+
+        let parsed = parse_candidates_from_event(&recall, &[access_pos, access_neg])
+            .expect("recall should parse");
+
+        assert_eq!(
+            parsed.accessed_ids,
+            vec!["mem-pos".to_string()],
+            "helpful access stays positive"
+        );
+        assert_eq!(
+            parsed.negative_ids,
+            vec!["mem-neg".to_string()],
+            "helpful=false access routes to negative_ids"
+        );
+    }
+
+    /// #A18 — when the SAME memory has both a neutral and an unhelpful
+    /// access, the explicit thumb-down dominates (memory excluded from
+    /// positives, present in negatives).
+    #[test]
+    fn test_parse_candidates_negative_dominates_on_conflict() {
+        use crate::store::adaptive::StoredEvent;
+        let now = chrono::Utc::now();
+        let recall = StoredEvent {
+            id: 1,
+            ts: now.to_rfc3339(),
+            event_type: "recall_complete".into(),
+            request_id: Some("req-1".into()),
+            memory_id: None,
+            concept_id: None,
+            query: None,
+            query_type: Some("semantic".into()),
+            topic: None,
+            payload: Some(
+                serde_json::json!({"candidates": [{"id": "mem-x", "bm25_norm": 0.5, "vec_norm": 0.5}]})
+                    .to_string(),
+            ),
+        };
+        let mk_access = |id: i64, helpful: bool| StoredEvent {
+            id,
+            ts: now.to_rfc3339(),
+            event_type: "recall_access".into(),
+            request_id: Some("req-1".into()),
+            memory_id: Some("mem-x".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: Some(
+                serde_json::json!({"source": "agent_feedback", "helpful": helpful}).to_string(),
+            ),
+        };
+        let parsed =
+            parse_candidates_from_event(&recall, &[mk_access(2, true), mk_access(3, false)])
+                .expect("recall should parse");
+        assert!(
+            parsed.accessed_ids.is_empty(),
+            "negative dominates: thumbed-down memory is not a positive"
+        );
+        assert_eq!(parsed.negative_ids, vec!["mem-x".to_string()]);
+    }
+
+    /// #A18 — the shared thumb-down predicate used by BOTH the M2 assembly
+    /// and the reranker learner. Only an explicit `helpful:false` counts;
+    /// true / null / absent / no-payload are all non-unhelpful (back-compat).
+    #[test]
+    fn test_access_event_marks_unhelpful() {
+        use crate::store::adaptive::StoredEvent;
+        let mk = |payload: Option<&str>| StoredEvent {
+            id: 1,
+            ts: chrono::Utc::now().to_rfc3339(),
+            event_type: "recall_access".into(),
+            request_id: Some("r".into()),
+            memory_id: Some("m".into()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: payload.map(|s| s.to_string()),
+        };
+        assert!(access_event_marks_unhelpful(&mk(Some(
+            r#"{"source":"agent_feedback","helpful":false}"#
+        ))));
+        assert!(!access_event_marks_unhelpful(&mk(Some(
+            r#"{"source":"agent_feedback","helpful":true}"#
+        ))));
+        assert!(!access_event_marks_unhelpful(&mk(Some(
+            r#"{"helpful":null}"#
+        ))));
+        assert!(!access_event_marks_unhelpful(&mk(Some(
+            r#"{"source":"agent_feedback"}"#
+        ))));
+        assert!(!access_event_marks_unhelpful(&mk(None)));
     }
 
     // ── Test 2: build_survival_curves with access data ───────────────────────
@@ -5203,6 +5405,7 @@ mod tests {
                 ],
                 // Agent accessed the BM25-dominant candidate
                 accessed_ids: vec![mem_a],
+                negative_ids: Vec::new(),
                 timestamp: Utc::now() - chrono::Duration::hours(i as i64),
                 query_cluster_id_at_recall: None,
                 cluster_version_at_recall: None,
@@ -5276,6 +5479,7 @@ mod tests {
                     },
                 ],
                 accessed_ids: vec![target.clone()],
+                negative_ids: Vec::new(),
                 timestamp: Utc::now() - chrono::Duration::minutes(i as i64),
                 query_cluster_id_at_recall: None,
                 cluster_version_at_recall: None,
@@ -6246,6 +6450,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["click_target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -6272,6 +6477,7 @@ mod tests {
             request_id: "rid-2".to_string(),
             candidates: vec![],
             accessed_ids: vec!["click_target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -6297,6 +6503,7 @@ mod tests {
                 source_diversity: 1.0,
             }],
             accessed_ids: vec![],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -6332,6 +6539,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec![],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -6374,6 +6582,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["click_target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -6415,6 +6624,7 @@ mod tests {
                 },
             ],
             accessed_ids: vec!["click_target".to_string()],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: None,
             cluster_version_at_recall: None,
@@ -6453,6 +6663,7 @@ mod tests {
                 source_diversity: 1.0,
             }],
             accessed_ids: vec![],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             // But production read-time recorded cluster=42 — that is
             // the SOURCE OF TRUTH for bucket alignment.
@@ -6573,6 +6784,7 @@ mod tests {
                 source_diversity: 1.0,
             }],
             accessed_ids: vec![],
+            negative_ids: Vec::new(),
             timestamp: chrono::Utc::now(),
             query_cluster_id_at_recall: Some(7),
             cluster_version_at_recall: Some(5),
