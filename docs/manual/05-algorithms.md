@@ -48,6 +48,17 @@ flowchart TD
 The recall output should be read as a canonical result set. Evidence rows are
 supporting observations, not separate competing memories.
 
+**Strong-signal fast-path (v0.36).** When the BM25 channel returns a dominant
+top hit (top1/top2 ratio over the configured threshold), that hit survives
+every downstream drop-filter (live-status, cold-tier, keyword/topic/time), the
+query needs no episode channel (non-episodic, no time bounds), and the
+surviving local hits already cover the requested `limit` after canonical
+collapse, recall deterministically skips the knowledge-graph channel and does
+not launch Supermemory — the two highest-latency fallbacks leave the critical
+path. The guard conditions are exact: if any of them fails, the full pipeline
+runs unchanged. The trade-off is validated by the recall eval gate holding
+non-inferior (paired McNemar) against the full-pipeline baseline.
+
 ## Query Classification
 
 `search/classify.rs` uses deterministic string rules, Unicode NFKC
