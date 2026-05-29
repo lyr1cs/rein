@@ -477,6 +477,15 @@ fn strip_trailing_punct(s: &str) -> &str {
 /// `１２３` → `123`, half-width katakana → full-width) so the Agent E
 /// triple-set comparison treats stylistic variants as equal.
 pub fn normalize_for_compare(triple: &Triple) -> Triple {
+    // v0.37 #A5 note: NFKC + lowercase only. A Snowball (Porter2) stemming pass
+    // was prototyped to collapse morphological variants ("tabs"→"tab") for
+    // fact-layer dedup, but reverted — naive English stemming is lossy on the
+    // non-dictionary tokens that dominate memory entities (acronyms, lowercase
+    // acronyms, proper nouns: `ARS`→`ar`, `Windows`→`window`), producing
+    // false full-triple matches in the gray-zone merge-upgrade path (a false
+    // merge destroys data). A safe version needs lexicon/NER-guarded
+    // normalization or a persistence-backed exact fingerprint — deferred to a
+    // schema-backed slice (see docs/backlog/algorithm.md #5).
     let subject = triple
         .subject
         .nfkc()
