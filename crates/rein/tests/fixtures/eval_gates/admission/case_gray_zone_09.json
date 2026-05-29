@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_09",
+  "topic": "incoming-note",
+  "content": "kaplan meier survival curves estimate per cluster memory decay rates",
+  "existing": [
+    {
+      "id": "ex_g9",
+      "topic": "store-record",
+      "content": "kaplan meier survival curves estimate fixed ebbinghaus decay half life"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

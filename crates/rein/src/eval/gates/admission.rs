@@ -82,21 +82,27 @@ impl Gate for AdmissionGate {
     }
 }
 
-/// `hit` = the admission classifier agrees with the ground-truth label.
-fn classify_one(fx: &AdmissionFixture) -> bool {
+/// Best (max) candidate similarity against the fixture's `existing` set.
+/// Extracted so the decision band AND the gray-zone margin invariant are both
+/// unit-testable. `cluster_id = None` (matches `mem.cluster_id = None`), so
+/// `cluster_match` never fires and `best == lexical similarity` plus an
+/// optional +0.05 topic bump — fixtures use non-overlapping topics so the bump
+/// never fires; best == lexical.
+fn candidate_best_sim(fx: &AdmissionFixture) -> f32 {
     let mut best = 0.0f32;
     for existing in &fx.existing {
         let mem = existing_to_memory(existing);
-        // cluster_id = None here (matches `mem.cluster_id = None`), so
-        // `cluster_match` is always false and best == lexical similarity
-        // plus an optional +0.05 topic bump.  Fixtures deliberately use
-        // non-overlapping topics so the bump never fires; best == lexical.
         let score = score_candidate(&fx.topic, &fx.content, &mem, None).final_score;
         if score > best {
             best = score;
         }
     }
-    decide(best) == fx.expected_decision
+    best
+}
+
+/// `hit` = the admission classifier agrees with the ground-truth label.
+fn classify_one(fx: &AdmissionFixture) -> bool {
+    decide(candidate_best_sim(fx)) == fx.expected_decision
 }
 
 /// Merge threshold mirroring the live `check_dedup` auto-merge bound
@@ -300,6 +306,58 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    #[ignore = "diagnostic — run with --ignored --nocapture to read gray-zone margins"]
+    fn dump_gray_zone_margins() {
+        let (fixtures, _) = load_admission_fixtures().unwrap();
+        for fx in &fixtures {
+            if fx.expected_decision == "gray_zone" {
+                let s = candidate_best_sim(fx);
+                eprintln!(
+                    "{}: best_sim={:.4} margin_to_0.35={:.4} margin_to_0.70={:.4}",
+                    fx.id,
+                    s,
+                    s - 0.35,
+                    0.70 - s
+                );
+            }
+        }
+    }
+
+    /// v0.36 #C3: every gray-zone fixture must sit comfortably inside the band,
+    /// not near an edge where a single-token edit flips it to admit_new (≤0.35)
+    /// or duplicate (>0.70). Guards against the fragility flagged at v0.33 ship
+    /// (fixtures were landing at best_sim≈0.40, only 0.05 above the 0.35 edge).
+    #[test]
+    fn gray_zone_fixtures_have_safe_margin() {
+        let (fixtures, _) = load_admission_fixtures().unwrap();
+        let gray: Vec<&AdmissionFixture> = fixtures
+            .iter()
+            .filter(|f| f.expected_decision == "gray_zone")
+            .collect();
+        assert!(
+            gray.len() >= 10,
+            "expected >= 10 gray-zone fixtures for statistical room, got {}",
+            gray.len()
+        );
+        for fx in gray {
+            let s = candidate_best_sim(fx);
+            let margin = (s - 0.35).min(0.70 - s);
+            assert!(
+                margin >= 0.07,
+                "gray-zone fixture {} sits at best_sim={s:.4} (edge margin {margin:.4} < 0.07) \
+                 — a single-token edit could flip its band; widen the token overlap",
+                fx.id
+            );
+            assert_eq!(
+                decide(s),
+                "gray_zone",
+                "{} must classify as gray_zone",
+                fx.id
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_07",
+  "topic": "incoming-note",
+  "content": "tantivy bm25 ranking weights term frequency against inverse document presence",
+  "existing": [
+    {
+      "id": "ex_g7",
+      "topic": "store-record",
+      "content": "tantivy bm25 ranking weights term similarity across dense embedding vectors"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

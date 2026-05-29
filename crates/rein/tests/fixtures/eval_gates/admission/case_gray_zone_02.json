@@ -6,7 +6,7 @@
     {
       "id": "ex_h1",
       "topic": "store-record",
-      "content": "rust borrow checker reports data lifetimes inside generic helper functions"
+      "content": "rust borrow checker prevents data lifetimes inside generic helper functions"
     }
   ],
   "expected_decision": "gray_zone"

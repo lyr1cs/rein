@@ -1,12 +1,12 @@
 {
   "id": "gray_zone_05",
   "topic": "incoming-note",
-  "content": "OAuth provider issues short-lived access tokens and rotates refresh tokens on use",
+  "content": "oauth provider issues access tokens rotating refresh secrets per session",
   "existing": [
     {
       "id": "ex_g5",
       "topic": "store-record",
-      "content": "OAuth provider rotates refresh tokens on every exchange and revokes the family on replay"
+      "content": "oauth provider issues access tokens revoking stale grants per replay"
     }
   ],
   "expected_decision": "gray_zone"

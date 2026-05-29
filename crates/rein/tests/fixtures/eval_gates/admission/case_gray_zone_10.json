@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_10",
+  "topic": "incoming-note",
+  "content": "supermemory cloud query runs concurrently with local fts vector channels",
+  "existing": [
+    {
+      "id": "ex_g10",
+      "topic": "store-record",
+      "content": "supermemory cloud query runs after local recall completes its fusion"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}

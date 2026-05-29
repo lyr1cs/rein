@@ -2,11 +2,11 @@
   "schema_version": 2,
   "gate_name": "admission",
   "kind": "baseline",
-  "created_at": 1779972063,
-  "rein_version": "0.34.0",
-  "build_fingerprint": "8ee2c477e080f92e2bcb48dc503c20f8",
-  "fixture_fingerprint": "385c3de1b492114b52cff765f3315eb0",
-  "fixture_count": 20,
+  "created_at": 1780013363,
+  "rein_version": "0.35.0",
+  "build_fingerprint": "7b6bac762156f8f56202d30bdc892f09",
+  "fixture_fingerprint": "a84a9105944487ab7e08080949105f8b",
+  "fixture_count": 24,
   "score": 1.0,
   "per_fixture": [
     {
@@ -87,6 +87,22 @@
     },
     {
       "fixture_id": "gray_zone_06",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_07",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_08",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_09",
+      "hit": true
+    },
+    {
+      "fixture_id": "gray_zone_10",
       "hit": true
     }
   ]

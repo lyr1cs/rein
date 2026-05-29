@@ -1,0 +1,13 @@
+{
+  "id": "gray_zone_08",
+  "topic": "incoming-note",
+  "content": "knowledge graph traversal expands seed concepts into neighboring linked memories",
+  "existing": [
+    {
+      "id": "ex_g8",
+      "topic": "store-record",
+      "content": "knowledge graph traversal expands seed concepts following temporal valid windows"
+    }
+  ],
+  "expected_decision": "gray_zone"
+}
