@@ -7,6 +7,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.86"
 license = "AGPL-3.0-or-later"
 authors = ["lyr1cs <42969110+lyr1cs@users.noreply.github.com>"]
 

@@ -40,3 +40,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  msrv:
+    # Enforce the declared MSRV (rust-version = "1.86"). If a dependency bump or
+    # code change raises the floor, this job fails — bump rust-version + docs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p rein --locked
