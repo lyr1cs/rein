@@ -2089,4 +2089,95 @@ mod tests {
         assert_eq!(parsed["id"], serde_json::Value::Null);
         assert_eq!(parsed["error"]["code"], serde_json::json!(-32600));
     }
+
+    /// v1.0 MCP API-surface freeze: the set of tools and each tool's argument
+    /// surface (sorted top-level property names + required fields) is pinned.
+    /// Adding/removing a tool, or changing a tool's args, breaks this —
+    /// enforcing the 1.0 contract that the MCP tool surface is stable. Update
+    /// `GOLDEN` only with an intentional, documented API change.
+    #[test]
+    fn mcp_tool_arg_surface_is_frozen() {
+        let mut lines: Vec<String> = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .map(|e| {
+                let schema: serde_json::Value = (e.input_schema)().into();
+                let props = schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|m| {
+                        let mut k: Vec<String> = m.keys().cloned().collect();
+                        k.sort();
+                        k.join(",")
+                    })
+                    .unwrap_or_default();
+                let required = schema
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|a| {
+                        let mut v: Vec<String> = a
+                            .iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect();
+                        v.sort();
+                        v.join(",")
+                    })
+                    .unwrap_or_default();
+                format!("{}: props[{props}] req[{required}]", e.mcp_name)
+            })
+            .collect();
+        lines.sort();
+        let snapshot = lines.join("\n");
+        // Frozen at v1.0 (2026-05-30). Update ONLY with an intentional API change.
+        const GOLDEN: &str = "\
+rein_adaptive_status: props[] req[]
+rein_archive_summary_refresh: props[force,memory_id] req[memory_id]
+rein_ars_acceleration_gate: props[] req[]
+rein_canonicals: props[limit] req[]
+rein_cleanup: props[all,asynchronous,dry_run,exact_topics,pattern,topic,topics] req[]
+rein_concept_history: props[limit,memoir,name] req[memoir,name]
+rein_concept_state: props[cluster_id,concept_id,query_type] req[concept_id]
+rein_concept_summary_refresh: props[concept_id,dry_run] req[]
+rein_consolidate: props[all,dry_run,merge_variants,pattern,summary,topic,topics] req[]
+rein_dedup: props[dry_run,merge_variants] req[]
+rein_dedup_concepts: props[] req[]
+rein_evidence: props[canonical_id,limit] req[canonical_id]
+rein_feedback: props[] req[]
+rein_feedback_concept_summary: props[concept_id,concept_summary_id,interaction,living_summary_id,metadata,recall_id] req[concept_id,interaction,recall_id]
+rein_forget: props[id] req[id]
+rein_gc: props[dry_run,threshold] req[]
+rein_health: props[topic] req[]
+rein_ingest_session: props[agent_label,async_mode,compact_summary,content,is_subagent,session_id,started_at,summary,title,tool_outputs,turns] req[]
+rein_judge_concept_summary: props[concept_summary_id,judge_model_override] req[concept_summary_id]
+rein_judge_synthesis: props[judge_model_override,synthesis_id] req[synthesis_id]
+rein_list_topics: props[] req[]
+rein_memoir_add_concept: props[definition,labels,memoir,name] req[definition,memoir,name]
+rein_memoir_create: props[description,name] req[name]
+rein_memoir_export: props[format,name] req[name]
+rein_memoir_inspect: props[depth,memoir,name] req[memoir,name]
+rein_memoir_link: props[from,memoir,relation,to] req[from,memoir,relation,to]
+rein_memoir_list: props[] req[]
+rein_memoir_refine: props[definition,memoir,name] req[definition,memoir,name]
+rein_memoir_search: props[limit,memoir,query] req[memoir,query]
+rein_memoir_search_all: props[limit,query] req[query]
+rein_memoir_show: props[name] req[name]
+rein_organize: props[max_links] req[]
+rein_recall: props[expand,from,keyword,limit,query,synthesize,to,topic] req[query]
+rein_recent: props[limit] req[]
+rein_resummerize: props[canonical_id,dry_run] req[]
+rein_stats: props[] req[]
+rein_store: props[content,importance,keywords,topic] req[content,topic]
+rein_timeline: props[from,limit,to] req[]
+rein_trust_measurement: props[] req[]
+rein_update: props[content,id,importance] req[content,id]";
+        assert_eq!(
+            snapshot.trim(),
+            GOLDEN.trim(),
+            "MCP tool arg surface changed. If intentional, update GOLDEN + docs.\nACTUAL:\n{snapshot}"
+        );
+        assert_eq!(
+            lines.len(),
+            40,
+            "expected 40 MCP tools; got {}",
+            lines.len()
+        );
+    }
 }
