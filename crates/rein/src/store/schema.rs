@@ -154,6 +154,92 @@ fn add_column_idempotent(conn: &Connection, sql: &str) -> ReinResult<()> {
     }
 }
 
+/// Cross-process serialization for the open-time bring-up + forward migrations.
+///
+/// `bring_up_to_baseline` can't be wrapped in a SQL transaction
+/// (`migrate_source_check` toggles `PRAGMA foreign_keys` — a no-op inside a txn
+/// — and opens its own `BEGIN EXCLUSIVE`; vec0 virtual tables are created there
+/// too), so a SQLite lock can't span the sequence. Instead take an OS advisory
+/// lock (`flock`) on a sidecar `<db>.migrate.lock`, mirroring `with_hnsw_lock`.
+/// The winner runs detect → bring-up → migrate while peers block on the lock,
+/// then re-read the stamped `user_version` and skip — so a forward `DROP`/rename
+/// is never resurrected by a peer's stale bring-up running over an
+/// already-migrated schema.
+///
+/// `:memory:` and pathless connections are single-process (no shared inode) and
+/// need no lock (`NotNeeded`). On a file-backed DB a create/`flock` failure
+/// yields `Failed`, and the caller fails closed before any mutating schema work
+/// rather than running it unserialized (a degraded lock there could let two
+/// concurrent first-opens resurrect a dropped column). Released on drop (and
+/// again implicitly when the fd closes).
+enum MigrationLock {
+    /// Exclusive advisory lock held on `<db>.migrate.lock`.
+    Held(std::fs::File),
+    /// Single-process connection (`:memory:` / pathless) — migration work may
+    /// proceed without a cross-process lock.
+    NotNeeded,
+    /// File-backed DB whose lock could not be created/acquired — the caller
+    /// MUST fail closed before running any mutating schema work.
+    Failed,
+}
+
+impl MigrationLock {
+    fn acquire(conn: &Connection) -> Self {
+        let path = match conn.path() {
+            Some(p) if p != ":memory:" && !p.is_empty() => p.to_string(),
+            _ => return Self::NotNeeded,
+        };
+        let lock_path = format!("{path}.migrate.lock");
+        let file = match std::fs::File::create(&lock_path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("migration lock: create {lock_path} failed: {e}");
+                return Self::Failed;
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                tracing::warn!(
+                    "migration flock(LOCK_EX) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                return Self::Failed;
+            }
+            Self::Held(file)
+        }
+        #[cfg(not(unix))]
+        {
+            // No portable advisory file lock without an extra dependency, so a
+            // non-unix file-backed DB is reported `Failed`: a pending FORWARD
+            // migration then fails closed (it can't be serialized here), while
+            // idempotent baseline bring-up still proceeds. rein's production
+            // target is macOS (unix), where the `flock` above is the real lock.
+            let _ = file;
+            Self::Failed
+        }
+    }
+
+    /// True when migration work may safely proceed: an exclusive lock is held,
+    /// or the connection is single-process. `Failed` returns false so the caller
+    /// fails closed instead of running migrations unserialized.
+    fn serialized(&self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Self::Held(file) = self {
+            use std::os::unix::io::AsRawFd;
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 /// Bring the schema up to the current version and run any pending forward
 /// migrations. Safe to call on every open: it is cheap once a DB is at the
 /// latest version (one `PRAGMA user_version` read, then nothing).
@@ -171,6 +257,14 @@ fn init_schema_with_migrations(
     dims: usize,
     migrations: &[Migration],
 ) -> ReinResult<()> {
+    // Serialize the whole detect → bring-up → migrate sequence across processes
+    // via an OS advisory lock on a sidecar file (see `MigrationLock`). Held until
+    // this function returns; a peer that opens the same pre-baseline DB blocks
+    // here, then re-reads the stamped version below and skips bring-up + applied
+    // migrations — closing the first-open resurrection/double-apply race that a
+    // SQL transaction can't cover (bring-up runs in autocommit).
+    let migration_lock = MigrationLock::acquire(conn);
+
     let current = schema_user_version(conn)?;
     let max_known = max_known_schema_version(migrations);
 
@@ -182,6 +276,24 @@ fn init_schema_with_migrations(
             "database schema version {current} is newer than this rein build \
              supports (max {max_known}); upgrade rein to open this database"
         )));
+    }
+
+    // Fail closed when a FORWARD migration is pending but the cross-process lock
+    // couldn't be taken (file-backed DB with a create/`flock` failure, or a
+    // non-unix build). A forward `DROP`/rename run unserialized is the
+    // resurrection/double-apply hazard. Idempotent baseline bring-up
+    // (`current < BASELINE`, no forward migration) is NOT gated here — concurrent
+    // bring-ups are benign (all `CREATE IF NOT EXISTS` + `add_column_idempotent`),
+    // so a Windows single-process first-open isn't broken by a missing flock.
+    // With `MIGRATIONS` empty this never fires. Unix file DBs hold the real lock
+    // above; `:memory:` is single-process.
+    let forward_migration_pending = migrations.iter().any(|m| m.version > current);
+    if forward_migration_pending && !migration_lock.serialized() {
+        return Err(ReinError::Config(
+            "could not acquire the schema migration lock (<db>.migrate.lock); \
+             refusing to run a forward schema migration unserialized"
+                .to_string(),
+        ));
     }
 
     // One-time legacy bring-up. `bring_up_to_baseline` is idempotent, so it
@@ -199,16 +311,12 @@ fn init_schema_with_migrations(
         // a txn, and opens its own `BEGIN EXCLUSIVE`; vec0 virtual tables are
         // also created there).
         //
-        // RESIDUAL (must fix before the first forward migration ships): two
-        // processes first-opening a *pre-baseline* DB in a release that ALSO
-        // adds a forward migration could both run bring-up, one re-adding a
-        // column the other's forward migration dropped. Benign while
-        // `MIGRATIONS` is empty (no forward migration ⇒ nothing to resurrect,
-        // and the max reachable version is the baseline so this guard can't
-        // downgrade). Full first-open serialization (flock sidecar or claim
-        // row) is required alongside the first `MIGRATIONS` entry. The
-        // forward-migration double-apply half is already covered by the in-lock
-        // recheck in `apply_migrations`.
+        // First-open serialization across processes is now provided by the
+        // `MigrationLock` flock held for this whole function (acquired at the
+        // top), so a peer can't run bring-up over an already-migrated schema and
+        // resurrect a dropped column. This in-lock monotonic stamp guard + the
+        // `apply_migrations` recheck remain as defense-in-depth, and cover the
+        // lock-degraded paths (`:memory:`, create/flock failure, non-unix).
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let stamped = (|| -> ReinResult<()> {
             if schema_user_version(conn)? < BASELINE_SCHEMA_VERSION {
@@ -2477,6 +2585,35 @@ mod migration_tests {
         assert_eq!(
             schema_user_version(&conn).unwrap(),
             BASELINE_SCHEMA_VERSION + 1
+        );
+    }
+
+    /// File-backed DB exercises the `MigrationLock` flock path (the in-memory
+    /// tests skip it: `:memory:` takes no lock). First open stamps baseline and
+    /// drops the lock cleanly; the sidecar exists; a second open is a clean
+    /// no-op (re-acquire + release, version unchanged).
+    #[test]
+    fn file_db_init_schema_takes_and_releases_migration_lock() {
+        init_sqlite_vec();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db = dir.path().join("rein-miglock-test.db");
+        {
+            let conn = Connection::open(&db).expect("open file db");
+            init_schema(&conn, 4).expect("first init on a file db");
+            assert_eq!(schema_user_version(&conn).unwrap(), BASELINE_SCHEMA_VERSION);
+        }
+        let lock = std::path::PathBuf::from(format!("{}.migrate.lock", db.display()));
+        assert!(
+            lock.exists(),
+            "migration lock sidecar should exist next to a file-backed DB"
+        );
+        // Second open: the lock is re-acquired and released, bring-up is skipped
+        // (version already at baseline), and no error surfaces.
+        let conn2 = Connection::open(&db).expect("reopen file db");
+        init_schema(&conn2, 4).expect("second init must be a clean no-op");
+        assert_eq!(
+            schema_user_version(&conn2).unwrap(),
+            BASELINE_SCHEMA_VERSION
         );
     }
 }
