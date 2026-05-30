@@ -64,9 +64,227 @@ pub fn init_sqlite_vec() {
     });
 }
 
-/// Create all tables, indexes, triggers, and virtual tables.
+/// Single global schema version, stored in SQLite's `PRAGMA user_version`
+/// (an otherwise-unused header slot — this is the first thing to claim it).
+///
+/// `BASELINE_SCHEMA_VERSION` marks the de-facto schema produced by the
+/// idempotent legacy bring-up (`bring_up_to_baseline`) as of v0.38.0. Forward
+/// migrations in `MIGRATIONS` use versions strictly greater than this.
+///
+/// INVARIANT (resurrection-safety): the legacy bring-up — every probe-then-ALTER
+/// and every `migrate_*` fn — runs ONLY when `user_version < BASELINE`. Once a DB
+/// is stamped at baseline, only the forward migration runner mutates DDL, so a
+/// forward `DROP COLUMN` is never silently re-added by a re-probe on the next
+/// open. This is the central correctness property of the framework; it is
+/// pinned by `migration_drop_column_is_not_resurrected` in `migration_tests`.
+///
+/// NOTE: this is distinct from the per-row `schema_version` columns on
+/// `session_artifacts` / `ars_parameter_policy` — those version individual row
+/// *payloads* for forward-compatible deserialization and are intentionally left
+/// untouched here (the ars R8 peek-before-deserialize path depends on them).
+const BASELINE_SCHEMA_VERSION: i64 = 1;
+
+/// A single forward, version-gated schema migration.
+///
+/// `up` runs inside a transaction that also bumps `PRAGMA user_version` to
+/// `version`; the DDL and the version bump commit (or roll back) together, so a
+/// failed migration leaves both the schema and the recorded version unchanged
+/// (fail-loud + atomic). Use `up` for rename / type-change / drop via SQLite's
+/// 12-step table-rebuild — reuse `MEMORIES_TRIGGERS_SQL` when rebuilding
+/// `memories`, since dropping the table tears its triggers down.
+///
+/// CONTRACT: `up` already runs inside `apply_migrations`' `BEGIN IMMEDIATE`, so
+/// it must NOT open its own transaction or toggle connection-level pragmas
+/// (`PRAGMA foreign_keys` is a no-op inside a transaction); use a `SAVEPOINT`
+/// if nested rollback scope is needed. It is therefore NOT a drop-in copy of
+/// `migrate_source_check`, which runs in autocommit during legacy bring-up and
+/// opens its own `BEGIN EXCLUSIVE`.
+struct Migration {
+    version: i64,
+    #[allow(dead_code)] // retained for logging / future migration ledger.
+    name: &'static str,
+    up: fn(&Connection) -> ReinResult<()>,
+}
+
+/// Forward migrations applied after baseline, in ascending `version` order.
+///
+/// Empty at the moment the framework lands: baseline stamping + the downgrade
+/// guard + fail-loud column adds ship first, exercised by the synthetic-migration
+/// tests in `migration_tests`. The first real forward migration (durable
+/// triple/fact table for the #A5 persistence unlock) is appended next.
+const MIGRATIONS: &[Migration] = &[];
+
+/// Read the global schema version from `PRAGMA user_version` (0 on a DB this
+/// framework has never stamped).
+fn schema_user_version(conn: &Connection) -> ReinResult<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+/// Stamp `PRAGMA user_version`. When called inside an open transaction the
+/// write participates in it (the value lives in the database header page).
+fn set_schema_user_version(conn: &Connection, version: i64) -> ReinResult<()> {
+    conn.pragma_update(None, "user_version", version)?;
+    Ok(())
+}
+
+/// Highest version this build knows how to reach: the max migration version, or
+/// the baseline when no forward migrations exist yet. A DB stamped above this
+/// was written by a newer rein and must not be opened (see downgrade guard).
+fn max_known_schema_version(migrations: &[Migration]) -> i64 {
+    migrations
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(BASELINE_SCHEMA_VERSION)
+        .max(BASELINE_SCHEMA_VERSION)
+}
+
+/// Idempotent `ALTER TABLE ... ADD COLUMN` that fails loud on every error
+/// EXCEPT the benign "duplicate column name" race — i.e. a peer process added
+/// the column between our `pragma_table_info` probe and this ALTER. Previously
+/// these sites used `.ok()`, which also swallowed disk-full / corruption /
+/// lock failures and left a load-bearing column silently missing on old DBs.
+fn add_column_idempotent(conn: &Connection, sql: &str) -> ReinResult<()> {
+    match conn.execute_batch(sql) {
+        Ok(()) => Ok(()),
+        // SQLite emits SQLITE_ERROR with the stable message
+        // "duplicate column name: <col>" when the column already exists.
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Bring the schema up to the current version and run any pending forward
+/// migrations. Safe to call on every open: it is cheap once a DB is at the
+/// latest version (one `PRAGMA user_version` read, then nothing).
+///
 /// `dims` is the embedding dimension (e.g., 3072 for gemini-embedding-001).
 pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
+    init_schema_with_migrations(conn, dims, MIGRATIONS)
+}
+
+/// Core open-time schema flow, parameterized over the migration list so tests
+/// can drive synthetic forward migrations (drop / rollback / re-apply) through
+/// the exact production code path.
+fn init_schema_with_migrations(
+    conn: &Connection,
+    dims: usize,
+    migrations: &[Migration],
+) -> ReinResult<()> {
+    let current = schema_user_version(conn)?;
+    let max_known = max_known_schema_version(migrations);
+
+    // Downgrade guard. A DB stamped by a newer rein may have had columns
+    // dropped / renamed that THIS build's bring-up would resurrect (and whose
+    // forward migrations this build doesn't have). Refuse rather than corrupt.
+    if current > max_known {
+        return Err(ReinError::Config(format!(
+            "database schema version {current} is newer than this rein build \
+             supports (max {max_known}); upgrade rein to open this database"
+        )));
+    }
+
+    // One-time legacy bring-up. `bring_up_to_baseline` is idempotent, so it
+    // brings ANY prior state — fresh DB or a pre-baseline one from an older
+    // rein — up to the baseline schema; it needs no fragile legacy-vs-fresh
+    // detection. Gated `< BASELINE` so a forward DROP/rename is never undone by
+    // a re-probe on the next open.
+    if current < BASELINE_SCHEMA_VERSION {
+        bring_up_to_baseline(conn, dims)?;
+        // Stamp the baseline under a write lock with an in-lock re-read so a
+        // concurrent first-open can't stamp the version *backwards*. The lock
+        // spans only the stamp, not the bring-up: `bring_up_to_baseline` MUST
+        // run in autocommit (it can't be wrapped in a transaction —
+        // `migrate_source_check` toggles `PRAGMA foreign_keys`, a no-op inside
+        // a txn, and opens its own `BEGIN EXCLUSIVE`; vec0 virtual tables are
+        // also created there).
+        //
+        // RESIDUAL (must fix before the first forward migration ships): two
+        // processes first-opening a *pre-baseline* DB in a release that ALSO
+        // adds a forward migration could both run bring-up, one re-adding a
+        // column the other's forward migration dropped. Benign while
+        // `MIGRATIONS` is empty (no forward migration ⇒ nothing to resurrect,
+        // and the max reachable version is the baseline so this guard can't
+        // downgrade). Full first-open serialization (flock sidecar or claim
+        // row) is required alongside the first `MIGRATIONS` entry. The
+        // forward-migration double-apply half is already covered by the in-lock
+        // recheck in `apply_migrations`.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let stamped = (|| -> ReinResult<()> {
+            if schema_user_version(conn)? < BASELINE_SCHEMA_VERSION {
+                set_schema_user_version(conn, BASELINE_SCHEMA_VERSION)?;
+            }
+            Ok(())
+        })();
+        match stamped {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+    }
+
+    apply_migrations(conn, migrations)?;
+    Ok(())
+}
+
+/// Apply every migration whose `version` exceeds the DB's current
+/// `user_version`, in order, each in its own transaction. The version bump is
+/// part of the same transaction as the DDL, so a mid-migration failure rolls
+/// back both — the DB is never left at a half-applied version.
+fn apply_migrations(conn: &Connection, migrations: &[Migration]) -> ReinResult<()> {
+    let mut prev = BASELINE_SCHEMA_VERSION;
+    for m in migrations {
+        debug_assert!(
+            m.version > BASELINE_SCHEMA_VERSION,
+            "forward migration {} must be > baseline {BASELINE_SCHEMA_VERSION}",
+            m.version
+        );
+        debug_assert!(
+            m.version > prev,
+            "migrations must be authored in strictly ascending version order"
+        );
+        prev = m.version;
+
+        if m.version <= schema_user_version(conn)? {
+            continue; // already applied on a prior open
+        }
+
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let applied = (|| -> ReinResult<()> {
+            // Double-checked locking: a peer process may have applied this
+            // migration between our pre-lock `schema_user_version` read above
+            // and our acquiring the write lock here. Re-read inside the
+            // transaction and skip if already applied — running a
+            // non-idempotent `up` (drop / rename / table-rebuild) twice could
+            // fail or damage the just-migrated schema.
+            if m.version <= schema_user_version(conn)? {
+                return Ok(());
+            }
+            (m.up)(conn)?;
+            set_schema_user_version(conn, m.version)?;
+            Ok(())
+        })();
+        match applied {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Idempotent legacy bring-up: creates every base table / index / trigger /
+/// virtual table and runs the historical probe-then-ALTER + `migrate_*` column
+/// additions. Invoked only when `user_version < BASELINE` (see
+/// `init_schema_with_migrations`); conceptually this whole function *is* "the
+/// migration to baseline". Do not add new schema changes here — author a
+/// `Migration` in `MIGRATIONS` instead, or the resurrection-safety invariant
+/// breaks.
+fn bring_up_to_baseline(conn: &Connection, dims: usize) -> ReinResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
@@ -272,7 +490,8 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_status {
-        conn.execute_batch(
+        add_column_idempotent(
+            conn,
             "ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
         )?;
     }
@@ -287,10 +506,10 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_concept_ids {
-        conn.execute_batch(
+        add_column_idempotent(
+            conn,
             "ALTER TABLE memories ADD COLUMN concept_ids TEXT NOT NULL DEFAULT '[]'",
-        )
-        .ok();
+        )?;
     }
 
     // Migrate: add source_memory_ids to concepts if missing
@@ -303,10 +522,10 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_source_memory_ids {
-        conn.execute_batch(
+        add_column_idempotent(
+            conn,
             "ALTER TABLE concepts ADD COLUMN source_memory_ids TEXT NOT NULL DEFAULT '[]'",
-        )
-        .ok();
+        )?;
     }
 
     // Migrate: add temporal fields to concept_links
@@ -319,13 +538,15 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_valid_from {
-        conn.execute_batch("ALTER TABLE concept_links ADD COLUMN valid_from TEXT")?;
-        conn.execute_batch("ALTER TABLE concept_links ADD COLUMN valid_until TEXT")?;
+        add_column_idempotent(conn, "ALTER TABLE concept_links ADD COLUMN valid_from TEXT")?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE concept_links ADD COLUMN valid_until TEXT",
+        )?;
         // Backfill: existing links get valid_from = created_at
         conn.execute_batch(
             "UPDATE concept_links SET valid_from = created_at WHERE valid_from IS NULL",
-        )
-        .ok();
+        )?;
     }
 
     // Migrate: add last_episode_id to concepts
@@ -338,8 +559,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_episode_id {
-        conn.execute_batch("ALTER TABLE concepts ADD COLUMN last_episode_id TEXT")
-            .ok();
+        add_column_idempotent(conn, "ALTER TABLE concepts ADD COLUMN last_episode_id TEXT")?;
     }
 
     // Migrate: add v0.24 ARS Concept Living Summary fields (three nullable
@@ -355,12 +575,17 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_living_summary {
-        conn.execute_batch(
-            "ALTER TABLE concepts ADD COLUMN living_summary TEXT;
-             ALTER TABLE concepts ADD COLUMN living_summary_updated_at TEXT;
-             ALTER TABLE concepts ADD COLUMN living_summary_source_revision INTEGER;",
-        )
-        .ok();
+        // Split into per-column fail-loud ALTERs: a peer-race duplicate on the
+        // first column must not abort the batch and silently skip the rest.
+        add_column_idempotent(conn, "ALTER TABLE concepts ADD COLUMN living_summary TEXT")?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE concepts ADD COLUMN living_summary_updated_at TEXT",
+        )?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE concepts ADD COLUMN living_summary_source_revision INTEGER",
+        )?;
     }
 
     // Create concept_revisions table (revision history)
@@ -430,8 +655,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     ")?;
 
     // Index for temporal concept queries
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_concepts_updated ON concepts(updated_at)")
-        .ok();
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_concepts_updated ON concepts(updated_at)")?;
 
     // === Adaptive Engine tables (v0.5.0) ===
 
@@ -488,8 +712,10 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_tier {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'warm'")
-            .ok();
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'warm'",
+        )?;
     }
 
     // M4: Migrate: add cluster_id column to memories
@@ -502,8 +728,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_cluster_id {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN cluster_id INTEGER")
-            .ok();
+        add_column_idempotent(conn, "ALTER TABLE memories ADD COLUMN cluster_id INTEGER")?;
     }
 
     // Migrate: add needs_vec_dedup flag for deferred embedding-based dedup
@@ -516,13 +741,12 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_nvd {
-        conn.execute_batch(
+        add_column_idempotent(
+            conn,
             "ALTER TABLE memories ADD COLUMN needs_vec_dedup INTEGER NOT NULL DEFAULT 0",
-        )
-        .ok();
+        )?;
         // Backfill: mark all existing active memories for vec dedup sweep
-        conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'")
-            .ok();
+        conn.execute_batch("UPDATE memories SET needs_vec_dedup = 1 WHERE status = 'active'")?;
     }
 
     migrate_episode_columns(conn)?;
@@ -545,8 +769,7 @@ pub fn init_schema(conn: &Connection, dims: usize) -> ReinResult<()> {
     conn.execute_batch(
         "INSERT OR IGNORE INTO memory_canonical_state(memory_id, canonical_id)
          SELECT id, id FROM memories;",
-    )
-    .ok();
+    )?;
 
     // M4 incremental: cluster centroids table (separate from AdaptiveState JSON to avoid bloat).
     // `dims` is stored so load_cluster_centroids can reject stale centroids after a model change.
@@ -745,7 +968,10 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_refresh_fingerprint {
-        conn.execute_batch("ALTER TABLE oauth_grants ADD COLUMN refresh_token_fingerprint TEXT")?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE oauth_grants ADD COLUMN refresh_token_fingerprint TEXT",
+        )?;
     }
     // Always check for NULL-fingerprint rows.  After the ALTER above (case
     // a) every existing row will satisfy this; after a crash-mid-migration
@@ -848,10 +1074,10 @@ pub fn migrate_cron_claims(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_claim_token {
-        conn.execute_batch(
+        add_column_idempotent(
+            conn,
             "ALTER TABLE cron_claims ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''",
-        )
-        .ok();
+        )?;
     }
     Ok(())
 }
@@ -942,10 +1168,10 @@ fn migrate_resummerize(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_needs {
-        conn.execute_batch(
+        add_column_idempotent(
+            conn,
             "ALTER TABLE memories ADD COLUMN needs_resummerize INTEGER NOT NULL DEFAULT 0",
-        )
-        .ok();
+        )?;
     }
 
     // ── memories.last_resummarized_at ─────────────────────────────────────
@@ -958,8 +1184,10 @@ fn migrate_resummerize(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_last {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN last_resummarized_at TEXT")
-            .ok();
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN last_resummarized_at TEXT",
+        )?;
     }
 
     // ── memories.in_progress_resummerize_at ───────────────────────────────
@@ -977,8 +1205,10 @@ fn migrate_resummerize(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_ipr {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN in_progress_resummerize_at TEXT")
-            .ok();
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN in_progress_resummerize_at TEXT",
+        )?;
     }
 
     // ── resummerize_runs audit table ──────────────────────────────────────
@@ -1044,13 +1274,24 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_archival_summary {
-        conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN archival_summary TEXT;
-             ALTER TABLE memories ADD COLUMN archival_summary_at INTEGER;
-             ALTER TABLE memories ADD COLUMN archival_summary_version INTEGER;
-             ALTER TABLE memories ADD COLUMN needs_archival_summary INTEGER NOT NULL DEFAULT 0;",
-        )
-        .ok();
+        // Per-column fail-loud ALTERs (a peer-race duplicate on the first must
+        // not abort the rest).
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN archival_summary TEXT",
+        )?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN archival_summary_at INTEGER",
+        )?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN archival_summary_version INTEGER",
+        )?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN needs_archival_summary INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     let has_in_progress: bool = conn
         .query_row(
@@ -1061,11 +1302,14 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_in_progress {
-        conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN in_progress_archival_summary_at TEXT;
-             ALTER TABLE memories ADD COLUMN archival_claim_token TEXT;",
-        )
-        .ok();
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN in_progress_archival_summary_at TEXT",
+        )?;
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN archival_claim_token TEXT",
+        )?;
     }
     // v0.27.5 R1: too-large backoff — `claim_batch` deprioritizes rows whose
     // last attempt returned `AttemptOutcome::TooLarge` so a permanently
@@ -1081,8 +1325,10 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_last_too_large {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN last_too_large_at INTEGER")
-            .ok();
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE memories ADD COLUMN last_too_large_at INTEGER",
+        )?;
     }
     // No backfill: existing cold rows stay NULL until run_tiering re-flags them.
     Ok(())
@@ -1125,7 +1371,13 @@ pub fn migrate_judge_call_ledger(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if needs_migrate {
-        conn.execute("DROP TABLE judge_call_ledger", []).ok();
+        // Fail loud on real errors (lock/disk), but tolerate a peer that
+        // already dropped the old-shape table in a concurrent first open.
+        match conn.execute("DROP TABLE judge_call_ledger", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("no such table") => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     conn.execute_batch(
         "
@@ -1157,8 +1409,10 @@ pub fn migrate_concepts_living_summary_id(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_col {
-        conn.execute_batch("ALTER TABLE concepts ADD COLUMN living_summary_id TEXT")
-            .ok();
+        add_column_idempotent(
+            conn,
+            "ALTER TABLE concepts ADD COLUMN living_summary_id TEXT",
+        )?;
     }
     Ok(())
 }
@@ -1189,7 +1443,7 @@ pub fn migrate_concept_summary_instances(conn: &Connection) -> ReinResult<()> {
 }
 
 fn migrate_episode_columns(conn: &Connection) -> ReinResult<()> {
-    let ensure_column = |name: &str, ddl: &str| {
+    let ensure_column = |name: &str, ddl: &str| -> ReinResult<()> {
         let has_column: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name=?1",
@@ -1199,38 +1453,38 @@ fn migrate_episode_columns(conn: &Connection) -> ReinResult<()> {
             .unwrap_or(0)
             > 0;
         if !has_column {
-            conn.execute_batch(ddl).ok();
+            add_column_idempotent(conn, ddl)?;
         }
+        Ok(())
     };
 
     ensure_column(
         "primary_topics",
         "ALTER TABLE episodes ADD COLUMN primary_topics TEXT NOT NULL DEFAULT '[]'",
-    );
+    )?;
     ensure_column(
         "tags",
         "ALTER TABLE episodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
-    );
+    )?;
     ensure_column(
         "involved_agents",
         "ALTER TABLE episodes ADD COLUMN involved_agents TEXT NOT NULL DEFAULT '[]'",
-    );
+    )?;
     ensure_column(
         "important_paths",
         "ALTER TABLE episodes ADD COLUMN important_paths TEXT NOT NULL DEFAULT '[]'",
-    );
+    )?;
     ensure_column(
         "temporal_keywords",
         "ALTER TABLE episodes ADD COLUMN temporal_keywords TEXT NOT NULL DEFAULT '[]'",
-    );
+    )?;
     ensure_column(
         "source_session_id",
         "ALTER TABLE episodes ADD COLUMN source_session_id TEXT",
-    );
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id)",
-    )
-    .ok();
+    )?;
 
     Ok(())
 }
@@ -1989,6 +2243,240 @@ mod migration_tests {
         assert!(
             elapsed < std::time::Duration::from_millis(100),
             "1000 idempotent re-migrations should complete in < 100ms; took {elapsed:?}"
+        );
+    }
+
+    // ====================================================================
+    // v0.38 schema-versioning framework (user_version + forward migrations)
+    // ====================================================================
+
+    fn column_exists(conn: &Connection, table: &str, col: &str) -> bool {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            [col],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    #[test]
+    fn fresh_db_stamps_baseline_version() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        assert_eq!(schema_user_version(&conn).unwrap(), 0);
+        init_schema(&conn, 4).expect("init schema");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            BASELINE_SCHEMA_VERSION,
+            "a fresh DB must be stamped at the baseline schema version"
+        );
+    }
+
+    #[test]
+    fn legacy_db_brings_up_and_stamps_baseline() {
+        let file = seed_pre_proxy_db();
+        let conn = Connection::open(file.path()).expect("open");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            0,
+            "a pre-framework DB starts at user_version 0"
+        );
+        init_schema(&conn, 4).expect("init schema on legacy db");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            BASELINE_SCHEMA_VERSION,
+            "legacy bring-up must stamp the baseline version"
+        );
+        // The bring-up actually ran (migrate_source_check widened the source
+        // CHECK), so a 'proxy'-sourced insert is now accepted.
+        conn.execute_batch(
+            "INSERT INTO memories (id, layer, topic, summary, content, importance, source,
+                 strength, decay_lambda, created_at, updated_at, last_accessed)
+             VALUES ('proxy-1', 'LTM', 't', 's', 'c', 'medium', 'proxy',
+                 1.0, 0.0, '2026-04-20T00:00:00Z', '2026-04-20T00:00:00Z', '2026-04-20T00:00:00Z');",
+        )
+        .expect("proxy source must be allowed after bring-up");
+    }
+
+    /// THE discriminating test for the whole framework: a column dropped by a
+    /// forward migration must NOT be silently re-added by `init_schema`'s
+    /// legacy probe-then-ALTER bring-up on the next open. If this fails, the
+    /// resurrection-safety invariant is broken and rename/type-change/drop
+    /// migrations are unsafe.
+    #[test]
+    fn migration_drop_column_is_not_resurrected() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+
+        fn drop_cluster_id(c: &Connection) -> ReinResult<()> {
+            c.execute_batch("ALTER TABLE memories DROP COLUMN cluster_id")?;
+            Ok(())
+        }
+        let migrations = &[Migration {
+            version: BASELINE_SCHEMA_VERSION + 1,
+            name: "drop_cluster_id",
+            up: drop_cluster_id,
+        }];
+
+        // First open: bring up to baseline (which creates `cluster_id`), then
+        // the forward migration drops it.
+        init_schema_with_migrations(&conn, 4, migrations).expect("first open");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            BASELINE_SCHEMA_VERSION + 1
+        );
+        assert!(
+            !column_exists(&conn, "memories", "cluster_id"),
+            "forward migration should have dropped cluster_id"
+        );
+
+        // Second open on the same DB: bring-up is gated out (>= baseline). The
+        // dropped column must stay gone.
+        init_schema_with_migrations(&conn, 4, migrations).expect("second open");
+        assert!(
+            !column_exists(&conn, "memories", "cluster_id"),
+            "init_schema must NOT resurrect a column dropped by a forward migration"
+        );
+    }
+
+    /// A migration that fails mid-way must roll back BOTH its DDL and the
+    /// `user_version` bump — they share one transaction.
+    #[test]
+    fn failed_migration_rolls_back_ddl_and_version_together() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+
+        fn half_then_fail(c: &Connection) -> ReinResult<()> {
+            c.execute_batch("CREATE TABLE migration_partial (x INTEGER)")?;
+            Err(ReinError::Config("simulated migration failure".into()))
+        }
+        let migrations = &[Migration {
+            version: BASELINE_SCHEMA_VERSION + 1,
+            name: "half_then_fail",
+            up: half_then_fail,
+        }];
+
+        let result = init_schema_with_migrations(&conn, 4, migrations);
+        assert!(
+            result.is_err(),
+            "a failing migration must surface the error"
+        );
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            BASELINE_SCHEMA_VERSION,
+            "user_version must NOT advance when the migration fails"
+        );
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migration_partial'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "DDL from a failed migration must roll back with the version bump"
+        );
+    }
+
+    #[test]
+    fn downgrade_guard_refuses_newer_database() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema");
+        // Simulate a DB stamped by a future rein build.
+        set_schema_user_version(&conn, max_known_schema_version(MIGRATIONS) + 5).unwrap();
+        match init_schema(&conn, 4) {
+            Err(ReinError::Config(msg)) => assert!(
+                msg.contains("newer than this rein build"),
+                "unexpected downgrade error message: {msg}"
+            ),
+            other => panic!("expected a Config downgrade error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_migration_applies_exactly_once() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+
+        // No IF NOT EXISTS: a second application would error "table already
+        // exists", so a clean second open proves the runner ran it once.
+        fn create_marker(c: &Connection) -> ReinResult<()> {
+            c.execute_batch("CREATE TABLE migration_marker (x INTEGER)")?;
+            Ok(())
+        }
+        let migrations = &[Migration {
+            version: BASELINE_SCHEMA_VERSION + 1,
+            name: "create_marker",
+            up: create_marker,
+        }];
+
+        init_schema_with_migrations(&conn, 4, migrations).expect("first open");
+        init_schema_with_migrations(&conn, 4, migrations)
+            .expect("second open must skip the already-applied migration");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            BASELINE_SCHEMA_VERSION + 1
+        );
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migration_marker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1, "migration table must exist exactly once");
+    }
+
+    #[test]
+    fn add_column_idempotent_swallows_duplicate_but_propagates_real_errors() {
+        let conn = Connection::open_in_memory().expect("open memory db");
+        conn.execute_batch("CREATE TABLE t (a INTEGER)").unwrap();
+
+        // New column → succeeds.
+        add_column_idempotent(&conn, "ALTER TABLE t ADD COLUMN b INTEGER").unwrap();
+        // Same column again → "duplicate column name" → benign, swallowed.
+        add_column_idempotent(&conn, "ALTER TABLE t ADD COLUMN b INTEGER")
+            .expect("duplicate-column race must be swallowed");
+        // A genuine error (missing table) must fail loud, NOT be swallowed.
+        assert!(
+            add_column_idempotent(&conn, "ALTER TABLE no_such_table ADD COLUMN z INTEGER").is_err(),
+            "non-duplicate ALTER errors must propagate"
+        );
+    }
+
+    /// A migration at or below the DB's current `user_version` must never have
+    /// its `up` re-run — covers the idempotent-skip path and guards the
+    /// double-checked-lock recheck added for concurrent first-open (a peer that
+    /// applied the migration between our pre-lock read and the write lock).
+    #[test]
+    fn already_applied_migration_is_not_reapplied() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema");
+
+        // Stamp the DB as if version BASELINE+1 was already applied.
+        set_schema_user_version(&conn, BASELINE_SCHEMA_VERSION + 1).unwrap();
+
+        // `up` always errors; a correct skip never calls it.
+        fn poison(_c: &Connection) -> ReinResult<()> {
+            Err(ReinError::Config(
+                "migration up must not run when already applied".into(),
+            ))
+        }
+        let migrations = &[Migration {
+            version: BASELINE_SCHEMA_VERSION + 1,
+            name: "poison",
+            up: poison,
+        }];
+
+        apply_migrations(&conn, migrations)
+            .expect("an already-applied migration must be skipped, not re-run");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            BASELINE_SCHEMA_VERSION + 1
         );
     }
 }
