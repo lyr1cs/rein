@@ -1,14 +1,33 @@
 # REST API Reference
 
-Updated for Rein v0.28.8 (2026-05-04). Route inventory is unchanged from
-v0.28.6 — v0.28.7 and v0.28.8 hardened existing surfaces without adding
-routes.
+Updated for Rein v1.0 (2026-05-31). The `/api/*` route inventory is unchanged
+since v0.28.6; v1.0 adds the `/v1/*` versioned alias (below) without changing
+any route's behaviour.
 
 The REST API is served under `/api/*` when HTTP/SSE or the GUI server is
 enabled. Network access is guarded by the HTTP server token policy; many
 mutating routes also require `x-rein-action: 1`. Protected reads accept
 `x-rein-token`, `Authorization: Bearer ...`, or the GUI session cookie when
 `REIN_HTTP_TOKEN` is configured.
+
+## `/v1/*` versioned alias (v1.0)
+
+`/v1/<resource>` is a stable versioned alias for `/api/<resource>`. The request
+URI is rewritten to `/api/...` at ingress (query string preserved), so every
+route documented below is reachable at both prefixes and behaves identically. A
+bare `/v1` with no resource is left untouched.
+
+**Auth difference — important.** `/v1` is the *programmatic* surface and
+authenticates with a **header token only** (`Authorization: Bearer
+<REIN_HTTP_TOKEN>` or `x-rein-token`). The browser **GUI session cookie does
+not work on `/v1`**: that cookie is deliberately scoped to `Path=/api` so it
+cannot be replayed against `/oauth/authorize` (which would otherwise satisfy the
+short-lived OAuth owner-approval window). Browser/GUI clients keep using
+`/api`; header-token clients may use either prefix.
+
+(Unrelated: the record-only LLM proxy on its own port also exposes
+`/v1/messages` and `/v1/chat/completions` — those are upstream-API shapes, not
+this REST server's alias.)
 
 ## Auth Classes
 

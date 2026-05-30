@@ -3687,7 +3687,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows2, rows, "re-persisting identical content must not duplicate triples");
+        assert_eq!(
+            rows2, rows,
+            "re-persisting identical content must not duplicate triples"
+        );
     }
 
     #[test]
@@ -3721,7 +3724,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 0, "default-off must persist zero triples (bit-identical)");
+        assert_eq!(
+            rows, 0,
+            "default-off must persist zero triples (bit-identical)"
+        );
     }
 
     #[test]

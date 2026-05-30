@@ -8,6 +8,7 @@ default TOML template is `crates/rein/config/default.toml`.
 
 | Section | Purpose |
 |---|---|
+| `config_version` (top-level) | Schema-version metadata, not a tunable (default `1` = `CURRENT_CONFIG_VERSION`). A config stamped newer than the running build is refused at load (forward-compat guard); the unversioned sentinel `0` and the current version both load. |
 | `[database]` | SQLite path. `path = "auto"` resolves to the user's Rein data directory. |
 | `[embedding]`, `[embedding.google]`, `[embedding.omlx]` | Embedding provider, dimensions, model, endpoint, and optional Google key. |
 | `[search]` | RRF/convex-combination fusion, dedup threshold, LLM reranker, MMR, and strong-signal settings. |
@@ -24,7 +25,7 @@ default TOML template is `crates/rein/config/default.toml`.
 | `[adaptive]` | Adaptive engine enable flag, sample thresholds, event retention, alpha step, and cache TTL. |
 | `[intelligent_merge]` | Default-off LLM classifier for gray-zone duplicate decisions. |
 | `[resummerize]` | Default-off LLM recompression of flagged canonicals. |
-| `[dedup]` | Triple-overlap, N-merge, and temporal-supersede dedup controls. |
+| `[dedup]` | Triple-overlap, N-merge, and temporal-supersede dedup controls, plus `persist_triples` (default `false`; opt-in durable `(subject,predicate,object)` persistence into the `memory_triples` fact table — v0.39 #A5, experimental). |
 | `[ars]`, `[ars.acceleration]` | ARS Cap A/B/C feature flags, batch/cold-start settings, and default-on/fail-closed v0.28 acceleration controls. |
 | `[ars.llm_judge]`, `[ars.llm_judge.nightly_cron]` | Default-off runtime judge and offline calibration cron policy (v0.28.7 H0 reverted these defaults from `true` to `false` per the v0.28 charter Non-Goal "Do not make LLM judge default-on"); when explicitly enabled, both are bounded by provider/cost gates. |
 | `[llm]`, `[llm.google]`, `[llm.omlx]` | Optional global LLM defaults used by the inheritance resolver. |
