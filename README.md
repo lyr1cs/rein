@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.37.0`** (2026-05-30) — algorithm + hooks pass. **(#A18)** Explicit feedback signal: `rein_feedback` with `helpful: false` now trains the adaptive fusion optimizer (M2 alpha + multi-dimensional shadow weights) as a *negative* sample via a parameter-free symmetric objective — accessed memories ranked up, explicitly-unhelpful ones ranked down — with recall held non-inferior on the eval gate (paired McNemar). **(hooks)** Ingestion de-duplication: identical content surfaced by multiple agents or hook sources is now collapsed at the queue, eliminating duplicate captures. Plus a re-confirmed data-driven dedup-threshold sweep, with the production threshold held pending live-traffic calibration. Tests: 1702 passed / 7 ignored / 0 failed; clippy + fmt clean. See the [v0.37.0 release](https://github.com/lyr1cs/rein/releases/tag/v0.37.0).
+**Current release: `v0.38.0`** (2026-05-30) — schema-versioning foundation. A single global `PRAGMA user_version` counter plus a fail-loud, atomic forward-migration framework (`Migration` runner + downgrade guard + resurrection-safety gating) replace the additive-only probe-then-ALTER bring-up, unlocking rename/type-change/drop migrations — the shared prerequisite for triple persistence, the fact-layer refactor, and a v1.0 schema freeze. Every legacy `ADD COLUMN` reachable from bring-up now fails loud on real errors (tolerating only the benign duplicate-column race). No new MCP tools; the default recall/algorithm path is bit-identical to v0.37.0. Tests: 1710 passed / 7 ignored / 0 failed; clippy + fmt clean. See the [v0.38.0 release](https://github.com/lyr1cs/rein/releases/tag/v0.38.0).
 
 **Recent releases (`v0.33` → `v0.35`)** — the eval-gate harness went from foundation to full: the dedup / admission / latency gates moved from `NoData` stubs to working scorers with committed baselines and 20-fixture corpora per gate (v0.33.0/.1, v0.35.0). Trust & Measurement Phase 3 landed its first slice — `repair_advice` + `judge_drift_alert_total` (v0.35.0); claude.ai remote-MCP polish added a sliding session cookie + metadata JSON (v0.35.0); and the bearer-auth migration progressed from a `rein doctor` WARN on the legacy loopback bool (v0.34.0) to its load-time removal (v0.35.0).
 
@@ -520,10 +520,11 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.37.0 arc rebuilt rein around five axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, secure remote MCP deployment for Claude clients, a reproducible eval-gate harness for Trust & Measurement, and an algorithm + performance pass on the recall and dedup hot paths.
+The v0.21 → v0.38.0 arc rebuilt rein around six axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, secure remote MCP deployment for Claude clients, a reproducible eval-gate harness for Trust & Measurement, an algorithm + performance pass on the recall and dedup hot paths, and a schema-versioning foundation for safe forward migrations.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.38.0** (2026-05-30) | Schema-versioning foundation | A single global `PRAGMA user_version` counter + a fail-loud, atomic forward-migration framework (`BASELINE_SCHEMA_VERSION` + `Migration{version,name,up}` + ascending `MIGRATIONS`, empty at landing) replace the additive-only probe-then-ALTER bring-up — unlocking rename/type-change/drop migrations (prerequisite for triple persistence, the fact-layer refactor, and a v1.0 schema freeze). Every legacy `ADD COLUMN` reachable from bring-up fails loud on real errors (tolerating only the benign duplicate-column race); downgrade guard + resurrection-safety gating + in-lock double-checked migration apply. No new MCP tools; default recall/algorithm path bit-identical. **1710 tests / 0 fail / 7 ignored.** |
 | **v0.37.0** (2026-05-30) | Algorithm + hooks | **#A18** explicit negative feedback: `rein_feedback` `helpful: false` trains the M2 alpha optimizer + multi-dimensional shadow weights as a parameter-free symmetric negative sample (accessed memories ranked up, explicitly-unhelpful ones ranked down); recall held non-inferior on the eval gate. **Hooks** ingestion de-dup: identical content surfaced by multiple agents / hook sources is collapsed at the queue. **#C2** dedup-threshold sweep re-confirmed; production threshold held pending live-traffic calibration. **1702 tests / 0 fail / 7 ignored.** |
 | **v0.36.0** (2026-05-29) | Algorithm + performance pass | **#P1** recall strong-signal fast-path: skip the KG + Supermemory fallback channels when a dominant BM25 hit survives every drop-filter and the local index alone satisfies the requested limit — deterministic, recall held non-inferior on the eval gate. **#C2** `rein-eval gate sweep --gate dedup`: data-driven precision/recall/F1 threshold sweep reporting a merge-safe (precision = 1.0) optimum. **#C3** admission gray-zone corpus 6 → 10 fixtures, ≥ 0.07 edge margin, drift-guard test. **#ablation** `rein-eval ablate`: multi-arm bootstrap-CI ablation with paired deltas + significance, reproducible (seeded PRNG). **1692 tests / 0 fail / 7 ignored.** |
 | **v0.33 → v0.35** (2026-05-28) | Eval-gate harness: foundation → full | The dedup / admission / latency gates moved from `NoData` stubs to working scorers with committed baselines + 20-fixture corpora per gate (v0.33.0/.1, v0.35.0). Trust & Measurement Phase 3 first slice: `repair_advice` + `judge_drift_alert_total` (v0.35.0). claude.ai remote-MCP polish: sliding session cookie + metadata JSON (v0.35.0). Bearer-auth migration: `rein doctor` WARN on the legacy loopback bool (v0.34.0) → load-time removal (v0.35.0). |
@@ -1033,7 +1034,7 @@ npm run build  # Build to gui/dist/ (embedded by rust-embed at compile time)
 flowchart TD
     U[User / AI Agent]
     CLI[CLI\n20+ commands]
-    MCP[MCP Server\n39 tools · stdio / HTTP / SSE]
+    MCP[MCP Server\n40 tools · stdio / HTTP / SSE]
     GUI[Neural Wiki GUI\nReact + Tailwind]
     PXY[Proxy\nClaude · Codex subscription · record-only]
 
@@ -1194,7 +1195,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v0.30.0`**（2026-05-10）— 内建 OAuth provider，面向 Claude Cowork / claude.ai / mobile 的远程 MCP connector。新增显式 `[server].auth` 策略、OAuth metadata、Dynamic Client Registration、Authorization Code + PKCE S256、refresh rotation、revocation、SQLite 持久化、owner approval GUI、Connectors 管理页、OAuth doctor 检查和 e2e/live-readiness 脚本；已通过 claude.ai/Cowork + Cloudflare Quick Tunnel 真机验证。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
+**当前版本：`v0.38.0`**（2026-05-30）— schema 版本化地基。单一全局 `PRAGMA user_version` 计数器 + fail-loud、原子的前向迁移框架（`Migration` runner + downgrade guard + resurrection-safety 门控）替换 additive-only probe-then-ALTER 起表，解锁 rename/type-change/drop 迁移——三元组持久化、fact-layer 重构、v1.0 schema freeze 的共同前置。bring-up 可达的每处 legacy `ADD COLUMN` 现对真实错误 fail-loud（仅容忍良性 duplicate-column 竞争）。无新增 MCP 工具；默认召回/算法路径与 v0.37.0 逐位一致。测试：1710 通过 / 7 ignored / 0 失败；clippy + fmt clean。License: AGPL-3.0-or-later。详见下方[最近版本](#最近版本)。
 
 完整英文 manual 见 [docs/manual/README.md](docs/manual/README.md)，引用表和命令/API 速查见 [docs/reference/](docs/reference/)。
 
@@ -1744,10 +1745,11 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.37.0 这一段重构围绕五条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、面向 Claude 客户端的安全远程 MCP 部署、可重复 Trust & Measurement eval-gate 闸口，以及召回 / dedup 热路径的算法 + 性能优化。
+v0.21 → v0.38.0 这一段重构围绕六条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、面向 Claude 客户端的安全远程 MCP 部署、可重复 Trust & Measurement eval-gate 闸口、召回 / dedup 热路径的算法 + 性能优化，以及面向安全前向迁移的 schema 版本化地基。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.38.0** (2026-05-30) | Schema 版本化地基 | 单一全局 `PRAGMA user_version` 计数器 + fail-loud、原子的前向迁移框架（`BASELINE_SCHEMA_VERSION` + `Migration{version,name,up}` + 升序 `MIGRATIONS`，落地时为空）替换 additive-only probe-then-ALTER 起表——解锁 rename/type-change/drop 迁移（三元组持久化、fact-layer 重构、v1.0 schema freeze 的共同前置）。bring-up 可达的每处 legacy `ADD COLUMN` 现对真实错误 fail-loud（仅容忍良性 duplicate-column 竞争）；downgrade guard + resurrection-safety 门控 + 锁内双重检查迁移。无新增 MCP 工具；默认召回/算法路径逐位一致。**1710 测试 / 0 失败 / 7 ignored**。 |
 | **v0.37.0** (2026-05-30) | 算法 + hooks | **#A18** 显式负反馈：`rein_feedback` `helpful: false` 作为 parameter-free 对称负样本训练 M2 alpha optimizer + 多维 shadow 权重（被访问的排高、显式无用的排低）；召回在 eval gate 上保持非劣效。**Hooks** 摄入去重：多 agent / hook source 产生的相同内容在队列层合并。**#C2** dedup 阈值 sweep 重新确认；生产阈值等真实流量校准。**1702 测试 / 0 失败 / 7 ignored**。 |
 | **v0.36.0** (2026-05-29) | 算法 + 性能 | **#P1** 召回强信号快路径：当 dominant BM25 命中过所有 drop-filter 且本地索引已满足请求 limit 时，跳过 KG + Supermemory 兜底通道——确定性，召回在 eval gate 上保持非劣效。**#C2** `rein-eval gate sweep --gate dedup`：数据驱动的 precision/recall/F1 阈值 sweep，报告 merge-safe（precision = 1.0）最优点。**#C3** admission gray-zone 语料 6 → 10 fixture，边距 ≥ 0.07，加 drift-guard 测试。**#ablation** `rein-eval ablate`：多 arm bootstrap-CI 消融 + 配对 delta + 显著性，seeded PRNG 可复现。**1692 测试 / 0 失败 / 7 ignored**。 |
 | **v0.33 → v0.35** (2026-05-28) | eval-gate 闸口：foundation → full | dedup / admission / latency 三闸从 `NoData` stub 变为带 committed baseline + 每闸 20-fixture 语料的真实 scorer（v0.33.0/.1、v0.35.0）。T&M Phase 3 首切片：`repair_advice` + `judge_drift_alert_total`（v0.35.0）。claude.ai 远程 MCP 精修：sliding session cookie + metadata JSON（v0.35.0）。bearer-auth 迁移：`rein doctor` 对 legacy loopback bool WARN（v0.34.0）→ load-time 删除（v0.35.0）。 |
