@@ -3676,9 +3676,16 @@ mod tests {
             "stored triples must match the rule-based extractor output (distinct s,p,o)"
         );
 
-        // Idempotent re-store of identical content keeps the count stable
-        // (DELETE-then-INSERT, not accumulate).
-        let _ = store.update(&store.get(&id).unwrap());
+        // update() with CHANGED content fires maybe_persist_triples, which
+        // DELETE-then-INSERTs so the persisted set tracks the NEW content (old
+        // facts purged, not accumulated). Exercise that path explicitly.
+        let mut changed = store.get(&id).unwrap();
+        changed.content = "Dave is a manager. Erin prefers tea.".to_string();
+        store.update(&changed).unwrap();
+        let new_expected: HashSet<_> =
+            crate::extract::triples::extract_triples_rule_based(&changed.content)
+                .into_iter()
+                .collect();
         let rows2: i64 = store
             .conn()
             .query_row(
@@ -3688,8 +3695,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            rows2, rows,
-            "re-persisting identical content must not duplicate triples"
+            rows2 as usize,
+            new_expected.len(),
+            "update() must REPLACE triples to match the rewritten content (DELETE-then-INSERT)"
         );
     }
 
