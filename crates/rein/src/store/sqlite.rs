@@ -107,6 +107,62 @@ impl SqliteStore {
             .find_map(|(id, _)| self.get(&id).ok().and_then(|m| m.cluster_id))
     }
 
+    /// v0.39 #A5: persist rule-based `(subject, predicate, object)` triples for
+    /// a memory into the durable `memory_triples` table.
+    ///
+    /// Gated by `[dedup].persist_triples` (default off → early return, no rows
+    /// written → behavior bit-identical to prior releases). DELETE-then-INSERT
+    /// so a content rewrite (MergeInto / intelligent-merge / resummerize) fully
+    /// REPLACES stale facts rather than accumulating phantoms. Rule-based
+    /// extraction only — never an LLM call — because this runs inside the
+    /// caller's `BEGIN IMMEDIATE` write lock. Callers invoke it WITHOUT `?`
+    /// (best-effort, like the side-index updates) so a triple failure never
+    /// aborts the memory write.
+    ///
+    /// NOTE: this slice persists triples as the durable fact-layer foundation;
+    /// the dedup gray-zone consumer still recomputes triples in-flight (the
+    /// read-side reuse is a deferred follow-up that needs a cold-start backfill
+    /// marker + an extractor-version equivalence stamp).
+    ///
+    /// `pub(crate)` so `ops::resummerize::apply_resummerize` — the one
+    /// content-mutation path that bypasses `store()`/`update()` via direct SQL
+    /// — can refresh triples inside its own CAS transaction.
+    pub(crate) fn maybe_persist_triples(&self, memory_id: &str, content: &str) -> ReinResult<()> {
+        let persist = crate::config::ReinConfig::load()
+            .map(|c| c.dedup.persist_triples)
+            .unwrap_or(false);
+        if !persist {
+            return Ok(());
+        }
+        // Full replace: purge any prior-content triples for this memory first,
+        // so a content rewrite cannot leave phantom facts behind.
+        self.conn.execute(
+            "DELETE FROM memory_triples WHERE memory_id = ?1",
+            rusqlite::params![memory_id],
+        )?;
+        let triples = crate::extract::triples::extract_triples_rule_based(content);
+        if triples.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO memory_triples
+             (memory_id, subject, predicate, object, confidence, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for t in &triples {
+            stmt.execute(rusqlite::params![
+                memory_id,
+                t.subject,
+                t.predicate,
+                t.object,
+                t.confidence,
+                now,
+            ])?;
+        }
+        Ok(())
+    }
+
     /// Open or create a database at the given path.
     /// Uses SQLITE_OPEN_FULL_MUTEX for thread-safe access via serialized mode.
     /// `model` and `dims` track the embedding model; if changed, vector index is rebuilt.
@@ -946,6 +1002,9 @@ impl MemoryStore for SqliteStore {
         );
         self.update_hnsw(&id, memory.embedding.as_deref());
         let _ = self.snapshot_memory_as_evidence(&id, &memory);
+        // v0.39 #A5: durable triple persistence (flag-gated, best-effort —
+        // never aborts the memory write, mirroring the side-index updates).
+        let _ = self.maybe_persist_triples(&id, &memory.content);
 
         Ok(id)
     }
@@ -1028,6 +1087,14 @@ impl MemoryStore for SqliteStore {
                 "memory {} not found",
                 memory.id
             )));
+        }
+
+        // v0.39 #A5: refresh durable triples when content changed (flag-gated,
+        // best-effort). DELETE-then-INSERT keeps the persisted fact set in sync
+        // with a rewritten canonical (MergeInto append / intelligent-merge
+        // synthesis), so stale facts from prior content cannot accumulate.
+        if previous.content != memory.content {
+            let _ = self.maybe_persist_triples(&memory.id, &memory.content);
         }
 
         // v0.26.2 hotfix: when a cold-tier memory's semantic fields (topic /
@@ -3560,6 +3627,101 @@ mod tests {
                 .contains("[merged on"),
             "canonical content should record provenance from gray-zone merge"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn store_persists_triples_when_flag_enabled() {
+        use std::collections::HashSet;
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore_config = EnvRestore {
+            key: "REIN_CONFIG",
+            value: std::env::var("REIN_CONFIG").ok(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rein.toml");
+        std::fs::write(&config_path, "[dedup]\npersist_triples = true\n").unwrap();
+        std::env::set_var("REIN_CONFIG", &config_path);
+
+        let content = "Alice is a developer. Bob likes coffee. Carol prefers tea.";
+        let expected: HashSet<_> = crate::extract::triples::extract_triples_rule_based(content)
+            .into_iter()
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "test content must yield at least one rule-based triple"
+        );
+
+        let store = SqliteStore::in_memory().unwrap();
+        let id = store
+            .store(test_memory_with_content(
+                "dev",
+                "prefs",
+                content,
+                Importance::High,
+            ))
+            .unwrap();
+
+        let rows: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_triples WHERE memory_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows as usize,
+            expected.len(),
+            "stored triples must match the rule-based extractor output (distinct s,p,o)"
+        );
+
+        // Idempotent re-store of identical content keeps the count stable
+        // (DELETE-then-INSERT, not accumulate).
+        let _ = store.update(&store.get(&id).unwrap());
+        let rows2: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_triples WHERE memory_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows2, rows, "re-persisting identical content must not duplicate triples");
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn store_persists_no_triples_when_flag_disabled() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore_config = EnvRestore {
+            key: "REIN_CONFIG",
+            value: std::env::var("REIN_CONFIG").ok(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rein.toml");
+        std::fs::write(&config_path, "[dedup]\npersist_triples = false\n").unwrap();
+        std::env::set_var("REIN_CONFIG", &config_path);
+
+        let store = SqliteStore::in_memory().unwrap();
+        let id = store
+            .store(test_memory_with_content(
+                "dev",
+                "prefs",
+                "Alice is a developer. Bob likes coffee.",
+                Importance::High,
+            ))
+            .unwrap();
+
+        let rows: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_triples WHERE memory_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "default-off must persist zero triples (bit-identical)");
     }
 
     #[test]

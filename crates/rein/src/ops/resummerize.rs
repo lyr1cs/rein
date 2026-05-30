@@ -888,6 +888,12 @@ fn apply_resummerize(
             // transaction and let the existing deferred
             // `needs_vec_dedup` pipeline regenerate the vector later.
             crate::store::vec::delete_embedding(conn, &canonical_id)?;
+            // v0.39 #A5: the canonical content was rewritten, so any persisted
+            // triples are stale. Refresh them in THIS transaction — apply_
+            // resummerize is the one content-mutation path that bypasses
+            // store()/update(), so the eager hooks there never fire here.
+            // Flag-gated + best-effort (no-op when [dedup].persist_triples off).
+            let _ = store.maybe_persist_triples(&canonical_id, new_content);
             Ok(ApplyResult::Applied)
         }
     })();

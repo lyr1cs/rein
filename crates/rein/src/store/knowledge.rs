@@ -580,6 +580,12 @@ impl SqliteStore {
                         &rec.keywords_json,
                     );
                     self.remove_from_hnsw(&rec.id);
+                    // v0.39 #A5: the refine branch rewrote content via raw
+                    // `UPDATE memories SET content` (bypassing store()/update()/
+                    // resummerize), so the durable triples are stale. Refresh
+                    // them here alongside the other post-commit side indexes
+                    // (flag-gated, best-effort — no-op when persist_triples off).
+                    let _ = self.maybe_persist_triples(&rec.id, &rec.content);
                 }
             }
             Err(_) => {

@@ -104,15 +104,62 @@ struct Migration {
     #[allow(dead_code)] // retained for logging / future migration ledger.
     name: &'static str,
     up: fn(&Connection) -> ReinResult<()>,
+    /// True when `up` is additive + idempotent — `CREATE ... IF NOT EXISTS`,
+    /// `ADD COLUMN`, backfills that re-run cleanly. Such a migration carries no
+    /// resurrection hazard (a concurrent/unserialized second run is a no-op via
+    /// `IF NOT EXISTS` + the in-lock version recheck + the atomic version
+    /// stamp), so it may run on a lock-degraded open path (a non-unix build, or
+    /// an flock-create failure on NFS / a read-only dir). A `false` migration
+    /// (drop / rename / 12-step rebuild) MUST be serialized and fails closed if
+    /// the cross-process lock can't be taken.
+    idempotent: bool,
 }
 
 /// Forward migrations applied after baseline, in ascending `version` order.
 ///
-/// Empty at the moment the framework lands: baseline stamping + the downgrade
-/// guard + fail-loud column adds ship first, exercised by the synthetic-migration
-/// tests in `migration_tests`. The first real forward migration (durable
-/// triple/fact table for the #A5 persistence unlock) is appended next.
-const MIGRATIONS: &[Migration] = &[];
+/// v2 (`create_memory_triples`) is the first real forward migration: the
+/// durable triple/fact table for the #A5 persistence unlock. Additive
+/// `CREATE TABLE` / `CREATE INDEX` only, so it is resurrection-safe and runs
+/// unconditionally on every open; triple POPULATION and READS are separately
+/// gated by `[dedup].persist_triples` (default off → empty table → no behavior
+/// change). The synthetic-migration tests in `migration_tests` still cover the
+/// drop / rollback / re-apply slices via their own `&[Migration]` lists.
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 2,
+    name: "create_memory_triples",
+    up: create_memory_triples,
+    // Additive `CREATE TABLE/INDEX IF NOT EXISTS` — resurrection-safe, so it
+    // may run on a lock-degraded open (non-unix build / flock-create failure)
+    // without bricking DB open. See the fail-closed gate below.
+    idempotent: true,
+}];
+
+/// v2 forward migration: durable `(subject, predicate, object)` fact table for
+/// #A5 triple persistence.
+///
+/// Additive only (resurrection-safe). Runs inside `apply_migrations`'
+/// `BEGIN IMMEDIATE`, so per the `Migration` CONTRACT it MUST NOT open its own
+/// transaction or toggle connection-level pragmas. `memory_id` carries
+/// `ON DELETE CASCADE`, so every hard-delete path (forget / gc / by-topic /
+/// STM prune) cleans triples automatically under `PRAGMA foreign_keys=ON`.
+/// `UNIQUE(memory_id, subject, predicate, object)` makes population idempotent;
+/// its left-prefix autoindex already serves per-memory lookups, so only the
+/// `subject` index (for future fact-space queries) is created explicitly.
+fn create_memory_triples(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_triples (
+            memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(memory_id, subject, predicate, object)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_triples_subject ON memory_triples(subject);",
+    )?;
+    Ok(())
+}
 
 /// Read the global schema version from `PRAGMA user_version` (0 on a DB this
 /// framework has never stamped).
@@ -278,20 +325,27 @@ fn init_schema_with_migrations(
         )));
     }
 
-    // Fail closed when a FORWARD migration is pending but the cross-process lock
-    // couldn't be taken (file-backed DB with a create/`flock` failure, or a
-    // non-unix build). A forward `DROP`/rename run unserialized is the
-    // resurrection/double-apply hazard. Idempotent baseline bring-up
-    // (`current < BASELINE`, no forward migration) is NOT gated here — concurrent
-    // bring-ups are benign (all `CREATE IF NOT EXISTS` + `add_column_idempotent`),
-    // so a Windows single-process first-open isn't broken by a missing flock.
-    // With `MIGRATIONS` empty this never fires. Unix file DBs hold the real lock
-    // above; `:memory:` is single-process.
-    let forward_migration_pending = migrations.iter().any(|m| m.version > current);
-    if forward_migration_pending && !migration_lock.serialized() {
+    // Fail closed ONLY when a NON-IDEMPOTENT forward migration is pending but
+    // the cross-process lock couldn't be taken (a file-backed DB with a
+    // create/`flock` failure on NFS / a read-only dir, or a non-unix build). A
+    // `DROP`/rename/rebuild run unserialized is the resurrection/double-apply
+    // hazard, so it must refuse rather than corrupt.
+    //
+    // An ADDITIVE + idempotent forward migration (`CREATE ... IF NOT EXISTS`,
+    // `ADD COLUMN`) is resurrection-safe: a concurrent/unserialized second run
+    // is a no-op via `IF NOT EXISTS` + the in-lock version recheck in
+    // `apply_migrations` + the atomic version stamp. Blocking it would brick a
+    // normal Windows/source install or any DB on a filesystem where flock can't
+    // be created — so those proceed on the lock-degraded path. Idempotent
+    // baseline bring-up (`current < BASELINE`) is likewise never gated.
+    // Unix file DBs hold the real lock above; `:memory:` is single-process.
+    let unsafe_migration_pending = migrations
+        .iter()
+        .any(|m| m.version > current && !m.idempotent);
+    if unsafe_migration_pending && !migration_lock.serialized() {
         return Err(ReinError::Config(
             "could not acquire the schema migration lock (<db>.migrate.lock); \
-             refusing to run a forward schema migration unserialized"
+             refusing to run a non-idempotent forward schema migration unserialized"
                 .to_string(),
         ));
     }
@@ -2376,8 +2430,9 @@ mod migration_tests {
         init_schema(&conn, 4).expect("init schema");
         assert_eq!(
             schema_user_version(&conn).unwrap(),
-            BASELINE_SCHEMA_VERSION,
-            "a fresh DB must be stamped at the baseline schema version"
+            max_known_schema_version(MIGRATIONS),
+            "a fresh DB must be stamped at the highest known version \
+             (baseline bring-up + every forward migration applied)"
         );
     }
 
@@ -2393,8 +2448,8 @@ mod migration_tests {
         init_schema(&conn, 4).expect("init schema on legacy db");
         assert_eq!(
             schema_user_version(&conn).unwrap(),
-            BASELINE_SCHEMA_VERSION,
-            "legacy bring-up must stamp the baseline version"
+            max_known_schema_version(MIGRATIONS),
+            "legacy bring-up must stamp baseline then apply every forward migration"
         );
         // The bring-up actually ran (migrate_source_check widened the source
         // CHECK), so a 'proxy'-sourced insert is now accepted.
@@ -2425,6 +2480,7 @@ mod migration_tests {
             version: BASELINE_SCHEMA_VERSION + 1,
             name: "drop_cluster_id",
             up: drop_cluster_id,
+            idempotent: false, // DROP COLUMN — must be serialized.
         }];
 
         // First open: bring up to baseline (which creates `cluster_id`), then
@@ -2507,6 +2563,7 @@ memoirs: created_at, description, id, name, updated_at
 memories: access_count, archival_claim_token, archival_summary, archival_summary_at, archival_summary_version, cluster_id, concept_ids, content, created_at, decay_lambda, id, importance, in_progress_archival_summary_at, in_progress_resummerize_at, keywords, last_accessed, last_resummarized_at, last_too_large_at, layer, needs_archival_summary, needs_resummerize, needs_vec_dedup, related_ids, source, status, strength, summary, superseded_by, tier, topic, updated_at
 memory_canonical_state: canonical_id, contradiction_score, dedup_confidence, last_merged_at, memory_id, merge_count, source_diversity, support_count
 memory_evidence: canonical_id, content, created_at, id, imported_at, keywords, memory_id, source, source_topic, summary
+memory_triples: confidence, created_at, memory_id, object, predicate, subject
 metadata: key, value
 oauth_auth_codes: client_id, code, code_challenge, code_challenge_method, consumed_at, expires_at, issued_at, redirect_uri
 oauth_clients: client_id, client_name, client_secret_hash, grant_types, last_used_at, redirect_uris, registered_at, revoked_at, token_endpoint_auth_method
@@ -2539,6 +2596,7 @@ session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subag
             version: BASELINE_SCHEMA_VERSION + 1,
             name: "half_then_fail",
             up: half_then_fail,
+            idempotent: false,
         }];
 
         let result = init_schema_with_migrations(&conn, 4, migrations);
@@ -2595,6 +2653,7 @@ session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subag
             version: BASELINE_SCHEMA_VERSION + 1,
             name: "create_marker",
             up: create_marker,
+            idempotent: false,
         }];
 
         init_schema_with_migrations(&conn, 4, migrations).expect("first open");
@@ -2654,6 +2713,7 @@ session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subag
             version: BASELINE_SCHEMA_VERSION + 1,
             name: "poison",
             up: poison,
+            idempotent: false,
         }];
 
         apply_migrations(&conn, migrations)
@@ -2676,7 +2736,10 @@ session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subag
         {
             let conn = Connection::open(&db).expect("open file db");
             init_schema(&conn, 4).expect("first init on a file db");
-            assert_eq!(schema_user_version(&conn).unwrap(), BASELINE_SCHEMA_VERSION);
+            assert_eq!(
+                schema_user_version(&conn).unwrap(),
+                max_known_schema_version(MIGRATIONS)
+            );
         }
         let lock = std::path::PathBuf::from(format!("{}.migrate.lock", db.display()));
         assert!(
@@ -2689,7 +2752,42 @@ session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subag
         init_schema(&conn2, 4).expect("second init must be a clean no-op");
         assert_eq!(
             schema_user_version(&conn2).unwrap(),
-            BASELINE_SCHEMA_VERSION
+            max_known_schema_version(MIGRATIONS)
         );
+    }
+
+    /// Drives the REAL `MIGRATIONS` const (not a synthetic slice): the first
+    /// forward migration (v2) must create `memory_triples` and stamp
+    /// user_version to the max known version. Fails loudly if v2 is unwired.
+    #[test]
+    fn migration_creates_memory_triples_and_stamps_v2() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema with real MIGRATIONS");
+        assert!(
+            max_known_schema_version(MIGRATIONS) >= 2,
+            "the v2 memory_triples migration must be wired into MIGRATIONS"
+        );
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            max_known_schema_version(MIGRATIONS),
+            "init must stamp the max known version after applying forward migrations"
+        );
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_triples'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "memory_triples table must exist after migration");
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memory_triples_subject'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "the subject index must exist after migration");
     }
 }

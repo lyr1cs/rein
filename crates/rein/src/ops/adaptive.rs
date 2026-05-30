@@ -1581,6 +1581,13 @@ fn run_tiering(
                         // content. The next dedup/re-embed pass will
                         // re-insert a summary-based embedding.
                         store.remove_from_hnsw(aid);
+                        // v0.39 #A5: the strip replaced the full body with the
+                        // summary, so triples extracted from the old body are
+                        // stale. Refresh against the new content (= summary)
+                        // alongside the other post-commit side indexes
+                        // (flag-gated, best-effort). This is the 5th content-
+                        // mutation path; see maybe_persist_triples.
+                        let _ = store.maybe_persist_triples(aid, &mem.summary);
                     }
                 }
                 Err(e) => {

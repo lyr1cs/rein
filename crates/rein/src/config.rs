@@ -185,6 +185,15 @@ pub struct DedupConfig {
     /// bootstrap; v0.27.1+ → ablation
     #[serde(default)]
     pub temporal_supersede_enabled: bool,
+    /// v0.39 #A5: when `true`, store-time + content-mutation paths persist
+    /// rule-based `(subject, predicate, object)` triples into the durable
+    /// `memory_triples` table (DELETE-then-INSERT, no LLM in the write lock).
+    /// Default `false` → no rows written → behavior bit-identical to prior
+    /// releases (the dedup gray-zone path keeps recomputing triples in-flight).
+    /// Not a tuning parameter — a pure on/off for the experimental fact-layer
+    /// foundation; the merge gate stays `triple_overlap_threshold`.
+    #[serde(default)]
+    pub persist_triples: bool,
 }
 
 fn default_triple_overlap_threshold() -> f64 {
@@ -201,6 +210,7 @@ impl Default for DedupConfig {
             triple_overlap_threshold: default_triple_overlap_threshold(),
             n_merge_max_candidates: default_n_merge_max_candidates(),
             temporal_supersede_enabled: false,
+            persist_triples: false,
         }
     }
 }
@@ -3383,7 +3393,7 @@ max_additional_context_chars = 1024
 
         // The bare derived Default carries the unversioned sentinel 0, which
         // the guard treats as the current baseline (validate must accept it).
-        let mut def = ReinConfig::default();
+        let def = ReinConfig::default();
         assert_eq!(def.config_version, 0);
         def.validate()
             .expect("unversioned (0) config must validate as current baseline");
