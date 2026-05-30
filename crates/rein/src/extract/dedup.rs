@@ -1181,7 +1181,7 @@ fn m6_explore_threshold(base_threshold: f32) -> (f32, bool) {
     let hash = count
         .wrapping_mul(0x9e3779b97f4a7c15)
         .wrapping_add(0x517cc1b727220a95);
-    let explore = hash.is_multiple_of(20); // 5% probability
+    let explore = hash % 20 == 0; // 5% probability
 
     if !explore {
         return (base_threshold, false);

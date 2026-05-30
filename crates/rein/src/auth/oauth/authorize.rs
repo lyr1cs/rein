@@ -58,7 +58,7 @@ fn csrf_mac(
 }
 
 fn hex_to_bytes(secret_hex: &str) -> anyhow::Result<Vec<u8>> {
-    if !secret_hex.len().is_multiple_of(2) {
+    if secret_hex.len() % 2 != 0 {
         anyhow::bail!("invalid hex");
     }
     secret_hex

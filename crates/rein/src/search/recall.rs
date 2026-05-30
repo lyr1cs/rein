@@ -2136,7 +2136,7 @@ pub fn recall_temporal_with_request_id(
 
     // Periodically update quality weights (every ~50 recalls)
     let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
-    if total_recalls > 0 && total_recalls.is_multiple_of(50) {
+    if total_recalls > 0 && total_recalls % 50 == 0 {
         store.update_quality_weights();
     }
 
