@@ -2448,6 +2448,82 @@ mod migration_tests {
         );
     }
 
+    /// Snapshot every core (non-shadow) table and its column set for a fresh
+    /// baseline DB. FTS5/vec0 auto-shadow tables are excluded — their internal
+    /// DDL is sqlite-version dependent.
+    #[cfg(test)]
+    fn baseline_schema_snapshot(conn: &Connection) -> String {
+        let mut names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table') AND name NOT LIKE 'sqlite_%'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|n| !n.contains("_fts") && !n.starts_with("vec_"))
+            .collect();
+        names.sort();
+        let mut out = String::new();
+        for t in &names {
+            let mut cols: Vec<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.sort();
+            out.push_str(&format!("{t}: {}\n", cols.join(", ")));
+        }
+        out
+    }
+
+    /// v1.0 SCHEMA FREEZE: the set of core tables and their columns is pinned.
+    /// Any column/table add/drop/rename outside a forward `Migration` breaks
+    /// this test — enforcing the 1.0 contract that all schema evolution goes
+    /// through `MIGRATIONS`. If a change is intentional, author a forward
+    /// migration and update `GOLDEN` to match.
+    #[test]
+    fn baseline_schema_is_frozen() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema");
+        let snapshot = baseline_schema_snapshot(&conn);
+        // Frozen at v1.0 (2026-05-30). Update ONLY alongside a forward Migration.
+        const GOLDEN: &str = "\
+cluster_centroids: centroid, cluster_id, cluster_version, dims
+cold_archive: archived_at, content, memory_id
+concept_links: created_at, id, relation, source_id, target_id, valid_from, valid_until, weight
+concept_revisions: concept_id, confidence, created_at, definition, episode_id, id, labels, revision, source_memory_ids
+concept_summary_instances: concept_id, refreshed_at, summary_id, summary_text
+concepts: confidence, created_at, definition, id, labels, last_episode_id, living_summary, living_summary_id, living_summary_source_revision, living_summary_updated_at, memoir_id, name, revision, source_memory_ids, updated_at
+consumer_offsets: consumer, last_event_id, updated_at
+cron_claims: claim_token, claimed_at, event_type, stamp_hash, surface_id
+dedup_decisions: canonical_id, confidence, conflict_detected, created_at, embedding_score, id, lexical_score, loser_id, merged_summary, novel_facts, operator, payload, reason, relation, reversible, winner_id
+embed_cache: created_at, embedding, query_hash
+episodes: concept_ids, created_at, decisions, id, important_paths, involved_agents, memory_ids, outcome, primary_topics, source_session_id, tags, temporal_keywords, title
+feedback_events: concept_id, event_type, id, memory_id, payload, query, query_type, request_id, topic, ts
+judge_call_ledger: id, status, ts
+memoirs: created_at, description, id, name, updated_at
+memories: access_count, archival_claim_token, archival_summary, archival_summary_at, archival_summary_version, cluster_id, concept_ids, content, created_at, decay_lambda, id, importance, in_progress_archival_summary_at, in_progress_resummerize_at, keywords, last_accessed, last_resummarized_at, last_too_large_at, layer, needs_archival_summary, needs_resummerize, needs_vec_dedup, related_ids, source, status, strength, summary, superseded_by, tier, topic, updated_at
+memory_canonical_state: canonical_id, contradiction_score, dedup_confidence, last_merged_at, memory_id, merge_count, source_diversity, support_count
+memory_evidence: canonical_id, content, created_at, id, imported_at, keywords, memory_id, source, source_topic, summary
+metadata: key, value
+oauth_auth_codes: client_id, code, code_challenge, code_challenge_method, consumed_at, expires_at, issued_at, redirect_uri
+oauth_clients: client_id, client_name, client_secret_hash, grant_types, last_used_at, redirect_uris, registered_at, revoked_at, token_endpoint_auth_method
+oauth_grants: access_expires_at, access_token_jti, client_id, grant_id, issued_at, refresh_expires_at, refresh_token_fingerprint, refresh_token_hash, revoked_at
+oauth_signing_keys: created_at, kid, rotated_at, secret_hex
+pending_grayzone_jobs: candidate_id, created_at, id, result_id, sim
+resummerize_runs: canonical_id, created_at, error, finished_at, id, input_canonical_chars, input_evidence_count, llm_backend, output_chars, output_hash, status, target_bytes, violations
+schema_migrations: applied_at, name, version
+session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subagent, schema_version, session_id, source_agent, source_label, started_at, summary, title, transcript_json, transcript_text, turn_count";
+        assert_eq!(
+            snapshot.trim(),
+            GOLDEN.trim(),
+            "v1.0 schema changed outside a Migration. If intentional, author a \
+             forward Migration and update GOLDEN.\nACTUAL:\n{snapshot}"
+        );
+    }
+
     /// A migration that fails mid-way must roll back BOTH its DDL and the
     /// `user_version` bump — they share one transaction.
     #[test]
