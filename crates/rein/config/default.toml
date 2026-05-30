@@ -1,3 +1,8 @@
+# Config schema version (metadata, not a tunable). Bumped only when the
+# config surface changes in a way that needs a load-time migration. A config
+# stamped newer than the running rein build understands is refused at load.
+config_version = 1
+
 [database]
 path = "auto"
 

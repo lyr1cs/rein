@@ -29,6 +29,28 @@ impl Provider {
 }
 
 // ---------------------------------------------------------------------------
+// Config schema version (v1.0)
+// ---------------------------------------------------------------------------
+
+/// Current config schema version understood by this rein build.
+///
+/// Monotonic integer (NOT a tunable parameter — pure metadata, like the
+/// SQLite `PRAGMA user_version` schema counter). Bump it whenever the config
+/// surface changes in a way that needs a load-time transform (a field rename,
+/// removal, or semantic change) and add the corresponding migration step.
+///
+/// Forward-compat contract: a config stamped with a version GREATER than this
+/// was written by a newer rein and is refused at load (`validate`), so an
+/// older binary never silently misreads future semantics. A version EQUAL to
+/// this, or the unversioned sentinel `0` (any pre-1.0 config, or the derived
+/// `Default`), is the current baseline and loads as-is.
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
+fn default_config_version() -> u32 {
+    CURRENT_CONFIG_VERSION
+}
+
+// ---------------------------------------------------------------------------
 // Config structs
 // ---------------------------------------------------------------------------
 
@@ -36,33 +58,57 @@ impl Provider {
 #[serde(deny_unknown_fields)]
 #[derive(Default)]
 pub struct ReinConfig {
+    /// Config schema version (see [`CURRENT_CONFIG_VERSION`]). Absent in any
+    /// pre-1.0 config → deserializes to the current version; the derived
+    /// `Default` leaves it `0` (unversioned baseline). A value newer than this
+    /// build understands is rejected at load. Never a behavior knob.
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
+    /// `[database]` — SQLite memory store path.
     pub database: DatabaseConfig,
+    /// `[embedding]` — embedding provider, vector dimensions, and per-provider (Google / OMLX) endpoints.
     pub embedding: EmbeddingConfig,
+    /// `[search]` — fusion (RRF / CC), LLM reranker, MMR diversity, and strong-signal bypass tuning.
     pub search: SearchConfig,
+    /// `[chunking]` — chunk max-tokens, overlap percent, and metadata-prefix toggle.
     pub chunking: ChunkingConfig,
+    /// `[sync]` — Supermemory cross-validation + auto-memory file sync (enable flags, glob, API key, endpoint).
     pub sync: SyncConfig,
+    /// `[decay]` — Ebbinghaus decay lambdas/betas, sweep interval, prune threshold, and STM→LTM promotion count.
     pub decay: DecayConfig,
+    /// `[server]` — MCP/SSE/GUI surface: SSE bind/port, auth policy, allowed hosts, and background warmup.
     pub server: ServerConfig,
+    /// `[hooks]` — session-extraction hook tuning: min turns, context window, per-session cap, signal keywords, buffer flush threshold.
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// `[extract]` — LLM extraction provider (Google / OMLX) and existing-context injection toggle.
     #[serde(default)]
     pub extract: ExtractConfig,
+    /// `[adaptive]` — operational settings for the M1-M5 adaptive engine (cold-start thresholds, retention, cache TTL).
     #[serde(default)]
     pub adaptive: AdaptiveConfig,
+    /// `[query_expansion]` — query-rewrite provider (default "google"), max variants, and per-provider endpoints.
     #[serde(default)]
     pub query_expansion: QueryExpansionConfig,
+    /// `[proxy]` — LLM-capture reverse proxy: bind/port, upstreams, body/buffer limits, and extraction gating.
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// `[async_memory]` — async memory worker queue: provider, retry/backoff, batch size, and working-set caps.
     #[serde(default)]
     pub async_memory: AsyncMemoryConfig,
+    /// `[cleanup]` — consolidation/dedup thresholds, LLM batch size + budget, and vector-dedup similarity bands.
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    /// `[intelligent_merge]` — opt-in LLM gray-zone merge classifier (enable flag, provider override, per-provider config).
     #[serde(default)]
     pub intelligent_merge: IntelligentMergeConfig,
+    /// `[resummerize]` — v0.23 slow-channel LLM canonical recompression (enable flag, LLM backend, batch size).
     #[serde(default)]
     pub resummerize: ResummerizeConfig,
+    /// `[ars]` — Adaptive Retention / Synthesis (Cap A/B/C): summary, recall-synthesis, and cold-archive knobs.
     #[serde(default)]
     pub ars: ArsConfig,
+    /// `[dedup]` — v0.27 dedup paths: triple-overlap threshold, N-merge fan-out cap, temporal-supersede flag.
     #[serde(default)]
     pub dedup: DedupConfig,
     /// v0.27.1 Track 2 — `[llm]` parent section providing 4-level
@@ -172,13 +218,16 @@ impl Default for DedupConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntelligentMergeConfig {
+    /// Master switch for the LLM intelligent-merge classifier. Default `false` (mechanical jaccard/containment only).
     #[serde(default)]
     pub enabled: bool,
     /// "google" | "omlx" | "none" — default "none" means reuse query_expansion.
     #[serde(default = "default_im_provider")]
     pub provider: String,
+    /// Independent Google provider config (model / api_key / endpoint), used only when `provider = "google"`.
     #[serde(default)]
     pub google: GoogleExpandConfig,
+    /// Independent OMLX provider config (endpoint / model / disable_thinking), used only when `provider = "omlx"`.
     #[serde(default)]
     pub omlx: OmlxExpandConfig,
 }
@@ -283,10 +332,15 @@ impl ResummerizeConfig {
 #[serde(deny_unknown_fields)]
 pub struct ArsConfig {
     // ── Cap A ────────────────────────────────────────────────────────────────
+    /// Enable Cap A concept living-summary refresh. Default `false` (opt-in).
+    /// Also the global fallback the per-cluster Cap-A gate falls back to.
     #[serde(default)]
     pub concept_summary_enabled: bool,
+    /// LLM provider for ARS: `"inherit"` | `"google"` | `"omlx"` | `"none"`.
+    /// Default `"inherit"` defers to `[extract].provider` (see `resolved_provider`).
     #[serde(default = "default_ars_backend")]
     pub llm_backend: String,
+    /// Max concepts refreshed per slow-channel Cap-A pass. Default 16; must be >= 1.
     #[serde(default = "default_ars_batch_size")]
     pub batch_size: usize,
     // ── Cap B ────────────────────────────────────────────────────────────────
@@ -709,22 +763,31 @@ pub struct ResolvedLlmConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
+    /// SQLite database path. `"auto"` (default) resolves to `~/.rein/memories.db`;
+    /// `:memory:` for an in-memory DB. Overridden by the `REIN_DB` env var.
     pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
+    /// Embedding backend: `"google"` (default), `"omlx"`, or `"none"` (disables embedding).
     pub provider: String,
+    /// Embedding vector length (default 3072). Must match the vector index dimensionality.
     pub dimensions: usize,
+    /// `[embedding.google]` — Gemini embedding settings (used when `provider = "google"`).
     pub google: GoogleEmbeddingConfig,
+    /// `[embedding.omlx]` — local OpenAI-compatible embedding settings (used when `provider = "omlx"`).
     pub omlx: OmlxEmbeddingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleEmbeddingConfig {
+    /// Gemini embedding model name. Default: "gemini-embedding-001".
     pub model: String,
+    /// Gemini API key; falls back to the `GEMINI_API_KEY` env var. When unset the
+    /// Google embedder is disabled (no embeddings produced).
     #[serde(default)]
     pub api_key: Option<String>,
     /// API endpoint override (for proxies in China, etc.)
@@ -740,7 +803,9 @@ fn default_google_endpoint() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OmlxEmbeddingConfig {
+    /// OpenAI-compatible embedding endpoint. Default: "http://localhost:8000/v1".
     pub endpoint: String,
+    /// OMLX embedding model name sent to the endpoint. Default: "default".
     #[serde(default = "default_omlx_model")]
     pub model: String,
 }
@@ -752,8 +817,12 @@ fn default_omlx_model() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
+    /// Reciprocal Rank Fusion rank constant `k` (default 60.0). Larger values flatten
+    /// the contribution of rank position.
     pub rrf_k: f64,
+    /// RRF weight applied to the BM25/FTS channel. Default: 0.3.
     pub rrf_fts_weight: f64,
+    /// RRF weight applied to the vector (HNSW) channel. Default: 0.7.
     pub rrf_vec_weight: f64,
     /// Fusion method: "rrf" (Reciprocal Rank Fusion) or "cc" (Convex Combination).
     /// CC normalizes scores to [0,1] and blends with alpha; often more accurate (Bruch 2023).
@@ -762,7 +831,10 @@ pub struct SearchConfig {
     /// Alpha for CC fusion: score = alpha * sparse + (1-alpha) * dense. Default 0.5.
     #[serde(default = "default_cc_alpha")]
     pub cc_alpha: f64,
+    /// Cosine-similarity threshold in [0.0, 1.0] for store-time dedup and auto-linking.
+    /// Default: 0.70.
     pub dedup_similarity: f64,
+    /// Lookback window (days) for store-time dedup candidate matching. Default: 7.
     pub dedup_time_window_days: i64,
     /// LLM reranker provider: "google", "omlx", or "none". Default: "none".
     #[serde(default = "default_llm_reranker")]
@@ -814,17 +886,25 @@ fn default_strong_signal_single() -> f32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkingConfig {
+    /// Max tokens per chunk (estimated at ~4 chars/token). Default: 512.
     pub max_tokens: usize,
+    /// Percent of `max_tokens` carried over from the end of the previous chunk. Default: 10.
     pub overlap_percent: usize,
+    /// Whether to prepend topic/summary metadata to chunk text before embedding. Default: true.
     pub metadata_prefix: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncConfig {
+    /// Enable Supermemory cross-source recall (skipped in fast-path recall). Default: true.
     pub supermemory_enabled: bool,
+    /// Enable auto-memory file recall over `auto_memory_glob` (skipped in fast-path recall). Default: true.
     pub auto_memory_enabled: bool,
+    /// Glob for auto-memory markdown files scanned during recall.
+    /// Default: "~/.claude/projects/*/memory/**/*.md".
     pub auto_memory_glob: String,
+    /// Supermemory API key; falls back to the `SUPERMEMORY_CC_API_KEY` env var.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Supermemory API endpoint override
@@ -979,23 +1059,41 @@ impl Default for CleanupConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecayConfig {
+    /// Base per-memory exponential decay rate. Default 0.06. The effective
+    /// per-row rate is `base_lambda * importance.decay_factor()`.
     pub base_lambda: f64,
+    /// Long-term-memory decay shaping factor. Default 0.8.
     pub ltm_beta: f64,
+    /// Short-term-memory decay shaping factor. Default 1.2.
     pub stm_beta: f64,
+    /// Nominal decay/GC cadence in hours. Default 24.
     pub interval_hours: u64,
+    /// Strength floor below which weak STM memories are pruned during `gc`.
+    /// Default 0.05; used unless overridden by the `--threshold` flag.
     pub prune_threshold: f64,
+    /// Access count at which an STM memory is eligible for STM->LTM promotion. Default 5.
     pub stm_to_ltm_access_count: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Render MCP tool output in compact form (sets the runtime compact flag).
+    /// Default false.
     pub compact: bool,
+    /// Enable the HTTP/SSE server surface. Default false.
     pub sse_enabled: bool,
+    /// TCP port for the HTTP/SSE (and GUI) server. Default 8680.
     pub sse_port: u16,
+    /// Bind host for the HTTP/SSE server. Default "127.0.0.1". A wildcard bind
+    /// (0.0.0.0, ::, *) requires `allowed_hosts` to be set.
     pub sse_bind: String,
+    /// Explicit HTTP auth policy (loopback_only / bearer_required / oauth /
+    /// public). Default None; resolved by `resolve_auth_policy`.
     #[serde(default)]
     pub auth: Option<AuthPolicyConfig>,
+    /// Externally reachable base URL, used to build OAuth/metadata endpoints.
+    /// Default None (falls back to the local bind address).
     #[serde(default)]
     pub public_url: Option<String>,
     /// Run background warmup/side-index repair when service surfaces start.
@@ -1008,6 +1106,7 @@ pub struct ServerConfig {
     /// side-index writer locks.
     #[serde(default)]
     pub stdio_background_warmup: bool,
+    /// Serve the embedded Neural Wiki GUI on non-`/mcp` paths. Default false.
     #[serde(default)]
     pub gui_enabled: bool,
     /// v0.27.3 F5/C3: optional explicit Host-header allowlist used by the
@@ -1056,14 +1155,27 @@ pub(crate) fn is_loopback_bind_host(bind: &str) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HooksConfig {
+    /// Minimum transcript turns (or lines, when turn count is unknown) before
+    /// a session is extracted. Default 20.
     pub min_turns: usize,
+    /// Number of lines kept before each signal-keyword hit when extracting
+    /// signal windows. Default 3.
     pub context_before: usize,
+    /// Number of lines kept after each signal-keyword hit when extracting
+    /// signal windows. Default 1.
     pub context_after: usize,
+    /// Cap on memories persisted per hook session. Default 10.
     pub max_items_per_session: usize,
+    /// `[hooks.codex]` — Codex-specific hook behavior (context injection and
+    /// guardrails).
     #[serde(default)]
     pub codex: CodexHooksConfig,
+    /// Keywords that mark transcript lines as memory-worthy signals. Defaults
+    /// to a built-in EN/CJK list (see `default_signal_keywords`).
     #[serde(default = "default_signal_keywords")]
     pub signal_keywords: Vec<String>,
+    /// Directory for hook session buffers. Default "auto" (resolves to the
+    /// database parent dir, e.g. ~/.rein/).
     #[serde(default = "default_buffer_dir")]
     pub buffer_dir: String,
     /// Buffer size (in characters) that triggers a mid-session LLM extraction.
@@ -1118,8 +1230,12 @@ fn default_codex_max_additional_context_chars() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractConfig {
+    /// LLM provider for memory extraction: "google", "omlx", or "none".
+    /// Default: "google". "none" disables LLM labeling (rule-based fallback only).
     pub provider: String,
+    /// `[extract.google]` — Gemini extraction backend (used when provider = "google").
     pub google: GoogleExtractConfig,
+    /// `[extract.omlx]` — local OpenAI-compatible extraction backend (used when provider = "omlx").
     pub omlx: OmlxExtractConfig,
     /// Inject existing memory summaries into extraction prompts to reduce duplicates.
     /// Default: false (opt-in to avoid sending memory content to remote providers).
@@ -1159,9 +1275,13 @@ pub struct AsyncMemoryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleExtractConfig {
+    /// Gemini model id. Default: "gemini-3.1-flash-lite-preview".
     pub model: String,
+    /// Gemini API key. Default: None (populated from GEMINI_API_KEY at load time).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// API endpoint override (for proxies in China, etc.)
+    /// Default: "https://generativelanguage.googleapis.com"
     #[serde(default = "default_google_endpoint")]
     pub endpoint: String,
     /// Max input characters. 0 = no truncation (default for gemini-3.1-flash-lite-preview which supports 1M tokens).
@@ -1172,7 +1292,9 @@ pub struct GoogleExtractConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OmlxExtractConfig {
+    /// OpenAI-compatible base URL for the local model. Default: "http://localhost:11434/v1".
     pub endpoint: String,
+    /// Local model name passed to the OpenAI-compatible endpoint. Default: "default".
     #[serde(default = "default_omlx_extract_model")]
     pub model: String,
     /// Max input characters for local models (default 16000, suitable for 7B-13B models).
@@ -1204,8 +1326,10 @@ pub struct QueryExpansionConfig {
     /// Maximum number of expanded query variants. Default: 3.
     #[serde(default = "default_max_expansions")]
     pub max_expansions: usize,
+    /// `[query_expansion.google]` — Gemini expansion backend (used when provider = "google").
     #[serde(default)]
     pub google: GoogleExpandConfig,
+    /// `[query_expansion.omlx]` — local OpenAI-compatible expansion backend (used when provider = "omlx").
     #[serde(default)]
     pub omlx: OmlxExpandConfig,
 }
@@ -1220,10 +1344,14 @@ fn default_max_expansions() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleExpandConfig {
+    /// Gemini model id for query expansion. Default: "gemini-3.1-flash-lite-preview".
     #[serde(default = "default_expand_google_model")]
     pub model: String,
+    /// Gemini API key. Default: None (falls back to GEMINI_API_KEY).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// API endpoint override (for proxies in China, etc.)
+    /// Default: "https://generativelanguage.googleapis.com"
     #[serde(default = "default_google_endpoint")]
     pub endpoint: String,
 }
@@ -1235,8 +1363,10 @@ fn default_expand_google_model() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OmlxExpandConfig {
+    /// OpenAI-compatible base URL for the local expansion model. Default: "http://localhost:8000/v1".
     #[serde(default = "default_omlx_expand_endpoint")]
     pub endpoint: String,
+    /// Local model name passed to the OpenAI-compatible endpoint. Default: "default".
     #[serde(default = "default_omlx_model")]
     pub model: String,
     /// Prepend /no_think to system prompts (for Qwen3 thinking mode). Default: true.
@@ -1374,21 +1504,38 @@ impl Default for ServerConfig {
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct ProxyConfig {
+    /// TCP port the recording proxy listens on. Default: 8690.
     pub port: u16,
+    /// Address the proxy binds to. Default: "127.0.0.1" (loopback only).
     pub bind: String,
+    /// Upstream forwarded to for Anthropic API traffic. Default: "https://api.anthropic.com".
     pub anthropic_upstream: String,
+    /// Upstream forwarded to for OpenAI API traffic. Default: "https://api.openai.com".
     pub openai_upstream: String,
+    /// Upstream forwarded to for ChatGPT backend traffic. Default: "https://chatgpt.com/backend-api".
     pub chatgpt_upstream: String,
+    /// Upstream forwarded to for Codex (first-party) traffic. Default: "https://chatgpt.com/backend-api/codex".
     pub codex_upstream: String,
+    /// Gate for record-only memory extraction from proxied responses. Default: true.
     pub extract_enabled: bool,
+    /// Minimum response length (chars) before a response is considered for extraction. Default: 220.
     pub store_min_chars: usize,
+    /// Minimum sentence-significance score required to extract when no strong signal is present. Default: 3.
     pub store_min_score: u32,
+    /// Max upstream retry attempts for idempotent/transient failures. Default: 2.
     pub max_retries: u32,
+    /// Base backoff in milliseconds; exponential per retry attempt. Default: 500.
     pub retry_base_ms: u64,
+    /// Max buffered request body in bytes. Default: 1_048_576 (1 MiB).
     pub max_request_body: usize,
+    /// Max buffered non-streaming response in bytes. Default: 1_048_576 (1 MiB).
     pub max_response_buffer: usize,
+    /// Max buffered SSE stream content in bytes. Default: 1_048_576 (1 MiB).
     pub max_sse_buffer: usize,
+    /// Max concurrent proxy-side extraction tasks. Default: 4.
     pub max_concurrent_extractions: usize,
+    /// Opt-in to serving unauthenticated loopback requests without REIN_PROXY_TOKEN.
+    /// Default: false (default-deny; operators must opt in or set the token).
     pub allow_unauthenticated_loopback: bool,
 }
 
@@ -1747,6 +1894,16 @@ impl ReinConfig {
 
     /// Validate configuration and return an error for invalid values.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // v1.0 forward-compat guard: refuse a config written by a newer rein.
+        // (Unversioned `0` and the current version both pass — see
+        // `CURRENT_CONFIG_VERSION`.) Mirrors the SQLite schema downgrade guard.
+        if self.config_version > CURRENT_CONFIG_VERSION {
+            anyhow::bail!(
+                "config_version {} is newer than this rein build understands (max {}); upgrade rein or remove the config_version key",
+                self.config_version,
+                CURRENT_CONFIG_VERSION
+            );
+        }
         validate_provider_name("embedding.provider", &self.embedding.provider)?;
         // Codex R4 P2 fix — extract / query_expansion / search.llm_reranker
         // accept "inherit" sentinel (in addition to google/omlx/none) so
@@ -3215,6 +3372,39 @@ max_additional_context_chars = 1024
         // H0 (v0.28 audit): nightly_cron defaults to false; the user TOML
         // here does not opt into it.
         assert!(!cfg.ars.llm_judge.nightly_cron.enabled);
+    }
+
+    #[test]
+    fn config_version_defaults_and_downgrade_guard() {
+        // A config that omits config_version loads at the current version
+        // (it is merged over the embedded default.toml which stamps it).
+        let cfg = ReinConfig::load_from_str("[search]\nrrf_k = 30.0\n").unwrap();
+        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
+
+        // The bare derived Default carries the unversioned sentinel 0, which
+        // the guard treats as the current baseline (validate must accept it).
+        let mut def = ReinConfig::default();
+        assert_eq!(def.config_version, 0);
+        def.validate()
+            .expect("unversioned (0) config must validate as current baseline");
+
+        // An explicit current version round-trips and validates.
+        let cur =
+            ReinConfig::load_from_str(&format!("config_version = {CURRENT_CONFIG_VERSION}\n"))
+                .unwrap();
+        assert_eq!(cur.config_version, CURRENT_CONFIG_VERSION);
+
+        // A newer-than-supported version is refused at load (forward-compat
+        // guard), so an older binary never misreads future config semantics.
+        let err = ReinConfig::load_from_str(&format!(
+            "config_version = {}\n",
+            CURRENT_CONFIG_VERSION + 1
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("newer than this rein build"),
+            "expected forward-compat rejection, got: {err}"
+        );
     }
 
     #[test]

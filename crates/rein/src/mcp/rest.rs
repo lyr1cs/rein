@@ -114,6 +114,13 @@ fn secure_cookie_suffix(secure: bool) -> &'static str {
     }
 }
 
+/// Session cookie scoped to `Path=/api` (deliberately NOT broadened to `/`).
+/// The v1.0 `/v1/*` versioned surface is authenticated with a header token
+/// (`Authorization: Bearer <REIN_HTTP_TOKEN>` or `x-rein-token`), which is
+/// path-independent — so `/v1` clients need no cookie. Keeping this long-lived
+/// static credential on `/api` avoids sending it to `/oauth/authorize` (where
+/// it would otherwise satisfy `owner_authorized` and bypass the short-lived
+/// `rein_oauth_owner` approval window) and to `/mcp`. HttpOnly + SameSite=Strict.
 fn session_cookie_value(token: &str, secure: bool) -> String {
     let secure = secure_cookie_suffix(secure);
     format!("{HTTP_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/api{secure}")

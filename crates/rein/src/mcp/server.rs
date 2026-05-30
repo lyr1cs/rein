@@ -447,6 +447,38 @@ fn is_mutating_http_surface_request(method: &hyper::Method, path: &str) -> bool 
     ) && (path.starts_with("/api/") || path.starts_with("/mcp"))
 }
 
+/// v1.0: `/v1/*` is a versioned alias for the REST surface served under
+/// `/api/*`. Rewrite the request URI in place at ingress so every downstream
+/// guard (host / browser-mutation / auth) and dispatcher sees the canonical
+/// `/api` path — no other call site needs to know about `/v1`. The query string
+/// is preserved. No-op for non-`/v1/` paths (and for a bare `/v1`, which has no
+/// resource and falls through like `/api`).
+///
+/// AUTH NOTE: `/v1` is the programmatic surface — authenticate with a header
+/// token (`Authorization: Bearer <REIN_HTTP_TOKEN>` or `x-rein-token`), which is
+/// path-independent. The browser session cookie (`rein_http_token`) is
+/// deliberately scoped to `Path=/api` (see `session_cookie_value`), so cookie /
+/// GUI auth uses `/api`, not `/v1`.
+fn normalize_versioned_api_path<B>(req: &mut hyper::Request<B>) {
+    let Some(target) = req.uri().path().strip_prefix("/v1/").map(|rest| {
+        let query = req
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        format!("/api/{rest}{query}")
+    }) else {
+        return;
+    };
+    if let Ok(path_and_query) = target.parse::<hyper::http::uri::PathAndQuery>() {
+        let mut parts = req.uri().clone().into_parts();
+        parts.path_and_query = Some(path_and_query);
+        if let Ok(uri) = hyper::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
+    }
+}
+
 fn request_has_browser_mutation_headers(headers: &hyper::HeaderMap) -> bool {
     headers.contains_key(hyper::header::ORIGIN) || headers.contains_key(SEC_FETCH_SITE)
 }
@@ -1052,6 +1084,8 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
             let cfg = rest_config.clone();
             let peer_is_loopback = peer_addr.ip().is_loopback();
             async move {
+                let mut req = req;
+                normalize_versioned_api_path(&mut req);
                 let path = req.uri().path().to_string();
                 let method = req.method().clone();
                 let allowed_hosts = cfg.server.allowed_hosts.as_deref();
@@ -2179,5 +2213,35 @@ rein_update: props[content,id,importance] req[content,id]";
             "expected 40 MCP tools; got {}",
             lines.len()
         );
+    }
+
+    #[test]
+    fn v1_path_is_normalized_to_api_alias() {
+        // /v1/<resource> rewrites to /api/<resource>, query preserved.
+        let mut req = hyper::Request::builder()
+            .uri("/v1/memories?limit=5")
+            .body(())
+            .unwrap();
+        normalize_versioned_api_path(&mut req);
+        assert_eq!(req.uri().path(), "/api/memories");
+        assert_eq!(req.uri().query(), Some("limit=5"));
+
+        // /api/* is untouched.
+        let mut req = hyper::Request::builder()
+            .uri("/api/store")
+            .body(())
+            .unwrap();
+        normalize_versioned_api_path(&mut req);
+        assert_eq!(req.uri().path(), "/api/store");
+
+        // A bare /v1 (no resource) is left alone — falls through like /api.
+        let mut req = hyper::Request::builder().uri("/v1").body(()).unwrap();
+        normalize_versioned_api_path(&mut req);
+        assert_eq!(req.uri().path(), "/v1");
+
+        // Non-API paths untouched.
+        let mut req = hyper::Request::builder().uri("/mcp").body(()).unwrap();
+        normalize_versioned_api_path(&mut req);
+        assert_eq!(req.uri().path(), "/mcp");
     }
 }
