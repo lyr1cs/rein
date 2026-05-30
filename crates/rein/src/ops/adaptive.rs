@@ -1640,15 +1640,14 @@ fn peek_recall_events(conn: &rusqlite::Connection) -> Vec<crate::store::adaptive
     }
 }
 
-/// Parse candidate score logs from a recall_complete event payload.
-/// Returns a list of CandidateLog structs extracted from the JSON payload.
 /// v0.37 #A18 — true when an access feedback event explicitly marks the
-/// recall as NOT helpful (`payload.helpful == false`). Shared by the M2
-/// training-event assembly (routes the memory to `negative_ids`) and the
-/// reranker weight learner (excludes the memory from its positive set) so
-/// the two consumers can never disagree on whether an access was a
-/// thumb-down. `helpful` absent/true/null ⇒ not unhelpful (pre-v0.37
-/// back-compat).
+/// recall as NOT helpful (`payload.helpful == false`). Used by the M2
+/// training-event assembly (`parse_candidates_from_event`) to route the memory
+/// into `negative_ids`. `helpful` absent / true / null ⇒ not unhelpful
+/// (pre-v0.37 back-compat). NOTE: the M2 alpha/shadow learner is the ONLY
+/// consumer of this negative signal — the reranker, M5 tiering, and quality
+/// scoring intentionally treat the underlying access uniformly (see the scope
+/// note at the reranker `used_ids` collection in `run_reranker_weight_learning`).
 fn access_event_marks_unhelpful(event: &crate::store::adaptive::StoredEvent) -> bool {
     event
         .payload
@@ -1658,6 +1657,8 @@ fn access_event_marks_unhelpful(event: &crate::store::adaptive::StoredEvent) -> 
         == Some(false)
 }
 
+/// Parse candidate score logs from a `recall_complete` event payload and join
+/// the correlated access events into a `RecallEvent` for M2 / shadow learning.
 fn parse_candidates_from_event(
     event: &crate::store::adaptive::StoredEvent,
     access_events: &[crate::store::adaptive::StoredEvent],

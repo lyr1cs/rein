@@ -1057,14 +1057,14 @@ Use this when rein is reachable through any public HTTPS tunnel and you want
 Claude's custom connector to complete OAuth itself.
 
 **Prerequisite: use a GUI-enabled rein binary.** The standard
-`cargo install --git https://github.com/lyr1cs/rein --tag v0.36.0 --locked rein`
+`cargo install --git https://github.com/lyr1cs/rein --tag v0.37.0 --locked rein`
 path builds the default non-GUI binary (`default = []`), so `rein serve --gui`
 cannot serve the Settings page needed to create the owner approval session.
 Use one of these instead:
 
 ```bash
 # Clone build with embedded GUI assets.
-git clone --branch v0.36.0 https://github.com/lyr1cs/rein
+git clone --branch v0.37.0 https://github.com/lyr1cs/rein
 cd rein
 ./scripts/install.sh
 

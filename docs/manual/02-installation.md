@@ -64,13 +64,13 @@ without cloning, use `cargo install --git` with **both** `--tag` **and**
 
 ```bash
 # Install a specific release (binary only, no GUI)
-cargo install --git https://github.com/lyr1cs/rein --tag v0.36.0 --locked rein
+cargo install --git https://github.com/lyr1cs/rein --tag v0.37.0 --locked rein
 ```
 
 To upgrade an existing install in place, add `--force`:
 
 ```bash
-cargo install --git https://github.com/lyr1cs/rein --tag v0.36.0 --locked rein --force
+cargo install --git https://github.com/lyr1cs/rein --tag v0.37.0 --locked rein --force
 ```
 
 > ⚠️ **`--locked` is mandatory when using `--tag`.** Without `--locked`,
@@ -86,7 +86,7 @@ If you need the embedded GUI when installing remotely, you must clone the
 source instead — `--git` alone does not run `npm` for the GUI bundle:
 
 ```bash
-git clone --branch v0.36.0 https://github.com/lyr1cs/rein
+git clone --branch v0.37.0 https://github.com/lyr1cs/rein
 cd rein
 ./scripts/install.sh        # builds GUI then runs cargo install --locked --features gui
 ```
@@ -261,7 +261,7 @@ and Windows users have two alternatives:
 
 1. **Claude Code plugin marketplace** — see the project README's
    `Install via Claude Code plugin marketplace` section. Requires
-   `cargo install --git https://github.com/lyr1cs/rein --tag v0.36.0 --locked rein` separately.
+   `cargo install --git https://github.com/lyr1cs/rein --tag v0.37.0 --locked rein` separately.
 2. **Manual MCP entry** — edit
    `~/Library/Application Support/Claude/claude_desktop_config.json`:
 

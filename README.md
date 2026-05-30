@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v0.36.0`** (2026-05-29) — algorithm + performance pass. **(#P1)** Recall strong-signal fast-path: when a dominant BM25 hit survives every downstream drop-filter and the local index alone already satisfies the requested `limit`, the knowledge-graph and Supermemory fallback channels leave the critical path — deterministically, with recall held non-inferior on the eval gate (paired McNemar). **(#C2)** `rein-eval gate sweep --gate dedup`: a hermetic, data-driven precision/recall/F1 threshold sweep that reports a merge-safe (precision = 1.0) optimum instead of a hand-set bound. **(#C3)** Admission gray-zone corpus hardened — 6 → 10 fixtures, every gray-zone case ≥ 0.07 from both band edges, plus a drift-guard test. **(#ablation)** New `rein-eval ablate`: multi-arm ablation over saved gate scorecards with bootstrap 95% confidence intervals, paired deltas, and a significance flag, reproducible via a seeded PRNG. Tests: 1692 passed / 7 ignored / 0 failed; clippy + fmt clean. See the [v0.36.0 release](https://github.com/lyr1cs/rein/releases/tag/v0.36.0).
+**Current release: `v0.37.0`** (2026-05-30) — algorithm + hooks pass. **(#A18)** Explicit feedback signal: `rein_feedback` with `helpful: false` now trains the adaptive fusion optimizer (M2 alpha + multi-dimensional shadow weights) as a *negative* sample via a parameter-free symmetric objective — accessed memories ranked up, explicitly-unhelpful ones ranked down — with recall held non-inferior on the eval gate (paired McNemar). **(hooks)** Ingestion de-duplication: identical content surfaced by multiple agents or hook sources is now collapsed at the queue, eliminating duplicate captures. Plus a re-confirmed data-driven dedup-threshold sweep, with the production threshold held pending live-traffic calibration. Tests: 1702 passed / 7 ignored / 0 failed; clippy + fmt clean. See the [v0.37.0 release](https://github.com/lyr1cs/rein/releases/tag/v0.37.0).
 
 **Recent releases (`v0.33` → `v0.35`)** — the eval-gate harness went from foundation to full: the dedup / admission / latency gates moved from `NoData` stubs to working scorers with committed baselines and 20-fixture corpora per gate (v0.33.0/.1, v0.35.0). Trust & Measurement Phase 3 landed its first slice — `repair_advice` + `judge_drift_alert_total` (v0.35.0); claude.ai remote-MCP polish added a sliding session cookie + metadata JSON (v0.35.0); and the bearer-auth migration progressed from a `rein doctor` WARN on the legacy loopback bool (v0.34.0) to its load-time removal (v0.35.0).
 
@@ -82,12 +82,12 @@ Three install paths depending on your client:
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v0.36.0.mcpb` from
-   [the v0.36.0 release](https://github.com/lyr1cs/rein/releases/download/v0.36.0/rein-v0.36.0.mcpb).
+1. Download `rein-v0.37.0.mcpb` from
+   [the v0.37.0 release](https://github.com/lyr1cs/rein/releases/download/v0.37.0/rein-v0.37.0.mcpb).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v0.36.0.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v0.37.0.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -121,7 +121,7 @@ need the `rein` binary on your `PATH`:
 cargo install --git https://github.com/lyr1cs/rein --locked rein
 
 # Or pin to a specific release tag (recommended for reproducible installs)
-cargo install --git https://github.com/lyr1cs/rein --tag v0.36.0 --locked rein
+cargo install --git https://github.com/lyr1cs/rein --tag v0.37.0 --locked rein
 ```
 
 > **`--locked` is required.** Without it, `cargo install --git` ignores
@@ -520,10 +520,11 @@ rein's core philosophy is to minimize fixed parameters through data-driven adapt
 
 ### Recent releases
 
-The v0.21 → v0.36.0 arc rebuilt rein around five axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, secure remote MCP deployment for Claude clients, a reproducible eval-gate harness for Trust & Measurement, and an algorithm + performance pass on the recall and dedup hot paths.
+The v0.21 → v0.37.0 arc rebuilt rein around five axes: a unified operation registry, an adaptive read-side synthesis (ARS) stack with feedback-driven gates, secure remote MCP deployment for Claude clients, a reproducible eval-gate harness for Trust & Measurement, and an algorithm + performance pass on the recall and dedup hot paths.
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v0.37.0** (2026-05-30) | Algorithm + hooks | **#A18** explicit negative feedback: `rein_feedback` `helpful: false` trains the M2 alpha optimizer + multi-dimensional shadow weights as a parameter-free symmetric negative sample (accessed memories ranked up, explicitly-unhelpful ones ranked down); recall held non-inferior on the eval gate. **Hooks** ingestion de-dup: identical content surfaced by multiple agents / hook sources is collapsed at the queue. **#C2** dedup-threshold sweep re-confirmed; production threshold held pending live-traffic calibration. **1702 tests / 0 fail / 7 ignored.** |
 | **v0.36.0** (2026-05-29) | Algorithm + performance pass | **#P1** recall strong-signal fast-path: skip the KG + Supermemory fallback channels when a dominant BM25 hit survives every drop-filter and the local index alone satisfies the requested limit — deterministic, recall held non-inferior on the eval gate. **#C2** `rein-eval gate sweep --gate dedup`: data-driven precision/recall/F1 threshold sweep reporting a merge-safe (precision = 1.0) optimum. **#C3** admission gray-zone corpus 6 → 10 fixtures, ≥ 0.07 edge margin, drift-guard test. **#ablation** `rein-eval ablate`: multi-arm bootstrap-CI ablation with paired deltas + significance, reproducible (seeded PRNG). **1692 tests / 0 fail / 7 ignored.** |
 | **v0.33 → v0.35** (2026-05-28) | Eval-gate harness: foundation → full | The dedup / admission / latency gates moved from `NoData` stubs to working scorers with committed baselines + 20-fixture corpora per gate (v0.33.0/.1, v0.35.0). Trust & Measurement Phase 3 first slice: `repair_advice` + `judge_drift_alert_total` (v0.35.0). claude.ai remote-MCP polish: sliding session cookie + metadata JSON (v0.35.0). Bearer-auth migration: `rein doctor` WARN on the legacy loopback bool (v0.34.0) → load-time removal (v0.35.0). |
 | **v0.32.0** (2026-05-18) | Trust & Measurement Phase 2 — eval-gate harness | New `eval::gates` module: `GateScorecard` / `Gate` trait / `compare_scorecards` 8-rule pipeline (presence / schema / identity / kind / freshness / stub / duplicate-id / strict id-set + paired McNemar non-inferiority). Recall gate ships full-impl over a 20-fixture corpus seeded into hermetic in-memory `SqliteStore` per fixture (deterministic, no live LLM/embedding). The dedup / admission / latency gates ship as `NoData` stubs here (taken to full in v0.33–v0.35). New `rein-eval gate {baseline,run,compare,status}` CLI subcommand; `rein_trust_measurement` reads real scorecards; `rein doctor` surfaces stale baselines / Bail / mis-wired / corrupt as WARN. Reference baseline at `docs/eval-baselines/recall.json` (score = 1.000). **1647 tests / 0 fail / 5 ignored.** |
@@ -1743,10 +1744,11 @@ open http://localhost:8680
 
 ### 最近版本
 
-v0.21 → v0.36.0 这一段重构围绕五条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、面向 Claude 客户端的安全远程 MCP 部署、可重复 Trust & Measurement eval-gate 闸口，以及召回 / dedup 热路径的算法 + 性能优化。
+v0.21 → v0.37.0 这一段重构围绕五条主线：统一 operation registry、ARS（Adaptive Read-Side Synthesis）反馈驱动闸门栈、面向 Claude 客户端的安全远程 MCP 部署、可重复 Trust & Measurement eval-gate 闸口，以及召回 / dedup 热路径的算法 + 性能优化。
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v0.37.0** (2026-05-30) | 算法 + hooks | **#A18** 显式负反馈：`rein_feedback` `helpful: false` 作为 parameter-free 对称负样本训练 M2 alpha optimizer + 多维 shadow 权重（被访问的排高、显式无用的排低）；召回在 eval gate 上保持非劣效。**Hooks** 摄入去重：多 agent / hook source 产生的相同内容在队列层合并。**#C2** dedup 阈值 sweep 重新确认；生产阈值等真实流量校准。**1702 测试 / 0 失败 / 7 ignored**。 |
 | **v0.36.0** (2026-05-29) | 算法 + 性能 | **#P1** 召回强信号快路径：当 dominant BM25 命中过所有 drop-filter 且本地索引已满足请求 limit 时，跳过 KG + Supermemory 兜底通道——确定性，召回在 eval gate 上保持非劣效。**#C2** `rein-eval gate sweep --gate dedup`：数据驱动的 precision/recall/F1 阈值 sweep，报告 merge-safe（precision = 1.0）最优点。**#C3** admission gray-zone 语料 6 → 10 fixture，边距 ≥ 0.07，加 drift-guard 测试。**#ablation** `rein-eval ablate`：多 arm bootstrap-CI 消融 + 配对 delta + 显著性，seeded PRNG 可复现。**1692 测试 / 0 失败 / 7 ignored**。 |
 | **v0.33 → v0.35** (2026-05-28) | eval-gate 闸口：foundation → full | dedup / admission / latency 三闸从 `NoData` stub 变为带 committed baseline + 每闸 20-fixture 语料的真实 scorer（v0.33.0/.1、v0.35.0）。T&M Phase 3 首切片：`repair_advice` + `judge_drift_alert_total`（v0.35.0）。claude.ai 远程 MCP 精修：sliding session cookie + metadata JSON（v0.35.0）。bearer-auth 迁移：`rein doctor` 对 legacy loopback bool WARN（v0.34.0）→ load-time 删除（v0.35.0）。 |
 | **v0.32.0** (2026-05-18) | Trust & Measurement Phase 2 — eval-gate harness | 新 `eval::gates` 模块：`GateScorecard` / `Gate` trait / `compare_scorecards` 8 规则流水线（presence / schema / identity / kind / freshness / stub / duplicate-id / strict id-set + 配对 McNemar 非劣效）。Recall gate 跑全量实现，20 fixture 注入隔离的 in-memory `SqliteStore`（确定性、hermetic、无 LLM/embedding API 调用）。dedup / admission / latency 三闸此版仍是 `NoData` stub（v0.33–v0.35 做满）。新 `rein-eval gate {baseline,run,compare,status}` CLI 子命令；`rein_trust_measurement` 改读真实 scorecard；`rein doctor` 把过期 baseline / Bail / 错装 / corrupt 暴露为 WARN。参考 baseline 在 `docs/eval-baselines/recall.json`（v0.32.0 score = 1.000）。**1647 测试 / 0 失败 / 5 ignored**。 |
