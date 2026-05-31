@@ -9,9 +9,34 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
-## [Unreleased]
+## [1.0.0] — 2026-05-31
 
-_Nothing yet._
+The 1.0 freeze. rein commits to a stable surface and ships its durable
+fact-layer foundation. (Releases 0.31–0.38 between this and the last
+CHANGELOG entry are detailed on the GitHub Releases page.)
+
+### Added
+
+- **#A5 durable triple persistence** — opt-in `[dedup].persist_triples`
+  (default off) persists extracted `(subject, predicate, object)` triples
+  into a new `memory_triples` table (the schema-versioning framework's first
+  forward migration, schema version 2). Default recall/dedup behaviour is
+  unchanged when the flag is off.
+- **`config_version`** config key + a load-time forward-compatibility guard:
+  a config written by a newer rein is refused rather than misread.
+- **REST `/v1/*` versioned alias** for `/api/*` (query preserved). `/v1`
+  authenticates with a header token (`Authorization: Bearer …` /
+  `x-rein-token`); the browser GUI session cookie stays scoped to `/api`.
+- Documentation for 96 previously-undocumented configuration fields.
+
+### Changed
+
+- **Minimum Supported Rust Version pinned to 1.86** (declared in `Cargo.toml`,
+  enforced by CI). Replaced three `is_multiple_of` (stabilized in Rust 1.87)
+  uses with `%` to honour the floor.
+- Baseline database schema and the MCP tool argument surface are now frozen
+  behind regression tests; all future schema changes go through the
+  forward-migration framework.
 
 ## [0.30.1] — 2026-05-11
 
