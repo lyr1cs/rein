@@ -9,6 +9,23 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.0.1] — 2026-06-02
+
+Correctness patch. No schema change, no config change — drop-in over 1.0.0.
+
+### Fixed
+
+- **Transitive canonical resolution in supersede chains** — a recall query
+  matching the oldest revision's text in a depth-≥2 supersede chain (A→B→C)
+  could surface the stale middle revision B instead of the live tip C.
+  `canonical_id_for` now resolves transitively to the live tip (visited-set
+  bounded, cycle-safe), so every reader — recall collapse, canonical lookups,
+  dedup — lands on the live successor on any database, including ones written
+  before this fix. The strong-signal recall fast-path and the canonical
+  collapse now share one liveness predicate so the channel-skip optimization
+  can never over-count survivors. No data loss in the prior behavior
+  (provenance was preserved); the live tip was always independently recallable.
+
 ## [1.0.0] — 2026-05-31
 
 The 1.0 freeze. rein commits to a stable surface and ships its durable
