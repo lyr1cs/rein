@@ -42,10 +42,13 @@ const VEC_LIVE_STATUS_FILTER: &str = "m.status IN ('active', 'updated')";
 
 /// Search for nearest neighbors by embedding vector, filtered to live memories.
 ///
-/// "Live" = `status IN ('active', 'updated') AND superseded_by IS NULL`.
-/// Deprecated rows (set by `apply_evolution`) and superseded rows (set by
-/// `mark_superseded`, which only flips `superseded_by` and leaves `status =
-/// 'active'`) are both excluded — see Bug #2 in the v0.26.2 audit.
+/// "Live" = `status IN ('active', 'updated')` (see `VEC_LIVE_STATUS_FILTER`).
+/// Deprecated rows (set by `apply_evolution`) are excluded. Superseded rows
+/// (set by `mark_superseded`, which flips `superseded_by` but leaves
+/// `status = 'active'`) are NOT excluded — they are mapped to their live
+/// canonical successor in `recall.rs::collapse_results_to_canonicals` under the
+/// canonical-first read model. Filtering `superseded_by IS NULL` here would
+/// silently drop queries that match only the old/evidence text (v0.26.2 R2 F3).
 ///
 /// `_topic` is accepted for caller-side documentation: callers express
 /// "I am topic-restricted" so future readers see the intent at the call

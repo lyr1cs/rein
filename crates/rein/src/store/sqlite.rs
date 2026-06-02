@@ -2698,7 +2698,41 @@ impl SqliteStore {
         }
     }
 
+    /// Resolve a memory id to the canonical id of the LIVE tip of its supersede
+    /// chain.
+    ///
+    /// This is **transitive**: it follows the canonical pointer to its fixpoint.
+    /// `mark_superseded` flattens chains eagerly at write time, but a DB written
+    /// before the STORE-1 fix can still hold an unflattened chain A→B→C where the
+    /// one-hop lookup for A returns the now-superseded middle B (only the loser's
+    /// own row was re-pointed, never its predecessors). Walking to the fixpoint
+    /// makes every reader — recall collapse, `collapse_to_canonicals`,
+    /// `get_canonical`, dedup — resolve to the live successor C on any DB, so no
+    /// caller has to special-case legacy data. Termination is bounded by the
+    /// visited set, not a fixed hop cap: each step either reaches the fixpoint or
+    /// advances to a not-yet-seen id, so the walk resolves an arbitrarily long
+    /// chain to its tip and still breaks any corrupt cycle (returning the last id
+    /// reached). On a healthy (flattened) DB this is a single confirming hop.
     pub fn canonical_id_for(&self, memory_id: &str) -> ReinResult<String> {
+        let mut current = self.canonical_id_one_hop(memory_id)?;
+        let mut seen = HashSet::new();
+        seen.insert(memory_id.to_string());
+        while seen.insert(current.clone()) {
+            let next = self.canonical_id_one_hop(&current)?;
+            if next == current {
+                break; // fixpoint reached — `current` is the live tip
+            }
+            current = next;
+        }
+        Ok(current)
+    }
+
+    /// Single-step canonical lookup: `COALESCE(canonical_id, memory_id)` from
+    /// `memory_canonical_state`, or the id itself when absent. Private — the
+    /// only intended caller is the transitive `canonical_id_for` above (callers
+    /// always want the tip; a raw one-hop result is stale on an unflattened
+    /// chain). Kept separate so the public resolver never recurses into itself.
+    fn canonical_id_one_hop(&self, memory_id: &str) -> ReinResult<String> {
         Ok(self
             .conn
             .query_row(
@@ -2760,6 +2794,19 @@ impl SqliteStore {
             )?;
             self.conn.execute(
                 "UPDATE memory_canonical_state SET canonical_id = ?1 WHERE memory_id = ?2",
+                rusqlite::params![canonical_id, old_id],
+            )?;
+            // STORE-1: eagerly flatten the supersede chain. The update above only
+            // re-points the loser's OWN row. Any predecessor whose canonical_id
+            // already equals `old_id` — e.g. `A` in a chain A→B→C once B is
+            // superseded by C — would otherwise stay pinned to the now-superseded
+            // middle node B forever, because `canonical_id_for` is a flat
+            // one-level `COALESCE(canonical_id, memory_id)` lookup with no
+            // recursion. Re-point every such predecessor to the live canonical so
+            // recall never resolves to a stale non-tip revision. Bounded by the
+            // existing merge fan-in; runs inside the same SAVEPOINT.
+            self.conn.execute(
+                "UPDATE memory_canonical_state SET canonical_id = ?1 WHERE canonical_id = ?2",
                 rusqlite::params![canonical_id, old_id],
             )?;
             Ok(())
@@ -4162,6 +4209,142 @@ enabled = true
         let canonicals = store.list_canonical_memories(10).unwrap();
         assert_eq!(canonicals.len(), 1);
         assert_eq!(canonicals[0].id, winner);
+    }
+
+    #[test]
+    fn test_mark_superseded_flattens_transitive_chain() {
+        // STORE-1 regression: a depth-≥2 supersede chain A→B→C must keep every
+        // predecessor resolving to the LIVE tip C — not the now-superseded middle
+        // B. Pre-fix, `mark_superseded` only re-pointed the immediate loser, so
+        // `canonical_id_for(A)` stayed pinned to B forever and recall could serve
+        // the stale middle revision as authoritative.
+        let store = SqliteStore::in_memory().unwrap();
+        let a = store
+            .store(test_memory("k", "revision A", Importance::High))
+            .unwrap();
+        let b = store
+            .store(test_memory("k", "revision B", Importance::High))
+            .unwrap();
+        let c = store
+            .store(test_memory("k", "revision C", Importance::High))
+            .unwrap();
+
+        // A superseded by B, then B superseded by C (the depth-2 case).
+        store.mark_superseded(&a, &b).unwrap();
+        store.mark_superseded(&b, &c).unwrap();
+
+        // Every node in the chain flattens to the live tip C.
+        assert_eq!(
+            store.canonical_id_for(&a).unwrap(),
+            c,
+            "predecessor A must flatten to tip C, not the stale middle B"
+        );
+        assert_eq!(store.canonical_id_for(&b).unwrap(), c);
+        assert_eq!(store.canonical_id_for(&c).unwrap(), c);
+
+        // And canonical collapse surfaces only the live tip.
+        let canonicals = store.list_canonical_memories(10).unwrap();
+        assert_eq!(canonicals.len(), 1);
+        assert_eq!(canonicals[0].id, c);
+    }
+
+    #[test]
+    fn test_canonical_id_for_resolves_legacy_unflattened_chain() {
+        // STORE-1 legacy path (codex R2 #1): a DB written before the chain-
+        // flattening fix can hold an unflattened chain where the one-hop lookup
+        // for a predecessor returns the stale middle. `canonical_id_for` is
+        // transitive, so it must still walk to the live tip — letting recall and
+        // every other reader resolve the memory on an upgraded DB instead of
+        // surfacing/dropping the superseded middle.
+        let store = SqliteStore::in_memory().unwrap();
+        let a = store
+            .store(test_memory("k", "revision A", Importance::High))
+            .unwrap();
+        let b = store
+            .store(test_memory("k", "revision B", Importance::High))
+            .unwrap();
+        let c = store
+            .store(test_memory("k", "revision C", Importance::High))
+            .unwrap();
+        store.mark_superseded(&a, &b).unwrap();
+        store.mark_superseded(&b, &c).unwrap();
+
+        // Simulate a legacy unflattened row: re-point A back to the middle B as a
+        // pre-fix DB would have left it (undo the post-fix eager flatten). The
+        // one-hop state now reads A→B, B→C — exactly the partially-flattened shape
+        // codex R2 #1 described.
+        store
+            .conn
+            .execute(
+                "UPDATE memory_canonical_state SET canonical_id = ?1 WHERE memory_id = ?2",
+                rusqlite::params![b, a],
+            )
+            .unwrap();
+        assert_eq!(
+            store.canonical_id_one_hop(&a).unwrap(),
+            b,
+            "legacy row is A→B"
+        );
+
+        // Transitive resolution still walks A→B→C to the live tip.
+        assert_eq!(
+            store.canonical_id_for(&a).unwrap(),
+            c,
+            "legacy unflattened A must transitively resolve to live tip C"
+        );
+        assert_eq!(store.canonical_id_for(&b).unwrap(), c);
+        assert_eq!(store.canonical_id_for(&c).unwrap(), c);
+    }
+
+    #[test]
+    fn test_canonical_id_for_terminates_on_corrupt_cycle() {
+        // The transitive resolver must never loop on a corrupt 2-cycle.
+        let store = SqliteStore::in_memory().unwrap();
+        let x = store
+            .store(test_memory("k", "x", Importance::High))
+            .unwrap();
+        let y = store
+            .store(test_memory("k", "y", Importance::High))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_canonical_state(memory_id, canonical_id) VALUES (?1, ?2), (?2, ?1)",
+                rusqlite::params![x, y],
+            )
+            .unwrap();
+        // Returns *some* id from the cycle without hanging or panicking.
+        let resolved = store.canonical_id_for(&x).unwrap();
+        assert!(resolved == x || resolved == y);
+    }
+
+    #[test]
+    fn test_canonical_id_for_resolves_chain_longer_than_old_cap() {
+        // STORE-1 (codex R3 #2): the resolver must reach the tip of an unflattened
+        // legacy chain LONGER than the old fixed 64-hop cap, not stop partway and
+        // return a still-superseded middle.
+        let store = SqliteStore::in_memory().unwrap();
+        let n = 80usize;
+        let ids: Vec<String> = (0..n)
+            .map(|i| {
+                store
+                    .store(test_memory("k", &format!("rev {i}"), Importance::High))
+                    .unwrap()
+            })
+            .collect();
+        // Manually link each id one hop to the next — a legacy unflattened chain
+        // id[0]→id[1]→…→id[n-1] that the eager flatten would never have produced.
+        for i in 0..n - 1 {
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO memory_canonical_state(memory_id, canonical_id) VALUES (?1, ?2)",
+                    rusqlite::params![ids[i], ids[i + 1]],
+                )
+                .unwrap();
+        }
+        // The tail is its own tip; the head resolves the full >64-hop walk to it.
+        assert_eq!(store.canonical_id_for(&ids[0]).unwrap(), ids[n - 1]);
     }
 
     #[test]

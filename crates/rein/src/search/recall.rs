@@ -215,6 +215,18 @@ fn ready_shadow_fusion_weights_for_recall(
     })
 }
 
+/// A resolved canonical is "live" iff it is neither superseded nor deprecated —
+/// the same predicate `SqliteStore::collapse_to_canonicals` uses. Shared by the
+/// recall collapse terminal guard and the strong-signal survivor count so the
+/// bypass never counts a candidate the collapse would later drop (STORE-1 R4).
+fn is_live_canonical(memory: &Memory) -> bool {
+    memory.superseded_by.is_none()
+        && matches!(
+            memory.status,
+            crate::types::MemoryStatus::Active | crate::types::MemoryStatus::Updated
+        )
+}
+
 fn collapse_results_to_canonicals(
     store: &SqliteStore,
     results: Vec<RecallResult>,
@@ -230,6 +242,9 @@ fn collapse_results_to_canonicals(
             passthrough.push(result);
             continue;
         }
+        // STORE-1: `canonical_id_for` resolves transitively to the live tip, so a
+        // legacy unflattened chain A→B→C maps the result to the live successor C
+        // (and dedups on the tip) rather than surfacing the superseded middle B.
         let canonical_id = store.canonical_id_for(&result.memory.id)?;
         if !meta.contains_key(&canonical_id) {
             ordered_ids.push(canonical_id.clone());
@@ -257,6 +272,15 @@ fn collapse_results_to_canonicals(
                 .remove(&canonical_id)
                 .or_else(|| fallback.remove(&canonical_id))
             {
+                // STORE-1 terminal guard — mirrors `SqliteStore::collapse_to_canonicals`
+                // (sqlite.rs): drop only a genuinely dead tip (the resolved
+                // canonical is itself deprecated, or — should `get_batch` miss the
+                // tip and fall back to the raw matched row — still superseded).
+                // `canonical_id_for` above already resolves live chains to their
+                // tip, so on any healthy or upgraded DB this drops nothing valid.
+                if !is_live_canonical(&memory) {
+                    continue;
+                }
                 collapsed.push(RecallResult {
                     memory,
                     score,
@@ -617,6 +641,18 @@ pub fn recall_temporal_with_request_id(
     // request. We count DISTINCT CANONICALS (not raw rows): `collapse_results_to_canonicals`
     // later merges rows sharing a canonical, so a raw-row count could satisfy
     // `limit` while the post-collapse local set falls short (codex v3 #1).
+    //
+    // STORE-1 (codex R2 #2): resolve through the SAME transitive `canonical_id_for`
+    // the collapse uses — NOT the raw one-hop `m.canonical_id` column. On a legacy
+    // unflattened chain the column would count B and C as two survivors while the
+    // collapse merges both to the tip C, so the guard could skip KG/SM yet return
+    // a single result. Tip resolution keeps the count identical to the collapse.
+    //
+    // STORE-1 (codex R4 #1): count ONLY tips that the collapse would actually keep
+    // — a tip that is itself dead (deleted, deprecated, or still superseded) is
+    // dropped by the collapse terminal guard, so counting it here would let the
+    // bypass skip KG/SM and then under-fill. Apply the same `is_live_canonical`
+    // check against the fetched tip (reusing the raw row when it *is* the tip).
     let surviving_local = {
         let mut canonicals = std::collections::HashSet::new();
         for m in &fts_results {
@@ -628,7 +664,20 @@ pub fn recall_temporal_with_request_id(
                 time_from,
                 time_to,
             ) {
-                canonicals.insert(m.canonical_id.as_deref().unwrap_or(m.id.as_str()));
+                let tip = store
+                    .canonical_id_for(&m.id)
+                    .unwrap_or_else(|_| m.id.clone());
+                let tip_is_live = if tip == m.id {
+                    is_live_canonical(m)
+                } else {
+                    store
+                        .get(&tip)
+                        .map(|t| is_live_canonical(&t))
+                        .unwrap_or(false)
+                };
+                if tip_is_live {
+                    canonicals.insert(tip);
+                }
             }
         }
         canonicals.len()
