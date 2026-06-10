@@ -307,7 +307,99 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
     // A failure here rolls back to the old index (staging is preserved for retry).
     schema::replace_vector_index_from_staging(store.conn(), config.embedding.dimensions)?;
 
-    // 6. Rebuild HNSW and Tantivy side indexes from fresh data
+    // 6. The embedding space just changed wholesale while the row COUNT
+    // stayed identical, so the #17 count-delta recluster cadence gate
+    // would otherwise skip HDBSCAN indefinitely — and every
+    // cluster-derived surface (memories.cluster_id fallback in recall,
+    // cluster_centroids in dedup assignment, per-cluster survival
+    // curves, cluster-scoped alpha / shadow-fusion / dedup-threshold
+    // maps) would keep serving labels learned in the OLD space until
+    // then. Clear them all: the next adaptive pass reclusters
+    // unconditionally (`should_recluster` on an empty map) and rebuilds
+    // in the new space; until then lookups degrade to the global
+    // fallbacks, which is correct — old-space cluster geometry is
+    // meaningless against new-space embeddings.
+    //
+    // Ordering (codex R11): this reset runs IMMEDIATELY after the swap,
+    // BEFORE the slow HNSW/Tantivy rebuild below — a live server (or an
+    // interruption during that rebuild) must not keep serving old-space
+    // cluster labels for the minutes the rebuild can take. The churn
+    // credit itself rides inside `replace_vector_index_from_staging`'s
+    // savepoint (codex R10), so even dying right here leaves the cadence
+    // gate re-armed and the next adaptive pass self-heals (codex R8).
+    //
+    // Within the reset, the SNAPSHOT generation bump commits FIRST and the
+    // SQL row clears second (codex R14): a concurrent adaptive HDBSCAN run
+    // on the old vectors re-checks the persisted `cluster_version` inside
+    // its write savepoint right before committing its labels. SQLite's
+    // single-writer serialization then leaves it only two outcomes — it
+    // serializes after the bump (guard sees the new generation → aborts),
+    // or it commits entirely before this reset (the SQL clears below wipe
+    // its rows). Clears-first would open a third interleaving where the
+    // stale run passes its guard pre-bump and repopulates the rows
+    // post-clear.
+    if let Some(mut state) = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
+        state.memory_clusters.clear();
+        state.clear_cluster_scoped_learned_state();
+        state.canonical_length_stats.clear();
+        state.last_recluster_embedding_count = 0;
+        state.last_recluster_embedding_write_seq = 0;
+        // The cleared map IS a new clustering generation: bumping
+        // cluster_version makes this reset dominate `save_snapshot`'s CAS
+        // merge, so an adaptive pipeline writer that loaded its snapshot
+        // BEFORE the reindex cannot merge old-space `memory_clusters` /
+        // cluster-scoped weights back in. Bump by TWO (codex R8): a
+        // concurrent adaptive pass that loaded generation N and reclusters
+        // on pre-reindex embeddings saves N+1 — with a +1 reset it would
+        // TIE and its `we_reclustered` wholesale-replace could overwrite
+        // this reset with old-space labels. A single-step writer can never
+        // tie N+2. centroid_version tracks it as in
+        // `run_hdbscan_clustering`.
+        state.cluster_version += 2;
+        state.centroid_version = state.cluster_version;
+        state.version += 1;
+        if let Err(e) = state.save_snapshot(store.conn()) {
+            // Fail loud (codex R5): with the old snapshot intact
+            // (non-empty `memory_clusters`, matching baselines, and a
+            // churn counter the bulk swap never bumped), the cadence gate
+            // would skip HDBSCAN indefinitely on old-space labels.
+            // `save_snapshot` already retried its CAS merge internally,
+            // so a persistent failure here is a real storage problem.
+            anyhow::bail!(
+                "reindex embedded {embedded}/{total} memories and swapped the vector index, \
+                 but persisting the cluster-state reset failed: {e}. Re-run \
+                 `rein migrate --reindex` so the adaptive engine reclusters in the new \
+                 embedding space."
+            );
+        }
+    }
+    let sql_reset: ReinResult<()> = (|| {
+        store.conn().execute_batch("BEGIN")?;
+        store
+            .conn()
+            .execute("UPDATE memories SET cluster_id = NULL", [])?;
+        store.conn().execute("DELETE FROM cluster_centroids", [])?;
+        store
+            .conn()
+            .execute("DELETE FROM metadata WHERE key LIKE 'survival_curve:%'", [])?;
+        store.conn().execute_batch("COMMIT")?;
+        Ok(())
+    })();
+    if let Err(e) = sql_reset {
+        let _ = store.conn().execute_batch("ROLLBACK");
+        // Fail loud (codex R5): the new embeddings are committed, but old-
+        // space cluster rows survived. The bulk swap bypassed
+        // `insert_embedding`, so the churn counter did not move either —
+        // nothing would ever force the recluster.
+        anyhow::bail!(
+            "reindex embedded {embedded}/{total} memories and swapped the vector index, \
+             but clearing stale cluster rows failed: {e}. Re-run `rein migrate --reindex` \
+             so recall/dedup stop using cluster labels from the old embedding space."
+        );
+    }
+
+    // 7. Rebuild HNSW and Tantivy side indexes from fresh data (after the
+    // cluster reset above — codex R11 ordering).
     let hnsw_path = store.db_path().with_extension("");
     let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
     let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));

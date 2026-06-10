@@ -2005,6 +2005,23 @@ pub fn replace_vector_index(
                 stmt.execute(rusqlite::params![id, bytes])?;
             }
         }
+        // #17 codex R10: credit the embedding churn counter INSIDE the swap
+        // savepoint. A wholesale index replacement rewrites every vector at
+        // an unchanged row count — committed separately, an interruption
+        // right after the swap would leave the recluster cadence gate
+        // closed on old-space cluster labels indefinitely. Riding the same
+        // commit makes the gate's reopening exactly as durable as the new
+        // vectors themselves (the next adaptive pass then reclusters and
+        // rewipes any stale cluster-scoped state — self-healing even if
+        // the caller's follow-up resets never ran).
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, CAST(?2 AS TEXT))
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT)",
+            rusqlite::params![
+                crate::store::vec::EMBEDDING_WRITE_SEQ_KEY,
+                embeddings.len() as i64
+            ],
+        )?;
         conn.execute_batch("RELEASE replace_vector_index")?;
         Ok(())
     })();
@@ -2064,6 +2081,14 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
                 write.execute(rusqlite::params![id, bytes])?;
             }
         }
+        // #17 codex R10: churn credit inside the swap savepoint — see the
+        // twin comment in `replace_vector_index` for the interrupted-
+        // reindex rationale.
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, CAST(?2 AS TEXT))
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT)",
+            rusqlite::params![crate::store::vec::EMBEDDING_WRITE_SEQ_KEY, row_count],
+        )?;
         conn.execute_batch("DROP TABLE embed_staging;")?;
         conn.execute_batch("RELEASE replace_vector_index_staged")?;
         Ok(())
@@ -2079,6 +2104,21 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
 mod migration_tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// #17 codex R10 — a wholesale vector-index swap must credit the
+    /// embedding churn counter inside the SAME commit, so an interrupted
+    /// reindex can never leave new vectors behind a closed recluster gate.
+    #[test]
+    fn replace_vector_index_credits_churn_counter() {
+        let store = crate::store::sqlite::SqliteStore::in_memory().unwrap();
+        let before = crate::store::vec::embedding_write_seq(store.conn());
+        let embeddings: Vec<(String, Vec<f32>)> = (0..3)
+            .map(|i| (format!("m{i}"), vec![0.0f32; 3072]))
+            .collect();
+        replace_vector_index(store.conn(), 3072, &embeddings).unwrap();
+        let after = crate::store::vec::embedding_write_seq(store.conn());
+        assert_eq!(after - before, 3, "swap credits one write per row");
+    }
 
     /// Builds a file-backed DB that looks like a pre-proxy v0.9.3 database:
     /// `source` CHECK without 'proxy', so the next `init_schema` triggers

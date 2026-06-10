@@ -1354,9 +1354,13 @@ pub fn recall_temporal_with_request_id(
     let query_top_vec_memory_id_at_recall: Option<String> =
         vec_for_fusion.first().map(|(id, _)| id.clone());
     let query_type_label = format!("{}", strategy.query_type);
-    let adaptive_alpha = adaptive_state_snapshot
-        .as_ref()
-        .and_then(|s| s.get_alpha(&query_type_label, query_cluster_id));
+    let adaptive_alpha = adaptive_state_snapshot.as_ref().and_then(|s| {
+        s.get_alpha(
+            &query_type_label,
+            query_cluster_id,
+            config.adaptive.min_samples_alpha,
+        )
+    });
     // v0.28.7+ audit M-6: capture `runtime_adoption_weight` alongside the
     // shadow weights so `apply_ars_dynamic_fusion_scores` can outer-blend
     // simplex against legacy by the same scalar that the inner trust blend

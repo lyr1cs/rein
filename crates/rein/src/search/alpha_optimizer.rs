@@ -950,6 +950,12 @@ fn finite_nonnegative(value: f64) -> f64 {
 // Bucket-level optimization
 // ---------------------------------------------------------------------------
 
+/// Exponential decay rate (per day) for event weighting — ~11.5 day
+/// half-life. Single source of truth shared by the alpha / shadow-weight
+/// optimizers and by [`decayed_cumulative_sample_count`], so stored
+/// bucket confidence decays at exactly the rate the estimators forget.
+pub const EVENT_DECAY_LAMBDA: f64 = 0.06;
+
 /// Compute the time-weighted mean of optimal alphas across events.
 ///
 /// Recent events receive higher weight via exponential decay:
@@ -1026,6 +1032,54 @@ pub fn bayesian_shrinkage(
 ) -> f64 {
     let n = n_bucket as f64;
     (n * bucket_alpha + n_prior * parent_alpha) / (n + n_prior)
+}
+
+/// Decay-weighted cumulative sample count (effective sample size under
+/// exponential forgetting):
+///
+///   `ess = round(prev_count * exp(-base_lambda * age_days)) + window_count`
+///
+/// `prev` is the previously stored `(sample_count, last_updated_rfc3339)`
+/// pair for the same bucket, if any. Uses the SAME `base_lambda` as the
+/// event weighting inside [`optimize_alpha`] so the stored confidence is
+/// consistent with the decay-weighted estimate it backs — a raw running
+/// total would keep trusting evidence the value estimator has already
+/// forgotten. An unparseable `last_updated` (or a future timestamp) drops
+/// the prior contribution to zero rather than trusting it unconditionally.
+///
+/// This is what lets a per-(query_type, cluster) bucket accumulate
+/// confidence across consume-once learning windows: each window alone
+/// rarely reaches the read-time `sample_count >= 10` gate, but the
+/// decayed cumulative count does once evidence keeps arriving (#17).
+pub fn decayed_cumulative_sample_count(
+    prev: Option<(usize, &str)>,
+    window_count: usize,
+    now: chrono::DateTime<Utc>,
+    base_lambda: f64,
+) -> usize {
+    decayed_prior_ess(prev, now, base_lambda).round() as usize + window_count
+}
+
+/// The decayed prior term of [`decayed_cumulative_sample_count`], un-rounded:
+/// `prev_count * exp(-base_lambda * age_days)`, or `0.0` when there is no
+/// usable prior. Exposed separately so callers that blend STATE (not just
+/// counts) across windows — e.g. the shadow-fusion weight vector — can use
+/// the exact same effective-sample-size weighting for the blend that the
+/// stored confidence uses for the gate.
+pub fn decayed_prior_ess(
+    prev: Option<(usize, &str)>,
+    now: chrono::DateTime<Utc>,
+    base_lambda: f64,
+) -> f64 {
+    prev.and_then(|(count, last_updated)| {
+        let parsed = chrono::DateTime::parse_from_rfc3339(last_updated).ok()?;
+        let age_days = (now - parsed.with_timezone(&Utc)).num_seconds() as f64 / 86400.0;
+        if age_days < 0.0 {
+            return None;
+        }
+        Some(count as f64 * (-base_lambda * age_days).exp())
+    })
+    .unwrap_or(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,5 +1778,63 @@ mod tests {
 
         assert!(learned.weights.sum().is_finite());
         assert!((learned.weights.sum() - 1.0).abs() < 1e-12);
+    }
+
+    // ── #17: decay-weighted cumulative sample count (effective sample size) ──
+
+    #[test]
+    fn decayed_cumulative_sample_count_no_prior_is_window_count() {
+        let now = Utc::now();
+        assert_eq!(
+            decayed_cumulative_sample_count(None, 7, now, EVENT_DECAY_LAMBDA),
+            7
+        );
+    }
+
+    #[test]
+    fn decayed_cumulative_sample_count_fresh_prior_carries_fully() {
+        let now = Utc::now();
+        let ts = now.to_rfc3339();
+        assert_eq!(
+            decayed_cumulative_sample_count(Some((10, &ts)), 5, now, EVENT_DECAY_LAMBDA),
+            15
+        );
+    }
+
+    #[test]
+    fn decayed_cumulative_sample_count_halves_after_one_half_life() {
+        let now = Utc::now();
+        // half-life = ln(2) / 0.06 ≈ 11.55 days
+        let half_life_secs = (std::f64::consts::LN_2 / EVENT_DECAY_LAMBDA * 86400.0) as i64;
+        let old = (now - Duration::seconds(half_life_secs)).to_rfc3339();
+        let n = decayed_cumulative_sample_count(Some((100, &old)), 0, now, EVENT_DECAY_LAMBDA);
+        assert!(
+            (49..=51).contains(&n),
+            "expected ~50 after one half-life, got {n}"
+        );
+    }
+
+    #[test]
+    fn decayed_cumulative_sample_count_drops_unparseable_prior() {
+        let now = Utc::now();
+        assert_eq!(
+            decayed_cumulative_sample_count(
+                Some((100, "not-a-timestamp")),
+                3,
+                now,
+                EVENT_DECAY_LAMBDA
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn decayed_cumulative_sample_count_drops_future_prior() {
+        let now = Utc::now();
+        let future = (now + Duration::days(2)).to_rfc3339();
+        assert_eq!(
+            decayed_cumulative_sample_count(Some((100, &future)), 3, now, EVENT_DECAY_LAMBDA),
+            3
+        );
     }
 }

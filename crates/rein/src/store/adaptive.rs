@@ -487,6 +487,39 @@ pub struct AdaptiveState {
     #[serde(default)]
     pub centroid_version: u64,
 
+    /// #17 M4 recluster cadence gate: how many embeddings existed when the
+    /// last successful recluster persisted. The pipeline re-runs HDBSCAN
+    /// only when `|current - last| >= 5.max(current / 50)` (the same
+    /// adaptive `min_cluster_size` formula HDBSCAN itself uses — no new
+    /// knob). `0` on fresh install / pre-#17 snapshots, which makes the
+    /// first pass after bootstrap or upgrade recluster unconditionally
+    /// (any `current >= 50` clears the gate against a `0` baseline).
+    /// Gating reclusters is also what lets cluster-scoped learned state
+    /// (M2 alpha, shadow fusion weights, A1 dedup thresholds) survive
+    /// across pipeline passes instead of being wiped every tick.
+    #[serde(default)]
+    pub last_recluster_embedding_count: u64,
+
+    /// #17 companion churn signal: value of the monotonic
+    /// `embedding_write_seq` metadata counter (see `store/vec.rs`) at the
+    /// last successful recluster. The count delta above is blind to
+    /// in-place embedding replacement (update paths re-embed under the
+    /// same id — same count, different vector), so the gate also fires
+    /// when enough WRITES accumulated at a constant row count. `0` on
+    /// pre-#17 snapshots.
+    #[serde(default)]
+    pub last_recluster_embedding_write_seq: u64,
+
+    /// #17 transient (never serialized): `cluster_version` as observed at
+    /// `restore_snapshot` time. `save_snapshot`'s CAS merge compares it to
+    /// the live `cluster_version` to distinguish a writer that RAN a
+    /// recluster this pass (wholesale-replace must win so the wipe isn't
+    /// undone) from one that merely carries the loaded generation
+    /// (same-generation conflicts merge additively; older-generation
+    /// contributions are dropped).
+    #[serde(skip)]
+    pub cluster_version_at_load: u64,
+
     /// v0.23: Per-cluster canonical content length percentiles. Drives
     /// adaptive `target_bytes` for resummerize compression. Populated by
     /// the slow-channel via `recompute_canonical_length_stats`.
@@ -786,6 +819,29 @@ impl AdaptiveState {
         );
     }
 
+    /// #17: drop every learned surface keyed by a cluster ID. Cluster ids
+    /// are local labels of one HDBSCAN run — after a relabel (recluster or
+    /// `migrate --reindex`), an old entry under id N would be served for
+    /// whatever unrelated cluster now wears N. Wipes: A1 dedup thresholds,
+    /// cluster-scoped M2 alpha + shadow-fusion buckets (`qt:N` keys), and
+    /// the synthesis / concept-summary `by_cluster` aggregates (codex R6 —
+    /// `decide_synthesize` indexes those by live cluster_id). Keeps:
+    /// scope-free alpha/fusion keys, the `-1|…` no-cluster feedback
+    /// buckets (not tied to any label), per-id LRU stats, and every
+    /// consumer watermark (`last_consumed_event_id` must survive or
+    /// consume-once events would replay).
+    pub fn clear_cluster_scoped_learned_state(&mut self) {
+        self.dedup_thresholds.clear();
+        self.learned_alpha.retain(|k, _| !k.contains(':'));
+        self.learned_shadow_fusion.retain(|k, _| !k.contains(':'));
+        if let Some(stats) = &mut self.synthesis_feedback_stats {
+            stats.by_cluster.retain(|k, _| k.starts_with("-1|"));
+        }
+        if let Some(stats) = &mut self.concept_summary_feedback_stats {
+            stats.by_cluster.retain(|k, _| k.starts_with("-1|"));
+        }
+    }
+
     /// Build bucket key from query_type and optional cluster_id.
     pub fn bucket_key(query_type: &str, cluster_id: Option<u32>) -> String {
         let query_type = query_type.to_lowercase();
@@ -796,19 +852,34 @@ impl AdaptiveState {
     }
 
     /// Get learned alpha for a query type and optional cluster, with fallback chain.
-    pub fn get_alpha(&self, query_type: &str, cluster_id: Option<u32>) -> Option<f32> {
+    ///
+    /// `min_samples` is the operator-configured `[adaptive].min_samples_alpha`.
+    /// #17 codex R12: since the write side no longer floors per-window
+    /// bucket creation (cumulative counts accumulate from any window), the
+    /// READ gate must honor a raised config floor — otherwise
+    /// `min_samples_alpha = 50` buckets would activate at the historical
+    /// hard-coded 10. The 10 floor stays as the lower bound so a config
+    /// meant as a learn-window knob (tests set 1) can't open the gate on
+    /// near-zero evidence.
+    pub fn get_alpha(
+        &self,
+        query_type: &str,
+        cluster_id: Option<u32>,
+        min_samples: usize,
+    ) -> Option<f32> {
+        let floor = min_samples.max(10);
         let legacy_key = query_type.to_string();
         // Try specific bucket first
         if let Some(cluster) = cluster_id {
             let key = Self::bucket_key(query_type, Some(cluster));
             if let Some(entry) = self.learned_alpha.get(&key) {
-                if entry.sample_count >= 10 {
+                if entry.sample_count >= floor {
                     return Some(entry.value as f32);
                 }
             }
             let legacy_cluster_key = format!("{legacy_key}:{cluster}");
             if let Some(entry) = self.learned_alpha.get(&legacy_cluster_key) {
-                if entry.sample_count >= 10 {
+                if entry.sample_count >= floor {
                     return Some(entry.value as f32);
                 }
             }
@@ -816,17 +887,17 @@ impl AdaptiveState {
         // Fall back to query-type level
         let key = Self::bucket_key(query_type, None);
         if let Some(entry) = self.learned_alpha.get(&key) {
-            if entry.sample_count >= 10 {
+            if entry.sample_count >= floor {
                 return Some(entry.value as f32);
             }
         }
         if let Some(entry) = self.learned_alpha.get(&legacy_key) {
-            if entry.sample_count >= 10 {
+            if entry.sample_count >= floor {
                 return Some(entry.value as f32);
             }
         }
         if let Some(entry) = self.learned_alpha.get("global") {
-            if entry.sample_count >= 10 {
+            if entry.sample_count >= floor {
                 return Some(entry.value as f32);
             }
         }
@@ -968,13 +1039,48 @@ impl AdaptiveState {
                         attempt + 1,
                     );
 
-                    // Cluster-scoped state: if we ran a recluster at the same or newer
-                    // version, replace wholesale to avoid resurrecting entries deleted
-                    // during recluster.  Two concurrent reclusters at the same version
-                    // would each increment once, so >= catches both cases.
-                    if self.cluster_version >= current.cluster_version {
+                    // Cluster-scoped state, three-way by clustering generation
+                    // (#17 codex R6):
+                    // 1. We RAN a recluster this pass (cluster_version grew past
+                    //    what we loaded) and are not behind the stored
+                    //    generation → wholesale replace, so the recluster's wipe
+                    //    can't be undone. Two concurrent reclusters both land
+                    //    here at the same number; last writer wins wholesale —
+                    //    additively mixing labels from two different HDBSCAN
+                    //    runs would corrupt every cluster-keyed map. (The
+                    //    `self > current` arm also covers the degenerate
+                    //    rolled-back-snapshot case without a recluster.)
+                    // 2. Same generation, nobody reclustered between us →
+                    //    additive merge; both writers' disjoint learned buckets
+                    //    are valid and neither may drop the other's.
+                    // 3. Ours is a STALE generation (they reclustered or a
+                    //    `migrate --reindex` bumped after we loaded) → drop our
+                    //    cluster-scoped contributions entirely; cluster ids are
+                    //    local labels of the newer generation and merging ours
+                    //    back would resurrect a dead embedding space.
+                    let we_reclustered = self.cluster_version > self.cluster_version_at_load;
+                    // #17 codex R7/R9: captured BEFORE the scalar section
+                    // maxes cluster_version. The feedback-stats watermark
+                    // arbitration below is generation-blind, so after the
+                    // arms we strip label-keyed buckets — but ONLY from a
+                    // winner whose generation is not the merge's final
+                    // generation (R9: a pass that reclustered AND consumed
+                    // feedback carries fresh new-generation buckets; its
+                    // offsets commit after this save, so stripping its own
+                    // stats would lose consumed events unreplayably).
+                    let current_cv_at_merge = current.cluster_version;
+                    if self.cluster_version > current.cluster_version
+                        || (we_reclustered && self.cluster_version == current.cluster_version)
+                    {
                         current.memory_clusters = self.memory_clusters.clone();
                         current.dedup_thresholds = self.dedup_thresholds.clone();
+                        // #17: the recluster baselines travel with the rest of
+                        // the cluster-scoped state — they were stamped by the
+                        // same recluster that produced `memory_clusters`.
+                        current.last_recluster_embedding_count =
+                            self.last_recluster_embedding_count;
+                        current.last_recluster_embedding_write_seq =
+                            self.last_recluster_embedding_write_seq;
                         // v0.23: canonical_length_stats is cluster-keyed, treat the
                         // same as dedup_thresholds across a recluster boundary.
                         current.canonical_length_stats = self.canonical_length_stats.clone();
@@ -995,7 +1101,8 @@ impl AdaptiveState {
                                     .insert(key.clone(), entry.clone());
                             }
                         }
-                    } else {
+                    } else if self.cluster_version == current.cluster_version {
+                        // Case 2: same generation, no recluster on either side.
                         // Additive merge for memory_clusters and dedup_thresholds
                         for (mid, &cid) in &self.memory_clusters {
                             current.memory_clusters.insert(mid.clone(), cid);
@@ -1027,7 +1134,25 @@ impl AdaptiveState {
                                     .insert(key.clone(), our_entry.clone());
                             }
                         }
+                        // #17 codex R6: cluster-scoped alpha keys must merge
+                        // additively here too — the non-cluster alpha loop
+                        // below skips ':' keys, so without this a
+                        // same-generation conflict would silently drop this
+                        // writer's learned cluster buckets.
+                        for (key, our_entry) in &self.learned_alpha {
+                            if !key.contains(':') {
+                                continue;
+                            }
+                            let dominated = current.learned_alpha.get(key).is_some_and(|theirs| {
+                                theirs.last_updated >= our_entry.last_updated
+                            });
+                            if !dominated {
+                                current.learned_alpha.insert(key.clone(), our_entry.clone());
+                            }
+                        }
                     }
+                    // else: case 3 — drop our stale-generation cluster state,
+                    // keep theirs (codex R3 P2; rationale in the header above).
 
                     // Merge learned_alpha (non-cluster keys): prefer newer timestamp
                     for (key, our_entry) in &self.learned_alpha {
@@ -1125,40 +1250,94 @@ impl AdaptiveState {
                     // they're both derived caches over the same monotonic
                     // event log — partial merging would create double-counted
                     // counters.
-                    match (
+                    // Tie rule (codex R11): on EQUAL watermarks a writer that
+                    // just reclustered wins — its by_cluster buckets are
+                    // keyed in the surviving generation, while the peer's
+                    // equally-advanced copy would be stripped below and the
+                    // already-committed offsets could never replay to
+                    // rebuild them.
+                    let synth_stats_from_self = match (
                         &self.synthesis_feedback_stats,
                         &current.synthesis_feedback_stats,
                     ) {
                         (Some(mine), Some(theirs)) => {
-                            if mine.last_consumed_event_id > theirs.last_consumed_event_id {
+                            if mine.last_consumed_event_id > theirs.last_consumed_event_id
+                                || (we_reclustered
+                                    && mine.last_consumed_event_id == theirs.last_consumed_event_id)
+                            {
                                 current.synthesis_feedback_stats = Some(mine.clone());
+                                true
+                            } else {
+                                false
                             }
                         }
                         (Some(_), None) => {
                             current.synthesis_feedback_stats =
                                 self.synthesis_feedback_stats.clone();
+                            true
                         }
-                        (None, _) => { /* keep current */ }
-                    }
+                        (None, _) => false, /* keep current */
+                    };
                     // v0.27 ARS Cap A feedback loop (Track 1): mirror the
                     // synthesis_feedback_stats arm above. Same arbitration
                     // shape — event-id MAX wins, writer's `None` does not
                     // overwrite existing learned state. Round-3 HIGH from
                     // v0.24 generalised; round-4 HIGH from v0.26 mirrored.
-                    match (
+                    let concept_stats_from_self = match (
                         &self.concept_summary_feedback_stats,
                         &current.concept_summary_feedback_stats,
                     ) {
                         (Some(mine), Some(theirs)) => {
-                            if mine.last_consumed_event_id > theirs.last_consumed_event_id {
+                            // Same equal-watermark recluster tie rule as the
+                            // synthesis arm above (codex R11).
+                            if mine.last_consumed_event_id > theirs.last_consumed_event_id
+                                || (we_reclustered
+                                    && mine.last_consumed_event_id == theirs.last_consumed_event_id)
+                            {
                                 current.concept_summary_feedback_stats = Some(mine.clone());
+                                true
+                            } else {
+                                false
                             }
                         }
                         (Some(_), None) => {
                             current.concept_summary_feedback_stats =
                                 self.concept_summary_feedback_stats.clone();
+                            true
                         }
-                        (None, _) => { /* keep current */ }
+                        (None, _) => false, /* keep current */
+                    };
+                    // #17 codex R7/R9: the watermark arms above are
+                    // generation-blind, so a winner from an OLDER clustering
+                    // generation could re-serve by_cluster buckets keyed to
+                    // dead labels. Strip label-keyed buckets ONLY when the
+                    // winning side's generation is not the merge's final
+                    // generation (R9: a reclustering pass's own
+                    // freshly-consumed new-generation buckets must survive —
+                    // its offsets commit after this save and cannot replay),
+                    // plus the recluster-tie case where equal numbers do not
+                    // mean equal labels and the peer's provenance is
+                    // unknowable. Watermarks and per-id stats always stay.
+                    let final_cv = self.cluster_version.max(current_cv_at_merge);
+                    let recluster_tie =
+                        we_reclustered && self.cluster_version == current_cv_at_merge;
+                    let strip_for = |from_self: bool| {
+                        let provenance_cv = if from_self {
+                            self.cluster_version
+                        } else {
+                            current_cv_at_merge
+                        };
+                        provenance_cv != final_cv || (recluster_tie && !from_self)
+                    };
+                    if strip_for(synth_stats_from_self) {
+                        if let Some(stats) = &mut current.synthesis_feedback_stats {
+                            stats.by_cluster.retain(|k, _| k.starts_with("-1|"));
+                        }
+                    }
+                    if strip_for(concept_stats_from_self) {
+                        if let Some(stats) = &mut current.concept_summary_feedback_stats {
+                            stats.by_cluster.retain(|k, _| k.starts_with("-1|"));
+                        }
                     }
                     // v0.27.1 E direction: judge_calibration_state — R9-K5
                     // mandates field-grouped CAS merge because Layer 1 and
@@ -1386,6 +1565,12 @@ impl AdaptiveState {
         // an over-cap blob. Shrink to cap at restore so the in-memory
         // state immediately respects the bound. No-op below cap.
         shrink_learned_shadow_fusion_to_cap(&mut state.learned_shadow_fusion);
+        // #17: remember which clustering generation this writer LOADED, so
+        // `save_snapshot`'s CAS merge can tell "this writer actually ran a
+        // recluster" (cluster_version grew past the loaded one → its wipe
+        // must win wholesale) apart from "same generation, no recluster"
+        // (additive merge of disjoint learned buckets is correct).
+        state.cluster_version_at_load = state.cluster_version;
         Some(state)
     }
 }
@@ -4904,9 +5089,290 @@ mod tests {
         let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
         assert_eq!(restored.version, 1);
         assert!((restored.hot_threshold - 0.5).abs() < 1e-6);
-        let alpha = restored.get_alpha("semantic", None);
+        let alpha = restored.get_alpha("semantic", None, 10);
         assert!(alpha.is_some());
         assert!((alpha.unwrap() - 0.35).abs() < 0.01);
+    }
+
+    // ── #17: recluster cadence baseline persistence ──────────────────────────
+
+    #[test]
+    fn test_last_recluster_embedding_count_serde_default() {
+        // A pre-#17 snapshot JSON (field absent) must deserialize to 0 so
+        // the first post-upgrade pass reclusters unconditionally.
+        let mut value = serde_json::to_value(AdaptiveState::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("last_recluster_embedding_count")
+            .expect("field should serialize by default");
+        let state: AdaptiveState = serde_json::from_value(value).unwrap();
+        assert_eq!(state.last_recluster_embedding_count, 0);
+    }
+
+    #[test]
+    fn test_cas_merge_carries_recluster_baseline() {
+        let conn = setup_db();
+
+        // Baseline snapshot.
+        let first = AdaptiveState {
+            version: 1,
+            ..Default::default()
+        };
+        first.save_snapshot(&conn).unwrap();
+
+        // Writer A and writer B both start from version 1.
+        let mut a = AdaptiveState::restore_snapshot(&conn).unwrap();
+        let mut b = AdaptiveState::restore_snapshot(&conn).unwrap();
+
+        // A commits first (no recluster).
+        a.version = 2;
+        a.save_snapshot(&conn).unwrap();
+
+        // B did a recluster → CAS conflict → merge path. The recluster
+        // baseline must travel with the rest of the cluster-scoped state.
+        b.version = 2;
+        b.cluster_version += 1;
+        b.last_recluster_embedding_count = 777;
+        b.save_snapshot(&conn).unwrap();
+
+        let merged = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(merged.last_recluster_embedding_count, 777);
+    }
+
+    /// #17 codex R9 — a pass that RECLUSTERED and consumed feedback in the
+    /// same tick carries by_cluster buckets keyed in the NEW generation;
+    /// a CAS conflict must not strip them (offsets commit after the save —
+    /// the consumed events can never replay to rebuild the buckets).
+    #[test]
+    fn test_cas_merge_keeps_recluster_pass_own_feedback_buckets() {
+        let conn = setup_db();
+
+        let mut by_cluster_old = HashMap::new();
+        by_cluster_old.insert("3|semantic".to_string(), Default::default());
+        let mut first = AdaptiveState {
+            version: 1,
+            cluster_version: 1,
+            synthesis_feedback_stats: Some(SynthesisFeedbackState {
+                by_cluster: by_cluster_old,
+                last_consumed_event_id: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        first.memory_clusters.insert("m".into(), 3);
+        first.save_snapshot(&conn).unwrap();
+
+        // Writer B: reclusters (gen 2) AND consumes feedback — fresh
+        // buckets keyed in generation 2.
+        let mut b = AdaptiveState::restore_snapshot(&conn).unwrap();
+
+        // Peer writer A commits first (no recluster, no stats change).
+        let mut a = AdaptiveState::restore_snapshot(&conn).unwrap();
+        a.version = 2;
+        a.save_snapshot(&conn).unwrap();
+
+        b.cluster_version += 1;
+        b.memory_clusters.insert("m".into(), 5);
+        b.clear_cluster_scoped_learned_state();
+        let mut by_cluster_new = HashMap::new();
+        by_cluster_new.insert("5|semantic".to_string(), Default::default());
+        by_cluster_new.insert("-1|semantic".to_string(), Default::default());
+        b.synthesis_feedback_stats = Some(SynthesisFeedbackState {
+            by_cluster: by_cluster_new,
+            last_consumed_event_id: 99,
+            ..Default::default()
+        });
+        b.version = 2;
+        b.save_snapshot(&conn).unwrap(); // CAS conflict → merge
+
+        let merged = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(merged.cluster_version, 2);
+        let synth = merged.synthesis_feedback_stats.as_ref().unwrap();
+        assert_eq!(synth.last_consumed_event_id, 99);
+        assert!(
+            synth.by_cluster.contains_key("5|semantic"),
+            "the reclustering pass's own new-generation bucket must survive"
+        );
+        assert!(
+            !synth.by_cluster.contains_key("3|semantic"),
+            "old-generation bucket stays gone"
+        );
+    }
+
+    /// #17 codex R8 — a reindex-style reset bumps the generation by TWO so
+    /// a concurrent adaptive pass that reclustered on PRE-reindex
+    /// embeddings (N → N+1, `we_reclustered` true) cannot tie and
+    /// wholesale-overwrite the reset with old-space labels.
+    #[test]
+    fn test_cas_merge_reindex_reset_outranks_concurrent_stale_recluster() {
+        let conn = setup_db();
+
+        let mut first = AdaptiveState {
+            version: 1,
+            cluster_version: 1,
+            ..Default::default()
+        };
+        first.memory_clusters.insert("m-old".into(), 3);
+        first.save_snapshot(&conn).unwrap();
+
+        // Adaptive pass loads gen 1 and reclusters on OLD embeddings.
+        let mut stale_recluster = AdaptiveState::restore_snapshot(&conn).unwrap();
+        stale_recluster.memory_clusters.insert("m-old".into(), 7);
+        stale_recluster.cluster_version += 1; // gen 2, we_reclustered = true
+        stale_recluster.last_recluster_embedding_count = 60;
+
+        // Reindex reset commits with the +2 bump (gen 3).
+        let mut reset = AdaptiveState::restore_snapshot(&conn).unwrap();
+        reset.memory_clusters.clear();
+        reset.cluster_version += 2;
+        reset.version += 1;
+        reset.save_snapshot(&conn).unwrap();
+
+        // Stale recluster saves → CAS conflict. Gen 2 < 3: its wholesale
+        // branch must not fire despite we_reclustered being true.
+        stale_recluster.version += 1;
+        stale_recluster.save_snapshot(&conn).unwrap();
+
+        let merged = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(merged.cluster_version, 3);
+        assert!(
+            merged.memory_clusters.is_empty(),
+            "old-space recluster must not overwrite the reindex reset"
+        );
+        assert_eq!(merged.last_recluster_embedding_count, 0);
+    }
+
+    /// #17 codex R6 — two same-generation writers (neither reclustered)
+    /// that learned DISJOINT cluster buckets must merge additively on CAS
+    /// conflict; the old `>=` wholesale-replace dropped the first writer's
+    /// buckets.
+    #[test]
+    fn test_cas_merge_same_generation_is_additive() {
+        let conn = setup_db();
+
+        let alpha_entry = || LearnedAlphaEntry {
+            value: 0.4,
+            sample_count: 15,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let mut first = AdaptiveState {
+            version: 1,
+            cluster_version: 3,
+            ..Default::default()
+        };
+        first.memory_clusters.insert("m-base".into(), 1);
+        first.save_snapshot(&conn).unwrap();
+
+        // Both writers load generation 3 and learn different buckets.
+        let mut a = AdaptiveState::restore_snapshot(&conn).unwrap();
+        let mut b = AdaptiveState::restore_snapshot(&conn).unwrap();
+        a.learned_alpha.insert("semantic:1".into(), alpha_entry());
+        b.learned_alpha.insert("semantic:2".into(), alpha_entry());
+
+        a.version = 2;
+        a.save_snapshot(&conn).unwrap();
+        b.version = 2;
+        b.save_snapshot(&conn).unwrap(); // CAS conflict → same-gen additive
+
+        let merged = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert!(
+            merged.learned_alpha.contains_key("semantic:1"),
+            "first writer's cluster bucket must survive the merge"
+        );
+        assert!(
+            merged.learned_alpha.contains_key("semantic:2"),
+            "second writer's cluster bucket must survive the merge"
+        );
+        assert!(merged.memory_clusters.contains_key("m-base"));
+    }
+
+    /// #17 codex R3 — a writer holding a snapshot from an OLDER clustering
+    /// generation (e.g. an adaptive pass that loaded before a
+    /// `migrate --reindex` generation bump) must not additively merge its
+    /// stale-space cluster labels / cluster-scoped weights back in.
+    #[test]
+    fn test_cas_merge_drops_stale_generation_cluster_state() {
+        let conn = setup_db();
+
+        let shadow_entry = || LearnedShadowFusionEntry {
+            weights: ShadowFusionWeightEntry {
+                bm25: 0.5,
+                vec: 0.5,
+                kg: 0.0,
+                episode: 0.0,
+                support: 0.0,
+                diversity: 0.0,
+            },
+            sample_count: 20,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Generation 1 baseline with cluster-scoped state.
+        let mut first = AdaptiveState {
+            version: 1,
+            cluster_version: 1,
+            ..Default::default()
+        };
+        first.memory_clusters.insert("m-old".into(), 3);
+        first
+            .learned_shadow_fusion
+            .insert("semantic:3".into(), shadow_entry());
+        first.save_snapshot(&conn).unwrap();
+
+        // Stale writer loads generation 1...
+        let mut stale = AdaptiveState::restore_snapshot(&conn).unwrap();
+        // ...and drains feedback events to a HIGHER watermark, with
+        // by_cluster buckets keyed to generation-1 labels (codex R7: the
+        // watermark arbitration alone would resurrect these).
+        let mut by_cluster = HashMap::new();
+        by_cluster.insert("3|semantic".to_string(), Default::default());
+        by_cluster.insert("-1|semantic".to_string(), Default::default());
+        stale.synthesis_feedback_stats = Some(SynthesisFeedbackState {
+            by_cluster,
+            last_consumed_event_id: 99,
+            ..Default::default()
+        });
+
+        // ...then a reindex-style reset commits generation 2 (cleared maps).
+        let mut reset = AdaptiveState::restore_snapshot(&conn).unwrap();
+        reset.memory_clusters.clear();
+        reset.learned_shadow_fusion.retain(|k, _| !k.contains(':'));
+        reset.last_recluster_embedding_count = 0;
+        reset.cluster_version += 1;
+        reset.version += 1;
+        reset.save_snapshot(&conn).unwrap();
+
+        // Stale writer saves → CAS conflict → merge. Its generation-1
+        // cluster state must be dropped, not additively resurrected.
+        stale.version += 1;
+        stale.save_snapshot(&conn).unwrap();
+
+        let merged = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(merged.cluster_version, 2);
+        assert!(
+            merged.memory_clusters.is_empty(),
+            "stale-generation memory_clusters must not be merged back"
+        );
+        assert!(
+            !merged.learned_shadow_fusion.contains_key("semantic:3"),
+            "stale-generation shadow fusion bucket must not be merged back"
+        );
+        assert_eq!(merged.last_recluster_embedding_count, 0);
+        let synth = merged.synthesis_feedback_stats.as_ref().unwrap();
+        assert_eq!(
+            synth.last_consumed_event_id, 99,
+            "watermark winner survives (replay safety)"
+        );
+        assert!(
+            !synth.by_cluster.contains_key("3|semantic"),
+            "label-keyed bucket from the dead generation must be stripped"
+        );
+        assert!(
+            synth.by_cluster.contains_key("-1|semantic"),
+            "no-cluster bucket is label-free and survives"
+        );
     }
 
     #[test]
@@ -4914,7 +5380,7 @@ mod tests {
         let mut state = AdaptiveState::default();
 
         // No data → None
-        assert!(state.get_alpha("semantic", Some(1)).is_none());
+        assert!(state.get_alpha("semantic", Some(1), 10).is_none());
 
         // Add global semantic with enough samples
         state.learned_alpha.insert(
@@ -4936,7 +5402,7 @@ mod tests {
         );
 
         // Should fall back to global (cluster has < 10 samples)
-        let alpha = state.get_alpha("semantic", Some(1)).unwrap();
+        let alpha = state.get_alpha("semantic", Some(1), 10).unwrap();
         assert!((alpha - 0.4).abs() < 0.01);
 
         // Give cluster enough samples
@@ -4945,7 +5411,7 @@ mod tests {
             .get_mut("semantic:1")
             .unwrap()
             .sample_count = 12;
-        let alpha = state.get_alpha("semantic", Some(1)).unwrap();
+        let alpha = state.get_alpha("semantic", Some(1), 10).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
     }
 
@@ -4960,7 +5426,7 @@ mod tests {
                 last_updated: String::new(),
             },
         );
-        let alpha = state.get_alpha("temporal", None).unwrap();
+        let alpha = state.get_alpha("temporal", None, 10).unwrap();
         assert!((alpha - 0.55).abs() < 0.01);
 
         state.learned_alpha.insert(
@@ -4971,7 +5437,7 @@ mod tests {
                 last_updated: String::new(),
             },
         );
-        let alpha = state.get_alpha("Temporal", None).unwrap();
+        let alpha = state.get_alpha("Temporal", None, 10).unwrap();
         assert!((alpha - 0.8).abs() < 0.01);
     }
 

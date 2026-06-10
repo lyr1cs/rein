@@ -290,8 +290,18 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         .query_row("SELECT COUNT(*) FROM vec_memories", [], |r| r.get(0))
         .unwrap_or(0);
 
-    if embeddings_count >= 50 {
-        run_hdbscan_clustering(store, &mut state, embeddings_count as usize);
+    // Read the churn counter ONCE, before the run: this exact value is
+    // both the gate input and the baseline stamped on success. Stamping a
+    // post-run read would absorb writes that raced in during clustering —
+    // vectors HDBSCAN never saw would be recorded as covered (codex R5).
+    let embedding_write_seq = crate::store::vec::embedding_write_seq(store.conn());
+    if embeddings_count >= 50 && should_recluster(&state, embeddings_count, embedding_write_seq) {
+        run_hdbscan_clustering(
+            store,
+            &mut state,
+            embeddings_count as usize,
+            embedding_write_seq,
+        );
     }
 
     // Step 1b: A1 — Compute per-cluster dedup thresholds
@@ -942,16 +952,60 @@ fn recall_fusion_adoption_key(bucket: &str) -> String {
 // M4: HDBSCAN clustering — read embeddings, cluster, store assignments
 // ===========================================================================
 
+/// #17 recluster cadence gate. A full HDBSCAN re-run relabels every cluster
+/// id, which forces a wipe of all cluster-scoped learned state (M2 alpha,
+/// shadow fusion weights, A1 dedup thresholds). Running it on every
+/// pipeline pass therefore keeps resetting per-cluster learning before the
+/// consume-once windows can accumulate read-gate confidence — the
+/// cluster-scoped read path was structurally dead.
+///
+/// Gate: recluster only when enough embedding churn accumulated since the
+/// last successful recluster — at least the adaptive `min_cluster_size`
+/// (`5.max(n / 50)` — the SAME formula `run_hdbscan_clustering` feeds to
+/// HDBSCAN, so no new constant) on EITHER signal:
+/// - row-count delta (`abs_diff` so bulk deletions also re-trigger), or
+/// - the monotonic `embedding_write_seq` counter delta (codex R4: the
+///   count is blind to in-place replacement — update paths re-embed under
+///   the same id, so a vault that only ever updates would never recluster
+///   on count alone).
+///
+/// An empty assignment map bypasses the gate: there is no cluster-scoped
+/// state to protect and no clusters to serve.
+/// Hard cap on how many embeddings one HDBSCAN run loads. Shared by the
+/// loader in `run_hdbscan_clustering` and the cadence-gate threshold in
+/// `should_recluster` — the gate must derive its churn threshold from the
+/// size the clusterer ACTUALLY uses, or a 100k-row vault would wait for a
+/// 2000-write delta while the run itself works at a 200-point
+/// `min_cluster_size` (codex R9).
+const HDBSCAN_LOAD_CAP: u64 = 10_000;
+
+fn should_recluster(
+    state: &crate::store::adaptive::AdaptiveState,
+    embeddings_count: u64,
+    embedding_write_seq: u64,
+) -> bool {
+    if state.memory_clusters.is_empty() {
+        return true;
+    }
+    let effective = embeddings_count.min(HDBSCAN_LOAD_CAP);
+    let min_cluster_size = 5u64.max(effective / 50);
+    embeddings_count.abs_diff(state.last_recluster_embedding_count) >= min_cluster_size
+        || embedding_write_seq.saturating_sub(state.last_recluster_embedding_write_seq)
+            >= min_cluster_size
+}
+
 fn run_hdbscan_clustering(
     store: &SqliteStore,
     state: &mut crate::store::adaptive::AdaptiveState,
     count: usize,
+    gate_write_seq: u64,
 ) {
     tracing::debug!("M4: running HDBSCAN on {count} embeddings");
 
     // Read all embeddings — hdbscan() internally handles sampling for n > 3000
-    // Cap at 10000 to avoid excessive memory use even with sampling
-    let load_limit = count.min(10_000);
+    // Cap to avoid excessive memory use even with sampling (shared with the
+    // cadence gate's threshold — see HDBSCAN_LOAD_CAP).
+    let load_limit = count.min(HDBSCAN_LOAD_CAP as usize);
     let embeddings: Vec<(String, Vec<f32>)> = match store.conn().prepare(
         "SELECT vm.id, vm.embedding FROM vec_memories vm
              JOIN memories m ON m.id = vm.id
@@ -1020,6 +1074,8 @@ fn run_hdbscan_clustering(
     // Use the in-memory `clustered_ids` set (derived from the actual HDBSCAN input)
     // to identify non-sampled memories — avoids a second LIMIT query whose row set
     // could differ from the first due to non-deterministic ordering.
+    let loaded_cluster_version = state.cluster_version;
+    let mut generation_aborted = false;
     let persist_result =
         (|| -> crate::types::ReinResult<(std::collections::HashMap<String, u32>, u32)> {
             let mut new_clusters = sampled_clusters.clone();
@@ -1122,6 +1178,32 @@ fn run_hdbscan_clustering(
             store
                 .conn()
                 .execute("DROP TABLE IF EXISTS _hdbscan_sampled", [])?;
+            // #17 codex R12: a `migrate --reindex` (or a peer recluster)
+            // may have advanced the clustering generation while this run
+            // was clustering the OLD vectors. The snapshot CAS merge
+            // protects the JSON state, but the SQL rows written above
+            // (memories.cluster_id, cluster_centroids) would commit
+            // regardless — re-check the persisted generation inside the
+            // savepoint and abort if it moved past the one we loaded, so
+            // stale-space labels never land. The rollback leaves the
+            // cadence baselines unstamped; the next pass reclusters on
+            // fresh vectors.
+            let db_cv: u64 = store
+                .conn()
+                .query_row(
+                    "SELECT COALESCE(json_extract(value, '$.cluster_version'), 0)
+                     FROM metadata WHERE key = 'adaptive_state'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0);
+            if db_cv > loaded_cluster_version {
+                generation_aborted = true;
+                return Err(crate::types::error::ReinError::Config(format!(
+                    "recluster aborted: clustering generation moved {loaded_cluster_version} -> {db_cv} mid-run (reindex or peer recluster relabeled the space); discarding labels computed on stale vectors"
+                )));
+            }
             store.conn().execute_batch("RELEASE hdbscan_recluster")?;
             Ok((new_clusters, reassigned))
         })();
@@ -1130,13 +1212,41 @@ fn run_hdbscan_clustering(
         Err(e) => {
             let _ = store.conn().execute_batch("ROLLBACK TO hdbscan_recluster");
             let _ = store.conn().execute_batch("RELEASE hdbscan_recluster");
-            tracing::error!("M4: failed to persist recluster atomically: {e}");
+            if generation_aborted {
+                // #17 codex R15: another writer relabeled the space while
+                // we clustered — our in-memory cluster view is from a dead
+                // generation. Drop it so the REST of this pipeline pass
+                // (survival curves, dedup thresholds, M2/shadow bucketing)
+                // degrades to global fallbacks instead of publishing side
+                // effects keyed to stale labels (some, like
+                // `survival_curve:{cid}` metadata rows, commit outside the
+                // snapshot CAS and would not be caught by the merge). The
+                // next pass sees the empty map and reclusters on fresh
+                // vectors.
+                state.memory_clusters.clear();
+                state.clear_cluster_scoped_learned_state();
+                tracing::warn!("M4: {e}");
+            } else {
+                tracing::error!("M4: failed to persist recluster atomically: {e}");
+            }
             return;
         }
     };
     state.memory_clusters = new_clusters;
-    state.dedup_thresholds.clear();
-    state.learned_alpha.retain(|k, _| !k.contains(':'));
+    // Cluster ids are local labels: after a re-run, old entries keyed by
+    // id N describe a dead cluster whose id a NEW unrelated cluster may
+    // now wear. Pre-#17 only learned_alpha was wiped here — shadow fusion
+    // weights and the synthesis / concept-summary by_cluster aggregates
+    // survived relabeling and could be served for the wrong cluster. The
+    // shared helper wipes every cluster-ID-keyed surface in one place.
+    state.clear_cluster_scoped_learned_state();
+    // #17: stamp the cadence-gate baselines only after the recluster
+    // actually persisted — a rolled-back attempt must stay re-runnable.
+    // Both baselines are the PRE-RUN values that opened the gate: writes
+    // racing in during the cluster run were not in HDBSCAN's input, so
+    // they must keep counting toward the NEXT gate (codex R5).
+    state.last_recluster_embedding_count = count as u64;
+    state.last_recluster_embedding_write_seq = gate_write_seq;
     if reassigned > 0 {
         tracing::info!("M4: reassigned {reassigned} non-sampled memories via nearest centroid");
     }
@@ -1944,18 +2054,33 @@ fn compute_counterfactual_alphas(
     state: &mut crate::store::adaptive::AdaptiveState,
     config: &ReinConfig,
 ) {
-    let decay_lambda = 0.06; // ~11 day half-life for event weighting
+    let decay_lambda = crate::search::alpha_optimizer::EVENT_DECAY_LAMBDA;
 
     // Compute global alpha
     if let Some(learned) =
         crate::search::alpha_optimizer::optimize_alpha(events_with_access, decay_lambda)
     {
         let key = "global".to_string();
+        let now = chrono::Utc::now();
         let current = state
             .learned_alpha
             .get(&key)
             .map(|e| e.value)
             .unwrap_or(0.5);
+        // #17: decay-weighted cumulative confidence. The stored value is
+        // already an across-window accumulation (apply_max_step walks it
+        // from the previous stored value), so the trust weight fed to
+        // shrinkage must accumulate the same way — per-window counts
+        // re-shrink toward the parent every pass and never converge.
+        let cumulative = crate::search::alpha_optimizer::decayed_cumulative_sample_count(
+            state
+                .learned_alpha
+                .get(&key)
+                .map(|e| (e.sample_count, e.last_updated.as_str())),
+            learned.sample_count,
+            now,
+            decay_lambda,
+        );
         let stepped = crate::search::alpha_optimizer::apply_max_step(
             current,
             learned.value,
@@ -1964,7 +2089,7 @@ fn compute_counterfactual_alphas(
         let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
             stepped,
             0.5,
-            learned.sample_count,
+            cumulative,
             config.adaptive.shrinkage_prior,
         );
 
@@ -1972,13 +2097,13 @@ fn compute_counterfactual_alphas(
             key,
             crate::store::adaptive::LearnedAlphaEntry {
                 value: shrunk,
-                sample_count: learned.sample_count,
-                last_updated: chrono::Utc::now().to_rfc3339(),
+                sample_count: cumulative,
+                last_updated: now.to_rfc3339(),
             },
         );
 
         tracing::info!(
-            "M2: learned global alpha = {shrunk:.3} (from {} events, raw={:.3})",
+            "M2: learned global alpha = {shrunk:.3} (from {} events, {cumulative} cumulative, raw={:.3})",
             learned.sample_count,
             learned.value
         );
@@ -2005,22 +2130,49 @@ fn compute_counterfactual_alphas(
             .cloned()
             .collect();
 
-        if qt_events.len() < config.adaptive.min_samples_alpha {
-            continue;
-        }
-
+        // #17: no per-window `min_samples_alpha` floor — a rarely-used
+        // query type would otherwise never accumulate under consume-once
+        // windows (same starvation shape as the cluster buckets below).
+        // The floor's old job is done by the read gate (`sample_count >=
+        // 10` in `get_alpha`) against the decayed cumulative count.
         if let Some(learned) =
             crate::search::alpha_optimizer::optimize_alpha(&qt_events, decay_lambda)
         {
+            let now = chrono::Utc::now();
             let global_alpha = state
                 .learned_alpha
                 .get("global")
                 .map(|e| e.value)
                 .unwrap_or(0.5);
-            let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
+            // #17: same accumulation scheme as the global / cluster
+            // buckets. apply_max_step (previously missing at this site)
+            // gives the value the across-window continuity that justifies
+            // weighting it with the cumulative count — shrinking a raw
+            // single-window estimate by cumulative trust would over-trust
+            // thin windows.
+            let current = state
+                .learned_alpha
+                .get(*qt)
+                .map(|e| e.value)
+                .unwrap_or(global_alpha);
+            let stepped = crate::search::alpha_optimizer::apply_max_step(
+                current,
                 learned.value,
-                global_alpha,
+                config.adaptive.alpha_max_step,
+            );
+            let cumulative = crate::search::alpha_optimizer::decayed_cumulative_sample_count(
+                state
+                    .learned_alpha
+                    .get(*qt)
+                    .map(|e| (e.sample_count, e.last_updated.as_str())),
                 learned.sample_count,
+                now,
+                decay_lambda,
+            );
+            let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
+                stepped,
+                global_alpha,
+                cumulative,
                 config.adaptive.shrinkage_prior,
             );
 
@@ -2028,8 +2180,8 @@ fn compute_counterfactual_alphas(
                 qt.to_string(),
                 crate::store::adaptive::LearnedAlphaEntry {
                     value: shrunk,
-                    sample_count: learned.sample_count,
-                    last_updated: chrono::Utc::now().to_rfc3339(),
+                    sample_count: cumulative,
+                    last_updated: now.to_rfc3339(),
                 },
             );
 
@@ -2064,11 +2216,19 @@ fn compute_counterfactual_alphas(
     }
 
     for ((qt, cluster_id), events) in &cluster_buckets {
-        if events.len() < config.adaptive.min_samples_alpha {
-            continue;
-        }
+        // #17: deliberately NO per-window `min_samples_alpha` floor here.
+        // Events are consumed once, and a single (query_type, cluster)
+        // window almost never reaches the floor — gating before the
+        // accumulation below would starve sparse buckets forever (3+3+4
+        // events across passes must accumulate, not be discarded thrice).
+        // Safety moved to the cumulative side: the read gate stays
+        // `sample_count >= 10` and shrinkage weighs the decayed
+        // cumulative count, so thin evidence keeps the value pinned to
+        // the parent until real confidence accrues.
         if let Some(learned) = crate::search::alpha_optimizer::optimize_alpha(events, decay_lambda)
         {
+            let now = chrono::Utc::now();
+            let key = crate::store::adaptive::AdaptiveState::bucket_key(qt, Some(*cluster_id));
             // Shrink toward the query-type level alpha (or global as fallback)
             let parent_alpha = state
                 .learned_alpha
@@ -2079,10 +2239,7 @@ fn compute_counterfactual_alphas(
             // Dampen step size to prevent volatile swings with small sample counts
             let current = state
                 .learned_alpha
-                .get(&crate::store::adaptive::AdaptiveState::bucket_key(
-                    qt,
-                    Some(*cluster_id),
-                ))
+                .get(&key)
                 .map(|e| e.value)
                 .unwrap_or(parent_alpha);
             let stepped = crate::search::alpha_optimizer::apply_max_step(
@@ -2090,23 +2247,37 @@ fn compute_counterfactual_alphas(
                 learned.value,
                 config.adaptive.alpha_max_step,
             );
+            // #17: this is THE bucket class the cadence gate + cumulative
+            // count exist for — a single consume-once window almost never
+            // yields >= 10 valid events for one (query_type, cluster)
+            // pair, so per-window counts left the read gate permanently
+            // closed (and per-window shrinkage left the value pinned to
+            // the parent).
+            let cumulative = crate::search::alpha_optimizer::decayed_cumulative_sample_count(
+                state
+                    .learned_alpha
+                    .get(&key)
+                    .map(|e| (e.sample_count, e.last_updated.as_str())),
+                learned.sample_count,
+                now,
+                decay_lambda,
+            );
             let shrunk = crate::search::alpha_optimizer::bayesian_shrinkage(
                 stepped,
                 parent_alpha,
-                learned.sample_count,
+                cumulative,
                 config.adaptive.shrinkage_prior,
             );
-            let key = crate::store::adaptive::AdaptiveState::bucket_key(qt, Some(*cluster_id));
             state.learned_alpha.insert(
                 key,
                 crate::store::adaptive::LearnedAlphaEntry {
                     value: shrunk,
-                    sample_count: learned.sample_count,
-                    last_updated: chrono::Utc::now().to_rfc3339(),
+                    sample_count: cumulative,
+                    last_updated: now.to_rfc3339(),
                 },
             );
             tracing::info!(
-                "M2: learned {qt}:{cluster_id} alpha = {shrunk:.3} ({} events)",
+                "M2: learned {qt}:{cluster_id} alpha = {shrunk:.3} ({} events, {cumulative} cumulative)",
                 learned.sample_count
             );
         }
@@ -2134,11 +2305,20 @@ fn compute_shadow_fusion_weight_replay(
     if !config.ars.acceleration.enabled {
         return None;
     }
-    if events_with_access.len() < config.adaptive.min_samples_alpha {
+    if events_with_access.is_empty() {
         return None;
     }
+    // #17: deliberately NO total-count `min_samples_alpha` floor here.
+    // Events are consumed once (run_alpha_learning advances the offsets
+    // whether or not this replay ran), so a low-traffic deployment whose
+    // passes each carry < 10 learnable events would NEVER reach the
+    // accumulation in `learned_shadow_fusion_entry` — 3+3+4 events
+    // across passes were consumed and discarded. `min_samples_alpha` is
+    // now purely the READ/eligibility-side confidence floor
+    // (`get_shadow_fusion_weights` / release gate); the write side
+    // accumulates decay-weighted counts from any window.
 
-    let decay_lambda = 0.06;
+    let decay_lambda = crate::search::alpha_optimizer::EVENT_DECAY_LAMBDA;
     let parent = crate::search::alpha_optimizer::ShadowFusionWeights::default();
     let n_prior = config.adaptive.shrinkage_prior;
     let mut report = ShadowFusionReplayReport {
@@ -2169,9 +2349,10 @@ fn compute_shadow_fusion_weight_replay(
             .filter(|e| qt_map.get(e.request_id.as_str()).copied() == Some(qt))
             .cloned()
             .collect();
-        if qt_events.len() < config.adaptive.min_samples_alpha {
+        if qt_events.is_empty() {
             continue;
         }
+        // #17: no per-window floor — see the total-count comment above.
         let parent_weights = report
             .global
             .as_ref()
@@ -2211,9 +2392,10 @@ fn compute_shadow_fusion_weight_replay(
     }
 
     for ((qt, cluster_id), events) in cluster_buckets {
-        if events.len() < config.adaptive.min_samples_alpha {
-            continue;
-        }
+        // #17: no per-window floor — mirror of the alpha cluster loop in
+        // `compute_counterfactual_alphas`. Sparse per-cluster windows must
+        // reach `learned_shadow_fusion_entry`'s cumulative count or the
+        // `sample_count >= min_sample_count` eligibility gate never opens.
         let parent_weights = report
             .by_query_type
             .iter()
@@ -2421,8 +2603,44 @@ fn project_learned_shadow_weights(
 
 fn learned_shadow_fusion_entry(
     learned: &crate::search::alpha_optimizer::LearnedShadowWeights,
+    prev: Option<&crate::store::adaptive::LearnedShadowFusionEntry>,
 ) -> crate::store::adaptive::LearnedShadowFusionEntry {
-    let weights = learned.weights.normalized_or_default();
+    let window = learned.weights.normalized_or_default();
+    // #17: stored confidence accumulates across consume-once windows
+    // (decay-weighted, same lambda as the optimizer's event weighting) so
+    // per-(query_type, cluster) buckets can ever reach the
+    // `sample_count >= min_sample_count` eligibility / release-gate
+    // checks. The stored weight VECTOR must accumulate with the SAME
+    // effective-sample-size weighting (codex R3): without the blend, ten
+    // one-event windows would store eligibility n=10 next to a vector
+    // learned from only the LAST event — count and state would describe
+    // different evidence. Convex ESS blend of two simplex points stays on
+    // the simplex; `normalized_or_default` re-normalizes float drift.
+    let prev_ess = crate::search::alpha_optimizer::decayed_prior_ess(
+        prev.map(|e| (e.sample_count, e.last_updated.as_str())),
+        learned.last_updated,
+        crate::search::alpha_optimizer::EVENT_DECAY_LAMBDA,
+    );
+    let window_n = learned.sample_count as f64;
+    let weights = match prev.filter(|_| prev_ess > 0.0 && window_n > 0.0) {
+        Some(prev_entry) => {
+            let p = &prev_entry.weights;
+            let blend = |prev_dim: f64, window_dim: f64| {
+                (prev_ess * prev_dim + window_n * window_dim) / (prev_ess + window_n)
+            };
+            crate::search::alpha_optimizer::ShadowFusionWeights {
+                bm25: blend(p.bm25, window.bm25),
+                vec: blend(p.vec, window.vec),
+                kg: blend(p.kg, window.kg),
+                episode: blend(p.episode, window.episode),
+                support: blend(p.support, window.support),
+                diversity: blend(p.diversity, window.diversity),
+            }
+            .normalized_or_default()
+        }
+        None => window,
+    };
+    let sample_count = prev_ess.round() as usize + learned.sample_count;
     crate::store::adaptive::LearnedShadowFusionEntry {
         weights: crate::store::adaptive::ShadowFusionWeightEntry {
             bm25: weights.bm25,
@@ -2432,7 +2650,7 @@ fn learned_shadow_fusion_entry(
             support: weights.support,
             diversity: weights.diversity,
         },
-        sample_count: learned.sample_count,
+        sample_count,
         last_updated: learned.last_updated.to_rfc3339(),
     }
 }
@@ -2448,33 +2666,36 @@ fn commit_shadow_fusion_weight_replay(
     // can trigger eviction in practice.
     if let Some(global) = &report.global {
         let key = "global".to_string();
+        let prev = state.learned_shadow_fusion.get(&key).cloned();
         crate::store::adaptive::evict_learned_shadow_fusion_lru_if_at_cap(
             &mut state.learned_shadow_fusion,
             &key,
         );
         state
             .learned_shadow_fusion
-            .insert(key, learned_shadow_fusion_entry(global));
+            .insert(key, learned_shadow_fusion_entry(global, prev.as_ref()));
     }
     for (query_type, learned) in &report.by_query_type {
         let key = crate::store::adaptive::AdaptiveState::bucket_key(query_type, None);
+        let prev = state.learned_shadow_fusion.get(&key).cloned();
         crate::store::adaptive::evict_learned_shadow_fusion_lru_if_at_cap(
             &mut state.learned_shadow_fusion,
             &key,
         );
         state
             .learned_shadow_fusion
-            .insert(key, learned_shadow_fusion_entry(learned));
+            .insert(key, learned_shadow_fusion_entry(learned, prev.as_ref()));
     }
     for ((query_type, cluster_id), learned) in &report.by_cluster {
         let key = crate::store::adaptive::AdaptiveState::bucket_key(query_type, Some(*cluster_id));
+        let prev = state.learned_shadow_fusion.get(&key).cloned();
         crate::store::adaptive::evict_learned_shadow_fusion_lru_if_at_cap(
             &mut state.learned_shadow_fusion,
             &key,
         );
         state
             .learned_shadow_fusion
-            .insert(key, learned_shadow_fusion_entry(learned));
+            .insert(key, learned_shadow_fusion_entry(learned, prev.as_ref()));
     }
 }
 
@@ -4906,13 +5127,152 @@ mod tests {
 
         let mut state = AdaptiveState::default();
         // Should not panic
-        run_hdbscan_clustering(&store, &mut state, 60);
+        let seq = crate::store::vec::embedding_write_seq(store.conn());
+        run_hdbscan_clustering(&store, &mut state, 60, seq);
 
         // HDBSCAN should complete and increment cluster_version
         assert!(
             state.cluster_version > 0,
             "cluster_version should have been incremented"
         );
+    }
+
+    // ── #17: recluster cadence gate ──────────────────────────────────────────
+
+    #[test]
+    fn test_should_recluster_cadence_gate() {
+        let mut state = AdaptiveState::default();
+        // Bootstrap / wiped state: no assignments to protect → always run.
+        assert!(should_recluster(&state, 60, 0));
+
+        state.memory_clusters.insert("m1".into(), 0);
+        state.last_recluster_embedding_count = 1000;
+        // min_cluster_size = max(5, 1000/50) = 20
+        assert!(!should_recluster(&state, 1000, 0), "no growth → gated");
+        assert!(!should_recluster(&state, 1019, 0), "+19 < 20 → gated");
+        assert!(should_recluster(&state, 1020, 0), "+20 → recluster");
+        assert!(
+            should_recluster(&state, 980, 0),
+            "-20 (bulk delete) → recluster"
+        );
+
+        // Small DB: the 5-floor applies.
+        state.last_recluster_embedding_count = 60;
+        assert!(!should_recluster(&state, 64, 0), "+4 < 5 → gated");
+        assert!(should_recluster(&state, 65, 0), "+5 → recluster");
+
+        // Pre-#17 snapshot (serde default 0 baseline): first pass fires.
+        state.last_recluster_embedding_count = 0;
+        assert!(should_recluster(&state, 50, 0));
+
+        // Codex R4: in-place embedding replacement keeps the row count
+        // constant but bumps the write counter — the gate must fire on
+        // write churn alone (an update-only vault never changes count).
+        state.last_recluster_embedding_count = 1000;
+        state.last_recluster_embedding_write_seq = 5000;
+        assert!(
+            !should_recluster(&state, 1000, 5019),
+            "+19 writes < 20 → gated"
+        );
+        assert!(
+            should_recluster(&state, 1000, 5020),
+            "+20 in-place writes at constant count → recluster"
+        );
+    }
+
+    #[test]
+    fn test_recluster_wipes_cluster_scoped_state_and_stamps_baseline() {
+        let store = SqliteStore::in_memory().unwrap();
+        let dim = 3072;
+        for i in 0..60 {
+            let mem = test_memory("cluster", &format!("cluster mem {i}"), 0);
+            let id = mem.id.clone();
+            store.store(mem).unwrap();
+            let mut embedding = vec![0.0f32; dim];
+            if i < 30 {
+                embedding[0] = 1.0 + (i as f32 * 0.01);
+                embedding[1] = 0.5;
+            } else {
+                embedding[0] = -1.0 + ((i - 30) as f32 * 0.01);
+                embedding[1] = -0.5;
+            }
+            crate::store::vec::insert_embedding(store.conn(), &id, &embedding).unwrap();
+        }
+
+        let mut state = AdaptiveState::default();
+        let alpha_entry = |v: f64| crate::store::adaptive::LearnedAlphaEntry {
+            value: v,
+            sample_count: 12,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+        };
+        let shadow_entry = || crate::store::adaptive::LearnedShadowFusionEntry {
+            weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                bm25: 0.4,
+                vec: 0.4,
+                kg: 0.1,
+                episode: 0.05,
+                support: 0.025,
+                diversity: 0.025,
+            },
+            sample_count: 12,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+        };
+        state
+            .learned_alpha
+            .insert("semantic".into(), alpha_entry(0.4));
+        state
+            .learned_alpha
+            .insert("semantic:1".into(), alpha_entry(0.3));
+        state
+            .learned_shadow_fusion
+            .insert("global".into(), shadow_entry());
+        state
+            .learned_shadow_fusion
+            .insert("semantic:1".into(), shadow_entry());
+        // Codex R6: synthesis by_cluster aggregates are cluster-ID-keyed
+        // too — seeded here to pin the wipe (watermark + no-cluster
+        // bucket must survive).
+        let mut by_cluster = std::collections::HashMap::new();
+        by_cluster.insert("3|semantic".to_string(), Default::default());
+        by_cluster.insert("-1|semantic".to_string(), Default::default());
+        state.synthesis_feedback_stats = Some(crate::store::adaptive::SynthesisFeedbackState {
+            by_cluster,
+            last_consumed_event_id: 42,
+            ..Default::default()
+        });
+
+        let pre_run_seq = crate::store::vec::embedding_write_seq(store.conn());
+        assert!(pre_run_seq >= 60, "each insert_embedding bumps the counter");
+        run_hdbscan_clustering(&store, &mut state, 60, pre_run_seq);
+        assert!(state.cluster_version > 0);
+
+        // Cluster-scoped keys are wiped (cluster ids are local labels —
+        // stale entries could be served for an unrelated new cluster);
+        // scope-free keys survive.
+        assert!(state.learned_alpha.contains_key("semantic"));
+        assert!(!state.learned_alpha.contains_key("semantic:1"));
+        assert!(state.learned_shadow_fusion.contains_key("global"));
+        assert!(!state.learned_shadow_fusion.contains_key("semantic:1"));
+        let synth = state.synthesis_feedback_stats.as_ref().unwrap();
+        assert!(
+            !synth.by_cluster.contains_key("3|semantic"),
+            "cluster-ID-keyed synthesis bucket must be wiped on relabel"
+        );
+        assert!(
+            synth.by_cluster.contains_key("-1|semantic"),
+            "no-cluster synthesis bucket is label-free and survives"
+        );
+        assert_eq!(
+            synth.last_consumed_event_id, 42,
+            "consumer watermark must survive the wipe (consume-once replay safety)"
+        );
+
+        // Cadence baselines stamped with the PRE-RUN count + write seq
+        // that opened the gate → the immediate next pass is gated, while
+        // writes racing in during the run still count toward the next one.
+        assert_eq!(state.last_recluster_embedding_count, 60);
+        assert_eq!(state.last_recluster_embedding_write_seq, pre_run_seq);
+        assert!(!should_recluster(&state, 60, pre_run_seq));
     }
 
     // ── Test 4: run_alpha_learning consumes events ───────────────────────────
@@ -5452,6 +5812,57 @@ mod tests {
         assert!(global.sample_count > 0, "sample_count should be positive");
     }
 
+    /// #17 — sparse per-(query_type, cluster) windows accumulate across
+    /// consume-once passes instead of being discarded by a per-window
+    /// floor. Codex P2 on the first #17 cut: with the old
+    /// `events.len() < min_samples_alpha` gate ahead of the accumulation,
+    /// 3+3+4 events across three passes never created an entry and the
+    /// read gate stayed closed forever.
+    #[test]
+    fn test_sparse_cluster_windows_accumulate_to_read_gate() {
+        let config = ReinConfig::default(); // min_samples_alpha = 10
+        let mut state = AdaptiveState {
+            cluster_version: 1,
+            ..Default::default()
+        };
+
+        let mut next_req = 0usize;
+        let mut run_window = |state: &mut AdaptiveState, n: usize| {
+            let mut recall_events = Vec::new();
+            let mut stored_events = Vec::new();
+            for _ in 0..n {
+                let req = format!("req-{next_req}");
+                let accessed = format!("mem-{next_req}");
+                next_req += 1;
+                state.memory_clusters.insert(accessed.clone(), 7);
+                recall_events.push(shadow_replay_event(&req, &accessed));
+                stored_events.push(stored_recall_event(next_req as i64, &req, "semantic"));
+            }
+            compute_counterfactual_alphas(&recall_events, &stored_events, state, &config);
+        };
+
+        run_window(&mut state, 3);
+        let after_first = state
+            .learned_alpha
+            .get("semantic:7")
+            .expect("sparse window should still write the bucket entry");
+        assert_eq!(after_first.sample_count, 3);
+        assert!(
+            state.get_alpha("semantic", Some(7), 10).is_none(),
+            "read gate must stay closed below 10 cumulative samples"
+        );
+
+        run_window(&mut state, 3);
+        assert_eq!(state.learned_alpha["semantic:7"].sample_count, 6);
+
+        run_window(&mut state, 4);
+        assert_eq!(state.learned_alpha["semantic:7"].sample_count, 10);
+        assert!(
+            state.get_alpha("semantic", Some(7), 10).is_some(),
+            "cumulative 3+3+4 must open the cluster-scoped read gate"
+        );
+    }
+
     #[test]
     fn counterfactual_cluster_alpha_shrinks_toward_query_type_parent() {
         let mut config = ReinConfig::default();
@@ -5550,17 +5961,89 @@ mod tests {
         );
     }
 
+    /// #17 codex R3 — the stored shadow weight VECTOR must accumulate with
+    /// the same ESS weighting as the stored count. Ten one-event windows
+    /// must NOT produce an eligible entry whose vector reflects only the
+    /// last event.
     #[test]
-    fn shadow_fusion_replay_is_default_off() {
-        let config = ReinConfig::default();
+    fn shadow_fusion_entry_blends_weights_by_ess() {
+        let now = Utc::now();
+        let prev = crate::store::adaptive::LearnedShadowFusionEntry {
+            weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                bm25: 0.8,
+                vec: 0.2,
+                kg: 0.0,
+                episode: 0.0,
+                support: 0.0,
+                diversity: 0.0,
+            },
+            sample_count: 9,
+            last_updated: now.to_rfc3339(),
+        };
+        // Window from a single event pointing the opposite way.
+        let learned = crate::search::alpha_optimizer::LearnedShadowWeights {
+            weights: crate::search::alpha_optimizer::ShadowFusionWeights {
+                bm25: 0.0,
+                vec: 1.0,
+                kg: 0.0,
+                episode: 0.0,
+                support: 0.0,
+                diversity: 0.0,
+            },
+            sample_count: 1,
+            last_updated: now,
+        };
+
+        let entry = learned_shadow_fusion_entry(&learned, Some(&prev));
+        assert_eq!(entry.sample_count, 10, "count accumulates 9 + 1");
+        // ESS blend: bm25 = (9*0.8 + 1*0.0) / 10 = 0.72 — the accumulated
+        // history dominates; one fresh event shifts the vector by ~1/10.
+        assert!(
+            (entry.weights.bm25 - 0.72).abs() < 1e-9,
+            "expected ESS-blended bm25 ≈ 0.72, got {}",
+            entry.weights.bm25
+        );
+        assert!(
+            (entry.weights.vec - 0.28).abs() < 1e-9,
+            "expected ESS-blended vec ≈ 0.28, got {}",
+            entry.weights.vec
+        );
+
+        // No prior → window vector taken as-is.
+        let fresh = learned_shadow_fusion_entry(&learned, None);
+        assert_eq!(fresh.sample_count, 1);
+        assert!((fresh.weights.vec - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shadow_fusion_replay_respects_disabled_flag() {
+        // Pre-#17 this test passed via the total-count floor (1 event <
+        // min_samples_alpha) rather than the flag it was named for —
+        // `[ars.acceleration].enabled` defaults to true since v0.28.8.
+        // The floor is gone (sparse windows must reach the accumulator),
+        // so pin the actual flag gate and the empty-window short-circuit.
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = false;
         let state = AdaptiveState::default();
         let recall_events = vec![shadow_replay_event("req-1", "mem-1")];
         let stored_events = vec![stored_recall_event(1, "req-1", "semantic")];
 
         let report =
             compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config);
+        assert!(report.is_none(), "disabled flag must short-circuit");
 
-        assert!(report.is_none());
+        config.ars.acceleration.enabled = true;
+        let report = compute_shadow_fusion_weight_replay(&[], &stored_events, &state, &config);
+        assert!(report.is_none(), "empty window must short-circuit");
+
+        // #17: a single-event window now reaches the optimizer — sparse
+        // passes must produce entries so cumulative counts can accrue.
+        let report =
+            compute_shadow_fusion_weight_replay(&recall_events, &stored_events, &state, &config);
+        assert!(
+            report.is_some_and(|r| r.global.is_some()),
+            "sparse window should produce a global shadow report"
+        );
     }
 
     #[test]

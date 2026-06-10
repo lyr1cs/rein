@@ -1,22 +1,96 @@
 use crate::types::ReinResult;
 use rusqlite::Connection;
 
-/// Insert an embedding vector for a memory.
-pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinResult<()> {
-    let bytes = embedding_to_bytes(embedding);
+/// Metadata key holding the monotonic embedding-write counter. Every
+/// insert/replace/delete through the two helpers below bumps it. The #17
+/// recluster cadence gate reads it because the row COUNT alone is blind to
+/// in-place embedding replacement (`SqliteStore::update` re-embeds changed
+/// content under the same id — same count, different vector): a vault that
+/// only ever updates would otherwise never recluster. `vec_memories` is a
+/// vec0 virtual table, so neither triggers nor rowid heuristics can track
+/// this — the shared write chokepoints are the reliable place.
+pub const EMBEDDING_WRITE_SEQ_KEY: &str = "embedding_write_seq";
+
+fn bump_embedding_write_seq(conn: &Connection) -> ReinResult<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)",
-        rusqlite::params![id, bytes],
+        "INSERT INTO metadata(key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+        rusqlite::params![EMBEDDING_WRITE_SEQ_KEY],
     )?;
     Ok(())
 }
 
+/// Read the monotonic embedding-write counter (0 when never bumped).
+pub fn embedding_write_seq(conn: &Connection) -> u64 {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = ?1",
+        rusqlite::params![EMBEDDING_WRITE_SEQ_KEY],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|v| v.max(0) as u64)
+    .unwrap_or(0)
+}
+
+/// Insert an embedding vector for a memory.
+///
+/// Counter atomicity (codex R9 + R11): the seq bump and the vec0 write
+/// commit under ONE savepoint. Two separate autocommits would open both
+/// failure directions — write-then-crash leaves a CHANGED vector the
+/// cadence gate never hears about, and bump-then-write lets an adaptive
+/// pass on another connection read the bumped counter between the two
+/// commits, recluster over the OLD vector, and stamp the new seq as
+/// covered. A savepoint nests harmlessly inside caller transactions and
+/// forms its own transaction otherwise.
+pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinResult<()> {
+    let bytes = embedding_to_bytes(embedding);
+    conn.execute_batch("SAVEPOINT vec_embed_write")?;
+    let result = (|| -> ReinResult<()> {
+        bump_embedding_write_seq(conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![id, bytes],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            // Propagate RELEASE failures (codex R12): as the outermost
+            // savepoint this IS the commit — SQLITE_FULL / I/O errors here
+            // mean nothing was made durable, and swallowing them would
+            // report a phantom embedding write. On failure, best-effort
+            // unwind the savepoint too (codex R13) — returning with it
+            // still open would leave the long-lived connection stuck in a
+            // failed transaction holding locks.
+            if let Err(e) = conn.execute_batch("RELEASE vec_embed_write") {
+                let _ = conn.execute_batch("ROLLBACK TO vec_embed_write");
+                let _ = conn.execute_batch("RELEASE vec_embed_write");
+                return Err(e.into());
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO vec_embed_write");
+            let _ = conn.execute_batch("RELEASE vec_embed_write");
+            Err(e)
+        }
+    }
+}
+
 /// Delete an embedding vector for a memory.
+///
+/// Bump-after here (unlike `insert_embedding`): the bump is conditioned on
+/// a row actually being removed, and a crash between delete and bump is
+/// covered anyway — deletions move the ROW COUNT, which is the cadence
+/// gate's other churn signal. Only count-invisible in-place replacement
+/// needs the bump-first guarantee.
 pub fn delete_embedding(conn: &Connection, id: &str) -> ReinResult<()> {
-    conn.execute(
+    let removed = conn.execute(
         "DELETE FROM vec_memories WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if removed > 0 {
+        bump_embedding_write_seq(conn)?;
+    }
     Ok(())
 }
 
