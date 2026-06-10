@@ -52,6 +52,17 @@ official references for implementation dependencies and integration behavior.
     deduplication. ICLR 2023 Workshop MRL; arXiv:2303.09540 (2023).
     doi:10.48550/arXiv.2303.09540.
 
+19. Aggarwal, C. C., Han, J., Wang, J. & Yu, P. S. A framework for clustering
+    evolving data streams. In *Proc. VLDB 2003*, 81-92 (2003).
+    doi:10.1016/B978-012722442-8/50016-1.
+
+20. Cao, F., Ester, M., Qian, W. & Zhou, A. Density-based clustering over an
+    evolving data stream with noise. In *Proc. SIAM International Conference
+    on Data Mining 2006*, 328-339 (2006). doi:10.1137/1.9781611972764.29.
+
+21. Luxenberg, E. & Boyd, S. Exponentially weighted moving models.
+    arXiv:2404.08136 (2024). doi:10.48550/arXiv.2404.08136.
+
 ## Software And Official Documentation
 
 12. Lee, J. et al. Gemini Embedding: Generalizable embeddings from Gemini.

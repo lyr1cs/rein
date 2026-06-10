@@ -308,9 +308,33 @@ S_{\text{rank}}(d) =
 $$
 
 where `x_j(d)` are normalized features and `beta_j` are default or learned
-weights. `search/rerank_llm.rs` can optionally rescore top candidates with a
-configured LLM. Strong lexical signals can bypass expansion or LLM reranking to
-avoid unnecessary latency and cost.
+weights. Strong lexical signals can bypass expansion or LLM reranking to avoid
+unnecessary latency and cost.
+
+**LLM reranking via score-envelope-preserving permutation (v1.1).**
+`search/rerank_llm.rs` can optionally reorder the top candidates with a
+configured LLM. Only the LLM's relevance *order* is used: the candidates'
+existing scores are redistributed by that order, so the LLM's rank-1 candidate
+receives the highest of the scores the candidates already had, rank 2 the
+second highest, and so on. Formally, if `σ` is the LLM-induced permutation and
+`s_(1) ≥ s_(2) ≥ …` the sorted existing scores:
+
+$$
+S'(d_{\sigma(k)}) = s_{(k)}
+$$
+
+The output score multiset equals the input multiset, which keeps reranked and
+non-reranked results on one comparable axis (earlier versions bridged the
+LLM's `[0,1]` onto the linear reranker's range with a fixed scale factor,
+overwriting fused scores with an alien scale). An identity ordering is an
+exact no-op; ties resolve stably to the original order, so a degenerate
+constant response cannot flatten the ranking; and because the order is derived
+from scores by sorting, the permutation is always valid — there are no
+duplicate or missing rank positions to reconcile. The mapping from rank to
+score is monotone, so when several pre-collapse candidates fold into one
+canonical result, taking the maximum reassigned score is exactly taking the
+best LLM rank. The non-inferiority of the reranking path is checked by the
+recall eval gate (paired McNemar).
 
 `search/mmr.rs` applies Maximal Marginal Relevance as a final diversity pass
 when enabled [6]. Given selected set `S`, the next result is:
@@ -480,6 +504,58 @@ recluster, and can reassign non-sampled memories to the nearest centroid.
 Sampling for large populations uses the reservoir sampling family described by
 Vitter [9].
 
+### Recluster Cadence Gate
+
+Cluster ids are local labels of one HDBSCAN run, so every recluster must wipe
+all cluster-keyed learned state (M2 alpha buckets, shadow fusion weights,
+dedup thresholds, synthesis and concept-summary feedback aggregates). Before
+v1.1, M4 re-ran on every adaptive pass, which reset that state before any
+bucket could accumulate read-gate confidence — cluster-scoped learning was
+structurally dead. M4 now reclusters only when enough embedding churn has
+accumulated since the last successful run:
+
+```mermaid
+flowchart TD
+    Pass[Adaptive pass] --> Empty{Assignment map empty?}
+    Empty -->|yes| Run[Run HDBSCAN]
+    Empty -->|no| Churn{Count delta or write delta >= mcs?}
+    Churn -->|no| Skip[Skip - learned state survives]
+    Churn -->|yes| Run
+    Run --> Persist[Persist labels and centroids]
+    Persist --> GenCheck{Generation moved mid-run?}
+    GenCheck -->|yes| Abort[Rollback - discard stale labels]
+    GenCheck -->|no| Wipe[Wipe cluster-keyed state]
+    Wipe --> Stamp[Stamp pre-run baselines]
+```
+
+The threshold reuses the adaptive `min_cluster_size` that HDBSCAN itself runs
+with — no new constant:
+
+$$
+\mathrm{mcs} = \max\left(5, \frac{\min(n, n_{\text{cap}})}{50}\right)
+$$
+
+where `n` is the embedding row count and `n_cap` is the HDBSCAN load cap.
+Churn is measured on two signals, either of which opens the gate:
+
+- the absolute row-count delta since the last recluster (insertions and bulk
+  deletions), and
+- the delta of a monotonic `embedding_write_seq` counter bumped atomically
+  with every embedding write — this catches in-place re-embedding, where an
+  update replaces a vector under the same id and the row count never moves.
+
+Count-based triggers are the parameter-free member of the trigger taxonomy
+used by streaming clustering systems such as CluStream and DenStream [19, 20];
+drift-based triggers require a significance threshold, which Rein's
+zero-subjective-parameters rule forbids. An empty assignment map (bootstrap,
+post-reindex) bypasses the gate. Baselines are stamped with the pre-run
+values, so writes racing in during a cluster run still count toward the next
+gate. `migrate --reindex` rewrites every vector at an unchanged row count: the
+swap credits the write counter inside its own commit, the reset clears every
+cluster-derived surface fail-loud, and a generation re-check inside the
+recluster savepoint aborts any clustering run that raced the reindex on
+old-space vectors.
+
 ## Deduplication
 
 ```mermaid
@@ -542,6 +618,16 @@ cluster-aware thresholds, sqlite-vec or HNSW candidates, and a durable evidence
 ledger. In large unclustered buckets, ANN candidate generation avoids a full
 pairwise scan. Merges preserve novel facts instead of hard-deleting the loser.
 
+**Concept-level dedup (knowledge graph).** `store/memoir.rs` merges concept
+rows whose normalized names collide exactly. The surviving definition is the
+*most-supported* one — the definition carried by the row with the largest
+`source_memory_ids` count, with length only as the tie-break (v1.1; earlier
+versions kept the longest definition, which rewarded verbosity over
+evidence). Source ids and labels from all duplicates merge into the survivor.
+Semantic (non-exact-name) concept merging is deliberately not implemented: a
+wrong "same entity" verdict is irreversible, so it stays parked behind a
+reliable correctness proxy.
+
 ## Adaptive Learning
 
 `ops/adaptive.rs` orchestrates Rein's adaptive slow channel. It is event-sourced
@@ -578,9 +664,37 @@ $$
 
 The optimizer replays historical recall candidates against observed access
 events, then selects alpha values that would have ranked accessed memories
-higher. Learned values are bucketed by global, query type, and cluster context
-when enough samples exist. Updates are damped by `alpha_max_step` to avoid
-large jumps after a small feedback batch.
+higher. Learned values are bucketed by global, query type, and cluster
+context. Updates are damped by `alpha_max_step` to avoid large jumps after a
+small feedback batch.
+
+**Cumulative confidence under exponential forgetting (v1.1).** Feedback
+events are consumed once, and a single learning window rarely carries enough
+events for one `(query type, cluster)` bucket to reach the read-time
+confidence gate. Each bucket therefore accumulates an effective sample size
+across windows, decayed at exactly the rate the value estimator forgets:
+
+$$
+n_t = \left\lfloor n_{t-1} e^{-\lambda \Delta t} \right\rceil + n_{\text{window}},
+\qquad \lambda = 0.06\,/\,\text{day}
+$$
+
+where `Δt` is the time since the bucket was last updated and `λ` is the same
+decay rate the replay applies to individual events (half-life ≈ 11.6 days).
+Interpreting the decayed weight sum as an effective sample size is the
+standard construction in exponentially weighted estimation [21]; using the
+same `λ` for both keeps the stored confidence consistent with the
+decay-weighted value it backs — a raw running total would keep trusting
+evidence the estimator has already forgotten. The cumulative count feeds both
+the read gate and Bayesian shrinkage toward the parent bucket, so sparse
+windows (for example 3 + 3 + 4 events across three passes) accumulate instead
+of being discarded, while thin evidence keeps the value pinned to its parent
+until real confidence accrues. Per-window sample floors are gone from the
+write side entirely; `min_samples_alpha` now acts purely as the read-side
+confidence floor. The shadow fusion weight vectors accumulate the same way:
+the stored vector is the ESS-weighted blend of its history and the current
+window, so an eligible bucket can never carry a vector learned from only the
+last event.
 
 The ARS acceleration path also maintains shadow six-dimensional fusion weights
 for BM25, vector, graph, episode, support, and diversity signals. These weights

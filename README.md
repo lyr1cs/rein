@@ -32,9 +32,9 @@ For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README
 | **Unified operation registry** | One `#[op]` declaration drives CLI / MCP / REST surfaces (v0.21, A1). Inventory-based dispatch; zero hand-maintained lists. |
 | **Neural Wiki GUI** | React + Tailwind web dashboard with Brain View, Adaptive Engine, Knowledge Graph, Timeline, and more |
 | **Self-adaptive engine** | M1-M6: all learning loops closed — data drives fusion weights, decay curves, dedup thresholds, and tier boundaries |
-| **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights — global, per-query-type, and per-cluster (M2) |
+| **Counterfactual alpha learning** | Replays past recalls to find optimal CC fusion weights — global, per-query-type, and per-cluster; bucket confidence accumulates across learning windows as a decay-weighted effective sample size (M2, v1.1) |
 | **Per-cluster survival decay** | Kaplan-Meier curves replace fixed Ebbinghaus per-cluster; global prior bridges cold-start (M3) |
-| **HDBSCAN clustering** | Pure Rust semantic clustering with sampling for large datasets (M4) |
+| **HDBSCAN clustering** | Pure Rust semantic clustering with sampling for large datasets; churn-gated recluster cadence keeps cluster-scoped learning alive between runs (M4, v1.1) |
 | **Hot/Warm/Cold tiering** | Streaming quantile estimator + cold_archive migration (M5) |
 | **Adaptive dedup thresholds** | Per-cluster P90 similarity thresholds (SemDeDup-inspired, M6/A1) |
 | **Provenance-preserving dedup** | Merges preserve temporal anchors and unique details instead of hard-deleting |
@@ -42,7 +42,7 @@ For the full GitHub-ready manual, see [docs/manual/README.md](docs/manual/README
 | **Temporal knowledge graph** | Memoir / Concept / ConceptLink with 9 relation types, revision history, episode nodes, temporal validity windows, BFS traversal (skips expired links) |
 | **Autonomous retrieval routing** | Rule-based query classifier routes to 6 strategies: Episodic / Temporal / Preference / ExactKeyword / Semantic / Exploratory (zero LLM calls) |
 | **Query expansion** | LLM rewrites query into 2-3 variants (Gemini Flash Lite / OMLX); multi-query results merged before fusion |
-| **LLM reranker** | Optional Gemini / OMLX rescoring of top-N candidates; strong-signal bypass skips LLM when confidence is already high |
+| **LLM reranker** | Optional Gemini / OMLX reordering of top-N candidates via score-envelope-preserving permutation (only the LLM's order is used — existing scores are redistributed, zero scale constants, v1.1); strong-signal bypass skips LLM when confidence is already high |
 | **Maximal Marginal Relevance** | MMR post-rerank diversity pass — balances relevance and variety in final result set |
 | **OMLX local embedding** | Optional local embedding backend via EmbedderKind enum dispatch (Google / OMLX) |
 | **Dual-layer decay** | LTM / STM layers with KM survival curves (data-driven) or Ebbinghaus (cold-start) |
