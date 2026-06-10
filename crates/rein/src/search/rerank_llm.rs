@@ -239,7 +239,13 @@ pub fn rerank_with_llm(config: &ReinConfig, query: &str, candidates: &[(Memory, 
         if let Some(cached) = cache.get(&cache_k) {
             if cached.len() == top_n {
                 tracing::debug!("reranker cache hit");
-                let mut scores = cached;
+                // Cache holds RAW LLM scores: the envelope permutation must
+                // be recomputed against THIS call's linear scores — the same
+                // (query, ids) key can recur with a different score envelope
+                // once adaptive state moves, and caching reassigned scores
+                // would replay a stale envelope.
+                let existing: Vec<f32> = candidates[..top_n].iter().map(|(_, s)| *s).collect();
+                let mut scores = envelope_permuted_scores(&cached, &existing);
                 scores.extend(candidates[top_n..].iter().map(|(_, s)| *s));
                 return scores;
             }
@@ -261,20 +267,24 @@ pub fn rerank_with_llm(config: &ReinConfig, query: &str, candidates: &[(Memory, 
     };
 
     match result {
-        Ok(mut scores) => {
+        Ok(raw_scores) => {
             tracing::info!(
-                count = scores.len(),
+                count = raw_scores.len(),
                 elapsed_ms = rerank_start.elapsed().as_millis() as u64,
                 "llm reranked"
             );
-            // Scale LLM scores to [0, 2.0] to match linear reranker output range
-            for s in &mut scores {
-                *s *= 2.0;
-            }
-            // Store in cache (before appending tail scores)
+            // Store RAW LLM scores in cache (see cache-hit comment above).
             if let Ok(mut cache) = crate::search::cache::rerank_cache().lock() {
-                cache.put(cache_k, scores.clone());
+                cache.put(cache_k, raw_scores.clone());
             }
+            // Score-envelope-preserving permutation: only the LLM's ORDER is
+            // used — the candidates' existing scores are redistributed by
+            // that order. No scale bridge (the old `*2.0`), no alien score
+            // axis mixed into the post-collapse population, and a monotone
+            // rank→score mapping means the collapse-time max() picks the
+            // best LLM rank among raw duplicates.
+            let existing: Vec<f32> = candidates[..top_n].iter().map(|(_, s)| *s).collect();
+            let mut scores = envelope_permuted_scores(&raw_scores, &existing);
             // Append original scores for candidates beyond top_n
             scores.extend(candidates[top_n..].iter().map(|(_, s)| *s));
             scores
@@ -287,6 +297,50 @@ pub fn rerank_with_llm(config: &ReinConfig, query: &str, candidates: &[(Memory, 
             candidates.iter().map(|(_, s)| *s).collect()
         }
     }
+}
+
+/// Score-envelope-preserving permutation (2026-06-02 audit D-item, the
+/// param-free correction of the #24 listwise proposal): take the LLM's
+/// relevance ORDER and reassign the candidates' EXISTING scores by that
+/// order — LLM rank 1 receives the highest existing score, rank 2 the
+/// second highest, and so on.
+///
+/// Properties (all parameter-free):
+/// - zero constants: no scale bridge between the LLM's [0,1] and the linear
+///   reranker's axis — the output score multiset IS the input multiset, so
+///   reranked and non-reranked results stay on one comparable axis;
+/// - an identity ordering is an exact no-op;
+/// - the sort is stable on the original index, so a degenerate constant
+///   response ("all 0.8") ties everywhere and degrades to the identity —
+///   it can no longer flatten the ranking;
+/// - deriving the order from scores via sort ALWAYS yields a valid
+///   permutation (no duplicate / missing positions to reconcile, unlike a
+///   rank-list response protocol).
+///
+/// `llm_scores` and `existing` must be positionally aligned with the same
+/// candidate list. Mismatched lengths fall back to `existing` unchanged
+/// (defensive — `parse_rerank_response` already enforces the length).
+fn envelope_permuted_scores(llm_scores: &[f32], existing: &[f32]) -> Vec<f32> {
+    if llm_scores.len() != existing.len() {
+        return existing.to_vec();
+    }
+    let n = existing.len();
+    // Candidate indices ordered by LLM relevance (desc), stable by index.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        llm_scores[b]
+            .partial_cmp(&llm_scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    // The existing score envelope, best first.
+    let mut envelope: Vec<f32> = existing.to_vec();
+    envelope.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = vec![0.0f32; n];
+    for (rank, &candidate_idx) in order.iter().enumerate() {
+        out[candidate_idx] = envelope[rank];
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -524,5 +578,58 @@ mod tests {
         // Single positive score but too low → not a strong signal
         let ranked = vec![("a".to_string(), 1.5), ("b".to_string(), -1.0)];
         assert!(!detect_strong_signal(&ranked));
+    }
+
+    // ── Score-envelope-preserving permutation ────────────────────────────────
+
+    #[test]
+    fn envelope_permutation_reorders_existing_scores() {
+        // LLM says candidate 2 is best, then 1, then 0.
+        let llm = [0.1, 0.5, 0.9];
+        let existing = [0.8, 0.6, 0.2];
+        let out = envelope_permuted_scores(&llm, &existing);
+        // Envelope {0.8, 0.6, 0.2} redistributed: idx2→0.8, idx1→0.6, idx0→0.2.
+        assert_eq!(out, vec![0.2, 0.6, 0.8]);
+        // Score multiset preserved exactly — no alien scale enters.
+        let mut a = out.clone();
+        let mut b = existing.to_vec();
+        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn envelope_permutation_identity_is_noop() {
+        // LLM agrees with the existing order → exact no-op.
+        let llm = [0.9, 0.5, 0.1];
+        let existing = [0.8, 0.6, 0.2];
+        assert_eq!(envelope_permuted_scores(&llm, &existing), existing.to_vec());
+    }
+
+    #[test]
+    fn envelope_permutation_constant_response_is_noop() {
+        // Degenerate "all 0.8" LLM response: ties everywhere → stable sort
+        // keeps the original index order → identity. The old `*2.0` path
+        // would have flattened every score to 1.6.
+        let llm = [0.8, 0.8, 0.8, 0.8];
+        let existing = [0.9, 0.7, 0.4, 0.1];
+        assert_eq!(envelope_permuted_scores(&llm, &existing), existing.to_vec());
+    }
+
+    #[test]
+    fn envelope_permutation_length_mismatch_falls_back() {
+        let llm = [0.9, 0.1];
+        let existing = [0.8, 0.6, 0.2];
+        assert_eq!(envelope_permuted_scores(&llm, &existing), existing.to_vec());
+    }
+
+    #[test]
+    fn envelope_permutation_handles_duplicate_existing_scores() {
+        // Duplicate envelope values stay duplicated; best LLM rank still
+        // receives the top value.
+        let llm = [0.2, 0.9, 0.4];
+        let existing = [0.5, 0.5, 0.3];
+        let out = envelope_permuted_scores(&llm, &existing);
+        assert_eq!(out, vec![0.3, 0.5, 0.5]);
     }
 }

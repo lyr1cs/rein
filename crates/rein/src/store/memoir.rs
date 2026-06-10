@@ -674,10 +674,24 @@ impl SqliteStore {
                 // Merge source_memory_ids and labels from dupes into canonical
                 let mut merged_sources: Vec<String> = canonical.source_memory_ids.clone();
                 let mut merged_labels: Vec<String> = canonical.labels.clone();
-                // Pick the longest definition as canonical
+                // Pick the MOST-SUPPORTED definition (#21 sub-goal, 2026-06-02
+                // audit D-item): support = how many memories back the concept
+                // row carrying the definition (`source_memory_ids.len()`,
+                // pre-merge). "Longest" rewarded verbosity — a thin one-off
+                // row with a wordy definition outranked an entrenched
+                // multi-source one. Ties fall back to length, then to the
+                // canonical (oldest) row. Zero thresholds.
                 let mut best_def = canonical.definition.clone();
+                let mut best_support = canonical.source_memory_ids.len();
 
                 for dupe in dupes {
+                    let dupe_support = dupe.source_memory_ids.len();
+                    if dupe_support > best_support
+                        || (dupe_support == best_support && dupe.definition.len() > best_def.len())
+                    {
+                        best_def = dupe.definition.clone();
+                        best_support = dupe_support;
+                    }
                     for sid in &dupe.source_memory_ids {
                         if !merged_sources.contains(sid) {
                             merged_sources.push(sid.clone());
@@ -687,9 +701,6 @@ impl SqliteStore {
                         if !merged_labels.contains(label) {
                             merged_labels.push(label.clone());
                         }
-                    }
-                    if dupe.definition.len() > best_def.len() {
-                        best_def = dupe.definition.clone();
                     }
                 }
 
@@ -2158,6 +2169,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(canonical.definition, "The engine v2 longer def");
+    }
+
+    /// #21 sub-goal (2026-06-02 audit D-item) — the surviving definition is
+    /// the MOST-SUPPORTED one, not the longest: a verbose one-off row must
+    /// not outrank an entrenched multi-source definition. (When support
+    /// ties — like the legacy test above where every row has zero
+    /// sources — length remains the tie-break.)
+    #[test]
+    fn test_dedup_concepts_keeps_most_supported_definition() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .create_memoir(make_memoir("arch", "Architecture"))
+            .unwrap();
+
+        let mut entrenched = make_concept("arch", "HNSW Index", "short but well-supported");
+        entrenched.source_memory_ids = vec!["m1".into(), "m2".into(), "m3".into()];
+        store.add_concept(entrenched).unwrap();
+
+        let mut verbose = make_concept(
+            "arch",
+            "hnsw-index",
+            "a much longer yet thinly supported definition of the very same concept",
+        );
+        verbose.source_memory_ids = vec!["m4".into()];
+        store.add_concept(verbose).unwrap();
+
+        let (groups, removed) = store.dedup_concepts().unwrap();
+        assert_eq!((groups, removed), (1, 1));
+
+        let canonical = store.get_concept("arch", "HNSW Index").unwrap().unwrap();
+        assert_eq!(
+            canonical.definition, "short but well-supported",
+            "3-source definition must beat the 1-source longer one"
+        );
+        // Sources from both rows still merge into the survivor.
+        assert_eq!(canonical.source_memory_ids.len(), 4);
     }
 
     // ── v0.24 ARS — Concept Living Summary refresh trigger tests ──────────────
