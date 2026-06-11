@@ -663,6 +663,33 @@ pub struct LearnedAlphaEntry {
     pub last_updated: String, // RFC3339
 }
 
+/// v1.2 audit F12 + codex R10: CAS-merge dominance rule for learned entries.
+///
+/// Timestamp LWW. The audit-F12 hazard (a fold based on a STALE prior
+/// overwriting a peer's durable fold while the watermarks advance) is closed
+/// at its ROOT by the cross-process single-flight lock on
+/// `run_adaptive_pipeline` (ops/adaptive.rs) — the only producer of these
+/// entries — so two concurrent folds can no longer exist. An interim
+/// "higher-ESS-wins" rule was tried and rejected (codex R10): sample_count
+/// is a DECAYED effective sample size, not a monotonic event count, so after
+/// an idle period a fresh fold can legitimately carry a LOWER ESS than the
+/// stale stored entry and would have been dropped while its events were
+/// marked consumed. With single-flight folding, a version conflict here can
+/// only come from a non-folding writer (whose snapshot carries the OLD
+/// entry, hence an older timestamp), and newest-fold-wins is correct.
+fn alpha_entry_dominates(theirs: &LearnedAlphaEntry, ours: &LearnedAlphaEntry) -> bool {
+    theirs.last_updated >= ours.last_updated
+}
+
+/// See [`alpha_entry_dominates`] — same rule for the six-dimensional fusion
+/// entries.
+fn shadow_entry_dominates(
+    theirs: &LearnedShadowFusionEntry,
+    ours: &LearnedShadowFusionEntry,
+) -> bool {
+    theirs.last_updated >= ours.last_updated
+}
+
 /// Six-dimensional ARS fusion weights persisted in [`AdaptiveState`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ShadowFusionWeightEntry {
@@ -912,7 +939,13 @@ impl AdaptiveState {
         cluster_id: Option<u32>,
         min_sample_count: usize,
     ) -> Option<&LearnedShadowFusionEntry> {
-        let eligible = |entry: &&LearnedShadowFusionEntry| entry.sample_count >= min_sample_count;
+        // v1.2 audit F26: same evidence floor as get_alpha — the config knob
+        // is a LEARN-window parameter (tests set it to 1); without the floor,
+        // fusion weights learned from a single recall event (averaged simplex
+        // corners — extreme vectors) became servable, the exact near-zero-
+        // evidence activation the get_alpha floor was added to prevent.
+        let floor = min_sample_count.max(10);
+        let eligible = |entry: &&LearnedShadowFusionEntry| entry.sample_count >= floor;
         let legacy_key = query_type.to_string();
         if let Some(cluster) = cluster_id {
             let key = Self::bucket_key(query_type, Some(cluster));
@@ -1121,13 +1154,10 @@ impl AdaptiveState {
                             if !key.contains(':') {
                                 continue;
                             }
-                            let dominated =
-                                current
-                                    .learned_shadow_fusion
-                                    .get(key)
-                                    .is_some_and(|theirs| {
-                                        theirs.last_updated >= our_entry.last_updated
-                                    });
+                            let dominated = current
+                                .learned_shadow_fusion
+                                .get(key)
+                                .is_some_and(|theirs| shadow_entry_dominates(theirs, our_entry));
                             if !dominated {
                                 current
                                     .learned_shadow_fusion
@@ -1143,9 +1173,10 @@ impl AdaptiveState {
                             if !key.contains(':') {
                                 continue;
                             }
-                            let dominated = current.learned_alpha.get(key).is_some_and(|theirs| {
-                                theirs.last_updated >= our_entry.last_updated
-                            });
+                            let dominated = current
+                                .learned_alpha
+                                .get(key)
+                                .is_some_and(|theirs| alpha_entry_dominates(theirs, our_entry));
                             if !dominated {
                                 current.learned_alpha.insert(key.clone(), our_entry.clone());
                             }
@@ -1154,7 +1185,8 @@ impl AdaptiveState {
                     // else: case 3 — drop our stale-generation cluster state,
                     // keep theirs (codex R3 P2; rationale in the header above).
 
-                    // Merge learned_alpha (non-cluster keys): prefer newer timestamp
+                    // Merge learned_alpha (non-cluster keys): prefer the
+                    // entry carrying more evidence (see *_entry_dominates).
                     for (key, our_entry) in &self.learned_alpha {
                         if key.contains(':') {
                             continue; // handled above based on cluster_version
@@ -1162,13 +1194,13 @@ impl AdaptiveState {
                         let dominated = current
                             .learned_alpha
                             .get(key)
-                            .is_some_and(|theirs| theirs.last_updated >= our_entry.last_updated);
+                            .is_some_and(|theirs| alpha_entry_dominates(theirs, our_entry));
                         if !dominated {
                             current.learned_alpha.insert(key.clone(), our_entry.clone());
                         }
                     }
                     // Merge ARS six-dimensional fusion weights (non-cluster
-                    // keys): prefer newer timestamp, mirroring learned_alpha.
+                    // keys): same evidence-first rule, mirroring learned_alpha.
                     for (key, our_entry) in &self.learned_shadow_fusion {
                         if key.contains(':') {
                             continue; // handled above based on cluster_version
@@ -1176,7 +1208,7 @@ impl AdaptiveState {
                         let dominated = current
                             .learned_shadow_fusion
                             .get(key)
-                            .is_some_and(|theirs| theirs.last_updated >= our_entry.last_updated);
+                            .is_some_and(|theirs| shadow_entry_dominates(theirs, our_entry));
                         if !dominated {
                             current
                                 .learned_shadow_fusion

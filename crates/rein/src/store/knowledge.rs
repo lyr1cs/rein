@@ -539,6 +539,19 @@ impl SqliteStore {
                     // also reverts the embedding removal. Ghost embedding
                     // would surface old content from the vector channel.
                     crate::store::vec::delete_embedding(&self.conn, &old.id)?;
+                    // v1.2 audit F13: invalidate the cold_archive fallback —
+                    // the missing companion to update()'s content-change
+                    // DELETE (sqlite.rs R7/R10 F1). Without it the archive
+                    // keeps the PRE-refine body: Cap C's attempt_one prefers
+                    // cold_archive.content, so the regeneration this UPDATE
+                    // just requested would summarize stale text forever, and
+                    // the M5 re-INSERT guard (id NOT IN cold_archive) would
+                    // never archive the refined body before the strip cuts
+                    // content down to its summary.
+                    self.conn.execute(
+                        "DELETE FROM cold_archive WHERE memory_id = ?1",
+                        rusqlite::params![old.id],
+                    )?;
                     refined_records.push(RefinedRecord {
                         id: old.id.clone(),
                         topic: old.topic.clone(),

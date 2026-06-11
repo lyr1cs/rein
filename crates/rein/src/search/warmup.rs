@@ -245,21 +245,53 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
         }
     };
 
-    // Stream memories and their cached embeddings directly into the
-    // HNSW index. F6 D-M3: peak heap is now one `WarmupRow` instead of
-    // a Vec of the entire `memories` table.
+    // Stream memories and their embeddings directly into the HNSW index.
+    // F6 D-M3: peak heap is now one `WarmupRow` instead of a Vec of the
+    // entire `memories` table.
+    //
+    // v1.2 audit F11/F14: EmbedCache is a bounded LRU (10k entries) — on
+    // stores past the cap, and after `rein migrate --reindex` (which wipes
+    // the cache and fills only vec_memories), a cache-only rebuild silently
+    // truncated the index (or hit the 0-insert dead end in a permanent
+    // .dirty loop) while being promoted as healthy. vec_memories is the
+    // AUTHORITATIVE durable vector store — fall back to it per row; the
+    // cache remains the fast path (no per-row text hashing when warm).
     let mut inserted = 0usize;
     let mut total_rows = 0usize;
+    let mut skipped_no_vector = 0usize;
     let stream_result = store.for_each_for_warmup(|row| {
         total_rows += 1;
         let text = prepend_metadata(&row.topic, &row.summary, &row.content);
-        if let Ok(Some(emb)) = EmbedCache::get(store.conn(), &text, &model) {
-            if emb.len() == dims && index.insert(&row.id, &emb).is_ok() {
-                inserted += 1;
+        let emb = match EmbedCache::get(store.conn(), &text, &model) {
+            Ok(Some(emb)) => Some(emb),
+            _ => crate::store::vec::get_embedding(store.conn(), &row.id)
+                .ok()
+                .flatten(),
+        };
+        match emb {
+            Some(emb) if emb.len() == dims => {
+                if index.insert(&row.id, &emb).is_ok() {
+                    inserted += 1;
+                }
+            }
+            _ => {
+                skipped_no_vector += 1;
             }
         }
         Ok(())
     });
+    if skipped_no_vector > 0 {
+        // No silent caps: rows without any stored vector (never embedded)
+        // are expected on partially-warmed stores, but the count must be
+        // visible — a large number here means the vector channel is serving
+        // a materially incomplete index.
+        tracing::warn!(
+            inserted,
+            skipped_no_vector,
+            total_rows,
+            "hnsw rebuild: some memories have no stored embedding (cache miss + no vec_memories row)"
+        );
+    }
     if let Err(e) = stream_result {
         tracing::warn!("hnsw: failed to list memories: {e}");
         // v0.30.3 codex R11 P2: mirror the tantivy path — when streaming

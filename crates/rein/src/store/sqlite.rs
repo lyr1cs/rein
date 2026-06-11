@@ -1747,6 +1747,17 @@ impl SqliteStore {
             result
         };
 
+        // v1.2 audit F28 / codex remediation R1 P2: reference scrubbing runs
+        // BEFORE the DELETE — clean_memory_refs splices supersede chains by
+        // reading the victim's own superseded_by, which requires the row to
+        // still exist (mirrors delete()'s clean-then-delete order).
+        for id in &ids {
+            if let Err(e) = clean_memory_refs(&self.conn, id) {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+
         let rows = self.conn.execute(
             "DELETE FROM memories WHERE layer = 'STM' AND strength < ?1
              AND importance NOT IN ('critical', 'high')",
@@ -1798,6 +1809,11 @@ impl SqliteStore {
                     }
                 }
             }
+
+            // (v1.2 audit F28: full reference scrubbing — including chain
+            // splicing — runs via clean_memory_refs BEFORE the DELETE above;
+            // this batched concepts pass remains as the fast path and is
+            // idempotent with it.)
         }
 
         self.conn.execute_batch("COMMIT")?;
@@ -1989,7 +2005,17 @@ impl SqliteStore {
                                                 updated.keywords.push(kw.clone());
                                             }
                                         }
-                                        let _ = self.update(&updated);
+                                        // v1.2 audit F15: propagate the update
+                                        // failure — `let _ =` silently dropped
+                                        // the incoming content (the synthesis
+                                        // was never applied, the new memory
+                                        // never stored anywhere) while the
+                                        // caller saw Ok(candidate_id) and a
+                                        // dedup_decisions 'update' row
+                                        // committed FALSE provenance. `?`
+                                        // rolls back the whole decision, like
+                                        // the mechanical MergeInto path.
+                                        self.update(&updated)?;
                                     } else {
                                         // Existing memory vanished between snapshot and write;
                                         // fall through to mechanical merge to stay safe.
@@ -2431,6 +2457,19 @@ impl SqliteStore {
                     existing.strength = (existing.strength + 0.2).min(1.0);
                     existing.updated_at = chrono::Utc::now();
                     self.update(&existing)?;
+                    // v1.2 audit F16: re-flag the WINNER for the deferred
+                    // re-embed sweep. update() above ran with embedding=None
+                    // and an enriched text that can never hit the exact-key
+                    // EmbedCache, so it deleted the vec row and evicted the
+                    // canonical from HNSW; without this flag nothing ever
+                    // re-embeds it (run_vec_dedup scans needs_vec_dedup=1
+                    // only, and stdio deployments never run warmup) — the
+                    // highest-evidence memory silently vanished from the
+                    // vector channel. Mirrors the CreateNew/Supersede flags.
+                    let _ = self.conn.execute(
+                        "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                        rusqlite::params![&existing_id],
+                    );
                     let _ = self.snapshot_memory_as_evidence(&canonical_id, &memory);
                     let _ = self.record_dedup_decision(DedupDecision {
                         id: String::new(),
@@ -3068,6 +3107,98 @@ pub(super) fn clean_memory_refs(conn: &Connection, memory_id: &str) -> ReinResul
              WHERE memory_ids LIKE ?2",
             rusqlite::params![memory_id, like],
         )?;
+    }
+
+    // v1.2 audit F27: un-strand superseded predecessors. `superseded_by` has
+    // no FK (so no ON DELETE SET NULL); deleting a supersede TIP left its
+    // losers pointing at a nonexistent id forever — status='active' rows that
+    // `collapse_to_canonicals` drops (superseded_by not NULL) and that no
+    // sweeper ever repairs: permanently invisible zombies occupying index
+    // slots.
+    //
+    // codex remediation R1 P2: SPLICE the chain, don't blanket-NULL. The
+    // victim row still exists here (callers run clean_memory_refs BEFORE the
+    // DELETE), so re-point predecessors to the victim's OWN successor:
+    //   - victim is a chain MIDDLE (A→B→C, deleting B): A.superseded_by := C
+    //     — A stays collapsed to the live canonical instead of resurrecting
+    //     as a stale duplicate of C;
+    //   - victim is the TIP (successor NULL): predecessors get NULL — the
+    //     loser's full row is the only remaining representation of its
+    //     content, so resurrecting it is the correct outcome.
+    let victim_successor: Option<String> = conn
+        .query_row(
+            "SELECT superseded_by FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+    conn.execute(
+        "UPDATE memories SET superseded_by = ?2 WHERE superseded_by = ?1",
+        rusqlite::params![memory_id, victim_successor],
+    )?;
+
+    // codex remediation R4 P2: repair `memory_canonical_state` for every row
+    // whose canonical pointer targets the victim — BEFORE the delete, whose
+    // FK (`ON DELETE SET NULL`) would otherwise erase the linkage and leave
+    // transitive predecessors invisible: with canonical_id NULL,
+    // `canonical_id_for(A)` resolves to A itself while A's `superseded_by`
+    // still marks it dead, so recall collapse drops it forever. Re-derive
+    // each affected row's canonical from the POST-SPLICE `superseded_by`
+    // chain (the ground-truth lineage): walk to the live end, skipping the
+    // victim; landing on self means the row is now its own tip (NULL).
+    {
+        let affected: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT memory_id FROM memory_canonical_state WHERE canonical_id = ?1")?;
+            let rows = stmt
+                .query_map(rusqlite::params![memory_id], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        for mid in affected {
+            let mut cur = mid.clone();
+            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+            visited.insert(cur.clone());
+            loop {
+                let next: Option<String> = conn
+                    .query_row(
+                        "SELECT superseded_by FROM memories WHERE id = ?1",
+                        rusqlite::params![cur],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(None);
+                match next {
+                    // Chain end, the victim itself (about to be deleted), a
+                    // dangling pointer, or a cycle — stop at `cur`.
+                    Some(n) if n != memory_id && visited.insert(n.clone()) => {
+                        // Only advance onto rows that actually exist.
+                        let exists: bool = conn
+                            .query_row(
+                                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
+                                rusqlite::params![n],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(false);
+                        if !exists {
+                            break;
+                        }
+                        cur = n;
+                    }
+                    _ => break,
+                }
+            }
+            // codex R6 P2: a row that is now its own tip gets its OWN id —
+            // not NULL. `canonical_id_for` would COALESCE either way, but
+            // maintenance paths identify canonicals via
+            // `cs.canonical_id = m.id` (resummarize eligibility, canonical
+            // length stats), and a NULL pointer would exclude the
+            // resurrected memory from them.
+            conn.execute(
+                "UPDATE memory_canonical_state SET canonical_id = ?2 WHERE memory_id = ?1",
+                rusqlite::params![mid, cur],
+            )?;
+        }
     }
 
     Ok(())

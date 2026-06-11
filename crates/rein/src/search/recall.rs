@@ -653,6 +653,24 @@ pub fn recall_temporal_with_request_id(
     // dropped by the collapse terminal guard, so counting it here would let the
     // bypass skip KG/SM and then under-fill. Apply the same `is_live_canonical`
     // check against the fetched tip (reusing the raw row when it *is* the tip).
+    // codex remediation R9 P2: keyword survival is decided at the CANONICAL
+    // TIP — the collapsed tip is what recall actually returns (and what the
+    // R8 post-collapse retain filters), so counting a keyword-matching
+    // predecessor whose live tip does NOT match would let the bypass skip
+    // KG/Supermemory and then under-fill.
+    let tip_matches_keyword = |raw: &Memory, tip_mem: &Memory| -> bool {
+        match keyword {
+            None => true,
+            Some(kw) => {
+                let kw_lower = kw.to_lowercase();
+                let m = if tip_mem.id == raw.id { raw } else { tip_mem };
+                m.keywords
+                    .iter()
+                    .any(|k| k.to_lowercase().contains(&kw_lower))
+                    || m.content.to_lowercase().contains(&kw_lower)
+            }
+        }
+    };
     let surviving_local = {
         let mut canonicals = std::collections::HashSet::new();
         for m in &fts_results {
@@ -667,15 +685,15 @@ pub fn recall_temporal_with_request_id(
                 let tip = store
                     .canonical_id_for(&m.id)
                     .unwrap_or_else(|_| m.id.clone());
-                let tip_is_live = if tip == m.id {
-                    is_live_canonical(m)
+                let (tip_is_live, tip_kw_ok) = if tip == m.id {
+                    (is_live_canonical(m), tip_matches_keyword(m, m))
                 } else {
-                    store
-                        .get(&tip)
-                        .map(|t| is_live_canonical(&t))
-                        .unwrap_or(false)
+                    match store.get(&tip) {
+                        Ok(t) => (is_live_canonical(&t), tip_matches_keyword(m, &t)),
+                        Err(_) => (false, false),
+                    }
                 };
-                if tip_is_live {
+                if tip_is_live && tip_kw_ok {
                     canonicals.insert(tip);
                 }
             }
@@ -1069,7 +1087,12 @@ pub fn recall_temporal_with_request_id(
 
     // === Phase 2: Join expansion thread, search with expanded queries, merge ===
     // Skip entirely if strong signal detected (BM25 top1 is dominant, expansion won't help)
-    let expanded_queries = if strong_signal {
+    // — UNLESS the caller explicitly forced expansion (v1.2 audit F25): the
+    // documented contract is `Some(true)` FORCES expansion, and `should_expand`
+    // honored it by spawning the thread; discarding the result here turned an
+    // explicit user `expand: true` into a silent no-op (plus a wasted LLM call)
+    // exactly when the strong-signal heuristic fired.
+    let expanded_queries = if strong_signal && expand_override != Some(true) {
         tracing::info!("strong signal — skipping expanded query searches");
         // Signal the expansion thread to skip the LLM API call if it hasn't started yet.
         cancel_expand.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1725,10 +1748,66 @@ pub fn recall_temporal_with_request_id(
         tracing::debug!(cold_filtered, "cold tier memories excluded pre-take");
     }
 
+    // v1.2 audit F10: apply the keyword filter BEFORE the take window, same
+    // rationale as the cold-tier filter above — keyword-failing rows in the
+    // top 2N used to consume take slots and were dropped only after the cut,
+    // so the post-collapse local set could fall below `limit` even though
+    // surviving candidates ranked just beyond the window (and the
+    // strong-signal bypass had already skipped KG/Supermemory on the promise
+    // that local hits satisfy the request).
+    // codex R12 P2: the filter decides eligibility at the CANONICAL TIP, not
+    // the raw row — superseded rows are intentionally kept in `memory_map`
+    // for the collapse, and a predecessor whose own text lacks the keyword
+    // can map to a live tip that matches (the collapse would surface the
+    // tip). Dropping the raw row here would silently lose that tip.
+    let fused: Vec<(String, f32)> = if let Some(kw) = keyword {
+        let kw_lower = kw.to_lowercase();
+        let kw_matches = |m: &Memory| {
+            m.keywords
+                .iter()
+                .any(|k| k.to_lowercase().contains(&kw_lower))
+                || m.content.to_lowercase().contains(&kw_lower)
+        };
+        fused
+            .into_iter()
+            .filter(|(id, _)| {
+                let Some(raw) = memory_map.get(id) else {
+                    return true;
+                };
+                let tip = store.canonical_id_for(id).unwrap_or_else(|_| id.clone());
+                if tip == *id {
+                    return kw_matches(raw);
+                }
+                if let Some(tip_mem) = memory_map.get(&tip) {
+                    return kw_matches(tip_mem);
+                }
+                match store.get(&tip) {
+                    Ok(t) => kw_matches(&t),
+                    // Tip unreadable — fall back to the raw row's own match
+                    // (conservative: keeps the slot for the collapse to
+                    // resolve).
+                    Err(_) => kw_matches(raw),
+                }
+            })
+            .collect()
+    } else {
+        fused
+    };
+
     let has_temporal = time_from.is_some() || time_to.is_some();
     let take_count = if has_temporal { usize::MAX } else { limit * 2 };
     let mut local_results: Vec<(Memory, f32)> = Vec::new();
-    for (id, rrf_score) in fused.into_iter().take(take_count) {
+    // v1.2 audit F10 (second half): the take window is canonical-collapse
+    // aware. A fixed `limit * 2` raw-row cut could be consumed by superseded
+    // rows collapsing to the SAME canonical, under-filling the post-collapse
+    // set. Keep admitting (beyond take_count) until the admitted rows cover
+    // `limit` distinct live canonical tips — the same count the
+    // strong-signal completeness guard promises — or the fused list ends.
+    let mut admitted_tips: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (id, rrf_score) in fused.into_iter() {
+        if local_results.len() >= take_count && admitted_tips.len() >= limit {
+            break;
+        }
         if let Some(memory) = memory_map.remove(&id) {
             // Temporal filter: skip memories outside the requested time range
             if let Some(from) = time_from {
@@ -1740,6 +1819,29 @@ pub fn recall_temporal_with_request_id(
                 if memory.created_at > to {
                     continue;
                 }
+            }
+            let tip = store
+                .canonical_id_for(&memory.id)
+                .unwrap_or_else(|_| memory.id.clone());
+            // codex R9 P2: count a tip only when it is live AND (for keyword
+            // searches) the TIP itself matches the keyword — that is the set
+            // the R8 post-collapse retain ultimately keeps, so the admission
+            // loop keeps pulling until enough RETAINABLE canonicals are in
+            // the window instead of stopping on predecessors whose tips get
+            // filtered out later.
+            let (tip_is_live, tip_kw_ok) = if tip == memory.id {
+                (
+                    is_live_canonical(&memory),
+                    tip_matches_keyword(&memory, &memory),
+                )
+            } else {
+                match store.get(&tip) {
+                    Ok(t) => (is_live_canonical(&t), tip_matches_keyword(&memory, &t)),
+                    Err(_) => (false, false),
+                }
+            };
+            if tip_is_live && tip_kw_ok {
+                admitted_tips.insert(tip);
             }
             // Use per-cluster survival curve if available (M3), else global prior, else Ebbinghaus
             let curve = memory
@@ -1914,16 +2016,9 @@ pub fn recall_temporal_with_request_id(
         None
     };
 
-    // === Optional keyword filter ===
-    if let Some(kw) = keyword {
-        let kw_lower = kw.to_lowercase();
-        local_results.retain(|(m, _)| {
-            m.keywords
-                .iter()
-                .any(|k| k.to_lowercase().contains(&kw_lower))
-                || m.content.to_lowercase().contains(&kw_lower)
-        });
-    }
+    // Keyword filtering moved BEFORE the take window (v1.2 audit F10) — every
+    // row in `local_results` already passed it; external channels apply it
+    // via `matches_external_filters` below.
 
     // === Cross-validation (if enabled) ===
     // Supermemory search was launched at pipeline start (sm_handle); join it here.
@@ -1975,6 +2070,21 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     results = collapse_results_to_canonicals(store, results)?;
+    // codex remediation R8 P2: re-assert the keyword filter on the COLLAPSED
+    // canonicals. The pre-take filter (audit F10) evaluates raw rows for slot
+    // economy, but a superseded predecessor can match the keyword while its
+    // live canonical tip does not — without this retain, recall would return
+    // a tip that violates the requested filter.
+    if let Some(kw) = keyword {
+        let kw_lower = kw.to_lowercase();
+        results.retain(|r| {
+            r.memory
+                .keywords
+                .iter()
+                .any(|k| k.to_lowercase().contains(&kw_lower))
+                || r.memory.content.to_lowercase().contains(&kw_lower)
+        });
+    }
     apply_evidence_rerank(store, query, &mut results, 3);
 
     sort_recall_results(&mut results);

@@ -269,6 +269,55 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         return;
     }
 
+    // codex remediation R10 P2 (root cause of audit F12): SINGLE-FLIGHT the
+    // pipeline across processes. Two overlapping passes against the same DB
+    // are the only way two learned-alpha/shadow-fusion folds can conflict —
+    // and no CAS-merge dominance rule can arbitrate them correctly, because
+    // a fold's entry fields (decayed ESS, timestamp) cannot encode which
+    // event windows it incorporated: timestamp-LWW drops the slower writer's
+    // durable window (F12), while evidence-first keeps stale high-ESS
+    // entries over fresh post-idle folds whose ESS legitimately decayed
+    // lower (this round). With the flock held for the whole pass, a peer
+    // process skips instead of folding concurrently — its events stay
+    // unconsumed for the next cycle, so nothing is lost.
+    // In-memory DBs are process-private — no cross-process peer can exist,
+    // and a lock file would pollute the CWD in tests.
+    let is_memory_db = store.db_path().to_str() == Some(":memory:");
+    let pipeline_lock_path = store.db_path().with_extension("adaptive_pipeline.lock");
+    let pipeline_lock = if is_memory_db {
+        None
+    } else {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&pipeline_lock_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!(
+                    "adaptive pipeline: cannot open single-flight lock ({e}); skipping pass"
+                );
+                return;
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                tracing::info!(
+                    "adaptive pipeline: another pass is running (single-flight); skipping"
+                );
+                return;
+            }
+        }
+        Some(file)
+    };
+    // Held until it drops at the end of this function.
+    let _pipeline_lock = pipeline_lock;
+
     let _span = tracing::info_span!("adaptive_pipeline").entered();
 
     // Restore or create AdaptiveState
@@ -750,10 +799,11 @@ fn refresh_ars_parameter_policy(
         return;
     }
 
+    // codex R11 P2: same effective floor as the runtime read gates.
     let eligible_shadow_fusion = state
         .learned_shadow_fusion
         .values()
-        .any(|entry| entry.sample_count >= config.adaptive.min_samples_alpha);
+        .any(|entry| entry.sample_count >= config.adaptive.min_samples_alpha.max(10));
     // v0.28.7 H2 — drift alerts force Shadow demotion. Mirror of v0.27.1
     // J-invariant fail-closed pattern: any drift signal (cross-surface or
     // per-surface) demotes Canary back to Shadow so the bad parameter
@@ -901,17 +951,23 @@ fn max_runtime_adoption_target(
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
 ) -> Option<f64> {
+    // codex R11 P2: same effective floor as the runtime read gates.
     let max_samples = state
         .learned_shadow_fusion
         .values()
-        .filter(|entry| entry.sample_count >= config.adaptive.min_samples_alpha)
+        .filter(|entry| entry.sample_count >= config.adaptive.min_samples_alpha.max(10))
         .map(|entry| entry.sample_count)
         .max()?;
     runtime_adoption_target(config, max_samples)
 }
 
 fn runtime_adoption_target(config: &ReinConfig, sample_count: usize) -> Option<f64> {
-    if sample_count < config.adaptive.min_samples_alpha {
+    // v1.2 audit F26: floor at 10, mirroring the get_alpha /
+    // get_shadow_fusion_weights read gates — min_samples_alpha is a
+    // learn-window knob, and without the floor a config of 1 would
+    // auto-promote the parameter policy toward live adoption on
+    // single-event evidence.
+    if sample_count < config.adaptive.min_samples_alpha.max(10) {
         return None;
     }
     let samples = sample_count as f64;
@@ -1552,10 +1608,14 @@ fn run_tiering(
     // so re-runs are no-ops. Pre-existing archived-but-not-yet-stripped
     // rows are picked up automatically.
     {
-        let archived_ids: Vec<String> = store
+        // v1.2 audit F6: capture the RAW updated_at alongside each eligible id
+        // — it is the CAS token for the strip UPDATE below. Any peer write
+        // (rein_update et al.) bumps updated_at, so the strip can never apply
+        // over content it did not snapshot.
+        let archived_ids: Vec<(String, String)> = store
             .conn()
             .prepare(
-                "SELECT ca.memory_id FROM cold_archive ca
+                "SELECT ca.memory_id, m.updated_at FROM cold_archive ca
 	                 JOIN memories m ON m.id = ca.memory_id
 	                 WHERE m.status IN ('active', 'updated')
 	                   AND m.superseded_by IS NULL
@@ -1566,7 +1626,7 @@ fn run_tiering(
             )
             .ok()
             .and_then(|mut stmt| {
-                stmt.query_map([], |row| row.get(0))
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                     .ok()
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
             })
@@ -1576,13 +1636,18 @@ fn run_tiering(
         // to Tantivy/HNSW post-COMMIT (external side-indexes must not be
         // updated inside the DB transaction — a COMMIT failure would leave
         // side-indexes reflecting state the DB never committed).
-        let strip_targets: Vec<(String, String, String)> = archived_ids
+        let strip_targets: Vec<(String, String, String, String)> = archived_ids
             .iter()
-            .filter_map(|aid| {
+            .filter_map(|(aid, updated_at_raw)| {
                 store.get(aid).ok().map(|mem| {
                     let keywords_json =
                         serde_json::to_string(&mem.keywords).unwrap_or_else(|_| "[]".to_string());
-                    (aid.clone(), mem.topic.clone(), keywords_json)
+                    (
+                        aid.clone(),
+                        updated_at_raw.clone(),
+                        mem.topic.clone(),
+                        keywords_json,
+                    )
                 })
             })
             .collect();
@@ -1598,16 +1663,29 @@ fn run_tiering(
             // guards so a concurrent write that changed a row's status between
             // the SELECT and this UPDATE will cause `affected == 0` and the
             // row is safely skipped.
+            //
+            // v1.2 audit F6 (Medium): the guards above were NOT sufficient —
+            // a peer rein_update commits new content C' with status
+            // active→updated (still in the accepted set), tier untouched,
+            // and DELETEs the cold_archive fallback; `SET content = summary`
+            // then truncated the user's fresh C' to its 240-char summary
+            // with no recovery copy anywhere. The updated_at CAS (every
+            // update() bumps it) plus re-asserted eligibility predicates
+            // make the strip apply only to the exact row state snapshotted.
             let mut applied: Vec<(String, String, String)> = Vec::new();
-            for (aid, topic, keywords_json) in &strip_targets {
+            for (aid, updated_at_raw, topic, keywords_json) in &strip_targets {
                 let affected = match store.conn().execute(
                     "UPDATE memories
                      SET content = summary
                      WHERE id = ?1
+                       AND updated_at = ?2
                        AND superseded_by IS NULL
                        AND status IN ('active', 'updated')
-                       AND tier = 'cold'",
-                    rusqlite::params![aid],
+                       AND tier = 'cold'
+                       AND content != summary
+                       AND strength < 0.3
+                       AND access_count = 0",
+                    rusqlite::params![aid, updated_at_raw],
                 ) {
                     Ok(n) => n,
                     Err(e) => {
@@ -2421,7 +2499,10 @@ fn compute_shadow_fusion_weight_replay(
 }
 
 pub fn shadow_fusion_status(store: &SqliteStore, config: &ReinConfig) -> serde_json::Value {
-    let min_samples = config.adaptive.min_samples_alpha;
+    // codex R11 P2: same effective floor as the runtime read gates — the
+    // status must not report "ready" on sample counts runtime serving
+    // refuses.
+    let min_samples = config.adaptive.min_samples_alpha.max(10);
     let base = |status: &str, eligible_samples: usize, global: serde_json::Value| {
         serde_json::json!({
             "enabled": config.ars.acceleration.enabled,
@@ -2454,12 +2535,23 @@ pub fn shadow_fusion_status(store: &SqliteStore, config: &ReinConfig) -> serde_j
         .iter()
         .filter_map(|event| parse_candidates_from_event(event, &access_events))
         .collect();
-    let events_with_access: Vec<_> = prefix_committed_events_with_access(
-        &recall_events,
-        parsed_recall_events
-            .iter()
-            .filter(|event| event.has_training_signal()),
-    );
+    // v1.2 audit F7: this is a READ-ONLY status preview — it commits no
+    // consumer offset, so the prefix-commit walk the learner needs is not
+    // required here, and it was actively harmful: the walk anchored at the
+    // oldest event of a sliding most-recent-500 window and hard-broke at the
+    // first live unmatched recall (the overwhelmingly common case for
+    // automated recalls). Under sustained traffic (>500 RecallComplete/24h)
+    // the window head never expired, eligible_samples collapsed to ~0, and
+    // the status — now a CANARY BLOCKER via shadow_fusion_replay_not_ready —
+    // reported "insufficient_samples" forever on exactly the deployments
+    // that have the most evidence. Count every training-signal event in the
+    // window instead; the real learner keeps its own durable-offset
+    // discipline (run_alpha_learning) untouched.
+    let events_with_access: Vec<_> = parsed_recall_events
+        .iter()
+        .filter(|event| event.has_training_signal())
+        .cloned()
+        .collect();
     let eligible_samples = events_with_access.len();
     if eligible_samples < min_samples {
         return base(
@@ -2516,35 +2608,12 @@ fn recent_events_by_type(
     }
 }
 
-fn prefix_committed_events_with_access<'a>(
-    stored_recall_events: &[crate::store::adaptive::StoredEvent],
-    events_with_access: impl Iterator<Item = &'a crate::search::alpha_optimizer::RecallEvent>,
-) -> Vec<crate::search::alpha_optimizer::RecallEvent> {
-    let events_with_access: Vec<_> = events_with_access.cloned().collect();
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
-    let matched_request_ids: std::collections::HashSet<&str> = events_with_access
-        .iter()
-        .map(|event| event.request_id.as_str())
-        .collect();
-    let mut rids_we_advanced_through = std::collections::HashSet::new();
-    for event in stored_recall_events {
-        let rid = event.request_id.as_deref().unwrap_or("");
-        let is_matched = matched_request_ids.contains(rid);
-        let is_expired = chrono::DateTime::parse_from_rfc3339(&event.ts)
-            .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
-            .unwrap_or(false);
-
-        if is_matched || is_expired {
-            rids_we_advanced_through.insert(rid.to_string());
-        } else {
-            break;
-        }
-    }
-    events_with_access
-        .into_iter()
-        .filter(|event| rids_we_advanced_through.contains(event.request_id.as_str()))
-        .collect()
-}
+// v1.2 audit F7: `prefix_committed_events_with_access` was removed. It
+// implemented an offset-style committed-prefix walk over a SLIDING window,
+// which starves under sustained traffic (see the comment at the
+// shadow_fusion_status call site). The status preview now counts all
+// training-signal events in the window directly; the learner's real
+// prefix-commit discipline lives in run_alpha_learning's durable offsets.
 
 fn project_shadow_fusion_report(
     report: ShadowFusionReplayReport,
@@ -2557,7 +2626,9 @@ fn project_shadow_fusion_report(
         "status": "ready",
         "replay_limit": SHADOW_FUSION_STATUS_REPLAY_LIMIT,
         "eligible_samples": eligible_samples,
-        "min_samples": config.adaptive.min_samples_alpha,
+        // codex R11 P2: report the same effective floor the runtime read
+        // gates enforce.
+        "min_samples": config.adaptive.min_samples_alpha.max(10),
         "global": report.global.map(project_learned_shadow_weights).unwrap_or(serde_json::Value::Null),
         "by_query_type": report.by_query_type
             .into_iter()
@@ -6203,7 +6274,15 @@ mod tests {
     #[test]
     fn shadow_fusion_status_previews_without_committing_offsets() {
         let store = SqliteStore::in_memory().unwrap();
-        emit_shadow_replay_feedback_pair(&store, "req-shadow-status", "mem-shadow-status");
+        // codex R11 P2: the status applies the same 10-sample effective
+        // floor as the runtime read gates, so the fixture seeds 10 pairs.
+        for i in 0..10 {
+            emit_shadow_replay_feedback_pair(
+                &store,
+                &format!("req-shadow-status-{i}"),
+                &format!("mem-shadow-status-{i}"),
+            );
+        }
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = true;
@@ -6215,9 +6294,13 @@ mod tests {
         assert_eq!(status["enabled"].as_bool(), Some(true));
         assert_eq!(status["shadow_only"].as_bool(), Some(true));
         assert_eq!(status["status"].as_str(), Some("ready"));
-        assert_eq!(status["eligible_samples"].as_u64(), Some(1));
-        assert_eq!(status["min_samples"].as_u64(), Some(1));
-        assert_eq!(status["global"]["sample_count"].as_u64(), Some(1));
+        assert_eq!(status["eligible_samples"].as_u64(), Some(10));
+        assert_eq!(
+            status["min_samples"].as_u64(),
+            Some(10),
+            "configured 1 must floor to the effective runtime gate of 10"
+        );
+        assert_eq!(status["global"]["sample_count"].as_u64(), Some(10));
         assert!(
             status["global"]["weights"]["kg"].as_f64().unwrap() > 0.5,
             "fixture should surface kg-heavy preview weights: {status}"
@@ -6239,7 +6322,11 @@ mod tests {
 
         assert_eq!(status["status"].as_str(), Some("insufficient_samples"));
         assert_eq!(status["eligible_samples"].as_u64(), Some(1));
-        assert_eq!(status["min_samples"].as_u64(), Some(2));
+        assert_eq!(
+            status["min_samples"].as_u64(),
+            Some(10),
+            "configured 2 must floor to the effective runtime gate of 10 (codex R11)"
+        );
         assert!(status["global"].is_null());
         assert_eq!(read_offset(&store, "alpha_optimizer"), 0);
         assert_eq!(read_offset(&store, "alpha_optimizer_access"), 0);

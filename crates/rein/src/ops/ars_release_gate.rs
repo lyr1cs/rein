@@ -92,7 +92,11 @@ pub fn evaluate_ars_acceleration_release_gate(
     let config = input.config;
     let state = input.state;
     let policy = input.policy;
-    let min_samples = config.adaptive.min_samples_alpha;
+    // codex R11 P2: same effective floor as the runtime read gates
+    // (get_alpha / get_shadow_fusion_weights / runtime_adoption_target) —
+    // with min_samples_alpha configured below 10, the gate must not report
+    // a bucket as eligible that runtime serving would refuse.
+    let min_samples = config.adaptive.min_samples_alpha.max(10);
     let eligible_learned_shadow_fusion_buckets = state
         .learned_shadow_fusion
         .values()

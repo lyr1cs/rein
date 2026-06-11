@@ -821,6 +821,16 @@ fn run_vec_dedup_inner(
                 }
                 let merge_ok = (|| -> ReinResult<()> {
                     let discard_mem = store.get(discard_id)?;
+                    // v1.2 audit F20: mark_superseded runs FIRST — it is pure
+                    // SQL (fully rollback-safe), while update() below fires
+                    // non-transactional Tantivy/HNSW writes. The old order
+                    // (update then mark_superseded) meant a mark_superseded
+                    // failure rolled back the SQL but left Tantivy serving
+                    // the never-committed merged content and the winner
+                    // evicted from HNSW with no dirty marker. Same
+                    // do-fallible-DB-work-first rule as the v0.27 R7 P2
+                    // MergeIntoMany fix.
+                    store.mark_superseded(discard_id, keep_id)?;
                     if let Ok(mut kept) = store.get(keep_id) {
                         let unique = extract_unique_lines(&discard_content, &kept.content);
                         if !unique.is_empty() {
@@ -851,8 +861,15 @@ fn run_vec_dedup_inner(
                         kept.strength = (kept.strength + 0.2).min(1.0);
                         kept.updated_at = chrono::Utc::now();
                         store.update(&kept)?;
+                        // v1.2 audit F16 (sibling): update() ran with
+                        // embedding=None on enriched text (guaranteed
+                        // EmbedCache miss) and evicted the winner from the
+                        // vector channel — re-flag it for the next sweep.
+                        let _ = store.conn().execute(
+                            "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                            rusqlite::params![keep_id],
+                        );
                     }
-                    store.mark_superseded(discard_id, keep_id)?;
                     if let Ok(discard_memory) = store.get(discard_id) {
                         record_dedup_artifacts(
                             store,
@@ -869,7 +886,21 @@ fn run_vec_dedup_inner(
                 })();
                 match merge_ok {
                     Ok(()) => {
-                        let _ = store.conn().execute_batch("RELEASE vec_strong");
+                        // v1.2 audit F21: RELEASE is the commit on this
+                        // connection — a swallowed failure left the savepoint
+                        // open (every later pair nested into the doomed txn)
+                        // while the merge was reported done. Unwind + retry
+                        // flag on failure, same pattern as
+                        // persist_triples_replacing (codex v1.2 R2 P2).
+                        if let Err(e) = store.conn().execute_batch("RELEASE vec_strong") {
+                            tracing::warn!(
+                                "vec_dedup: RELEASE vec_strong failed ({e}); rolling back"
+                            );
+                            let _ = store.conn().execute_batch("ROLLBACK TO vec_strong");
+                            let _ = store.conn().execute_batch("RELEASE vec_strong");
+                            flag_clear_ok = false;
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("vec_dedup: strong-match merge failed, rolling back: {e}");
@@ -883,6 +914,14 @@ fn run_vec_dedup_inner(
                 tracing::info!(
                     "vec_dedup: merged {discard_id} into {keep_id} (cosine_sim={sim:.3})"
                 );
+                // codex remediation R3 P2: when the SOURCE row is the merge
+                // winner, the end-of-loop `needs_vec_dedup = 0` clear would
+                // immediately undo the re-flag set inside the merge —
+                // leaving the enriched winner absent from the vector channel.
+                // Keep the flag set so the next sweep re-embeds it.
+                if keep_id == id {
+                    flag_clear_ok = false;
+                }
                 merged += 1;
                 break;
             }
@@ -1170,8 +1209,26 @@ pub fn run_dedup_scoped(
 
                             match merge_result {
                                 Ok(()) => {
-                                    let _ =
-                                        store.conn().execute_batch(&format!("RELEASE {sp_name}"));
+                                    // v1.2 audit F21: RELEASE is the commit
+                                    // on this connection. A swallowed failure
+                                    // left the savepoint open — every later
+                                    // pair nested into the doomed transaction
+                                    // and the op reported "merged N" for work
+                                    // that rolled back when the connection
+                                    // dropped. Unwind and propagate instead.
+                                    if let Err(e) =
+                                        store.conn().execute_batch(&format!("RELEASE {sp_name}"))
+                                    {
+                                        let _ = store
+                                            .conn()
+                                            .execute_batch(&format!("ROLLBACK TO {sp_name}"));
+                                        let _ = store
+                                            .conn()
+                                            .execute_batch(&format!("RELEASE {sp_name}"));
+                                        return Err(crate::types::ReinError::Config(format!(
+                                            "dedup: RELEASE {sp_name} (commit) failed: {e}"
+                                        )));
+                                    }
                                     emit_cleanup_event(
                                         store,
                                         crate::store::adaptive::EventType::Forget,
