@@ -236,10 +236,15 @@ pub fn evaluate_ars_acceleration_release_gate(
     if judge_drift_alert {
         canary_blockers.push("judge_drift_alert".to_string());
     }
-
-    let mut canary_warnings = Vec::new();
+    // v1.2 (#A12 activation prerequisite — 2026-06-02 algorithm-directions
+    // recommendation 2): shadow-fusion replay readiness is a BLOCKER, not a
+    // warning. The volume blockers above only prove data exists
+    // (buckets/samples filled); "ready" means the counterfactual replay
+    // actually computed a learnable quality report over those samples. A
+    // pure volume ramp must not promote a canary whose quality machinery
+    // hasn't produced a verdict ("don't ramp on volume alone").
     if shadow_status.as_deref() != Some("ready") {
-        canary_warnings.push(format!(
+        canary_blockers.push(format!(
             "shadow_fusion_replay_not_ready:{}",
             shadow_status.as_deref().unwrap_or("unknown")
         ));
@@ -248,7 +253,7 @@ pub fn evaluate_ars_acceleration_release_gate(
     let canary = ReleaseGateDecision {
         allowed: canary_blockers.is_empty(),
         blockers: canary_blockers,
-        warnings: canary_warnings,
+        warnings: Vec::new(),
     };
 
     let mut default_on_blockers = vec!["default_on_requires_release_evaluation".to_string()];

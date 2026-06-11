@@ -165,6 +165,43 @@ fn canary_is_allowed_only_when_config_policy_and_adaptive_evidence_are_healthy()
         .any(|b| b == "default_on_requires_release_evaluation"));
 }
 
+/// v1.2 (#A12 activation prerequisite): shadow-fusion replay readiness is a
+/// BLOCKER. An otherwise-fully-healthy canary (policy canary mode + filled
+/// buckets + samples over min) must NOT be allowed on volume alone when the
+/// replay's quality machinery hasn't produced a "ready" verdict.
+#[test]
+fn replay_not_ready_blocks_canary_despite_healthy_volume() {
+    let mut config = ReinConfig::default();
+    config.ars.acceleration.enabled = true;
+    config.ars.acceleration.shadow_only = false;
+    config.adaptive.min_samples_alpha = 10;
+    let state = eligible_state(12);
+    let policy = loaded_canary_policy(state.version);
+    let mut shadow_fusion_status = ready_shadow_status();
+    shadow_fusion_status["status"] = serde_json::json!("insufficient_samples");
+
+    let report = evaluate_ars_acceleration_release_gate(input(
+        &config,
+        &state,
+        &policy,
+        &shadow_fusion_status,
+    ));
+
+    assert!(
+        !report.canary.allowed,
+        "volume-only readiness must not pass the canary gate"
+    );
+    assert!(
+        report
+            .canary
+            .blockers
+            .iter()
+            .any(|b| b == "shadow_fusion_replay_not_ready:insufficient_samples"),
+        "not-ready replay must surface as a BLOCKER, got {:?}",
+        report.canary.blockers
+    );
+}
+
 #[test]
 fn drift_alert_blocks_canary_even_with_loaded_canary_policy() {
     let mut config = ReinConfig::default();
