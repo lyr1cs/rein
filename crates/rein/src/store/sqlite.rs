@@ -119,10 +119,10 @@ impl SqliteStore {
     /// (best-effort, like the side-index updates) so a triple failure never
     /// aborts the memory write.
     ///
-    /// NOTE: this slice persists triples as the durable fact-layer foundation;
-    /// the dedup gray-zone consumer still recomputes triples in-flight (the
-    /// read-side reuse is a deferred follow-up that needs a cold-start backfill
-    /// marker + an extractor-version equivalence stamp).
+    /// NOTE: v1.2 wires the read side — `cached_triples_if_valid` serves the
+    /// dedup gray-zone consumer, validated by the `memory_triple_meta` stamp
+    /// this writer maintains (content hash + extractor version + backfill
+    /// marker). Any validation miss falls back to in-flight recompute.
     ///
     /// `pub(crate)` so `ops::resummerize::apply_resummerize` — the one
     /// content-mutation path that bypasses `store()`/`update()` via direct SQL
@@ -134,33 +134,200 @@ impl SqliteStore {
         if !persist {
             return Ok(());
         }
-        // Full replace: purge any prior-content triples for this memory first,
-        // so a content rewrite cannot leave phantom facts behind.
-        self.conn.execute(
-            "DELETE FROM memory_triples WHERE memory_id = ?1",
-            rusqlite::params![memory_id],
-        )?;
         let triples = crate::extract::triples::extract_triples_rule_based(content);
-        if triples.is_empty() {
+        self.persist_triples_replacing(memory_id, content, &triples)
+    }
+
+    /// v1.2 #A5: flag-gated variant for the dedup reuse reader's miss path,
+    /// reusing triples the caller already recomputed (avoids a second
+    /// extraction). Same gate + same write body as `maybe_persist_triples`.
+    pub(crate) fn maybe_persist_triples_precomputed(
+        &self,
+        memory_id: &str,
+        content: &str,
+        triples: &[crate::extract::triples::Triple],
+    ) -> ReinResult<()> {
+        let persist = crate::config::ReinConfig::load()
+            .map(|c| c.dedup.persist_triples)
+            .unwrap_or(false);
+        if !persist {
             return Ok(());
         }
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO memory_triples
-             (memory_id, subject, predicate, object, confidence, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for t in &triples {
-            stmt.execute(rusqlite::params![
-                memory_id,
-                t.subject,
-                t.predicate,
-                t.object,
-                t.confidence,
-                now,
-            ])?;
+        self.persist_triples_replacing(memory_id, content, triples)
+    }
+
+    /// Shared write body: full-replace the persisted triple set + stamp
+    /// `memory_triple_meta`, atomically.
+    ///
+    /// ATOMICITY IS LOAD-BEARING (codex v1.2 R1 P2). Some callers run inside
+    /// their own `BEGIN IMMEDIATE`, but others may reach this on a bare
+    /// connection where each statement would autocommit — two connections
+    /// refreshing the same memory could then interleave and commit a
+    /// `memory_triple_meta` stamp for one content's hash over `memory_triples`
+    /// rows from the other, and `cached_triples_if_valid` would trust a
+    /// non-equivalent fact set. The SAVEPOINT makes replace+stamp one atomic
+    /// unit on both paths (it nests inside an outer transaction; on a bare
+    /// connection it opens one — same pattern as `mark_superseded`).
+    ///
+    /// ORDERING IS ALSO LOAD-BEARING, as defense in depth. The meta stamp is
+    /// deleted FIRST and re-inserted LAST: if any future caller bypasses the
+    /// rollback (or a partial set otherwise reaches disk), the rows carry no
+    /// stamp, the reuse reader treats them as never-extracted, and recomputes.
+    /// A partial candidate set must never be served as valid — dropping
+    /// non-overlapping triples SHRINKS the Jaccard union while preserving the
+    /// intersection, INFLATING `triple_overlap_score` toward a false merge
+    /// (= permanent data loss).
+    fn persist_triples_replacing(
+        &self,
+        memory_id: &str,
+        content: &str,
+        triples: &[crate::extract::triples::Triple],
+    ) -> ReinResult<()> {
+        self.conn.execute("SAVEPOINT triple_replace", [])?;
+        let result: ReinResult<()> = (|| {
+            self.conn.execute(
+                "DELETE FROM memory_triple_meta WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+            )?;
+            // Full replace: purge any prior-content triples for this memory
+            // first, so a content rewrite cannot leave phantom facts behind.
+            self.conn.execute(
+                "DELETE FROM memory_triples WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+            )?;
+            let now = chrono::Utc::now().to_rfc3339();
+            if !triples.is_empty() {
+                let mut stmt = self.conn.prepare(
+                    "INSERT OR IGNORE INTO memory_triples
+                     (memory_id, subject, predicate, object, confidence, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for t in triples {
+                    stmt.execute(rusqlite::params![
+                        memory_id,
+                        t.subject,
+                        t.predicate,
+                        t.object,
+                        t.confidence,
+                        now,
+                    ])?;
+                }
+            }
+            // Stamp LAST — row presence means "extraction completed under
+            // (content_hash, extractor_version)". Written even for an empty
+            // triple set: the stamp is what lets the reader distinguish
+            // "genuinely zero facts" (valid cache hit) from "never extracted"
+            // (cold-start miss → recompute).
+            self.conn.execute(
+                "INSERT INTO memory_triple_meta
+                 (memory_id, content_hash, extractor_version, extracted_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    memory_id,
+                    crate::extract::triples::content_hash_hex(content),
+                    crate::extract::triples::TRIPLE_EXTRACTOR_VERSION,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match self.conn.execute("RELEASE triple_replace", []) {
+                Ok(_) => Ok(()),
+                // codex v1.2 R2 P2: on a bare connection RELEASE is the
+                // commit; if it fails (SQLITE_FULL / I/O / busy) the savepoint
+                // — and its implicit transaction — can stay open. Callers
+                // intentionally swallow triple-persistence errors, so without
+                // an unwind here the long-lived store connection would keep
+                // holding write locks and fail every later write. Roll the
+                // savepoint back before surfacing the error.
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK TO triple_replace", []);
+                    let _ = self.conn.execute("RELEASE triple_replace", []);
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK TO triple_replace", []);
+                let _ = self.conn.execute("RELEASE triple_replace", []);
+                Err(e)
+            }
         }
-        Ok(())
+    }
+
+    /// v1.2 #A5 reuse reader: the persisted triple set for a memory, IFF it is
+    /// verdict-equivalent to recomputing `extract_triples_rule_based` on
+    /// `current_content` right now. This is a verdict-equivalent CACHE — any
+    /// doubt returns `None` and the caller recomputes (fail-safe direction:
+    /// a spurious miss costs one re-extraction; a spurious hit can flip a
+    /// dedup verdict).
+    ///
+    /// Returns `None` (recompute) when:
+    ///   * `[dedup].persist_triples` is off — feature gate; with the writer
+    ///     off, rows no longer track content;
+    ///   * no `memory_triple_meta` stamp — never extracted: pre-v1.2 rows,
+    ///     or an OFF→ON config flip (cold-start backfill marker);
+    ///   * `content_hash` mismatch — content rewritten since extraction;
+    ///   * `extractor_version` ≠ `TRIPLE_EXTRACTOR_VERSION` — extractor
+    ///     semantics changed; the dedup new-content side always recomputes
+    ///     under CURRENT semantics, and mixed-semantics overlap could flip
+    ///     the verdict;
+    ///   * any SQL error — never serve a possibly-partial set.
+    ///
+    /// Returns `Some(vec![])` for a validly-stamped zero-fact memory — a
+    /// cache HIT (recompute would also return nothing), not a miss.
+    pub(crate) fn cached_triples_if_valid(
+        &self,
+        memory_id: &str,
+        current_content: &str,
+    ) -> Option<Vec<crate::extract::triples::Triple>> {
+        use rusqlite::OptionalExtension;
+        let persist = crate::config::ReinConfig::load()
+            .map(|c| c.dedup.persist_triples)
+            .unwrap_or(false);
+        if !persist {
+            return None;
+        }
+        let meta: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT content_hash, extractor_version
+                 FROM memory_triple_meta WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()?;
+        let (content_hash, extractor_version) = meta?;
+        if extractor_version != crate::extract::triples::TRIPLE_EXTRACTOR_VERSION
+            || content_hash != crate::extract::triples::content_hash_hex(current_content)
+        {
+            return None;
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT subject, predicate, object, confidence
+                 FROM memory_triples WHERE memory_id = ?1",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map(rusqlite::params![memory_id], |r| {
+                Ok(crate::extract::triples::Triple {
+                    subject: r.get(0)?,
+                    predicate: r.get(1)?,
+                    object: r.get(2)?,
+                    source_memory_id: Some(memory_id.to_string()),
+                    confidence: r.get(3)?,
+                })
+            })
+            .ok()?;
+        let mut out = Vec::new();
+        for t in rows {
+            // Any row error → miss; never return a partial set.
+            out.push(t.ok()?);
+        }
+        Some(out)
     }
 
     /// Open or create a database at the given path.
@@ -3782,6 +3949,239 @@ mod tests {
         assert_eq!(
             rows, 0,
             "default-off must persist zero triples (bit-identical)"
+        );
+    }
+
+    /// Writes `[dedup] persist_triples = <on>` to a fresh temp config and
+    /// points `REIN_CONFIG` at it. Returns guards that restore the env on drop.
+    /// Callers MUST hold `env_lock()` and be `#[serial_test::serial]`.
+    fn triples_test_config(on: bool) -> (tempfile::TempDir, EnvRestore) {
+        let restore = EnvRestore {
+            key: "REIN_CONFIG",
+            value: std::env::var("REIN_CONFIG").ok(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rein.toml");
+        std::fs::write(&config_path, format!("[dedup]\npersist_triples = {on}\n")).unwrap();
+        std::env::set_var("REIN_CONFIG", &config_path);
+        (dir, restore)
+    }
+
+    /// v1.2 #A5 EQUIVALENCE GATE: for every stored memory, the reuse reader
+    /// must return a triple set IDENTICAL (as a fact set — the semantic
+    /// `triple_overlap_score` consumes) to recomputing the rule-based
+    /// extractor on the same content. Covers EN, CJK, mixed, repeated-fact,
+    /// and zero-fact contents. Any divergence here can flip a dedup verdict,
+    /// and one false merge = permanent data loss.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn reuse_reader_equals_recompute_over_corpus() {
+        use std::collections::HashSet;
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_dir, _restore) = triples_test_config(true);
+
+        let corpus: &[&str] = &[
+            "Alice is a developer. Bob likes coffee. Carol prefers tea.",
+            "她使用 React。我喜欢制表符。",
+            "I prefer tabs. Alice uses Vim. 他是工程师。",
+            "I prefer tabs. I prefer tabs.",
+            "completely factless text without any extractable pattern",
+            "Dave has a laptop. Dave has a laptop! Erin prefers tea?",
+        ];
+
+        let store = SqliteStore::in_memory().unwrap();
+        for content in corpus {
+            let id = store
+                .store(test_memory_with_content(
+                    "dev",
+                    "corpus",
+                    content,
+                    Importance::High,
+                ))
+                .unwrap();
+
+            let recomputed: HashSet<_> =
+                crate::extract::triples::extract_triples_rule_based(content)
+                    .into_iter()
+                    .collect();
+            let cached = store.cached_triples_if_valid(&id, content);
+            let cached_set: HashSet<_> = cached
+                .unwrap_or_else(|| panic!("freshly stored memory must be a cache HIT: {content:?}"))
+                .into_iter()
+                .collect();
+            assert_eq!(
+                cached_set, recomputed,
+                "reuse == recompute violated for content: {content:?}"
+            );
+
+            // Zero-fact contents must still be a HIT (validated empty set),
+            // distinguished from never-extracted by the meta stamp.
+            let meta_rows: i64 = store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_triple_meta WHERE memory_id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(meta_rows, 1, "every persisted extraction must be stamped");
+        }
+    }
+
+    /// Content-hash validation: a rewrite that bypasses the writer (or any
+    /// drift between `memories.content` and the persisted rows) must be a
+    /// cache MISS, not a stale hit.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn reuse_reader_misses_on_content_hash_mismatch() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_dir, _restore) = triples_test_config(true);
+
+        let store = SqliteStore::in_memory().unwrap();
+        let id = store
+            .store(test_memory_with_content(
+                "dev",
+                "prefs",
+                "Alice is a developer.",
+                Importance::High,
+            ))
+            .unwrap();
+
+        assert!(
+            store
+                .cached_triples_if_valid(&id, "Alice is a developer.")
+                .is_some(),
+            "sanity: matching content must hit"
+        );
+        assert!(
+            store
+                .cached_triples_if_valid(&id, "Alice is a manager.")
+                .is_none(),
+            "rewritten content must MISS (hash mismatch)"
+        );
+    }
+
+    /// Extractor-version validation: rows stamped by a different extractor
+    /// semantics version must be treated stale — the dedup new-content side
+    /// always recomputes under CURRENT semantics, and mixed-semantics overlap
+    /// scoring could flip the verdict.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn reuse_reader_misses_on_extractor_version_mismatch() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_dir, _restore) = triples_test_config(true);
+
+        let store = SqliteStore::in_memory().unwrap();
+        let content = "Alice is a developer.";
+        let id = store
+            .store(test_memory_with_content(
+                "dev",
+                "prefs",
+                content,
+                Importance::High,
+            ))
+            .unwrap();
+
+        store
+            .conn()
+            .execute(
+                "UPDATE memory_triple_meta SET extractor_version = ?1 WHERE memory_id = ?2",
+                rusqlite::params![crate::extract::triples::TRIPLE_EXTRACTOR_VERSION + 1, id],
+            )
+            .unwrap();
+        assert!(
+            store.cached_triples_if_valid(&id, content).is_none(),
+            "old-extractor rows must MISS (version mismatch)"
+        );
+    }
+
+    /// Cold-start backfill marker: triple rows WITHOUT a meta stamp (the v1.0
+    /// writer's output, or a mid-write failure) must be a MISS — row presence
+    /// alone cannot distinguish a complete set from a partial one.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn reuse_reader_misses_without_meta_stamp() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_dir, _restore) = triples_test_config(true);
+
+        let store = SqliteStore::in_memory().unwrap();
+        let content = "Alice is a developer. Bob likes coffee.";
+        let id = store
+            .store(test_memory_with_content(
+                "dev",
+                "prefs",
+                content,
+                Importance::High,
+            ))
+            .unwrap();
+
+        // Simulate pre-v1.2 rows: triples present, no stamp.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM memory_triple_meta WHERE memory_id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        assert!(
+            store.cached_triples_if_valid(&id, content).is_none(),
+            "unstamped rows (pre-v1.2 / partial write) must MISS"
+        );
+
+        // Self-heal: the dedup miss path persists its recompute back, after
+        // which the same lookup is a HIT with the identical fact set.
+        let recomputed = crate::extract::triples::extract_triples_rule_based(content);
+        store
+            .maybe_persist_triples_precomputed(&id, content, &recomputed)
+            .unwrap();
+        let cached = store
+            .cached_triples_if_valid(&id, content)
+            .expect("self-healed rows must HIT");
+        use std::collections::HashSet;
+        assert_eq!(
+            cached.into_iter().collect::<HashSet<_>>(),
+            recomputed.into_iter().collect::<HashSet<_>>(),
+            "self-healed cache must equal the recompute that produced it"
+        );
+    }
+
+    /// Feature gate: with `[dedup].persist_triples` off the reader must never
+    /// serve rows (the writer is off too, so rows no longer track content).
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn reuse_reader_disabled_when_flag_off() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let restore = EnvRestore {
+            key: "REIN_CONFIG",
+            value: std::env::var("REIN_CONFIG").ok(),
+        };
+        let _restore = restore;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rein.toml");
+        std::fs::write(&config_path, "[dedup]\npersist_triples = true\n").unwrap();
+        std::env::set_var("REIN_CONFIG", &config_path);
+
+        let store = SqliteStore::in_memory().unwrap();
+        let content = "Alice is a developer.";
+        let id = store
+            .store(test_memory_with_content(
+                "dev",
+                "prefs",
+                content,
+                Importance::High,
+            ))
+            .unwrap();
+        assert!(
+            store.cached_triples_if_valid(&id, content).is_some(),
+            "sanity: flag on + valid stamp must HIT"
+        );
+
+        // Flip the flag off (config reloads per call) — reader must go dark
+        // even though valid rows + stamp exist.
+        std::fs::write(&config_path, "[dedup]\npersist_triples = false\n").unwrap();
+        assert!(
+            store.cached_triples_if_valid(&id, content).is_none(),
+            "flag off must disable the reader regardless of row state"
         );
     }
 

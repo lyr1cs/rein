@@ -188,8 +188,13 @@ pub struct DedupConfig {
     /// v0.39 #A5: when `true`, store-time + content-mutation paths persist
     /// rule-based `(subject, predicate, object)` triples into the durable
     /// `memory_triples` table (DELETE-then-INSERT, no LLM in the write lock).
-    /// Default `false` → no rows written → behavior bit-identical to prior
-    /// releases (the dedup gray-zone path keeps recomputing triples in-flight).
+    /// v1.2 wires the read side: the dedup gray-zone path reuses the
+    /// persisted set when the `memory_triple_meta` stamp validates
+    /// (content hash + extractor version), recomputing + self-healing on any
+    /// miss — verdicts are bit-identical either way, reuse only skips the
+    /// re-extraction. Default `false` → no rows written, reader dark →
+    /// behavior bit-identical to prior releases (the dedup gray-zone path
+    /// recomputes triples in-flight).
     /// Not a tuning parameter — a pure on/off for the experimental fact-layer
     /// foundation; the merge gate stays `triple_overlap_threshold`.
     #[serde(default)]

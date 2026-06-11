@@ -582,6 +582,7 @@ pub fn check_dedup(
         if let Some(memory) = best_vec_memory {
             if !intelligent_merge_enabled {
                 if let Some(upgrade) = maybe_triple_upgrade(
+                    store,
                     extractor_ref,
                     content,
                     memory,
@@ -764,6 +765,7 @@ pub fn check_dedup(
             // merge fallback) verbatim.
             if !intelligent_merge_enabled {
                 if let Some(upgrade) = maybe_triple_upgrade(
+                    store,
                     extractor_ref,
                     content,
                     memory,
@@ -897,7 +899,15 @@ fn build_dedup_extractor() -> Option<ExtractorKind> {
 ///   - the new content yields no triples (LLM degraded or no facts present);
 ///   - the candidate's content yields no triples;
 ///   - the overlap score is below `triple_overlap_threshold`.
+///
+/// v1.2 #A5 reuse reader: the CANDIDATE side now consults the persisted
+/// `memory_triples` cache via `cached_triples_if_valid` (content-hash +
+/// extractor-version validated) before recomputing. The NEW-content side
+/// always recomputes — it isn't stored yet. On a cache miss the recomputed
+/// set is persisted back (self-heal), which is also the cold-start backfill
+/// path for pre-v1.2 rows and OFF→ON config flips.
 fn maybe_triple_upgrade(
+    store: &SqliteStore,
     _extractor: Option<&ExtractorKind>,
     new_content: &str,
     candidate: &Memory,
@@ -922,7 +932,24 @@ fn maybe_triple_upgrade(
         return None;
     }
 
-    let cand_triples = extract_triples_rule_based(&candidate.content);
+    let cand_triples: Vec<Triple> =
+        match store.cached_triples_if_valid(&candidate.id, &candidate.content) {
+            Some(cached) => cached,
+            None => {
+                let recomputed = extract_triples_rule_based(&candidate.content);
+                // Self-heal / backfill: persist what we just computed so the
+                // next gray-zone touch of this candidate reuses it. Flag-gated
+                // inside; best-effort like every triple write (a failure here
+                // must not abort the dedup decision). We already hold the
+                // caller's write lock (same precedent as `m6_log_outcome`).
+                let _ = store.maybe_persist_triples_precomputed(
+                    &candidate.id,
+                    &candidate.content,
+                    &recomputed,
+                );
+                recomputed
+            }
+        };
     if cand_triples.is_empty() {
         return None;
     }
@@ -1653,6 +1680,7 @@ mod tests {
     /// the input text).
     #[test]
     fn v027_triple_upgrade_promotes_grayzone_to_mergeinto() {
+        let store = SqliteStore::in_memory().unwrap();
         let candidate = test_memory("prefs", "I prefer tabs");
         let mut cache: Option<Vec<Triple>> = None;
         let cfg = crate::config::DedupConfig::default(); // threshold 0.7
@@ -1660,6 +1688,7 @@ mod tests {
         // Rule-based extraction on "I prefer tabs" yields (user, prefers,
         // tabs); same on the new content. Overlap = 1.0 → upgrade.
         let action = maybe_triple_upgrade(
+            &store,
             None, // rule-based fallback
             "I prefer tabs",
             &candidate,
@@ -1683,14 +1712,22 @@ mod tests {
     /// Distinct subjects → zero overlap.
     #[test]
     fn v027_triple_upgrade_returns_none_below_threshold() {
+        let store = SqliteStore::in_memory().unwrap();
         let candidate = test_memory("prefs", "Alice prefers tabs");
         let mut cache: Option<Vec<Triple>> = None;
         let cfg = crate::config::DedupConfig::default();
 
         // "user prefers spaces" ≠ "Alice prefers tabs" → triple overlap is
         // 0 (objects differ AND subjects differ after pronoun normalization).
-        let action =
-            maybe_triple_upgrade(None, "I prefer spaces", &candidate, &cfg, &mut cache, 30);
+        let action = maybe_triple_upgrade(
+            &store,
+            None,
+            "I prefer spaces",
+            &candidate,
+            &cfg,
+            &mut cache,
+            30,
+        );
         assert!(
             action.is_none(),
             "low triple overlap must NOT upgrade, got {action:?}"

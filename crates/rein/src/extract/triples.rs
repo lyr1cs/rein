@@ -213,6 +213,35 @@ fn call_llm_sync(
 /// copula or passive auxiliary). // bootstrap; v0.27.1+ → ablation
 const RULE_BASED_CONFIDENCE: f32 = 0.6;
 
+/// v1.2 #A5 reuse reader: semantics version of `extract_triples_rule_based`.
+///
+/// Persisted `memory_triples` rows are stamped with this value (via
+/// `memory_triple_meta`) at write time; the dedup reuse reader treats any
+/// other stamp as stale and recomputes. The dedup new-content side ALWAYS
+/// recomputes against the current extractor, so serving rows produced under
+/// different extraction semantics would compute `triple_overlap_score` with
+/// its two sides under different rules and could flip a dedup verdict
+/// (one false merge = permanent data loss).
+///
+/// BUMP THIS on ANY observable output change to the rule-based pipeline:
+///   * `extract_triples_rule_based` / `match_sentence` / `split_sentences`
+///     pattern or normalization changes (incl. pronoun normalization);
+///   * NFKC / unicode-normalization behavior changes;
+///   * `jieba-rs` upgrades that change segmentation output;
+///   * `RULE_BASED_CONFIDENCE` changes.
+pub const TRIPLE_EXTRACTOR_VERSION: i64 = 1;
+
+/// SHA-256 hex of memory content, shared by the triple writer (stamp) and the
+/// dedup reuse reader (validation). Byte-exact: any content rewrite —
+/// MergeInto provenance lines, resummerize, M5 cold-strip — changes the hash
+/// and invalidates the cached triple set.
+pub fn content_hash_hex(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Rule-based fallback when no LLM is available or LLM returns empty.
 ///
 /// Patterns covered:

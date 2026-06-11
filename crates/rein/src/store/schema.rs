@@ -124,15 +124,25 @@ struct Migration {
 /// gated by `[dedup].persist_triples` (default off → empty table → no behavior
 /// change). The synthetic-migration tests in `migration_tests` still cover the
 /// drop / rollback / re-apply slices via their own `&[Migration]` lists.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 2,
-    name: "create_memory_triples",
-    up: create_memory_triples,
-    // Additive `CREATE TABLE/INDEX IF NOT EXISTS` — resurrection-safe, so it
-    // may run on a lock-degraded open (non-unix build / flock-create failure)
-    // without bricking DB open. See the fail-closed gate below.
-    idempotent: true,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 2,
+        name: "create_memory_triples",
+        up: create_memory_triples,
+        // Additive `CREATE TABLE/INDEX IF NOT EXISTS` — resurrection-safe, so it
+        // may run on a lock-degraded open (non-unix build / flock-create failure)
+        // without bricking DB open. See the fail-closed gate below.
+        idempotent: true,
+    },
+    Migration {
+        version: 3,
+        name: "create_memory_triple_meta",
+        up: create_memory_triple_meta,
+        // Additive `CREATE TABLE IF NOT EXISTS` — same resurrection-safety
+        // argument as v2.
+        idempotent: true,
+    },
+];
 
 /// v2 forward migration: durable `(subject, predicate, object)` fact table for
 /// #A5 triple persistence.
@@ -157,6 +167,40 @@ fn create_memory_triples(conn: &Connection) -> ReinResult<()> {
             UNIQUE(memory_id, subject, predicate, object)
         );
         CREATE INDEX IF NOT EXISTS idx_memory_triples_subject ON memory_triples(subject);",
+    )?;
+    Ok(())
+}
+
+/// v3 forward migration: per-memory extraction stamp enabling the #A5
+/// dedup-reuse READER (the v2 table alone cannot express the reader's three
+/// correctness prerequisites).
+///
+/// One row per memory whose triples have been extracted and persisted:
+///   * row PRESENCE = cold-start backfill marker — distinguishes "genuinely
+///     zero facts" (row, zero `memory_triples` rows) from "never extracted"
+///     (no row; pre-v1.2 DBs and OFF→ON config flips). This cannot live as a
+///     per-row column on `memory_triples`: both states produce zero rows there.
+///   * `content_hash` = SHA-256 of the exact content the triples were
+///     extracted from; reader recomputes when it doesn't match the candidate's
+///     current content (self-healing — eager-writer gaps become misses, never
+///     wrong verdicts).
+///   * `extractor_version` = `TRIPLE_EXTRACTOR_VERSION` at write time; reader
+///     treats any other value as stale (the dedup new-content side always
+///     recomputes under CURRENT semantics — mixed-semantics overlap scoring
+///     could flip a verdict).
+///
+/// Additive only (resurrection-safe). Runs inside `apply_migrations`'
+/// `BEGIN IMMEDIATE` per the `Migration` CONTRACT (no own transaction, no
+/// pragma toggles). `ON DELETE CASCADE` mirrors `memory_triples` so
+/// hard-delete paths clean the stamp automatically.
+fn create_memory_triple_meta(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_triple_meta (
+            memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            extractor_version INTEGER NOT NULL,
+            extracted_at TEXT NOT NULL
+        );",
     )?;
     Ok(())
 }
@@ -2603,6 +2647,7 @@ memoirs: created_at, description, id, name, updated_at
 memories: access_count, archival_claim_token, archival_summary, archival_summary_at, archival_summary_version, cluster_id, concept_ids, content, created_at, decay_lambda, id, importance, in_progress_archival_summary_at, in_progress_resummerize_at, keywords, last_accessed, last_resummarized_at, last_too_large_at, layer, needs_archival_summary, needs_resummerize, needs_vec_dedup, related_ids, source, status, strength, summary, superseded_by, tier, topic, updated_at
 memory_canonical_state: canonical_id, contradiction_score, dedup_confidence, last_merged_at, memory_id, merge_count, source_diversity, support_count
 memory_evidence: canonical_id, content, created_at, id, imported_at, keywords, memory_id, source, source_topic, summary
+memory_triple_meta: content_hash, extracted_at, extractor_version, memory_id
 memory_triples: confidence, created_at, memory_id, object, predicate, subject
 metadata: key, value
 oauth_auth_codes: client_id, code, code_challenge, code_challenge_method, consumed_at, expires_at, issued_at, redirect_uri
@@ -2829,5 +2874,50 @@ session_artifacts: artifact_kind, created_at, ended_at, episode_id, id, is_subag
             )
             .unwrap();
         assert_eq!(idx, 1, "the subject index must exist after migration");
+    }
+
+    /// Drives the REAL `MIGRATIONS` const: the v3 forward migration must
+    /// create `memory_triple_meta` (the #A5 reuse-reader stamp table) and the
+    /// stamped version must reach at least 3. Also exercises the v2→v3
+    /// upgrade path: a DB stamped at v2 (one release behind) must come out of
+    /// `init_schema` with the meta table and the max known version.
+    #[test]
+    fn migration_v3_creates_triple_meta_and_upgrades_v2_db() {
+        init_sqlite_vec();
+        assert!(
+            max_known_schema_version(MIGRATIONS) >= 3,
+            "the v3 memory_triple_meta migration must be wired into MIGRATIONS"
+        );
+
+        // Fresh DB: both forward migrations apply in order.
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema with real MIGRATIONS");
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_triple_meta'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "memory_triple_meta must exist after migration");
+
+        // v2-era DB (v1.0/v1.1 release): wind the stamp back to 2 and drop the
+        // meta table to simulate, then re-open — only v3 should apply.
+        conn.execute_batch("DROP TABLE memory_triple_meta").unwrap();
+        set_schema_user_version(&conn, 2).unwrap();
+        init_schema(&conn, 4).expect("re-init on a v2-stamped DB");
+        assert_eq!(
+            schema_user_version(&conn).unwrap(),
+            max_known_schema_version(MIGRATIONS),
+            "v2→v3 upgrade must stamp the max known version"
+        );
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_triple_meta'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "v2→v3 upgrade must create memory_triple_meta");
     }
 }
