@@ -1891,10 +1891,12 @@ mod tests {
             server.auth.is_none(),
             "ServerConfig::default().auth must be None — operators choose at config time"
         );
+        // v1.2 Phase 3: the legacy proxy bool was removed too; default-deny
+        // is now expressed as `auth = None` (no policy → token required).
         let proxy = crate::config::ProxyConfig::default();
         assert!(
-            !proxy.allow_unauthenticated_loopback,
-            "ProxyConfig::default().allow_unauthenticated_loopback must be false"
+            proxy.auth.is_none(),
+            "ProxyConfig::default().auth must be None — default-deny until operators choose"
         );
         // C3 sibling: allowed_hosts defaults to None so wildcard binds
         // hit the startup refusal until operators opt in.

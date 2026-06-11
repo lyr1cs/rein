@@ -1655,7 +1655,16 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
         })
         .is_some();
     let is_loopback = is_loopback_bind(&config.proxy.bind);
-    let allow_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
+    // v1.2 Phase 3: explicit `[proxy].auth = "public"` (loopback bind only)
+    // replaces the legacy `allow_unauthenticated_loopback` bool.
+    let allow_unauth =
+        config.proxy.auth == Some(crate::config::ProxyAuthPolicyConfig::Public) && is_loopback;
+    // codex v1.2 R2 P2: an EXPLICIT `bearer_required` without a token is an
+    // actionable misconfiguration (`rein proxy on` will refuse immediately),
+    // so it must never take the fresh-install OK shortcut below — that
+    // shortcut exists for the implicit default-deny posture only.
+    let explicit_bearer_without_token = !token_present
+        && config.proxy.auth == Some(crate::config::ProxyAuthPolicyConfig::BearerRequired);
     // F5/C1 follow-up: proxy is a separately-managed service (`rein proxy on`)
     // and is NOT auto-started. When the bind is loopback AND the service
     // is offline AND no token is configured, surface OK with a hint string
@@ -1669,6 +1678,7 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
     // beyond loopback, so the missing-token check is acted on now.
     if !token_present
         && !allow_unauth
+        && !explicit_bearer_without_token
         && is_loopback
         && crate::service::is_running("proxy").is_none()
     {
@@ -1676,27 +1686,38 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
             DoctorCategory::Configuration,
             "proxy_auth",
             format!(
-                "proxy not running on {}:{} (set REIN_PROXY_TOKEN or [proxy].allow_unauthenticated_loopback before `rein proxy on`)",
+                "proxy not running on {}:{} (set REIN_PROXY_TOKEN or [proxy].auth = \"public\" before `rein proxy on`)",
                 config.proxy.bind, config.proxy.port
             ),
         );
     }
 
-    if token_present {
+    // codex v1.2 R3 P2: explicit public must report BEFORE token presence —
+    // the runtime honors `[proxy].auth = "public"` on loopback even when a
+    // token is still exported (`resolve_proxy_startup_auth` returns None),
+    // so "token configured" would describe a token the proxy never checks
+    // and hide the actual unauthenticated posture.
+    if allow_unauth {
+        ok_in(
+            DoctorCategory::Configuration,
+            "proxy_auth",
+            format!(
+                "[proxy].auth = \"public\": loopback-only unauthenticated access for {}:{}{}",
+                config.proxy.bind,
+                config.proxy.port,
+                if token_present {
+                    " (exported proxy token is NOT enforced under explicit public)"
+                } else {
+                    ""
+                }
+            ),
+        )
+    } else if token_present {
         ok_in(
             DoctorCategory::Configuration,
             "proxy_auth",
             format!(
                 "token configured for {}:{}",
-                config.proxy.bind, config.proxy.port
-            ),
-        )
-    } else if allow_unauth {
-        ok_in(
-            DoctorCategory::Configuration,
-            "proxy_auth",
-            format!(
-                "loopback-only unauthenticated access allowed for {}:{}",
                 config.proxy.bind, config.proxy.port
             ),
         )
@@ -1708,7 +1729,7 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
                 "proxy cannot start on {}:{} without REIN_PROXY_TOKEN or REIN_HTTP_TOKEN",
                 config.proxy.bind, config.proxy.port
             ),
-            "set REIN_PROXY_TOKEN=<secret> or enable [proxy].allow_unauthenticated_loopback for loopback-only access",
+            "set REIN_PROXY_TOKEN=<secret> or set [proxy].auth = \"public\" for loopback-only unauthenticated access",
         )
     }
 }
@@ -2961,7 +2982,6 @@ endpoint = "http://127.0.0.1:11434/v1/chat/completions"
 [proxy]
 bind = "0.0.0.0"
 port = 8777
-allow_unauthenticated_loopback = false
 
 [async_memory]
 provider = "inherit"
@@ -3856,6 +3876,78 @@ provider = "inherit"
 
         let tantivy = report.checks.iter().find(|c| c.name == "tantivy").unwrap();
         assert_eq!(tantivy.status, CheckStatus::Warn);
+    }
+
+    /// codex v1.2 R2 P2: explicit `[proxy].auth = "bearer_required"` without
+    /// a token must FAIL even on a loopback bind with the service offline —
+    /// the fresh-install OK shortcut is for the implicit default-deny posture
+    /// only (`rein proxy on` would refuse immediately here, so doctor must
+    /// not report OK).
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn proxy_auth_explicit_bearer_without_token_fails() {
+        let _guard = env_lock().lock().await;
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        std::env::remove_var("REIN_PROXY_TOKEN");
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tempdir);
+        config.proxy.bind = "127.0.0.1".to_string();
+        config.proxy.auth = Some(crate::config::ProxyAuthPolicyConfig::BearerRequired);
+
+        let check = check_proxy_auth(&config);
+        assert_eq!(
+            check.status,
+            CheckStatus::Fail,
+            "explicit bearer_required without a token must FAIL, got: {}",
+            check.message
+        );
+    }
+
+    /// codex v1.2 R3 P2: explicit `[proxy].auth = "public"` on loopback must
+    /// report the unauthenticated posture even when a token is still
+    /// exported — the runtime does not enforce that token under explicit
+    /// public, so "token configured" would be a false security posture.
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn proxy_auth_explicit_public_reports_unauthenticated_over_token() {
+        let _guard = env_lock().lock().await;
+        let _restore_http = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        let _restore_proxy = EnvRestore {
+            key: "REIN_PROXY_TOKEN",
+            value: std::env::var("REIN_PROXY_TOKEN").ok(),
+        };
+        std::env::set_var("REIN_PROXY_TOKEN", "exported-but-not-enforced");
+        std::env::remove_var("REIN_HTTP_TOKEN");
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tempdir);
+        config.proxy.bind = "127.0.0.1".to_string();
+        config.proxy.auth = Some(crate::config::ProxyAuthPolicyConfig::Public);
+
+        let check = check_proxy_auth(&config);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(
+            check.message.contains("unauthenticated"),
+            "explicit public must surface the unauthenticated posture, got: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("NOT enforced"),
+            "exported-token caveat must be visible, got: {}",
+            check.message
+        );
     }
 
     #[tokio::test]

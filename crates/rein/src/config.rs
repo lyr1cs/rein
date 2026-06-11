@@ -44,7 +44,14 @@ impl Provider {
 /// older binary never silently misreads future semantics. A version EQUAL to
 /// this, or the unversioned sentinel `0` (any pre-1.0 config, or the derived
 /// `Default`), is the current baseline and loads as-is.
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
+///
+/// History:
+/// - 1 — v1.0 baseline.
+/// - 2 — v1.2: `[proxy].allow_unauthenticated_loopback` removed in favor of
+///   `[proxy].auth` (`migrate_legacy_proxy_auth`). A v1-stamped build's
+///   `deny_unknown_fields` decoder would reject the new key, so configs
+///   adopting it must be recognizable as newer on downgrade.
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 fn default_config_version() -> u32 {
     CURRENT_CONFIG_VERSION
@@ -1549,9 +1556,29 @@ pub struct ProxyConfig {
     pub max_sse_buffer: usize,
     /// Max concurrent proxy-side extraction tasks. Default: 4.
     pub max_concurrent_extractions: usize,
-    /// Opt-in to serving unauthenticated loopback requests without REIN_PROXY_TOKEN.
-    /// Default: false (default-deny; operators must opt in or set the token).
-    pub allow_unauthenticated_loopback: bool,
+    /// v1.2 bearer-auth Phase 3 (proxy-side): explicit proxy auth policy,
+    /// mirroring `[server].auth`. Default `None` → default-deny (the proxy
+    /// refuses to start without REIN_PROXY_TOKEN / REIN_HTTP_TOKEN).
+    /// `bearer_required` makes the token mandate explicit; `public` opts into
+    /// serving unauthenticated requests — honored ONLY on a loopback bind
+    /// (the proxy forwards provider credentials, so an unauthenticated
+    /// non-loopback listener is never inferred; see `run_proxy`).
+    ///
+    /// The legacy `allow_unauthenticated_loopback` bool was removed; configs
+    /// still carrying it are transformed by `migrate_legacy_proxy_auth` at
+    /// TOML load time (same pattern as the v0.35 `[server]` migration).
+    #[serde(default)]
+    pub auth: Option<ProxyAuthPolicyConfig>,
+}
+
+/// Explicit `[proxy].auth` policy values. Subset of the server enum: the
+/// proxy has no OAuth surface, and `loopback_only` is expressed by binding
+/// to loopback (the default) rather than by policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyAuthPolicyConfig {
+    BearerRequired,
+    Public,
 }
 
 impl Default for ProxyConfig {
@@ -1572,10 +1599,11 @@ impl Default for ProxyConfig {
             max_response_buffer: 1_048_576,
             max_sse_buffer: 1_048_576,
             max_concurrent_extractions: 4,
-            // v0.27.3 F5/C1: default-deny. Operators must opt in to
-            // unauthenticated loopback or set REIN_PROXY_TOKEN. The doctor
-            // template already writes `false` (see doctor.rs:1767).
-            allow_unauthenticated_loopback: false,
+            // v0.27.3 F5/C1 (carried through v1.2 Phase 3): default-deny.
+            // No policy set → the proxy requires REIN_PROXY_TOKEN /
+            // REIN_HTTP_TOKEN; operators opt into unauthenticated loopback
+            // with `auth = "public"` explicitly.
+            auth: None,
         }
     }
 }
@@ -3161,6 +3189,10 @@ fn merge_toml(base: ReinConfig, toml_str: &str) -> anyhow::Result<ReinConfig> {
     // load). See `migrate_legacy_server_auth` for the mapping rules.
     migrate_legacy_server_auth(&mut base_val)?;
 
+    // v1.2 Phase 3 (proxy-side): same treatment for the removed
+    // `[proxy].allow_unauthenticated_loopback` bool.
+    migrate_legacy_proxy_auth(&mut base_val)?;
+
     // Deserialize the merged table back into ReinConfig
     let merged: ReinConfig = base_val.try_into()?;
     Ok(merged)
@@ -3252,6 +3284,85 @@ fn migrate_legacy_server_auth(val: &mut toml::Value) -> anyhow::Result<()> {
         tracing::warn!(
             target: "rein::config::migration",
             "[server].allow_unauthenticated_loopback = true was stripped but NOT migrated: bind '{bind}' is not loopback and REIN_HTTP_TOKEN is not set, so no safe policy can be inferred automatically. HTTP/SSE will refuse to start until you set [server].auth explicitly (\"public\", \"loopback_only\", \"bearer_required\", or \"oauth\")."
+        );
+    }
+    Ok(())
+}
+
+/// v1.2 bearer-auth Phase 3 (proxy-side) — TOML load-time migration of the
+/// removed `[proxy].allow_unauthenticated_loopback` bool into an explicit
+/// `[proxy].auth` policy. Mirrors `migrate_legacy_server_auth`; mapping rules
+/// derived from the v1.1 runtime semantics of `run_proxy` so behavior is
+/// preserved across the upgrade:
+///
+/// - bool absent or false → no-op (key stripped; default-deny takes over).
+/// - bool true + explicit `[proxy].auth` set → explicit policy always wins;
+///   strip the dead key and WARN.
+/// - bool true + REIN_PROXY_TOKEN / REIN_HTTP_TOKEN set → token auth always
+///   won over the bool at runtime; map to `auth = "bearer_required"` + WARN.
+/// - bool true + loopback bind + no token → previous runtime allowed
+///   unauthenticated loopback; map to `auth = "public"` + WARN.
+/// - bool true + non-loopback bind + no token → the bool could never take
+///   effect off loopback (`allow_loopback_unauth` required a loopback bind);
+///   strip + WARN and leave `auth` unset so `run_proxy` produces the same
+///   actionable refusal at the point the proxy is actually started (load
+///   itself must not fail — stdio/CLI commands don't touch the proxy).
+///
+/// The effective bind honors the `REIN_PROXY_BIND` env override (same lesson
+/// as REIN_SSE_BIND on the server migration: a stale loopback TOML default
+/// must not silently migrate to `public` under an env-overridden bind).
+fn migrate_legacy_proxy_auth(val: &mut toml::Value) -> anyhow::Result<()> {
+    let Some(proxy_table) = val.get_mut("proxy").and_then(|v| v.as_table_mut()) else {
+        return Ok(());
+    };
+    let Some(legacy) = proxy_table.remove("allow_unauthenticated_loopback") else {
+        return Ok(());
+    };
+    let opted_in = legacy.as_bool().unwrap_or(false);
+    if !opted_in {
+        return Ok(());
+    }
+    if proxy_table.contains_key("auth") {
+        tracing::warn!(
+            target: "rein::config::migration",
+            "[proxy].allow_unauthenticated_loopback = true was ignored because [proxy].auth is set explicitly; remove the legacy bool from your config (it is no longer recognized as of v1.2.0)"
+        );
+        return Ok(());
+    }
+    let has_token = nonempty_env("REIN_PROXY_TOKEN")
+        .or_else(|| nonempty_env("REIN_HTTP_TOKEN"))
+        .is_some();
+    let bind = nonempty_env("REIN_PROXY_BIND").unwrap_or_else(|| {
+        proxy_table
+            .get("bind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1")
+            .to_string()
+    });
+    if has_token {
+        proxy_table.insert(
+            "auth".to_string(),
+            toml::Value::String("bearer_required".to_string()),
+        );
+        tracing::warn!(
+            target: "rein::config::migration",
+            migrated_to = "bearer_required",
+            "[proxy].allow_unauthenticated_loopback = true was migrated to [proxy].auth = \"bearer_required\" (REIN_PROXY_TOKEN/REIN_HTTP_TOKEN is set, so token auth wins); remove the legacy bool from your config (it is no longer recognized as of v1.2.0)"
+        );
+    } else if is_loopback_bind_host(&bind) {
+        proxy_table.insert(
+            "auth".to_string(),
+            toml::Value::String("public".to_string()),
+        );
+        tracing::warn!(
+            target: "rein::config::migration",
+            migrated_to = "public",
+            "[proxy].allow_unauthenticated_loopback = true was migrated to [proxy].auth = \"public\" (loopback bind, no token); remove the legacy bool from your config (it is no longer recognized as of v1.2.0)"
+        );
+    } else {
+        tracing::warn!(
+            target: "rein::config::migration",
+            "[proxy].allow_unauthenticated_loopback = true was stripped but NOT migrated: bind '{bind}' is not loopback and no proxy token is set, so no safe policy can be inferred automatically (the legacy bool never took effect off loopback either). The proxy will refuse to start until you set REIN_PROXY_TOKEN or [proxy].auth explicitly."
         );
     }
     Ok(())
@@ -3947,6 +4058,139 @@ allow_unauthenticated_loopback = true
         assert_eq!(
             cfg.resolve_auth_policy().expect("policy resolves"),
             crate::auth::AuthPolicy::LoopbackOnly
+        );
+    }
+
+    // v1.2 Phase 3 — legacy `[proxy].allow_unauthenticated_loopback`
+    // migration. Mirrors the v0.35 `[server]` migration shapes; mapping
+    // preserves the v1.1 runtime semantics of `run_proxy` (the bool never
+    // took effect off a loopback bind).
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_proxy_auth_migrates_loopback_unauth_to_public_when_no_token() {
+        let _t1 = EnvGuard::remove("REIN_PROXY_TOKEN");
+        let _t2 = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_PROXY_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[proxy]
+bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy proxy bool on loopback bind should migrate to public");
+        assert_eq!(cfg.proxy.auth, Some(ProxyAuthPolicyConfig::Public));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_proxy_auth_migrates_to_bearer_when_token_set() {
+        let _t1 = EnvGuard::set("REIN_PROXY_TOKEN", "proxy-migration-token");
+        let _t2 = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_PROXY_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[proxy]
+bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy proxy bool + token should migrate to bearer_required");
+        assert_eq!(cfg.proxy.auth, Some(ProxyAuthPolicyConfig::BearerRequired));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_proxy_auth_strips_bool_without_inference_on_non_loopback() {
+        let _t1 = EnvGuard::remove("REIN_PROXY_TOKEN");
+        let _t2 = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_PROXY_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[proxy]
+bind = "0.0.0.0"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("legacy proxy bool on non-loopback bind must still load (CLI must not brick)");
+        assert!(
+            cfg.proxy.auth.is_none(),
+            "no safe policy can be inferred; auth must stay None (run_proxy refuses at start)"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_proxy_auth_strips_false_bool_silently() {
+        let _t1 = EnvGuard::remove("REIN_PROXY_TOKEN");
+        let _t2 = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_PROXY_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[proxy]
+bind = "127.0.0.1"
+allow_unauthenticated_loopback = false
+"#,
+        )
+        .expect("legacy proxy bool = false should be stripped silently");
+        assert!(cfg.proxy.auth.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_proxy_auth_yields_to_explicit_policy() {
+        let _t1 = EnvGuard::remove("REIN_PROXY_TOKEN");
+        let _t2 = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::remove("REIN_PROXY_BIND");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[proxy]
+bind = "127.0.0.1"
+auth = "bearer_required"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("explicit [proxy].auth should win, legacy bool stripped");
+        assert_eq!(cfg.proxy.auth, Some(ProxyAuthPolicyConfig::BearerRequired));
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn legacy_proxy_auth_migration_honors_rein_proxy_bind_env_override() {
+        // Same lesson as REIN_SSE_BIND on the server migration: an
+        // env-overridden non-loopback bind must defeat the bool→public
+        // mapping even when the TOML bind looks loopback.
+        let _t1 = EnvGuard::remove("REIN_PROXY_TOKEN");
+        let _t2 = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let _bind = EnvGuard::set("REIN_PROXY_BIND", "0.0.0.0");
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[proxy]
+bind = "127.0.0.1"
+allow_unauthenticated_loopback = true
+"#,
+        )
+        .expect("load must succeed under REIN_PROXY_BIND override");
+        assert!(
+            cfg.proxy.auth.is_none(),
+            "REIN_PROXY_BIND override must defeat the legacy-bool->public migration"
+        );
+    }
+
+    #[test]
+    fn proxy_auth_rejects_unknown_value() {
+        let err = ReinConfig::load_from_str(
+            r#"
+[proxy]
+auth = "loopback_only"
+"#,
+        )
+        .expect_err("proxy auth accepts only bearer_required/public");
+        assert!(
+            err.to_string().contains("unknown variant")
+                || err.to_string().contains("loopback_only"),
+            "unexpected error: {err}"
         );
     }
 

@@ -59,7 +59,7 @@ auth = "loopback_only"   # strict local-only HTTP/SSE
                          # claude.ai connector reads through the bind
 
 [proxy]
-allow_unauthenticated_loopback = true
+auth = "public"          # unauthenticated proxy; honored on loopback binds only
 ```
 
 The `[server].auth` policy values are `"loopback_only"`, `"public"`,
@@ -79,9 +79,17 @@ it are handled by a load-time migration:
 - bool false (the old default) → silently stripped.
 
 In every migration branch a one-time WARN is logged so the operator removes
-the legacy key from their config. The `[proxy].allow_unauthenticated_loopback`
-opt-in still works as before for the proxy surface and is unaffected by
-this migration.
+the legacy key from their config.
+
+**v1.2.0 applied the same treatment to the proxy surface**: the legacy
+`[proxy].allow_unauthenticated_loopback` bool was removed in favor of an
+explicit `[proxy].auth` policy (`"bearer_required"` or `"public"`). The
+load-time migration mirrors the server mapping (token set →
+`"bearer_required"`; loopback bind + no token → `"public"`; non-loopback +
+no token → stripped with a WARN, and `rein proxy on` refuses to start until
+a token or policy is set). `"public"` is honored only on loopback binds —
+the proxy fronts provider credentials, so an unauthenticated non-loopback
+listener is never inferred.
 
 This opt-in only applies to loopback binds such as `127.0.0.1`, `localhost`, or
 `::1`. Wildcard HTTP binds require a token or explicit host allowlist. Docker's

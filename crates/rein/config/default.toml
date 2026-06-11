@@ -1,7 +1,7 @@
 # Config schema version (metadata, not a tunable). Bumped only when the
 # config surface changes in a way that needs a load-time migration. A config
 # stamped newer than the running rein build understands is refused at load.
-config_version = 1
+config_version = 2
 
 [database]
 path = "auto"
@@ -164,9 +164,12 @@ extract_enabled = true     # extract memories from assistant responses
 store_min_chars = 220      # don't run proxy extraction on short assistant replies
 store_min_score = 3        # pattern score required before proxy extraction runs
 max_request_body = 1048576 # reject oversized client requests before forwarding
-# v0.27.4 F5/C1: default-deny. Operators must opt in to unauthenticated
-# loopback or set REIN_PROXY_TOKEN before running `rein proxy on`.
-allow_unauthenticated_loopback = false
+# v1.2.0: [proxy].allow_unauthenticated_loopback was removed. Default-deny
+# stands: set REIN_PROXY_TOKEN before `rein proxy on`, or opt into
+# unauthenticated loopback explicitly with `auth = "public"` (honored only
+# on a loopback bind). `auth = "bearer_required"` makes the token mandate
+# explicit. Legacy configs are migrated at load time.
+# auth = "bearer_required"
 
 [async_memory]
 provider = "inherit"       # inherit [extract].provider; can be "google", "omlx", or "none"

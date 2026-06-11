@@ -350,6 +350,12 @@ Proxy clients should send `x-rein-token` from `REIN_PROXY_TOKEN`. Proxy startup
 also accepts `REIN_HTTP_TOKEN` as a fallback, but setting a distinct proxy token
 keeps HTTP and proxy credentials easier to rotate independently.
 
+Tokenless loopback use requires an explicit `[proxy].auth = "public"` opt-in
+(honored only on loopback binds). (v1.2.0 removed the legacy
+`[proxy].allow_unauthenticated_loopback` bool; older configs that still set it
+are migrated automatically at TOML load time, mirroring the v0.35.0 `[server]`
+migration.)
+
 `rein init --proxy` can generate shell helpers and Codex provider overrides for
 common proxy flows. Generated Codex proxy examples use `env_http_headers` so the
 token is read from `REIN_PROXY_TOKEN` at invocation time.

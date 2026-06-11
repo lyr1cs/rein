@@ -100,6 +100,40 @@ struct ProxyArtifactInput {
 // WebSocketMirrorState (struct + ~270-line impl) moved to
 // `src/proxy/ws_mirror.rs` in v0.19.0. Re-imported at the top of this file.
 
+/// v1.2 Phase 3: resolve the proxy's effective startup auth from the explicit
+/// `[proxy].auth` policy + the exported token (REIN_PROXY_TOKEN falling back
+/// to REIN_HTTP_TOKEN, already filtered for emptiness by the caller).
+///
+/// - `auth = "public"` + loopback bind → unauthenticated (`Ok(None)`) even
+///   when a token is exported in the shell — explicit policy wins, mirroring
+///   `[server].auth = "public"` (codex v1.2 R2: enforcing the exported token
+///   under explicit public would 401 every unauthenticated client and defeat
+///   the policy in the common shared-shell case).
+/// - `auth = "public"` + non-loopback bind → public is NOT honored (the
+///   proxy fronts provider credentials; an unauthenticated non-loopback
+///   listener is never inferred). Falls through to the token requirement.
+/// - `auth = "bearer_required"`, `None` (default-deny), or unhonored public
+///   → token required; refuse startup without one.
+fn resolve_proxy_startup_auth(
+    config: &ReinConfig,
+    env_token: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let is_loopback = crate::config::is_loopback_bind_host(&config.proxy.bind);
+    let public_honored =
+        config.proxy.auth == Some(crate::config::ProxyAuthPolicyConfig::Public) && is_loopback;
+    if public_honored {
+        return Ok(None);
+    }
+    if env_token.is_none() {
+        anyhow::bail!(
+            "rein proxy: refusing to start on '{}' without REIN_PROXY_TOKEN set. \
+             Set REIN_PROXY_TOKEN=<secret> or explicitly opt into unauthenticated loopback with [proxy].auth = \"public\" (loopback bind only).",
+            config.proxy.bind
+        );
+    }
+    Ok(env_token)
+}
+
 /// Start the transparent proxy server.
 pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     // REIN_PROXY_ACTIVE is set by the caller (main.rs) before entering async
@@ -108,10 +142,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     let bind = format!("{}:{}", config.proxy.bind, config.proxy.port);
 
     // Security: require auth token by default, even on loopback.
-    let is_loopback = config.proxy.bind == "127.0.0.1"
-        || config.proxy.bind == "localhost"
-        || config.proxy.bind == "::1";
-    let auth_token = std::env::var("REIN_PROXY_TOKEN")
+    let env_token = std::env::var("REIN_PROXY_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
         .or_else(|| {
@@ -119,14 +150,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
                 .ok()
                 .filter(|token| !token.trim().is_empty())
         });
-    let allow_loopback_unauth = config.proxy.allow_unauthenticated_loopback && is_loopback;
-    if auth_token.is_none() && !allow_loopback_unauth {
-        anyhow::bail!(
-            "rein proxy: refusing to start on '{}' without REIN_PROXY_TOKEN set. \
-             Set REIN_PROXY_TOKEN=<secret> or explicitly opt into unauthenticated loopback with [proxy].allow_unauthenticated_loopback=true.",
-            config.proxy.bind
-        );
-    }
+    let auth_token = resolve_proxy_startup_auth(&config, env_token)?;
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!("rein proxy: running in record-only mode (automatic injection removed)");
@@ -2107,8 +2131,75 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// Default test config with the database diverted to a fresh temp path.
+    ///
+    /// NEVER use raw `ReinConfig::default()` in this module's tests: the
+    /// default `"auto"` database path resolves to the OPERATOR'S LIVE DB
+    /// (`~/.rein/memories.db`), and the proxy's extraction path calls
+    /// `config.open_store()` on response handling — `cargo test` would open
+    /// (and schema-stamp) the live DB. Discovered in v1.2: a leaked open
+    /// from this module stamped the live DB with this build's newer schema
+    /// version, and the installed older server refused to start via the
+    /// downgrade guard.
+    fn test_config() -> ReinConfig {
+        let dir = tempfile::tempdir().expect("tempdir for proxy test config");
+        let mut config = ReinConfig::default();
+        config.database.path = dir.path().join("proxy-test.db").display().to_string();
+        // Intentionally leak the tempdir handle: dropping it would delete
+        // the DB file under a still-running one-shot proxy task; the test
+        // process is short-lived and the OS reclaims the temp dir.
+        std::mem::forget(dir);
+        config
+    }
+
     fn find_header_end_for_test(buf: &[u8]) -> Option<usize> {
         buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    /// v1.2 Phase 3 startup-auth resolution (codex R2 P2: explicit public on
+    /// loopback must win over an exported token; public is never honored off
+    /// loopback; default/bearer without token refuses startup).
+    #[test]
+    fn proxy_startup_auth_resolution_matrix() {
+        use crate::config::ProxyAuthPolicyConfig as P;
+        let cfg = |auth: Option<P>, bind: &str| {
+            let mut c = test_config();
+            c.proxy.auth = auth;
+            c.proxy.bind = bind.to_string();
+            c
+        };
+        let tok = || Some("secret".to_string());
+
+        // Explicit public + loopback: unauthenticated even with a token
+        // exported in the shell.
+        assert_eq!(
+            resolve_proxy_startup_auth(&cfg(Some(P::Public), "127.0.0.1"), tok()).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_proxy_startup_auth(&cfg(Some(P::Public), "127.0.0.1"), None).unwrap(),
+            None
+        );
+        // Public is NOT honored off loopback: token used when present,
+        // startup refused without one.
+        assert_eq!(
+            resolve_proxy_startup_auth(&cfg(Some(P::Public), "0.0.0.0"), tok()).unwrap(),
+            tok()
+        );
+        assert!(resolve_proxy_startup_auth(&cfg(Some(P::Public), "0.0.0.0"), None).is_err());
+        // Default-deny (None) and explicit bearer: token required.
+        assert_eq!(
+            resolve_proxy_startup_auth(&cfg(None, "127.0.0.1"), tok()).unwrap(),
+            tok()
+        );
+        assert!(resolve_proxy_startup_auth(&cfg(None, "127.0.0.1"), None).is_err());
+        assert!(
+            resolve_proxy_startup_auth(&cfg(Some(P::BearerRequired), "127.0.0.1"), None).is_err()
+        );
+        assert_eq!(
+            resolve_proxy_startup_auth(&cfg(Some(P::BearerRequired), "0.0.0.0"), tok()).unwrap(),
+            tok()
+        );
     }
 
     fn spawn_capture_http_server(
@@ -3058,7 +3149,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3098,7 +3189,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.extract_enabled = false;
         config.proxy.anthropic_upstream = anthropic_upstream;
         config.proxy.openai_upstream = openai_upstream;
@@ -3133,7 +3224,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3177,7 +3268,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3214,7 +3305,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3251,7 +3342,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3284,7 +3375,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3317,7 +3408,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3352,7 +3443,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3387,7 +3478,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3417,7 +3508,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3450,7 +3541,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3483,7 +3574,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3516,7 +3607,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3546,7 +3637,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3581,7 +3672,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3612,7 +3703,7 @@ Sec-WebSocket-Extensions: permessage-deflate\r\n\
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let expected_origin = codex_upstream.clone();
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3721,7 +3812,7 @@ x-client-request-id: ws_upgrade_123\r\n\
         let (codex_upstream, codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3773,7 +3864,7 @@ ChatGPT-Account-ID: acct_test\r\n\
         let (openai_upstream, _openai_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = unused_local_base_url("http");
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -3829,7 +3920,7 @@ ChatGPT-Account-ID: acct_test\r\n\
         );
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.database.path = db_path.display().to_string();
         config.proxy.extract_enabled = false;
         config.proxy.openai_upstream = openai_upstream;
@@ -3904,7 +3995,7 @@ ChatGPT-Account-ID: acct_test\r\n\
         );
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.database.path = db_path.display().to_string();
         config.proxy.extract_enabled = false;
         config.proxy.openai_upstream = openai_upstream;
@@ -3995,7 +4086,7 @@ ChatGPT-Account-ID: acct_test\r\n\
         ]);
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.database.path = db_path.display().to_string();
         config.proxy.extract_enabled = false;
         config.proxy.openai_upstream = openai_upstream;
@@ -4087,7 +4178,7 @@ x-client-request-id: ws_thread_123\r\n\
         ]);
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.database.path = db_path.display().to_string();
         config.proxy.extract_enabled = false;
         config.proxy.openai_upstream = openai_upstream;
@@ -4772,7 +4863,8 @@ x-openai-subagent: worker_abc\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
+        config.proxy.extract_enabled = false;
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -4825,7 +4917,7 @@ Connection: close\r\n\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
@@ -4876,7 +4968,7 @@ Connection: close\r\n\r\n\
         let (codex_upstream, _codex_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
         let (chatgpt_upstream, _chatgpt_rx) = spawn_capture_http_server("200 OK", "{\"ok\":true}");
 
-        let mut config = ReinConfig::default();
+        let mut config = test_config();
         config.proxy.openai_upstream = openai_upstream;
         config.proxy.codex_upstream = codex_upstream;
         config.proxy.chatgpt_upstream = chatgpt_upstream;
