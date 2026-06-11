@@ -216,13 +216,20 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+/// v1.2 audit F23: the body error type is a boxed error (not `hyper::Error`,
+/// which has no public constructor) so the streaming relay can emit an
+/// explicit `Err` frame when the UPSTREAM connection dies mid-body. hyper
+/// then aborts the client connection instead of emitting the terminating
+/// zero-length chunk — without this, a truncated SSE / chunked body looked
+/// protocol-complete to the client.
+type BodyError = Box<dyn std::error::Error + Send + Sync>;
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, BodyError>;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 type UpstreamWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn box_body<B>(body: B) -> BoxBody
 where
-    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Send + Sync + 'static,
+    B: hyper::body::Body<Data = Bytes, Error = BodyError> + Send + Sync + 'static,
 {
     BoxBody::new(body)
 }
@@ -973,6 +980,13 @@ async fn send_with_retry(
     retry_base_ms: u64,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut attempt = 0u32;
+    // Only retry for idempotent methods (GET, HEAD, OPTIONS). POST/PUT/PATCH
+    // are not idempotent — LLM providers may have already billed tokens or
+    // triggered side effects.
+    let is_idempotent = matches!(
+        method,
+        reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+    );
     loop {
         let mut req = client.request(method.clone(), url);
         req = req.headers(headers.clone());
@@ -982,13 +996,6 @@ async fn send_with_retry(
 
         match req.send().await {
             Ok(resp) => {
-                // Only retry 5xx for idempotent methods (GET, HEAD, OPTIONS).
-                // POST/PUT/PATCH are not idempotent — LLM providers may have
-                // already billed tokens or triggered side effects.
-                let is_idempotent = matches!(
-                    method,
-                    reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
-                );
                 if resp.status().is_server_error() && is_idempotent && attempt < max_retries {
                     tracing::warn!(
                         "upstream returned {} (attempt {}/{}), retrying",
@@ -1001,7 +1008,13 @@ async fn send_with_retry(
                 }
             }
             Err(e) => {
-                if attempt < max_retries {
+                // v1.2 audit F9: the network-error arm must obey the SAME
+                // idempotency gate as the 5xx arm above. A timeout / reset
+                // AFTER the request was transmitted does not mean the
+                // upstream didn't execute it — an unconditional retry could
+                // run a POST completion twice (double token billing +
+                // duplicate provider-side state).
+                if is_idempotent && attempt < max_retries {
                     tracing::warn!(
                         "upstream network error (attempt {}/{}): {e}",
                         attempt + 1,
@@ -1163,8 +1176,15 @@ async fn handle_request(
             route.recording_mode.captures_structured_text()
                 && route.provider.supports_websocket_passthrough()
         }) {
-            return handle_websocket_proxy(req, &config, &path_and_query, &headers, route.provider)
-                .await;
+            return handle_websocket_proxy(
+                req,
+                &config,
+                &path_and_query,
+                &headers,
+                route.provider,
+                Arc::clone(&state),
+            )
+            .await;
         }
     }
 
@@ -1256,7 +1276,13 @@ async fn handle_request(
         }
         if let Ok(rname) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
             if let Ok(rval) = reqwest::header::HeaderValue::from_bytes(value.as_ref()) {
-                upstream_headers.insert(rname, rval);
+                // v1.2 audit F22: APPEND, not insert. HeaderMap::iter yields
+                // one pair per VALUE, so insert() collapsed multi-value
+                // request headers (e.g. two `anthropic-beta:` lines) to the
+                // last value — silently dropping requested features upstream.
+                // append() preserves all values, matching the unrouted
+                // forward_raw path's builder semantics.
+                upstream_headers.append(rname, rval);
             }
         }
     }
@@ -1455,7 +1481,7 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(64);
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, BodyError>>(64);
 
     let extract_enabled = allow_extraction
         && config.proxy.extract_enabled
@@ -1540,7 +1566,16 @@ where
                     }
                 }
                 Err(e) => {
+                    // v1.2 audit F23: surface the mid-stream upstream failure
+                    // to the CLIENT as a connection abort. Silently breaking
+                    // here used to close the mpsc channel normally, so hyper
+                    // emitted the terminating zero-length chunk and a
+                    // truncated body looked protocol-complete to non-SSE-aware
+                    // clients.
                     tracing::warn!("upstream stream error: {e}");
+                    let _ = tx
+                        .send(Err(format!("rein proxy: upstream stream error: {e}").into()))
+                        .await;
                     break;
                 }
             }
@@ -1730,6 +1765,7 @@ async fn handle_websocket_proxy(
     path_and_query: &str,
     headers: &hyper::HeaderMap,
     provider: ProviderKind,
+    state: Arc<ProxyState>,
 ) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     let recording_mode = provider.recording_mode_for_path(path_and_query);
     // H5: Only /responses-family routes (StructuredText) are eligible for WS upgrade.
@@ -1794,6 +1830,7 @@ async fn handle_websocket_proxy(
                     artifact,
                     hyper_util::rt::TokioIo::new(upgraded),
                     upstream,
+                    state,
                 )
                 .await;
             }
@@ -1922,6 +1959,7 @@ async fn relay_websocket_with_mirror(
     artifact: ProxyArtifactInput,
     upgraded: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
     upstream: UpstreamWebsocket,
+    state: Arc<ProxyState>,
 ) {
     let response_headers = upstream.headers.clone();
     let should_collect = artifact.route.recording_mode.captures_structured_text();
@@ -2001,9 +2039,9 @@ async fn relay_websocket_with_mirror(
             &response_mirror.assistant_text,
         )
     {
-        let state = Arc::new(ProxyState {
-            metrics: ProxyMetrics::new(),
-        });
+        // v1.2 audit F24: count against the SERVER-WIDE ProxyState (threaded
+        // from run_proxy via handle_request) — a throwaway ProxyState here
+        // made /rein/metrics permanently undercount WS-path extractions.
         maybe_spawn_extraction(
             config,
             &state,
