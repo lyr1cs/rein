@@ -412,7 +412,16 @@ fn open_transcript_reader(path: &str, context: &str) -> Option<BufReader<std::fs
 
 fn extract_transcript_turn(entry: &serde_json::Value) -> Option<(&'static str, String)> {
     let msg_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if msg_type != "human" && msg_type != "assistant" {
+    // v1.2 audit F1 (High): Claude Code transcript JSONL emits `"user"` for
+    // user turns (verified against live transcripts: hundreds of "user"
+    // entries, zero "human") — the old "human"-only match silently dropped
+    // EVERY user turn from session ingest, turn counting, and stop-time
+    // extraction, so user-stated facts/preferences/decisions never reached
+    // the extractor. "human" is kept for older transcript formats. Tool
+    // results also arrive as `"user"` entries, but their content blocks are
+    // `tool_result` (not `text`), so `extract_message_content` already
+    // returns empty for them and they stay excluded.
+    if msg_type != "human" && msg_type != "user" && msg_type != "assistant" {
         return None;
     }
     let content = if let Some(msg) = entry.get("message") {
@@ -423,10 +432,10 @@ fn extract_transcript_turn(entry: &serde_json::Value) -> Option<(&'static str, S
     if content.is_empty() {
         return None;
     }
-    let role = if msg_type == "human" {
-        "User"
-    } else {
+    let role = if msg_type == "assistant" {
         "Assistant"
+    } else {
+        "User"
     };
     Some((role, content))
 }
@@ -699,6 +708,64 @@ mod tests {
         assert!(text.contains("test result: ok"));
         assert!(text.contains("warning: one warning"));
         assert!(!text.contains("old transcript"));
+    }
+
+    /// v1.2 audit F1 (High): real Claude Code transcripts use `"user"` (not
+    /// `"human"`) for user turns. Both must parse; tool_result-only user
+    /// entries must stay excluded; legacy `"human"` keeps working.
+    #[test]
+    fn transcript_turns_accept_user_and_human_types() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Modern Claude Code shape: type "user", content array of text blocks.
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"text","text":"I prefer tabs over spaces"}}]}}}}"#
+        )
+        .unwrap();
+        // Tool result arrives as type "user" but with tool_result blocks only —
+        // must NOT become a turn.
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","content":"raw tool output"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Noted, tabs it is"}}]}}}}"#
+        )
+        .unwrap();
+        // Legacy shape: type "human".
+        writeln!(
+            file,
+            r#"{{"type":"human","message":{{"content":"legacy human turn"}}}}"#
+        )
+        .unwrap();
+        // Non-conversation entry types must stay excluded.
+        writeln!(
+            file,
+            r#"{{"type":"file-history-snapshot","snapshot":{{}}}}"#
+        )
+        .unwrap();
+
+        let payload = serde_json::json!({ "transcript_path": path }).to_string();
+        assert_eq!(
+            count_transcript_turns(&payload),
+            3,
+            "user + assistant + human text turns must count; tool_result and meta entries must not"
+        );
+        let session = extract_hook_session_ingest(&payload).expect("session ingest");
+        let roles: Vec<&str> = session.turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(roles, vec!["User", "Assistant", "User"]);
+        assert!(session.turns[0].content.contains("I prefer tabs"));
+        assert!(
+            !session
+                .turns
+                .iter()
+                .any(|t| t.content.contains("raw tool output")),
+            "tool_result content must not enter turns"
+        );
     }
 
     #[test]

@@ -91,7 +91,27 @@ pub fn update_working_set(
     current.append(&mut incoming);
     let merged = merge_items(current, config.async_memory.max_working_set_items);
     let state = WorkingSetState { items: merged };
-    std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
+    // v1.2 audit F19: tmp + rename (atomic), not in-place truncate+write —
+    // a crash mid-write or an unlocked reader racing the truncate would see
+    // a partial file, and the unwrap_or_default loaders would silently
+    // discard the entire working set. Mirrors save_recent_events.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&state)?)?;
+    // codex R13 P2: the rename replaces the destination INODE — carry the
+    // existing file's permissions onto the tmp so a restrictive mode (e.g.
+    // 0600 from a prior umask) is never loosened on memory-surface content.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    // codex R7 P2: Windows rename fails onto an existing destination (which
+    // is the steady state here). Best-effort remove first; Unix overwrites
+    // atomically and skips this.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(&tmp, &path)?;
 
     let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(lock_file);
@@ -155,7 +175,20 @@ pub fn update_always_on_index(
     current.append(&mut incoming);
     let merged = merge_items(current, config.async_memory.max_always_on_items);
     let state = AlwaysOnState { items: merged };
-    std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
+    // v1.2 audit F19: atomic tmp + rename, same rationale as
+    // update_working_set above (incl. the codex R7 Windows replace guard and
+    // the codex R13 permission-preservation guard).
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&state)?)?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(&tmp, &path)?;
 
     let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(lock_file);

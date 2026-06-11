@@ -384,9 +384,16 @@ pub fn cleanup_stale_buffers(config: &ReinConfig) {
                     if modified_utc < cutoff {
                         tracing::info!("cleaning stale buffer: {}", entry.display());
                         let _ = std::fs::remove_file(&entry);
-                        // Also remove associated lock and flush marker files
-                        let lock = buffer_lock_path(&entry);
-                        let _ = std::fs::remove_file(&lock);
+                        // Also remove associated flush marker/ledger files.
+                        // v1.2 audit F17: the LOCK file is intentionally NOT
+                        // removed — flock correctness requires a stable inode.
+                        // Unlinking a lock file races with_buffer_lock's
+                        // open→flock gap: a peer that already opened the old
+                        // inode would then hold a lock no future process can
+                        // see (the path now resolves to a fresh inode),
+                        // putting two writers inside the "exclusive" section.
+                        // Lock files are 0-byte and bounded by session count;
+                        // leaving them is free.
                         let marker = flush_marker_path(&entry);
                         let _ = std::fs::remove_file(&marker);
                         let _ = std::fs::remove_file(flushed_ledger_path(&entry));
@@ -418,32 +425,13 @@ pub fn cleanup_stale_buffers(config: &ReinConfig) {
             }
         }
     }
-    // Clean orphaned lock files (no matching buffer) — only if not currently held
-    #[cfg(unix)]
-    {
-        let lock_pattern = buf_dir.join("buffer_*.jsonl.lock");
-        if let Ok(entries) = glob::glob(&lock_pattern.to_string_lossy()) {
-            for entry in entries.flatten() {
-                let buf_path = entry.with_extension(""); // strip .lock
-                if !buf_path.exists() {
-                    // Try non-blocking lock to verify nobody holds this lock file
-                    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&entry) {
-                        use std::os::unix::io::AsRawFd;
-                        let rc =
-                            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                        if rc == 0 {
-                            // We got the lock — nobody else holds it, safe to remove
-                            let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
-                            drop(f);
-                            tracing::debug!("cleaning orphaned lock: {}", entry.display());
-                            let _ = std::fs::remove_file(&entry);
-                        }
-                        // rc != 0 means someone holds it — skip
-                    }
-                }
-            }
-        }
-    }
+    // v1.2 audit F17: the orphan-lock sweep was REMOVED. "Probe with LOCK_NB
+    // then unlink" cannot be made safe: a peer inside with_buffer_lock's
+    // open→flock gap has the OLD inode open; after our unlink it flocks an
+    // unlinked inode while every later process creates and locks a NEW inode
+    // at the same path — two writers end up inside the "exclusive" section
+    // and the buffer/ledger files interleave. Lock files are 0-byte and
+    // bounded by session count, so leaving them costs nothing.
 }
 
 fn buffer_lock_path(path: &std::path::Path) -> std::path::PathBuf {

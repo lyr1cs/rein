@@ -129,9 +129,74 @@ struct RecentEventEntry {
     /// rows default to `false` (Quick), which only ever loosens suppression.
     #[serde(default)]
     is_full: bool,
+    /// v1.2 audit F2: char count of the FULL normalized event text. Lets the
+    /// suppressor distinguish "same event re-captured" (suppress) from "the
+    /// same growing document, now longer" (prefix EXTENSION — new content the
+    /// earlier capture never saw). `#[serde(default)]` → legacy rows are 0 =
+    /// unknown, which disables extension detection (falls back to suppress —
+    /// the pre-v1.2 behavior).
+    #[serde(default)]
+    normalized_len: usize,
     preview: String,
     agent_label: String,
     created_at: DateTime<Utc>,
+}
+
+/// v1.2 audit F2: tri-state verdict from the recent-events suppressor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuppressVerdict {
+    /// No recent match — proceed to normal enqueue.
+    New,
+    /// Re-capture of already-seen content — drop.
+    Duplicate,
+    /// Prefix-extension of recently-seen content (e.g. the per-turn Stop
+    /// firing re-rendering a GROWING session transcript): the tail is new
+    /// information the earlier capture never had, so it must not be dropped —
+    /// but per-turn re-extraction of the whole transcript would be O(N²)
+    /// LLM cost. The enqueue path resolves this by REPLACING a still-pending
+    /// matching job with the longer snapshot (one job per drain cycle, always
+    /// the latest), enqueueing fresh only when nothing is pending.
+    Extension,
+}
+
+/// v1.2 audit F2/F3: what actually happened to an enqueue request. `Err` from
+/// the queue fns still means I/O failure; this is the Ok-payload so callers
+/// (hook_post's flushed-content ledger in particular) can distinguish
+/// "content WILL be extracted" from "content was dropped as a duplicate" —
+/// recording dropped content in the ledger would let hook_stop strip turns
+/// that were never extracted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// A new job was appended to the queue.
+    Enqueued,
+    /// A still-pending job for the same growing document was replaced with
+    /// this longer snapshot.
+    Replaced,
+    /// codex remediation R8 P2: a SIMILAR (≥0.85 on the 500-char preview)
+    /// job is already pending — the content is on a path to extraction via
+    /// that job, so this is not a drop. Distinct from `Enqueued`/`Replaced`
+    /// because the pending job's text is NOT byte-identical to ours:
+    /// hook_post must record the flush marker (a mid-session pass covers
+    /// this content) but must NOT ledger-record our exact lines (the
+    /// pending job may never extract them verbatim — same false-ledger
+    /// hazard as audit F3).
+    CoveredByPending,
+    /// Dropped as a duplicate (recent-events match).
+    SuppressedDuplicate,
+}
+
+impl EnqueueOutcome {
+    /// True when the submitted content is on a path to extraction.
+    pub fn accepted(self) -> bool {
+        !matches!(self, EnqueueOutcome::SuppressedDuplicate)
+    }
+
+    /// True when the QUEUED text is byte-identical to (or a strict extension
+    /// of) the submitted content — the only cases where ledger-recording the
+    /// submitted lines as "flushed" is sound.
+    pub fn carries_exact_content(self) -> bool {
+        matches!(self, EnqueueOutcome::Enqueued | EnqueueOutcome::Replaced)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -153,7 +218,7 @@ pub fn queue_memory_job_with_session(
     text: String,
     artifact_id: Option<String>,
     session_json: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EnqueueOutcome> {
     _queue_memory_job(
         config,
         mode,
@@ -179,7 +244,7 @@ pub fn queue_memory_job(
     priority: u8,
     source_query: Option<String>,
     text: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EnqueueOutcome> {
     _queue_memory_job(
         config,
         mode,
@@ -207,11 +272,13 @@ fn _queue_memory_job(
     text: String,
     artifact_id: Option<String>,
     session_json: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EnqueueOutcome> {
     let text = redact_secrets(&text);
     let source_query = source_query.map(|q| redact_secrets(&q));
     if text.trim().is_empty() {
-        return Ok(());
+        // Nothing extractable was submitted; treat as suppressed so callers
+        // never ledger-record empty content.
+        return Ok(EnqueueOutcome::SuppressedDuplicate);
     }
     append_raw_archive(
         config,
@@ -226,7 +293,7 @@ fn _queue_memory_job(
     )?;
     let path = queue_path(config);
     with_advisory_lock(&lock_path(config), true, || {
-        if suppress_duplicate_event(
+        let verdict = suppress_duplicate_event(
             config,
             source,
             &agent_label,
@@ -234,30 +301,60 @@ fn _queue_memory_job(
             matches!(mode, MemoryJobMode::Full),
             source_query.as_deref(),
             &text,
-        )? {
+        )?;
+        if verdict == SuppressVerdict::Duplicate {
             let mut stats = load_worker_stats(config);
             stats.suppressed_duplicates += 1;
             let _ = save_worker_stats(config, &stats);
-            return Ok(());
+            return Ok(EnqueueOutcome::SuppressedDuplicate);
         }
 
-        // Also check pending queue for similar jobs (prevents cross-session duplicates
-        // that fall outside the fingerprint_window_ms).
-        let preview: String = text.chars().take(500).collect();
-        let is_full = matches!(mode, MemoryJobMode::Full);
-        let queue_content = std::fs::read_to_string(&path).unwrap_or_default();
-        for line in queue_content.lines().rev().take(50) {
-            if let Ok(existing) = serde_json::from_str::<MemoryJob>(line) {
-                // Don't suppress a Full job if existing is Quick.
-                if is_full && matches!(existing.mode, MemoryJobMode::Quick) {
-                    continue;
-                }
-                if crate::extract::similarity(
-                    &preview,
-                    &existing.text.chars().take(500).collect::<String>(),
-                ) > 0.85
-                {
-                    return Ok(()); // Already queued with same or higher fidelity
+        // v1.2 audit F2: a prefix EXTENSION of recently-seen content (the
+        // per-turn Stop firing re-rendering a growing transcript) carries new
+        // tail information and must not be dropped — but re-extracting the
+        // full document once per turn would be O(N²) LLM cost. Resolve by
+        // REPLACING a still-pending job for the same document with the longer
+        // snapshot: one job per drain cycle, always the latest content at
+        // drain time. When nothing matching is pending (already drained),
+        // fall through and enqueue fresh — it then absorbs further
+        // extensions itself until the next drain.
+        if verdict == SuppressVerdict::Extension {
+            if let Some(replaced) = try_replace_pending_extension(
+                &path,
+                &agent_label,
+                source,
+                &text,
+                &mode,
+                &artifact_id,
+                &session_json,
+            )? {
+                return Ok(replaced);
+            }
+        } else {
+            // Pending-queue similarity check (prevents cross-session
+            // duplicates that fall outside fingerprint_window_ms). Skipped
+            // for extensions: a growing document is ~identical to its own
+            // pending predecessor in the first 500 chars by construction,
+            // and the precise prefix scan above already ran.
+            let preview: String = text.chars().take(500).collect();
+            let is_full = matches!(mode, MemoryJobMode::Full);
+            let queue_content = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in queue_content.lines().rev().take(50) {
+                if let Ok(existing) = serde_json::from_str::<MemoryJob>(line) {
+                    // Don't suppress a Full job if existing is Quick.
+                    if is_full && matches!(existing.mode, MemoryJobMode::Quick) {
+                        continue;
+                    }
+                    if crate::extract::similarity(
+                        &preview,
+                        &existing.text.chars().take(500).collect::<String>(),
+                    ) > 0.85
+                    {
+                        // Already queued with same or higher fidelity — the
+                        // content reaches extraction via the pending job
+                        // (codex R8 P2: NOT a drop, but also not exact).
+                        return Ok(EnqueueOutcome::CoveredByPending);
+                    }
                 }
             }
         }
@@ -280,8 +377,102 @@ fn _queue_memory_job(
             next_attempt_at: None,
             created_at: Utc::now().to_rfc3339(),
         };
-        append_jsonl(&path, &serde_json::to_string(&job)?)
+        append_jsonl(&path, &serde_json::to_string(&job)?)?;
+        Ok(EnqueueOutcome::Enqueued)
     })
+}
+
+/// v1.2 audit F2: replace a still-pending job that the incoming text strictly
+/// extends (same agent + source, pending text is a byte prefix of the
+/// incoming text — the growing-transcript shape). Keeps the pending job's
+/// queue position and id but swaps in the longer text, the latest artifact id
+/// and session payload, and resets the retry counters (the content changed).
+/// Returns Ok(None) when nothing pending matches. Caller holds the queue
+/// advisory lock.
+#[allow(clippy::too_many_arguments)]
+fn try_replace_pending_extension(
+    path: &std::path::Path,
+    agent_label: &str,
+    source: &str,
+    text: &str,
+    mode: &MemoryJobMode,
+    artifact_id: &Option<String>,
+    session_json: &Option<String>,
+) -> anyhow::Result<Option<EnqueueOutcome>> {
+    let queue_content = std::fs::read_to_string(path).unwrap_or_default();
+    if queue_content.is_empty() {
+        return Ok(None);
+    }
+    let mut lines: Vec<String> = queue_content.lines().map(|l| l.to_string()).collect();
+    let mut replaced_at: Option<usize> = None;
+    // Scan newest-first: the most recent pending snapshot is the one this
+    // extension grew from.
+    for idx in (0..lines.len()).rev() {
+        let Ok(existing) = serde_json::from_str::<MemoryJob>(&lines[idx]) else {
+            continue;
+        };
+        if existing.agent_label != agent_label || existing.source != source {
+            continue;
+        }
+        if existing.text.len() < text.len() && text.starts_with(&existing.text) {
+            let mut updated = existing;
+            updated.mode = mode.clone();
+            updated.text = text.to_string();
+            updated.artifact_id = artifact_id.clone();
+            updated.session_json = session_json.clone();
+            updated.attempts = 0;
+            updated.next_attempt_at = None;
+            lines[idx] = serde_json::to_string(&updated)?;
+            replaced_at = Some(idx);
+            break;
+        }
+    }
+    let Some(_) = replaced_at else {
+        return Ok(None);
+    };
+    // Atomic rewrite (tmp + rename), mirroring save_recent_events.
+    let tmp = path.with_extension("tmp-replace");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    // codex R13 P2: the rename replaces the destination INODE — carry the
+    // existing queue file's permissions onto the tmp so a restrictive mode
+    // (e.g. 0600 from a prior umask) is never silently loosened to the
+    // current process umask on queued memory text.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    // codex R5 P2: Windows rename fails when the destination exists — and in
+    // this path it exists by definition. Best-effort remove first (same
+    // pattern as the warmup staging swap); Unix rename overwrites atomically
+    // and skips this.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(Some(EnqueueOutcome::Replaced))
+}
+
+/// Unconditional worker-process spawn — no env guard, no cooldown. Used by
+/// `drain_memory_queue` to chain a SUCCESSOR worker when it exits on the
+/// per-run cap with work still pending (codex remediation R3 P2: the hooks
+/// that enqueued during the drain already consumed their spawn attempts
+/// against the held drain lock / cooldown, so without a successor the tail
+/// sits until an unrelated future enqueue). Touches the spawn marker so the
+/// normal cooldown accounting still sees the spawn.
+fn spawn_worker_process(config: &ReinConfig) {
+    let _ = touch_spawn_marker(config);
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("worker")
+        .arg("memory")
+        .env("REIN_MEMORY_WORKER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
 }
 
 pub fn spawn_memory_worker(config: &ReinConfig) {
@@ -296,18 +487,8 @@ pub fn spawn_memory_worker(config: &ReinConfig) {
     }
     // Touch spawn marker BEFORE spawning to close TOCTOU race window where two
     // concurrent hook invocations both see the cooldown as expired.
-    let _ = touch_spawn_marker(config);
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("worker")
-        .arg("memory")
-        .env("REIN_MEMORY_WORKER", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let _ = cmd.spawn();
+    // (Marker touch happens inside spawn_worker_process.)
+    spawn_worker_process(config);
 }
 
 pub(crate) fn collect_queue_diagnostics(config: &ReinConfig) -> QueueGroupDiagnostics {
@@ -835,7 +1016,15 @@ fn merge_refinement_spawn_marker_path(config: &ReinConfig) -> std::path::PathBuf
 pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
     let path = queue_path(config);
     let inflight = inflight_path(config);
-    let lock = lock_path(config);
+    // v1.2 audit F5: the drain previously held the ENQUEUE lock
+    // (`lock_path`) for the entire async drain — up to 32 jobs of network
+    // LLM extraction — while `_queue_memory_job` takes a BLOCKING flock on
+    // the same file, so every hook enqueue stalled behind the worker
+    // (easily past Claude Code's 60s hook timeout). Single-drainer mutual
+    // exclusion now uses a DEDICATED drain lock held across the drain; the
+    // shared enqueue lock is taken only around the brief claim phase
+    // (recover + rename snapshot) inside drain_memory_queue_locked.
+    let lock = drain_lock_path(config);
     if let Some(parent) = lock.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -860,9 +1049,99 @@ pub async fn drain_memory_queue(config: &ReinConfig) -> anyhow::Result<u32> {
     // lock_file is held for the entire operation (including async phases).
     // The flock is advisory and process-scoped — it survives across awaits
     // because the file descriptor stays open in lock_file.
-    let result = drain_memory_queue_locked(config, &path, &inflight).await;
+    //
+    // codex v1.2 remediation R1 P1: with enqueues no longer blocked behind
+    // the drain, a hook can append a job WHILE this worker is processing —
+    // and that hook's spawn attempt is consumed immediately (suppressed by
+    // the spawn cooldown or by this very drain lock), so without a recheck
+    // the job would sit unprocessed until some future enqueue. Loop: when a
+    // pass fully drained the ready set (processed < max_jobs_per_run) and
+    // the queue file is non-empty again, run another pass. A pass that hit
+    // the per-run cap exits as before (pre-existing batch semantics — the
+    // write-back preserved the tail for the next worker), and a pass that
+    // processed 0 (only deferred/future jobs remain) also exits.
+    // codex remediation R3 P1: cap/liveness decisions key off JOBS CLAIMED
+    // (and an explicit hit-cap signal) from each pass — `stored` counts
+    // memories produced by process_job, which undercounts whenever jobs are
+    // filtered/empty, and comparing it against max_jobs_per_run both
+    // bypassed the LLM-job cap and mis-detected "fully drained".
+    let mut total_stored: u32 = 0;
+    // codex remediation R4 P2: max_jobs_per_run is a WORKER-LIFETIME budget
+    // ("worker drains up to this many jobs before exiting"), enforced
+    // cumulatively across every pass — including the F5/R2 re-check passes.
+    // Without this, steady hook traffic kept one worker claiming fresh
+    // arrivals forever instead of handing off after the run budget.
+    let mut budget: usize = config.async_memory.max_jobs_per_run;
+    let result = 'outer: loop {
+        // Inner passes with the drain lock held; yields the last pass.
+        let last_pass: DrainPass = loop {
+            match drain_memory_queue_locked(config, &path, &inflight, budget).await {
+                Ok(pass) => {
+                    total_stored = total_stored.saturating_add(pass.stored);
+                    budget = budget.saturating_sub(pass.jobs_claimed as usize);
+                    if !pass.hit_cap
+                        && pass.jobs_claimed > 0
+                        && budget > 0
+                        && queue_has_ready_job(&path)
+                    {
+                        continue;
+                    }
+                    break pass;
+                }
+                Err(e) => break 'outer Err(e),
+            }
+        };
+        // Budget exhausted (or a pass left a ready tail behind): exit with
+        // the tail preserved — the cap bounds THIS worker's LLM spend.
+        // codex R3 P2: jobs appended during the drain consumed their spawn
+        // attempts against our held lock / the cooldown, so chain an
+        // unconditional successor worker (after releasing the lock) instead
+        // of relying on a future enqueue.
+        if last_pass.hit_cap || budget == 0 {
+            let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+            // codex R9 P2: gate the successor on READY work (locked read) —
+            // a budget exhausted by rescheduling failures alone leaves only
+            // future-dated retries, and a successor spawned for those exits
+            // immediately while its marker touch arms the cooldown against
+            // the next REAL enqueue.
+            // codex R5 P2: never chain a successor when the configured
+            // budget is zero — max_jobs_per_run = 0 means the worker is
+            // effectively disabled, and an unconditional (cooldown-free)
+            // successor would spawn-loop forever on a non-empty queue.
+            if config.async_memory.max_jobs_per_run > 0 && queue_has_ready_job_locked(config, &path)
+            {
+                spawn_worker_process(config);
+            }
+            break Ok(total_stored);
+        }
+        // codex remediation R2 P2 (+ R7 P2): the pre-release check races
+        // hooks — a job appended after the inner loop's check but before our
+        // LOCK_UN sees a held drain lock, its spawned worker exits, and the
+        // job strands. Close the window by RELEASING first, then rechecking
+        // for READY work specifically (R7: a metadata-length check spun a
+        // false reclaim cycle on deferred-only queues AND missed the
+        // deferred-only early exit stranding a fresh ready job): anything
+        // ready appended before the recheck is visible to us (reclaim the
+        // lock and run another cycle — the claim takes the entire ready
+        // set, so cycles only repeat when NEW ready work keeps arriving);
+        // anything appended after it finds the lock free, so its own
+        // spawned worker proceeds.
+        let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+        // codex R9 P2: locked read — serializes against a hook mid-append.
+        if !queue_has_ready_job_locked(config, &path) {
+            break Ok(total_stored);
+        }
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            // Another worker holds the drain lock now — the pending job is
+            // its to process.
+            break Ok(total_stored);
+        }
+        // Reclaimed with the lock held — loop back for another full cycle.
+    };
 
-    // Explicitly unlock + drop (lock released when fd closes).
+    // Explicitly unlock + drop (lock released when fd closes; harmless if
+    // already unlocked on the no-reclaim exit paths).
     let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(lock_file);
     result
@@ -936,19 +1215,29 @@ async fn drain_memory_queue_locked(
     config: &ReinConfig,
     path: &std::path::Path,
     inflight: &std::path::Path,
-) -> anyhow::Result<u32> {
-    recover_inflight(path, inflight)?;
-
-    if !path.exists() {
-        return Ok(0);
+    max_jobs: usize,
+) -> anyhow::Result<DrainPass> {
+    if max_jobs == 0 {
+        return Ok(DrainPass::default());
     }
-    let meta = std::fs::metadata(path)?;
-    if meta.len() == 0 {
-        return Ok(0);
-    }
-
-    std::fs::rename(path, inflight)?;
-    let content = std::fs::read_to_string(inflight).unwrap_or_default();
+    // v1.2 audit F5: claim phase under the SHARED enqueue lock (brief —
+    // recover + rename snapshot + read). Enqueues only ever wait for this,
+    // not for the LLM processing below.
+    let content = with_advisory_lock(&lock_path(config), true, || {
+        recover_inflight(path, inflight)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let meta = std::fs::metadata(path)?;
+        if meta.len() == 0 {
+            return Ok(None);
+        }
+        std::fs::rename(path, inflight)?;
+        Ok(Some(std::fs::read_to_string(inflight).unwrap_or_default()))
+    })?;
+    let Some(content) = content else {
+        return Ok(DrainPass::default());
+    };
     let jobs = content
         .lines()
         .filter_map(|line| serde_json::from_str::<MemoryJob>(line).ok())
@@ -974,9 +1263,15 @@ async fn drain_memory_queue_locked(
     let mut remaining = Vec::new();
     let mut stats = load_worker_stats(config);
 
-    // Split ready jobs: process first batch, keep the rest
-    let split_at = config.async_memory.max_jobs_per_run.min(ready.len());
+    // Split ready jobs: process first batch (bounded by the caller's
+    // remaining worker budget — codex R4 P2), keep the rest.
+    let split_at = max_jobs.min(ready.len());
     let ready_tail = ready.split_off(split_at);
+    // codex remediation R3 P1: the caller's cap/liveness logic needs JOBS
+    // claimed and whether the per-run cap left a ready tail behind —
+    // `processed` (memories stored) is the wrong unit for both.
+    let jobs_claimed = split_at as u32;
+    let hit_cap = !ready_tail.is_empty();
     let to_process = ready; // first `split_at` jobs
 
     for job in to_process {
@@ -1004,26 +1299,50 @@ async fn drain_memory_queue_locked(
 
     // Write remaining jobs atomically: write to temp file first, then rename.
     // This prevents partial writes from panics or crashes from corrupting the queue.
+    //
+    // v1.2 audit F5 follow-through: the enqueue lock is NOT held during
+    // processing anymore, so jobs may have been appended to `path` while we
+    // worked. The write-back must MERGE them (remaining first, then the new
+    // arrivals) under the enqueue lock — a plain rename would clobber every
+    // job enqueued during the drain.
     if !remaining.is_empty() {
-        use std::io::Write;
-        let tmp_path = path.with_extension("jsonl.tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        for job in &remaining {
-            writeln!(file, "{}", serde_json::to_string(job)?)?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&tmp_path, path)?;
+        with_advisory_lock(&lock_path(config), true, || {
+            use std::io::Write;
+            let newly_enqueued = std::fs::read_to_string(path).unwrap_or_default();
+            let tmp_path = path.with_extension("jsonl.tmp");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            for job in &remaining {
+                writeln!(file, "{}", serde_json::to_string(job)?)?;
+            }
+            for line in newly_enqueued.lines().filter(|l| !l.trim().is_empty()) {
+                writeln!(file, "{line}")?;
+            }
+            file.sync_all()?;
+            // codex R5 P2: hooks may have recreated `path` during processing
+            // (we hold the enqueue lock now, but the file can exist) and
+            // Windows rename fails onto an existing destination.
+            #[cfg(windows)]
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })?;
     }
 
     // Safe to delete inflight now — remaining jobs are persisted in queue.
     let _ = std::fs::remove_file(inflight);
     stats.last_run_at = Some(Utc::now().to_rfc3339());
     let _ = save_worker_stats(config, &stats);
-    Ok(processed)
+    Ok(DrainPass {
+        stored: processed,
+        jobs_claimed,
+        hit_cap,
+    })
 }
 
 async fn process_job(config: &ReinConfig, job: MemoryJob) -> anyhow::Result<u32> {
@@ -1093,6 +1412,52 @@ fn inflight_path(config: &ReinConfig) -> std::path::PathBuf {
 
 fn lock_path(config: &ReinConfig) -> std::path::PathBuf {
     project_scoped_path(config, "memory_queue_lock")
+}
+
+/// v1.2 audit F5: dedicated single-drainer lock, distinct from the enqueue
+/// lock so hooks never block behind a worker's LLM processing.
+fn drain_lock_path(config: &ReinConfig) -> std::path::PathBuf {
+    project_scoped_path(config, "memory_queue_drain_lock")
+}
+
+/// Result of one locked drain pass (codex remediation R3 P1): the caller's
+/// cap/liveness logic needs the number of queue JOBS claimed and an explicit
+/// hit-cap signal — `stored` (memories produced) undercounts whenever jobs
+/// extract to nothing and must only be used for reporting.
+#[derive(Debug, Default, Clone, Copy)]
+struct DrainPass {
+    stored: u32,
+    jobs_claimed: u32,
+    hit_cap: bool,
+}
+
+/// True when the queue file holds at least one job whose retry timer has
+/// elapsed (codex R7 P2: liveness rechecks must distinguish READY work from
+/// deferred-only backlogs — a length check both spun false reclaim cycles on
+/// deferred-only queues and let a fresh ready job strand behind the
+/// deferred-only early exit). Unparseable lines count as ready so corrupt
+/// entries still get a pass to dead-letter them.
+fn queue_has_ready_job(path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let now = Utc::now();
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .any(|line| match serde_json::from_str::<MemoryJob>(line) {
+            Ok(job) => job.next_attempt_at.is_none_or(|ts| ts <= now),
+            Err(_) => true,
+        })
+}
+
+/// `queue_has_ready_job` under the ENQUEUE lock (codex R9 P2): a hook holds
+/// `lock_path` while creating + writing the queue file, so an unlocked read
+/// can observe the file created but the JSONL line not yet written and
+/// wrongly conclude "no ready work" — exactly the strand this recheck is
+/// meant to close. Taking the lock serializes against in-flight appends.
+fn queue_has_ready_job_locked(config: &ReinConfig, path: &std::path::Path) -> bool {
+    with_advisory_lock(&lock_path(config), true, || Ok(queue_has_ready_job(path))).unwrap_or(false)
 }
 
 fn dead_letter_path(config: &ReinConfig) -> std::path::PathBuf {
@@ -1775,7 +2140,7 @@ fn suppress_duplicate_event(
     is_full: bool,
     source_query: Option<&str>,
     text: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<SuppressVerdict> {
     let path = recent_events_path(config);
     let now = Utc::now();
     let mut state = load_recent_events(config);
@@ -1786,6 +2151,7 @@ fn suppress_duplicate_event(
         .retain(|item| (now - item.created_at).num_milliseconds() <= window_ms);
 
     let normalized = normalized_event_text(source, source_query, text);
+    let normalized_len = normalized.chars().count();
     let preview: String = normalized.chars().take(2000).collect();
     let fingerprint = sha256_hex(&preview);
     // Cross-agent exact-duplicate fingerprint: hash the RAW (already
@@ -1802,14 +2168,16 @@ fn suppress_duplicate_event(
     // double-capture, never two independent observations.
     let full_fingerprint = sha256_hex(text);
 
-    let duplicate = state.items.iter().any(|item| {
+    let mut saw_duplicate = false;
+    let mut saw_extension = false;
+    for item in state.items.iter() {
         // v0.37 hook-dup fix — Full-over-Quick, applied UNIFORMLY first: an
         // incoming Full job is never suppressed by a stored Quick entry on ANY
         // match path (mirrors the pending-queue exception). A Full extraction
         // is higher fidelity than the Quick one it may share content with, so
         // it must always be allowed through.
         if is_full && !item.is_full {
-            return false;
+            continue;
         }
         // FULL-content, cross-agent exact match: catches the post-flush + stop
         // re-queue of identical buffered content even when the two firings
@@ -1818,27 +2186,61 @@ fn suppress_duplicate_event(
         // tail cannot false-suppress a distinct event. Guarded on non-empty so
         // legacy cache rows (no `full_fingerprint`) never cross-match.
         if !item.full_fingerprint.is_empty() && item.full_fingerprint == full_fingerprint {
-            return true;
+            saw_duplicate = true;
+            break;
         }
         // Within-agent path: truncated-preview fingerprint + fuzzy similarity,
         // scoped to the same agent so genuinely distinct agents' similar
         // content is not cross-suppressed.
         if item.agent_label != agent_label {
-            return false;
+            continue;
         }
         if is_subagent && !item.agent_label.contains(":") {
-            return false;
+            continue;
         }
-        if item.fingerprint == fingerprint {
-            return true;
+        // v1.2 audit F2 (High): a strict prefix EXTENSION is the same growing
+        // document with NEW tail content (the per-turn Stop firing shape:
+        // each firing re-renders the full transcript, so successive texts are
+        // prefix-extending). Suppressing it as a duplicate permanently lost
+        // every turn after the first capture in a continuously-active session
+        // — each suppressed firing re-pushed a fresh-timestamp entry with the
+        // SAME prefix fingerprint, so the window self-renewed forever.
+        // Extension test: stored entry knows its full normalized length
+        // (0 = legacy row → unknown → keep old suppress behavior), incoming
+        // is strictly longer, and incoming's prefix at the stored PREVIEW
+        // length is char-identical to the stored preview.
+        let stored_preview_len = item.preview.chars().count();
+        let is_extension = item.normalized_len > 0
+            && normalized_len > item.normalized_len
+            && stored_preview_len > 0
+            && normalized
+                .chars()
+                .take(stored_preview_len)
+                .eq(item.preview.chars());
+        if item.fingerprint == fingerprint
+            || crate::extract::similarity(&item.preview, &preview) > 0.94
+        {
+            if is_extension {
+                saw_extension = true;
+                continue;
+            }
+            saw_duplicate = true;
+            break;
         }
-        crate::extract::similarity(&item.preview, &preview) > 0.94
-    });
+    }
+    let verdict = if saw_duplicate {
+        SuppressVerdict::Duplicate
+    } else if saw_extension {
+        SuppressVerdict::Extension
+    } else {
+        SuppressVerdict::New
+    };
 
     state.items.push(RecentEventEntry {
         fingerprint,
         full_fingerprint,
         is_full,
+        normalized_len,
         preview,
         agent_label: agent_label.to_string(),
         created_at: now,
@@ -1848,7 +2250,7 @@ fn suppress_duplicate_event(
         state.items = state.items.split_off(start);
     }
     save_recent_events(config, &path, &state)?;
-    Ok(duplicate)
+    Ok(verdict)
 }
 
 fn load_recent_events(config: &ReinConfig) -> RecentEventState {
@@ -2012,6 +2414,155 @@ mod tests {
             sha256_hex(b),
             "raw full fingerprints must NOT collide on distinct operators"
         );
+    }
+
+    fn isolated_config() -> (ReinConfig, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("queue-test.db")
+            .to_string_lossy()
+            .into_owned();
+        config.hooks.buffer_dir = tmp.path().join("buffer").to_string_lossy().into_owned();
+        (config, tmp)
+    }
+
+    /// v1.2 audit F2 (High): the per-turn Stop firing shape — successive
+    /// prefix-extending transcripts — must classify as Extension (new tail
+    /// content), while a re-send of identical content stays Duplicate.
+    /// Pre-fix, the extension was suppressed AND re-pushed a fresh-timestamp
+    /// entry with the same prefix fingerprint, so a continuously-active
+    /// session never ingested anything past the first capture.
+    #[test]
+    fn suppressor_classifies_prefix_extension_vs_duplicate() {
+        let (config, _tmp) = isolated_config();
+        let base =
+            "User: we decided to use postgres for billing because sqlite locks.\n".repeat(40); // well past the 2000-char preview cap
+        let extended = format!("{base}Assistant: noted, migration plan saved.\n");
+        let extended_more = format!("{extended}User: also pin MSRV at 1.86.\n");
+
+        let v1 = suppress_duplicate_event(&config, "hook_stop", "main", false, true, None, &base)
+            .unwrap();
+        assert_eq!(v1, SuppressVerdict::New);
+
+        let v2 = suppress_duplicate_event(&config, "hook_stop", "main", false, true, None, &base)
+            .unwrap();
+        assert_eq!(
+            v2,
+            SuppressVerdict::Duplicate,
+            "identical re-send stays duplicate"
+        );
+
+        let v3 =
+            suppress_duplicate_event(&config, "hook_stop", "main", false, true, None, &extended)
+                .unwrap();
+        assert_eq!(
+            v3,
+            SuppressVerdict::Extension,
+            "longer prefix-extension must pass"
+        );
+
+        let v4 = suppress_duplicate_event(
+            &config,
+            "hook_stop",
+            "main",
+            false,
+            true,
+            None,
+            &extended_more,
+        )
+        .unwrap();
+        assert_eq!(
+            v4,
+            SuppressVerdict::Extension,
+            "every further growth step is again an extension"
+        );
+
+        let v5 = suppress_duplicate_event(
+            &config,
+            "hook_stop",
+            "main",
+            false,
+            true,
+            None,
+            &extended_more,
+        )
+        .unwrap();
+        assert_eq!(
+            v5,
+            SuppressVerdict::Duplicate,
+            "re-send of the latest snapshot is a duplicate again"
+        );
+    }
+
+    /// v1.2 audit F2: pending-queue replacement — an extension swaps the
+    /// still-pending shorter snapshot in place (same id, reset attempts,
+    /// latest text/session payload), leaving unrelated jobs untouched.
+    #[test]
+    fn pending_extension_replaces_matching_job_in_place() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("memory_queue");
+        let job = |id: &str, agent: &str, text: &str| MemoryJob {
+            id: id.into(),
+            mode: MemoryJobMode::Full,
+            source: "ingest_session".into(),
+            source_label: "source:main-agent".into(),
+            agent_label: agent.into(),
+            is_subagent: false,
+            priority: 95,
+            source_query: None,
+            text: text.into(),
+            artifact_id: Some("artifact-old".into()),
+            session_json: Some("{\"old\":true}".into()),
+            attempts: 2,
+            next_attempt_at: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let lines = [
+            serde_json::to_string(&job("other", "subagent:x", "unrelated text")).unwrap(),
+            serde_json::to_string(&job("target", "main", "session transcript v1")).unwrap(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let outcome = try_replace_pending_extension(
+            &path,
+            "main",
+            "ingest_session",
+            "session transcript v1 plus a new turn",
+            &MemoryJobMode::Full,
+            &Some("artifact-new".into()),
+            &Some("{\"new\":true}".into()),
+        )
+        .unwrap();
+        assert_eq!(outcome, Some(EnqueueOutcome::Replaced));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let jobs: Vec<MemoryJob> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(jobs.len(), 2, "no jobs added or lost");
+        assert_eq!(jobs[0].text, "unrelated text", "unrelated job untouched");
+        let replaced = &jobs[1];
+        assert_eq!(replaced.id, "target", "queue position + id preserved");
+        assert_eq!(replaced.text, "session transcript v1 plus a new turn");
+        assert_eq!(replaced.artifact_id.as_deref(), Some("artifact-new"));
+        assert_eq!(replaced.session_json.as_deref(), Some("{\"new\":true}"));
+        assert_eq!(replaced.attempts, 0, "retry counters reset for new content");
+
+        // Non-extension (different document) must not match anything.
+        let none = try_replace_pending_extension(
+            &path,
+            "main",
+            "ingest_session",
+            "a completely different document",
+            &MemoryJobMode::Full,
+            &None,
+            &None,
+        )
+        .unwrap();
+        assert_eq!(none, None);
     }
 
     #[test]

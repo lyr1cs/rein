@@ -90,7 +90,7 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                         MemoryJobMode::Full
                     };
                     let priority = if is_subagent { 10 } else { 40 };
-                    if let Err(e) = queue_memory_job(
+                    match queue_memory_job(
                         config,
                         mode,
                         "hook_post",
@@ -105,13 +105,36 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                         None,
                         combined,
                     ) {
-                        eprintln!("rein: failed to queue memory job: {e}");
-                    } else {
-                        mark_flushed(&buf_path);
-                        // v1.2: remember WHAT was flushed (content hashes) so
-                        // hook_stop can filter verbatim re-occurrences out of
-                        // the transcript turns instead of re-extracting them.
-                        record_flushed_content(&buf_path, &flushable);
+                        Err(e) => {
+                            eprintln!("rein: failed to queue memory job: {e}");
+                        }
+                        // v1.2 audit F3: gate the flush marker AND the ledger
+                        // on the job actually being accepted for extraction.
+                        // A suppressed duplicate was NOT queued — recording it
+                        // as flushed would let hook_stop strip its verbatim
+                        // occurrence from the transcript turns even though it
+                        // was never extracted (losing the fact), and the
+                        // flush marker would wrongly flip the session into
+                        // incremental mode.
+                        //
+                        // codex R8 P2: ledger-record ONLY when the queued
+                        // text carries our exact content (Enqueued/Replaced).
+                        // A CoveredByPending match routes the content to
+                        // extraction via a merely-SIMILAR pending job, so the
+                        // flush marker is recorded but our exact lines are
+                        // not — the pending job may never extract them
+                        // verbatim (same false-ledger hazard as F3).
+                        Ok(outcome) if outcome.accepted() => {
+                            mark_flushed(&buf_path);
+                            if outcome.carries_exact_content() {
+                                // v1.2: remember WHAT was flushed (content
+                                // hashes) so hook_stop can filter verbatim
+                                // re-occurrences out of the transcript turns
+                                // instead of re-extracting them.
+                                record_flushed_content(&buf_path, &flushable);
+                            }
+                        }
+                        Ok(_) => {}
                     }
                     spawn_memory_worker(config);
                 }
@@ -288,30 +311,23 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
                 session.tool_outputs = buffered.clone();
             }
             if incremental_mode {
-                // Bulk of this session's content was already extracted incrementally.
-                // Only clear turns when there is fallback content for episode synthesis
-                // (buffered tool outputs OR a compact_summary from Claude's compaction).
-                // If neither exists, keeping the turns prevents silently losing the episode
-                // record and any stop-time memories on sessions with no summary fields.
-                let has_fallback = !buffered.is_empty() || session.compact_summary.is_some();
-                if has_fallback {
-                    session.turns.clear();
-                } else {
-                    // v1.2 content-level dedup: the kept turns historically
-                    // re-fed the FULL transcript to the LLM, re-extracting
-                    // content the mid-session flushes already covered (the
-                    // queue's exact-dedup can't catch the resulting
-                    // semantically-near LLM outputs). Strip exactly what the
-                    // ledger proves was flushed — verbatim whole-turn or
-                    // long-line matches — and keep every conversation fact.
-                    // (The v0.38 offset approach was rejected: conversation
-                    // turns never enter the buffer, so truncation would drop
-                    // never-extracted facts.)
-                    session.turns = filter_turns_against_flushed(
-                        std::mem::take(&mut session.turns),
-                        &flushed_hashes,
-                    );
-                }
+                // v1.2 content-level dedup (audit F18 unified both branches):
+                // the turns historically either re-fed the FULL transcript to
+                // the LLM (no-fallback branch — re-extracting content the
+                // mid-session flushes already covered) or were CLEARED
+                // wholesale (fallback branch — discarding conversation facts
+                // that never entered the buffer: only PostToolUse tool output
+                // is buffered, so buffered content is not a substitute for
+                // conversation turns). Both branches now strip exactly what
+                // the ledger proves was flushed — verbatim whole-turn or
+                // long-line matches — and keep every conversation fact.
+                // (The v0.38 offset approach was rejected: conversation turns
+                // never enter the buffer, so truncation would drop
+                // never-extracted facts.)
+                session.turns = filter_turns_against_flushed(
+                    std::mem::take(&mut session.turns),
+                    &flushed_hashes,
+                );
             }
             let _ =
                 crate::ops::queue_ingest_session(config, &session, Some(&agent_label), is_subagent);

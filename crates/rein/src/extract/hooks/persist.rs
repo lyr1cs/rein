@@ -19,6 +19,11 @@ pub struct StoreExtractedStats {
     pub created_count: u32,
     pub merged_count: u32,
     pub superseded_count: u32,
+    /// v1.2 audit F4: items that PASSED filtering/admission but whose
+    /// `store_with_dedup` errored (SQLITE_BUSY, disk-full, I/O). Previously
+    /// discarded with no trace — the job was marked done and the extracted
+    /// memories silently lost.
+    pub store_failed_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -357,6 +362,7 @@ pub fn store_extracted_report(
         }
 
         let content_for_activation = item.content.clone();
+        let memory_summary_for_log = item.summary.clone();
         let importance = item
             .importance
             .parse::<crate::types::Importance>()
@@ -394,40 +400,54 @@ pub fn store_extracted_report(
             updated_at: chrono::Utc::now(),
             last_accessed: chrono::Utc::now(),
         };
-        if let Ok(id) = store.store_with_dedup(
+        match store.store_with_dedup(
             memory,
             config.search.dedup_similarity as f32,
             config.search.dedup_time_window_days,
         ) {
-            stats.stored_ids.push(id.clone());
-            stats.stored_count += 1;
-            if id != proposed_id {
-                stats.merged_count += 1;
-            } else {
-                let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
-                let _ = store.activate_related_memories(&content_for_activation, 3);
-                let _ = store.activate_related_concepts(&content_for_activation);
-                let _ = store.apply_evolution(&id, &content_for_activation, None);
-                let superseded_rows: u32 = store
-                    .conn()
-                    .query_row(
-                        "SELECT COUNT(*) FROM memories WHERE superseded_by = ?1",
-                        rusqlite::params![&id],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                if superseded_rows > 0 {
-                    stats.superseded_count += 1;
+            Ok(id) => {
+                stats.stored_ids.push(id.clone());
+                stats.stored_count += 1;
+                if id != proposed_id {
+                    stats.merged_count += 1;
                 } else {
-                    stats.created_count += 1;
+                    let _ = store.auto_link(&id, config.search.dedup_similarity as f32, 5);
+                    let _ = store.activate_related_memories(&content_for_activation, 3);
+                    let _ = store.activate_related_concepts(&content_for_activation);
+                    let _ = store.apply_evolution(&id, &content_for_activation, None);
+                    let superseded_rows: u32 = store
+                        .conn()
+                        .query_row(
+                            "SELECT COUNT(*) FROM memories WHERE superseded_by = ?1",
+                            rusqlite::params![&id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if superseded_rows > 0 {
+                        stats.superseded_count += 1;
+                    } else {
+                        stats.created_count += 1;
+                    }
                 }
+            }
+            // v1.2 audit F4: surface the failure instead of silently dropping
+            // an admitted memory. Counted + logged here; callers fail the job
+            // when an entire batch was lost so the queue's retry/dead-letter
+            // machinery gets a chance instead of marking it done.
+            Err(e) => {
+                stats.store_failed_count += 1;
+                tracing::warn!(
+                    summary = %memory_summary_for_log,
+                    error = %e,
+                    "store_with_dedup failed for admitted extraction item"
+                );
             }
         }
     }
     stats
 }
 
-fn surface_memories_for_ids(
+pub(crate) fn surface_memories_for_ids(
     store: &crate::store::SqliteStore,
     ids: &[String],
 ) -> Vec<ExtractedMemory> {
@@ -466,7 +486,19 @@ pub fn process_quick_extraction(
         return Ok(0);
     }
     let store = config.open_store()?;
-    let (stored, ids) = store_extracted(&store, config, extracted, agent_label, is_subagent);
+    let stats = store_extracted_report(&store, config, extracted, agent_label, is_subagent);
+    // v1.2 audit F4: when every admitted item failed to store (transient
+    // SQLITE_BUSY / disk pressure), fail the job so the queue retries it
+    // instead of marking it done with the extraction silently dropped.
+    // Partial success is NOT failed — retrying would re-run the LLM for
+    // already-stored items; the failure count is logged per item instead.
+    if stats.stored_count == 0 && stats.store_failed_count > 0 {
+        anyhow::bail!(
+            "all {} admitted extraction items failed to store; retrying job",
+            stats.store_failed_count
+        );
+    }
+    let (stored, ids) = (stats.stored_count, stats.stored_ids);
     let memories_for_ws = surface_memories_for_ids(&store, &ids);
     let _ = update_working_set(
         config,
@@ -503,8 +535,16 @@ pub fn process_full_extraction(
     let store = config.open_store()?;
     let episode_for_ws = result.episode.clone();
     let concepts_for_ws = result.concepts.clone();
-    let (mem_count, memory_ids) =
-        store_extracted(&store, config, result.memories, agent_label, is_subagent);
+    let stats = store_extracted_report(&store, config, result.memories, agent_label, is_subagent);
+    // v1.2 audit F4: total batch loss → fail the job for retry (nothing —
+    // memories, KG units, episode — has been persisted yet at this point).
+    if stats.stored_count == 0 && stats.store_failed_count > 0 {
+        anyhow::bail!(
+            "all {} admitted extraction items failed to store; retrying job",
+            stats.store_failed_count
+        );
+    }
+    let (mem_count, memory_ids) = (stats.stored_count, stats.stored_ids);
     let memories_for_ws = surface_memories_for_ids(&store, &memory_ids);
     let _ = update_working_set(
         config,

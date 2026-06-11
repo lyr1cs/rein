@@ -862,7 +862,6 @@ pub fn ingest_extraction_report(
 
     let store = config.open_store()?;
     let episode_for_ws = result.episode.clone();
-    let memories_for_ws = result.memories.clone();
     let concepts_for_ws = result.concepts.clone();
     let ingest_agent = agent_label
         .or(session.source_agent.as_deref())
@@ -874,8 +873,25 @@ pub fn ingest_extraction_report(
         ingest_agent,
         is_subagent,
     );
+    // v1.2 audit F4: total batch loss → fail the job so the queue retries
+    // (nothing has been persisted yet).
+    if memory_stats.stored_count == 0 && memory_stats.store_failed_count > 0 {
+        return Err(crate::types::ReinError::Config(format!(
+            "all {} admitted extraction items failed to store; retrying job",
+            memory_stats.store_failed_count
+        )));
+    }
     let memory_count = memory_stats.stored_count;
     let stored_memory_ids = memory_stats.stored_ids.clone();
+    // v1.2 audit F8: the working set / always-on index must surface only
+    // memories that actually PASSED the secret filter + admission gate and
+    // were stored — `result.memories` is the raw pre-filter LLM output, and
+    // writing it verbatim leaked secret-looking / rejected items into
+    // working_set.json + always_on_index.json (which hook_prompt and
+    // SessionStart inject into agent context). Mirrors the two persist.rs
+    // paths, which already surface from stored ids.
+    let memories_for_ws =
+        crate::extract::hooks::persist::surface_memories_for_ids(&store, &stored_memory_ids);
     let _ = crate::extract::hooks::working_set::update_working_set(
         config,
         &memories_for_ws,
