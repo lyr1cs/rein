@@ -19,7 +19,8 @@ use crate::config::ReinConfig;
 
 use self::buffer::{
     adaptive_flush_threshold, append_to_buffer, cleanup_stale_buffers, clear_flush_marker,
-    flush_count, mark_flushed, read_and_clear_buffer, session_buffer_path,
+    clear_flushed_ledger, filter_turns_against_flushed, flush_count, mark_flushed,
+    read_and_clear_buffer, read_flushed_hashes, record_flushed_content, session_buffer_path,
 };
 use self::parsing::*;
 use self::queue::*;
@@ -71,12 +72,17 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
             );
             let buffered = read_and_clear_buffer(&buf_path);
             if !buffered.is_empty() {
-                let combined = buffered
+                // codex v1.2 R1 P2: split filter from join — the ledger below
+                // must record ONLY the items actually queued for extraction.
+                // Recording the unfiltered slice would let a secret-looking
+                // false positive (never extracted here) strip its verbatim
+                // occurrence from the stop-time turns, losing the fact.
+                let flushable: Vec<String> = buffered
                     .iter()
                     .filter(|t| !looks_like_secret(t))
                     .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n---\n");
+                    .collect();
+                let combined = flushable.join("\n---\n");
                 if !combined.is_empty() {
                     let mode = if is_subagent {
                         MemoryJobMode::Quick
@@ -102,6 +108,10 @@ pub async fn hook_post(config: &ReinConfig) -> anyhow::Result<()> {
                         eprintln!("rein: failed to queue memory job: {e}");
                     } else {
                         mark_flushed(&buf_path);
+                        // v1.2: remember WHAT was flushed (content hashes) so
+                        // hook_stop can filter verbatim re-occurrences out of
+                        // the transcript turns instead of re-extracting them.
+                        record_flushed_content(&buf_path, &flushable);
                     }
                     spawn_memory_worker(config);
                 }
@@ -259,7 +269,12 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
     let buf_path = session_buffer_path(config, &input);
     let prior_flushes = flush_count(&buf_path);
     let buffered = read_and_clear_buffer(&buf_path);
+    // v1.2: load the flushed-content ledger BEFORE clearing session state —
+    // the incremental no-fallback path below filters transcript turns
+    // against it (content-level dedup of already-extracted tool output).
+    let flushed_hashes = read_flushed_hashes(&buf_path);
     clear_flush_marker(&buf_path);
+    clear_flushed_ledger(&buf_path);
 
     // When mid-session flushes already extracted the bulk of this session's content,
     // skip re-extracting the full transcript to avoid duplication.
@@ -281,6 +296,21 @@ pub async fn hook_stop(config: &ReinConfig) -> anyhow::Result<()> {
                 let has_fallback = !buffered.is_empty() || session.compact_summary.is_some();
                 if has_fallback {
                     session.turns.clear();
+                } else {
+                    // v1.2 content-level dedup: the kept turns historically
+                    // re-fed the FULL transcript to the LLM, re-extracting
+                    // content the mid-session flushes already covered (the
+                    // queue's exact-dedup can't catch the resulting
+                    // semantically-near LLM outputs). Strip exactly what the
+                    // ledger proves was flushed — verbatim whole-turn or
+                    // long-line matches — and keep every conversation fact.
+                    // (The v0.38 offset approach was rejected: conversation
+                    // turns never enter the buffer, so truncation would drop
+                    // never-extracted facts.)
+                    session.turns = filter_turns_against_flushed(
+                        std::mem::take(&mut session.turns),
+                        &flushed_hashes,
+                    );
                 }
             }
             let _ =
