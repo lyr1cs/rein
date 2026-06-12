@@ -9,6 +9,49 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.2.0] — 2026-06-12
+
+Algorithm + hardening minor: the #A5 fact-layer reader lands, the hooks
+extraction pipeline gets a full-sweep audit remediation (28 confirmed
+findings fixed, two of them High), and the proxy moves to an explicit auth
+policy. Config schema version bumps to 2; database schema version bumps
+to 3 (both additive, forward-migrated automatically).
+
+### Added
+
+- **#A5 dedup-reuse reader** — the dedup gray-zone now reuses persisted
+  triples when a new `memory_triple_meta` stamp validates (content hash +
+  extractor version; schema v3). Any doubt recomputes and self-heals; a
+  corpus equivalence gate pins reuse == recompute.
+- **hook_stop content-level dedup** — mid-session flushes record a
+  flushed-content hash ledger; stop-time extraction strips only
+  byte-provably already-extracted tool output and keeps every
+  conversation fact.
+- **`[proxy].auth` policy** (`"bearer_required"` / `"public"`) replaces the
+  removed `allow_unauthenticated_loopback` bool, with automatic load-time
+  migration (config schema v2). Explicit `public` is honored on loopback
+  binds only.
+- **ARS canary quality blocker** — `shadow_fusion_replay_not_ready` is now
+  a canary blocker, so a pure volume ramp can no longer promote the #A12
+  simplex without a replay verdict.
+
+### Fixed
+
+- **User turns were dropped from session extraction** (High) — the
+  transcript parser accepted only the legacy `"human"` entry type; Claude
+  Code emits `"user"`. User-stated facts, preferences, and decisions now
+  reach the extractor.
+- **Active sessions stopped ingesting after the first Stop capture**
+  (High) — prefix-fingerprint suppression treated every longer transcript
+  snapshot as a duplicate while re-arming its own window. Growing
+  transcripts now replace their pending job in place.
+- 26 further audit findings across the store, hooks queue, recall, the
+  adaptive engine, and the proxy — including M5 cold-strip CAS, supersede
+  chain splicing on delete, HNSW rebuilds sourcing from `vec_memories`
+  (fixes >10k-memory truncation and the `migrate --reindex` dirty loop),
+  non-idempotent POST retries, and a cross-process single-flight lock for
+  the adaptive pipeline. Full details on the GitHub Release.
+
 ## [1.0.1] — 2026-06-02
 
 Correctness patch. No schema change, no config change — drop-in over 1.0.0.
