@@ -2067,6 +2067,11 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         "parameter_policy": parameter_policy,
         "shadow_fusion_replay": shadow_fusion,
     });
+    let judge_calibration = crate::ops::trust_measurement::collect_judge_calibration_observability(
+        store,
+        config,
+        chrono::Utc::now().timestamp(),
+    );
 
     serde_json::json!({
         "learned_alphas": learned_alphas,
@@ -2079,6 +2084,7 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         "cluster_profiles": cluster_profiles,
         "synthesis": synthesis,
         "ars_acceleration": ars_acceleration,
+        "judge_calibration": judge_calibration,
     })
 }
 

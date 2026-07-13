@@ -11,16 +11,18 @@
 
 #![cfg(feature = "test-support")]
 
-use rein::config::ReinConfig;
+use rein::config::{JudgeStructuralAnchorMode, ReinConfig};
 use rein::extract::llm::{ExtractorKind, MockExtractor};
 use rein::judge::contract::LLM_JUDGE_DAILY_CALL_CAP_DEFAULT;
 use rein::ops::llm_judge_worker::{
-    dispatch_one, parse_judge_output, write_test_judge_cache_entry, DispatchResult, DropReason,
-    JudgeJob, JudgeJobKind,
+    dispatch_one, parse_judge_output, run_structural_anchor_suite, write_test_judge_cache_entry,
+    DispatchResult, DropReason, JudgeJob, JudgeJobKind,
 };
 use rein::store::adaptive::{
-    peek_events, EventType, JudgeSource, SignalHint, SynthesisLlmJudgePayload,
-    LLM_JUDGE_J3_MIN_PAIRS, LLM_JUDGE_KAPPA_FLOOR,
+    commit_offset, peek_events, AdaptiveState, ClusterConceptSummaryStats, ClusterSynthesisStats,
+    ConceptSummaryFeedbackState, EventType, JudgeCalibrationState, JudgeSource, SignalHint,
+    SynthesisFeedbackState, SynthesisLlmJudgePayload, LLM_JUDGE_J3_MIN_PAIRS,
+    LLM_JUDGE_KAPPA_FLOOR,
 };
 use rein::store::SqliteStore;
 
@@ -568,4 +570,247 @@ fn judge_model_override_records_override_model() {
     assert_eq!(payload.judge_model, "mock");
     assert_eq!(payload.synthesis_id, "synth_override_001");
     assert!(matches!(payload.source, JudgeSource::AutoSampled));
+}
+
+#[test]
+fn structural_anchor_events_only_advance_the_independent_structural_state() {
+    let (store, mut config, _tmp) = temp_store();
+    config.ars.llm_judge.synthesis_enabled = true;
+    config.ars.llm_judge.concept_summary_enabled = true;
+    config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Monitor;
+    config.ars.llm_judge.structural_anchors.interval_secs = 86_400;
+    config.ars.llm_judge.daily_call_cap = 100;
+
+    let mut synthesis = SynthesisFeedbackState {
+        last_consumed_event_id: 41,
+        total_events: 9,
+        ..SynthesisFeedbackState::default()
+    };
+    synthesis.by_cluster.insert(
+        "7|Semantic".to_string(),
+        ClusterSynthesisStats {
+            useful_rate: 0.73,
+            viewed_count: 11,
+            ..ClusterSynthesisStats::default()
+        },
+    );
+    let mut concept = ConceptSummaryFeedbackState {
+        last_consumed_event_id: 42,
+        total_events: 10,
+        ..ConceptSummaryFeedbackState::default()
+    };
+    concept.by_cluster.insert(
+        "7|Semantic".to_string(),
+        ClusterConceptSummaryStats {
+            useful_rate: 0.61,
+            viewed_count: 12,
+            ..ClusterConceptSummaryStats::default()
+        },
+    );
+    let mut calibration = JudgeCalibrationState {
+        last_consumed_event_id_calibration: 43,
+        runtime_vs_offline_kappa: 0.81,
+        runtime_vs_offline_kappa_synthesis: 0.82,
+        runtime_vs_offline_kappa_concept: 0.80,
+        ..JudgeCalibrationState::default()
+    };
+    calibration.push_pair(
+        rein::store::adaptive::JudgeSurface::Synthesis,
+        true,
+        true,
+        100,
+    );
+    calibration.push_pair(
+        rein::store::adaptive::JudgeSurface::ConceptSummary,
+        false,
+        false,
+        100,
+    );
+    calibration
+        .recent_pairs_runtime_vs_offline
+        .push_back((true, true, 100));
+    calibration
+        .recent_pairs_runtime_vs_offline_synthesis
+        .push_back((true, true, 100));
+    calibration
+        .recent_pairs_runtime_vs_offline_concept
+        .push_back((false, false, 100));
+    let before = AdaptiveState {
+        version: 7,
+        synthesis_feedback_stats: Some(synthesis),
+        concept_summary_feedback_stats: Some(concept),
+        judge_calibration_state: Some(calibration),
+        ..AdaptiveState::default()
+    };
+    before
+        .save_snapshot(store.conn())
+        .expect("seed adaptive state");
+    commit_offset(
+        store.conn(),
+        &[
+            ("synthesis_feedback", 41),
+            ("concept_summary_feedback", 42),
+            (rein::ops::judge_calibration::JUDGE_CALIBRATION_CONSUMER, 43),
+        ],
+    )
+    .expect("seed unrelated consumer watermarks");
+    for index in 0..50 {
+        rein::store::adaptive::emit_event(
+            store.conn(),
+            rein::store::adaptive::FeedbackEvent {
+                event_type: EventType::Store,
+                request_id: Some(format!("structural-isolation-filler-{index}")),
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: None,
+            },
+        )
+        .expect("seed event ids beyond legacy consumer watermarks");
+    }
+
+    let responses = [true, true, false, false, true, true, false, false]
+        .into_iter()
+        .map(|hit| {
+            Ok(format!(
+                "HIT: {}\nWHY: scripted structural verdict",
+                if hit { "yes" } else { "no" }
+            ))
+        })
+        .collect();
+    let extractor = ExtractorKind::Mock(MockExtractor::with_responses(responses));
+    let stats = run_structural_anchor_suite(&store, &config, &extractor, 1_000)
+        .expect("run structural suite");
+    assert_eq!(stats.emitted, 8);
+    let structural = rein::ops::judge_calibration::run_judge_structural_anchor_consumer(&store)
+        .expect("fold structural anchors");
+    assert!(
+        structural.last_event_id > 43,
+        "anchor events must sit beyond every seeded legacy watermark"
+    );
+    assert_eq!(
+        structural.synthesis.status,
+        rein::judge::contract::JudgeStructuralStatus::Ready
+    );
+    assert_eq!(
+        structural.concept_summary.status,
+        rein::judge::contract::JudgeStructuralStatus::Ready
+    );
+
+    let consumer_input =
+        AdaptiveState::restore_snapshot(store.conn()).expect("seeded adaptive state");
+    let (synthesis_after_consume, synthesis_pairs, synthesis_calibration, synthesis_max_id) =
+        rein::store::adaptive::recompute_synthesis_feedback_stats_with_judge(
+            store.conn(),
+            consumer_input.synthesis_feedback_stats.clone(),
+            consumer_input.pending_kappa_half_pairs.clone(),
+            consumer_input
+                .judge_calibration_state
+                .clone()
+                .unwrap_or_default(),
+            config.ars.llm_judge.weight_decay_rate,
+        )
+        .expect("run synthesis legacy consumer");
+    assert_eq!(synthesis_max_id, None);
+    assert_eq!(
+        synthesis_after_consume,
+        before.synthesis_feedback_stats.clone().unwrap()
+    );
+    assert_eq!(synthesis_pairs, before.pending_kappa_half_pairs);
+    assert_eq!(
+        synthesis_calibration,
+        before.judge_calibration_state.clone().unwrap()
+    );
+    assert_eq!(
+        synthesis_after_consume.by_cluster["7|Semantic"].useful_rate,
+        0.73
+    );
+
+    let (concept_after_consume, concept_pairs, concept_calibration, concept_max_id) =
+        rein::store::adaptive::recompute_concept_summary_feedback_stats_with_judge(
+            store.conn(),
+            consumer_input.concept_summary_feedback_stats.clone(),
+            consumer_input.pending_kappa_half_pairs.clone(),
+            consumer_input
+                .judge_calibration_state
+                .clone()
+                .unwrap_or_default(),
+            config.ars.llm_judge.weight_decay_rate,
+        )
+        .expect("run concept-summary legacy consumer");
+    assert_eq!(concept_max_id, None);
+    assert_eq!(
+        concept_after_consume,
+        before.concept_summary_feedback_stats.clone().unwrap()
+    );
+    assert_eq!(concept_pairs, before.pending_kappa_half_pairs);
+    assert_eq!(
+        concept_calibration,
+        before.judge_calibration_state.clone().unwrap()
+    );
+    assert_eq!(
+        concept_after_consume.by_cluster["7|Semantic"].useful_rate,
+        0.61
+    );
+
+    let mut judge_consumer_state = consumer_input.clone();
+    let judge_offset_batch = rein::ops::judge_calibration::run_judge_calibration_consumer(
+        &store,
+        &mut judge_consumer_state,
+        None,
+    );
+    assert_eq!(judge_offset_batch, None);
+    assert_eq!(
+        judge_consumer_state.judge_calibration_state,
+        before.judge_calibration_state
+    );
+
+    let after = AdaptiveState::restore_snapshot(store.conn()).expect("adaptive state remains");
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "anchor events must not mutate AdaptiveState"
+    );
+    for (consumer, expected) in [
+        ("synthesis_feedback", 41_i64),
+        ("concept_summary_feedback", 42_i64),
+        (
+            rein::ops::judge_calibration::JUDGE_CALIBRATION_CONSUMER,
+            43_i64,
+        ),
+    ] {
+        let actual: i64 = store
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM consumer_offsets WHERE consumer = ?1",
+                [consumer],
+                |row| row.get(0),
+            )
+            .expect("seeded consumer offset remains");
+        assert_eq!(actual, expected, "anchor events advanced {consumer}");
+    }
+    let structural_offset: i64 = store
+        .conn()
+        .query_row(
+            "SELECT last_event_id FROM consumer_offsets WHERE consumer = ?1",
+            [rein::ops::judge_calibration::JUDGE_STRUCTURAL_ANCHOR_CONSUMER],
+            |row| row.get(0),
+        )
+        .expect("independent structural offset");
+    assert_eq!(structural_offset, structural.last_event_id);
+
+    let observability = rein::ops::trust_measurement::collect_judge_calibration_observability(
+        &store, &config, 1_000,
+    );
+    assert_eq!(observability.structural_watermark, structural.last_event_id);
+    assert_eq!(observability.human_runtime_watermark, 43);
+    assert_eq!(observability.synthesis.human.pair_count, 1);
+    assert_eq!(observability.synthesis.runtime_vs_nightly.pair_count, 1);
+    assert_eq!(observability.synthesis.structural.load_status, "loaded");
+    assert_eq!(
+        observability.synthesis.structural.status, "unknown",
+        "the test-only Mock extractor has no config-resolvable production fingerprint"
+    );
 }

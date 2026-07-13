@@ -103,6 +103,8 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_extract_provider(config));
     checks.push(check_query_expansion_provider(config));
     checks.push(check_reranker_provider(config));
+    checks.push(check_retired_llm_models(config));
+    checks.push(check_judge_llm_provider(config));
     checks.push(check_supermemory(config));
     checks.push(check_http_auth(config));
     checks.push(check_auth_policy_consistency(config));
@@ -1327,6 +1329,140 @@ fn check_query_expansion_provider(config: &ReinConfig) -> DoctorCheck {
             format!("omlx:{model} at {endpoint}"),
         ),
         Provider::None => ok_in(DoctorCategory::Configuration, "query_expansion", "disabled"),
+    }
+}
+
+const RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL: &str = "gemini-3.1-flash-lite-preview";
+const STABLE_GEMINI_FLASH_LITE_MODEL: &str = "gemini-3.1-flash-lite";
+
+fn judge_runtime_active(config: &ReinConfig) -> bool {
+    config.ars.llm_judge.enabled
+        && (config.ars.llm_judge.synthesis_enabled || config.ars.llm_judge.concept_summary_enabled)
+}
+
+fn judge_nightly_active(config: &ReinConfig) -> bool {
+    config.ars.llm_judge.enabled && config.ars.llm_judge.nightly_cron.enabled
+}
+
+/// Warn when an enabled LLM consumer resolves to the retired preview model.
+/// Resolution is authoritative: inherited sections are reported under the
+/// consumer that will actually call the model, while disabled opt-in sections
+/// are ignored. This check is deliberately read-only.
+fn check_retired_llm_models(config: &ReinConfig) -> DoctorCheck {
+    let raw_provider_is_active =
+        |provider: &str| !matches!(provider.trim().to_ascii_lowercase().as_str(), "" | "none");
+    let sections = [
+        ("extract", true),
+        (
+            "extract.async_memory",
+            raw_provider_is_active(&config.async_memory.provider),
+        ),
+        (
+            "extract.intelligent_merge",
+            config.intelligent_merge.enabled,
+        ),
+        ("extract.dedup", true),
+        ("query_expansion", true),
+        (
+            "search.llm_reranker",
+            raw_provider_is_active(&config.search.llm_reranker),
+        ),
+        ("ars.recall_synthesis", config.ars.recall_synthesis_enabled),
+        ("ars.concept_summary", config.ars.concept_summary_enabled),
+        ("ars.cold_archive", config.ars.cold_archive_enabled),
+        ("resummerize", config.resummerize.enabled),
+        ("ars.llm_judge", judge_runtime_active(config)),
+        ("ars.llm_judge.nightly_cron", judge_nightly_active(config)),
+    ];
+    let mut retired_sections = sections
+        .into_iter()
+        .filter(|(_, active)| *active)
+        .filter_map(|(section, _)| {
+            let resolved = config.resolve_llm_for(section).ok()?;
+            (resolved.provider == Provider::Google
+                && resolved.model == RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL)
+                .then_some(section)
+        })
+        .collect::<Vec<_>>();
+    retired_sections.sort_unstable();
+    retired_sections.dedup();
+
+    if retired_sections.is_empty() {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "llm_model_lifecycle",
+            "no active resolved LLM section uses a retired model id".to_string(),
+        );
+    }
+
+    DoctorCheck {
+        name: "llm_model_lifecycle",
+        category: DoctorCategory::Configuration,
+        severity: DoctorSeverity::Warning,
+        status: CheckStatus::Warn,
+        fixable: false,
+        message: format!(
+            "retired model {} is active in resolved LLM sections: {}",
+            RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL,
+            retired_sections.join(", ")
+        ),
+        repair_hint: Some(format!(
+            "Replace {} with the stable model id {} in the listed operator config sections. This diagnostic does not rewrite operator config automatically.",
+            RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL, STABLE_GEMINI_FLASH_LITE_MODEL
+        )),
+    }
+}
+
+/// Active judge consumers must resolve an actual provider. `enabled = true`
+/// with `Provider::None` otherwise looks configured while both workers skip
+/// their LLM calls. Runtime and nightly are independent production consumers.
+fn check_judge_llm_provider(config: &ReinConfig) -> DoctorCheck {
+    let consumers = [
+        (
+            "ars.llm_judge runtime",
+            "ars.llm_judge",
+            judge_runtime_active(config),
+        ),
+        (
+            "ars.llm_judge.nightly_cron",
+            "ars.llm_judge.nightly_cron",
+            judge_nightly_active(config),
+        ),
+    ];
+    let missing = consumers
+        .into_iter()
+        .filter(|(_, _, active)| *active)
+        .filter_map(|(label, section, _)| {
+            config
+                .resolve_llm_for(section)
+                .ok()
+                .filter(|resolved| resolved.provider == Provider::None)
+                .map(|_| label)
+        })
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "judge_llm_provider",
+            "all active judge consumers resolve an LLM provider".to_string(),
+        );
+    }
+
+    DoctorCheck {
+        name: "judge_llm_provider",
+        category: DoctorCategory::Configuration,
+        severity: DoctorSeverity::Warning,
+        status: CheckStatus::Warn,
+        fixable: false,
+        message: format!(
+            "active judge consumers resolve to Provider::None and will not make LLM calls: {}",
+            missing.join(", ")
+        ),
+        repair_hint: Some(
+            "Set [llm] provider = \"google\" or \"omlx\" with a model, or disable the listed judge consumer flags. This diagnostic is read-only."
+                .to_string(),
+        ),
     }
 }
 
@@ -2833,9 +2969,9 @@ fn project_dedup_threshold_doctor_check(
     }
 }
 
-/// v0.27.1 — surface `JudgeCalibrationState` stats so operators know
-/// the runtime LLM judge is producing usable signal. Reports κ values,
-/// pair counts, drift alert count, and last-computed timestamp.
+/// Surface human agreement, runtime-vs-nightly drift, and deterministic
+/// structural health as three distinct evidence classes. The shared Trust
+/// projection owns the semantics; doctor only formats it and remains read-only.
 fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfig) -> DoctorCheck {
     if !config.ars.llm_judge.enabled {
         return ok_in(
@@ -2844,56 +2980,133 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
             "[ars.llm_judge].enabled = false (disabled by config)".to_string(),
         );
     }
-    let state = match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
-        Some(s) => s,
-        None => {
-            return ok_in(
-                DoctorCategory::Configuration,
-                "judge_calibration",
-                "no AdaptiveState snapshot yet (no recall traffic)".to_string(),
-            );
-        }
-    };
-    let cal = match state.judge_calibration_state {
-        Some(c) => c,
-        None => {
-            return ok_in(
-                DoctorCategory::Configuration,
-                "judge_calibration",
-                "no calibration state yet (no judge events processed)".to_string(),
-            );
-        }
-    };
-    let synth_pairs = cal.recent_pairs_synthesis.len();
-    let concept_pairs = cal.recent_pairs_concept.len();
-    let total_drift_alerts = cal
-        .judge_drift_alert
-        .saturating_add(cal.judge_drift_alert_synthesis)
-        .saturating_add(cal.judge_drift_alert_concept);
-    let summary = format!(
-        "kappa={:.2} runtime_vs_offline_kappa={:.2} synth_runtime_kappa={:.2} \
-         concept_runtime_kappa={:.2} drift_alerts={} synth_drift_alerts={} \
-         concept_drift_alerts={} synth_pairs={} concept_pairs={} total_offline={}",
-        cal.kappa,
-        cal.runtime_vs_offline_kappa,
-        cal.runtime_vs_offline_kappa_synthesis,
-        cal.runtime_vs_offline_kappa_concept,
-        cal.judge_drift_alert,
-        cal.judge_drift_alert_synthesis,
-        cal.judge_drift_alert_concept,
-        synth_pairs,
-        concept_pairs,
-        cal.total_offline_cron_events,
+    let report = crate::ops::trust_measurement::collect_judge_calibration_observability(
+        store,
+        config,
+        chrono::Utc::now().timestamp(),
     );
-    if total_drift_alerts > 0 {
-        warn_in(
-            DoctorCategory::Configuration,
-            "judge_calibration",
-            format!("drift alerts present: {summary}"),
-        )
+    let synthesis = format_judge_calibration_surface("synthesis", &report.synthesis);
+    let concept = format_judge_calibration_surface("concept_summary", &report.concept_summary);
+    let summary = format!(
+        "{synthesis} {concept} human_runtime_watermark={} structural_watermark={} \
+         last_runtime_computed_at={} total_runtime_nightly_events={} \
+         global_drift_alerts={}",
+        report.human_runtime_watermark,
+        report.structural_watermark,
+        report.last_runtime_computed_at,
+        report.total_runtime_nightly_events,
+        report.global_drift_alert_count,
+    );
+    let surface_drift_alerts = report
+        .synthesis
+        .runtime_vs_nightly
+        .drift_alert_count
+        .saturating_add(report.concept_summary.runtime_vs_nightly.drift_alert_count);
+    let total_drift_alerts = report
+        .global_drift_alert_count
+        .saturating_add(surface_drift_alerts);
+    let mut repair_advice = std::collections::BTreeSet::new();
+    for advice in report
+        .synthesis
+        .structural
+        .repair_advice
+        .iter()
+        .chain(report.concept_summary.structural.repair_advice.iter())
+    {
+        repair_advice.insert(advice.clone());
+    }
+    let attention = total_drift_alerts > 0
+        || report.synthesis.structural.baseline_blocks_release
+        || report.concept_summary.structural.baseline_blocks_release
+        || report
+            .synthesis
+            .structural
+            .recall_fusion_promotion
+            .release_blocked
+        || report
+            .concept_summary
+            .structural
+            .surface_scope_promotion
+            .release_blocked
+        || !repair_advice.is_empty();
+    if attention {
+        let mut check = warn_in(DoctorCategory::Configuration, "judge_calibration", summary);
+        if !repair_advice.is_empty() {
+            check.repair_hint = Some(repair_advice.into_iter().collect::<Vec<_>>().join(" "));
+        }
+        check
     } else {
         ok_in(DoctorCategory::Configuration, "judge_calibration", summary)
     }
+}
+
+fn format_judge_calibration_surface(
+    name: &str,
+    report: &crate::ops::trust_measurement::JudgeSurfaceCalibrationReport,
+) -> String {
+    let optional_kappa = |value: Option<f64>| {
+        value
+            .map(|kappa| format!("{kappa:.2}"))
+            .unwrap_or_else(|| "undefined".to_string())
+    };
+    let optional_text = |value: Option<&str>| value.unwrap_or("undefined").to_string();
+    let optional_timestamp = |value: Option<i64>| {
+        value
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_else(|| "undefined".to_string())
+    };
+    format!(
+        "{name}[mode={} load_status={} human_pairs={} human_kappa={} \
+         runtime_nightly_pairs={} runtime_nightly_kappa={} drift_alerts={} \
+         structural_status={} requested_action={} basis={} reason={} \
+         baseline_allowed={} baseline_scale={:.2} baseline_blocks_release={} \
+         recall_fusion_action={} recall_fusion_allowed={} \
+         recall_fusion_blocks_release={} recall_fusion_release_blocked={} \
+         surface_scope_action={} surface_scope_allowed={} \
+         surface_scope_blocks_release={} surface_scope_release_blocked={} \
+         expected_model_fingerprint={} observed_model_fingerprint={} \
+         expected_rubric_fingerprint={} observed_rubric_fingerprint={} \
+         expected_probe_set={} observed_probe_set={} last_probe_at={} \
+         completed_at={} fresh_until={} fresh={}]",
+        report.structural.mode,
+        report.structural.load_status,
+        report.human.pair_count,
+        optional_kappa(report.human.kappa),
+        report.runtime_vs_nightly.pair_count,
+        optional_kappa(report.runtime_vs_nightly.kappa),
+        report.runtime_vs_nightly.drift_alert_count,
+        report.structural.status,
+        report.structural.requested_action,
+        report.structural.basis,
+        report.structural.reason,
+        report.structural.baseline_allowed,
+        report.structural.configured_baseline_scale,
+        report.structural.baseline_blocks_release,
+        report.structural.recall_fusion_promotion.requested_action,
+        report.structural.recall_fusion_promotion.promotion_allowed,
+        report
+            .structural
+            .recall_fusion_promotion
+            .promotion_blocks_release,
+        report.structural.recall_fusion_promotion.release_blocked,
+        report.structural.surface_scope_promotion.requested_action,
+        report.structural.surface_scope_promotion.promotion_allowed,
+        report
+            .structural
+            .surface_scope_promotion
+            .promotion_blocks_release,
+        report.structural.surface_scope_promotion.release_blocked,
+        optional_text(report.structural.expected_model_fingerprint.as_deref()),
+        optional_text(report.structural.observed_model_fingerprint.as_deref()),
+        optional_text(report.structural.expected_rubric_fingerprint.as_deref()),
+        optional_text(report.structural.observed_rubric_fingerprint.as_deref()),
+        report.structural.expected_probe_set_version,
+        optional_text(report.structural.observed_probe_set_version.as_deref()),
+        optional_timestamp(report.structural.last_probe_at),
+        optional_timestamp(report.structural.completed_at),
+        optional_timestamp(report.structural.fresh_until),
+        report.structural.is_fresh,
+    )
 }
 
 /// v0.27.1 — rolling 24h judge_call_ledger usage vs daily_call_cap.
@@ -4553,5 +4766,411 @@ provider = "inherit"
                 .unwrap();
             assert_eq!(actual, expected, "future-schema row {key} changed");
         }
+    }
+
+    #[test]
+    fn judge_calibration_doctor_reports_modes_and_missing_state_side_by_side() {
+        use crate::config::JudgeStructuralAnchorMode;
+
+        let configured = |mode| {
+            let mut config = ReinConfig::default();
+            config.ars.llm_judge.enabled = true;
+            config.ars.llm_judge.synthesis_enabled = true;
+            config.ars.llm_judge.concept_summary_enabled = true;
+            config.ars.llm_judge.structural_anchors.mode = mode;
+            config.ars.llm_judge.structural_anchors.interval_secs = 100;
+            config.llm.provider = "omlx".to_string();
+            config.llm.omlx.model = Some("doctor-judge-model".to_string());
+            config
+        };
+
+        for (mode, expected_status, expected_scale, expected_check_status) in [
+            (
+                JudgeStructuralAnchorMode::Off,
+                "disabled",
+                "baseline_scale=1.00",
+                CheckStatus::Warn,
+            ),
+            (
+                JudgeStructuralAnchorMode::Monitor,
+                "unknown",
+                "baseline_scale=1.00",
+                CheckStatus::Warn,
+            ),
+            (
+                JudgeStructuralAnchorMode::Enforce,
+                "unknown",
+                "baseline_scale=0.00",
+                CheckStatus::Warn,
+            ),
+        ] {
+            let store = crate::store::SqliteStore::in_memory().unwrap();
+            let config = configured(mode);
+            let check = check_judge_calibration(&store, &config);
+            assert_eq!(check.status, expected_check_status, "mode={mode:?}");
+            assert!(!check.fixable);
+            assert!(
+                check.message.contains(&format!(
+                    "mode={} load_status=missing",
+                    match mode {
+                        JudgeStructuralAnchorMode::Off => "off",
+                        JudgeStructuralAnchorMode::Monitor => "monitor",
+                        JudgeStructuralAnchorMode::Enforce => "enforce",
+                    }
+                )),
+                "message={}",
+                check.message
+            );
+            assert!(
+                check
+                    .message
+                    .contains("human_pairs=0 human_kappa=undefined"),
+                "message={}",
+                check.message
+            );
+            assert!(
+                check
+                    .message
+                    .contains("runtime_nightly_pairs=0 runtime_nightly_kappa=undefined"),
+                "message={}",
+                check.message
+            );
+            assert!(
+                check
+                    .message
+                    .contains(&format!("structural_status={expected_status}")),
+                "message={}",
+                check.message
+            );
+            assert!(
+                check.message.contains(expected_scale),
+                "message={}",
+                check.message
+            );
+            assert!(
+                check
+                    .message
+                    .contains("requested_action=keep_configured_baseline"),
+                "message={}",
+                check.message
+            );
+            assert!(
+                check.message.contains("recall_fusion_release_blocked=true"),
+                "message={}",
+                check.message
+            );
+            if mode == JudgeStructuralAnchorMode::Off {
+                assert!(check.repair_hint.is_none());
+            } else {
+                let hint = check.repair_hint.as_deref().unwrap_or_default();
+                assert!(hint.contains("read-only"), "hint={hint}");
+                assert!(!hint.contains("doctor --fix"), "hint={hint}");
+            }
+        }
+    }
+
+    #[test]
+    fn judge_calibration_doctor_redacts_and_preserves_unhealthy_structural_rows() {
+        use crate::config::JudgeStructuralAnchorMode;
+        use crate::store::judge_structural_calibration::JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY;
+
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Enforce;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("doctor-judge-model".to_string());
+
+        for (raw, expected_load, advice_word) in [
+            (
+                "{doctor-operator-secret".to_string(),
+                "load_status=corrupt",
+                "Preserve",
+            ),
+            (
+                serde_json::json!({
+                    "schema_version": 9999,
+                    "revision": 4,
+                    "doctor_operator_secret": "must-not-leak"
+                })
+                .to_string(),
+                "load_status=unsupported_schema",
+                "Upgrade",
+            ),
+        ] {
+            let store = crate::store::SqliteStore::in_memory().unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                    rusqlite::params![JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY, &raw],
+                )
+                .unwrap();
+            let check = check_judge_calibration(&store, &config);
+            assert_eq!(check.status, CheckStatus::Warn);
+            assert!(!check.fixable);
+            assert!(
+                check.message.contains(expected_load),
+                "message={}",
+                check.message
+            );
+            assert!(!check.message.contains("operator-secret"));
+            assert!(!check.message.contains("must-not-leak"));
+            let hint = check.repair_hint.as_deref().unwrap_or_default();
+            assert!(hint.contains(advice_word), "hint={hint}");
+            assert!(!hint.contains("doctor --fix"), "hint={hint}");
+            let preserved: String = store
+                .conn()
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = ?1",
+                    [JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(preserved, raw);
+        }
+    }
+
+    #[test]
+    fn judge_calibration_doctor_reports_stale_and_fingerprint_mismatch_with_freshness() {
+        use crate::config::JudgeStructuralAnchorMode;
+        use crate::store::adaptive::{JudgeStructuralProbeKind, JudgeSurface};
+        use crate::store::judge_structural_calibration::{
+            compare_and_swap_judge_structural_calibration, JudgeStructuralCalibrationState,
+            JudgeStructuralSurfaceState,
+        };
+
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Enforce;
+        config.ars.llm_judge.structural_anchors.interval_secs = 100;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("doctor-model-a".to_string());
+        let (model_fingerprint, rubric_fingerprint) =
+            crate::ops::llm_judge_worker::structural_fingerprints_for_config(
+                &config,
+                JudgeSurface::Synthesis,
+            )
+            .unwrap();
+        let completed_at = chrono::Utc::now().timestamp() - 201;
+        let state = JudgeStructuralCalibrationState {
+            revision: 1,
+            synthesis: JudgeStructuralSurfaceState {
+                run_id: Some("doctor-run-not-exposed".to_string()),
+                probe_set_version: crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION
+                    .to_string(),
+                model_fingerprint,
+                rubric_fingerprint,
+                run_token_hashes: JudgeStructuralProbeKind::ALL
+                    .into_iter()
+                    .map(|kind| (kind, "u".repeat(64)))
+                    .collect(),
+                seen_kinds: JudgeStructuralProbeKind::ALL.into_iter().collect(),
+                run_started_at: completed_at - 10,
+                last_probe_at: completed_at,
+                completed_at: Some(completed_at),
+                status: crate::judge::contract::JudgeStructuralStatus::Ready,
+                ..JudgeStructuralSurfaceState::default()
+            },
+            updated_at: completed_at,
+            ..JudgeStructuralCalibrationState::default()
+        };
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        assert!(compare_and_swap_judge_structural_calibration(store.conn(), &state, 0).unwrap());
+
+        let stale = check_judge_calibration(&store, &config);
+        assert_eq!(stale.status, CheckStatus::Warn);
+        assert!(stale.message.contains("structural_status=stale"));
+        assert!(stale.message.contains("fresh_until="));
+        assert!(stale
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("refresh"));
+
+        config.llm.omlx.model = Some("doctor-model-b".to_string());
+        let mismatch = check_judge_calibration(&store, &config);
+        assert_eq!(mismatch.status, CheckStatus::Warn);
+        assert!(mismatch
+            .message
+            .contains("structural_status=fingerprint_mismatch"));
+        assert!(mismatch.message.contains("expected_model_fingerprint="));
+        assert!(mismatch.message.contains("observed_model_fingerprint="));
+        assert!(mismatch
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("current model"));
+        assert!(!mismatch.message.contains("doctor-run-not-exposed"));
+        assert!(!mismatch.message.contains(&"u".repeat(64)));
+    }
+
+    #[test]
+    fn retired_gemini_preview_warning_covers_all_active_resolved_llm_sections() {
+        let retired = "gemini-3.1-flash-lite-preview";
+        let mut config = ReinConfig::default();
+        config.llm.provider = "google".to_string();
+        config.llm.google.model = Some(retired.to_string());
+        config.extract.provider = "google".to_string();
+        config.extract.google.model = retired.to_string();
+        config.query_expansion.provider = "google".to_string();
+        config.query_expansion.google.model = retired.to_string();
+        config.async_memory.provider = "inherit".to_string();
+        config.intelligent_merge.enabled = true;
+        config.intelligent_merge.provider = "google".to_string();
+        config.intelligent_merge.google.model = retired.to_string();
+        config.search.llm_reranker = "google".to_string();
+        config.ars.recall_synthesis_enabled = true;
+        config.ars.concept_summary_enabled = true;
+        config.ars.cold_archive_enabled = true;
+        config.ars.llm_backend = "google".to_string();
+        config.resummerize.enabled = true;
+        config.resummerize.llm_backend = "google".to_string();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.nightly_cron.enabled = true;
+
+        let original_extract = config.extract.google.model.clone();
+        let original_expansion = config.query_expansion.google.model.clone();
+        let check = check_retired_llm_models(&config);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.severity, DoctorSeverity::Warning);
+        assert!(!check.fixable);
+        for section in [
+            "extract",
+            "extract.async_memory",
+            "extract.intelligent_merge",
+            "extract.dedup",
+            "query_expansion",
+            "search.llm_reranker",
+            "ars.recall_synthesis",
+            "ars.concept_summary",
+            "ars.cold_archive",
+            "resummerize",
+            "ars.llm_judge",
+            "ars.llm_judge.nightly_cron",
+        ] {
+            assert!(
+                check.message.contains(section),
+                "missing {section}: {}",
+                check.message
+            );
+        }
+        assert!(check.message.contains(retired));
+        let hint = check.repair_hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("gemini-3.1-flash-lite"), "hint={hint}");
+        assert!(hint.contains("does not rewrite"), "hint={hint}");
+        assert!(!hint.contains("doctor --fix"), "hint={hint}");
+        assert_eq!(config.extract.google.model, original_extract);
+        assert_eq!(config.query_expansion.google.model, original_expansion);
+    }
+
+    #[test]
+    fn retired_gemini_preview_warning_treats_nightly_as_independent_production_consumer() {
+        let mut config = ReinConfig::default();
+        config.llm.provider = "google".to_string();
+        config.llm.google.model = Some(RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL.to_string());
+        config.extract.provider = "google".to_string();
+        config.extract.google.model = STABLE_GEMINI_FLASH_LITE_MODEL.to_string();
+        config.query_expansion.provider = "google".to_string();
+        config.query_expansion.google.model = STABLE_GEMINI_FLASH_LITE_MODEL.to_string();
+        config.async_memory.provider = "none".to_string();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = false;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        config.ars.llm_judge.nightly_cron.enabled = true;
+
+        let check = check_retired_llm_models(&config);
+        assert_eq!(check.status, CheckStatus::Warn);
+        let listed = check
+            .message
+            .split("sections: ")
+            .nth(1)
+            .expect("lifecycle warning lists active sections");
+        assert_eq!(listed, "ars.llm_judge.nightly_cron, extract.dedup");
+    }
+
+    #[test]
+    fn judge_llm_provider_warning_reports_active_runtime_with_none_provider() {
+        let mut config = ReinConfig::default();
+        config.llm.provider = "none".to_string();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        config.ars.llm_judge.nightly_cron.enabled = false;
+        assert_eq!(
+            config.resolve_llm_for("ars.llm_judge").unwrap().provider,
+            Provider::None
+        );
+
+        let check = check_judge_llm_provider(&config);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.severity, DoctorSeverity::Warning);
+        assert!(!check.fixable);
+        assert!(check.message.contains("ars.llm_judge runtime"));
+        assert!(!check.message.contains("nightly_cron"));
+        let hint = check.repair_hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("[llm] provider"), "hint={hint}");
+        assert!(!check.message.contains("endpoint"));
+        assert!(!check.message.contains("api_key"));
+    }
+
+    #[test]
+    fn judge_llm_provider_warning_reports_active_nightly_with_runtime_surfaces_off() {
+        let mut config = ReinConfig::default();
+        config.llm.provider = "none".to_string();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = false;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        config.ars.llm_judge.nightly_cron.enabled = true;
+        assert_eq!(
+            config
+                .resolve_llm_for("ars.llm_judge.nightly_cron")
+                .unwrap()
+                .provider,
+            Provider::None
+        );
+
+        let check = check_judge_llm_provider(&config);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.severity, DoctorSeverity::Warning);
+        assert!(!check.fixable);
+        assert!(check.message.contains("ars.llm_judge.nightly_cron"));
+        assert!(!check.message.contains("ars.llm_judge runtime"));
+        let hint = check.repair_hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("[llm] provider"), "hint={hint}");
+        assert!(!check.message.contains("endpoint"));
+        assert!(!check.message.contains("api_key"));
+    }
+
+    #[test]
+    fn retired_gemini_preview_warning_ignores_inactive_or_non_google_sections() {
+        let retired = "gemini-3.1-flash-lite-preview";
+        let stable = "gemini-3.1-flash-lite";
+        let mut config = ReinConfig::default();
+        config.llm.provider = "google".to_string();
+        config.llm.google.model = Some(stable.to_string());
+        config.extract.provider = "google".to_string();
+        config.extract.google.model = stable.to_string();
+        config.query_expansion.provider = "google".to_string();
+        config.query_expansion.google.model = stable.to_string();
+        config.intelligent_merge.enabled = false;
+        config.intelligent_merge.provider = "google".to_string();
+        config.intelligent_merge.google.model = retired.to_string();
+        config.ars.recall_synthesis_enabled = false;
+        config.ars.concept_summary_enabled = false;
+        config.ars.cold_archive_enabled = false;
+        config.resummerize.enabled = false;
+        config.ars.llm_judge.enabled = false;
+
+        let check = check_retired_llm_models(&config);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.repair_hint.is_none());
+
+        config.extract.provider = "omlx".to_string();
+        config.extract.omlx.model = retired.to_string();
+        let non_google = check_retired_llm_models(&config);
+        assert_eq!(non_google.status, CheckStatus::Ok);
     }
 }

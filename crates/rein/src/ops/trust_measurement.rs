@@ -7,7 +7,7 @@ use crate::ops::ars_release_gate::ArsAccelerationReleaseGateReport;
 use crate::ops::system_health::SystemHealthSnapshot;
 use crate::store::SqliteStore;
 
-pub const TRUST_MEASUREMENT_SCHEMA_VERSION: u32 = 2;
+pub const TRUST_MEASUREMENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MeasurementGate {
@@ -65,6 +65,133 @@ pub struct ActiveLearningReport {
     pub judge_drift_alert_total: u64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JudgeHumanAgreementReport {
+    pub pair_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kappa: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JudgeRuntimeVsNightlyReport {
+    pub pair_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kappa: Option<f64>,
+    pub drift_alert_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JudgePromotionDecisionReport {
+    pub requested_action: String,
+    pub basis: String,
+    pub reason: String,
+    pub promotion_allowed: bool,
+    pub promotion_blocks_release: bool,
+    /// Mirrors the release gate's effective blocker condition.
+    pub release_blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JudgeStructuralReport {
+    pub mode: String,
+    pub load_status: String,
+    pub status: String,
+    pub requested_action: String,
+    pub basis: String,
+    pub reason: String,
+    pub baseline_allowed: bool,
+    pub configured_baseline_scale: f64,
+    pub baseline_blocks_release: bool,
+    pub recall_fusion_promotion: JudgePromotionDecisionReport,
+    pub surface_scope_promotion: JudgePromotionDecisionReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_model_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_model_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_rubric_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_rubric_fingerprint: Option<String>,
+    pub expected_probe_set_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_probe_set_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_probe_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_until: Option<i64>,
+    pub is_fresh: bool,
+    pub alert_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_advice: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JudgeSurfaceCalibrationReport {
+    pub human: JudgeHumanAgreementReport,
+    pub runtime_vs_nightly: JudgeRuntimeVsNightlyReport,
+    pub structural: JudgeStructuralReport,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JudgeCalibrationObservabilityReport {
+    pub synthesis: JudgeSurfaceCalibrationReport,
+    pub concept_summary: JudgeSurfaceCalibrationReport,
+    pub human_runtime_watermark: i64,
+    pub structural_watermark: i64,
+    pub last_runtime_computed_at: i64,
+    pub total_runtime_nightly_events: u64,
+    pub global_drift_alert_count: u64,
+}
+
+fn judge_action_name(action: crate::judge::contract::JudgeTrustAction) -> &'static str {
+    use crate::judge::contract::JudgeTrustAction;
+    match action {
+        JudgeTrustAction::KeepConfiguredBaseline => "keep_configured_baseline",
+        JudgeTrustAction::IncreaseJudgeWeight => "increase_judge_weight",
+        JudgeTrustAction::IncreaseSampleRate => "increase_sample_rate",
+        JudgeTrustAction::PromoteJudgeScope => "promote_judge_scope",
+        JudgeTrustAction::PromoteRecallFusion => "promote_recall_fusion",
+    }
+}
+
+fn judge_basis_name(basis: crate::judge::contract::JudgeCalibrationBasis) -> &'static str {
+    use crate::judge::contract::JudgeCalibrationBasis;
+    match basis {
+        JudgeCalibrationBasis::HumanKappa => "human_kappa",
+        JudgeCalibrationBasis::StructuralAnchors => "structural_anchors",
+        JudgeCalibrationBasis::ConfiguredBaseline => "configured_baseline",
+        JudgeCalibrationBasis::Untrusted => "untrusted",
+    }
+}
+
+fn judge_reason_name(reason: crate::judge::contract::JudgeTrustReason) -> &'static str {
+    use crate::judge::contract::JudgeTrustReason;
+    match reason {
+        JudgeTrustReason::HumanKappaHealthy => "human_kappa_healthy",
+        JudgeTrustReason::HumanKappaBelowFloor => "human_kappa_below_floor",
+        JudgeTrustReason::HumanKappaMissingOrInvalid => "human_kappa_missing_or_invalid",
+        JudgeTrustReason::StructuralAnchorsReady => "structural_anchors_ready",
+        JudgeTrustReason::ConfiguredBaselineFallback => "configured_baseline_fallback",
+        JudgeTrustReason::StructuralHealthEnforced => "structural_health_enforced",
+    }
+}
+
+fn judge_promotion_report(
+    requested_action: crate::judge::contract::JudgeTrustAction,
+    decision: crate::judge::contract::JudgeTrustDecision,
+) -> JudgePromotionDecisionReport {
+    JudgePromotionDecisionReport {
+        requested_action: judge_action_name(requested_action).to_string(),
+        basis: judge_basis_name(decision.basis).to_string(),
+        reason: judge_reason_name(decision.reason).to_string(),
+        promotion_allowed: decision.action_allowed,
+        promotion_blocks_release: decision.blocks_release,
+        release_blocked: !decision.action_allowed || decision.blocks_release,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TrustMeasurementReport {
     pub schema_version: u32,
@@ -73,6 +200,7 @@ pub struct TrustMeasurementReport {
     pub eval_gates: Vec<MeasurementGate>,
     pub index_consistency: IndexConsistencyReport,
     pub dedup_calibration: crate::ops::DedupThresholdObservability,
+    pub judge_calibration: JudgeCalibrationObservabilityReport,
     pub background_observability: BackgroundObservabilityReport,
     pub active_learning: ActiveLearningReport,
 }
@@ -99,6 +227,12 @@ pub fn collect(store: &SqliteStore, config: &ReinConfig) -> TrustMeasurementRepo
         dedup_calibration: crate::ops::dedup_threshold_observability_from_state(
             store, config, &state,
         ),
+        judge_calibration: collect_judge_calibration_observability_from_state(
+            store,
+            config,
+            &state,
+            chrono::Utc::now().timestamp(),
+        ),
         background_observability: BackgroundObservabilityReport {
             status: background_status.to_string(),
             adaptive_version: state.version,
@@ -109,6 +243,278 @@ pub fn collect(store: &SqliteStore, config: &ReinConfig) -> TrustMeasurementRepo
         },
         active_learning: active_learning_report(store, config),
     }
+}
+
+pub fn collect_judge_calibration_observability(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    now: i64,
+) -> JudgeCalibrationObservabilityReport {
+    let state =
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
+    collect_judge_calibration_observability_from_state(store, config, &state, now)
+}
+
+fn collect_judge_calibration_observability_from_state(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    now: i64,
+) -> JudgeCalibrationObservabilityReport {
+    use crate::store::adaptive::JudgeSurface;
+    use crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus;
+
+    let calibration = state.judge_calibration_state.as_ref();
+    let loaded =
+        crate::store::judge_structural_calibration::load_judge_structural_calibration(store.conn());
+    let structural_watermark = if loaded.status == JudgeStructuralCalibrationLoadStatus::Loaded {
+        loaded.state.last_event_id
+    } else {
+        0
+    };
+    let human_runtime_watermark = calibration
+        .map(|value| value.last_consumed_event_id_calibration)
+        .unwrap_or(0);
+    let last_runtime_computed_at = calibration.map(|value| value.last_computed_at).unwrap_or(0);
+    let total_runtime_nightly_events = calibration
+        .map(|value| value.total_offline_cron_events)
+        .unwrap_or(0);
+    let global_drift_alert_count = calibration
+        .map(|value| value.judge_drift_alert)
+        .unwrap_or(0);
+
+    JudgeCalibrationObservabilityReport {
+        synthesis: collect_judge_surface_calibration(
+            store,
+            config,
+            calibration,
+            &loaded,
+            JudgeSurface::Synthesis,
+            now,
+        ),
+        concept_summary: collect_judge_surface_calibration(
+            store,
+            config,
+            calibration,
+            &loaded,
+            JudgeSurface::ConceptSummary,
+            now,
+        ),
+        human_runtime_watermark,
+        structural_watermark,
+        last_runtime_computed_at,
+        total_runtime_nightly_events,
+        global_drift_alert_count,
+    }
+}
+
+fn collect_judge_surface_calibration(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    loaded: &crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoad,
+    surface: crate::store::adaptive::JudgeSurface,
+    now: i64,
+) -> JudgeSurfaceCalibrationReport {
+    use crate::config::JudgeStructuralAnchorMode;
+    use crate::judge::contract::{JudgeStructuralStatus, JudgeTrustAction};
+    use crate::store::adaptive::JudgeSurface;
+    use crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus;
+
+    let human = crate::ops::ars_tuning::human_judge_calibration(calibration, surface);
+    let (runtime_pairs, runtime_kappa, drift_alert_count) = match (calibration, surface) {
+        (Some(calibration), JudgeSurface::Synthesis) => (
+            calibration.recent_pairs_runtime_vs_offline_synthesis.len(),
+            calibration.runtime_vs_offline_kappa_synthesis,
+            calibration.judge_drift_alert_synthesis,
+        ),
+        (Some(calibration), JudgeSurface::ConceptSummary) => (
+            calibration.recent_pairs_runtime_vs_offline_concept.len(),
+            calibration.runtime_vs_offline_kappa_concept,
+            calibration.judge_drift_alert_concept,
+        ),
+        (None, _) => (0, 0.0, 0),
+    };
+    let runtime_kappa = (runtime_pairs >= crate::store::adaptive::JUDGE_DRIFT_MIN_PAIRS
+        && runtime_kappa.is_finite()
+        && (-1.0..=1.0).contains(&runtime_kappa))
+    .then_some(runtime_kappa);
+    let structural =
+        crate::ops::ars_tuning::resolve_judge_structural_trust(store.conn(), config, surface, now);
+    let baseline_action = JudgeTrustAction::KeepConfiguredBaseline;
+    let baseline_decision = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        baseline_action,
+    );
+    let recall_fusion_action = JudgeTrustAction::PromoteRecallFusion;
+    let recall_fusion_decision = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        recall_fusion_action,
+    );
+    let surface_scope_action = JudgeTrustAction::PromoteJudgeScope;
+    let surface_scope_decision = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        surface_scope_action,
+    );
+    let mode = match config.ars.llm_judge.structural_anchors.mode {
+        JudgeStructuralAnchorMode::Off => "off",
+        JudgeStructuralAnchorMode::Monitor => "monitor",
+        JudgeStructuralAnchorMode::Enforce => "enforce",
+    };
+    let status = match structural.status {
+        JudgeStructuralStatus::Disabled => "disabled",
+        JudgeStructuralStatus::Collecting => "collecting",
+        JudgeStructuralStatus::Ready => "ready",
+        JudgeStructuralStatus::Failed => "failed",
+        JudgeStructuralStatus::Stale => "stale",
+        JudgeStructuralStatus::FingerprintMismatch => "fingerprint_mismatch",
+        JudgeStructuralStatus::Corrupt => "corrupt",
+        JudgeStructuralStatus::Unknown => "unknown",
+    };
+    let basis = judge_basis_name(baseline_decision.basis);
+    let reason = judge_reason_name(baseline_decision.reason);
+    let load_status = match loaded.status {
+        JudgeStructuralCalibrationLoadStatus::Missing => "missing",
+        JudgeStructuralCalibrationLoadStatus::Loaded => "loaded",
+        JudgeStructuralCalibrationLoadStatus::Corrupt => "corrupt",
+        JudgeStructuralCalibrationLoadStatus::UnsupportedSchema => "unsupported_schema",
+        JudgeStructuralCalibrationLoadStatus::StorageError => "storage_error",
+    };
+    let expected_fingerprints = (structural.gate_required
+        && config.ars.llm_judge.structural_anchors.mode != JudgeStructuralAnchorMode::Off)
+        .then(|| crate::ops::llm_judge_worker::structural_fingerprints_for_config(config, surface))
+        .flatten();
+    let (expected_model_fingerprint, expected_rubric_fingerprint) = expected_fingerprints
+        .map(|(model, rubric)| (Some(model), Some(rubric)))
+        .unwrap_or((None, None));
+    let observed = (loaded.status == JudgeStructuralCalibrationLoadStatus::Loaded)
+        .then(|| loaded.state.surface(surface));
+    let observed_string = |value: &str| (!value.is_empty()).then(|| value.to_string());
+    let observed_model_fingerprint =
+        observed.and_then(|value| observed_string(&value.model_fingerprint));
+    let observed_rubric_fingerprint =
+        observed.and_then(|value| observed_string(&value.rubric_fingerprint));
+    let observed_probe_set_version =
+        observed.and_then(|value| observed_string(&value.probe_set_version));
+    let last_probe_at =
+        observed.and_then(|value| (value.last_probe_at > 0).then_some(value.last_probe_at));
+    let completed_at = observed.and_then(|value| value.completed_at);
+    let interval_secs =
+        i64::try_from(config.ars.llm_judge.structural_anchors.interval_secs).unwrap_or(i64::MAX);
+    let fresh_until =
+        completed_at.map(|value| value.saturating_add(interval_secs.saturating_mul(2)));
+    let alert_count = observed.map(|value| value.alert_count).unwrap_or(0);
+    let repair_advice = if structural.gate_required {
+        judge_structural_repair_advice(
+            config.ars.llm_judge.structural_anchors.mode,
+            loaded.status,
+            structural.status,
+        )
+    } else {
+        Vec::new()
+    };
+
+    JudgeSurfaceCalibrationReport {
+        human: JudgeHumanAgreementReport {
+            pair_count: human.pair_count,
+            kappa: human
+                .kappa
+                .filter(|kappa| kappa.is_finite() && (-1.0..=1.0).contains(kappa)),
+        },
+        runtime_vs_nightly: JudgeRuntimeVsNightlyReport {
+            pair_count: runtime_pairs,
+            kappa: runtime_kappa,
+            drift_alert_count,
+        },
+        structural: JudgeStructuralReport {
+            mode: mode.to_string(),
+            load_status: load_status.to_string(),
+            status: status.to_string(),
+            requested_action: judge_action_name(baseline_action).to_string(),
+            basis: basis.to_string(),
+            reason: reason.to_string(),
+            baseline_allowed: baseline_decision.action_allowed,
+            configured_baseline_scale: baseline_decision.configured_baseline_scale,
+            baseline_blocks_release: baseline_decision.blocks_release,
+            recall_fusion_promotion: judge_promotion_report(
+                recall_fusion_action,
+                recall_fusion_decision,
+            ),
+            surface_scope_promotion: judge_promotion_report(
+                surface_scope_action,
+                surface_scope_decision,
+            ),
+            expected_model_fingerprint,
+            observed_model_fingerprint,
+            expected_rubric_fingerprint,
+            observed_rubric_fingerprint,
+            expected_probe_set_version:
+                crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION.to_string(),
+            observed_probe_set_version,
+            last_probe_at,
+            completed_at,
+            fresh_until,
+            is_fresh: structural.status == JudgeStructuralStatus::Ready,
+            alert_count,
+            repair_advice,
+        },
+    }
+}
+
+fn judge_structural_repair_advice(
+    mode: crate::config::JudgeStructuralAnchorMode,
+    load_status: crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus,
+    status: crate::judge::contract::JudgeStructuralStatus,
+) -> Vec<String> {
+    use crate::config::JudgeStructuralAnchorMode;
+    use crate::judge::contract::JudgeStructuralStatus;
+    use crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus;
+
+    if mode == JudgeStructuralAnchorMode::Off {
+        return Vec::new();
+    }
+    let advice = match load_status {
+        JudgeStructuralCalibrationLoadStatus::Missing => {
+            "Run the judge worker to create a sealed four-probe structural calibration run. This diagnostic is read-only and does not synthesize or repair calibration evidence automatically."
+        }
+        JudgeStructuralCalibrationLoadStatus::Corrupt => {
+            "Preserve the unreadable structural calibration row for diagnosis, resolve the storage or producer fault, then run a fresh sealed four-probe suite. This diagnostic never deletes or rewrites the row."
+        }
+        JudgeStructuralCalibrationLoadStatus::UnsupportedSchema => {
+            "Upgrade rein before evaluating this future-schema structural calibration row. Preserve the row unchanged; this diagnostic never rewrites downgrade-owned evidence."
+        }
+        JudgeStructuralCalibrationLoadStatus::StorageError => {
+            "Restore read access to the calibration store and retry. This diagnostic is read-only and never mutates structural calibration state."
+        }
+        JudgeStructuralCalibrationLoadStatus::Loaded => match status {
+            JudgeStructuralStatus::Ready | JudgeStructuralStatus::Disabled => return Vec::new(),
+            JudgeStructuralStatus::Collecting => {
+                "Let the sealed four-probe run finish, or rerun the judge worker after the configured interval. This diagnostic does not complete probes automatically."
+            }
+            JudgeStructuralStatus::Failed => {
+                "Investigate the judge model and rubric, then run a fresh sealed four-probe suite. Failed evidence is preserved and never promoted or repaired automatically."
+            }
+            JudgeStructuralStatus::Stale => {
+                "Run the judge worker to refresh the expired structural anchor suite. This diagnostic reports staleness but never refreshes evidence automatically."
+            }
+            JudgeStructuralStatus::FingerprintMismatch => {
+                "Run the judge worker with the current model, rubric, and probe set to create a matching sealed suite. Mismatched evidence is preserved unchanged."
+            }
+            JudgeStructuralStatus::Corrupt => {
+                "Preserve the structural calibration evidence for diagnosis, then run a fresh sealed suite after resolving the fault. This diagnostic never rewrites it."
+            }
+            JudgeStructuralStatus::Unknown => {
+                "Run the judge worker to establish a complete sealed structural calibration run. This diagnostic does not infer missing evidence automatically."
+            }
+        },
+    };
+    vec![advice.to_string()]
 }
 
 /// v0.32 (T&M Phase 2): each `MeasurementGate` is now populated from a real
@@ -402,7 +808,26 @@ mod tests {
         let report_json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(report.schema_version, TRUST_MEASUREMENT_SCHEMA_VERSION);
-        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.schema_version, 3);
+        assert_eq!(report.judge_calibration.synthesis.human.pair_count, 0);
+        assert_eq!(report.judge_calibration.synthesis.human.kappa, None);
+        assert_eq!(
+            report
+                .judge_calibration
+                .synthesis
+                .runtime_vs_nightly
+                .pair_count,
+            0
+        );
+        assert_eq!(report.judge_calibration.synthesis.structural.mode, "off");
+        assert_eq!(
+            report.judge_calibration.synthesis.structural.status,
+            "disabled"
+        );
+        assert_eq!(
+            report.judge_calibration.synthesis.structural.basis,
+            "configured_baseline"
+        );
         for gate in ["recall", "dedup", "admission", "latency"] {
             assert!(
                 report.eval_gates.iter().any(|item| item.name == gate),
@@ -477,6 +902,353 @@ mod tests {
         assert!(advice.contains("atomically"), "advice={advice}");
         assert!(!advice.contains("doctor --fix"), "advice={advice}");
         assert!(!advice.contains("automatically"), "advice={advice}");
+    }
+
+    #[test]
+    fn judge_calibration_observability_keeps_human_drift_and_structural_evidence_distinct() {
+        use crate::config::JudgeStructuralAnchorMode;
+        use crate::store::adaptive::{
+            JudgeCalibrationState, JudgeStructuralProbeKind, JudgeSurface,
+        };
+        use crate::store::judge_structural_calibration::{
+            compare_and_swap_judge_structural_calibration, JudgeStructuralCalibrationState,
+            JudgeStructuralSurfaceState,
+        };
+
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = true;
+        config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Enforce;
+        config.ars.llm_judge.structural_anchors.interval_secs = 100;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-observability-model".to_string());
+
+        let mut calibration = JudgeCalibrationState {
+            runtime_vs_offline_kappa_synthesis: 0.88,
+            runtime_vs_offline_kappa_concept: 0.79,
+            last_consumed_event_id_calibration: 77,
+            total_offline_cron_events: 60,
+            last_computed_at: 9_990,
+            judge_drift_alert: 3,
+            ..JudgeCalibrationState::default()
+        };
+        for index in 0_i64..30 {
+            let value = index % 2 == 0;
+            calibration.push_pair(JudgeSurface::Synthesis, value, value, 9_900 + index);
+            calibration
+                .recent_pairs_runtime_vs_offline_synthesis
+                .push_back((value, value, 9_900 + index));
+            calibration
+                .recent_pairs_runtime_vs_offline_concept
+                .push_back((value, !value, 9_900 + index));
+        }
+        crate::store::adaptive::AdaptiveState {
+            judge_calibration_state: Some(calibration),
+            version: 1,
+            ..Default::default()
+        }
+        .save_snapshot(store.conn())
+        .unwrap();
+
+        let secret_token_hash = "s".repeat(64);
+        let ready_surface = |surface| {
+            let (model_fingerprint, rubric_fingerprint) =
+                crate::ops::llm_judge_worker::structural_fingerprints_for_config(&config, surface)
+                    .unwrap();
+            JudgeStructuralSurfaceState {
+                run_id: Some(format!("run-{surface:?}")),
+                probe_set_version: crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION
+                    .to_string(),
+                model_fingerprint,
+                rubric_fingerprint,
+                run_token_hashes: JudgeStructuralProbeKind::ALL
+                    .into_iter()
+                    .map(|kind| (kind, secret_token_hash.clone()))
+                    .collect(),
+                seen_kinds: JudgeStructuralProbeKind::ALL.into_iter().collect(),
+                run_started_at: 9_900,
+                last_probe_at: 9_950,
+                completed_at: Some(9_950),
+                status: crate::judge::contract::JudgeStructuralStatus::Ready,
+                ..JudgeStructuralSurfaceState::default()
+            }
+        };
+        let structural_state = JudgeStructuralCalibrationState {
+            revision: 1,
+            last_event_id: 88,
+            synthesis: ready_surface(JudgeSurface::Synthesis),
+            concept_summary: ready_surface(JudgeSurface::ConceptSummary),
+            updated_at: 9_950,
+            ..JudgeStructuralCalibrationState::default()
+        };
+        assert!(
+            compare_and_swap_judge_structural_calibration(store.conn(), &structural_state, 0)
+                .unwrap()
+        );
+
+        let report = collect_judge_calibration_observability(&store, &config, 10_000);
+        assert_eq!(report.human_runtime_watermark, 77);
+        assert_eq!(report.structural_watermark, 88);
+        assert_eq!(report.last_runtime_computed_at, 9_990);
+        assert_eq!(report.total_runtime_nightly_events, 60);
+        assert_eq!(report.global_drift_alert_count, 3);
+        assert_eq!(report.synthesis.human.pair_count, 30);
+        assert_eq!(report.synthesis.human.kappa, Some(1.0));
+        assert_eq!(report.concept_summary.human.pair_count, 0);
+        assert_eq!(report.concept_summary.human.kappa, None);
+        assert_eq!(report.synthesis.runtime_vs_nightly.pair_count, 30);
+        assert_eq!(report.synthesis.runtime_vs_nightly.kappa, Some(0.88));
+        assert_eq!(report.concept_summary.runtime_vs_nightly.kappa, Some(0.79));
+
+        let structural = &report.synthesis.structural;
+        assert_eq!(structural.load_status, "loaded");
+        assert_eq!(structural.status, "ready");
+        assert_eq!(structural.requested_action, "keep_configured_baseline");
+        assert_eq!(structural.basis, "human_kappa");
+        assert_eq!(structural.reason, "human_kappa_healthy");
+        assert!(structural.baseline_allowed);
+        assert_eq!(structural.configured_baseline_scale, 1.0);
+        assert!(!structural.baseline_blocks_release);
+        assert_eq!(
+            structural.expected_model_fingerprint,
+            structural.observed_model_fingerprint
+        );
+        assert_eq!(
+            structural.expected_rubric_fingerprint,
+            structural.observed_rubric_fingerprint
+        );
+        assert_eq!(
+            structural.expected_probe_set_version,
+            crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION
+        );
+        assert_eq!(
+            structural.observed_probe_set_version.as_deref(),
+            Some(crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION)
+        );
+        assert_eq!(structural.last_probe_at, Some(9_950));
+        assert_eq!(structural.completed_at, Some(9_950));
+        assert_eq!(structural.fresh_until, Some(10_150));
+        assert!(structural.is_fresh);
+        assert!(structural.repair_advice.is_empty());
+        let concept_structural = &report.concept_summary.structural;
+        assert_eq!(concept_structural.basis, "structural_anchors");
+        assert!(concept_structural.baseline_allowed);
+        assert!(!concept_structural.baseline_blocks_release);
+        assert_eq!(
+            concept_structural.recall_fusion_promotion.requested_action,
+            "promote_recall_fusion"
+        );
+        assert!(!concept_structural.recall_fusion_promotion.promotion_allowed);
+        assert!(concept_structural.recall_fusion_promotion.release_blocked);
+        assert_eq!(
+            concept_structural.surface_scope_promotion.requested_action,
+            "promote_judge_scope"
+        );
+        assert!(!concept_structural.surface_scope_promotion.promotion_allowed);
+        assert!(concept_structural.surface_scope_promotion.release_blocked);
+
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains(&secret_token_hash));
+        assert!(!serialized.contains("run-Synthesis"));
+    }
+
+    #[test]
+    fn judge_human_kappa_projection_omits_non_finite_or_out_of_range_values() {
+        use crate::store::adaptive::{AdaptiveState, JudgeCalibrationState, JudgeSurface};
+
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.01, -1.01] {
+            let store = SqliteStore::in_memory().unwrap();
+            let mut config = ReinConfig::default();
+            config.ars.llm_judge.enabled = true;
+            config.ars.llm_judge.synthesis_enabled = true;
+
+            let mut calibration = JudgeCalibrationState::default();
+            for timestamp in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS as i64 {
+                calibration.push_pair(JudgeSurface::Synthesis, true, true, timestamp);
+            }
+            calibration.kappa = invalid;
+            let state = AdaptiveState {
+                judge_calibration_state: Some(calibration),
+                ..AdaptiveState::default()
+            };
+
+            let report =
+                collect_judge_calibration_observability_from_state(&store, &config, &state, 1_000);
+            assert_eq!(
+                report.synthesis.human.pair_count,
+                crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS
+            );
+            assert_eq!(report.synthesis.human.kappa, None, "invalid={invalid}");
+        }
+    }
+
+    #[test]
+    fn judge_structural_repair_advice_is_status_specific_read_only_and_redacted() {
+        use crate::config::JudgeStructuralAnchorMode;
+        use crate::store::adaptive::{JudgeStructuralProbeKind, JudgeSurface};
+        use crate::store::judge_structural_calibration::{
+            compare_and_swap_judge_structural_calibration, JudgeStructuralCalibrationState,
+            JudgeStructuralSurfaceState, JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY,
+        };
+
+        let config_for = |mode, model: &str| {
+            let mut config = ReinConfig::default();
+            config.ars.llm_judge.enabled = true;
+            config.ars.llm_judge.synthesis_enabled = true;
+            config.ars.llm_judge.concept_summary_enabled = false;
+            config.ars.llm_judge.structural_anchors.mode = mode;
+            config.ars.llm_judge.structural_anchors.interval_secs = 100;
+            config.llm.provider = "omlx".to_string();
+            config.llm.omlx.model = Some(model.to_string());
+            config
+        };
+        let ready_state = |config: &ReinConfig, completed_at: i64| {
+            let (model_fingerprint, rubric_fingerprint) =
+                crate::ops::llm_judge_worker::structural_fingerprints_for_config(
+                    config,
+                    JudgeSurface::Synthesis,
+                )
+                .unwrap();
+            JudgeStructuralCalibrationState {
+                revision: 1,
+                synthesis: JudgeStructuralSurfaceState {
+                    run_id: Some("operator-run-id-must-not-leak".to_string()),
+                    probe_set_version:
+                        crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION.to_string(),
+                    model_fingerprint,
+                    rubric_fingerprint,
+                    run_token_hashes: JudgeStructuralProbeKind::ALL
+                        .into_iter()
+                        .map(|kind| (kind, "t".repeat(64)))
+                        .collect(),
+                    seen_kinds: JudgeStructuralProbeKind::ALL.into_iter().collect(),
+                    run_started_at: completed_at - 10,
+                    last_probe_at: completed_at,
+                    completed_at: Some(completed_at),
+                    status: crate::judge::contract::JudgeStructuralStatus::Ready,
+                    ..JudgeStructuralSurfaceState::default()
+                },
+                updated_at: completed_at,
+                ..JudgeStructuralCalibrationState::default()
+            }
+        };
+
+        for (mode, expected_status, expected_basis, expected_scale, has_advice) in [
+            (
+                JudgeStructuralAnchorMode::Off,
+                "disabled",
+                "configured_baseline",
+                1.0,
+                false,
+            ),
+            (
+                JudgeStructuralAnchorMode::Monitor,
+                "unknown",
+                "configured_baseline",
+                1.0,
+                true,
+            ),
+            (
+                JudgeStructuralAnchorMode::Enforce,
+                "unknown",
+                "untrusted",
+                0.0,
+                true,
+            ),
+        ] {
+            let store = SqliteStore::in_memory().unwrap();
+            let config = config_for(mode, "judge-model-a");
+            let report = collect_judge_calibration_observability(&store, &config, 1_000);
+            let structural = &report.synthesis.structural;
+            assert_eq!(structural.load_status, "missing");
+            assert_eq!(structural.status, expected_status);
+            assert_eq!(structural.basis, expected_basis);
+            assert_eq!(structural.configured_baseline_scale, expected_scale);
+            assert_eq!(!structural.repair_advice.is_empty(), has_advice);
+            assert!(
+                report.concept_summary.structural.repair_advice.is_empty(),
+                "a disabled judge surface must not request structural repair"
+            );
+        }
+
+        for (raw, load_status, advice_word) in [
+            (
+                "{operator-secret-corrupt-payload".to_string(),
+                "corrupt",
+                "Preserve",
+            ),
+            (
+                serde_json::json!({
+                    "schema_version": 9999,
+                    "revision": 7,
+                    "operator_secret": "future-secret-must-not-leak"
+                })
+                .to_string(),
+                "unsupported_schema",
+                "Upgrade",
+            ),
+        ] {
+            let store = SqliteStore::in_memory().unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                    rusqlite::params![JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY, &raw],
+                )
+                .unwrap();
+            let config = config_for(JudgeStructuralAnchorMode::Enforce, "judge-model-a");
+            let report = collect_judge_calibration_observability(&store, &config, 1_000);
+            let structural = &report.synthesis.structural;
+            assert_eq!(structural.load_status, load_status);
+            assert!(
+                structural.repair_advice.join(" ").contains(advice_word),
+                "advice={:?}",
+                structural.repair_advice
+            );
+            let serialized = serde_json::to_string(&report).unwrap();
+            assert!(!serialized.contains("operator-secret"));
+            assert!(!serialized.contains("future-secret"));
+            assert!(!serialized.contains(&raw));
+            assert!(!serialized.contains("doctor --fix"));
+        }
+
+        let stale_store = SqliteStore::in_memory().unwrap();
+        let stale_config = config_for(JudgeStructuralAnchorMode::Enforce, "judge-model-a");
+        let stale_state = ready_state(&stale_config, 1_000);
+        assert!(
+            compare_and_swap_judge_structural_calibration(stale_store.conn(), &stale_state, 0)
+                .unwrap()
+        );
+        let stale = collect_judge_calibration_observability(&stale_store, &stale_config, 1_201);
+        assert_eq!(stale.synthesis.structural.status, "stale");
+        assert!(stale
+            .synthesis
+            .structural
+            .repair_advice
+            .join(" ")
+            .contains("refresh"));
+
+        let mismatch_store = SqliteStore::in_memory().unwrap();
+        let original_config = config_for(JudgeStructuralAnchorMode::Enforce, "judge-model-a");
+        let mismatch_state = ready_state(&original_config, 1_000);
+        assert!(compare_and_swap_judge_structural_calibration(
+            mismatch_store.conn(),
+            &mismatch_state,
+            0
+        )
+        .unwrap());
+        let changed_config = config_for(JudgeStructuralAnchorMode::Enforce, "judge-model-b");
+        let mismatch =
+            collect_judge_calibration_observability(&mismatch_store, &changed_config, 1_100);
+        assert_eq!(mismatch.synthesis.structural.status, "fingerprint_mismatch");
+        assert!(mismatch
+            .synthesis
+            .structural
+            .repair_advice
+            .join(" ")
+            .contains("current model"));
     }
 
     #[test]

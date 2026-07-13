@@ -855,6 +855,11 @@ fn api_judge_calibration(config: &ReinConfig) -> BoxedResponse {
     let state =
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
     let cal = state.judge_calibration_state.unwrap_or_default();
+    let observability = crate::ops::trust_measurement::collect_judge_calibration_observability(
+        &store,
+        config,
+        chrono::Utc::now().timestamp(),
+    );
     let body = json!({
         "kappa": cal.kappa,
         "runtime_vs_offline_kappa": cal.runtime_vs_offline_kappa,
@@ -871,6 +876,7 @@ fn api_judge_calibration(config: &ReinConfig) -> BoxedResponse {
         "recent_pairs_runtime_vs_offline_count": cal.recent_pairs_runtime_vs_offline.len(),
         "recent_pairs_runtime_vs_offline_synthesis_count": cal.recent_pairs_runtime_vs_offline_synthesis.len(),
         "recent_pairs_runtime_vs_offline_concept_count": cal.recent_pairs_runtime_vs_offline_concept.len(),
+        "observability": observability,
     });
     json_response(StatusCode::OK, body)
 }
@@ -2443,6 +2449,87 @@ mod tests {
             }),
             "cold-start synthesis projection must match contract §4.3 exactly"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn judge_calibration_projection_is_consistent_across_rest_and_adaptive_status() {
+        let _guard = env_lock().lock().await;
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("judge-observability.db");
+        let mut config = test_config(&db_path);
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = true;
+        config.ars.llm_judge.structural_anchors.mode =
+            crate::config::JudgeStructuralAnchorMode::Enforce;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-observability-model".to_string());
+        let _store = SqliteStore::new(&db_path, &config.embedding_model(), 3072).unwrap();
+
+        let calibration_request = Request::builder()
+            .method("GET")
+            .uri("/api/judge/calibration")
+            .body(())
+            .unwrap();
+        let calibration_response = handle_rest_request(&calibration_request, &config)
+            .await
+            .unwrap();
+        let calibration_json = read_json(calibration_response).await;
+        let rest_projection = &calibration_json["observability"];
+        assert_eq!(rest_projection["synthesis"]["human"]["pair_count"], 0);
+        assert!(rest_projection["synthesis"]["human"].get("kappa").is_none());
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["load_status"],
+            "missing"
+        );
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["status"],
+            "unknown"
+        );
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["basis"],
+            "untrusted"
+        );
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["requested_action"],
+            "keep_configured_baseline"
+        );
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["baseline_allowed"],
+            false
+        );
+        assert!(rest_projection["synthesis"]["structural"]
+            .get("action_allowed")
+            .is_none());
+        assert!(rest_projection["synthesis"]["structural"]
+            .get("blocks_release")
+            .is_none());
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["recall_fusion_promotion"]
+                ["requested_action"],
+            "promote_recall_fusion"
+        );
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["recall_fusion_promotion"]
+                ["release_blocked"],
+            true
+        );
+        assert_eq!(
+            rest_projection["synthesis"]["structural"]["configured_baseline_scale"],
+            0.0
+        );
+
+        let adaptive_request = Request::builder()
+            .method("GET")
+            .uri("/api/adaptive")
+            .body(())
+            .unwrap();
+        let adaptive_response = handle_rest_request(&adaptive_request, &config)
+            .await
+            .unwrap();
+        let adaptive_json = read_json(adaptive_response).await;
+        assert_eq!(&adaptive_json["judge_calibration"], rest_projection);
     }
 
     #[tokio::test]
