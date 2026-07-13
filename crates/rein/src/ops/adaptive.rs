@@ -5,11 +5,583 @@
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
-use std::collections::HashMap;
+use crate::types::{ReinError, ReinResult};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 
 use super::dedup::run_vec_dedup;
 
 const ARS_POLICY_ADOPTION_MAX_STEP: f64 = 0.05;
+const A12_RECALL_TRACE_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct A12RefreshInputs {
+    source_snapshot_fingerprint: String,
+    behavior_config_fingerprint: String,
+    hard_dedup_bound_bits: u32,
+    trace_limit: usize,
+    min_samples_alpha: usize,
+}
+
+impl A12RefreshInputs {
+    fn hard_dedup_bound(&self) -> f32 {
+        f32::from_bits(self.hard_dedup_bound_bits)
+    }
+}
+
+#[derive(Debug)]
+struct A12CalibrationBatch {
+    corpus_fingerprint: String,
+    scopes: Vec<crate::ops::a12_autocalibration::A12ScopeCalibration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum A12CalibrationRefreshOutcome {
+    Disabled,
+    Unhealthy,
+    Unchanged,
+    PendingCasMiss,
+    CompleteSaved,
+    FinalSnapshotMismatch,
+    FinalCasMiss,
+}
+
+fn a12_generation_fingerprint(
+    phase: &str,
+    generation: u64,
+    source_snapshot_fingerprint: &str,
+    behavior_config_fingerprint: &str,
+    corpus_fingerprint: &str,
+    calibrated_at_unix_ms: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"a12-calibration-generation-v1\0");
+    for field in [
+        phase.as_bytes(),
+        source_snapshot_fingerprint.as_bytes(),
+        behavior_config_fingerprint.as_bytes(),
+        corpus_fingerprint.as_bytes(),
+        &generation.to_le_bytes(),
+        &calibrated_at_unix_ms.to_le_bytes(),
+    ] {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn a12_count(value: usize, label: &str) -> ReinResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| ReinError::Config(format!("A12 {label} exceeds the durable u64 schema")))
+}
+
+fn parse_a12_scope_key(
+    key: &str,
+) -> ReinResult<crate::store::a12_calibration::A12CalibrationScope> {
+    use crate::store::a12_calibration::A12CalibrationScope;
+
+    if key == "global" {
+        return Ok(A12CalibrationScope::Global);
+    }
+    if key.is_empty() || key.trim() != key {
+        return Err(ReinError::Config(format!(
+            "invalid A12 calibration scope '{key}'"
+        )));
+    }
+    let Some((query_type, cluster_id)) = key.split_once(':') else {
+        return Ok(A12CalibrationScope::QueryType {
+            query_type: key.to_string(),
+        });
+    };
+    if query_type.is_empty()
+        || query_type == "global"
+        || cluster_id.is_empty()
+        || cluster_id.contains(':')
+    {
+        return Err(ReinError::Config(format!(
+            "invalid A12 calibration scope '{key}'"
+        )));
+    }
+    let cluster_id = cluster_id
+        .parse::<u32>()
+        .map_err(|_| ReinError::Config(format!("invalid A12 cluster scope id in '{key}'")))?;
+    Ok(A12CalibrationScope::Cluster {
+        query_type: query_type.to_string(),
+        cluster_id: i64::from(cluster_id),
+    })
+}
+
+/// Lossless Task-3 → Task-4 durable projection. The validity horizon is
+/// already Unix milliseconds and is deliberately copied without conversion.
+fn map_a12_scope_calibration(
+    calibration: &crate::ops::a12_autocalibration::A12ScopeCalibration,
+    generation: u64,
+    generation_fingerprint: &str,
+    snapshot_cutoff: i64,
+    cluster_generation: u64,
+) -> ReinResult<(String, crate::store::a12_calibration::A12ScopeEntry)> {
+    use crate::eval::gates::ScorecardStatus;
+    use crate::store::a12_calibration::{
+        A12CalibrationScope, A12CalibrationVerdict, A12FusionSimplex, A12PairedTop3Stats,
+        A12ProvenanceCounts, A12ScopeEntry, A12_DEFAULT_NOISE_FLOOR,
+    };
+
+    if generation == 0
+        || generation_fingerprint.is_empty()
+        || calibration.snapshot_fingerprint.is_empty()
+        || calibration.corpus_fingerprint.is_empty()
+        || calibration.training_fingerprint.is_empty()
+        || calibration.holdout_fingerprint.is_empty()
+        || calibration.optimizer_fingerprint.is_empty()
+        || calibration.evaluation_fingerprint.is_empty()
+        || calibration.holdout_reason.is_empty()
+    {
+        return Err(ReinError::Config(
+            "A12 scope mapping requires complete generation and provenance identities".into(),
+        ));
+    }
+    let scope = parse_a12_scope_key(&calibration.scope)?;
+    let weights = match calibration.learned_weights {
+        Some(weights) => weights,
+        None if calibration.holdout_status == ScorecardStatus::Ship => {
+            return Err(ReinError::Config(
+                "A12 Ship calibration is missing learned weights".into(),
+            ));
+        }
+        None => crate::search::alpha_optimizer::ShadowFusionWeights::default(),
+    };
+    let paired = calibration.paired_top3;
+    let mcnemar = &calibration.mcnemar;
+    if (
+        paired.both_hit,
+        paired.baseline_only,
+        paired.treatment_only,
+        paired.neither_hit,
+    ) != (
+        mcnemar.a as usize,
+        mcnemar.b as usize,
+        mcnemar.c as usize,
+        mcnemar.d as usize,
+    ) || calibration.holdout_family_ess != mcnemar.n as usize
+    {
+        return Err(ReinError::Config(
+            "A12 paired holdout counts do not match the McNemar projection".into(),
+        ));
+    }
+    let calibrated_at = calibration.calibrated_at.timestamp();
+    if calibrated_at < 0 {
+        return Err(ReinError::Config(
+            "A12 calibration timestamp predates the Unix epoch".into(),
+        ));
+    }
+    let cluster_generation = if matches!(scope, A12CalibrationScope::Cluster { .. }) {
+        Some(cluster_generation)
+    } else {
+        None
+    };
+    let key = scope.key();
+    Ok((
+        key,
+        A12ScopeEntry {
+            scope,
+            canonical_generation: generation,
+            generation_fingerprint: generation_fingerprint.to_string(),
+            source_snapshot_fingerprint: calibration.snapshot_fingerprint.clone(),
+            snapshot_cutoff,
+            corpus_fingerprint: calibration.corpus_fingerprint.clone(),
+            train_family_ess: a12_count(calibration.train_family_ess, "train family ESS")?,
+            train_case_count: a12_count(calibration.train_case_count, "train case count")?,
+            holdout_family_ess: a12_count(calibration.holdout_family_ess, "holdout family ESS")?,
+            simplex: A12FusionSimplex {
+                bm25: weights.bm25,
+                vector: weights.vec,
+                kg: weights.kg,
+                episode: weights.episode,
+                support: weights.support,
+                diversity: weights.diversity,
+            },
+            verdict: match calibration.holdout_status {
+                ScorecardStatus::Ship => A12CalibrationVerdict::Ship,
+                ScorecardStatus::Bail => A12CalibrationVerdict::Bail,
+                ScorecardStatus::NoData => A12CalibrationVerdict::NoData,
+            },
+            noise_floor: A12_DEFAULT_NOISE_FLOOR,
+            paired_top3: A12PairedTop3Stats {
+                n: u64::from(mcnemar.n),
+                both_hit: u64::from(mcnemar.a),
+                baseline_only: u64::from(mcnemar.b),
+                treatment_only: u64::from(mcnemar.c),
+                neither_hit: u64::from(mcnemar.d),
+                chi_squared: mcnemar.chi_squared,
+                p_value: mcnemar.p_value,
+                diff_point: mcnemar.diff_point,
+                ci_lower: mcnemar.ci_lower,
+                ci_upper: mcnemar.ci_upper,
+                used_exact: mcnemar.used_exact,
+            },
+            provenance: A12ProvenanceCounts {
+                canonical_loo: a12_count(
+                    calibration.provenance.canonical_loo,
+                    "canonical provenance count",
+                )?,
+                concept_loo: a12_count(
+                    calibration.provenance.concept_loo,
+                    "concept provenance count",
+                )?,
+                episode_loo: a12_count(
+                    calibration.provenance.episode_loo,
+                    "episode provenance count",
+                )?,
+            },
+            training_fingerprint: calibration.training_fingerprint.clone(),
+            holdout_fingerprint: calibration.holdout_fingerprint.clone(),
+            optimizer_fingerprint: calibration.optimizer_fingerprint.clone(),
+            evaluation_fingerprint: calibration.evaluation_fingerprint.clone(),
+            holdout_reason: calibration.holdout_reason.clone(),
+            calibrated_at,
+            evaluated_at: calibrated_at,
+            valid_until_exclusive: calibration.valid_until_exclusive,
+            cluster_generation,
+            invalidation: None,
+        },
+    ))
+}
+
+fn refresh_a12_calibration_with<F, H>(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    durable_state: &crate::store::adaptive::AdaptiveState,
+    calibrated_at: chrono::DateTime<chrono::Utc>,
+    calibrate: F,
+    before_final_cas: H,
+) -> ReinResult<A12CalibrationRefreshOutcome>
+where
+    F: FnOnce(&A12RefreshInputs, chrono::DateTime<chrono::Utc>) -> ReinResult<A12CalibrationBatch>,
+    H: FnOnce(&SqliteStore, &crate::store::a12_calibration::A12CalibrationState) -> ReinResult<()>,
+{
+    use crate::store::a12_calibration::{
+        compare_and_swap_a12_calibration, load_a12_calibration,
+        next_a12_calibration_revision_identity, A12CalibrationLoadStatus, A12CalibrationPhase,
+        A12CalibrationRunMetadata, A12CalibrationState, A12_CALIBRATION_SCHEMA_VERSION,
+    };
+
+    if !config.adaptive.enabled || !config.ars.acceleration.enabled {
+        return Ok(A12CalibrationRefreshOutcome::Disabled);
+    }
+    let calibrated_at_unix_ms = calibrated_at.timestamp_millis();
+    let calibrated_at_unix_s = calibrated_at.timestamp();
+    if calibrated_at_unix_ms < 0 || calibrated_at_unix_s < 0 {
+        return Err(ReinError::Config(
+            "A12 calibration time predates the Unix epoch".into(),
+        ));
+    }
+    let snapshot_cutoff = i64::try_from(durable_state.version).map_err(|_| {
+        ReinError::Config("adaptive snapshot version exceeds A12 i64 cutoff schema".into())
+    })?;
+    let hard_dedup_bound =
+        crate::ops::effective_hard_dedup_threshold_from_conn(store.conn(), config);
+    let source_snapshot_fingerprint =
+        crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint(store)?;
+    let behavior_config_fingerprint =
+        crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
+            config,
+            hard_dedup_bound,
+            A12_RECALL_TRACE_LIMIT,
+            config.adaptive.min_samples_alpha,
+        )?;
+    let inputs = A12RefreshInputs {
+        source_snapshot_fingerprint,
+        behavior_config_fingerprint,
+        hard_dedup_bound_bits: hard_dedup_bound.to_bits(),
+        trace_limit: A12_RECALL_TRACE_LIMIT,
+        min_samples_alpha: config.adaptive.min_samples_alpha,
+    };
+
+    let loaded = load_a12_calibration(store.conn());
+    if matches!(
+        loaded.status,
+        A12CalibrationLoadStatus::Corrupt
+            | A12CalibrationLoadStatus::UnsupportedSchema
+            | A12CalibrationLoadStatus::StorageError
+    ) {
+        return Ok(A12CalibrationRefreshOutcome::Unhealthy);
+    }
+    if loaded.status == A12CalibrationLoadStatus::Loaded
+        && loaded.state.is_complete()
+        && loaded.state.run.as_ref().is_some_and(|run| {
+            run.source_snapshot_fingerprint == inputs.source_snapshot_fingerprint
+                && run.behavior_config_fingerprint == inputs.behavior_config_fingerprint
+        })
+        && loaded
+            .state
+            .next_expiry_unix_ms()
+            .is_none_or(|expiry| calibrated_at_unix_ms < expiry)
+    {
+        return Ok(A12CalibrationRefreshOutcome::Unchanged);
+    }
+
+    let expected_revision = if loaded.status == A12CalibrationLoadStatus::Loaded {
+        loaded.state.revision
+    } else {
+        0
+    };
+    let previous_generation = if loaded.status == A12CalibrationLoadStatus::Loaded {
+        loaded.state.generation
+    } else {
+        0
+    };
+    let pending_generation = previous_generation
+        .checked_add(1)
+        .ok_or_else(|| ReinError::Config("A12 calibration generation space is exhausted".into()))?;
+    let pending_identity =
+        next_a12_calibration_revision_identity(store.conn(), pending_generation)?;
+    let pending_corpus_fingerprint = a12_generation_fingerprint(
+        "pending-corpus",
+        pending_generation,
+        &inputs.source_snapshot_fingerprint,
+        &inputs.behavior_config_fingerprint,
+        "pending",
+        calibrated_at_unix_ms,
+    );
+    let pending_generation_fingerprint = a12_generation_fingerprint(
+        "pending",
+        pending_generation,
+        &inputs.source_snapshot_fingerprint,
+        &inputs.behavior_config_fingerprint,
+        &pending_corpus_fingerprint,
+        calibrated_at_unix_ms,
+    );
+    let pending = A12CalibrationState {
+        schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+        revision: pending_identity.revision,
+        generation: pending_identity.generation,
+        generation_fingerprint: pending_generation_fingerprint,
+        snapshot_cutoff,
+        corpus_fingerprint: pending_corpus_fingerprint,
+        cluster_generation: durable_state.cluster_version,
+        scopes: BTreeMap::new(),
+        created_at: calibrated_at_unix_s,
+        updated_at: calibrated_at_unix_s,
+        run: Some(A12CalibrationRunMetadata {
+            phase: A12CalibrationPhase::Pending,
+            source_snapshot_fingerprint: inputs.source_snapshot_fingerprint.clone(),
+            behavior_config_fingerprint: inputs.behavior_config_fingerprint.clone(),
+        }),
+    };
+    if !compare_and_swap_a12_calibration(store.conn(), &pending, expected_revision)? {
+        return Ok(A12CalibrationRefreshOutcome::PendingCasMiss);
+    }
+
+    // The activation barrier is durable before corpus construction or replay
+    // begins. Any error below intentionally leaves this pending head active.
+    let batch = calibrate(&inputs, calibrated_at)?;
+    if batch.corpus_fingerprint.is_empty()
+        || batch.scopes.iter().any(|scope| {
+            scope.snapshot_fingerprint != inputs.source_snapshot_fingerprint
+                || scope.corpus_fingerprint != batch.corpus_fingerprint
+        })
+    {
+        return Err(ReinError::Config(
+            "A12 calibration batch does not match its pending snapshot/corpus identity".into(),
+        ));
+    }
+    let live_snapshot = crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint(store)?;
+    if live_snapshot != inputs.source_snapshot_fingerprint {
+        return Err(ReinError::Config(format!(
+            "A12 local snapshot advanced before final CAS: pending={} live={live_snapshot}",
+            inputs.source_snapshot_fingerprint
+        )));
+    }
+
+    let final_generation = pending
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| ReinError::Config("A12 calibration generation space is exhausted".into()))?;
+    let final_identity = next_a12_calibration_revision_identity(store.conn(), final_generation)?;
+    let final_generation_fingerprint = a12_generation_fingerprint(
+        "complete",
+        final_generation,
+        &inputs.source_snapshot_fingerprint,
+        &inputs.behavior_config_fingerprint,
+        &batch.corpus_fingerprint,
+        calibrated_at_unix_ms,
+    );
+    let mut scopes = BTreeMap::new();
+    let mut updated_at = calibrated_at_unix_s;
+    for calibration in &batch.scopes {
+        let (key, entry) = map_a12_scope_calibration(
+            calibration,
+            final_generation,
+            &final_generation_fingerprint,
+            snapshot_cutoff,
+            durable_state.cluster_version,
+        )?;
+        updated_at = updated_at.max(entry.evaluated_at);
+        if scopes.insert(key.clone(), entry).is_some() {
+            return Err(ReinError::Config(format!(
+                "A12 calibration batch contains duplicate scope '{key}'"
+            )));
+        }
+    }
+    let final_state = A12CalibrationState {
+        schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+        revision: final_identity.revision,
+        generation: final_identity.generation,
+        generation_fingerprint: final_generation_fingerprint,
+        snapshot_cutoff,
+        corpus_fingerprint: batch.corpus_fingerprint,
+        cluster_generation: durable_state.cluster_version,
+        scopes,
+        created_at: calibrated_at_unix_s,
+        updated_at,
+        run: Some(A12CalibrationRunMetadata {
+            phase: A12CalibrationPhase::Complete,
+            source_snapshot_fingerprint: inputs.source_snapshot_fingerprint,
+            behavior_config_fingerprint: inputs.behavior_config_fingerprint,
+        }),
+    };
+
+    // The review hook intentionally runs before the write lock so tests can
+    // reproduce a source mutation in the former check→CAS race window.
+    before_final_cas(store, &pending)?;
+    store.conn().execute_batch("BEGIN IMMEDIATE")?;
+    let publication = (|| -> ReinResult<A12CalibrationRefreshOutcome> {
+        let locked_snapshot =
+            crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint_in_transaction(store)?;
+        if locked_snapshot
+            != final_state
+                .run
+                .as_ref()
+                .expect("Task-5 final state always carries run metadata")
+                .source_snapshot_fingerprint
+        {
+            return Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch);
+        }
+        if compare_and_swap_a12_calibration(store.conn(), &final_state, pending.revision)? {
+            Ok(A12CalibrationRefreshOutcome::CompleteSaved)
+        } else {
+            Ok(A12CalibrationRefreshOutcome::FinalCasMiss)
+        }
+    })();
+    match publication {
+        Ok(A12CalibrationRefreshOutcome::CompleteSaved) => {
+            if let Err(error) = store.conn().execute_batch("COMMIT") {
+                let _ = store.conn().execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+            Ok(A12CalibrationRefreshOutcome::CompleteSaved)
+        }
+        Ok(outcome) => {
+            store.conn().execute_batch("ROLLBACK")?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = store.conn().execute_batch("ROLLBACK") {
+                return Err(rollback_error.into());
+            }
+            Err(error)
+        }
+    }
+}
+
+fn refresh_a12_calibration(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    durable_state: &crate::store::adaptive::AdaptiveState,
+    calibrated_at: chrono::DateTime<chrono::Utc>,
+) -> ReinResult<A12CalibrationRefreshOutcome> {
+    refresh_a12_calibration_with(
+        store,
+        config,
+        durable_state,
+        calibrated_at,
+        |inputs, calibrated_at| {
+            let corpus = crate::ops::a12_autocalibration::build_a12_loo_corpus(
+                store,
+                inputs.hard_dedup_bound(),
+            )?;
+            if corpus.source_snapshot_fingerprint != inputs.source_snapshot_fingerprint {
+                return Err(ReinError::Config(format!(
+                    "A12 corpus snapshot mismatch: pending={} corpus={}",
+                    inputs.source_snapshot_fingerprint, corpus.source_snapshot_fingerprint
+                )));
+            }
+            let corpus_fingerprint =
+                crate::ops::a12_autocalibration::a12_corpus_fingerprint(&corpus)?;
+            let scopes = crate::ops::a12_autocalibration::train_and_evaluate_a12_corpus(
+                store,
+                config,
+                &corpus,
+                inputs.trace_limit,
+                inputs.min_samples_alpha,
+                calibrated_at,
+            )?;
+            Ok(A12CalibrationBatch {
+                corpus_fingerprint,
+                scopes,
+            })
+        },
+        |_store, _pending| Ok(()),
+    )
+}
+
+/// Restore the durable post-CAS AdaptiveState and run every policy-producing
+/// refresh from that exact state. `save_snapshot` may merge with a concurrent
+/// writer, so the caller's in-memory value is not authoritative after success.
+fn run_post_snapshot_refreshes(store: &SqliteStore, config: &ReinConfig) {
+    let Some(durable_state) = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
+    else {
+        tracing::warn!(
+            "post-snapshot calibration skipped because durable AdaptiveState could not be restored"
+        );
+        return;
+    };
+
+    let now = chrono::Utc::now();
+    let validity_secs = config
+        .adaptive
+        .event_retention_days
+        .max(1)
+        .saturating_mul(2)
+        .saturating_mul(24 * 60 * 60)
+        .min(i64::MAX as u64) as i64;
+    if let Err(error) = crate::eval::gates::dedup::refresh_dedup_calibration_policy(
+        store,
+        config.search.dedup_similarity as f32,
+        durable_state.get_dedup_shadow_threshold(None),
+        now.timestamp(),
+        validity_secs,
+    ) {
+        tracing::warn!(%error, "dedup calibration bundle refresh skipped");
+    }
+
+    match refresh_a12_calibration(store, config, &durable_state, now) {
+        Ok(A12CalibrationRefreshOutcome::CompleteSaved) => {
+            tracing::debug!("A12 calibration pending barrier replaced by completed revision")
+        }
+        Ok(A12CalibrationRefreshOutcome::FinalCasMiss) => tracing::warn!(
+            "A12 final calibration CAS missed; active pending/peer revision remains fail-closed"
+        ),
+        Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch) => tracing::warn!(
+            "A12 source snapshot changed before final publication; active pending revision remains fail-closed"
+        ),
+        Ok(A12CalibrationRefreshOutcome::PendingCasMiss) => {
+            tracing::warn!("A12 pending calibration CAS missed; peer revision remains active")
+        }
+        Ok(A12CalibrationRefreshOutcome::Unhealthy) => tracing::warn!(
+            "A12 calibration state is corrupt, future-schema, or unreadable; preserving bytes"
+        ),
+        Ok(A12CalibrationRefreshOutcome::Disabled | A12CalibrationRefreshOutcome::Unchanged) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "A12 recalibration failed after publishing pending barrier; policy stays fail-closed"
+        ),
+    }
+
+    // Policy refresh is last: it can only resolve the A12 revision that won
+    // the final CAS (or the active empty pending barrier after a failure).
+    refresh_ars_parameter_policy(store.conn(), config, &durable_state);
+}
 
 fn persist_ars_effective_scalars(
     state: &mut crate::store::adaptive::AdaptiveState,
@@ -732,24 +1304,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         }
     };
     if snapshot_saved {
-        let now = chrono::Utc::now().timestamp();
-        let validity_secs = config
-            .adaptive
-            .event_retention_days
-            .max(1)
-            .saturating_mul(2)
-            .saturating_mul(24 * 60 * 60)
-            .min(i64::MAX as u64) as i64;
-        if let Err(error) = crate::eval::gates::dedup::refresh_dedup_calibration_policy(
-            store,
-            config.search.dedup_similarity as f32,
-            state.get_dedup_shadow_threshold(None),
-            now,
-            validity_secs,
-        ) {
-            tracing::warn!(%error, "dedup calibration bundle refresh skipped");
-        }
-        refresh_ars_parameter_policy(store.conn(), config, &state);
+        run_post_snapshot_refreshes(store, config);
     }
 
     // Step 6b: Post-save offset commits. Honor the module invariant —
@@ -4263,6 +4818,465 @@ mod tests {
             },
         );
         state
+    }
+
+    fn a12_scope_calibration(
+        scope: &str,
+        calibrated_at: chrono::DateTime<Utc>,
+        valid_until_exclusive: Option<i64>,
+    ) -> crate::ops::a12_autocalibration::A12ScopeCalibration {
+        let mcnemar = crate::eval::mcnemar::mcnemar_from_counts(14, 0, 4, 2).unwrap();
+        crate::ops::a12_autocalibration::A12ScopeCalibration {
+            scope: scope.to_string(),
+            learned_weights: Some(crate::search::alpha_optimizer::ShadowFusionWeights {
+                bm25: 0.30,
+                vec: 0.30,
+                kg: 0.10,
+                episode: 0.10,
+                support: 0.10,
+                diversity: 0.10,
+            }),
+            train_family_ess: 24,
+            train_case_count: 31,
+            holdout_family_ess: 20,
+            paired_top3: crate::ops::a12_autocalibration::A12PairedTop3 {
+                both_hit: 14,
+                baseline_only: 0,
+                treatment_only: 4,
+                neither_hit: 2,
+            },
+            mcnemar,
+            holdout_status: crate::eval::gates::ScorecardStatus::Ship,
+            holdout_reason: "Ship: holdout non-inferiority passed".to_string(),
+            provenance: crate::ops::a12_autocalibration::A12ProvenanceCounts {
+                canonical_loo: 24,
+                concept_loo: 5,
+                episode_loo: 2,
+            },
+            valid_until_exclusive,
+            snapshot_fingerprint: "snapshot-fingerprint".to_string(),
+            corpus_fingerprint: "corpus-fingerprint".to_string(),
+            training_fingerprint: "training-fingerprint".to_string(),
+            holdout_fingerprint: "holdout-fingerprint".to_string(),
+            optimizer_fingerprint: "optimizer-fingerprint".to_string(),
+            evaluation_fingerprint: "evaluation-fingerprint".to_string(),
+            calibrated_at,
+        }
+    }
+
+    #[test]
+    fn a12_scope_mapping_preserves_complete_calibration_evidence_and_ms_expiry() {
+        let calibrated_at = chrono::DateTime::<Utc>::from_timestamp(1_000, 0).unwrap();
+        let calibration = a12_scope_calibration("semantic:7", calibrated_at, Some(1_000_987_654));
+
+        let (key, mapped) =
+            map_a12_scope_calibration(&calibration, 12, "generation-fingerprint", 77, 9).unwrap();
+
+        assert_eq!(key, "semantic:7");
+        assert_eq!(
+            mapped.scope,
+            crate::store::a12_calibration::A12CalibrationScope::Cluster {
+                query_type: "semantic".to_string(),
+                cluster_id: 7,
+            }
+        );
+        assert_eq!(mapped.canonical_generation, 12);
+        assert_eq!(mapped.generation_fingerprint, "generation-fingerprint");
+        assert_eq!(mapped.source_snapshot_fingerprint, "snapshot-fingerprint");
+        assert_eq!(mapped.snapshot_cutoff, 77);
+        assert_eq!(mapped.corpus_fingerprint, "corpus-fingerprint");
+        assert_eq!(mapped.train_family_ess, 24);
+        assert_eq!(mapped.train_case_count, 31);
+        assert_eq!(mapped.holdout_family_ess, 20);
+        assert_eq!(mapped.simplex.bm25, 0.30);
+        assert_eq!(mapped.simplex.vector, 0.30);
+        assert_eq!(
+            mapped.verdict,
+            crate::store::a12_calibration::A12CalibrationVerdict::Ship
+        );
+        assert_eq!(mapped.paired_top3.n, 20);
+        assert_eq!(mapped.paired_top3.both_hit, 14);
+        assert_eq!(mapped.paired_top3.baseline_only, 0);
+        assert_eq!(mapped.paired_top3.treatment_only, 4);
+        assert_eq!(mapped.paired_top3.neither_hit, 2);
+        assert_eq!(mapped.paired_top3.p_value, calibration.mcnemar.p_value);
+        assert_eq!(mapped.paired_top3.ci_lower, calibration.mcnemar.ci_lower);
+        assert_eq!(mapped.provenance.canonical_loo, 24);
+        assert_eq!(mapped.provenance.concept_loo, 5);
+        assert_eq!(mapped.provenance.episode_loo, 2);
+        assert_eq!(mapped.training_fingerprint, "training-fingerprint");
+        assert_eq!(mapped.holdout_fingerprint, "holdout-fingerprint");
+        assert_eq!(mapped.optimizer_fingerprint, "optimizer-fingerprint");
+        assert_eq!(mapped.evaluation_fingerprint, "evaluation-fingerprint");
+        assert_eq!(mapped.holdout_reason, calibration.holdout_reason);
+        assert_eq!(mapped.calibrated_at, calibrated_at.timestamp());
+        assert_eq!(mapped.evaluated_at, calibrated_at.timestamp());
+        assert_eq!(mapped.valid_until_exclusive, Some(1_000_987_654));
+        assert_eq!(mapped.cluster_generation, Some(9));
+    }
+
+    #[test]
+    fn a12_scope_mapping_rejects_ambiguous_or_invalid_scope_keys() {
+        let calibrated_at = chrono::DateTime::<Utc>::from_timestamp(1_000, 0).unwrap();
+        for invalid in ["", "global:7", "semantic:nope", "semantic:7:8"] {
+            let calibration = a12_scope_calibration(invalid, calibrated_at, None);
+            assert!(map_a12_scope_calibration(&calibration, 12, "generation", 77, 9).is_err());
+        }
+    }
+
+    fn a12_test_batch(
+        inputs: &A12RefreshInputs,
+        calibrated_at: chrono::DateTime<Utc>,
+        valid_until_exclusive: Option<i64>,
+    ) -> A12CalibrationBatch {
+        let mut scope = a12_scope_calibration("global", calibrated_at, valid_until_exclusive);
+        scope.snapshot_fingerprint = inputs.source_snapshot_fingerprint.clone();
+        scope.corpus_fingerprint = "test-corpus-fingerprint".to_string();
+        A12CalibrationBatch {
+            corpus_fingerprint: scope.corpus_fingerprint.clone(),
+            scopes: vec![scope],
+        }
+    }
+
+    fn a12_enabled_config() -> ReinConfig {
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.ars.acceleration.enabled = true;
+        config
+    }
+
+    #[test]
+    fn a12_refresh_publishes_pending_then_complete_and_skips_unchanged_identity() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = a12_enabled_config();
+        let durable = AdaptiveState {
+            version: 7,
+            cluster_version: 3,
+            ..AdaptiveState::default()
+        };
+        let at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap();
+        let calls = std::cell::Cell::new(0usize);
+
+        let first = refresh_a12_calibration_with(
+            &store,
+            &config,
+            &durable,
+            at,
+            |inputs, calibrated_at| {
+                calls.set(calls.get() + 1);
+                Ok(a12_test_batch(inputs, calibrated_at, None))
+            },
+            |_store, _pending| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(first, A12CalibrationRefreshOutcome::CompleteSaved);
+        let completed = crate::store::a12_calibration::load_a12_calibration(store.conn());
+        assert!(completed.state.is_complete());
+        assert_eq!(completed.state.generation, 2);
+        assert_eq!(completed.state.revision, 2);
+        assert_eq!(completed.state.snapshot_cutoff, 7);
+        assert_eq!(completed.state.cluster_generation, 3);
+        let history_len = crate::store::a12_calibration::list_a12_calibration_history(store.conn())
+            .unwrap()
+            .len();
+        assert_eq!(history_len, 2, "one pending + one complete revision");
+
+        let second = refresh_a12_calibration_with(
+            &store,
+            &config,
+            &durable,
+            at + chrono::Duration::seconds(1),
+            |inputs, calibrated_at| {
+                calls.set(calls.get() + 1);
+                Ok(a12_test_batch(inputs, calibrated_at, None))
+            },
+            |_store, _pending| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(second, A12CalibrationRefreshOutcome::Unchanged);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            crate::store::a12_calibration::list_a12_calibration_history(store.conn())
+                .unwrap()
+                .len(),
+            history_len
+        );
+    }
+
+    #[test]
+    fn a12_refresh_reruns_at_exact_unix_ms_expiry_boundary() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = a12_enabled_config();
+        let durable = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap();
+        let expiry = at.timestamp_millis() + 1_000;
+        let calls = std::cell::Cell::new(0usize);
+
+        let first = refresh_a12_calibration_with(
+            &store,
+            &config,
+            &durable,
+            at,
+            |inputs, calibrated_at| {
+                calls.set(calls.get() + 1);
+                Ok(a12_test_batch(inputs, calibrated_at, Some(expiry)))
+            },
+            |_store, _pending| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(first, A12CalibrationRefreshOutcome::CompleteSaved);
+
+        let before = refresh_a12_calibration_with(
+            &store,
+            &config,
+            &durable,
+            at + chrono::Duration::milliseconds(999),
+            |inputs, calibrated_at| {
+                calls.set(calls.get() + 1);
+                Ok(a12_test_batch(inputs, calibrated_at, None))
+            },
+            |_store, _pending| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(before, A12CalibrationRefreshOutcome::Unchanged);
+
+        let boundary = refresh_a12_calibration_with(
+            &store,
+            &config,
+            &durable,
+            at + chrono::Duration::milliseconds(1_000),
+            |inputs, calibrated_at| {
+                calls.set(calls.get() + 1);
+                Ok(a12_test_batch(inputs, calibrated_at, None))
+            },
+            |_store, _pending| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(boundary, A12CalibrationRefreshOutcome::CompleteSaved);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            crate::store::a12_calibration::load_a12_calibration(store.conn())
+                .state
+                .generation,
+            4
+        );
+    }
+
+    #[test]
+    fn a12_final_cas_miss_keeps_active_revision_pending_without_new_evidence() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = a12_enabled_config();
+        let durable = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap();
+
+        let outcome = refresh_a12_calibration_with(
+            &store,
+            &config,
+            &durable,
+            at,
+            |inputs, calibrated_at| Ok(a12_test_batch(inputs, calibrated_at, None)),
+            |store, pending| {
+                let mut peer_pending = pending.clone();
+                peer_pending.revision =
+                    crate::store::a12_calibration::next_a12_calibration_revision_identity(
+                        store.conn(),
+                        pending.generation,
+                    )?
+                    .revision;
+                assert!(
+                    crate::store::a12_calibration::compare_and_swap_a12_calibration(
+                        store.conn(),
+                        &peer_pending,
+                        pending.revision,
+                    )?
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, A12CalibrationRefreshOutcome::FinalCasMiss);
+        let active = crate::store::a12_calibration::load_a12_calibration(store.conn());
+        assert!(active.state.is_pending());
+        assert!(active.state.scopes.is_empty());
+        assert!(
+            crate::store::a12_calibration::list_a12_calibration_history(store.conn())
+                .unwrap()
+                .iter()
+                .all(|entry| entry.generation == 1)
+        );
+    }
+
+    #[test]
+    fn a12_final_lock_rechecks_every_local_snapshot_surface_after_hook() {
+        for surface in ["memories", "fts", "vec", "metadata"] {
+            let store = SqliteStore::in_memory().unwrap();
+            store
+                .store(test_memory("a12-race", "source memory", 0))
+                .unwrap();
+            let config = a12_enabled_config();
+            let durable = AdaptiveState {
+                version: 7,
+                ..AdaptiveState::default()
+            };
+            let at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap();
+
+            let outcome = refresh_a12_calibration_with(
+                &store,
+                &config,
+                &durable,
+                at,
+                |inputs, calibrated_at| Ok(a12_test_batch(inputs, calibrated_at, None)),
+                |store, _pending| {
+                    match surface {
+                        "memories" => {
+                            store.conn().execute(
+                                "UPDATE memories SET access_count = access_count + 1",
+                                [],
+                            )?;
+                        }
+                        "fts" => {
+                            store.conn().execute(
+                                "INSERT INTO memories_fts(id, topic, summary, content, keywords) \
+                                 VALUES ('a12-fts-race', 'race', 'race', 'race', 'race')",
+                                [],
+                            )?;
+                        }
+                        "vec" => {
+                            crate::store::vec::insert_embedding(
+                                store.conn(),
+                                "a12-vec-race",
+                                &vec![0.25; 3_072],
+                            )?;
+                        }
+                        "metadata" => {
+                            store.conn().execute(
+                                "INSERT INTO metadata(key, value) \
+                                 VALUES ('survival_curve:a12-race', '{\"changed\":true}')",
+                                [],
+                            )?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_ne!(
+                outcome,
+                A12CalibrationRefreshOutcome::CompleteSaved,
+                "surface={surface}"
+            );
+            let active = crate::store::a12_calibration::load_a12_calibration(store.conn());
+            assert!(active.state.is_pending(), "surface={surface}");
+            assert!(active.state.scopes.is_empty(), "surface={surface}");
+            assert_eq!(
+                crate::store::a12_calibration::list_a12_calibration_history(store.conn())
+                    .unwrap()
+                    .len(),
+                1,
+                "surface={surface}: final revision must not remain as an orphan"
+            );
+        }
+    }
+
+    #[test]
+    fn a12_refresh_preserves_future_and_corrupt_active_pointer_bytes() {
+        for raw in [r#"{"schema_version":99,"future":"preserve"}"#, "{not-json"] {
+            let store = SqliteStore::in_memory().unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        crate::store::a12_calibration::A12_CALIBRATION_METADATA_KEY,
+                        raw
+                    ],
+                )
+                .unwrap();
+            let called = std::cell::Cell::new(false);
+            let outcome = refresh_a12_calibration_with(
+                &store,
+                &a12_enabled_config(),
+                &AdaptiveState::default(),
+                chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap(),
+                |_inputs, _at| {
+                    called.set(true);
+                    unreachable!("unhealthy active pointers must not invoke calibration")
+                },
+                |_store, _pending| Ok(()),
+            )
+            .unwrap();
+
+            assert_eq!(outcome, A12CalibrationRefreshOutcome::Unhealthy);
+            assert!(!called.get());
+            let preserved: String = store
+                .conn()
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = ?1",
+                    rusqlite::params![crate::store::a12_calibration::A12_CALIBRATION_METADATA_KEY],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(preserved, raw);
+        }
+    }
+
+    #[test]
+    fn post_snapshot_refreshes_reload_durable_state_before_c2_a12_and_policy() {
+        let store = SqliteStore::in_memory().unwrap();
+        let durable = AdaptiveState {
+            version: 9,
+            cluster_version: 17,
+            global_dedup_threshold: 0.81,
+            ..AdaptiveState::default()
+        };
+        durable.save_snapshot(store.conn()).unwrap();
+
+        run_post_snapshot_refreshes(&store, &a12_enabled_config());
+
+        let a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
+        assert_eq!(
+            a12.status,
+            crate::store::a12_calibration::A12CalibrationLoadStatus::Loaded
+        );
+        assert!(a12.state.is_complete());
+        assert_eq!(a12.state.snapshot_cutoff, durable.version as i64);
+        assert_eq!(a12.state.cluster_generation, durable.cluster_version);
+        let policy = crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
+        assert_eq!(policy.policy.source_adaptive_version, durable.version);
+    }
+
+    #[test]
+    fn post_snapshot_refreshes_fail_closed_when_durable_restore_fails() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES ('adaptive_state', '{broken')",
+                [],
+            )
+            .unwrap();
+
+        run_post_snapshot_refreshes(&store, &a12_enabled_config());
+
+        assert_eq!(
+            crate::store::a12_calibration::load_a12_calibration(store.conn()).status,
+            crate::store::a12_calibration::A12CalibrationLoadStatus::Missing
+        );
+        assert_eq!(
+            crate::store::ars_parameter_policy::load_parameter_policy(store.conn()).status,
+            crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Missing
+        );
     }
 
     #[test]

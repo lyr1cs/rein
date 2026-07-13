@@ -254,6 +254,61 @@ fn a12_recall_config_projection(config: &crate::config::ReinConfig) -> A12Recall
     }
 }
 
+/// Read-only cadence identity for every non-secret input that can change A12
+/// replay or its activation decision. Provider credentials, endpoints, and
+/// filesystem paths are absent by construction.
+pub(crate) fn a12_behavior_config_fingerprint(
+    config: &crate::config::ReinConfig,
+    hard_dedup_bound: f32,
+    trace_limit: usize,
+    min_samples_alpha: usize,
+) -> ReinResult<String> {
+    if !hard_dedup_bound.is_finite() || !(0.0..=1.0).contains(&hard_dedup_bound) {
+        return Err(ReinError::Config(format!(
+            "A12 hard dedup bound must be finite and in [0, 1], got {hard_dedup_bound}"
+        )));
+    }
+    let config_bytes = serde_json::to_vec(&a12_recall_config_projection(config))?;
+    Ok(fingerprint_framed(
+        b"a12-behavior-config-v1\0",
+        &[
+            &config_bytes,
+            &hard_dedup_bound.to_bits().to_le_bytes(),
+            &u64::try_from(trace_limit).unwrap_or(u64::MAX).to_le_bytes(),
+            &u64::try_from(min_samples_alpha)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+            &crate::eval::gates::DEFAULT_NOISE_FLOOR
+                .to_bits()
+                .to_le_bytes(),
+            env!("REIN_BUILD_FINGERPRINT").as_bytes(),
+        ],
+    ))
+}
+
+/// Capture the complete local SQLite-backed recall identity without exposing
+/// the transaction implementation to the cadence/orchestration layer.
+pub(crate) fn a12_source_snapshot_fingerprint(store: &SqliteStore) -> ReinResult<String> {
+    capture_a12_local_recall_snapshot_identity(store)
+}
+
+/// Hash the local recall snapshot using the caller's existing SQLite
+/// transaction. This helper deliberately does not issue `BEGIN`/`COMMIT`;
+/// final publication calls it only after acquiring `BEGIN IMMEDIATE`, so the
+/// hash and active-pointer CAS share one write-locked transaction.
+pub(crate) fn a12_source_snapshot_fingerprint_in_transaction(
+    store: &SqliteStore,
+) -> ReinResult<String> {
+    a12_local_recall_snapshot_identity(store)
+}
+
+/// Stable identity of the complete Task-1 corpus, including abstentions and
+/// the exact hard-dedup bound used to build exclusions.
+pub(crate) fn a12_corpus_fingerprint(corpus: &A12LooCorpus) -> ReinResult<String> {
+    let corpus_bytes = serde_json::to_vec(corpus)?;
+    Ok(domain_separated_sha256(b"a12-corpus-v1\0", &corpus_bytes))
+}
+
 /// Compute generation identities before the expensive recall replay. The
 /// corpus must still match the complete local recall snapshot captured during
 /// its own atomic build; otherwise callers must rebuild instead of mixing
@@ -273,8 +328,7 @@ pub(crate) fn a12_calibration_context_for_corpus(
             corpus.source_snapshot_fingerprint
         )));
     }
-    let corpus_bytes = serde_json::to_vec(corpus)?;
-    let corpus_fingerprint = domain_separated_sha256(b"a12-corpus-v1\0", &corpus_bytes);
+    let corpus_fingerprint = a12_corpus_fingerprint(corpus)?;
     let config_bytes = serde_json::to_vec(&a12_recall_config_projection(config))?;
     let calibrated_at_bytes = calibrated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     let optimizer_fingerprint = fingerprint_framed(
@@ -1048,6 +1102,8 @@ pub(crate) struct A12ScopeCalibration {
     pub valid_until_exclusive: Option<i64>,
     pub snapshot_fingerprint: String,
     pub corpus_fingerprint: String,
+    pub training_fingerprint: String,
+    pub holdout_fingerprint: String,
     pub optimizer_fingerprint: String,
     pub evaluation_fingerprint: String,
     pub calibrated_at: DateTime<Utc>,
@@ -1220,27 +1276,36 @@ pub(crate) fn train_and_evaluate_a12_traces(
         };
 
         let training_trace_bytes = normalized_scoped_trace_bytes(training_families);
-        let learned_weight_bytes = encode_shadow_weights(learned_weights);
-        let optimizer_fingerprint = fingerprint_framed(
-            b"a12-family-equal-optimizer-scope-v2\0",
+        let training_fingerprint = fingerprint_framed(
+            b"a12-family-training-scope-v1\0",
             &[
                 context.optimizer_fingerprint.as_bytes(),
                 context.corpus_fingerprint.as_bytes(),
                 scope.as_bytes(),
                 &training_trace_bytes,
-                &learned_weight_bytes,
             ],
         );
+        let learned_weight_bytes = encode_shadow_weights(learned_weights);
+        let optimizer_fingerprint = fingerprint_framed(
+            b"a12-family-equal-optimizer-scope-v3\0",
+            &[training_fingerprint.as_bytes(), &learned_weight_bytes],
+        );
         let holdout_trace_bytes = normalized_scoped_trace_bytes(holdout_families);
-        let outcome_bytes = encode_paired_outcomes(&outcomes);
-        let evaluation_fingerprint = fingerprint_framed(
-            b"a12-family-top3-evaluation-scope-v2\0",
+        let holdout_fingerprint = fingerprint_framed(
+            b"a12-family-holdout-scope-v1\0",
             &[
                 context.evaluation_fingerprint.as_bytes(),
                 context.corpus_fingerprint.as_bytes(),
-                optimizer_fingerprint.as_bytes(),
                 scope.as_bytes(),
                 &holdout_trace_bytes,
+            ],
+        );
+        let outcome_bytes = encode_paired_outcomes(&outcomes);
+        let evaluation_fingerprint = fingerprint_framed(
+            b"a12-family-top3-evaluation-scope-v3\0",
+            &[
+                holdout_fingerprint.as_bytes(),
+                optimizer_fingerprint.as_bytes(),
                 &outcome_bytes,
             ],
         );
@@ -1261,6 +1326,8 @@ pub(crate) fn train_and_evaluate_a12_traces(
             valid_until_exclusive,
             snapshot_fingerprint: context.snapshot_fingerprint.clone(),
             corpus_fingerprint: context.corpus_fingerprint.clone(),
+            training_fingerprint,
+            holdout_fingerprint,
             optimizer_fingerprint,
             evaluation_fingerprint,
             calibrated_at: context.calibrated_at,
@@ -2563,6 +2630,18 @@ mod tests {
         assert_eq!(calibration.corpus_fingerprint, "corpus-fp");
         assert_ne!(calibration.optimizer_fingerprint, "optimizer-fp");
         assert_ne!(calibration.evaluation_fingerprint, "evaluation-fp");
+        assert_ne!(calibration.training_fingerprint, "optimizer-fp");
+        assert_ne!(calibration.holdout_fingerprint, "evaluation-fp");
+        assert_ne!(
+            calibration.training_fingerprint,
+            calibration.optimizer_fingerprint
+        );
+        assert_ne!(
+            calibration.holdout_fingerprint,
+            calibration.evaluation_fingerprint
+        );
+        assert_eq!(calibration.training_fingerprint.len(), 64);
+        assert_eq!(calibration.holdout_fingerprint.len(), 64);
         assert_eq!(calibration.optimizer_fingerprint.len(), 64);
         assert_eq!(calibration.evaluation_fingerprint.len(), 64);
         assert_eq!(calibration.calibrated_at, calibrated_at);
@@ -2661,6 +2740,10 @@ mod tests {
         let config = crate::config::ReinConfig::default();
         let base =
             a12_calibration_context_for_corpus(&store, &config, &corpus, 10, 10, at).unwrap();
+        assert_eq!(
+            a12_corpus_fingerprint(&corpus).unwrap(),
+            base.corpus_fingerprint
+        );
         let different_limit =
             a12_calibration_context_for_corpus(&store, &config, &corpus, 11, 10, at).unwrap();
         let different_minimum =
@@ -2735,6 +2818,53 @@ mod tests {
             mutate(&mut changed);
             assert_ne!(projection, a12_recall_config_projection(&changed));
         }
+    }
+
+    #[test]
+    fn cadence_identity_ignores_secrets_and_binds_behavior_inputs() {
+        let base = crate::config::ReinConfig::default();
+        let identity = a12_behavior_config_fingerprint(&base, 0.70, 20, 10).unwrap();
+
+        let mut secrets = base.clone();
+        secrets.sync.api_key = Some("secret-token".to_string());
+        secrets.sync.endpoint = "https://secret-proxy.invalid".to_string();
+        secrets.embedding.google.api_key = Some("embedding-secret".to_string());
+        secrets.embedding.google.endpoint = "https://embedding-proxy.invalid".to_string();
+        secrets.embedding.omlx.endpoint = "http://private-host.invalid/v1".to_string();
+        assert_eq!(
+            identity,
+            a12_behavior_config_fingerprint(&secrets, 0.70, 20, 10).unwrap()
+        );
+
+        assert_ne!(
+            identity,
+            a12_behavior_config_fingerprint(&base, 0.71, 20, 10).unwrap()
+        );
+        assert_ne!(
+            identity,
+            a12_behavior_config_fingerprint(&base, 0.70, 21, 10).unwrap()
+        );
+        assert_ne!(
+            identity,
+            a12_behavior_config_fingerprint(&base, 0.70, 20, 11).unwrap()
+        );
+        let mut changed = base.clone();
+        changed.search.rrf_k += 1.0;
+        assert_ne!(
+            identity,
+            a12_behavior_config_fingerprint(&changed, 0.70, 20, 10).unwrap()
+        );
+        assert_eq!(identity.len(), 64);
+    }
+
+    #[test]
+    fn public_snapshot_identity_matches_complete_local_projection() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(
+            a12_source_snapshot_fingerprint(&store).unwrap(),
+            capture_a12_local_recall_snapshot_identity(&store).unwrap()
+        );
     }
 
     #[test]

@@ -246,9 +246,16 @@ pub struct A12ScopeEntry {
     /// Ship entry into a newer generation cannot make it active.
     pub canonical_generation: u64,
     pub generation_fingerprint: String,
+    /// Exact local SQLite recall identity produced by Task 3. Older schema-2
+    /// revisions omit this field and remain readable, but cannot satisfy the
+    /// Task-5 complete-run contract.
+    #[serde(default)]
+    pub source_snapshot_fingerprint: String,
     pub snapshot_cutoff: i64,
     pub corpus_fingerprint: String,
     pub train_family_ess: u64,
+    #[serde(default)]
+    pub train_case_count: u64,
     pub holdout_family_ess: u64,
     pub simplex: A12FusionSimplex,
     pub verdict: A12CalibrationVerdict,
@@ -262,6 +269,8 @@ pub struct A12ScopeEntry {
     pub holdout_fingerprint: String,
     pub optimizer_fingerprint: String,
     pub evaluation_fingerprint: String,
+    #[serde(default)]
+    pub holdout_reason: String,
     pub calibrated_at: i64,
     pub evaluated_at: i64,
     /// Earliest Unix millisecond at which fixed-time replay may diverge from
@@ -290,7 +299,8 @@ impl A12ScopeEntry {
             }
             _ => self.cluster_generation.is_none(),
         };
-        self.invalidation.is_none()
+        state.is_complete()
+            && self.invalidation.is_none()
             && cluster_generation_matches
             && self.canonical_generation == state.generation
             && self.generation_fingerprint == state.generation_fingerprint
@@ -408,6 +418,23 @@ impl A12ScopeEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A12CalibrationPhase {
+    Pending,
+    Complete,
+}
+
+/// Cadence identity for Task 5. This is optional so revisions written by the
+/// original schema-2 implementation remain readable, but a legacy revision is
+/// never silently treated as a completed automatic calibration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A12CalibrationRunMetadata {
+    pub phase: A12CalibrationPhase,
+    pub source_snapshot_fingerprint: String,
+    pub behavior_config_fingerprint: String,
+}
+
 /// Atomic metadata envelope for one canonical-snapshot generation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct A12CalibrationState {
@@ -421,6 +448,8 @@ pub struct A12CalibrationState {
     pub scopes: BTreeMap<String, A12ScopeEntry>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<A12CalibrationRunMetadata>,
 }
 
 impl Default for A12CalibrationState {
@@ -436,11 +465,40 @@ impl Default for A12CalibrationState {
             scopes: BTreeMap::new(),
             created_at: 0,
             updated_at: 0,
+            run: None,
         }
     }
 }
 
 impl A12CalibrationState {
+    /// A pending revision is an immutable, empty activation barrier. Merely
+    /// observing a schema-2 row without phase metadata is not enough.
+    pub fn is_pending(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| run.phase == A12CalibrationPhase::Pending)
+    }
+
+    /// Only an explicitly completed Task-5 revision may feed activation.
+    pub fn is_complete(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| run.phase == A12CalibrationPhase::Complete)
+    }
+
+    /// Earliest fixed-time replay boundary across completed scopes, in Unix
+    /// milliseconds. Pending and legacy schema-2 rows have no reusable
+    /// cadence horizon.
+    pub fn next_expiry_unix_ms(&self) -> Option<i64> {
+        if !self.is_complete() {
+            return None;
+        }
+        self.scopes
+            .values()
+            .filter_map(|entry| entry.valid_until_exclusive)
+            .min()
+    }
+
     /// Mark only cluster-scoped entries unusable after M4 changes cluster ids.
     /// Global and query-type scopes remain byte-for-byte intact. The first
     /// tombstone is retained across later reclusters so diagnostics show the
@@ -602,6 +660,25 @@ fn validate_state(state: &A12CalibrationState) -> Result<(), String> {
     }
     if state.snapshot_cutoff < 0 || state.created_at < 0 || state.updated_at < state.created_at {
         return Err("A12 state timestamps and snapshot cutoff are inconsistent".to_string());
+    }
+    if let Some(run) = &state.run {
+        if run.source_snapshot_fingerprint.is_empty() || run.behavior_config_fingerprint.is_empty()
+        {
+            return Err("A12 run identities must be non-empty".to_string());
+        }
+        if run.phase == A12CalibrationPhase::Pending && !state.scopes.is_empty() {
+            return Err("A12 pending revisions must have empty scopes".to_string());
+        }
+        if run.phase == A12CalibrationPhase::Complete
+            && state.scopes.values().any(|entry| {
+                entry.source_snapshot_fingerprint != run.source_snapshot_fingerprint
+                    || entry.holdout_reason.is_empty()
+            })
+        {
+            return Err(
+                "A12 complete scopes must preserve source identity and holdout reason".to_string(),
+            );
+        }
     }
     for (key, entry) in &state.scopes {
         if key != &entry.scope.key() {
@@ -1318,9 +1395,11 @@ mod tests {
             scope,
             canonical_generation: generation,
             generation_fingerprint: format!("generation-{generation}"),
+            source_snapshot_fingerprint: format!("snapshot-{generation}"),
             snapshot_cutoff,
             corpus_fingerprint: format!("corpus-{generation}"),
             train_family_ess: 40,
+            train_case_count: 40,
             holdout_family_ess: 20,
             simplex: simplex(0.0),
             verdict: A12CalibrationVerdict::Ship,
@@ -1335,6 +1414,7 @@ mod tests {
             holdout_fingerprint: "holdout-fingerprint".to_string(),
             optimizer_fingerprint: "optimizer-v1".to_string(),
             evaluation_fingerprint: "evaluation-v1".to_string(),
+            holdout_reason: "Ship: test holdout passed".to_string(),
             calibrated_at: 1_000,
             evaluated_at: 1_010,
             valid_until_exclusive: None,
@@ -1376,7 +1456,126 @@ mod tests {
             scopes,
             created_at: 990,
             updated_at: 1_010,
+            run: Some(A12CalibrationRunMetadata {
+                phase: A12CalibrationPhase::Complete,
+                source_snapshot_fingerprint: format!("snapshot-{generation}"),
+                behavior_config_fingerprint: format!("behavior-{generation}"),
+            }),
         }
+    }
+
+    #[test]
+    fn a12_pending_revision_is_empty_and_never_complete() {
+        let mut pending = state(12, 1);
+        pending.scopes.clear();
+        pending.run = Some(A12CalibrationRunMetadata {
+            phase: A12CalibrationPhase::Pending,
+            source_snapshot_fingerprint: "snapshot-12".to_string(),
+            behavior_config_fingerprint: "behavior-12".to_string(),
+        });
+
+        assert!(pending.is_pending());
+        assert!(!pending.is_complete());
+        assert_eq!(pending.next_expiry_unix_ms(), None);
+
+        let conn = conn();
+        assert!(compare_and_swap_a12_calibration(&conn, &pending, 0).unwrap());
+        let loaded = load_a12_calibration(&conn);
+        assert_eq!(loaded.status, A12CalibrationLoadStatus::Loaded);
+        assert!(loaded.state.is_pending());
+        assert!(loaded.state.scopes.is_empty());
+    }
+
+    #[test]
+    fn pending_and_legacy_schema_two_states_never_make_scope_current() {
+        let complete = state(12, 1);
+        let entry = complete.scopes["global"].clone();
+        assert!(entry.is_current_for(&complete, A12_DEFAULT_NOISE_FLOOR));
+
+        let mut pending = complete.clone();
+        pending.run.as_mut().unwrap().phase = A12CalibrationPhase::Pending;
+        pending.scopes.clear();
+        assert!(!entry.is_current_for(&pending, A12_DEFAULT_NOISE_FLOOR));
+
+        let mut legacy = complete;
+        legacy.run = None;
+        assert!(!entry.is_current_for(&legacy, A12_DEFAULT_NOISE_FLOOR));
+    }
+
+    #[test]
+    fn a12_pending_revision_rejects_activation_scopes() {
+        let mut pending = state(12, 1);
+        pending.run = Some(A12CalibrationRunMetadata {
+            phase: A12CalibrationPhase::Pending,
+            source_snapshot_fingerprint: "snapshot-12".to_string(),
+            behavior_config_fingerprint: "behavior-12".to_string(),
+        });
+
+        let error = compare_and_swap_a12_calibration(&conn(), &pending, 0).unwrap_err();
+
+        assert!(error.to_string().contains("pending"));
+    }
+
+    #[test]
+    fn legacy_schema_two_without_phase_loads_but_is_not_complete() {
+        let conn = conn();
+        let mut legacy = state(12, 1);
+        legacy.run = None;
+        let legacy_raw = serde_json::to_string(&legacy).unwrap();
+        let row_key = revision_key(legacy.generation, legacy.revision);
+        let pointer = A12CalibrationActivePointer {
+            schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+            generation: legacy.generation,
+            revision: legacy.revision,
+            row_key: row_key.clone(),
+            generation_fingerprint: legacy.generation_fingerprint.clone(),
+            snapshot_cutoff: legacy.snapshot_cutoff,
+            corpus_fingerprint: legacy.corpus_fingerprint.clone(),
+            state_digest: state_digest(&legacy_raw),
+            activated_at: legacy.updated_at,
+        };
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![row_key, legacy_raw],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![
+                A12_CALIBRATION_METADATA_KEY,
+                serde_json::to_string(&pointer).unwrap()
+            ],
+        )
+        .unwrap();
+
+        let loaded = load_a12_calibration(&conn);
+
+        assert_eq!(loaded.status, A12CalibrationLoadStatus::Loaded);
+        assert!(!loaded.state.is_pending());
+        assert!(!loaded.state.is_complete());
+    }
+
+    #[test]
+    fn a12_complete_revision_reports_earliest_unix_ms_expiry() {
+        let mut complete = state(12, 1);
+        complete.run = Some(A12CalibrationRunMetadata {
+            phase: A12CalibrationPhase::Complete,
+            source_snapshot_fingerprint: "snapshot-12".to_string(),
+            behavior_config_fingerprint: "behavior-12".to_string(),
+        });
+        complete
+            .scopes
+            .get_mut("global")
+            .unwrap()
+            .valid_until_exclusive = Some(1_200_000);
+        complete
+            .scopes
+            .get_mut("semantic")
+            .unwrap()
+            .valid_until_exclusive = Some(1_100_000);
+
+        assert!(complete.is_complete());
+        assert_eq!(complete.next_expiry_unix_ms(), Some(1_100_000));
     }
 
     #[test]
