@@ -217,8 +217,8 @@ fn apply_ars_dynamic_fusion_scores(
     // Some, which silently nuked route-specific alpha (most visibly
     // ExactKeyword's alpha=0.85 BM25-heavy signal — it became indistinguishable
     // from the generic simplex). The inner trust blend in
-    // `ready_shadow_fusion_weights_for_recall::effective_simplex` blends
-    // weights against a static prior; this OUTER blend smooths the
+    // `resolve_runtime_recall_fusion` returns an inner trust-shrunk simplex;
+    // this OUTER blend smooths the
     // simplex-vs-legacy transition so a barely-promoted canary
     // (adoption=0.05) does not lose 95% of the route-specific signal in one
     // step. `adoption=0` reproduces pre-canary behavior exactly; `adoption=1`
@@ -266,66 +266,46 @@ fn apply_ars_dynamic_fusion_scores(
         .collect()
 }
 
-fn ready_shadow_fusion_weights_for_recall(
-    state: &crate::store::adaptive::AdaptiveState,
+/// Load the sealed parameter policy and active A12 pointer for one online
+/// recall, then delegate all human/automatic scope selection and attestation
+/// checks to the shared resolver. Recall deliberately does not read eval-gate
+/// files; policy refresh already sealed their immutable identity.
+fn resolve_dynamic_fusion_for_recall(
+    conn: &rusqlite::Connection,
     config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
     query_type: &str,
     cluster_id: Option<u32>,
-    runtime_adoption_weight: f64,
-) -> Option<crate::search::alpha_optimizer::ShadowFusionWeights> {
-    let production_canary = runtime_adoption_weight > f64::EPSILON;
-    if !config.adaptive.enabled
-        || !config.ars.acceleration.enabled
-        || config.ars.acceleration.shadow_only
-        || !production_canary
-    {
-        return None;
-    }
-    let entry = state.get_shadow_fusion_weights(
+    now_millis: i64,
+) -> (
+    Option<crate::search::alpha_optimizer::ShadowFusionWeights>,
+    f64,
+) {
+    let policy = crate::store::ars_parameter_policy::load_parameter_policy(conn);
+    let active_a12 = crate::store::a12_calibration::load_a12_calibration(conn);
+    let resolution = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+        &policy.policy,
+        config,
+        state,
+        &active_a12,
         query_type,
         cluster_id,
         config.adaptive.min_samples_alpha,
-    )?;
-    let static_prior = crate::search::alpha_optimizer::ShadowFusionWeights::default();
-    let effective = crate::ops::ars_tuning::effective_simplex(
-        [
-            static_prior.bm25,
-            static_prior.vec,
-            static_prior.kg,
-            static_prior.episode,
-            static_prior.support,
-            static_prior.diversity,
-        ],
-        [
-            entry.weights.bm25,
-            entry.weights.vec,
-            entry.weights.kg,
-            entry.weights.episode,
-            entry.weights.support,
-            entry.weights.diversity,
-        ],
-        crate::ops::ars_tuning::TrustInputs {
-            enabled: config.ars.acceleration.enabled,
-            production_canary,
-            runtime_adoption_weight,
-            human_count: entry.sample_count as u64,
-            llm_count: 0,
-            llm_reliability: 0.0,
-            calibration: 1.0,
-            stability: 1.0,
-            drift_alert: false,
-            prior_strength: config.adaptive.shrinkage_prior,
-            max_trust: 0.85,
-        },
+        crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+        now_millis,
     );
-    Some(crate::search::alpha_optimizer::ShadowFusionWeights {
-        bm25: effective[0],
-        vec: effective[1],
-        kg: effective[2],
-        episode: effective[3],
-        support: effective[4],
-        diversity: effective[5],
-    })
+    let weights =
+        resolution.simplex.map(
+            |simplex| crate::search::alpha_optimizer::ShadowFusionWeights {
+                bm25: simplex.bm25,
+                vec: simplex.vector,
+                kg: simplex.kg,
+                episode: simplex.episode,
+                support: simplex.support,
+                diversity: simplex.diversity,
+            },
+        );
+    (weights, resolution.adoption_weight)
 }
 
 /// A resolved canonical is "live" iff it is neither superseded nor deprecated —
@@ -1649,23 +1629,15 @@ fn recall_temporal_with_execution_mode(
         } else {
             adaptive_state_snapshot
                 .as_ref()
-                .map(|s| {
-                    let runtime_adoption_weight =
-                    crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
+                .map(|state| {
+                    resolve_dynamic_fusion_for_recall(
                         store.conn(),
                         config,
-                        s,
+                        state,
                         &query_type_label,
                         query_cluster_id,
-                    );
-                    let weights = ready_shadow_fusion_weights_for_recall(
-                        s,
-                        config,
-                        &query_type_label,
-                        query_cluster_id,
-                        runtime_adoption_weight,
-                    );
-                    (weights, runtime_adoption_weight)
+                        evaluation_at.timestamp_millis(),
+                    )
                 })
                 .unwrap_or((None, 0.0))
         };
@@ -4353,6 +4325,7 @@ mod tests {
 
     #[test]
     fn ars_dynamic_fusion_resolver_is_shadow_only_by_default() {
+        let store = SqliteStore::in_memory().unwrap();
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = true;
@@ -4374,14 +4347,21 @@ mod tests {
             },
         );
 
-        assert!(
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 1.0)
-                .is_none()
+        let (weights, adoption) = resolve_dynamic_fusion_for_recall(
+            store.conn(),
+            &config,
+            &state,
+            "semantic",
+            None,
+            1_700_000_075_000,
         );
+        assert!(weights.is_none());
+        assert_eq!(adoption, 0.0);
     }
 
     #[test]
     fn ars_dynamic_fusion_resolver_requires_parameter_policy_canary() {
+        let store = SqliteStore::in_memory().unwrap();
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = false;
@@ -4403,14 +4383,21 @@ mod tests {
             },
         );
 
-        assert!(
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 0.0)
-                .is_none()
+        let (weights, adoption) = resolve_dynamic_fusion_for_recall(
+            store.conn(),
+            &config,
+            &state,
+            "semantic",
+            None,
+            1_700_000_075_000,
         );
+        assert!(weights.is_none());
+        assert_eq!(adoption, 0.0);
     }
 
     #[test]
     fn ars_dynamic_fusion_resolver_returns_effective_weights_with_policy_canary() {
+        let store = SqliteStore::in_memory().unwrap();
         let mut config = ReinConfig::default();
         config.ars.acceleration.enabled = true;
         config.ars.acceleration.shadow_only = false;
@@ -4432,11 +4419,122 @@ mod tests {
             },
         );
 
-        let weights =
-            ready_shadow_fusion_weights_for_recall(&state, &config, "semantic", None, 1.0)
-                .expect("non-shadow mode should expose eligible snapshot weights");
+        let policy = crate::store::ars_parameter_policy::ArsParameterPolicy {
+            revision: 1,
+            mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            runtime_adoption_weight: 1.0,
+            last_updated: "2026-07-13T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+        assert!(crate::store::ars_parameter_policy::save_parameter_policy_cas(
+            store.conn(),
+            &policy,
+            0,
+        )
+        .unwrap());
+
+        let (weights, adoption) = resolve_dynamic_fusion_for_recall(
+            store.conn(),
+            &config,
+            &state,
+            "semantic",
+            None,
+            1_700_000_075_000,
+        );
+        let weights = weights.expect("non-shadow mode should expose eligible snapshot weights");
+        assert_eq!(adoption, 1.0);
         assert!((weights.sum() - 1.0).abs() < 1e-9);
         assert!(weights.bm25 > weights.support);
+    }
+
+    #[test]
+    fn runtime_policy_loader_preserves_human_simplex_values_exactly() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        let mut state = crate::store::adaptive::AdaptiveState {
+            version: 3,
+            ..Default::default()
+        };
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 4.0,
+                    vec: 3.0,
+                    kg: 1.0,
+                    episode: 0.8,
+                    support: 0.7,
+                    diversity: 0.5,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let policy = crate::store::ars_parameter_policy::ArsParameterPolicy {
+            revision: 1,
+            mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            source_adaptive_version: 3,
+            runtime_adoption_weight: 0.40,
+            last_updated: "2026-07-13T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+        assert!(crate::store::ars_parameter_policy::save_parameter_policy_cas(
+            store.conn(),
+            &policy,
+            0,
+        )
+        .unwrap());
+
+        let (actual, adoption) = resolve_dynamic_fusion_for_recall(
+            store.conn(),
+            &config,
+            &state,
+            "semantic",
+            Some(7),
+            1_700_000_075_000,
+        );
+
+        let static_prior = crate::search::alpha_optimizer::ShadowFusionWeights::default();
+        let expected = crate::ops::ars_tuning::effective_simplex(
+            [
+                static_prior.bm25,
+                static_prior.vec,
+                static_prior.kg,
+                static_prior.episode,
+                static_prior.support,
+                static_prior.diversity,
+            ],
+            [4.0, 3.0, 1.0, 0.8, 0.7, 0.5],
+            crate::ops::ars_tuning::TrustInputs {
+                enabled: true,
+                production_canary: true,
+                runtime_adoption_weight: 0.40,
+                human_count: 20,
+                llm_count: 0,
+                llm_reliability: 0.0,
+                calibration: 1.0,
+                stability: 1.0,
+                drift_alert: false,
+                prior_strength: config.adaptive.shrinkage_prior,
+                max_trust: 0.85,
+            },
+        );
+        let actual = actual.expect("human canary must resolve");
+        assert_eq!(adoption, 0.40);
+        assert_eq!(
+            [
+                actual.bm25,
+                actual.vec,
+                actual.kg,
+                actual.episode,
+                actual.support,
+                actual.diversity,
+            ],
+            expected
+        );
     }
 
     #[test]

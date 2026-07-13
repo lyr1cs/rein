@@ -183,15 +183,39 @@ fn valid_scope_key(scope: &str) -> bool {
 }
 
 fn human_simplex(entry: &LearnedShadowFusionEntry) -> Option<A12FusionSimplex> {
+    // Legacy runtime accepted finite/non-finite and non-normalized persisted
+    // shadow vectors, sanitizing them through `normalized_or_default` inside
+    // `effective_simplex`. Preserve that byte-for-byte behavior while sealing
+    // a schema-valid simplex into the policy evidence record.
+    let normalized = crate::search::alpha_optimizer::ShadowFusionWeights {
+        bm25: entry.weights.bm25,
+        vec: entry.weights.vec,
+        kg: entry.weights.kg,
+        episode: entry.weights.episode,
+        support: entry.weights.support,
+        diversity: entry.weights.diversity,
+    }
+    .normalized_or_default();
     let simplex = A12FusionSimplex {
+        bm25: normalized.bm25,
+        vector: normalized.vec,
+        kg: normalized.kg,
+        episode: normalized.episode,
+        support: normalized.support,
+        diversity: normalized.diversity,
+    };
+    simplex_is_valid(simplex).then_some(simplex)
+}
+
+fn raw_human_simplex(entry: &LearnedShadowFusionEntry) -> A12FusionSimplex {
+    A12FusionSimplex {
         bm25: entry.weights.bm25,
         vector: entry.weights.vec,
         kg: entry.weights.kg,
         episode: entry.weights.episode,
         support: entry.weights.support,
         diversity: entry.weights.diversity,
-    };
-    simplex_is_valid(simplex).then_some(simplex)
+    }
 }
 
 fn simplex_is_valid(simplex: A12FusionSimplex) -> bool {
@@ -334,6 +358,9 @@ fn build_evidence(
         basis,
         resolved_simplex,
         human_ess,
+        automatic_candidate_present: automatic.is_some(),
+        human_simplex,
+        human_runtime_adoption_weight: None,
         self_supervised_train_family_ess: 0,
         self_supervised_holdout_family_ess: 0,
         a12_generation: None,
@@ -445,14 +472,16 @@ pub fn resolve_runtime_recall_fusion(
         match policy
             .recall_fusion_evidence
             .get(key)
-            .map(|evidence| evidence.basis)
+            .map(|evidence| (evidence.basis, has_automatic_candidate(evidence)))
         {
-            Some(
+            Some((
                 ArsRecallFusionEvidenceBasis::Static
                 | ArsRecallFusionEvidenceBasis::SelfSupervised
                 | ArsRecallFusionEvidenceBasis::Blended,
-            ) => true,
-            Some(ArsRecallFusionEvidenceBasis::Human) | None => has_matching_adoption,
+                _,
+            )) => true,
+            Some((ArsRecallFusionEvidenceBasis::Human, true)) => true,
+            Some((ArsRecallFusionEvidenceBasis::Human, false)) | None => has_matching_adoption,
         }
     });
     let evidence = selected
@@ -471,7 +500,7 @@ pub fn resolve_runtime_recall_fusion(
         | Some(ArsRecallFusionEvidenceBasis::Blended) => {
             let key = selected.expect("automatic evidence always has a selected key");
             let evidence = evidence.expect("automatic basis came from evidence");
-            if let Some(reason) = automatic_runtime_ineligibility_reason(
+            if let Some(blocker) = automatic_runtime_ineligibility_reason(
                 policy,
                 adaptive,
                 active_a12,
@@ -481,7 +510,22 @@ pub fn resolve_runtime_recall_fusion(
                 expected_noise_floor,
                 now_millis,
             ) {
-                return runtime_disabled(Some(key), evidence.basis, reason);
+                if evidence.basis == ArsRecallFusionEvidenceBasis::Blended
+                    && blocker.allows_human_fallback()
+                    && evidence.human_simplex.is_some()
+                    && evidence.human_runtime_adoption_weight.is_some()
+                {
+                    return resolve_runtime_sealed_human_boundary(
+                        policy,
+                        config,
+                        adaptive,
+                        active_a12,
+                        &key,
+                        evidence,
+                        min_samples_alpha,
+                    );
+                }
+                return runtime_disabled(Some(key), evidence.basis, blocker.into_reason());
             }
             let adoption_weight = policy.runtime_adoption_weight_for(adaptive.version, &key);
             if adoption_weight <= f64::EPSILON {
@@ -506,7 +550,32 @@ pub fn resolve_runtime_recall_fusion(
                 reason: "sealed automatic recall fusion is current".to_string(),
             }
         }
-        Some(ArsRecallFusionEvidenceBasis::Human) | None => resolve_runtime_human(
+        Some(ArsRecallFusionEvidenceBasis::Human) => {
+            let key = selected.expect("human evidence has a selected key");
+            let evidence = evidence.expect("human basis came from evidence");
+            if has_automatic_candidate(evidence) {
+                resolve_runtime_sealed_human_boundary(
+                    policy,
+                    config,
+                    adaptive,
+                    active_a12,
+                    &key,
+                    evidence,
+                    min_samples_alpha,
+                )
+            } else {
+                resolve_runtime_human(
+                    policy,
+                    config,
+                    adaptive,
+                    query_type,
+                    cluster_id,
+                    min_samples_alpha,
+                    Some(key),
+                )
+            }
+        }
+        None => resolve_runtime_human(
             policy,
             config,
             adaptive,
@@ -516,6 +585,190 @@ pub fn resolve_runtime_recall_fusion(
             selected,
         ),
     }
+}
+
+fn has_automatic_candidate(evidence: &ArsRecallFusionEvidence) -> bool {
+    // Schema-2 rows written before the explicit marker existed still carried
+    // the A12 pointer. Treat those rows as candidate boundaries too, so a
+    // downgraded/older record cannot bypass a specific scope. Missing sealed
+    // human fields then fail closed in the resolver below.
+    evidence.automatic_candidate_present
+        || evidence.a12_generation.is_some()
+        || evidence.a12_revision.is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_runtime_sealed_human_boundary(
+    policy: &ArsParameterPolicy,
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    active_a12: &A12CalibrationLoad,
+    policy_key: &str,
+    evidence: &ArsRecallFusionEvidence,
+    min_samples_alpha: usize,
+) -> RuntimeRecallFusionResolution {
+    let selected = Some(policy_key.to_string());
+    if policy.source_adaptive_version != adaptive.version {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "sealed human fallback source adaptive version is not exact",
+        );
+    }
+    if let Some(reason) = automatic_candidate_identity_mismatch(active_a12, policy_key, evidence) {
+        return runtime_disabled(selected, ArsRecallFusionEvidenceBasis::Human, reason);
+    }
+    let Some(sealed_human) = evidence.human_simplex else {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "automatic boundary is missing its sealed human simplex",
+        );
+    };
+    if let Some(reason) =
+        sealed_human_fallback_relation_mismatch(active_a12, policy_key, evidence, sealed_human)
+    {
+        return runtime_disabled(selected, ArsRecallFusionEvidenceBasis::Human, reason);
+    }
+    let Some(adoption_weight) = evidence.human_runtime_adoption_weight else {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "automatic boundary is missing its sealed human adoption",
+        );
+    };
+    if !adoption_weight.is_finite()
+        || !(0.0..=1.0).contains(&adoption_weight)
+        || adoption_weight <= f64::EPSILON
+    {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "automatic boundary has zero or invalid sealed human adoption",
+        );
+    }
+    let Some(scope) = policy_key.strip_prefix("recall_fusion:") else {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "sealed human policy key is outside recall_fusion",
+        );
+    };
+    let floor = u64::try_from(min_samples_alpha.max(10)).unwrap_or(u64::MAX);
+    let Some(human) = human_for_scope(adaptive, scope, floor) else {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "automatic boundary has no matching live human fallback",
+        );
+    };
+    let human_ess = u64::try_from(human.sample_count).unwrap_or(u64::MAX);
+    let Some(live_human) = human_simplex(human) else {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "automatic boundary has an invalid live human fallback",
+        );
+    };
+    if evidence.human_ess != human_ess || !simplex_matches(sealed_human, live_human) {
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            "live human fallback does not match sealed simplex or ESS",
+        );
+    }
+
+    RuntimeRecallFusionResolution {
+        scope_key: Some(policy_key.to_string()),
+        basis: ArsRecallFusionEvidenceBasis::Human,
+        simplex: Some(effective_runtime_simplex(
+            config,
+            raw_human_simplex(human),
+            human_ess,
+            adoption_weight,
+        )),
+        adoption_weight,
+        reason: "authoritative scoped human fallback".to_string(),
+    }
+}
+
+fn sealed_human_fallback_relation_mismatch(
+    active_a12: &A12CalibrationLoad,
+    policy_key: &str,
+    evidence: &ArsRecallFusionEvidence,
+    sealed_human: A12FusionSimplex,
+) -> Option<String> {
+    match evidence.basis {
+        ArsRecallFusionEvidenceBasis::Human => {
+            if !simplex_matches(evidence.resolved_simplex, sealed_human) {
+                return Some(
+                    "sealed human fallback resolved simplex mismatched pure human evidence"
+                        .to_string(),
+                );
+            }
+        }
+        ArsRecallFusionEvidenceBasis::Blended => {
+            let Some(scope) = policy_key.strip_prefix("recall_fusion:") else {
+                return Some("blended fallback policy key is outside recall_fusion".to_string());
+            };
+            let Some(entry) = active_a12.state.scopes.get(scope) else {
+                return Some("blended fallback has no active A12 scope".to_string());
+            };
+            let expected = blend_simplexes(
+                sealed_human,
+                evidence.human_ess,
+                entry.simplex,
+                entry.train_family_ess,
+            );
+            if !simplex_matches(evidence.resolved_simplex, expected) {
+                return Some(
+                    "sealed blended fallback resolved simplex mismatched A12 and human evidence"
+                        .to_string(),
+                );
+            }
+        }
+        ArsRecallFusionEvidenceBasis::Static | ArsRecallFusionEvidenceBasis::SelfSupervised => {
+            return Some("sealed human fallback has an incompatible evidence basis".to_string());
+        }
+    }
+    None
+}
+
+fn automatic_candidate_identity_mismatch(
+    active_a12: &A12CalibrationLoad,
+    policy_key: &str,
+    evidence: &ArsRecallFusionEvidence,
+) -> Option<String> {
+    if active_a12.status != A12CalibrationLoadStatus::Loaded {
+        return Some("active A12 calibration is unavailable for human fallback".to_string());
+    }
+    let Some(scope) = policy_key.strip_prefix("recall_fusion:") else {
+        return Some("human fallback policy key is outside recall_fusion".to_string());
+    };
+    let Some(entry) = active_a12.state.scopes.get(scope) else {
+        return Some("active A12 calibration has no matching fallback boundary".to_string());
+    };
+    if evidence.a12_generation != Some(active_a12.state.generation)
+        || evidence.a12_revision != Some(active_a12.state.revision)
+        || evidence.generation_fingerprint.as_deref() != Some(entry.generation_fingerprint.as_str())
+        || evidence.corpus_fingerprint.as_deref() != Some(entry.corpus_fingerprint.as_str())
+        || evidence.optimizer_fingerprint.as_deref() != Some(entry.optimizer_fingerprint.as_str())
+        || evidence.evaluation_fingerprint.as_deref() != Some(entry.evaluation_fingerprint.as_str())
+        || evidence.a12_verdict != Some(entry.verdict)
+        || evidence.self_supervised_train_family_ess != entry.train_family_ess
+        || evidence.self_supervised_holdout_family_ess != entry.holdout_family_ess
+        || evidence.calibrated_at != Some(entry.calibrated_at)
+        || evidence.evaluated_at != Some(entry.evaluated_at)
+        || evidence.a12_valid_until_exclusive != entry.valid_until_exclusive
+        || evidence
+            .a12_noise_floor
+            .is_none_or(|noise_floor| !same_f64(noise_floor, entry.noise_floor))
+    {
+        return Some(
+            "sealed A12 candidate identity mismatched human fallback boundary".to_string(),
+        );
+    }
+    None
 }
 
 fn runtime_scope_keys(query_type: &str, cluster_id: Option<u32>) -> Vec<String> {
@@ -562,13 +815,11 @@ fn resolve_runtime_human(
             "no eligible live human recall-fusion entry",
         );
     };
-    let Some(learned_simplex) = human_simplex(entry) else {
-        return runtime_disabled(
-            selected,
-            ArsRecallFusionEvidenceBasis::Human,
-            "live human recall-fusion simplex is invalid",
-        );
-    };
+    // Feed the live raw vector into the same normalization boundary used by
+    // the legacy runtime. The policy evidence stores a normalized copy, but
+    // normalizing that copy a second time can introduce last-bit drift and
+    // perturb deterministic tie ordering.
+    let learned_simplex = raw_human_simplex(entry);
     let evidence_count = u64::try_from(entry.sample_count).unwrap_or(u64::MAX);
     RuntimeRecallFusionResolution {
         scope_key: selected,
@@ -632,6 +883,32 @@ fn effective_runtime_simplex(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutomaticRuntimeBlocker {
+    Eligibility(String),
+    FailClosed(String),
+}
+
+impl AutomaticRuntimeBlocker {
+    fn eligibility(reason: impl Into<String>) -> Self {
+        Self::Eligibility(reason.into())
+    }
+
+    fn fail_closed(reason: impl Into<String>) -> Self {
+        Self::FailClosed(reason.into())
+    }
+
+    fn allows_human_fallback(&self) -> bool {
+        matches!(self, Self::Eligibility(_))
+    }
+
+    fn into_reason(self) -> String {
+        match self {
+            Self::Eligibility(reason) | Self::FailClosed(reason) => reason,
+        }
+    }
+}
+
 fn automatic_runtime_ineligibility_reason(
     policy: &ArsParameterPolicy,
     adaptive: &AdaptiveState,
@@ -641,40 +918,46 @@ fn automatic_runtime_ineligibility_reason(
     min_samples_alpha: usize,
     expected_noise_floor: f64,
     now_millis: i64,
-) -> Option<String> {
+) -> Option<AutomaticRuntimeBlocker> {
     if policy.source_adaptive_version != adaptive.version {
-        return Some("automatic policy source adaptive version is not exact".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "automatic policy source adaptive version is not exact",
+        ));
     }
     if !policy.adoption_weights.contains_key(policy_key) {
-        return Some("automatic policy is missing its explicit scoped adoption weight".to_string());
-    }
-    if has_judge_drift(adaptive) {
-        return Some("judge drift blocks automatic recall fusion".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "automatic policy is missing its explicit scoped adoption weight",
+        ));
     }
     if active_a12.status != A12CalibrationLoadStatus::Loaded {
-        return Some("active A12 calibration is unavailable".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "active A12 calibration is unavailable",
+        ));
     }
     let Some(scope) = policy_key.strip_prefix("recall_fusion:") else {
-        return Some("automatic policy key is outside recall_fusion".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "automatic policy key is outside recall_fusion",
+        ));
     };
     let Some(entry) = active_a12.state.scopes.get(scope) else {
-        return Some("active A12 calibration has no matching scope".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "active A12 calibration has no matching scope",
+        ));
     };
     let floor = u64::try_from(min_samples_alpha.max(10)).unwrap_or(u64::MAX);
     if entry.verdict != A12CalibrationVerdict::Ship
         || evidence.a12_verdict != Some(A12CalibrationVerdict::Ship)
     {
-        return Some("automatic A12 holdout is not Ship".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "automatic A12 holdout attestation is not Ship",
+        ));
     }
-    if entry.train_family_ess < floor
-        || entry.holdout_family_ess < floor
-        || evidence.self_supervised_train_family_ess != entry.train_family_ess
+    if evidence.self_supervised_train_family_ess != entry.train_family_ess
         || evidence.self_supervised_holdout_family_ess != entry.holdout_family_ess
     {
-        return Some("automatic A12 ESS attestation is insufficient or mismatched".to_string());
-    }
-    if !entry.is_current_for_at(&active_a12.state, expected_noise_floor, now_millis) {
-        return Some("active A12 scope is stale or expired".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "automatic A12 ESS attestation is mismatched",
+        ));
     }
     if evidence.a12_generation != Some(active_a12.state.generation)
         || evidence.a12_revision != Some(active_a12.state.revision)
@@ -686,14 +969,17 @@ fn automatic_runtime_ineligibility_reason(
         || evidence.evaluated_at != Some(entry.evaluated_at)
         || evidence.a12_valid_until_exclusive != entry.valid_until_exclusive
     {
-        return Some("sealed A12 pointer or fingerprint identity mismatched".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "sealed A12 pointer or fingerprint identity mismatched",
+        ));
     }
     if evidence
         .a12_noise_floor
         .is_none_or(|noise_floor| !same_f64(noise_floor, entry.noise_floor))
-        || !entry.matches_noise_floor(expected_noise_floor)
     {
-        return Some("sealed A12 noise floor mismatched".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "sealed A12 noise floor mismatched active evidence",
+        ));
     }
     if evidence.recall_gate_status != ArsRecallGateStatus::Ship
         || evidence.recall_gate_build_fingerprint.as_deref() != Some(env!("REIN_BUILD_FINGERPRINT"))
@@ -705,23 +991,33 @@ fn automatic_runtime_ineligibility_reason(
             .recall_gate_evaluated_at
             .is_none_or(|value| value <= 0)
     {
-        return Some("sealed recall eval gate is not current Ship evidence".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "sealed recall eval gate is not current Ship evidence",
+        ));
     }
     if !simplex_is_valid(evidence.resolved_simplex) {
-        return Some("sealed recall-fusion simplex is invalid".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "sealed recall-fusion simplex is invalid",
+        ));
     }
     if evidence.basis == ArsRecallFusionEvidenceBasis::SelfSupervised
         && evidence.resolved_simplex != entry.simplex
     {
-        return Some("self-supervised simplex does not match active A12 scope".to_string());
+        return Some(AutomaticRuntimeBlocker::fail_closed(
+            "self-supervised simplex does not match active A12 scope",
+        ));
     }
     if evidence.basis == ArsRecallFusionEvidenceBasis::Blended {
         let Some(human) = human_for_scope(adaptive, scope, floor) else {
-            return Some("blended evidence has no matching live human scope".to_string());
+            return Some(AutomaticRuntimeBlocker::fail_closed(
+                "blended evidence has no matching live human scope",
+            ));
         };
         let human_ess = u64::try_from(human.sample_count).unwrap_or(u64::MAX);
         let Some(human_simplex) = human_simplex(human) else {
-            return Some("blended evidence has an invalid live human simplex".to_string());
+            return Some(AutomaticRuntimeBlocker::fail_closed(
+                "blended evidence has an invalid live human simplex",
+            ));
         };
         if human_ess != evidence.human_ess
             || !simplex_matches(
@@ -734,8 +1030,34 @@ fn automatic_runtime_ineligibility_reason(
                 ),
             )
         {
-            return Some("blended simplex or human ESS mismatched sealed evidence".to_string());
+            return Some(AutomaticRuntimeBlocker::fail_closed(
+                "blended simplex or human ESS mismatched sealed evidence",
+            ));
         }
+    }
+    // Integrity and sealed-relation checks above deliberately dominate the
+    // rollback conditions below. An expired/stale candidate is eligible for
+    // its sealed Human fallback only when every persisted attestation still
+    // matches; eligibility must never mask a concurrent tamper.
+    if has_judge_drift(adaptive) {
+        return Some(AutomaticRuntimeBlocker::eligibility(
+            "judge drift blocks automatic recall fusion",
+        ));
+    }
+    if entry.train_family_ess < floor || entry.holdout_family_ess < floor {
+        return Some(AutomaticRuntimeBlocker::eligibility(
+            "automatic A12 ESS is below the current eligibility floor",
+        ));
+    }
+    if !entry.matches_noise_floor(expected_noise_floor) {
+        return Some(AutomaticRuntimeBlocker::eligibility(
+            "active A12 noise floor is stale for the current runtime",
+        ));
+    }
+    if !entry.is_current_for_at(&active_a12.state, expected_noise_floor, now_millis) {
+        return Some(AutomaticRuntimeBlocker::eligibility(
+            "active A12 scope is stale or expired",
+        ));
     }
     None
 }
@@ -952,9 +1274,11 @@ mod tests {
             scope,
             canonical_generation: 11,
             generation_fingerprint: "generation-fingerprint".to_string(),
+            source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
             snapshot_cutoff: 1_700_000_000,
             corpus_fingerprint: "corpus-fingerprint".to_string(),
             train_family_ess: train_ess,
+            train_case_count: train_ess,
             holdout_family_ess: holdout_ess,
             simplex: simplex(values),
             verdict,
@@ -969,6 +1293,7 @@ mod tests {
             holdout_fingerprint: "holdout-fingerprint".to_string(),
             optimizer_fingerprint: "optimizer-fingerprint".to_string(),
             evaluation_fingerprint: "evaluation-fingerprint".to_string(),
+            holdout_reason: "holdout evaluated".to_string(),
             calibrated_at: 1_700_000_000,
             evaluated_at: 1_700_000_050,
             valid_until_exclusive: None,
@@ -987,6 +1312,11 @@ mod tests {
                 scopes: BTreeMap::from([(key, entry)]),
                 created_at: 1_700_000_000,
                 updated_at: 1_700_000_050,
+                run: Some(crate::store::a12_calibration::A12CalibrationRunMetadata {
+                    phase: crate::store::a12_calibration::A12CalibrationPhase::Complete,
+                    source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+                    behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
+                }),
             },
             status: A12CalibrationLoadStatus::Loaded,
             error: None,
@@ -1061,9 +1391,9 @@ mod tests {
         let run_path = temp.path().join("run.json");
         write_scorecard(
             &baseline_path,
-            &scorecard(ScorecardKind::Baseline, &vec![true; 20]),
+            &scorecard(ScorecardKind::Baseline, &[true; 20]),
         );
-        write_scorecard(&run_path, &scorecard(ScorecardKind::Run, &vec![false; 20]));
+        write_scorecard(&run_path, &scorecard(ScorecardKind::Run, &[false; 20]));
 
         let attestation = recall_eval_gate_attestation(&baseline_path, &run_path, 0.02);
 
@@ -1104,7 +1434,7 @@ mod tests {
 
         write_scorecard(
             &baseline_path,
-            &scorecard(ScorecardKind::Baseline, &vec![true; 20]),
+            &scorecard(ScorecardKind::Baseline, &[true; 20]),
         );
         std::fs::write(&run_path, b"{another secret invalid json").unwrap();
 
@@ -1596,9 +1926,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_human_scope_without_matching_adoption_does_not_shadow_query_fallback() {
+    fn runtime_specific_a12_candidate_is_authoritative_human_fallback() {
         let config = runtime_config();
-        let human = [0.40, 0.30, 0.10, 0.08, 0.07, 0.05];
+        // Deliberately non-normalized: the sealed boundary must compare the
+        // normalized attestation while feeding this raw vector through the
+        // exact legacy runtime normalization boundary.
+        let human = [4.0, 3.0, 1.0, 0.8, 0.7, 0.5];
         let state = AdaptiveState {
             learned_shadow_fusion: HashMap::from([(
                 "semantic".to_string(),
@@ -1617,7 +1950,7 @@ mod tests {
             20,
             A12CalibrationVerdict::Bail,
         );
-        let evidence = resolve_recall_fusion_evidence(
+        let mut evidence = resolve_recall_fusion_evidence(
             &state,
             &calibration,
             10,
@@ -1629,6 +1962,10 @@ mod tests {
             evidence["recall_fusion:semantic:7"].basis,
             ArsRecallFusionEvidenceBasis::Human
         );
+        evidence
+            .get_mut("recall_fusion:semantic:7")
+            .unwrap()
+            .human_runtime_adoption_weight = Some(0.3);
         let policy = canary_policy(
             6,
             0.8,
@@ -1650,13 +1987,198 @@ mod tests {
 
         assert_eq!(
             resolved.scope_key.as_deref(),
-            Some("recall_fusion:semantic")
+            Some("recall_fusion:semantic:7")
         );
         assert_eq!(resolved.basis, ArsRecallFusionEvidenceBasis::Human);
         assert_eq!(resolved.adoption_weight, 0.3);
         assert_eq!(
             resolved.simplex,
             Some(expected_runtime_simplex(simplex(human), 20, 0.3, &config,))
+        );
+    }
+
+    #[test]
+    fn runtime_specific_candidate_rollback_matrix_stays_on_sealed_human_scope() {
+        let config = runtime_config();
+        let human = [0.40, 0.30, 0.10, 0.08, 0.07, 0.05];
+        let state = AdaptiveState {
+            learned_shadow_fusion: HashMap::from([(
+                "semantic".to_string(),
+                human_entry(human, 20),
+            )]),
+            version: 6,
+            ..Default::default()
+        };
+        let base = a12_loaded(
+            A12CalibrationScope::Cluster {
+                query_type: "semantic".to_string(),
+                cluster_id: 7,
+            },
+            [0.35, 0.35, 0.10, 0.08, 0.07, 0.05],
+            20,
+            20,
+            A12CalibrationVerdict::Ship,
+        );
+        let now_millis = 1_700_000_075_000;
+        let mut cases = Vec::new();
+
+        let mut bail = base.clone();
+        bail.state.scopes.get_mut("semantic:7").unwrap().verdict = A12CalibrationVerdict::Bail;
+        cases.push(("bail", bail, gate(ArsRecallGateStatus::Ship), 0.02));
+
+        let mut no_data = base.clone();
+        no_data.state.scopes.get_mut("semantic:7").unwrap().verdict = A12CalibrationVerdict::NoData;
+        cases.push(("no-data", no_data, gate(ArsRecallGateStatus::Ship), 0.02));
+
+        let mut stale = base.clone();
+        stale
+            .state
+            .scopes
+            .get_mut("semantic:7")
+            .unwrap()
+            .generation_fingerprint = "stale-generation".to_string();
+        cases.push(("stale", stale, gate(ArsRecallGateStatus::Ship), 0.02));
+
+        let mut expired = base.clone();
+        expired
+            .state
+            .scopes
+            .get_mut("semantic:7")
+            .unwrap()
+            .valid_until_exclusive = Some(now_millis);
+        cases.push(("expired", expired, gate(ArsRecallGateStatus::Ship), 0.02));
+
+        cases.push((
+            "recall-gate-no-data",
+            base,
+            gate(ArsRecallGateStatus::NoData),
+            0.02,
+        ));
+
+        for (name, calibration, recall_gate, expected_noise_floor) in cases {
+            let mut evidence = resolve_recall_fusion_evidence(
+                &state,
+                &calibration,
+                10,
+                expected_noise_floor,
+                now_millis,
+                &recall_gate,
+            );
+            let specific = evidence.get_mut("recall_fusion:semantic:7").unwrap();
+            assert_eq!(
+                specific.basis,
+                ArsRecallFusionEvidenceBasis::Human,
+                "{name}"
+            );
+            assert!(specific.automatic_candidate_present, "{name}");
+            specific.human_runtime_adoption_weight = Some(0.3);
+            let policy = canary_policy(
+                state.version,
+                0.8,
+                HashMap::from([("recall_fusion:semantic".to_string(), 0.9)]),
+                evidence,
+            );
+
+            let resolved = resolve_runtime_recall_fusion(
+                &policy,
+                &config,
+                &state,
+                &calibration,
+                "semantic",
+                Some(7),
+                10,
+                expected_noise_floor,
+                now_millis,
+            );
+
+            assert_eq!(
+                resolved.scope_key.as_deref(),
+                Some("recall_fusion:semantic:7"),
+                "{name}: {}",
+                resolved.reason
+            );
+            assert_eq!(
+                resolved.basis,
+                ArsRecallFusionEvidenceBasis::Human,
+                "{name}"
+            );
+            assert_eq!(resolved.adoption_weight, 0.3, "{name}");
+            assert_eq!(
+                resolved.simplex,
+                Some(expected_runtime_simplex(simplex(human), 20, 0.3, &config)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_blended_expiry_uses_sealed_human_fallback() {
+        let config = runtime_config();
+        let human = [0.60, 0.20, 0.05, 0.05, 0.05, 0.05];
+        let state = AdaptiveState {
+            learned_shadow_fusion: HashMap::from([(
+                "semantic".to_string(),
+                human_entry(human, 20),
+            )]),
+            version: 8,
+            ..Default::default()
+        };
+        let mut calibration = a12_loaded(
+            A12CalibrationScope::Cluster {
+                query_type: "semantic".to_string(),
+                cluster_id: 7,
+            },
+            [0.20, 0.60, 0.05, 0.05, 0.05, 0.05],
+            20,
+            20,
+            A12CalibrationVerdict::Ship,
+        );
+        let boundary = 1_700_000_100_000;
+        calibration
+            .state
+            .scopes
+            .get_mut("semantic:7")
+            .unwrap()
+            .valid_until_exclusive = Some(boundary);
+        let mut evidence = resolve_recall_fusion_evidence(
+            &state,
+            &calibration,
+            10,
+            0.02,
+            boundary - 1,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let specific = evidence.get_mut("recall_fusion:semantic:7").unwrap();
+        assert_eq!(specific.basis, ArsRecallFusionEvidenceBasis::Blended);
+        specific.human_runtime_adoption_weight = Some(0.3);
+        let policy = canary_policy(
+            state.version,
+            0.0,
+            HashMap::from([("recall_fusion:semantic:7".to_string(), 0.5)]),
+            evidence,
+        );
+
+        let resolved = resolve_runtime_recall_fusion(
+            &policy,
+            &config,
+            &state,
+            &calibration,
+            "semantic",
+            Some(7),
+            10,
+            0.02,
+            boundary,
+        );
+
+        assert_eq!(
+            resolved.scope_key.as_deref(),
+            Some("recall_fusion:semantic:7")
+        );
+        assert_eq!(resolved.basis, ArsRecallFusionEvidenceBasis::Human);
+        assert_eq!(resolved.adoption_weight, 0.3);
+        assert_eq!(
+            resolved.simplex,
+            Some(expected_runtime_simplex(simplex(human), 20, 0.3, &config))
         );
     }
 

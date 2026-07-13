@@ -1396,9 +1396,34 @@ fn refresh_ars_parameter_policy(
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
 ) {
+    let active_a12 = crate::store::a12_calibration::load_a12_calibration(conn);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let recall_gate = crate::ops::a12_activation::recall_eval_gate_attestation(
+        &cwd.join("docs/eval-baselines/recall.json"),
+        &cwd.join("target/eval-gates/recall-run.json"),
+        crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+    );
+    refresh_ars_parameter_policy_with_inputs(
+        conn,
+        config,
+        state,
+        &active_a12,
+        &recall_gate,
+        chrono::Utc::now().timestamp_millis(),
+    );
+}
+
+fn refresh_ars_parameter_policy_with_inputs(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    active_a12: &crate::store::a12_calibration::A12CalibrationLoad,
+    recall_gate: &crate::ops::a12_activation::RecallEvalGateAttestation,
+    now_millis: i64,
+) {
     use crate::store::ars_parameter_policy::{
         load_parameter_policy, save_parameter_policy_cas, ArsParameterPolicy,
-        ArsParameterPolicyLoadStatus, ArsParameterPolicyMode,
+        ArsParameterPolicyLoadStatus, ArsParameterPolicyMode, ArsRecallFusionEvidenceBasis,
     };
 
     let loaded = load_parameter_policy(conn);
@@ -1429,11 +1454,26 @@ fn refresh_ars_parameter_policy(
         return;
     }
 
-    // codex R11 P2: same effective floor as the runtime read gates.
-    let eligible_shadow_fusion = state
-        .learned_shadow_fusion
-        .values()
-        .any(|entry| entry.sample_count >= config.adaptive.min_samples_alpha.max(10));
+    let mut recall_fusion_evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence(
+        state,
+        active_a12,
+        config.adaptive.min_samples_alpha,
+        crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+        now_millis,
+        recall_gate,
+    );
+    let eligible_human = recall_fusion_evidence.values().any(|evidence| {
+        matches!(
+            evidence.basis,
+            ArsRecallFusionEvidenceBasis::Human | ArsRecallFusionEvidenceBasis::Blended
+        )
+    });
+    let eligible_automatic = recall_fusion_evidence.values().any(|evidence| {
+        matches!(
+            evidence.basis,
+            ArsRecallFusionEvidenceBasis::SelfSupervised | ArsRecallFusionEvidenceBasis::Blended
+        )
+    });
     // v0.28.7 H2 — drift alerts force Shadow demotion. Mirror of v0.27.1
     // J-invariant fail-closed pattern: any drift signal (cross-surface or
     // per-surface) demotes Canary back to Shadow so the bad parameter
@@ -1449,7 +1489,7 @@ fn refresh_ars_parameter_policy(
         .unwrap_or(false);
     let mut desired_mode = if !config.adaptive.enabled || !config.ars.acceleration.enabled {
         ArsParameterPolicyMode::Disabled
-    } else if config.ars.acceleration.shadow_only || !eligible_shadow_fusion {
+    } else if config.ars.acceleration.shadow_only || (!eligible_human && !eligible_automatic) {
         ArsParameterPolicyMode::Shadow
     } else {
         ArsParameterPolicyMode::Canary
@@ -1488,13 +1528,22 @@ fn refresh_ars_parameter_policy(
         crate::store::adaptive::JudgeSurface::ConceptSummary,
         now,
     );
-    let runtime_adoption_weight =
-        next_runtime_adoption_weight(config, state, desired_mode, current.runtime_adoption_weight);
-    let adoption_weights = next_scoped_adoption_weights(
+    // The legacy scalar is exclusively human-evidence-driven. A12 may activate
+    // recall-fusion scopes, but it must never leak into synthesis, concept,
+    // judge-sampling, decay, or signal-hint consumers through scalar fallback.
+    let runtime_adoption_weight = if eligible_human {
+        next_runtime_adoption_weight(config, state, desired_mode, current.runtime_adoption_weight)
+    } else {
+        0.0
+    };
+    let adoption_weights = next_scoped_adoption_weights_with_evidence(
         config,
         state,
         desired_mode,
         &current.adoption_weights,
+        &mut recall_fusion_evidence,
+        eligible_human,
+        runtime_adoption_weight,
         synthesis_structural,
         concept_structural,
     );
@@ -1505,6 +1554,10 @@ fn refresh_ars_parameter_policy(
         && current.disabled_reason == disabled_reason
         && (current.runtime_adoption_weight - runtime_adoption_weight).abs() <= f64::EPSILON
         && current.adoption_weights == adoption_weights
+        && current.recall_fusion_evidence.len() == recall_fusion_evidence.len()
+        && recall_fusion_evidence
+            .iter()
+            .all(|(key, value)| current.recall_fusion_evidence.get(key) == Some(value))
     {
         return;
     }
@@ -1516,6 +1569,7 @@ fn refresh_ars_parameter_policy(
         source_adaptive_version: state.version,
         runtime_adoption_weight,
         adoption_weights,
+        recall_fusion_evidence: recall_fusion_evidence.into_iter().collect(),
         last_event_id: state
             .alpha_optimizer_last_id
             .max(state.alpha_optimizer_access_last_id),
@@ -1535,6 +1589,143 @@ fn refresh_ars_parameter_policy(
             "ARS parameter policy CAS miss; keeping existing activation policy"
         ),
         Err(e) => tracing::warn!("failed to refresh ARS parameter policy: {e}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn next_scoped_adoption_weights_with_evidence(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    desired_mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode,
+    current_weights: &HashMap<String, f64>,
+    evidence: &mut std::collections::BTreeMap<
+        String,
+        crate::store::ars_parameter_policy::ArsRecallFusionEvidence,
+    >,
+    eligible_human: bool,
+    runtime_adoption_weight: f64,
+    synthesis_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+    concept_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+) -> HashMap<String, f64> {
+    use crate::store::ars_parameter_policy::{
+        ArsParameterPolicyMode, ArsRecallFusionEvidenceBasis,
+    };
+
+    // Starting from the existing human path keeps every pre-A12 scalar and
+    // human recall value identical. Automatic evidence is overlaid only onto
+    // recall_fusion:* keys below.
+    let mut weights = if eligible_human && matches!(desired_mode, ArsParameterPolicyMode::Canary) {
+        next_scoped_adoption_weights(
+            config,
+            state,
+            desired_mode,
+            current_weights,
+            synthesis_structural,
+            concept_structural,
+        )
+    } else {
+        HashMap::new()
+    };
+    seal_human_fallback_adoption(evidence, &weights, runtime_adoption_weight);
+    if !matches!(desired_mode, ArsParameterPolicyMode::Canary) {
+        return HashMap::new();
+    }
+    let recall_decisions = enabled_judge_trust_decisions(
+        config,
+        state,
+        synthesis_structural,
+        concept_structural,
+        crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+        true,
+        false,
+    );
+
+    for (key, evidence) in evidence.iter() {
+        match evidence.basis {
+            ArsRecallFusionEvidenceBasis::Static => {
+                // Static automatic evidence is authoritative for this scope.
+                // Roll back immediately; do not take a gradual 0.05 step.
+                weights.insert(key.clone(), 0.0);
+            }
+            ArsRecallFusionEvidenceBasis::SelfSupervised
+            | ArsRecallFusionEvidenceBasis::Blended => {
+                let evidence_count = match evidence.basis {
+                    ArsRecallFusionEvidenceBasis::SelfSupervised => {
+                        evidence.self_supervised_train_family_ess
+                    }
+                    ArsRecallFusionEvidenceBasis::Blended => evidence
+                        .human_ess
+                        .saturating_add(evidence.self_supervised_train_family_ess),
+                    _ => unreachable!(),
+                };
+                let Some(sample_count) = usize::try_from(evidence_count).ok() else {
+                    weights.insert(key.clone(), 0.0);
+                    continue;
+                };
+                let Some(target) = runtime_adoption_target(config, sample_count) else {
+                    weights.insert(key.clone(), 0.0);
+                    continue;
+                };
+                let current = current_weights.get(key).copied().unwrap_or(0.0);
+                weights.insert(
+                    key.clone(),
+                    gated_policy_weight(current, target, &recall_decisions, false),
+                );
+            }
+            ArsRecallFusionEvidenceBasis::Human => {
+                // The legacy helper already handles exact human scopes and
+                // judge structural trust. A broader human fallback attached
+                // to an ineligible A12-specific scope must not synthesize a
+                // new, more-specific policy key.
+            }
+        }
+    }
+
+    if !eligible_human {
+        // Scoped readers search cluster/query/global before scalar fallback.
+        // Seal an explicit global zero unless global A12 evidence itself is
+        // eligible and has already supplied a positive scoped weight.
+        weights
+            .entry("recall_fusion:global".to_string())
+            .or_insert(0.0);
+    }
+    weights
+}
+
+fn seal_human_fallback_adoption(
+    evidence: &mut std::collections::BTreeMap<
+        String,
+        crate::store::ars_parameter_policy::ArsRecallFusionEvidence,
+    >,
+    pure_human_weights: &HashMap<String, f64>,
+    runtime_adoption_weight: f64,
+) {
+    for (policy_key, evidence) in evidence {
+        if evidence.human_ess == 0 || evidence.human_simplex.is_none() {
+            evidence.human_runtime_adoption_weight = None;
+            continue;
+        }
+        let scope = policy_key
+            .strip_prefix("recall_fusion:")
+            .unwrap_or_default();
+        let query_key = scope
+            .split_once(':')
+            .map(|(query_type, _)| format!("recall_fusion:{query_type}"));
+        let adoption_weight = pure_human_weights
+            .get(policy_key)
+            .or_else(|| {
+                query_key
+                    .as_ref()
+                    .and_then(|key| pure_human_weights.get(key))
+            })
+            .or_else(|| pure_human_weights.get("recall_fusion:global"))
+            .copied()
+            .unwrap_or(runtime_adoption_weight);
+        evidence.human_runtime_adoption_weight = Some(if adoption_weight.is_finite() {
+            adoption_weight.clamp(0.0, 1.0)
+        } else {
+            0.0
+        });
     }
 }
 
@@ -5279,6 +5470,719 @@ mod tests {
         );
     }
 
+    fn a12_ship_load(
+        scope: crate::store::a12_calibration::A12CalibrationScope,
+        valid_until_exclusive: Option<i64>,
+    ) -> crate::store::a12_calibration::A12CalibrationLoad {
+        use crate::store::a12_calibration::{
+            A12CalibrationLoad, A12CalibrationLoadStatus, A12CalibrationPhase,
+            A12CalibrationRunMetadata, A12CalibrationState, A12CalibrationVerdict,
+            A12FusionSimplex, A12PairedTop3Stats, A12ProvenanceCounts, A12ScopeEntry,
+            A12_CALIBRATION_SCHEMA_VERSION,
+        };
+
+        let paired = crate::eval::mcnemar::mcnemar_from_counts(20, 0, 0, 0).unwrap();
+        let paired_top3 = A12PairedTop3Stats {
+            n: u64::from(paired.n),
+            both_hit: u64::from(paired.a),
+            baseline_only: u64::from(paired.b),
+            treatment_only: u64::from(paired.c),
+            neither_hit: u64::from(paired.d),
+            chi_squared: paired.chi_squared,
+            p_value: paired.p_value,
+            diff_point: paired.diff_point,
+            ci_lower: paired.ci_lower,
+            ci_upper: paired.ci_upper,
+            used_exact: paired.used_exact,
+        };
+        let key = scope.key();
+        let cluster_generation = scope.is_cluster().then_some(3);
+        let entry = A12ScopeEntry {
+            scope,
+            canonical_generation: 11,
+            generation_fingerprint: "generation-fingerprint".to_string(),
+            source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+            snapshot_cutoff: 1_700_000_000,
+            corpus_fingerprint: "corpus-fingerprint".to_string(),
+            train_family_ess: 20,
+            train_case_count: 20,
+            holdout_family_ess: 20,
+            simplex: A12FusionSimplex {
+                bm25: 0.25,
+                vector: 0.45,
+                kg: 0.10,
+                episode: 0.08,
+                support: 0.07,
+                diversity: 0.05,
+            },
+            verdict: A12CalibrationVerdict::Ship,
+            noise_floor: 0.02,
+            paired_top3,
+            provenance: A12ProvenanceCounts {
+                canonical_loo: 20,
+                concept_loo: 0,
+                episode_loo: 0,
+            },
+            training_fingerprint: "training-fingerprint".to_string(),
+            holdout_fingerprint: "holdout-fingerprint".to_string(),
+            optimizer_fingerprint: "optimizer-fingerprint".to_string(),
+            evaluation_fingerprint: "evaluation-fingerprint".to_string(),
+            holdout_reason: "holdout evaluated".to_string(),
+            calibrated_at: 1_700_000_000,
+            evaluated_at: 1_700_000_050,
+            valid_until_exclusive,
+            cluster_generation,
+            invalidation: None,
+        };
+        A12CalibrationLoad {
+            state: A12CalibrationState {
+                schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+                revision: 4,
+                generation: 11,
+                generation_fingerprint: "generation-fingerprint".to_string(),
+                snapshot_cutoff: 1_700_000_000,
+                corpus_fingerprint: "corpus-fingerprint".to_string(),
+                cluster_generation: 3,
+                scopes: std::collections::BTreeMap::from([(key, entry)]),
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_050,
+                run: Some(A12CalibrationRunMetadata {
+                    phase: A12CalibrationPhase::Complete,
+                    source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+                    behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
+                }),
+            },
+            status: A12CalibrationLoadStatus::Loaded,
+            error: None,
+        }
+    }
+
+    fn ship_recall_gate() -> crate::ops::a12_activation::RecallEvalGateAttestation {
+        crate::ops::a12_activation::RecallEvalGateAttestation {
+            status: crate::store::ars_parameter_policy::ArsRecallGateStatus::Ship,
+            reason_code: crate::ops::a12_activation::RecallEvalGateReasonCode::Compared,
+            build_fingerprint: Some(env!("REIN_BUILD_FINGERPRINT").to_string()),
+            fixture_fingerprint: Some("fixture-fingerprint".to_string()),
+            evaluated_at: Some(1_700_000_060),
+            reason: "paired recall gate shipped".to_string(),
+        }
+    }
+
+    fn a12_runtime_config() -> ReinConfig {
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.adaptive.min_samples_alpha = 10;
+        config
+    }
+
+    #[test]
+    fn a12_auto_ship_refreshes_recall_only_canary_with_zero_scalar_fallback() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let state = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_075_000,
+        );
+
+        let policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            policy.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert_eq!(policy.runtime_adoption_weight, 0.0);
+        assert_eq!(policy.adoption_weights["recall_fusion:semantic"], 0.05);
+        assert_eq!(policy.adoption_weights["recall_fusion:global"], 0.0);
+        assert!(policy
+            .adoption_weights
+            .keys()
+            .all(|key| key.starts_with("recall_fusion:")));
+        assert_eq!(
+            policy.recall_fusion_evidence["recall_fusion:semantic"].basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::SelfSupervised
+        );
+    }
+
+    #[test]
+    fn a12_auto_adoption_steps_by_at_most_point_zero_five_per_refresh() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::Global,
+            None,
+        );
+        let mut state = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_075_000,
+        );
+        let first = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(first.adoption_weights["recall_fusion:global"], 0.05);
+
+        state.version += 1;
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_076_000,
+        );
+        let second = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(second.adoption_weights["recall_fusion:global"], 0.10);
+        assert_eq!(second.runtime_adoption_weight, 0.0);
+    }
+
+    #[test]
+    fn a12_no_data_bail_or_expiry_rolls_auto_adoption_back_immediately() {
+        use crate::store::a12_calibration::A12CalibrationVerdict;
+        use crate::store::ars_parameter_policy::ArsRecallGateStatus;
+
+        for failure in ["no_data", "bail", "expired"] {
+            let conn = metadata_conn();
+            let config = a12_runtime_config();
+            let mut a12 = a12_ship_load(
+                crate::store::a12_calibration::A12CalibrationScope::Global,
+                (failure == "expired").then_some(1_700_000_080_000),
+            );
+            let mut state = AdaptiveState {
+                version: 7,
+                ..AdaptiveState::default()
+            };
+            refresh_ars_parameter_policy_with_inputs(
+                &conn,
+                &config,
+                &state,
+                &a12,
+                &ship_recall_gate(),
+                1_700_000_075_000,
+            );
+            assert_eq!(
+                crate::store::ars_parameter_policy::load_parameter_policy(&conn)
+                    .policy
+                    .adoption_weights["recall_fusion:global"],
+                0.05
+            );
+
+            let mut gate = ship_recall_gate();
+            match failure {
+                "no_data" => gate.status = ArsRecallGateStatus::NoData,
+                "bail" => {
+                    a12.state.scopes.get_mut("global").unwrap().verdict =
+                        A12CalibrationVerdict::Bail;
+                }
+                "expired" => {}
+                _ => unreachable!(),
+            }
+            state.version += 1;
+            refresh_ars_parameter_policy_with_inputs(
+                &conn,
+                &config,
+                &state,
+                &a12,
+                &gate,
+                1_700_000_080_000,
+            );
+            let rolled_back =
+                crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+            assert_eq!(rolled_back.runtime_adoption_weight, 0.0, "{failure}");
+            assert!(
+                rolled_back
+                    .adoption_weights
+                    .get("recall_fusion:global")
+                    .copied()
+                    .unwrap_or(0.0)
+                    <= f64::EPSILON,
+                "{failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn a12_blended_refresh_records_ess_blend_without_changing_human_scalars() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.25,
+                    kg: 0.10,
+                    episode: 0.08,
+                    support: 0.07,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_075_000,
+        );
+
+        let policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        let evidence = &policy.recall_fusion_evidence["recall_fusion:semantic"];
+        assert_eq!(
+            evidence.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Blended
+        );
+        assert_eq!(evidence.human_ess, 20);
+        assert_eq!(evidence.self_supervised_train_family_ess, 20);
+        assert_eq!(policy.runtime_adoption_weight, 0.05);
+        for key in [
+            "synthesis_gate",
+            "concept_summary_gate",
+            "judge_sample_rate",
+            "llm_feedback_decay",
+            "signal_hint_priors",
+        ] {
+            assert_eq!(policy.adoption_weights[key], 0.05, "{key}");
+        }
+    }
+
+    #[test]
+    fn a12_blended_failure_drops_auto_immediately_and_keeps_human_canary() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.25,
+                    kg: 0.10,
+                    episode: 0.08,
+                    support: 0.07,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_075_000,
+        );
+        assert_eq!(
+            crate::store::ars_parameter_policy::load_parameter_policy(&conn)
+                .policy
+                .recall_fusion_evidence["recall_fusion:semantic"]
+                .basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Blended
+        );
+
+        state.version += 1;
+        let mut failed_gate = ship_recall_gate();
+        failed_gate.status = crate::store::ars_parameter_policy::ArsRecallGateStatus::NoData;
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &failed_gate,
+            1_700_000_076_000,
+        );
+
+        let policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(
+            policy.mode,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
+        );
+        assert_eq!(
+            policy.recall_fusion_evidence["recall_fusion:semantic"].basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Human
+        );
+        let runtime = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+            &policy,
+            &config,
+            &state,
+            &a12,
+            "semantic",
+            None,
+            10,
+            0.02,
+            1_700_000_076_000,
+        );
+        assert_eq!(
+            runtime.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Human
+        );
+        assert!(runtime.adoption_weight > 0.0);
+        assert!(runtime.simplex.is_some());
+    }
+
+    #[test]
+    fn a12_expired_specific_scope_is_explicit_zero_and_does_not_fallback() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let state = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let mut a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+        let mut cluster = a12.state.scopes["semantic"].clone();
+        cluster.scope = crate::store::a12_calibration::A12CalibrationScope::Cluster {
+            query_type: "semantic".to_string(),
+            cluster_id: 7,
+        };
+        cluster.cluster_generation = Some(3);
+        cluster.valid_until_exclusive = Some(1_700_000_080_000);
+        a12.state.scopes.insert("semantic:7".to_string(), cluster);
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_080_000,
+        );
+
+        let policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        assert_eq!(policy.adoption_weights["recall_fusion:semantic"], 0.05);
+        assert_eq!(policy.adoption_weights["recall_fusion:semantic:7"], 0.0);
+        assert_eq!(
+            policy.recall_fusion_evidence["recall_fusion:semantic:7"].basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Static
+        );
+        let runtime = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+            &policy,
+            &config,
+            &state,
+            &a12,
+            "semantic",
+            Some(7),
+            10,
+            0.02,
+            1_700_000_080_000,
+        );
+        assert_eq!(
+            runtime.scope_key.as_deref(),
+            Some("recall_fusion:semantic:7")
+        );
+        assert_eq!(runtime.adoption_weight, 0.0);
+        assert!(runtime.simplex.is_none());
+    }
+
+    #[test]
+    fn a12_stale_specific_scope_uses_human_fallback_not_broader_auto() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.60,
+                    vec: 0.20,
+                    kg: 0.05,
+                    episode: 0.05,
+                    support: 0.05,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let mut a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+        let mut cluster = a12.state.scopes["semantic"].clone();
+        cluster.scope = crate::store::a12_calibration::A12CalibrationScope::Cluster {
+            query_type: "semantic".to_string(),
+            cluster_id: 7,
+        };
+        cluster.cluster_generation = Some(3);
+        cluster.valid_until_exclusive = Some(1_700_000_080_000);
+        a12.state.scopes.insert("semantic:7".to_string(), cluster);
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            1_700_000_080_000,
+        );
+        let policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+
+        let runtime = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+            &policy,
+            &config,
+            &state,
+            &a12,
+            "semantic",
+            Some(7),
+            10,
+            0.02,
+            1_700_000_080_000,
+        );
+
+        assert_eq!(
+            runtime.scope_key.as_deref(),
+            Some("recall_fusion:semantic:7")
+        );
+        assert_eq!(
+            runtime.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Human
+        );
+        assert!(runtime.adoption_weight > 0.0);
+        assert!(runtime.simplex.is_some());
+    }
+
+    #[test]
+    fn production_sealed_blended_simplex_mismatch_fails_closed() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.25,
+                    kg: 0.10,
+                    episode: 0.08,
+                    support: 0.07,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+        let now_millis = 1_700_000_075_000;
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            now_millis,
+        );
+        let mut policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        let evidence = policy
+            .recall_fusion_evidence
+            .get_mut("recall_fusion:semantic")
+            .unwrap();
+        assert_eq!(
+            evidence.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Blended
+        );
+        assert!(evidence.human_runtime_adoption_weight.is_some());
+        evidence.resolved_simplex = crate::store::a12_calibration::A12FusionSimplex {
+            bm25: 0.34,
+            vector: 0.36,
+            kg: 0.10,
+            episode: 0.08,
+            support: 0.07,
+            diversity: 0.05,
+        };
+
+        let runtime = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+            &policy, &config, &state, &a12, "semantic", None, 10, 0.02, now_millis,
+        );
+
+        assert_eq!(runtime.adoption_weight, 0.0, "{}", runtime.reason);
+        assert!(runtime.simplex.is_none());
+        assert!(runtime.reason.contains("simplex"), "{}", runtime.reason);
+    }
+
+    #[test]
+    fn production_sealed_expired_blended_recall_gate_tamper_fails_closed() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.25,
+                    kg: 0.10,
+                    episode: 0.08,
+                    support: 0.07,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let expires_at = 1_700_000_080_000;
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            Some(expires_at),
+        );
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            expires_at - 1,
+        );
+        let mut policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        let evidence = policy
+            .recall_fusion_evidence
+            .get_mut("recall_fusion:semantic")
+            .unwrap();
+        assert_eq!(
+            evidence.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Blended
+        );
+        evidence.recall_gate_build_fingerprint = Some("tampered-build".to_string());
+
+        let runtime = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+            &policy, &config, &state, &a12, "semantic", None, 10, 0.02, expires_at,
+        );
+
+        assert_eq!(runtime.adoption_weight, 0.0, "{}", runtime.reason);
+        assert!(runtime.simplex.is_none());
+        assert!(
+            runtime.reason.contains("recall eval gate"),
+            "{}",
+            runtime.reason
+        );
+    }
+
+    #[test]
+    fn production_sealed_human_boundary_simplex_mismatch_fails_closed() {
+        let conn = metadata_conn();
+        let config = a12_runtime_config();
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.25,
+                    kg: 0.10,
+                    episode: 0.08,
+                    support: 0.07,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let mut a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+        a12.state.scopes.get_mut("semantic").unwrap().verdict =
+            crate::store::a12_calibration::A12CalibrationVerdict::Bail;
+        let now_millis = 1_700_000_075_000;
+
+        refresh_ars_parameter_policy_with_inputs(
+            &conn,
+            &config,
+            &state,
+            &a12,
+            &ship_recall_gate(),
+            now_millis,
+        );
+        let mut policy = crate::store::ars_parameter_policy::load_parameter_policy(&conn).policy;
+        let evidence = policy
+            .recall_fusion_evidence
+            .get_mut("recall_fusion:semantic")
+            .unwrap();
+        assert_eq!(
+            evidence.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Human
+        );
+        assert!(evidence.automatic_candidate_present);
+        assert!(evidence.human_runtime_adoption_weight.is_some());
+        evidence.resolved_simplex = crate::store::a12_calibration::A12FusionSimplex {
+            bm25: 0.44,
+            vector: 0.26,
+            kg: 0.10,
+            episode: 0.08,
+            support: 0.07,
+            diversity: 0.05,
+        };
+
+        let runtime = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+            &policy, &config, &state, &a12, "semantic", None, 10, 0.02, now_millis,
+        );
+
+        assert_eq!(runtime.adoption_weight, 0.0, "{}", runtime.reason);
+        assert!(runtime.simplex.is_none());
+        assert!(runtime.reason.contains("simplex"), "{}", runtime.reason);
+    }
+
     #[test]
     fn ars_parameter_policy_refresh_promotes_canary_only_for_non_shadow_eligible_state() {
         let conn = metadata_conn();
@@ -5461,6 +6365,105 @@ mod tests {
         assert_eq!(weights["signal_hint_priors"], 0.0);
         assert_eq!(weights["judge_sample_rate"], 0.25);
         assert_eq!(weights["llm_feedback_decay"], 0.20);
+    }
+
+    #[test]
+    fn structural_denial_blocks_auto_only_recall_overlay() {
+        let mut config = a12_runtime_config();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        let state = AdaptiveState {
+            version: 7,
+            ..Default::default()
+        };
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::Global,
+            None,
+        );
+        let mut evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence(
+            &state,
+            &a12,
+            10,
+            0.02,
+            1_700_000_075_000,
+            &ship_recall_gate(),
+        );
+        let ready = crate::ops::ars_tuning::JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Ready,
+            enforce: true,
+            gate_required: true,
+        };
+
+        let weights = next_scoped_adoption_weights_with_evidence(
+            &config,
+            &state,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            &HashMap::new(),
+            &mut evidence,
+            false,
+            0.0,
+            ready,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
+
+        assert_eq!(weights["recall_fusion:global"], 0.0);
+    }
+
+    #[test]
+    fn structural_denial_blocks_blended_recall_overlay() {
+        let mut config = a12_runtime_config();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        let mut state = eligible_shadow_state();
+        state.learned_shadow_fusion.remove("global");
+        state.learned_shadow_fusion.insert(
+            "semantic".to_string(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.45,
+                    vec: 0.25,
+                    kg: 0.10,
+                    episode: 0.08,
+                    support: 0.07,
+                    diversity: 0.05,
+                },
+                sample_count: 20,
+                last_updated: "2026-07-13T00:00:00Z".to_string(),
+            },
+        );
+        let a12 = a12_ship_load(
+            crate::store::a12_calibration::A12CalibrationScope::QueryType {
+                query_type: "semantic".to_string(),
+            },
+            None,
+        );
+        let mut evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence(
+            &state,
+            &a12,
+            10,
+            0.02,
+            1_700_000_075_000,
+            &ship_recall_gate(),
+        );
+        let ready = crate::ops::ars_tuning::JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Ready,
+            enforce: true,
+            gate_required: true,
+        };
+
+        let weights = next_scoped_adoption_weights_with_evidence(
+            &config,
+            &state,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            &HashMap::new(),
+            &mut evidence,
+            true,
+            0.0,
+            ready,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
+
+        assert_eq!(weights["recall_fusion:semantic"], 0.0);
     }
 
     #[test]

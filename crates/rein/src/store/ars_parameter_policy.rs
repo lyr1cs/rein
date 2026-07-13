@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::io;
 
 pub const ARS_PARAMETER_POLICY_METADATA_KEY: &str = "ars_parameter_policy";
-pub const ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 2;
+pub const ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 3;
 const LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 1;
+const LEGACY_A12_ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +52,21 @@ pub struct ArsRecallFusionEvidence {
     pub resolved_simplex: crate::store::a12_calibration::A12FusionSimplex,
     #[serde(default)]
     pub human_ess: u64,
+    /// True when this scope had an A12 candidate at refresh time, including a
+    /// candidate that was Bail, stale, expired, or blocked by the recall gate.
+    /// The bit makes a more-specific human fallback authoritative at runtime.
+    #[serde(default)]
+    pub automatic_candidate_present: bool,
+    /// Pure human simplex sealed independently of any A12 blend. This lets a
+    /// blended or ineligible automatic scope fall back without consulting a
+    /// broader automatic scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_simplex: Option<crate::store::a12_calibration::A12FusionSimplex>,
+    /// Pure legacy-human adoption sealed before automatic overlays are
+    /// applied. It is intentionally scoped evidence rather than a synthesized
+    /// entry in `adoption_weights`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_runtime_adoption_weight: Option<f64>,
     #[serde(default)]
     pub self_supervised_train_family_ess: u64,
     #[serde(default)]
@@ -270,12 +286,15 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
     }
     if !matches!(
         detected_schema,
-        LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION | ARS_PARAMETER_POLICY_SCHEMA_VERSION
+        LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION
+            | LEGACY_A12_ARS_PARAMETER_POLICY_SCHEMA_VERSION
+            | ARS_PARAMETER_POLICY_SCHEMA_VERSION
     ) {
         return corrupt_parameter_policy_load(format!(
-            "policy schema_version={} is older or invalid (supported schemas are {} and {})",
+            "policy schema_version={} is older or invalid (supported schemas are {}, {}, and {})",
             detected_schema,
             LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            LEGACY_A12_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
             ARS_PARAMETER_POLICY_SCHEMA_VERSION
         ));
     }
@@ -284,18 +303,19 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
         Ok(mut policy) => {
             // `#[serde(default)]` deliberately describes newly-created values,
             // not historical on-disk identity. Preserve the schema detected
-            // above so legacy rows remain fail-closed until a schema-2 CAS.
+            // above so legacy rows remain fail-closed until a schema-3 CAS.
             policy.schema_version = detected_schema;
             clamp_policy_weights(&mut policy);
             if detected_schema == LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION {
                 policy.recall_fusion_evidence.clear();
+            }
+            if detected_schema != ARS_PARAMETER_POLICY_SCHEMA_VERSION {
                 return ArsParameterPolicyLoad {
                     policy,
                     status: ArsParameterPolicyLoadStatus::Loaded,
-                    error: Some(
-                        "legacy policy schema loaded fail-closed; next policy refresh must migrate it"
-                            .to_string(),
-                    ),
+                    error: Some(format!(
+                        "legacy policy schema {detected_schema} loaded fail-closed; next policy refresh must migrate it"
+                    )),
                 };
             }
             if let Err(error) = validate_parameter_policy(&policy) {
@@ -335,20 +355,22 @@ pub fn save_parameter_policy_cas(
     // future code paths that bypass the refresh-layer early-return —
     // and the row survives the downgrade window untouched.
     //
-    // Schema 1 and missing-schema rows are explicitly migratable to schema 2.
-    // Future rows cannot satisfy the allowlist and retain their exact bytes.
+    // Schema 1, schema 2, and missing-schema rows are explicitly migratable to
+    // schema 3. Future rows cannot satisfy the allowlist and retain their exact
+    // bytes.
     let updated = conn.execute(
         "UPDATE metadata
             SET value = ?1
           WHERE key = ?2
             AND json_valid(value)
             AND COALESCE(json_extract(value, '$.revision'), 0) = ?3
-            AND COALESCE(json_extract(value, '$.schema_version'), ?4) IN (?4, ?5)",
+            AND COALESCE(json_extract(value, '$.schema_version'), ?4) IN (?4, ?5, ?6)",
         params![
             json,
             ARS_PARAMETER_POLICY_METADATA_KEY,
             expected_revision,
             LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            LEGACY_A12_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
             ARS_PARAMETER_POLICY_SCHEMA_VERSION,
         ],
     )?;
@@ -603,6 +625,65 @@ fn validate_recall_fusion_evidence(
             "recall-fusion evidence `{key}` declares human evidence with zero ESS"
         ));
     }
+    if let Some(simplex) = evidence.human_simplex {
+        let values = [
+            simplex.bm25,
+            simplex.vector,
+            simplex.kg,
+            simplex.episode,
+            simplex.support,
+            simplex.diversity,
+        ];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+            || (values.iter().sum::<f64>() - 1.0).abs() > 1e-6
+        {
+            return Err(format!(
+                "recall-fusion evidence `{key}` has an invalid sealed human simplex"
+            ));
+        }
+    }
+    if evidence
+        .human_runtime_adoption_weight
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` human runtime adoption weight must be finite and in [0, 1]"
+        ));
+    }
+    if evidence.human_runtime_adoption_weight.is_some()
+        && (evidence.human_simplex.is_none() || evidence.human_ess == 0)
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` seals human adoption without complete human evidence"
+        ));
+    }
+    if evidence.automatic_candidate_present
+        && evidence.human_ess > 0
+        && (evidence.human_simplex.is_none() || evidence.human_runtime_adoption_weight.is_none())
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` automatic boundary is missing sealed human fallback"
+        ));
+    }
+    if evidence.automatic_candidate_present {
+        let missing_candidate_identity = evidence.a12_generation.is_none()
+            || evidence.a12_revision.is_none()
+            || evidence.generation_fingerprint.is_none()
+            || evidence.corpus_fingerprint.is_none()
+            || evidence.optimizer_fingerprint.is_none()
+            || evidence.evaluation_fingerprint.is_none()
+            || evidence.a12_verdict.is_none()
+            || evidence.a12_noise_floor.is_none()
+            || evidence.calibrated_at.is_none()
+            || evidence.evaluated_at.is_none();
+        if missing_candidate_identity {
+            return Err(format!(
+                "recall-fusion evidence `{key}` has incomplete A12 candidate identity"
+            ));
+        }
+    }
     if uses_automatic {
         let missing_identity = evidence.a12_generation.is_none()
             || evidence.a12_revision.is_none()
@@ -713,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_policy_schema_two_round_trips_recall_fusion_evidence() {
+    fn parameter_policy_schema_three_round_trips_recall_fusion_evidence() {
         let conn = conn();
         let mut policy = canary_policy(1);
         policy.recall_fusion_evidence.insert(
@@ -729,6 +810,16 @@ mod tests {
                     diversity: 0.05,
                 },
                 human_ess: 40,
+                automatic_candidate_present: true,
+                human_simplex: Some(crate::store::a12_calibration::A12FusionSimplex {
+                    bm25: 0.4,
+                    vector: 0.3,
+                    kg: 0.1,
+                    episode: 0.1,
+                    support: 0.05,
+                    diversity: 0.05,
+                }),
+                human_runtime_adoption_weight: Some(0.25),
                 self_supervised_train_family_ess: 80,
                 self_supervised_holdout_family_ess: 20,
                 a12_generation: Some(7),
@@ -754,7 +845,10 @@ mod tests {
         let loaded = load_parameter_policy(&conn);
 
         assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
-        assert_eq!(loaded.policy.schema_version, 2);
+        assert_eq!(
+            loaded.policy.schema_version,
+            ARS_PARAMETER_POLICY_SCHEMA_VERSION
+        );
         assert_eq!(loaded.policy, policy);
     }
 
@@ -797,7 +891,10 @@ mod tests {
         };
         assert!(save_parameter_policy_cas(&conn, &migrated, 4).unwrap());
         let loaded = load_parameter_policy(&conn);
-        assert_eq!(loaded.policy.schema_version, 2);
+        assert_eq!(
+            loaded.policy.schema_version,
+            ARS_PARAMETER_POLICY_SCHEMA_VERSION
+        );
         assert_eq!(loaded.policy.revision, 5);
         assert_eq!(
             loaded
@@ -808,7 +905,88 @@ mod tests {
     }
 
     #[test]
-    fn parameter_policy_missing_schema_is_treated_as_legacy_one_not_current_two() {
+    fn parameter_policy_schema_two_a12_evidence_loads_fail_closed_then_migrates_to_three() {
+        let conn = conn();
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "revision": 4,
+            "mode": "canary",
+            "source_adaptive_version": 7,
+            "runtime_adoption_weight": 0.0,
+            "adoption_weights": {"recall_fusion:global": 0.5},
+            "recall_fusion_evidence": {
+                "recall_fusion:global": {
+                    "basis": "self_supervised",
+                    "resolved_simplex": {
+                        "bm25": 0.45,
+                        "vector": 0.45,
+                        "kg": 0.04,
+                        "episode": 0.03,
+                        "support": 0.02,
+                        "diversity": 0.01
+                    },
+                    "human_ess": 0,
+                    "self_supervised_train_family_ess": 20,
+                    "self_supervised_holdout_family_ess": 20,
+                    "a12_generation": 7,
+                    "a12_revision": 9,
+                    "generation_fingerprint": "generation-fp",
+                    "corpus_fingerprint": "corpus-fp",
+                    "optimizer_fingerprint": "optimizer-fp",
+                    "evaluation_fingerprint": "evaluation-fp",
+                    "a12_verdict": "ship",
+                    "a12_noise_floor": 0.02,
+                    "recall_gate_status": "ship",
+                    "recall_gate_build_fingerprint": "build-fp",
+                    "recall_gate_fixture_fingerprint": "fixture-fp",
+                    "recall_gate_evaluated_at": 990,
+                    "calibrated_at": 1000,
+                    "evaluated_at": 1010,
+                    "reason": "legacy schema-two A12 evidence"
+                }
+            },
+            "last_event_id": 99,
+            "last_updated": "2026-07-13T00:00:00Z"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![ARS_PARAMETER_POLICY_METADATA_KEY, legacy],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
+        assert_eq!(loaded.policy.schema_version, 2);
+        assert_eq!(
+            loaded
+                .policy
+                .runtime_adoption_weight_for(7, "recall_fusion:global"),
+            0.0,
+            "schema-two A12 policy must not activate without schema-three fallback seals"
+        );
+
+        let mut migrated = canary_policy(5);
+        migrated.runtime_adoption_weight = 0.0;
+        migrated
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), 0.05);
+        assert!(save_parameter_policy_cas(&conn, &migrated, 4).unwrap());
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
+        assert_eq!(loaded.policy.schema_version, 3);
+        assert_eq!(loaded.policy.revision, 5);
+        assert_eq!(
+            loaded
+                .policy
+                .runtime_adoption_weight_for(7, "recall_fusion:global"),
+            0.05
+        );
+    }
+
+    #[test]
+    fn parameter_policy_missing_schema_is_treated_as_legacy_one_not_current_three() {
         let conn = conn();
         let legacy = serde_json::json!({
             "revision": 3,
@@ -884,6 +1062,14 @@ mod tests {
             "source_adaptive_version": 0,
             "runtime_adoption_weight": 0.5,
             "adoption_weights": {},
+            "recall_fusion_evidence": {
+                "recall_fusion:semantic:7": {
+                    "basis": "future_blended",
+                    "automatic_candidate_present": true,
+                    "human_simplex": {"future_axis": 1.0},
+                    "human_runtime_adoption_weight": 0.4
+                }
+            },
             "last_event_id": 0,
             "last_updated": "2030-01-01T00:00:00Z",
             "future_field": "neat",
@@ -1325,6 +1511,9 @@ mod tests {
             ArsRecallFusionEvidence {
                 basis: ArsRecallFusionEvidenceBasis::Human,
                 human_ess: 1,
+                automatic_candidate_present: false,
+                human_simplex: Some(crate::store::a12_calibration::A12FusionSimplex::default()),
+                human_runtime_adoption_weight: Some(0.05),
                 resolved_simplex: crate::store::a12_calibration::A12FusionSimplex::default(),
                 self_supervised_train_family_ess: 0,
                 self_supervised_holdout_family_ess: 0,
@@ -1406,6 +1595,71 @@ mod tests {
         assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Corrupt);
         assert_eq!(loaded.policy.runtime_adoption_weight(7), 0.0);
         assert!(loaded.error.unwrap().contains("simplex must sum to 1"));
+    }
+
+    #[test]
+    fn parameter_policy_rejects_invalid_sealed_human_fallback_fields() {
+        let conn = conn();
+        let invalid = serde_json::json!({
+            "schema_version": ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            "revision": 1,
+            "mode": "canary",
+            "source_adaptive_version": 7,
+            "runtime_adoption_weight": 0.0,
+            "adoption_weights": {},
+            "recall_fusion_evidence": {
+                "recall_fusion:semantic:7": {
+                    "basis": "human",
+                    "resolved_simplex": {
+                        "bm25": 0.4,
+                        "vector": 0.3,
+                        "kg": 0.1,
+                        "episode": 0.1,
+                        "support": 0.05,
+                        "diversity": 0.05
+                    },
+                    "human_ess": 40,
+                    "automatic_candidate_present": true,
+                    "human_simplex": {
+                        "bm25": 0.4,
+                        "vector": 0.3,
+                        "kg": 0.1,
+                        "episode": 0.1,
+                        "support": 0.05,
+                        "diversity": 0.05
+                    },
+                    "human_runtime_adoption_weight": 2.0,
+                    "self_supervised_train_family_ess": 80,
+                    "self_supervised_holdout_family_ess": 20,
+                    "a12_generation": 7,
+                    "a12_revision": 9,
+                    "generation_fingerprint": "generation",
+                    "corpus_fingerprint": "corpus",
+                    "optimizer_fingerprint": "optimizer",
+                    "evaluation_fingerprint": "evaluation",
+                    "a12_verdict": "bail",
+                    "a12_noise_floor": 0.02,
+                    "recall_gate_status": "no_data",
+                    "calibrated_at": 100,
+                    "evaluated_at": 101
+                }
+            },
+            "last_event_id": 0,
+            "last_updated": "2026-07-13T00:00:00Z"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![ARS_PARAMETER_POLICY_METADATA_KEY, invalid],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Corrupt);
+        assert!(loaded
+            .error
+            .unwrap()
+            .contains("human runtime adoption weight"));
     }
 
     #[test]
