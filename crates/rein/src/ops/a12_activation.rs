@@ -2,8 +2,8 @@
 
 use crate::eval::gates::{self, ScorecardLoad, ScorecardStatus};
 use crate::store::a12_calibration::{
-    A12CalibrationLoad, A12CalibrationLoadStatus, A12CalibrationVerdict, A12FusionSimplex,
-    A12ScopeEntry,
+    A12CalibrationLoad, A12CalibrationLoadStatus, A12CalibrationPhase, A12CalibrationVerdict,
+    A12FusionSimplex, A12ScopeEntry,
 };
 use crate::store::adaptive::{AdaptiveState, LearnedShadowFusionEntry};
 use crate::store::ars_parameter_policy::{
@@ -34,6 +34,23 @@ pub struct RecallEvalGateAttestation {
     pub fixture_fingerprint: Option<String>,
     pub evaluated_at: Option<i64>,
     pub reason: String,
+}
+
+/// Load the current recall scorecards from the same conventional locations
+/// used by Trust. Scorecards are resolved from the server process working
+/// directory on purpose: the policy sealer attests the same cwd-based paths,
+/// so sealer and verifier always describe the same artifacts. A daemon
+/// started outside the repository therefore reports `NoData` rather than
+/// attesting someone else's scorecards. The returned attestation contains
+/// semantic identity only; neither the repository root nor either scorecard
+/// path is retained.
+pub fn current_recall_eval_gate_attestation(noise_floor: f64) -> RecallEvalGateAttestation {
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    recall_eval_gate_attestation(
+        &gates::baseline_path(&repo_root, "recall"),
+        &gates::run_path(&repo_root.join("target"), "recall"),
+        noise_floor,
+    )
 }
 
 /// Load and compare caller-supplied recall scorecard paths. Supplying paths is
@@ -909,6 +926,23 @@ impl AutomaticRuntimeBlocker {
     }
 }
 
+/// True only when an attested recall eval-gate identity is current Ship
+/// evidence for this exact binary: Ship status, this build's fingerprint, a
+/// non-empty fixture fingerprint, and a positive evaluation time. Shared by
+/// the sealed-policy and live-attestation blockers so both enforce the same
+/// definition of "current Ship evidence".
+fn current_ship_gate_identity(
+    status: ArsRecallGateStatus,
+    build_fingerprint: Option<&str>,
+    fixture_fingerprint: Option<&str>,
+    evaluated_at: Option<i64>,
+) -> bool {
+    status == ArsRecallGateStatus::Ship
+        && build_fingerprint == Some(env!("REIN_BUILD_FINGERPRINT"))
+        && fixture_fingerprint.is_some_and(|fingerprint| !fingerprint.is_empty())
+        && evaluated_at.is_some_and(|value| value > 0)
+}
+
 fn automatic_runtime_ineligibility_reason(
     policy: &ArsParameterPolicy,
     adaptive: &AdaptiveState,
@@ -981,16 +1015,12 @@ fn automatic_runtime_ineligibility_reason(
             "sealed A12 noise floor mismatched active evidence",
         ));
     }
-    if evidence.recall_gate_status != ArsRecallGateStatus::Ship
-        || evidence.recall_gate_build_fingerprint.as_deref() != Some(env!("REIN_BUILD_FINGERPRINT"))
-        || evidence
-            .recall_gate_fixture_fingerprint
-            .as_deref()
-            .is_none_or(str::is_empty)
-        || evidence
-            .recall_gate_evaluated_at
-            .is_none_or(|value| value <= 0)
-    {
+    if !current_ship_gate_identity(
+        evidence.recall_gate_status,
+        evidence.recall_gate_build_fingerprint.as_deref(),
+        evidence.recall_gate_fixture_fingerprint.as_deref(),
+        evidence.recall_gate_evaluated_at,
+    ) {
         return Some(AutomaticRuntimeBlocker::fail_closed(
             "sealed recall eval gate is not current Ship evidence",
         ));
@@ -1093,6 +1123,607 @@ fn runtime_disabled(
         simplex: None,
         adoption_weight: 0.0,
         reason: reason.into(),
+    }
+}
+
+pub const RECALL_FUSION_ACTIVATION_REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Task-5 run state projected without coupling consumers to the persisted A12
+/// schema. Legacy A12 rows have no run metadata and therefore never satisfy
+/// the complete-run prerequisite for automatic activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallFusionCalibrationRunPhase {
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecallFusionCalibrationRunAttestation {
+    pub phase: RecallFusionCalibrationRunPhase,
+    pub source_snapshot_fingerprint: String,
+    pub behavior_config_fingerprint: String,
+}
+
+/// Read-only projection of one recall-fusion scope. Runtime eligibility is
+/// owned exclusively by [`resolve_runtime_recall_fusion`]; this DTO only
+/// combines that decision with the sealed policy and active A12 evidence.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RecallFusionActivationScopeReport {
+    pub scope: String,
+    pub policy_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_policy_key: Option<String>,
+    /// Effective basis returned by the shared runtime resolver.
+    pub basis: ArsRecallFusionEvidenceBasis,
+    /// Basis sealed in the exact policy scope, retained as provenance only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_basis: Option<ArsRecallFusionEvidenceBasis>,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_simplex: Option<A12FusionSimplex>,
+    pub adoption_weight: f64,
+    pub human_ess: u64,
+    pub train_family_ess: u64,
+    pub holdout_family_ess: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<A12CalibrationVerdict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_top3: Option<crate::store::a12_calibration::A12PairedTop3Stats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::store::a12_calibration::A12ProvenanceCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a12_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a12_revision: Option<u64>,
+    pub source_adaptive_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_snapshot_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_case_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holdout_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holdout_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimizer_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_gate_status: Option<ArsRecallGateStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_gate_build_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_gate_fixture_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_gate_evaluated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_recall_gate_status: Option<ArsRecallGateStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_recall_gate_build_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_recall_gate_fixture_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_recall_gate_evaluated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_until_exclusive: Option<i64>,
+    pub valid_now: bool,
+    pub active: bool,
+}
+
+/// Shared read-only recall-fusion activation report used by Adaptive, the
+/// release gate, Trust, and doctor. It contains semantic identifiers only and
+/// never records scorecard/database paths.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RecallFusionActivationReport {
+    pub schema_version: u32,
+    pub activation_status: String,
+    pub health_status: String,
+    pub reason: String,
+    pub policy_load_status: String,
+    pub a12_load_status: String,
+    pub policy_mode: String,
+    pub current_adaptive_version: u64,
+    pub source_adaptive_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a12_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a12_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_phase: Option<RecallFusionCalibrationRunPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_snapshot_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behavior_config_fingerprint: Option<String>,
+    pub run_complete: bool,
+    pub active: bool,
+    pub scopes: Vec<RecallFusionActivationScopeReport>,
+}
+
+/// Project the persisted Task-5 run envelope into the shared report DTO.
+/// Legacy schema-2 rows carry no run metadata and therefore never satisfy the
+/// complete-run prerequisite for automatic activation.
+pub fn recall_fusion_calibration_run_attestation(
+    active_a12: &A12CalibrationLoad,
+) -> Option<RecallFusionCalibrationRunAttestation> {
+    if active_a12.status != A12CalibrationLoadStatus::Loaded {
+        return None;
+    }
+    let run = active_a12.state.run.as_ref()?;
+    Some(RecallFusionCalibrationRunAttestation {
+        phase: match run.phase {
+            A12CalibrationPhase::Pending => RecallFusionCalibrationRunPhase::Pending,
+            A12CalibrationPhase::Complete => RecallFusionCalibrationRunPhase::Complete,
+        },
+        source_snapshot_fingerprint: run.source_snapshot_fingerprint.clone(),
+        behavior_config_fingerprint: run.behavior_config_fingerprint.clone(),
+    })
+}
+
+pub fn collect_recall_fusion_activation_report(
+    store: &crate::store::SqliteStore,
+    config: &crate::config::ReinConfig,
+    now_millis: i64,
+) -> RecallFusionActivationReport {
+    let adaptive = AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
+    let policy = crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
+    let active_a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
+    let recall_gate = current_recall_eval_gate_attestation(
+        crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+    );
+    let run = recall_fusion_calibration_run_attestation(&active_a12);
+    recall_fusion_activation_report(
+        config,
+        &adaptive,
+        &policy,
+        &active_a12,
+        &recall_gate,
+        run.as_ref(),
+        now_millis,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recall_fusion_activation_report(
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
+    active_a12: &A12CalibrationLoad,
+    current_recall_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+    now_millis: i64,
+) -> RecallFusionActivationReport {
+    let mut scope_names = BTreeSet::new();
+    scope_names.extend(
+        adaptive
+            .learned_shadow_fusion
+            .keys()
+            .filter(|scope| valid_scope_key(scope))
+            .cloned(),
+    );
+    scope_names.extend(active_a12.state.scopes.keys().cloned());
+    scope_names.extend(
+        policy
+            .policy
+            .recall_fusion_evidence
+            .keys()
+            .filter_map(|key| {
+                key.strip_prefix("recall_fusion:")
+                    .filter(|scope| valid_scope_key(scope))
+                    .map(ToOwned::to_owned)
+            }),
+    );
+
+    let scopes = scope_names
+        .into_iter()
+        .map(|scope| {
+            recall_fusion_activation_scope_report(
+                config,
+                adaptive,
+                policy,
+                active_a12,
+                current_recall_gate,
+                calibration_run,
+                &scope,
+                now_millis,
+            )
+        })
+        .collect::<Vec<_>>();
+    let active = scopes.iter().any(|scope| scope.active);
+    let activation_status = if !config.adaptive.enabled
+        || !config.ars.acceleration.enabled
+        || config.ars.acceleration.shadow_only
+    {
+        "disabled"
+    } else if active {
+        "active"
+    } else {
+        "inactive"
+    };
+    let health_status = recall_fusion_report_health(policy, active_a12.status, active, &scopes);
+    let reason = match (activation_status, health_status) {
+        ("disabled", _) => "recall-fusion activation is disabled or shadow-only by config",
+        ("active", "healthy") => "at least one recall-fusion scope is active and healthy",
+        ("active", _) => "recall fusion is active with degraded or incomplete evidence",
+        (_, "missing" | "policy_missing" | "a12_missing") => {
+            "recall-fusion calibration evidence is missing"
+        }
+        _ => "no recall-fusion scope passes the shared runtime activation checks",
+    }
+    .to_string();
+    let a12_loaded = active_a12.status == A12CalibrationLoadStatus::Loaded;
+    let run_complete = calibration_run.is_some_and(complete_calibration_run);
+
+    RecallFusionActivationReport {
+        schema_version: RECALL_FUSION_ACTIVATION_REPORT_SCHEMA_VERSION,
+        activation_status: activation_status.to_string(),
+        health_status: health_status.to_string(),
+        reason,
+        policy_load_status: parameter_policy_load_status_name(&policy.status),
+        a12_load_status: a12_load_status_name(active_a12.status).to_string(),
+        policy_mode: parameter_policy_mode_name(policy.policy.mode).to_string(),
+        current_adaptive_version: adaptive.version,
+        source_adaptive_version: policy.policy.source_adaptive_version,
+        a12_generation: a12_loaded.then_some(active_a12.state.generation),
+        a12_revision: a12_loaded.then_some(active_a12.state.revision),
+        run_phase: calibration_run.map(|run| run.phase),
+        source_snapshot_fingerprint: calibration_run
+            .map(|run| run.source_snapshot_fingerprint.clone()),
+        behavior_config_fingerprint: calibration_run
+            .map(|run| run.behavior_config_fingerprint.clone()),
+        run_complete,
+        active,
+        scopes,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recall_fusion_activation_scope_report(
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
+    active_a12: &A12CalibrationLoad,
+    current_recall_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+    scope: &str,
+    now_millis: i64,
+) -> RecallFusionActivationScopeReport {
+    let policy_key = format!("recall_fusion:{scope}");
+    let evidence = policy.policy.recall_fusion_evidence.get(&policy_key);
+    let entry = (active_a12.status == A12CalibrationLoadStatus::Loaded)
+        .then(|| active_a12.state.scopes.get(scope))
+        .flatten();
+    let resolution = if policy.status
+        == crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+    {
+        match runtime_scope_parts(scope) {
+            Some((query_type, cluster_id)) => resolve_runtime_recall_fusion(
+                &policy.policy,
+                config,
+                adaptive,
+                active_a12,
+                query_type,
+                cluster_id,
+                config.adaptive.min_samples_alpha,
+                crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+                now_millis,
+            ),
+            None => runtime_disabled(
+                Some(policy_key.clone()),
+                evidence.map_or(ArsRecallFusionEvidenceBasis::Static, |value| value.basis),
+                "scope cannot be represented by the runtime resolver",
+            ),
+        }
+    } else {
+        runtime_disabled(
+            Some(policy_key.clone()),
+            evidence.map_or(ArsRecallFusionEvidenceBasis::Static, |value| value.basis),
+            format!(
+                "parameter policy load status is {}",
+                parameter_policy_load_status_name(&policy.status)
+            ),
+        )
+    };
+    let valid_now = entry.is_some_and(|entry| {
+        entry.is_current_for_at(
+            &active_a12.state,
+            crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+            now_millis,
+        )
+    });
+    let exact_human = adaptive
+        .learned_shadow_fusion
+        .get(scope)
+        .is_some_and(|entry| {
+            entry.sample_count >= config.adaptive.min_samples_alpha.max(10)
+                && human_simplex(entry).is_some()
+        });
+    let owns_resolution = resolution.scope_key.as_deref() == Some(policy_key.as_str())
+        || (resolution.scope_key.is_none()
+            && resolution.basis == ArsRecallFusionEvidenceBasis::Human
+            && exact_human);
+    let automatic_basis = matches!(
+        resolution.basis,
+        ArsRecallFusionEvidenceBasis::SelfSupervised | ArsRecallFusionEvidenceBasis::Blended
+    );
+    let live_attestation_blocker = (owns_resolution
+        && automatic_basis
+        && resolution.adoption_weight > f64::EPSILON
+        && resolution.simplex.is_some())
+    .then(|| automatic_live_attestation_blocker(evidence, current_recall_gate, calibration_run))
+    .flatten();
+    let active = owns_resolution
+        && live_attestation_blocker.is_none()
+        && resolution.adoption_weight > f64::EPSILON
+        && resolution.simplex.is_some();
+    let reason = if !owns_resolution {
+        resolution.scope_key.as_ref().map_or_else(
+            || "runtime fallback is not owned by this exact recall-fusion scope".to_string(),
+            |resolved| format!("runtime resolves this request through broader scope {resolved}"),
+        )
+    } else if let Some(blocker) = live_attestation_blocker {
+        blocker
+    } else {
+        resolution.reason.clone()
+    };
+    RecallFusionActivationScopeReport {
+        scope: scope.to_string(),
+        policy_key,
+        resolved_policy_key: resolution.scope_key.clone(),
+        basis: resolution.basis,
+        sealed_basis: evidence.map(|value| value.basis),
+        reason,
+        effective_simplex: active.then_some(resolution.simplex).flatten(),
+        adoption_weight: if active {
+            resolution.adoption_weight
+        } else {
+            0.0
+        },
+        human_ess: evidence.map_or_else(
+            || {
+                adaptive
+                    .learned_shadow_fusion
+                    .get(scope)
+                    .and_then(|entry| u64::try_from(entry.sample_count).ok())
+                    .unwrap_or(0)
+            },
+            |value| value.human_ess,
+        ),
+        train_family_ess: entry.map_or_else(
+            || evidence.map_or(0, |value| value.self_supervised_train_family_ess),
+            |value| value.train_family_ess,
+        ),
+        holdout_family_ess: entry.map_or_else(
+            || evidence.map_or(0, |value| value.self_supervised_holdout_family_ess),
+            |value| value.holdout_family_ess,
+        ),
+        verdict: entry
+            .map(|value| value.verdict)
+            .or_else(|| evidence.and_then(|value| value.a12_verdict)),
+        paired_top3: entry.map(|value| value.paired_top3),
+        provenance: entry.map(|value| value.provenance),
+        a12_generation: evidence
+            .and_then(|value| value.a12_generation)
+            .or_else(|| entry.map(|_| active_a12.state.generation)),
+        a12_revision: evidence
+            .and_then(|value| value.a12_revision)
+            .or_else(|| entry.map(|_| active_a12.state.revision)),
+        source_adaptive_version: policy.policy.source_adaptive_version,
+        source_snapshot_fingerprint: entry
+            .map(|value| value.source_snapshot_fingerprint.clone())
+            .filter(|fingerprint| !fingerprint.is_empty())
+            .or_else(|| calibration_run.map(|run| run.source_snapshot_fingerprint.clone())),
+        train_case_count: entry.map(|value| value.train_case_count),
+        holdout_reason: entry
+            .map(|value| value.holdout_reason.clone())
+            .filter(|reason| !reason.is_empty()),
+        generation_fingerprint: evidence
+            .and_then(|value| value.generation_fingerprint.clone())
+            .or_else(|| entry.map(|value| value.generation_fingerprint.clone())),
+        corpus_fingerprint: evidence
+            .and_then(|value| value.corpus_fingerprint.clone())
+            .or_else(|| entry.map(|value| value.corpus_fingerprint.clone())),
+        training_fingerprint: entry.map(|value| value.training_fingerprint.clone()),
+        holdout_fingerprint: entry.map(|value| value.holdout_fingerprint.clone()),
+        optimizer_fingerprint: evidence
+            .and_then(|value| value.optimizer_fingerprint.clone())
+            .or_else(|| entry.map(|value| value.optimizer_fingerprint.clone())),
+        evaluation_fingerprint: evidence
+            .and_then(|value| value.evaluation_fingerprint.clone())
+            .or_else(|| entry.map(|value| value.evaluation_fingerprint.clone())),
+        recall_gate_status: Some(current_recall_gate.status),
+        recall_gate_build_fingerprint: current_recall_gate.build_fingerprint.clone(),
+        recall_gate_fixture_fingerprint: current_recall_gate.fixture_fingerprint.clone(),
+        recall_gate_evaluated_at: current_recall_gate.evaluated_at,
+        sealed_recall_gate_status: evidence.map(|value| value.recall_gate_status),
+        sealed_recall_gate_build_fingerprint: evidence
+            .and_then(|value| value.recall_gate_build_fingerprint.clone()),
+        sealed_recall_gate_fixture_fingerprint: evidence
+            .and_then(|value| value.recall_gate_fixture_fingerprint.clone()),
+        sealed_recall_gate_evaluated_at: evidence.and_then(|value| value.recall_gate_evaluated_at),
+        calibrated_at: entry
+            .map(|value| value.calibrated_at)
+            .or_else(|| evidence.and_then(|value| value.calibrated_at)),
+        evaluated_at: entry
+            .map(|value| value.evaluated_at)
+            .or_else(|| evidence.and_then(|value| value.evaluated_at)),
+        valid_until_exclusive: entry
+            .and_then(|value| value.valid_until_exclusive)
+            .or_else(|| evidence.and_then(|value| value.a12_valid_until_exclusive)),
+        valid_now,
+        active,
+    }
+}
+
+fn runtime_scope_parts(scope: &str) -> Option<(&str, Option<u32>)> {
+    match scope.split_once(':') {
+        Some((query_type, cluster_id)) => Some((query_type, Some(cluster_id.parse::<u32>().ok()?))),
+        None => Some((scope, None)),
+    }
+}
+
+fn complete_calibration_run(run: &RecallFusionCalibrationRunAttestation) -> bool {
+    run.phase == RecallFusionCalibrationRunPhase::Complete
+        && !run.source_snapshot_fingerprint.is_empty()
+        && !run.behavior_config_fingerprint.is_empty()
+}
+
+fn automatic_live_attestation_blocker(
+    evidence: Option<&ArsRecallFusionEvidence>,
+    current_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+) -> Option<String> {
+    if calibration_run.is_none_or(|run| !complete_calibration_run(run)) {
+        return Some("current A12 calibration run is not complete".to_string());
+    }
+    if current_gate.status != ArsRecallGateStatus::Ship {
+        return Some(format!(
+            "current recall eval gate is {}",
+            recall_gate_status_name(current_gate.status)
+        ));
+    }
+    if !current_ship_gate_identity(
+        current_gate.status,
+        current_gate.build_fingerprint.as_deref(),
+        current_gate.fixture_fingerprint.as_deref(),
+        current_gate.evaluated_at,
+    ) {
+        return Some("current recall eval gate is not current Ship evidence".to_string());
+    }
+    let Some(evidence) = evidence else {
+        return Some("sealed automatic recall evidence is missing".to_string());
+    };
+    // Strict exact-match on the sealed identity is fail-closed by design: a
+    // newer Ship re-run of the eval gate still blocks automatic activation
+    // until the next policy refresh reseals against it. The blocker self-heals
+    // at that reseal; nothing here rewrites the sealed evidence.
+    if evidence.recall_gate_status != current_gate.status
+        || evidence.recall_gate_build_fingerprint != current_gate.build_fingerprint
+        || evidence.recall_gate_fixture_fingerprint != current_gate.fixture_fingerprint
+        || evidence.recall_gate_evaluated_at != current_gate.evaluated_at
+    {
+        return Some(
+            "current recall eval gate identity mismatched sealed policy evidence".to_string(),
+        );
+    }
+    None
+}
+
+fn recall_gate_status_name(status: ArsRecallGateStatus) -> &'static str {
+    match status {
+        ArsRecallGateStatus::Ship => "ship",
+        ArsRecallGateStatus::Bail => "bail",
+        ArsRecallGateStatus::NoData => "no_data",
+    }
+}
+
+fn recall_fusion_report_health(
+    policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
+    a12_status: A12CalibrationLoadStatus,
+    active: bool,
+    scopes: &[RecallFusionActivationScopeReport],
+) -> &'static str {
+    use crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus;
+
+    match policy.status {
+        ArsParameterPolicyLoadStatus::Missing => return "policy_missing",
+        ArsParameterPolicyLoadStatus::Corrupt => return "policy_corrupt",
+        ArsParameterPolicyLoadStatus::UnsupportedSchema => {
+            return "policy_unsupported_schema";
+        }
+        ArsParameterPolicyLoadStatus::StorageError => return "policy_storage_error",
+        ArsParameterPolicyLoadStatus::Loaded => {}
+    }
+    match a12_status {
+        A12CalibrationLoadStatus::Missing => return "a12_missing",
+        A12CalibrationLoadStatus::Corrupt => return "a12_corrupt",
+        A12CalibrationLoadStatus::UnsupportedSchema => return "a12_unsupported_schema",
+        A12CalibrationLoadStatus::StorageError => return "a12_storage_error",
+        A12CalibrationLoadStatus::Loaded => {}
+    }
+    if scopes.is_empty() {
+        return "missing";
+    }
+    if scopes
+        .iter()
+        .any(|scope| scope.verdict == Some(A12CalibrationVerdict::Bail))
+    {
+        "bail"
+    } else if scopes
+        .iter()
+        .any(|scope| scope.verdict == Some(A12CalibrationVerdict::NoData))
+    {
+        "no_data"
+    } else if !active
+        && scopes.iter().all(|scope| {
+            scope.basis == ArsRecallFusionEvidenceBasis::Static
+                || scope.sealed_basis == Some(ArsRecallFusionEvidenceBasis::Static)
+        })
+    {
+        "static"
+    } else if scopes.iter().any(|scope| {
+        (!scope.active
+            && (scope.a12_generation.is_some()
+                || matches!(
+                    scope.sealed_basis,
+                    Some(
+                        ArsRecallFusionEvidenceBasis::SelfSupervised
+                            | ArsRecallFusionEvidenceBasis::Blended
+                    )
+                )))
+            || scope.reason.contains("mismatch")
+            || scope.reason.contains("stale")
+            || scope.reason.contains("expired")
+            || scope.reason.contains("not complete")
+            || scope.reason.contains("current recall eval gate")
+    }) {
+        "degraded"
+    } else if active {
+        "healthy"
+    } else {
+        "inactive"
+    }
+}
+
+fn a12_load_status_name(status: A12CalibrationLoadStatus) -> &'static str {
+    match status {
+        A12CalibrationLoadStatus::Missing => "missing",
+        A12CalibrationLoadStatus::Loaded => "loaded",
+        A12CalibrationLoadStatus::Corrupt => "corrupt",
+        A12CalibrationLoadStatus::UnsupportedSchema => "unsupported_schema",
+        A12CalibrationLoadStatus::StorageError => "storage_error",
+    }
+}
+
+fn parameter_policy_load_status_name(
+    status: &crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus,
+) -> String {
+    use crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus;
+    match status {
+        ArsParameterPolicyLoadStatus::Missing => "missing",
+        ArsParameterPolicyLoadStatus::Loaded => "loaded",
+        ArsParameterPolicyLoadStatus::Corrupt => "corrupt",
+        ArsParameterPolicyLoadStatus::UnsupportedSchema => "unsupported_schema",
+        ArsParameterPolicyLoadStatus::StorageError => "storage_error",
+    }
+    .to_string()
+}
+
+fn parameter_policy_mode_name(mode: ArsParameterPolicyMode) -> &'static str {
+    match mode {
+        ArsParameterPolicyMode::Disabled => "disabled",
+        ArsParameterPolicyMode::Shadow => "shadow",
+        ArsParameterPolicyMode::Canary => "canary",
     }
 }
 
@@ -1341,6 +1972,149 @@ mod tests {
             last_event_id: 0,
             last_updated: "2026-07-13T00:00:00Z".to_string(),
         }
+    }
+
+    fn loaded_policy(
+        policy: ArsParameterPolicy,
+    ) -> crate::store::ars_parameter_policy::ArsParameterPolicyLoad {
+        crate::store::ars_parameter_policy::ArsParameterPolicyLoad {
+            policy,
+            status: crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn activation_report_projects_ship_evidence_through_runtime_resolver() {
+        let config = runtime_config();
+        let adaptive = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let a12 = a12_loaded(
+            A12CalibrationScope::Global,
+            [0.10, 0.20, 0.30, 0.15, 0.15, 0.10],
+            12,
+            12,
+            A12CalibrationVerdict::Ship,
+        );
+        let evidence = resolve_recall_fusion_evidence(
+            &adaptive,
+            &a12,
+            10,
+            0.02,
+            1_700_000_060_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let policy = loaded_policy(canary_policy(
+            adaptive.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.25)]),
+            evidence,
+        ));
+        let run = recall_fusion_calibration_run_attestation(&a12);
+
+        let report = recall_fusion_activation_report(
+            &config,
+            &adaptive,
+            &policy,
+            &a12,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_060_000,
+        );
+
+        assert_eq!(report.activation_status, "active");
+        assert_eq!(report.health_status, "healthy");
+        assert!(report.run_complete);
+        assert!(report.active);
+        assert_eq!(report.source_adaptive_version, adaptive.version);
+        assert_eq!(report.a12_generation, Some(11));
+        assert_eq!(report.a12_revision, Some(4));
+        let scope = &report.scopes[0];
+        assert_eq!(scope.scope, "global");
+        assert_eq!(scope.basis, ArsRecallFusionEvidenceBasis::SelfSupervised);
+        assert_eq!(scope.adoption_weight, 0.25);
+        assert!(scope.active);
+        assert!(scope.effective_simplex.is_some());
+        assert_eq!(scope.train_family_ess, 12);
+        assert_eq!(scope.holdout_family_ess, 12);
+        assert_eq!(scope.verdict, Some(A12CalibrationVerdict::Ship));
+        assert_eq!(scope.paired_top3.as_ref().map(|stats| stats.n), Some(12));
+        assert_eq!(
+            scope.provenance.as_ref().map(|counts| counts.canonical_loo),
+            Some(12)
+        );
+        assert_eq!(
+            scope.training_fingerprint.as_deref(),
+            Some("training-fingerprint")
+        );
+        assert_eq!(
+            scope.holdout_fingerprint.as_deref(),
+            Some("holdout-fingerprint")
+        );
+        assert_eq!(
+            scope.recall_gate_build_fingerprint.as_deref(),
+            Some(env!("REIN_BUILD_FINGERPRINT"))
+        );
+        assert!(scope.valid_now);
+    }
+
+    #[test]
+    fn activation_report_fails_closed_on_expiry_and_never_exposes_paths() {
+        let config = runtime_config();
+        let adaptive = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let mut a12 = a12_loaded(
+            A12CalibrationScope::Global,
+            [0.10, 0.20, 0.30, 0.15, 0.15, 0.10],
+            12,
+            12,
+            A12CalibrationVerdict::Ship,
+        );
+        a12.state
+            .scopes
+            .get_mut("global")
+            .unwrap()
+            .valid_until_exclusive = Some(1_700_000_061_000);
+        let evidence = resolve_recall_fusion_evidence(
+            &adaptive,
+            &a12,
+            10,
+            0.02,
+            1_700_000_060_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let policy = loaded_policy(canary_policy(
+            adaptive.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.25)]),
+            evidence,
+        ));
+        let run = recall_fusion_calibration_run_attestation(&a12);
+
+        let report = recall_fusion_activation_report(
+            &config,
+            &adaptive,
+            &policy,
+            &a12,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_061_000,
+        );
+        let scope = &report.scopes[0];
+        assert_eq!(report.activation_status, "inactive");
+        assert_eq!(report.health_status, "degraded");
+        assert!(!report.active);
+        assert!(!scope.active);
+        assert!(!scope.valid_now);
+        assert!(scope.reason.contains("stale or expired"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("/Users/"));
+        assert!(!json.contains("docs/eval-baselines"));
+        assert!(!json.contains("target/eval-gates"));
     }
 
     #[test]

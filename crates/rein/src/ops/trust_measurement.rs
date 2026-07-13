@@ -7,7 +7,7 @@ use crate::ops::ars_release_gate::ArsAccelerationReleaseGateReport;
 use crate::ops::system_health::SystemHealthSnapshot;
 use crate::store::SqliteStore;
 
-pub const TRUST_MEASUREMENT_SCHEMA_VERSION: u32 = 3;
+pub const TRUST_MEASUREMENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MeasurementGate {
@@ -200,6 +200,7 @@ pub struct TrustMeasurementReport {
     pub eval_gates: Vec<MeasurementGate>,
     pub index_consistency: IndexConsistencyReport,
     pub dedup_calibration: crate::ops::DedupThresholdObservability,
+    pub recall_fusion_calibration: crate::ops::a12_activation::RecallFusionActivationReport,
     pub judge_calibration: JudgeCalibrationObservabilityReport,
     pub background_observability: BackgroundObservabilityReport,
     pub active_learning: ActiveLearningReport,
@@ -215,18 +216,20 @@ pub fn collect(store: &SqliteStore, config: &ReinConfig) -> TrustMeasurementRepo
     } else {
         "attention"
     };
+    let release_gate =
+        crate::ops::ars_release_gate::ars_acceleration_release_gate_report(store, config);
+    let recall_fusion_calibration = release_gate.signals.recall_fusion_calibration.clone();
 
     TrustMeasurementReport {
         schema_version: TRUST_MEASUREMENT_SCHEMA_VERSION,
         purpose: "trust_measurement_platform_for_ars_rollout".to_string(),
-        release_gate: crate::ops::ars_release_gate::ars_acceleration_release_gate_report(
-            store, config,
-        ),
+        release_gate,
         eval_gates: eval_gates(),
         index_consistency,
         dedup_calibration: crate::ops::dedup_threshold_observability_from_state(
             store, config, &state,
         ),
+        recall_fusion_calibration,
         judge_calibration: collect_judge_calibration_observability_from_state(
             store,
             config,
@@ -808,7 +811,21 @@ mod tests {
         let report_json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(report.schema_version, TRUST_MEASUREMENT_SCHEMA_VERSION);
-        assert_eq!(report.schema_version, 3);
+        assert_eq!(report.schema_version, 4);
+        assert_eq!(
+            report.recall_fusion_calibration.activation_status,
+            "inactive"
+        );
+        assert_eq!(
+            report.recall_fusion_calibration.health_status,
+            "policy_missing"
+        );
+        assert!(!report.recall_fusion_calibration.active);
+        assert!(report_json["judge_calibration"].is_object());
+        assert_eq!(
+            report_json["recall_fusion_calibration"],
+            serde_json::to_value(&report.recall_fusion_calibration).unwrap()
+        );
         assert_eq!(report.judge_calibration.synthesis.human.pair_count, 0);
         assert_eq!(report.judge_calibration.synthesis.human.kappa, None);
         assert_eq!(

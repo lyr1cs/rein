@@ -8,13 +8,16 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 use crate::config::ReinConfig;
+use crate::ops::a12_activation::{
+    RecallEvalGateAttestation, RecallEvalGateReasonCode, RecallFusionCalibrationRunAttestation,
+};
 use crate::store::adaptive::AdaptiveState;
 use crate::store::ars_parameter_policy::{
     ArsParameterPolicyLoad, ArsParameterPolicyLoadStatus, ArsParameterPolicyMode,
 };
 use crate::store::SqliteStore;
 
-pub const ARS_ACCELERATION_RELEASE_GATE_SCHEMA_VERSION: u32 = 2;
+pub const ARS_ACCELERATION_RELEASE_GATE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JudgeStructuralReleaseInput {
@@ -52,8 +55,17 @@ pub struct ReleaseGateSignals {
     pub policy_revision: u64,
     pub policy_source_adaptive_version: u64,
     pub policy_allows_runtime: bool,
+    /// Legacy global policy scalar. Kept for schema consumers; schema 3 names
+    /// the scalar and recall surfaces explicitly below.
     pub runtime_adoption_weight: f64,
     pub runtime_adoption_weights: BTreeMap<String, f64>,
+    pub scalar_runtime_adoption_weight: f64,
+    pub scalar_runtime_adoption_weights: BTreeMap<String, f64>,
+    pub recall_runtime_adoption_weights: BTreeMap<String, f64>,
+    pub recall_runtime_allowed: bool,
+    pub recall_human_runtime_allowed: bool,
+    pub recall_self_supervised_runtime_allowed: bool,
+    pub recall_fusion_calibration: crate::ops::a12_activation::RecallFusionActivationReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +105,12 @@ pub fn ars_acceleration_release_gate_report(
 ) -> ArsAccelerationReleaseGateReport {
     let state = AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
     let policy = crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
+    let active_a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
+    let current_recall_gate = crate::ops::a12_activation::current_recall_eval_gate_attestation(
+        crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+    );
+    let calibration_run =
+        crate::ops::a12_activation::recall_fusion_calibration_run_attestation(&active_a12);
     let shadow_fusion_status = crate::ops::adaptive::shadow_fusion_status(store, config);
     let now = chrono::Utc::now().timestamp();
     let judge_structural = JudgeStructuralReleaseInput {
@@ -110,17 +128,53 @@ pub fn ars_acceleration_release_gate_report(
         ),
     };
 
-    evaluate_ars_acceleration_release_gate(ReleaseGateInput {
-        config,
-        state: &state,
-        policy: &policy,
-        shadow_fusion_status: &shadow_fusion_status,
-        judge_structural,
-    })
+    evaluate_ars_acceleration_release_gate_with_a12(
+        ReleaseGateInput {
+            config,
+            state: &state,
+            policy: &policy,
+            shadow_fusion_status: &shadow_fusion_status,
+            judge_structural,
+        },
+        &active_a12,
+        &current_recall_gate,
+        calibration_run.as_ref(),
+        chrono::Utc::now().timestamp_millis(),
+    )
 }
 
 pub fn evaluate_ars_acceleration_release_gate(
     input: ReleaseGateInput<'_>,
+) -> ArsAccelerationReleaseGateReport {
+    let missing_a12 = crate::store::a12_calibration::A12CalibrationLoad {
+        state: crate::store::a12_calibration::A12CalibrationState::default(),
+        status: crate::store::a12_calibration::A12CalibrationLoadStatus::Missing,
+        error: None,
+    };
+    let unavailable_gate = RecallEvalGateAttestation {
+        status: crate::store::ars_parameter_policy::ArsRecallGateStatus::NoData,
+        reason_code: RecallEvalGateReasonCode::MissingRun,
+        build_fingerprint: None,
+        fixture_fingerprint: None,
+        evaluated_at: None,
+        reason: "current recall run is unavailable".to_string(),
+    };
+    evaluate_ars_acceleration_release_gate_with_a12(
+        input,
+        &missing_a12,
+        &unavailable_gate,
+        None,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_ars_acceleration_release_gate_with_a12(
+    input: ReleaseGateInput<'_>,
+    active_a12: &crate::store::a12_calibration::A12CalibrationLoad,
+    current_recall_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+    now_millis: i64,
 ) -> ArsAccelerationReleaseGateReport {
     let config = input.config;
     let state = input.state;
@@ -135,42 +189,89 @@ pub fn evaluate_ars_acceleration_release_gate(
         .values()
         .filter(|entry| entry.sample_count >= min_samples)
         .count();
+    let runtime_enabled = config.adaptive.enabled
+        && config.ars.acceleration.enabled
+        && !config.ars.acceleration.shadow_only;
     let policy_row_adoption_weight =
         if matches!(policy.status, ArsParameterPolicyLoadStatus::Loaded) {
             policy.policy.runtime_adoption_weight(state.version)
         } else {
             0.0
         };
-    let runtime_adoption_weight = if config.adaptive.enabled
-        && config.ars.acceleration.enabled
-        && !config.ars.acceleration.shadow_only
-    {
+    let runtime_adoption_weight = if runtime_enabled {
         policy_row_adoption_weight
     } else {
         0.0
     };
-    let runtime_adoption_weights = if config.adaptive.enabled
-        && config.ars.acceleration.enabled
-        && !config.ars.acceleration.shadow_only
-        && matches!(policy.status, ArsParameterPolicyLoadStatus::Loaded)
-    {
-        policy
-            .policy
-            .adoption_weights
-            .keys()
-            .map(|key| {
-                (
-                    key.clone(),
-                    policy
-                        .policy
-                        .runtime_adoption_weight_for(state.version, key),
+    let runtime_adoption_weights =
+        if runtime_enabled && matches!(policy.status, ArsParameterPolicyLoadStatus::Loaded) {
+            policy
+                .policy
+                .adoption_weights
+                .keys()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        policy
+                            .policy
+                            .runtime_adoption_weight_for(state.version, key),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+    let scalar_runtime_adoption_weights = runtime_adoption_weights
+        .iter()
+        .filter(|(key, _)| !key.starts_with("recall_fusion:"))
+        .map(|(key, value)| (key.clone(), *value))
+        .collect::<BTreeMap<_, _>>();
+    let recall_runtime_adoption_weights = runtime_adoption_weights
+        .iter()
+        .filter(|(key, _)| key.starts_with("recall_fusion:"))
+        .map(|(key, value)| (key.clone(), *value))
+        .collect::<BTreeMap<_, _>>();
+    let recall_fusion_calibration = crate::ops::a12_activation::recall_fusion_activation_report(
+        config,
+        state,
+        policy,
+        active_a12,
+        current_recall_gate,
+        calibration_run,
+        now_millis,
+    );
+    let shadow_status = input
+        .shadow_fusion_status
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let resolved_human_recall = recall_fusion_calibration.scopes.iter().any(|scope| {
+        scope.active
+            && matches!(
+                scope.basis,
+                crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Human
+                    | crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Blended
+            )
+    });
+    let recall_self_supervised_runtime_allowed =
+        recall_fusion_calibration.scopes.iter().any(|scope| {
+            scope.active
+                && matches!(
+                    scope.basis,
+                    crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::SelfSupervised
+                        | crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Blended
                 )
-            })
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
-    let policy_allows_runtime = runtime_adoption_weight > f64::EPSILON;
+        });
+    let recall_human_runtime_allowed = resolved_human_recall
+        && eligible_learned_shadow_fusion_buckets > 0
+        && shadow_status.as_deref() == Some("ready");
+    let recall_runtime_allowed =
+        recall_human_runtime_allowed || recall_self_supervised_runtime_allowed;
+    let scalar_runtime_allowed = runtime_adoption_weight > f64::EPSILON
+        || scalar_runtime_adoption_weights
+            .values()
+            .any(|weight| *weight > f64::EPSILON);
+    let policy_allows_runtime = scalar_runtime_allowed || recall_runtime_allowed;
     let judge_drift_alert = state
         .judge_calibration_state
         .as_ref()
@@ -205,18 +306,9 @@ pub fn evaluate_ars_acceleration_release_gate(
         .pair_count
         .saturating_add(concept_human.pair_count);
 
-    let live_allowed = config.adaptive.enabled
-        && config.ars.acceleration.enabled
-        && !config.ars.acceleration.shadow_only
-        && policy_allows_runtime;
+    let live_allowed = runtime_enabled && policy_allows_runtime;
     let (doctor_level, doctor_message) =
         doctor_policy_signal(policy, state, live_allowed, runtime_adoption_weight);
-    let shadow_status = input
-        .shadow_fusion_status
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-
     let signals = ReleaseGateSignals {
         adaptive_enabled: config.adaptive.enabled,
         ars_acceleration_enabled: config.ars.acceleration.enabled,
@@ -232,6 +324,13 @@ pub fn evaluate_ars_acceleration_release_gate(
         policy_allows_runtime,
         runtime_adoption_weight,
         runtime_adoption_weights,
+        scalar_runtime_adoption_weight: runtime_adoption_weight,
+        scalar_runtime_adoption_weights,
+        recall_runtime_adoption_weights,
+        recall_runtime_allowed,
+        recall_human_runtime_allowed,
+        recall_self_supervised_runtime_allowed,
+        recall_fusion_calibration,
         policy_error: policy.error.clone(),
         shadow_fusion_status: shadow_status.clone(),
         shadow_fusion_eligible_samples: json_u64(input.shadow_fusion_status, "eligible_samples"),
@@ -289,13 +388,27 @@ pub fn evaluate_ars_acceleration_release_gate(
             if policy.policy.source_adaptive_version > state.version {
                 canary_blockers.push("ars_parameter_policy_not_current".to_string());
             }
-            if policy_row_adoption_weight <= f64::EPSILON {
+            if policy_row_adoption_weight <= f64::EPSILON && !recall_runtime_allowed {
                 canary_blockers.push("ars_parameter_policy_adoption_weight_zero".to_string());
             }
         }
     }
-    if eligible_learned_shadow_fusion_buckets == 0 {
+    if !recall_runtime_allowed {
+        canary_blockers.push("recall_fusion_runtime_unavailable".to_string());
+    }
+    if !recall_self_supervised_runtime_allowed && eligible_learned_shadow_fusion_buckets == 0 {
         canary_blockers.push("insufficient_learned_shadow_fusion".to_string());
+    }
+    // Scalar isolation deliberately does not fire when human recall runtime
+    // adoption is also allowed: with live human evidence the scalar scopes may
+    // legitimately be human-driven. Only when self-supervised recall fusion is
+    // the sole runtime basis must the scalars stay at zero, because automatic
+    // evidence may create `recall_fusion:*` adoption only.
+    if recall_self_supervised_runtime_allowed
+        && !recall_human_runtime_allowed
+        && scalar_runtime_allowed
+    {
+        canary_blockers.push("automatic_recall_fusion_scalar_isolation".to_string());
     }
     if judge_drift_alert {
         canary_blockers.push("judge_drift_alert".to_string());
@@ -327,7 +440,7 @@ pub fn evaluate_ars_acceleration_release_gate(
     // actually computed a learnable quality report over those samples. A
     // pure volume ramp must not promote a canary whose quality machinery
     // hasn't produced a verdict ("don't ramp on volume alone").
-    if shadow_status.as_deref() != Some("ready") {
+    if !recall_self_supervised_runtime_allowed && shadow_status.as_deref() != Some("ready") {
         canary_blockers.push(format!(
             "shadow_fusion_replay_not_ready:{}",
             shadow_status.as_deref().unwrap_or("unknown")

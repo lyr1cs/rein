@@ -2530,6 +2530,19 @@ mod tests {
             .unwrap();
         let adaptive_json = read_json(adaptive_response).await;
         assert_eq!(&adaptive_json["judge_calibration"], rest_projection);
+
+        let trust_request = Request::builder()
+            .method("GET")
+            .uri("/api/trust-measurement")
+            .body(())
+            .unwrap();
+        let trust_response = handle_rest_request(&trust_request, &config).await.unwrap();
+        let trust_json = read_json(trust_response).await;
+        assert_eq!(&trust_json["judge_calibration"], rest_projection);
+        assert_eq!(
+            trust_json["recall_fusion_calibration"],
+            adaptive_json["recall_fusion_calibration"]
+        );
     }
 
     #[tokio::test]

@@ -1,16 +1,27 @@
 use rein::config::ReinConfig;
 use rein::judge::contract::JudgeStructuralStatus;
+use rein::ops::a12_activation::{
+    RecallEvalGateAttestation, RecallEvalGateReasonCode, RecallFusionCalibrationRunAttestation,
+    RecallFusionCalibrationRunPhase,
+};
 use rein::ops::ars_release_gate::{
-    evaluate_ars_acceleration_release_gate, JudgeStructuralReleaseInput, ReleaseGateInput,
+    evaluate_ars_acceleration_release_gate, evaluate_ars_acceleration_release_gate_with_a12,
+    JudgeStructuralReleaseInput, ReleaseGateInput,
 };
 use rein::ops::ars_tuning::JudgeStructuralTrustContext;
+use rein::store::a12_calibration::{
+    A12CalibrationLoad, A12CalibrationLoadStatus, A12CalibrationPhase, A12CalibrationRunMetadata,
+    A12CalibrationScope, A12CalibrationState, A12CalibrationVerdict, A12FusionSimplex,
+    A12PairedTop3Stats, A12ProvenanceCounts, A12ScopeEntry, A12_CALIBRATION_SCHEMA_VERSION,
+};
 use rein::store::adaptive::{
     AdaptiveState, JudgeCalibrationState, LearnedShadowFusionEntry, ShadowFusionWeightEntry,
 };
 use rein::store::ars_parameter_policy::{
     ArsParameterPolicy, ArsParameterPolicyLoad, ArsParameterPolicyLoadStatus,
-    ArsParameterPolicyMode,
+    ArsParameterPolicyMode, ArsRecallGateStatus,
 };
+use std::collections::BTreeMap;
 
 fn missing_policy() -> ArsParameterPolicyLoad {
     ArsParameterPolicyLoad {
@@ -110,6 +121,390 @@ fn structural_input(status: JudgeStructuralStatus, enforce: bool) -> JudgeStruct
     }
 }
 
+fn a12_paired(n: u32) -> A12PairedTop3Stats {
+    let result = rein::eval::mcnemar::mcnemar_from_counts(n, 0, 0, 0).unwrap();
+    A12PairedTop3Stats {
+        n: u64::from(result.n),
+        both_hit: u64::from(result.a),
+        baseline_only: u64::from(result.b),
+        treatment_only: u64::from(result.c),
+        neither_hit: u64::from(result.d),
+        chi_squared: result.chi_squared,
+        p_value: result.p_value,
+        diff_point: result.diff_point,
+        ci_lower: result.ci_lower,
+        ci_upper: result.ci_upper,
+        used_exact: result.used_exact,
+    }
+}
+
+fn a12_global(train_ess: u64, holdout_ess: u64, valid_until: Option<i64>) -> A12CalibrationLoad {
+    let entry = A12ScopeEntry {
+        scope: A12CalibrationScope::Global,
+        canonical_generation: 2,
+        generation_fingerprint: "generation-fingerprint".to_string(),
+        source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+        snapshot_cutoff: 1_700_000_000,
+        corpus_fingerprint: "corpus-fingerprint".to_string(),
+        train_family_ess: train_ess,
+        train_case_count: train_ess,
+        holdout_family_ess: holdout_ess,
+        simplex: A12FusionSimplex {
+            bm25: 0.10,
+            vector: 0.20,
+            kg: 0.30,
+            episode: 0.15,
+            support: 0.15,
+            diversity: 0.10,
+        },
+        verdict: A12CalibrationVerdict::Ship,
+        noise_floor: 0.02,
+        paired_top3: a12_paired(u32::try_from(holdout_ess).unwrap()),
+        provenance: A12ProvenanceCounts {
+            canonical_loo: train_ess,
+            concept_loo: 0,
+            episode_loo: 0,
+        },
+        training_fingerprint: "training-fingerprint".to_string(),
+        holdout_fingerprint: "holdout-fingerprint".to_string(),
+        optimizer_fingerprint: "optimizer-fingerprint".to_string(),
+        evaluation_fingerprint: "evaluation-fingerprint".to_string(),
+        holdout_reason: "holdout evaluated".to_string(),
+        calibrated_at: 1_700_000_000,
+        evaluated_at: 1_700_000_050,
+        valid_until_exclusive: valid_until,
+        cluster_generation: None,
+        invalidation: None,
+    };
+    A12CalibrationLoad {
+        state: A12CalibrationState {
+            schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+            revision: 3,
+            generation: 2,
+            generation_fingerprint: "generation-fingerprint".to_string(),
+            snapshot_cutoff: 1_700_000_000,
+            corpus_fingerprint: "corpus-fingerprint".to_string(),
+            cluster_generation: 4,
+            scopes: BTreeMap::from([("global".to_string(), entry)]),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_050,
+            run: Some(A12CalibrationRunMetadata {
+                phase: A12CalibrationPhase::Complete,
+                source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+                behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
+            }),
+        },
+        status: A12CalibrationLoadStatus::Loaded,
+        error: None,
+    }
+}
+
+fn auto_policy(
+    state: &AdaptiveState,
+    a12: &A12CalibrationLoad,
+    scalar_weight: f64,
+    scoped_weight: f64,
+    now_millis: i64,
+) -> ArsParameterPolicyLoad {
+    let gate = rein::ops::a12_activation::RecallEvalGateAttestation {
+        status: ArsRecallGateStatus::Ship,
+        reason_code: rein::ops::a12_activation::RecallEvalGateReasonCode::Compared,
+        build_fingerprint: Some(env!("REIN_BUILD_FINGERPRINT").to_string()),
+        fixture_fingerprint: Some("recall-fixtures".to_string()),
+        evaluated_at: Some(1_700_000_100),
+        reason: "paired recall gate shipped".to_string(),
+    };
+    let evidence = rein::ops::a12_activation::resolve_recall_fusion_evidence(
+        state, a12, 10, 0.02, now_millis, &gate,
+    );
+    ArsParameterPolicyLoad {
+        policy: ArsParameterPolicy {
+            revision: 4,
+            mode: ArsParameterPolicyMode::Canary,
+            disabled_reason: None,
+            source_adaptive_version: state.version,
+            runtime_adoption_weight: scalar_weight,
+            adoption_weights: std::collections::HashMap::from([(
+                "recall_fusion:global".to_string(),
+                scoped_weight,
+            )]),
+            recall_fusion_evidence: evidence.into_iter().collect(),
+            last_updated: "2026-07-13T00:00:00Z".to_string(),
+            ..ArsParameterPolicy::default()
+        },
+        status: ArsParameterPolicyLoadStatus::Loaded,
+        error: None,
+    }
+}
+
+fn current_ship_gate() -> RecallEvalGateAttestation {
+    RecallEvalGateAttestation {
+        status: ArsRecallGateStatus::Ship,
+        reason_code: RecallEvalGateReasonCode::Compared,
+        build_fingerprint: Some(env!("REIN_BUILD_FINGERPRINT").to_string()),
+        fixture_fingerprint: Some("recall-fixtures".to_string()),
+        evaluated_at: Some(1_700_000_100),
+        reason: "paired recall gate shipped".to_string(),
+    }
+}
+
+fn complete_run() -> RecallFusionCalibrationRunAttestation {
+    RecallFusionCalibrationRunAttestation {
+        phase: RecallFusionCalibrationRunPhase::Complete,
+        source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+        behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
+    }
+}
+
+fn evaluate_with_complete_a12(
+    input: ReleaseGateInput<'_>,
+    a12: &A12CalibrationLoad,
+    now_millis: i64,
+) -> rein::ops::ars_release_gate::ArsAccelerationReleaseGateReport {
+    evaluate_ars_acceleration_release_gate_with_a12(
+        input,
+        a12,
+        &current_ship_gate(),
+        Some(&complete_run()),
+        now_millis,
+    )
+}
+
+#[test]
+fn a12_ship_with_scoped_weight_and_zero_scalar_allows_recall_canary() {
+    let mut config = ReinConfig::default();
+    config.ars.acceleration.enabled = true;
+    config.ars.acceleration.shadow_only = false;
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let a12 = a12_global(12, 12, None);
+    let policy = auto_policy(&state, &a12, 0.0, 0.40, 1_700_000_060_000);
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert_eq!(report.schema_version, 3);
+    assert!(report.canary.allowed, "{:?}", report.canary.blockers);
+    assert_eq!(report.signals.scalar_runtime_adoption_weight, 0.0);
+    assert!(report.signals.recall_runtime_allowed);
+    assert!(report.signals.recall_self_supervised_runtime_allowed);
+    assert!(!report.signals.recall_human_runtime_allowed);
+    assert!(report.signals.recall_fusion_calibration.active);
+}
+
+#[test]
+fn a12_training_volume_without_holdout_stays_blocked() {
+    let mut config = ReinConfig::default();
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let mut a12 = a12_global(12, 0, None);
+    a12.state.scopes.get_mut("global").unwrap().verdict = A12CalibrationVerdict::NoData;
+    let policy = auto_policy(&state, &a12, 0.0, 0.40, 1_700_000_060_000);
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert!(!report.canary.allowed);
+    assert!(!report.signals.recall_runtime_allowed);
+    assert!(report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "recall_fusion_runtime_unavailable"));
+}
+
+#[test]
+fn expired_a12_scope_stays_blocked() {
+    let mut config = ReinConfig::default();
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let a12 = a12_global(12, 12, Some(1_700_000_061_000));
+    let policy = auto_policy(&state, &a12, 0.0, 0.40, 1_700_000_060_000);
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_061_000,
+    );
+
+    assert!(!report.canary.allowed);
+    assert!(!report.signals.recall_fusion_calibration.scopes[0].valid_now);
+    assert!(report.signals.recall_fusion_calibration.scopes[0]
+        .reason
+        .contains("stale or expired"));
+}
+
+#[test]
+fn fingerprint_mismatched_a12_scope_stays_blocked() {
+    let mut config = ReinConfig::default();
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let original = a12_global(12, 12, None);
+    let policy = auto_policy(&state, &original, 0.0, 0.40, 1_700_000_060_000);
+    let mut current = original;
+    current.state.generation = 3;
+    current.state.revision = 4;
+    current.state.generation_fingerprint = "new-generation-fingerprint".to_string();
+    let current_entry = current.state.scopes.get_mut("global").unwrap();
+    current_entry.canonical_generation = 3;
+    current_entry.generation_fingerprint = "new-generation-fingerprint".to_string();
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &current,
+        1_700_000_060_000,
+    );
+
+    assert!(!report.canary.allowed);
+    assert!(!report.signals.recall_runtime_allowed);
+    assert!(report.signals.recall_fusion_calibration.scopes[0]
+        .reason
+        .contains("fingerprint identity mismatched"));
+}
+
+#[test]
+fn auto_only_recall_rejects_nonzero_scalar_runtime_adoption() {
+    let mut config = ReinConfig::default();
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let a12 = a12_global(12, 12, None);
+    let policy = auto_policy(&state, &a12, 0.25, 0.40, 1_700_000_060_000);
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert!(!report.canary.allowed);
+    assert!(report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "automatic_recall_fusion_scalar_isolation"));
+}
+
+#[test]
+fn auto_only_recall_rejects_nonrecall_scoped_scalar_adoption() {
+    let mut config = ReinConfig::default();
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let a12 = a12_global(12, 12, None);
+    let mut policy = auto_policy(&state, &a12, 0.0, 0.40, 1_700_000_060_000);
+    policy
+        .policy
+        .adoption_weights
+        .insert("synthesis_gate".to_string(), 0.25);
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert!(!report.canary.allowed);
+    assert_eq!(
+        report.signals.scalar_runtime_adoption_weights["synthesis_gate"],
+        0.25
+    );
+    assert!(report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "automatic_recall_fusion_scalar_isolation"));
+}
+
+/// The scalar-isolation blocker deliberately does not fire when human recall
+/// runtime adoption is also allowed: with live human evidence the scalar
+/// scopes may legitimately be human-driven. It fires only when self-supervised
+/// recall fusion is the sole runtime basis.
+#[test]
+fn scalar_adoption_is_not_isolated_when_human_recall_runtime_is_also_allowed() {
+    let mut config = ReinConfig::default();
+    config.ars.acceleration.enabled = true;
+    config.ars.acceleration.shadow_only = false;
+    config.adaptive.min_samples_alpha = 10;
+    let state = eligible_state(12);
+    let a12 = a12_global(12, 12, None);
+    let policy = auto_policy(&state, &a12, 0.25, 0.40, 1_700_000_060_000);
+    let shadow = ready_shadow_status();
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert!(report.signals.recall_human_runtime_allowed);
+    assert!(report.signals.recall_self_supervised_runtime_allowed);
+    assert!(report.signals.scalar_runtime_adoption_weight > 0.0);
+    assert!(!report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "automatic_recall_fusion_scalar_isolation"));
+    assert!(report.canary.allowed, "{:?}", report.canary.blockers);
+}
+
+#[test]
+fn nonrecall_scalar_scope_cannot_unlock_recall_canary() {
+    let mut config = ReinConfig::default();
+    config.adaptive.min_samples_alpha = 10;
+    let state = AdaptiveState {
+        version: 9,
+        ..AdaptiveState::default()
+    };
+    let mut policy = loaded_canary_policy(state.version);
+    policy.policy.runtime_adoption_weight = 0.0;
+    policy.policy.adoption_weights =
+        std::collections::HashMap::from([("synthesis_gate".to_string(), 0.75)]);
+    let a12 = A12CalibrationLoad {
+        state: A12CalibrationState::default(),
+        status: A12CalibrationLoadStatus::Missing,
+        error: None,
+    };
+    let shadow = serde_json::json!({ "status": "ready" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert!(!report.canary.allowed);
+    assert!(!report.signals.recall_runtime_allowed);
+}
+
 #[test]
 fn failed_stale_and_mismatched_structural_health_block_without_faking_human_kappa() {
     for status in [
@@ -173,7 +568,7 @@ fn ready_structural_anchors_do_not_authorize_release_promotion() {
     });
 
     assert!(!report.canary.allowed);
-    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.schema_version, 3);
     assert!(report
         .canary
         .blockers

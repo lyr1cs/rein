@@ -2073,6 +2073,12 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         config,
         chrono::Utc::now().timestamp(),
     );
+    let recall_fusion_calibration =
+        crate::ops::a12_activation::collect_recall_fusion_activation_report(
+            store,
+            config,
+            chrono::Utc::now().timestamp_millis(),
+        );
 
     serde_json::json!({
         "learned_alphas": learned_alphas,
@@ -2085,6 +2091,7 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         "cluster_profiles": cluster_profiles,
         "synthesis": synthesis,
         "ars_acceleration": ars_acceleration,
+        "recall_fusion_calibration": recall_fusion_calibration,
         "judge_calibration": judge_calibration,
     })
 }
@@ -2422,6 +2429,25 @@ mod tests {
     use crate::store::SqliteStore;
     use crate::types::traits::MemoryStore;
     use chrono::Utc;
+
+    #[test]
+    fn adaptive_status_uses_shared_recall_fusion_calibration_projection() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+
+        let status = adaptive_status_with_config(&store, &config);
+        let shared = crate::ops::a12_activation::collect_recall_fusion_activation_report(
+            &store,
+            &config,
+            chrono::Utc::now().timestamp_millis(),
+        );
+
+        assert_eq!(
+            status["recall_fusion_calibration"],
+            serde_json::to_value(shared).unwrap()
+        );
+        assert!(status["judge_calibration"].is_object());
+    }
 
     #[test]
     fn effective_dedup_threshold_ignores_shadow_below_static() {

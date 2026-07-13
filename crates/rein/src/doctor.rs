@@ -155,6 +155,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_pool_saturation(config));
                             checks.push(check_ars_parameter_policy(&store, config));
                             checks.push(check_dedup_threshold_observability(&store, config));
+                            checks.push(check_recall_fusion_calibration(&store, config));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -2969,6 +2970,118 @@ fn project_dedup_threshold_doctor_check(
     }
 }
 
+/// Format the shared A12 activation projection without reading scorecard
+/// paths or changing the active pointer/policy. Recovery is always an
+/// operator/producer action; doctor never repairs calibration evidence.
+fn check_recall_fusion_calibration(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    let report = crate::ops::a12_activation::collect_recall_fusion_activation_report(
+        store,
+        config,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    let scope_summary = if report.scopes.is_empty() {
+        "scopes=[]".to_string()
+    } else {
+        report
+            .scopes
+            .iter()
+            .map(|scope| {
+                format!(
+                    "{}[basis={:?} active={} adoption={:.3} human_ess={} train_ess={} \
+                     holdout_ess={} verdict={:?} gate={:?} generation={:?} revision={:?} \
+                     valid_now={} calibrated_at={:?} evaluated_at={:?} valid_until={:?} reason={}]",
+                    scope.scope,
+                    scope.basis,
+                    scope.active,
+                    scope.adoption_weight,
+                    scope.human_ess,
+                    scope.train_family_ess,
+                    scope.holdout_family_ess,
+                    scope.verdict,
+                    scope.recall_gate_status,
+                    scope.a12_generation,
+                    scope.a12_revision,
+                    scope.valid_now,
+                    scope.calibrated_at,
+                    scope.evaluated_at,
+                    scope.valid_until_exclusive,
+                    scope.reason,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let summary = format!(
+        "activation_status={} health_status={} active={} policy_load_status={} policy_mode={} \
+         a12_load_status={} current_adaptive_version={} source_adaptive_version={} \
+         a12_generation={:?} a12_revision={:?} reason={} {}",
+        report.activation_status,
+        report.health_status,
+        report.active,
+        report.policy_load_status,
+        report.policy_mode,
+        report.a12_load_status,
+        report.current_adaptive_version,
+        report.source_adaptive_version,
+        report.a12_generation,
+        report.a12_revision,
+        report.reason,
+        scope_summary,
+    );
+    let unhealthy_scope = report.scopes.iter().any(|scope| {
+        matches!(
+            scope.verdict,
+            Some(
+                crate::store::a12_calibration::A12CalibrationVerdict::Bail
+                    | crate::store::a12_calibration::A12CalibrationVerdict::NoData
+            )
+        ) || (scope.a12_generation.is_some() && !scope.valid_now)
+            || scope.reason.contains("mismatch")
+            || scope.reason.contains("stale")
+            || scope.reason.contains("expired")
+    });
+    let attention = !report.active
+        || report.a12_load_status == "corrupt"
+        || report.a12_load_status == "unsupported_schema"
+        || report.a12_load_status == "storage_error"
+        || unhealthy_scope;
+    if !attention {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "recall_fusion_calibration",
+            summary,
+        );
+    }
+
+    let advice = match report.health_status.as_str() {
+        "missing" | "static" | "no_data" | "policy_missing" | "a12_missing" => {
+            "Collect both training and permanent-holdout family evidence, produce a current Ship recall eval-gate attestation, and let the adaptive pipeline seal a new policy revision. Recall eval-gate scorecards are resolved from the server process working directory, so a daemon started outside the repository reports NoData here. This check is read-only."
+        }
+        "bail" => {
+            "Inspect the paired holdout regression, then calibrate a new immutable A12 generation after correcting the producer or retrieval behavior. Bail evidence is preserved and never overridden by doctor."
+        }
+        "policy_unsupported_schema" | "a12_unsupported_schema" => {
+            "Upgrade rein to a binary that understands this policy/A12 schema. Preserve the active pointer and immutable revision bytes unchanged; this check never rewrites them."
+        }
+        "policy_corrupt" | "a12_corrupt" | "policy_storage_error" | "a12_storage_error" => {
+            "Preserve the policy/A12 evidence for diagnosis, restore the producer or storage invariant, then seal a new immutable revision. This check never deletes or repairs calibration rows."
+        }
+        _ => {
+            "Refresh the stale, expired, or fingerprint-mismatched A12 generation and seal a matching policy revision. This check reports evidence only and performs no repair."
+        }
+    };
+    let mut check = warn_in(
+        DoctorCategory::Configuration,
+        "recall_fusion_calibration",
+        summary,
+    );
+    check.repair_hint = Some(advice.to_string());
+    check
+}
+
 /// Surface human agreement, runtime-vs-nightly drift, and deterministic
 /// structural health as three distinct evidence classes. The shared Trust
 /// projection owns the semantics; doctor only formats it and remains read-only.
@@ -4766,6 +4879,81 @@ provider = "inherit"
                 .unwrap();
             assert_eq!(actual, expected, "future-schema row {key} changed");
         }
+    }
+
+    #[test]
+    fn recall_fusion_doctor_is_read_only_and_matches_adaptive_projection() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let before: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
+            .unwrap();
+        let shared = crate::ops::a12_activation::collect_recall_fusion_activation_report(
+            &store,
+            &config,
+            chrono::Utc::now().timestamp_millis(),
+        );
+
+        let check = check_recall_fusion_calibration(&store, &config);
+        let adaptive = crate::ops::adaptive_status_with_config(&store, &config);
+        let after: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(check.name, "recall_fusion_calibration");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(!check.fixable);
+        assert!(check
+            .message
+            .contains(&format!("activation_status={}", shared.activation_status)));
+        assert!(check
+            .message
+            .contains(&format!("health_status={}", shared.health_status)));
+        assert_eq!(
+            adaptive["recall_fusion_calibration"],
+            serde_json::to_value(shared).unwrap()
+        );
+        assert_eq!(before, after, "doctor check must not mutate metadata");
+        assert!(!check.message.contains("/Users/"));
+    }
+
+    #[test]
+    fn recall_fusion_doctor_preserves_future_schema_evidence() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let raw = r#"{"schema_version":9999,"future_pointer":"keep"}"#;
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    crate::store::a12_calibration::A12_CALIBRATION_METADATA_KEY,
+                    raw
+                ],
+            )
+            .unwrap();
+
+        let check = check_recall_fusion_calibration(&store, &config);
+        let stored: String = store
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::a12_calibration::A12_CALIBRATION_METADATA_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(!check.fixable);
+        assert!(check.message.contains("unsupported_schema"));
+        assert_eq!(stored, raw);
+        assert!(!check
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--fix"));
     }
 
     #[test]
