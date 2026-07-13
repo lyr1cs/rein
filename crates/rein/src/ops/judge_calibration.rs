@@ -591,12 +591,10 @@ fn fold_structural_anchor(
 /// callers that can use the generic public feedback-event API cannot fabricate
 /// a Ready suite without first obtaining a runner-owned credential.
 #[derive(Clone)]
-#[allow(dead_code)] // Task 4 passes these per-kind tokens to the runner.
 pub(crate) struct JudgeStructuralProbeRunCredentials {
     run_tokens: BTreeMap<crate::store::adaptive::JudgeStructuralProbeKind, String>,
 }
 
-#[allow(dead_code)]
 impl JudgeStructuralProbeRunCredentials {
     pub(crate) fn token_for(&self, kind: crate::store::adaptive::JudgeStructuralProbeKind) -> &str {
         self.run_tokens
@@ -605,16 +603,16 @@ impl JudgeStructuralProbeRunCredentials {
     }
 }
 
-#[allow(dead_code)] // Task 4 wires the bounded probe runner to this API.
 pub(crate) fn start_judge_structural_probe_run(
     store: &SqliteStore,
     surface: JudgeSurface,
+    expected_prior: &JudgeStructuralSurfaceState,
     run_id: &str,
     model_fingerprint: &str,
     rubric_fingerprint: &str,
     probe_set_version: &str,
     started_at: i64,
-) -> ReinResult<JudgeStructuralProbeRunCredentials> {
+) -> ReinResult<Option<JudgeStructuralProbeRunCredentials>> {
     if started_at <= 0
         || ![
             run_id,
@@ -654,6 +652,9 @@ pub(crate) fn start_judge_structural_probe_run(
                 )));
             }
         };
+        if state.surface(surface) != expected_prior {
+            return Ok(None);
+        }
         let alert_count = state.surface(surface).alert_count;
         *state.surface_mut(surface) = JudgeStructuralSurfaceState {
             run_id: Some(run_id.to_string()),
@@ -670,7 +671,7 @@ pub(crate) fn start_judge_structural_probe_run(
         state.updated_at = started_at;
         state.revision = expected_revision.saturating_add(1);
         if compare_and_swap_judge_structural_calibration(store.conn(), &state, expected_revision)? {
-            return Ok(JudgeStructuralProbeRunCredentials { run_tokens });
+            return Ok(Some(JudgeStructuralProbeRunCredentials { run_tokens }));
         }
     }
     Err(ReinError::Config(
@@ -2236,9 +2237,12 @@ mod tests {
         model_fingerprint: &str,
         rubric_fingerprint: &str,
     ) -> JudgeStructuralProbeRunCredentials {
+        let loaded = load_judge_structural_calibration(store.conn());
+        let expected_prior = loaded.state.surface(surface).clone();
         start_judge_structural_probe_run(
             store,
             surface,
+            &expected_prior,
             run_id,
             model_fingerprint,
             rubric_fingerprint,
@@ -2246,6 +2250,7 @@ mod tests {
             1_000,
         )
         .unwrap()
+        .expect("test owns the surface run claim")
     }
 
     #[test]
@@ -2501,6 +2506,36 @@ mod tests {
         assert_eq!(forged.synthesis.status, JudgeStructuralStatus::Collecting);
         assert_eq!(forged.synthesis.seen_kinds.len(), 1);
         assert_eq!(forged.synthesis.alert_count, 3);
+    }
+
+    #[test]
+    fn judge_structural_anchor_run_claim_has_one_winner() {
+        let store = SqliteStore::in_memory().unwrap();
+        let expected = JudgeStructuralSurfaceState::default();
+        let first = start_judge_structural_probe_run(
+            &store,
+            JudgeSurface::Synthesis,
+            &expected,
+            "run-a",
+            "model-a",
+            "rubric-a",
+            "judge-anchors-v1",
+            1_000,
+        )
+        .unwrap();
+        assert!(first.is_some());
+        let racing = start_judge_structural_probe_run(
+            &store,
+            JudgeSurface::Synthesis,
+            &expected,
+            "run-b",
+            "model-a",
+            "rubric-a",
+            "judge-anchors-v1",
+            1_000,
+        )
+        .unwrap();
+        assert!(racing.is_none(), "stale surface claim must lose");
     }
 
     #[test]

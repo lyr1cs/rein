@@ -51,7 +51,10 @@ impl Provider {
 ///   `[proxy].auth` (`migrate_legacy_proxy_auth`). A v1-stamped build's
 ///   `deny_unknown_fields` decoder would reject the new key, so configs
 ///   adopting it must be recognizable as newer on downgrade.
-pub const CURRENT_CONFIG_VERSION: u32 = 2;
+/// - 3 — post-v1.2: explicit `[ars.llm_judge.structural_anchors]` mode and
+///   interval. Older binaries reject this nested table, so downgrade must fail
+///   before typed decode rather than silently discarding the spend policy.
+pub const CURRENT_CONFIG_VERSION: u32 = 3;
 
 fn default_config_version() -> u32 {
     CURRENT_CONFIG_VERSION
@@ -522,6 +525,39 @@ impl Default for ArsAccelerationConfig {
 // v0.27.1 Track 1 — `[ars.llm_judge]` runtime LLM judge config
 // ---------------------------------------------------------------------------
 
+pub const DEFAULT_JUDGE_STRUCTURAL_ANCHOR_INTERVAL_SECS: u64 = 86_400;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeStructuralAnchorMode {
+    #[default]
+    Off,
+    Monitor,
+    Enforce,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeStructuralAnchorConfig {
+    #[serde(default)]
+    pub mode: JudgeStructuralAnchorMode,
+    #[serde(default = "default_judge_structural_anchor_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_judge_structural_anchor_interval_secs() -> u64 {
+    DEFAULT_JUDGE_STRUCTURAL_ANCHOR_INTERVAL_SECS
+}
+
+impl Default for JudgeStructuralAnchorConfig {
+    fn default() -> Self {
+        Self {
+            mode: JudgeStructuralAnchorMode::Off,
+            interval_secs: default_judge_structural_anchor_interval_secs(),
+        }
+    }
+}
+
 /// `[ars.llm_judge]` config block — default-on runtime LLM judge worker for
 /// auto-feedback on synthesis (Cap B) and concept-summary (Cap A) outputs.
 ///
@@ -583,6 +619,10 @@ pub struct ArsLlmJudgeConfig {
     /// cron policy.
     #[serde(default)]
     pub nightly_cron: ArsLlmJudgeNightlyCronConfig,
+    /// Deterministic four-probe health suite. Explicitly opt-in and separate
+    /// from the existing judge/nightly flags so upgrades never add LLM spend.
+    #[serde(default)]
+    pub structural_anchors: JudgeStructuralAnchorConfig,
 }
 
 /// `[ars.llm_judge.nightly_cron]` sub-table — Layer 2 of the calibration
@@ -656,6 +696,7 @@ impl Default for ArsLlmJudgeConfig {
             daily_call_cap: default_judge_daily_call_cap(),
             cache_ttl_secs: default_judge_cache_ttl_secs(),
             nightly_cron: ArsLlmJudgeNightlyCronConfig::default(),
+            structural_anchors: JudgeStructuralAnchorConfig::default(),
         }
     }
 }
@@ -2368,6 +2409,9 @@ fn validate_provider_name_or_inherit(field: &str, value: &str) -> anyhow::Result
 /// accepting negative values that would make `w_llm` subtract judge
 /// hits from the human signal. NaN / non-finite also rejected.
 pub fn validate_ars_llm_judge(cfg: &ArsLlmJudgeConfig) -> anyhow::Result<()> {
+    if cfg.structural_anchors.interval_secs == 0 {
+        anyhow::bail!("ars.llm_judge.structural_anchors.interval_secs must be positive");
+    }
     if !cfg.weight_decay_rate.is_finite() || !(0.0..=1.0).contains(&cfg.weight_decay_rate) {
         anyhow::bail!(
             "ars.llm_judge.weight_decay_rate must be finite and in [0.0, 1.0], got {}",
@@ -3624,6 +3668,67 @@ shadow_only = false
         assert!(
             !cfg.ars.llm_judge.nightly_cron.enabled,
             "[ars.llm_judge.nightly_cron].enabled must default to false"
+        );
+    }
+
+    #[test]
+    fn test_default_judge_structural_anchors_are_off() {
+        let cfg = ReinConfig::default();
+        assert_eq!(
+            cfg.ars.llm_judge.structural_anchors.mode,
+            JudgeStructuralAnchorMode::Off
+        );
+        assert_eq!(cfg.ars.llm_judge.structural_anchors.interval_secs, 86_400);
+    }
+
+    #[test]
+    fn test_judge_structural_anchor_modes_parse_explicitly() {
+        for (raw, expected) in [
+            ("off", JudgeStructuralAnchorMode::Off),
+            ("monitor", JudgeStructuralAnchorMode::Monitor),
+            ("enforce", JudgeStructuralAnchorMode::Enforce),
+        ] {
+            let cfg = ReinConfig::load_from_str(&format!(
+                "[ars.llm_judge.structural_anchors]\nmode = \"{raw}\"\ninterval_secs = 3600\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.ars.llm_judge.structural_anchors.mode, expected);
+            assert_eq!(cfg.ars.llm_judge.structural_anchors.interval_secs, 3_600);
+        }
+        assert!(ReinConfig::load_from_str(
+            "[ars.llm_judge.structural_anchors]\nmode = \"auto\"\ninterval_secs = 3600\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_judge_structural_anchor_interval_must_be_positive() {
+        let error = ReinConfig::load_from_str(
+            "[ars.llm_judge.structural_anchors]\nmode = \"monitor\"\ninterval_secs = 0\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("interval_secs"));
+    }
+
+    #[test]
+    fn enabling_existing_judge_does_not_enable_structural_anchor_spend() {
+        let cfg = ReinConfig::load_from_str("[ars.llm_judge]\nenabled = true\n").unwrap();
+        assert!(cfg.ars.llm_judge.enabled);
+        assert_eq!(
+            cfg.ars.llm_judge.structural_anchors.mode,
+            JudgeStructuralAnchorMode::Off
+        );
+    }
+
+    #[test]
+    fn config_v2_without_structural_anchor_table_migrates_to_off_semantics() {
+        let cfg =
+            ReinConfig::load_from_str("config_version = 2\n[ars.llm_judge]\nenabled = true\n")
+                .unwrap();
+        assert_eq!(cfg.config_version, 2);
+        assert_eq!(
+            cfg.ars.llm_judge.structural_anchors,
+            JudgeStructuralAnchorConfig::default()
         );
     }
 

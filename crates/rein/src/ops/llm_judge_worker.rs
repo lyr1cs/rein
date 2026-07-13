@@ -20,13 +20,15 @@
 //! `judge::contract::J1_ALLOWED_WRITE_TABLES`. This is the reason the judge
 //! worker stays out of the v0.26.x 4-way pipeline-interaction matrix.
 
+use crate::config::JudgeStructuralAnchorMode;
 use crate::extract::llm::ExtractorKind;
 use crate::judge::contract::{
     self, JudgeContext, JudgePayload, ReservationToken, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
 };
 use crate::store::adaptive::{
     emit_event, ConceptSummaryLlmJudgePayload, EventType, FeedbackEvent, JudgeMetadata,
-    JudgeSource, SignalHint, SynthesisLlmJudgePayload,
+    JudgeSource, JudgeStructuralAnchorPayload, JudgeStructuralProbeKind, JudgeSurface, SignalHint,
+    SynthesisLlmJudgePayload,
 };
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
@@ -44,6 +46,300 @@ pub const JUDGE_REASON_MAX_CHARS: usize = 280;
 pub const JUDGE_MAX_INPUT_CHARS: usize = 16_384;
 
 const JUDGE_INPUT_JOINER: &str = "\n\nCandidate:\n";
+pub const JUDGE_STRUCTURAL_PROBE_SET_VERSION: &str = "judge-anchors-v1";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StructuralAnchorRunStats {
+    pub runs_started: usize,
+    pub attempted: usize,
+    pub emitted: usize,
+    pub failed: usize,
+    pub cap_dropped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuralAnchorProbe {
+    prompt: String,
+    candidate: String,
+    nonce: Option<String>,
+}
+
+fn structural_surface_label(surface: JudgeSurface) -> &'static str {
+    match surface {
+        JudgeSurface::Synthesis => "synthesis",
+        JudgeSurface::ConceptSummary => "concept_summary",
+    }
+}
+
+fn structural_probe_nonce(
+    run_id: &str,
+    surface: JudgeSurface,
+    kind: JudgeStructuralProbeKind,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(JUDGE_STRUCTURAL_PROBE_SET_VERSION.as_bytes());
+    hasher.update([0]);
+    hasher.update(run_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(structural_surface_label(surface).as_bytes());
+    hasher.update([0]);
+    hasher.update(format!("{kind:?}").as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("anchor-{}", &digest[..16])
+}
+
+fn build_structural_anchor_probe(
+    run_id: &str,
+    surface: JudgeSurface,
+    kind: JudgeStructuralProbeKind,
+) -> StructuralAnchorProbe {
+    let surface_label = structural_surface_label(surface);
+    match kind {
+        JudgeStructuralProbeKind::SupportedExactSingle => StructuralAnchorProbe {
+            prompt: format!(
+                "Structural health probe for {surface_label}.\nQuery: What color is the release flag?\nSources:\n- The release flag color is cobalt."
+            ),
+            candidate: "The release flag color is cobalt.".to_string(),
+            nonce: None,
+        },
+        JudgeStructuralProbeKind::SupportedExactMulti => StructuralAnchorProbe {
+            prompt: format!(
+                "Structural health probe for {surface_label}.\nQuery: Which region and port serve the release?\nSources:\n- The release region is ap-southeast-1.\n- The release port is 443."
+            ),
+            candidate: "The release is served from ap-southeast-1 on port 443.".to_string(),
+            nonce: None,
+        },
+        JudgeStructuralProbeKind::UnsupportedNonce => {
+            let nonce = structural_probe_nonce(run_id, surface, kind);
+            StructuralAnchorProbe {
+                prompt: format!(
+                    "Structural health probe for {surface_label}.\nQuery: Summarize the deployment state.\nSources:\n- The deployment is healthy.\n- The deployment has three replicas."
+                ),
+                candidate: format!(
+                    "The deployment is healthy with three replicas and audit token {nonce}."
+                ),
+                nonce: Some(nonce),
+            }
+        }
+        JudgeStructuralProbeKind::QueryMismatch => StructuralAnchorProbe {
+            prompt: format!(
+                "Structural health probe for {surface_label}.\nQuery: Where is the deployment running?\nSources:\n- The deployment runs in Singapore.\n- The backup window begins at 02:00 UTC."
+            ),
+            candidate: "The backup window begins at 02:00 UTC.".to_string(),
+            nonce: None,
+        },
+    }
+}
+
+fn structural_fingerprint(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn structural_model_fingerprint(extractor: &ExtractorKind) -> String {
+    match extractor {
+        ExtractorKind::Gemini(extractor) => structural_fingerprint(&[
+            "judge-model-v1",
+            "gemini",
+            &extractor.model,
+            &extractor.endpoint,
+        ]),
+        ExtractorKind::Omlx(extractor) => structural_fingerprint(&[
+            "judge-model-v1",
+            "omlx",
+            &extractor.model,
+            &extractor.endpoint,
+            if extractor.disable_thinking {
+                "disable_thinking"
+            } else {
+                "thinking_enabled"
+            },
+        ]),
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => structural_fingerprint(&["judge-model-v1", "mock"]),
+    }
+}
+
+fn structural_rubric_fingerprint(surface: JudgeSurface) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "judge-structural-rubric-v1",
+        JUDGE_SYSTEM_PROMPT,
+        JUDGE_STRUCTURAL_PROBE_SET_VERSION,
+        structural_surface_label(surface),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    for kind in JudgeStructuralProbeKind::ALL {
+        let probe = build_structural_anchor_probe("fingerprint-sentinel", surface, kind);
+        hasher.update(format!("{kind:?}").as_bytes());
+        hasher.update([0]);
+        hasher.update(probe.prompt.as_bytes());
+        hasher.update([0]);
+        hasher.update(probe.candidate.as_bytes());
+        hasher.update([0xff]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn structural_surface_due(
+    state: &crate::store::judge_structural_calibration::JudgeStructuralCalibrationState,
+    surface: JudgeSurface,
+    now: i64,
+    interval_secs: u64,
+    model_fingerprint: &str,
+    rubric_fingerprint: &str,
+) -> bool {
+    let surface_state = state.surface(surface);
+    if surface_state.model_fingerprint != model_fingerprint
+        || surface_state.rubric_fingerprint != rubric_fingerprint
+        || surface_state.probe_set_version != JUDGE_STRUCTURAL_PROBE_SET_VERSION
+    {
+        return true;
+    }
+    let started_at = surface_state.run_started_at;
+    if started_at <= 0 {
+        return true;
+    }
+    let interval = i64::try_from(interval_secs).unwrap_or(i64::MAX);
+    now >= started_at && now.saturating_sub(started_at) >= interval
+}
+
+/// Run at most one sealed four-probe suite per enabled surface and interval.
+/// Every actual LLM call uses the existing judge-call ledger before dispatch.
+pub fn run_structural_anchor_suite(
+    store: &SqliteStore,
+    config: &crate::config::ReinConfig,
+    extractor: &ExtractorKind,
+    now: i64,
+) -> ReinResult<StructuralAnchorRunStats> {
+    let anchor_config = &config.ars.llm_judge.structural_anchors;
+    if !config.ars.llm_judge.enabled || anchor_config.mode == JudgeStructuralAnchorMode::Off {
+        return Ok(StructuralAnchorRunStats::default());
+    }
+    if now <= 0 || anchor_config.interval_secs == 0 {
+        return Err(ReinError::Config(
+            "judge structural anchor run requires positive time and interval".to_string(),
+        ));
+    }
+    let loaded =
+        crate::store::judge_structural_calibration::load_judge_structural_calibration(store.conn());
+    let state = match loaded.status {
+        crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus::Missing => {
+            crate::store::judge_structural_calibration::JudgeStructuralCalibrationState::default()
+        }
+        crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus::Loaded => {
+            loaded.state
+        }
+        status => {
+            return Err(ReinError::Config(format!(
+                "judge structural anchor runner preserved unhealthy state {status:?}: {}",
+                loaded.error.unwrap_or_else(|| "no detail".to_string())
+            )));
+        }
+    };
+
+    let model_fingerprint = structural_model_fingerprint(extractor);
+    let mut stats = StructuralAnchorRunStats::default();
+    for surface in [JudgeSurface::Synthesis, JudgeSurface::ConceptSummary] {
+        let surface_enabled = match surface {
+            JudgeSurface::Synthesis => config.ars.llm_judge.synthesis_enabled,
+            JudgeSurface::ConceptSummary => config.ars.llm_judge.concept_summary_enabled,
+        };
+        let rubric_fingerprint = structural_rubric_fingerprint(surface);
+        if !surface_enabled
+            || !structural_surface_due(
+                &state,
+                surface,
+                now,
+                anchor_config.interval_secs,
+                &model_fingerprint,
+                &rubric_fingerprint,
+            )
+        {
+            continue;
+        }
+        let surface_label = structural_surface_label(surface);
+        let run_id = format!("jsa-{surface_label}-{}", ulid::Ulid::new());
+        let Some(credentials) = crate::ops::judge_calibration::start_judge_structural_probe_run(
+            store,
+            surface,
+            state.surface(surface),
+            &run_id,
+            &model_fingerprint,
+            &rubric_fingerprint,
+            JUDGE_STRUCTURAL_PROBE_SET_VERSION,
+            now,
+        )?
+        else {
+            tracing::debug!(?surface, "judge structural run already claimed by peer");
+            continue;
+        };
+        stats.runs_started += 1;
+
+        for kind in JudgeStructuralProbeKind::ALL {
+            let Some(reservation) =
+                contract::reserve_call(store.conn(), config.ars.llm_judge.daily_call_cap)?
+            else {
+                stats.cap_dropped += 1;
+                break;
+            };
+            stats.attempted += 1;
+            let probe = build_structural_anchor_probe(&run_id, surface, kind);
+            let raw = match call_judge_sync(config, extractor, &probe.prompt, &probe.candidate) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    let _ = reservation.fail(store.conn());
+                    stats.failed += 1;
+                    tracing::warn!(?surface, ?kind, error = %error, "judge structural probe failed");
+                    continue;
+                }
+            };
+            let Some((observed_hit, _reason)) = parse_judge_output(&raw) else {
+                let _ = reservation.fail(store.conn());
+                stats.failed += 1;
+                tracing::warn!(
+                    ?surface,
+                    ?kind,
+                    "judge structural probe output was unparseable"
+                );
+                continue;
+            };
+            let payload = JudgeStructuralAnchorPayload {
+                surface,
+                probe_kind: kind,
+                observed_hit,
+                run_id: run_id.clone(),
+                model_fingerprint: model_fingerprint.clone(),
+                rubric_fingerprint: rubric_fingerprint.clone(),
+                probe_set_version: JUDGE_STRUCTURAL_PROBE_SET_VERSION.to_string(),
+                run_token: credentials.token_for(kind).to_string(),
+            };
+            let event = FeedbackEvent {
+                event_type: EventType::JudgeStructuralAnchor,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::to_value(payload).map_err(ReinError::Serialization)?),
+            };
+            if let Err(error) = emit_event(store.conn(), event) {
+                let _ = reservation.fail(store.conn());
+                return Err(error);
+            }
+            reservation.commit(store.conn())?;
+            stats.emitted += 1;
+        }
+    }
+    Ok(stats)
+}
 
 pub(crate) fn resolve_judge_max_input_chars(config: &crate::config::ReinConfig) -> usize {
     if let Some(max) = config.ars.llm_judge.max_input_chars.filter(|max| *max > 0) {
@@ -1143,6 +1439,26 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
         }
     };
 
+    if config.ars.llm_judge.structural_anchors.mode != JudgeStructuralAnchorMode::Off {
+        match run_structural_anchor_suite(store, config, &extractor, chrono::Utc::now().timestamp())
+        {
+            Ok(stats) if stats.attempted > 0 || stats.cap_dropped > 0 => {
+                tracing::info!(
+                    runs_started = stats.runs_started,
+                    attempted = stats.attempted,
+                    emitted = stats.emitted,
+                    failed = stats.failed,
+                    cap_dropped = stats.cap_dropped,
+                    "judge structural anchor pass"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "judge structural anchor pass failed closed");
+            }
+        }
+    }
+
     // v0.27.x C4 — reap stale .processing-{ts}-{pid} files from
     // crashed prior drains. Now safe: extractor resolved means any
     // .processing-* files older than 24h are real crash orphans,
@@ -1298,6 +1614,8 @@ pub fn drain_queue(store: &SqliteStore, config: &crate::config::ReinConfig) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::JudgeStructuralAnchorMode;
+    use crate::extract::llm::MockExtractor;
 
     fn temp_judge_config(dir: &tempfile::TempDir) -> crate::config::ReinConfig {
         let mut config = crate::config::ReinConfig::default();
@@ -1306,6 +1624,145 @@ mod tests {
         config.ars.llm_judge.enabled = true;
         config.ars.llm_judge.cache_ttl_secs = 600;
         config
+    }
+
+    fn mock_call_count(extractor: &ExtractorKind) -> usize {
+        match extractor {
+            ExtractorKind::Mock(mock) => mock.call_count(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn structural_anchor_mode_off_never_calls_llm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = temp_judge_config(&dir);
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Off;
+        let store = SqliteStore::in_memory().unwrap();
+        let extractor =
+            ExtractorKind::Mock(MockExtractor::with_fixed_response("HIT: yes\nWHY: ok"));
+
+        let stats = run_structural_anchor_suite(&store, &config, &extractor, 1_000).unwrap();
+        assert_eq!(stats.attempted, 0);
+        assert_eq!(stats.emitted, 0);
+        assert_eq!(mock_call_count(&extractor), 0);
+        let ledger: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM judge_call_ledger", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ledger, 0);
+    }
+
+    #[test]
+    fn structural_anchor_run_emits_exactly_four_kinds_per_surface_through_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = temp_judge_config(&dir);
+        config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Monitor;
+        config.ars.llm_judge.structural_anchors.interval_secs = 86_400;
+        config.ars.llm_judge.daily_call_cap = 100;
+        let store = SqliteStore::in_memory().unwrap();
+        let responses = [true, true, false, false, true, true, false, false]
+            .into_iter()
+            .map(|hit| {
+                Ok(format!(
+                    "HIT: {}\nWHY: scripted structural verdict",
+                    if hit { "yes" } else { "no" }
+                ))
+            })
+            .collect();
+        let extractor = ExtractorKind::Mock(MockExtractor::with_responses(responses));
+
+        let stats = run_structural_anchor_suite(&store, &config, &extractor, 1_000).unwrap();
+        assert_eq!(stats.runs_started, 2);
+        assert_eq!(stats.attempted, 8);
+        assert_eq!(stats.emitted, 8);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(mock_call_count(&extractor), 8);
+        let events: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM feedback_events WHERE event_type = 'judge_structural_anchor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 8);
+        let done: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM judge_call_ledger WHERE status = 'done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, 8);
+
+        let state =
+            crate::ops::judge_calibration::run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(
+            state.synthesis.status,
+            crate::judge::contract::JudgeStructuralStatus::Ready
+        );
+        assert_eq!(
+            state.concept_summary.status,
+            crate::judge::contract::JudgeStructuralStatus::Ready
+        );
+
+        let skipped = run_structural_anchor_suite(&store, &config, &extractor, 1_100).unwrap();
+        assert_eq!(skipped.attempted, 0);
+        assert_eq!(
+            mock_call_count(&extractor),
+            8,
+            "interval gate must prevent extra spend"
+        );
+    }
+
+    #[test]
+    fn structural_nonce_probe_is_deterministic_and_absent_from_sources() {
+        let first = build_structural_anchor_probe(
+            "run-1",
+            crate::store::adaptive::JudgeSurface::Synthesis,
+            crate::store::adaptive::JudgeStructuralProbeKind::UnsupportedNonce,
+        );
+        let second = build_structural_anchor_probe(
+            "run-1",
+            crate::store::adaptive::JudgeSurface::Synthesis,
+            crate::store::adaptive::JudgeStructuralProbeKind::UnsupportedNonce,
+        );
+        assert_eq!(first, second);
+        let nonce = first.nonce.as_deref().unwrap();
+        assert!(first.candidate.contains(nonce));
+        assert!(!first.prompt.contains(nonce));
+    }
+
+    #[test]
+    fn structural_anchor_fingerprint_change_bypasses_interval_wait() {
+        let mut state =
+            crate::store::judge_structural_calibration::JudgeStructuralCalibrationState::default();
+        state.synthesis.run_started_at = 1_000;
+        state.synthesis.model_fingerprint = "model-a".to_string();
+        state.synthesis.rubric_fingerprint = "rubric-a".to_string();
+        state.synthesis.probe_set_version = JUDGE_STRUCTURAL_PROBE_SET_VERSION.to_string();
+
+        assert!(!structural_surface_due(
+            &state,
+            JudgeSurface::Synthesis,
+            1_100,
+            86_400,
+            "model-a",
+            "rubric-a",
+        ));
+        assert!(structural_surface_due(
+            &state,
+            JudgeSurface::Synthesis,
+            1_100,
+            86_400,
+            "model-b",
+            "rubric-a",
+        ));
     }
 
     #[test]

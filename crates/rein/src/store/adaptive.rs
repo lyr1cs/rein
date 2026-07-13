@@ -4637,7 +4637,7 @@ impl JudgeStructuralProbeKind {
 /// Event payload for [`EventType::JudgeStructuralAnchor`]. Unknown JSON fields
 /// are ignored for forward compatibility, but no expected-label field exists:
 /// consumers derive it exclusively from [`JudgeStructuralProbeKind`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JudgeStructuralAnchorPayload {
     pub surface: JudgeSurface,
     pub probe_kind: JudgeStructuralProbeKind,
