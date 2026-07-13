@@ -181,6 +181,106 @@ pub fn mcnemar(outcomes: &[PairedOutcome]) -> McNemarResult {
     }
 }
 
+/// Exact one-sided Clopper-Pearson upper confidence bound for a binomial
+/// failure rate.
+///
+/// `alpha` is the upper-tail error probability (`0.05` gives a 95% upper
+/// bound). For `0 < failures < trials`, this inverts
+/// `P[X <= failures | p] = alpha` with a fixed 80-step binary search. For
+/// conventional upper-confidence alpha the bracket is
+/// `[failures / trials, 1]`; unusually large alpha can put the exact root below
+/// the sample rate, in which case the bracket expands to `[0, 1]`. The binomial
+/// CDF is accumulated away from the distribution mode so the recurrence
+/// remains stable without a statistics dependency.
+///
+/// Returns `None` when the counts are invalid, no trials were observed, or
+/// `alpha` is not strictly between zero and one. The all-failures boundary is
+/// exactly `1.0`.
+pub fn one_sided_binomial_upper_bound(failures: u32, trials: u32, alpha: f64) -> Option<f64> {
+    if trials == 0 || failures > trials || !(0.0 < alpha && alpha < 1.0) {
+        return None;
+    }
+    if failures == trials {
+        return Some(1.0);
+    }
+    if failures == 0 {
+        return Some(-(alpha.ln() / trials as f64).exp_m1());
+    }
+
+    let sample_rate = failures as f64 / trials as f64;
+    let mut lower = if binomial_cdf_through(failures, trials, sample_rate) >= alpha {
+        sample_rate
+    } else {
+        0.0
+    };
+    let mut upper = 1.0;
+    for _ in 0..80 {
+        let midpoint = lower + (upper - lower) / 2.0;
+        if binomial_cdf_through(failures, trials, midpoint) > alpha {
+            // The lower-tail CDF decreases as the candidate failure rate grows.
+            lower = midpoint;
+        } else {
+            upper = midpoint;
+        }
+    }
+    Some(lower + (upper - lower) / 2.0)
+}
+
+/// `P[X <= failures]` for `X ~ Binomial(trials, failure_probability)`.
+///
+/// On the lower-tail side of the mode, compute `PMF(failures)` in log space and
+/// walk toward zero. If the exact root lies below the sample rate, compute the
+/// complementary tail from `PMF(failures + 1)` toward `trials` instead. In both
+/// cases the recurrence walks from the largest boundary term toward smaller
+/// terms, avoiding large binomial coefficients and underflow-prone starts.
+fn binomial_cdf_through(failures: u32, trials: u32, failure_probability: f64) -> f64 {
+    if failures >= trials || failure_probability <= 0.0 {
+        return 1.0;
+    }
+    if failure_probability >= 1.0 {
+        return 0.0;
+    }
+
+    let p = failure_probability;
+    let q = 1.0 - p;
+    let sample_rate = failures as f64 / trials as f64;
+    if p < sample_rate {
+        let first_excluded = failures + 1;
+        let mut term = binomial_log_pmf(first_excluded, trials, p).exp();
+        let mut upper_tail = term;
+        for observed in first_excluded..trials {
+            term *= (trials - observed) as f64 / (observed + 1) as f64 * p / q;
+            let next = upper_tail + term;
+            if next == upper_tail {
+                break;
+            }
+            upper_tail = next;
+        }
+        return (1.0 - upper_tail).clamp(0.0, 1.0);
+    }
+
+    let mut term = binomial_log_pmf(failures, trials, p).exp();
+    let mut cdf = term;
+    for observed in (1..=failures).rev() {
+        term *= observed as f64 / (trials - observed + 1) as f64 * q / p;
+        cdf += term;
+    }
+
+    cdf.min(1.0)
+}
+
+fn binomial_log_pmf(observed: u32, trials: u32, probability: f64) -> f64 {
+    let choose_terms = observed.min(trials - observed);
+    let mut log_coefficient = 0.0;
+    for i in 1..=choose_terms {
+        log_coefficient += ((trials - choose_terms + i) as f64).ln() - (i as f64).ln();
+    }
+
+    log_coefficient
+        + observed as f64 * probability.ln()
+        + (trials - observed) as f64 * (-probability).ln_1p()
+}
+
 /// Survival function of chi-squared(df=1) at `x`: `1 - F(x)`.
 ///
 /// Uses the identity: if `Z ~ N(0,1)` then `Z^2 ~ chi2(1)`, so
@@ -419,5 +519,99 @@ mod tests {
         // Variance guard: b+c - (b-c)^2/n = 0, sqrt(0) = 0, CI = [0, 0].
         assert_eq!(r.ci_lower, 0.0);
         assert_eq!(r.ci_upper, 0.0);
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_zero_failures_needs_149_trials() {
+        let upper_148 = one_sided_binomial_upper_bound(0, 148, 0.05).unwrap();
+        let upper_149 = one_sided_binomial_upper_bound(0, 149, 0.05).unwrap();
+
+        assert!(
+            upper_148 > 0.02,
+            "148 negatives only bound FPR at {upper_148}"
+        );
+        assert!(
+            upper_149 <= 0.02,
+            "149 negatives should bound FPR at 2%, got {upper_149}"
+        );
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_zero_of_ten_matches_closed_form() {
+        let upper = one_sided_binomial_upper_bound(0, 10, 0.05).unwrap();
+        assert!(
+            (upper - 0.258_865_550_893_052_3).abs() < 1e-12,
+            "upper={upper}"
+        );
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_one_of_ten_matches_exact_bound() {
+        let upper = one_sided_binomial_upper_bound(1, 10, 0.05).unwrap();
+        assert!(
+            (upper - 0.394_163_302_436_504_7).abs() < 1e-12,
+            "upper={upper}"
+        );
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_all_failures_is_one() {
+        assert_eq!(one_sided_binomial_upper_bound(10, 10, 0.05), Some(1.0));
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_rejects_invalid_inputs() {
+        assert_eq!(one_sided_binomial_upper_bound(1, 0, 0.05), None);
+        assert_eq!(one_sided_binomial_upper_bound(11, 10, 0.05), None);
+        assert_eq!(one_sided_binomial_upper_bound(0, 10, 0.0), None);
+        assert_eq!(one_sided_binomial_upper_bound(0, 10, 1.0), None);
+        assert_eq!(one_sided_binomial_upper_bound(0, 10, -0.1), None);
+        assert_eq!(one_sided_binomial_upper_bound(0, 10, f64::NAN), None);
+        assert_eq!(one_sided_binomial_upper_bound(0, 10, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_zero_failures_is_stable_near_alpha_one() {
+        let alpha = f64::from_bits(1.0f64.to_bits() - 1);
+        let upper = one_sided_binomial_upper_bound(0, 2, alpha).unwrap();
+        let expected = -(alpha.ln() / 2.0).exp_m1();
+
+        assert!(upper > 0.0, "the positive bound was rounded to zero");
+        assert_eq!(upper, expected);
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_inverts_valid_high_alpha() {
+        let upper = one_sided_binomial_upper_bound(1, 10, 0.90).unwrap();
+
+        assert!(upper < 0.1, "the exact root lies below the sample rate");
+        assert!((binomial_cdf_through(1, 10, upper) - 0.90).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_is_monotone_in_failures() {
+        let mut previous = 0.0;
+        for failures in 0..=100 {
+            let upper = one_sided_binomial_upper_bound(failures, 100, 0.05).unwrap();
+            assert!(
+                upper + 1e-14 >= previous,
+                "k={failures}: {upper} < previous {previous}"
+            );
+            previous = upper;
+        }
+    }
+
+    #[test]
+    fn one_sided_binomial_upper_bound_is_monotone_in_trials_for_fixed_failures() {
+        let failures = 3;
+        let mut previous = one_sided_binomial_upper_bound(failures, failures, 0.05).unwrap();
+        for trials in (failures + 1)..=250 {
+            let upper = one_sided_binomial_upper_bound(failures, trials, 0.05).unwrap();
+            assert!(
+                upper <= previous + 1e-14,
+                "n={trials}: {upper} > previous {previous}"
+            );
+            previous = upper;
+        }
     }
 }

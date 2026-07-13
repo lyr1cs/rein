@@ -18,6 +18,7 @@ use crate::eval::gates::{
     fixture_corpus_fingerprint, FixtureResult, Gate, GateScorecard, ScorecardKind,
     SCORECARD_SCHEMA_VERSION,
 };
+use crate::eval::mcnemar::one_sided_binomial_upper_bound;
 use crate::extract::dedup::similarity;
 use crate::store::SqliteStore;
 
@@ -156,7 +157,7 @@ pub const PRODUCTION_DEFAULT_THRESHOLD: f32 = 0.70;
 /// One row of the precision/recall sweep at a fixed similarity threshold.
 /// "Positive" = duplicate. Pure function of the labeled corpus, so the same
 /// corpus always yields the same curve (no LLM, no store).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdStat {
     pub threshold: f32,
     pub tp: usize,
@@ -169,8 +170,23 @@ pub struct ThresholdStat {
     pub accuracy: f64,
 }
 
+/// False-positive evidence budget for destructive hard-merge promotion.
+pub const FALSE_POSITIVE_BUDGET: f64 = 0.02;
+const FALSE_POSITIVE_ALPHA: f64 = 0.05;
+const ZERO_FP_REQUIRED_NEGATIVES: usize = 149;
+
+/// False-positive safety verdict for an independently fixed threshold evaluated
+/// only against a sealed negative holdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FalsePositiveSafetyStatus {
+    Ship,
+    Bail,
+    NoData,
+}
+
 /// Full sweep report: the per-threshold curve plus the data-derived optimum.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupSweepReport {
     pub fixture_count: usize,
     pub positives: usize,
@@ -181,12 +197,26 @@ pub struct DedupSweepReport {
     /// Production cold-start global fallback (`PRODUCTION_DEFAULT_THRESHOLD`).
     pub production_default_threshold: f32,
     pub curve: Vec<ThresholdStat>,
-    /// HEADLINE recommendation for a hard auto-merge bound: the threshold with
-    /// the highest recall among those achieving precision == 1.0 (zero false
-    /// merges on the corpus). A false merge destroys data, while a miss falls
-    /// through to the gray-zone / LLM path — so precision is the priority for a
-    /// merge bound, NOT F1. `None` if no threshold reaches precision 1.0.
+    /// Directional zero-observed-false-positive curve point: the threshold with
+    /// the highest recall among rows achieving precision == 1.0 on this corpus.
+    /// This discovery-only row is not a production hard-threshold
+    /// recommendation. `None` if no row reaches precision 1.0.
     pub merge_safe_optimal: Option<ThresholdStat>,
+    /// Number of distinct-labeled pairs in the discovery corpus. These pairs
+    /// participate in threshold selection and are not a sealed holdout.
+    pub discovery_negative_count: usize,
+    /// Number of distinct-labeled pairs in an untouched sealed holdout. The
+    /// bundled sweep currently has no such holdout, so this is zero.
+    pub sealed_negative_holdout_count: usize,
+    /// Exact one-sided 95% Clopper-Pearson upper bound from sealed negatives
+    /// only. `None` when no independently fixed threshold or holdout exists.
+    pub false_positive_upper_95: Option<f64>,
+    /// Maximum acceptable false-positive rate for a destructive merge bound.
+    pub false_positive_budget: f64,
+    /// Safety evidence only, not a full threshold-promotion verdict.
+    pub false_positive_safety_status: FalsePositiveSafetyStatus,
+    /// Human-readable sealed-holdout evidence and fail-closed action.
+    pub false_positive_safety_reason: String,
     /// SECONDARY, informational only: the max-F1 point. Do NOT use this as a
     /// merge bound — it can carry false positives (here it does), i.e. data
     /// loss. Reported so the precision/recall trade-off is visible.
@@ -271,15 +301,14 @@ pub fn optimal_threshold(curve: &[ThresholdStat]) -> ThresholdStat {
         .expect("sweep curve is never empty (fixed 0.30..=0.95 grid)")
 }
 
-/// Pick the merge-safe optimum: among thresholds with precision == 1.0 (zero
-/// false merges), the one with the highest recall; tie-break LOWER threshold
-/// (merge as much as is provably safe). `None` if no threshold is false-merge
-/// free on this corpus. This is the correct objective for a HARD auto-merge
-/// bound, where a false positive is data loss.
+/// Pick the directional zero-observed-FP point: among thresholds with
+/// precision == 1.0 on this corpus, choose the highest recall and tie-break at
+/// the lower threshold. This curve row is not powered safety evidence and must
+/// not be used directly as a production hard auto-merge bound.
 pub fn merge_safe_threshold(curve: &[ThresholdStat]) -> Option<ThresholdStat> {
     curve
         .iter()
-        .filter(|s| s.precision >= 1.0 - 1e-9 && s.tp + s.fp > 0)
+        .filter(|s| s.fp == 0 && s.tp > 0)
         .cloned()
         .max_by(|a, b| {
             a.recall
@@ -291,6 +320,106 @@ pub fn merge_safe_threshold(curve: &[ThresholdStat]) -> Option<ThresholdStat> {
                         .unwrap_or(std::cmp::Ordering::Equal),
                 )
         })
+}
+
+#[derive(Debug)]
+struct FalsePositiveSafetyAssessment {
+    fixed_threshold: f32,
+    sealed_negative_holdout_count: usize,
+    observed_false_positives: usize,
+    false_positive_upper_95: Option<f64>,
+    false_positive_safety_status: FalsePositiveSafetyStatus,
+    false_positive_safety_reason: String,
+}
+
+fn assess_false_positive_safety(
+    fixed_threshold: f32,
+    sealed_negative_sims: &[f32],
+) -> FalsePositiveSafetyAssessment {
+    let sealed_negative_holdout_count = sealed_negative_sims.len();
+    let observed_false_positives = sealed_negative_sims
+        .iter()
+        .filter(|&&sim| sim > fixed_threshold)
+        .count();
+
+    if sealed_negative_holdout_count == 0 {
+        return FalsePositiveSafetyAssessment {
+            fixed_threshold,
+            sealed_negative_holdout_count,
+            observed_false_positives,
+            false_positive_upper_95: None,
+            false_positive_safety_status: FalsePositiveSafetyStatus::NoData,
+            false_positive_safety_reason: format!(
+                "NoData: sealed negative holdout is missing for fixed_threshold={fixed_threshold:.6}; false-positive safety cannot be assessed."
+            ),
+        };
+    }
+
+    let (failures, trials) = match (
+        u32::try_from(observed_false_positives),
+        u32::try_from(sealed_negative_holdout_count),
+    ) {
+        (Ok(failures), Ok(trials)) => (failures, trials),
+        _ => {
+            return FalsePositiveSafetyAssessment {
+                fixed_threshold,
+                sealed_negative_holdout_count,
+                observed_false_positives,
+                false_positive_upper_95: None,
+                false_positive_safety_status: FalsePositiveSafetyStatus::Bail,
+                false_positive_safety_reason:
+                    "Bail: sealed negative holdout counts exceed the exact-bound API range."
+                        .to_string(),
+            };
+        }
+    };
+
+    let Some(upper) = one_sided_binomial_upper_bound(failures, trials, FALSE_POSITIVE_ALPHA) else {
+        return FalsePositiveSafetyAssessment {
+            fixed_threshold,
+            sealed_negative_holdout_count,
+            observed_false_positives,
+            false_positive_upper_95: None,
+            false_positive_safety_status: FalsePositiveSafetyStatus::Bail,
+            false_positive_safety_reason: format!(
+                "Bail: observed={sealed_negative_holdout_count}, false_positives={observed_false_positives}; UCB=unavailable."
+            ),
+        };
+    };
+
+    let false_positive_safety_status = if sealed_negative_holdout_count < ZERO_FP_REQUIRED_NEGATIVES
+        && observed_false_positives == 0
+    {
+        FalsePositiveSafetyStatus::NoData
+    } else if observed_false_positives > 0 && upper > FALSE_POSITIVE_BUDGET {
+        FalsePositiveSafetyStatus::Bail
+    } else if sealed_negative_holdout_count >= ZERO_FP_REQUIRED_NEGATIVES
+        && upper <= FALSE_POSITIVE_BUDGET
+    {
+        FalsePositiveSafetyStatus::Ship
+    } else {
+        FalsePositiveSafetyStatus::Bail
+    };
+    let false_positive_safety_reason = match false_positive_safety_status {
+        FalsePositiveSafetyStatus::Ship => format!(
+            "Ship: fixed_threshold={fixed_threshold:.6}, observed={sealed_negative_holdout_count}, false_positives={observed_false_positives}, exact one-sided 95% UCB={upper:.6} <= budget={FALSE_POSITIVE_BUDGET:.6}. This passes the sealed-holdout safety gate only."
+        ),
+        FalsePositiveSafetyStatus::Bail => format!(
+            "Bail: fixed_threshold={fixed_threshold:.6}, observed={sealed_negative_holdout_count}, false_positives={observed_false_positives}, exact one-sided 95% UCB={upper:.6} does not establish safety at budget={FALSE_POSITIVE_BUDGET:.6}."
+        ),
+        FalsePositiveSafetyStatus::NoData => format!(
+            "NoData: required={ZERO_FP_REQUIRED_NEGATIVES} zero-false-positive sealed negative holdout cases; observed={sealed_negative_holdout_count}, false_positives={observed_false_positives}, exact one-sided 95% UCB={upper:.6} exceeds budget={FALSE_POSITIVE_BUDGET:.6}."
+        ),
+    };
+
+    FalsePositiveSafetyAssessment {
+        fixed_threshold,
+        sealed_negative_holdout_count,
+        observed_false_positives,
+        false_positive_upper_95: Some(upper),
+        false_positive_safety_status,
+        false_positive_safety_reason,
+    }
 }
 
 /// Load the dedup corpus and run the full sweep. Pure + hermetic (same
@@ -306,17 +435,26 @@ pub fn run_dedup_sweep() -> Result<DedupSweepReport> {
     let curve = sweep_thresholds(&sims);
     let max_f1_point = optimal_threshold(&curve);
     let merge_safe_optimal = merge_safe_threshold(&curve);
+    let safety = assess_false_positive_safety(PRODUCTION_DEFAULT_THRESHOLD, &[]);
     let power_note = format!(
-        "n={} ({} duplicate / {} distinct) — power-limited; directional only. \
-         This sweeps LEXICAL similarity (max Jaccard/containment) separability on \
-         the corpus. Production dedup is MULTI-SIGNAL (lexical bound + embedding- \
-         cosine path + gray-zone LLM verdict) and per-cluster adaptive (M6), so \
-         this calibrates the lexical bound in isolation, NOT the full merge \
-         decision. Threshold defaults are left UNCHANGED pending a production- \
-         traffic recalibration sample.",
+        "The bundled fixture corpus is discovery only: it sweeps LEXICAL \
+         similarity on n={} ({} duplicate / {} distinct), so its {} distinct \
+         pairs are not a sealed holdout and no 95% coverage bound is reported. \
+         false_positive_safety_status={:?}, fixed_threshold={:.6}, \
+         sealed_negative_holdout_count={}, observed_false_positives={}, \
+         false_positive_upper_95=unavailable, budget={:.6}. merge_safe_optimal \
+         remains directional only. A complete promotion decision additionally \
+         requires paired McNemar evidence, slice safety checks, and a pinned \
+         sealed-holdout fingerprint; this report exposes no promotion Ship field.",
         fixtures.len(),
         positives,
-        negatives
+        negatives,
+        negatives,
+        safety.false_positive_safety_status,
+        safety.fixed_threshold,
+        safety.sealed_negative_holdout_count,
+        safety.observed_false_positives,
+        FALSE_POSITIVE_BUDGET,
     );
     Ok(DedupSweepReport {
         fixture_count: fixtures.len(),
@@ -327,6 +465,12 @@ pub fn run_dedup_sweep() -> Result<DedupSweepReport> {
         production_default_threshold: PRODUCTION_DEFAULT_THRESHOLD,
         curve,
         merge_safe_optimal,
+        discovery_negative_count: negatives,
+        sealed_negative_holdout_count: safety.sealed_negative_holdout_count,
+        false_positive_upper_95: safety.false_positive_upper_95,
+        false_positive_budget: FALSE_POSITIVE_BUDGET,
+        false_positive_safety_status: safety.false_positive_safety_status,
+        false_positive_safety_reason: safety.false_positive_safety_reason,
         max_f1_point,
         power_note,
     })
@@ -393,6 +537,7 @@ mod tests {
     #[test]
     fn run_dedup_sweep_on_real_corpus_is_sane() {
         let report = run_dedup_sweep().expect("sweep runs on the bundled corpus");
+        let value = serde_json::to_value(&report).unwrap();
         assert_eq!(report.curve.len(), 14);
         assert!(report.positives > 0 && report.negatives > 0);
         assert_eq!(report.fixture_count, report.positives + report.negatives);
@@ -402,12 +547,103 @@ mod tests {
         if let Some(ref ms) = report.merge_safe_optimal {
             assert_eq!(ms.fp, 0, "merge-safe optimum must have precision 1.0");
         }
+        assert_eq!(value["discovery_negative_count"], 10);
+        assert_eq!(value["sealed_negative_holdout_count"], 0);
+        assert!(value["false_positive_upper_95"].is_null());
+        assert_eq!(value["false_positive_budget"], 0.02);
+        assert_eq!(value["false_positive_safety_status"], "no_data");
+        assert!(value["false_positive_safety_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sealed"));
+        assert!(value.get("hard_promotion_status").is_none());
+        assert!(value.get("hard_promotion_reason").is_none());
+        assert!(report.power_note.contains("discovery only"));
+        assert!(report.power_note.contains("McNemar"));
+        assert!(report.power_note.contains("slice"));
+        assert!(report.power_note.contains("fingerprint"));
+    }
+
+    #[test]
+    fn fixed_threshold_ships_with_149_clean_sealed_negatives() {
+        let fixed_threshold = 0.80;
+        let sealed_negative_sims = vec![0.79; 149];
+        let assessment = assess_false_positive_safety(fixed_threshold, &sealed_negative_sims);
+
+        assert_eq!(assessment.fixed_threshold, fixed_threshold);
+        assert_eq!(assessment.sealed_negative_holdout_count, 149);
+        assert_eq!(assessment.observed_false_positives, 0);
+        assert_eq!(
+            assessment.false_positive_safety_status,
+            FalsePositiveSafetyStatus::Ship
+        );
+        assert!(assessment.false_positive_upper_95.unwrap() <= 0.02);
+        assert!(assessment
+            .false_positive_safety_reason
+            .contains("observed=149"));
+    }
+
+    #[test]
+    fn fixed_threshold_is_no_data_with_148_clean_sealed_negatives() {
+        let fixed_threshold = 0.80;
+        let sealed_negative_sims = vec![0.79; 148];
+        let assessment = assess_false_positive_safety(fixed_threshold, &sealed_negative_sims);
+
+        assert_eq!(
+            assessment.false_positive_safety_status,
+            FalsePositiveSafetyStatus::NoData
+        );
+        assert!(assessment.false_positive_upper_95.unwrap() > 0.02);
+        assert!(assessment
+            .false_positive_safety_reason
+            .contains("required=149"));
+    }
+
+    #[test]
+    fn fixed_threshold_bails_on_observed_sealed_false_positive() {
+        let fixed_threshold = 0.80;
+        let mut sealed_negative_sims = vec![0.79; 149];
+        sealed_negative_sims[0] = 0.81;
+        let assessment = assess_false_positive_safety(fixed_threshold, &sealed_negative_sims);
+
+        assert_eq!(assessment.observed_false_positives, 1);
+        assert_eq!(
+            assessment.false_positive_safety_status,
+            FalsePositiveSafetyStatus::Bail
+        );
+        assert!(assessment.false_positive_upper_95.unwrap() > 0.02);
+        assert!(assessment
+            .false_positive_safety_reason
+            .contains("false_positives=1"));
+    }
+
+    #[test]
+    fn dedup_sweep_report_json_roundtrips_false_positive_safety_evidence() {
+        let report = run_dedup_sweep().expect("sweep runs on the bundled corpus");
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let decoded: DedupSweepReport = serde_json::from_str(&json).unwrap();
+        let roundtripped = serde_json::to_value(&decoded).unwrap();
+
+        assert_eq!(value["discovery_negative_count"], 10);
+        assert_eq!(value["sealed_negative_holdout_count"], 0);
+        assert!(value["false_positive_upper_95"].is_null());
+        assert_eq!(value["false_positive_safety_status"], "no_data");
+        assert!(value.get("hard_promotion_status").is_none());
+        assert_eq!(
+            roundtripped["discovery_negative_count"],
+            value["discovery_negative_count"]
+        );
+        assert_eq!(
+            roundtripped["false_positive_safety_status"],
+            value["false_positive_safety_status"]
+        );
     }
 
     #[test]
     fn merge_safe_prefers_lowest_zero_fp_threshold() {
         // Perfectly separable → precision 1.0 and recall 1.0 at every threshold;
-        // merge-safe tie-break picks the LOWEST (merge as much as is safe).
+        // the directional tie-break picks the LOWEST threshold.
         let curve = sweep_thresholds(&[(1.0, true), (0.0, false)]);
         let ms = merge_safe_threshold(&curve).expect("a zero-FP threshold exists");
         assert_eq!(ms.fp, 0);
@@ -422,6 +658,26 @@ mod tests {
         // above it make no positive prediction at all → no merge-safe point.
         let curve = sweep_thresholds(&[(0.9, false)]);
         assert!(merge_safe_threshold(&curve).is_none());
+    }
+
+    #[test]
+    fn merge_safe_rejects_any_observed_false_positive() {
+        // A floating-point precision tolerance can hide one FP when TP is very
+        // large. Candidate eligibility must use the exact confusion counts.
+        let tp = 2_000_000_000usize;
+        let row = ThresholdStat {
+            threshold: 0.80,
+            tp,
+            fp: 1,
+            tn: 149,
+            false_neg: 0,
+            precision: tp as f64 / (tp + 1) as f64,
+            recall: 1.0,
+            f1: 1.0,
+            accuracy: 1.0,
+        };
+
+        assert!(merge_safe_threshold(&[row]).is_none());
     }
 
     #[test]
