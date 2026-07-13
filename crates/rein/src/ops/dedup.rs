@@ -602,7 +602,8 @@ fn run_vec_dedup_inner(
     embedder_override: Option<crate::embed::EmbedderKind>,
 ) {
     let conn = store.conn();
-    // A1: Load per-cluster dedup thresholds once for this run.
+    // Load adaptive shadow suggestions once; destructive branches resolve
+    // them through the hard getter before merging.
     let adaptive = crate::store::adaptive::AdaptiveState::restore_snapshot(conn);
     let pending_limit = vec_dedup_pending_limit(config);
     // `status IN ('active', 'updated')`: round-5 H-1. Merged canonicals
@@ -726,22 +727,17 @@ fn run_vec_dedup_inner(
             }
         };
 
-        // A1: weak floor = minimum adaptive threshold minus margin (never below 0.40).
-        // Uses the minimum across all per-cluster thresholds so that candidates in
-        // low-threshold clusters are not prematurely skipped by the break below.
+        // A1: non-destructive candidate floor = minimum shadow suggestion minus
+        // margin (never below 0.40). A low suggestion can widen review coverage,
+        // but cannot authorize the strong merge below.
         let weak_floor = adaptive
             .as_ref()
             .map(|s| {
-                let global = s.get_dedup_threshold(None);
+                let global = s.get_dedup_shadow_threshold(None);
                 let min_threshold = s.dedup_thresholds.values().copied().fold(global, f32::min);
                 (min_threshold as f64 - 0.10).max(0.40)
             })
             .unwrap_or_else(|| vec_dedup_weak_threshold(config));
-
-        // A1: source cluster for fallback threshold resolution
-        let source_cluster = adaptive
-            .as_ref()
-            .and_then(|s| s.memory_clusters.get(id).copied());
 
         for (candidate_id, distance) in &vec_results {
             if candidate_id == id {
@@ -775,16 +771,11 @@ fn run_vec_dedup_inner(
                 continue;
             }
 
-            // A1: strong merge threshold — per candidate cluster, with fallback chain
-            let candidate_cluster = adaptive
-                .as_ref()
-                .and_then(|s| s.memory_clusters.get(candidate_id).copied())
-                .or(candidate.cluster_id)
-                .or(source_cluster);
-            let strong_threshold = adaptive
-                .as_ref()
-                .map(|s| s.get_dedup_threshold(candidate_cluster) as f64)
-                .unwrap_or_else(|| vec_dedup_strong_threshold(config));
+            // Cosine similarity and lexical similarity are different score
+            // spaces. Lexical shadow learning may widen the candidate floor
+            // above, but the destructive vector boundary comes only from the
+            // vector-specific operator config.
+            let strong_threshold = vec_dedup_strong_threshold(config);
 
             if sim > strong_threshold {
                 let (keep_id, discard_id, discard_content, discard_created) =
@@ -1027,7 +1018,8 @@ pub fn run_dedup_scoped(
     let mut changed = false;
     let llm_budget = vec_dedup_llm_budget(config);
     let mut llm_calls_used = 0usize;
-    // A1: load adaptive thresholds once for the whole batch
+    // Load adaptive suggestions once; each destructive comparison below
+    // resolves a hard-effective threshold against static config.
     let adaptive_state = if config.adaptive.enabled {
         crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
     } else {
@@ -1055,8 +1047,8 @@ pub fn run_dedup_scoped(
 
         // Compare within each cluster group (much smaller than full pairwise)
         for (cluster_id, indices) in &cluster_groups {
-            // A1: learned per-cluster values may raise, but never lower, the
-            // operator's static floor for a destructive lexical merge.
+            // Unlabeled per-cluster suggestions are shadow-only; the hard
+            // getter keeps this destructive lexical merge on static config.
             let cluster_threshold = adaptive_state
                 .as_ref()
                 .map(|s| {
@@ -1486,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_lexical_dedup_threshold_floors_learned_value_at_static() {
+    fn batch_lexical_dedup_ignores_shadow_below_static() {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
         let mut state = crate::store::adaptive::AdaptiveState {
@@ -1502,7 +1494,7 @@ mod tests {
         let similarity = crate::extract::similarity(left, right);
         assert!(
             similarity > 0.45 && similarity < config.search.dedup_similarity as f32,
-            "test fixture must sit between learned and static thresholds: {similarity}"
+            "test fixture must sit between shadow and static thresholds: {similarity}"
         );
 
         store
@@ -1520,7 +1512,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(found, 0, "learned threshold must not lower the hard floor");
+        assert_eq!(found, 0, "shadow threshold must not affect the hard policy");
         assert_eq!(merged, 0);
     }
 

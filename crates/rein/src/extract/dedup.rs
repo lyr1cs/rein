@@ -516,9 +516,20 @@ pub fn check_dedup(
         }
     }
 
-    // M6: Randomized threshold exploration (5% of the time, offset threshold by ±0.1)
-    // This creates A/B test data for causal inference on optimal thresholds.
-    let (effective_threshold, is_exploration) = m6_explore_threshold(similarity_threshold);
+    // M6: randomized shadow-threshold probe (5% of calls, ±0.1). The
+    // counterfactual suggestion is logged for learning only; destructive
+    // decisions continue to use the caller-resolved hard threshold.
+    let (hard_threshold, shadow_threshold, is_exploration) =
+        m6_explore_threshold(similarity_threshold);
+    if is_exploration && best_sim > 0.3 {
+        m6_log_outcome(
+            store,
+            best_sim,
+            shadow_threshold,
+            hard_threshold,
+            best_sim > shadow_threshold,
+        );
+    }
 
     // v0.27 Track 2 #6: Collect ALL candidates that exceed the merge threshold
     // for N-merge consideration. Sorted by final_score descending so the head
@@ -528,7 +539,7 @@ pub fn check_dedup(
     let mut above_threshold: Vec<CandidateScore> = candidates
         .iter()
         .map(|c| score_candidate(topic, content, c, cluster_id))
-        .filter(|s| s.final_score > effective_threshold)
+        .filter(|s| s.final_score > hard_threshold)
         .collect();
     above_threshold.sort_by(|a, b| {
         b.final_score
@@ -573,7 +584,7 @@ pub fn check_dedup(
                 return Ok(DedupAction::Supersede(memory.id.clone()));
             }
         }
-    } else if best_vec_sim > 0.60 && best_sim < effective_threshold {
+    } else if best_vec_sim > 0.60 && best_sim < hard_threshold {
         // v0.27 #5: gray-zone — attempt triple-overlap upgrade BEFORE routing
         // to LLM. v0.27 R2 P2 fix: skip the upgrade when
         // `[intelligent_merge].enabled = true` — the operator opted into
@@ -638,16 +649,6 @@ pub fn check_dedup(
             .expect("winner came from candidates");
 
         let age_days = (chrono::Utc::now() - winner_memory.created_at).num_days();
-        if is_exploration {
-            m6_log_outcome(
-                store,
-                winner.final_score,
-                effective_threshold,
-                similarity_threshold,
-                true,
-            );
-        }
-
         if age_days < time_window_days
             && !new_strongly_contains_old(content, &winner_memory.content)
         {
@@ -713,19 +714,9 @@ pub fn check_dedup(
         }
     }
 
-    if best_sim > effective_threshold {
+    if best_sim > hard_threshold {
         if let Some(memory) = best_memory {
             let age_days = (chrono::Utc::now() - memory.created_at).num_days();
-            // Log exploration outcome for M6 learning
-            if is_exploration {
-                m6_log_outcome(
-                    store,
-                    best_sim,
-                    effective_threshold,
-                    similarity_threshold,
-                    true,
-                );
-            }
             if age_days < time_window_days && !new_strongly_contains_old(content, &memory.content) {
                 // v0.27 #8: temporal-conflict downgrade.
                 if let Some(supersede) = maybe_temporal_supersede(
@@ -824,28 +815,8 @@ pub fn check_dedup(
                 // 0.50..0.85 — embedding uncertain, fall through to LLM
             }
             // Embedding unavailable or uncertain — escalate to LLM
-            if is_exploration {
-                m6_log_outcome(
-                    store,
-                    best_sim,
-                    effective_threshold,
-                    similarity_threshold,
-                    false,
-                );
-            }
             return Ok(DedupAction::GrayZone(memory.id.clone(), best_sim));
         }
-    }
-
-    // Log exploration non-match for control group
-    if is_exploration && best_sim > 0.3 {
-        m6_log_outcome(
-            store,
-            best_sim,
-            effective_threshold,
-            similarity_threshold,
-            false,
-        );
     }
 
     Ok(DedupAction::CreateNew)
@@ -1098,11 +1069,11 @@ fn embedding_candidate_lookup(
         .ok()
         .flatten()?;
     let results = crate::store::vec::search_vec(store.conn(), &emb, None, 5).ok()?;
-    // A1: use adaptive global threshold minus margin as pre-filter floor.
-    // This ensures candidates below the fixed 0.70 are not silently dropped
-    // when the per-cluster dedup threshold is lower.
+    // A1: use the global shadow suggestion minus margin as a non-destructive
+    // candidate-generation floor. The later merge decision still resolves a
+    // hard threshold separately.
     let floor = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
-        .map(|s| (s.get_dedup_threshold(None) as f64 - 0.10).max(0.40))
+        .map(|s| (s.get_dedup_shadow_threshold(None) as f64 - 0.10).max(0.40))
         .unwrap_or(0.60);
     let mut memories = Vec::new();
     for (id, distance) in results {
@@ -1195,10 +1166,17 @@ fn m6_has_llm_budget(store: &SqliteStore) -> bool {
     new_calls <= MAX_LLM_CALLS_PER_HOUR
 }
 
-/// M6: Randomized threshold exploration.
-/// With 5% probability, offset the threshold by a random amount in [-0.1, +0.1].
-/// Returns (effective_threshold, is_exploration).
-fn m6_explore_threshold(base_threshold: f32) -> (f32, bool) {
+/// Separate a destructive hard threshold from an M6 shadow suggestion.
+fn m6_threshold_probe(base_threshold: f32, offset: f32) -> (f32, f32) {
+    (base_threshold, (base_threshold + offset).clamp(0.30, 0.95))
+}
+
+/// M6: randomized non-destructive threshold exploration.
+/// With 5% probability, create a shadow suggestion offset by a random amount
+/// in [-0.1, +0.1]. Returns
+/// `(hard_threshold, shadow_suggestion, is_exploration)` so callers cannot
+/// accidentally substitute the probe for the destructive threshold.
+fn m6_explore_threshold(base_threshold: f32) -> (f32, f32, bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1211,29 +1189,34 @@ fn m6_explore_threshold(base_threshold: f32) -> (f32, bool) {
     let explore = hash % 20 == 0; // 5% probability
 
     if !explore {
-        return (base_threshold, false);
+        let (hard_threshold, shadow_suggestion) = m6_threshold_probe(base_threshold, 0.0);
+        return (hard_threshold, shadow_suggestion, false);
     }
 
     // Random offset in [-0.1, +0.1]
     let offset_bits = ((hash >> 16) % 201) as f32 / 1000.0 - 0.1; // [-0.100, +0.100]
-    let effective = (base_threshold + offset_bits).clamp(0.30, 0.95);
-    (effective, true)
+    let (hard_threshold, shadow_suggestion) = m6_threshold_probe(base_threshold, offset_bits);
+    (hard_threshold, shadow_suggestion, true)
 }
 
-/// M6: Log threshold exploration outcome as feedback event.
+/// M6: Log a non-destructive threshold counterfactual as feedback.
 fn m6_log_outcome(
     store: &SqliteStore,
     sim: f32,
-    used_threshold: f32,
-    base_threshold: f32,
-    was_dedup: bool,
+    shadow_threshold: f32,
+    hard_threshold: f32,
+    would_shadow_dedup: bool,
 ) {
     let payload = serde_json::json!({
         "similarity": sim,
-        "threshold_used": used_threshold,
-        "threshold_base": base_threshold,
-        "offset": used_threshold - base_threshold,
-        "was_dedup": was_dedup,
+        // Legacy serialized keys retained for event-log compatibility. They
+        // now describe a shadow counterfactual, never a destructive outcome.
+        "threshold_used": shadow_threshold,
+        "threshold_base": hard_threshold,
+        "offset": shadow_threshold - hard_threshold,
+        "was_dedup": would_shadow_dedup,
+        "would_dedup_shadow": would_shadow_dedup,
+        "semantics": "shadow_counterfactual",
     });
     let _ = crate::store::adaptive::emit_event(
         store.conn(),
@@ -1295,6 +1278,14 @@ mod tests {
     fn test_jaccard_identical() {
         let text = "the quick brown fox jumps over the lazy dog";
         assert!((jaccard_similarity(text, text) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn m6_exploration_offset_is_shadow_only() {
+        let (hard_threshold, shadow_suggestion) = m6_threshold_probe(0.70, -0.10);
+
+        assert_eq!(hard_threshold, 0.70);
+        assert!((shadow_suggestion - 0.60).abs() < f32::EPSILON);
     }
 
     #[test]

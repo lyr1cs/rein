@@ -1,5 +1,6 @@
 //! Adaptive pipeline: HDBSCAN clustering, survival curves, tiering, alpha learning,
-//! reranker weight learning, M6 threshold learning, and per-cluster dedup thresholds.
+//! reranker weight learning, M6 threshold shadow learning, and per-cluster
+//! dedup shadow suggestions.
 
 use crate::config::ReinConfig;
 use crate::store::SqliteStore;
@@ -353,7 +354,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         );
     }
 
-    // Step 1b: A1 — Compute per-cluster dedup thresholds
+    // Step 1b: A1 — Compute non-destructive per-cluster dedup suggestions
     if !state.memory_clusters.is_empty() {
         compute_per_cluster_dedup_thresholds(store, &mut state);
     }
@@ -653,7 +654,8 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // post-save batch list.
     run_reranker_weight_learning(store);
 
-    // Step 4b: M6 — Consume threshold exploration data + co-recall signal → update dedup thresholds
+    // Step 4b: M6 — Consume shadow probes + co-recall signal → update
+    // non-destructive dedup suggestions
     if let Some(batch) = run_m6_threshold_learning(store, &mut state) {
         pending_offset_batches.push(batch);
     }
@@ -3500,7 +3502,7 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
 }
 
 // ===========================================================================
-// M6: Threshold learning — consume exploration data + co-recall signal
+// M6: Shadow-threshold learning — consume probes + co-recall signal
 // ===========================================================================
 
 fn run_m6_threshold_learning(
@@ -3510,11 +3512,12 @@ fn run_m6_threshold_learning(
     let conn = store.conn();
     let mut pending: Vec<(&'static str, i64)> = Vec::new();
 
-    // --- Part 1: Peek threshold_exploration events (from randomized A/B test) ---
-    // peek+commit: state mutation lands in `state.global_dedup_threshold`
-    // which is only durable after `state.save_snapshot()` in
-    // `run_adaptive_pipeline`. Caller commits the returned offsets only
-    // on save success.
+    // --- Part 1: Peek threshold_exploration shadow-counterfactual events ---
+    // peek+commit: the suggestion lands in the legacy serialized field
+    // `state.global_dedup_threshold`; it is only durable after
+    // `state.save_snapshot()` in `run_adaptive_pipeline`. Destructive callers
+    // still resolve through the hard getter. Caller commits returned offsets
+    // only on save success.
     //
     // v0.25.2 — gate-and-stay (M6 latent watermark-on-peek, flagged in
     // v0.24.0 ship notes). The previous implementation pushed the offset
@@ -3559,11 +3562,11 @@ fn run_m6_threshold_learning(
         .collect();
 
     if explore_events.len() >= 10 {
-        // Causal inference: compare dedup rates at different thresholds
-        // Group by whether threshold was raised or lowered
-        let mut raised_dedup = 0u32; // threshold raised (harder to dedup) → was_dedup count
+        // Compare counterfactual would-dedup rates at different shadow
+        // suggestions. `was_dedup` is the retained legacy payload key.
+        let mut raised_dedup = 0u32; // suggestion raised → would-dedup count
         let mut raised_total = 0u32;
-        let mut lowered_dedup = 0u32; // threshold lowered (easier to dedup) → was_dedup count
+        let mut lowered_dedup = 0u32; // suggestion lowered → would-dedup count
         let mut lowered_total = 0u32;
 
         for event in &explore_events {
@@ -3577,55 +3580,58 @@ fn run_m6_threshold_learning(
                 .get("offset")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            let was_dedup = payload
-                .get("was_dedup")
+            let would_shadow_dedup = payload
+                .get("would_dedup_shadow")
+                // Legacy event rows retain `was_dedup`; new probes use the
+                // explicit counterfactual field above.
+                .or_else(|| payload.get("was_dedup"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
             if offset > 0.01 {
                 raised_total += 1;
-                if was_dedup {
+                if would_shadow_dedup {
                     raised_dedup += 1;
                 }
             } else if offset < -0.01 {
                 lowered_total += 1;
-                if was_dedup {
+                if would_shadow_dedup {
                     lowered_dedup += 1;
                 }
             }
         }
 
-        // If lowering the threshold catches significantly more duplicates,
-        // the current threshold is too high → nudge global threshold down
+        // If a lower shadow suggestion identifies significantly more
+        // candidates, nudge the global shadow suggestion down.
         if raised_total >= 5 && lowered_total >= 5 {
             let raised_rate = raised_dedup as f64 / raised_total as f64;
             let lowered_rate = lowered_dedup as f64 / lowered_total as f64;
 
             if lowered_rate > raised_rate + 0.15 {
-                // Lowering threshold catches 15%+ more duplicates → threshold too high
+                // Lower suggestion identifies 15%+ more counterfactual matches.
                 let adjustment = -0.02;
                 state.global_dedup_threshold =
                     (state.global_dedup_threshold + adjustment as f32).clamp(0.40, 0.90);
                 tracing::info!(
-                    "M6: lowered global threshold to {:.3} (lowered_rate={:.2}, raised_rate={:.2})",
+                    "M6 shadow: lowered global suggestion to {:.3} (lowered_rate={:.2}, raised_rate={:.2})",
                     state.global_dedup_threshold,
                     lowered_rate,
                     raised_rate
                 );
             } else if raised_rate > lowered_rate + 0.15 {
-                // Raising threshold still catches duplicates → threshold too low (too aggressive)
+                // Higher suggestion preserves more matches; raise the shadow suggestion.
                 let adjustment = 0.02;
                 state.global_dedup_threshold =
                     (state.global_dedup_threshold + adjustment as f32).clamp(0.40, 0.90);
                 tracing::info!(
-                    "M6: raised global threshold to {:.3} (raised_rate={:.2}, lowered_rate={:.2})",
+                    "M6 shadow: raised global suggestion to {:.3} (raised_rate={:.2}, lowered_rate={:.2})",
                     state.global_dedup_threshold,
                     raised_rate,
                     lowered_rate
                 );
             } else {
                 tracing::debug!(
-                    "M6: threshold stable (lowered={:.2}, raised={:.2})",
+                    "M6 shadow: suggestion stable (lowered={:.2}, raised={:.2})",
                     lowered_rate,
                     raised_rate
                 );
@@ -3738,14 +3744,13 @@ fn run_m6_threshold_learning(
     // (eventually) crosses the threshold.
 
     // --- Part 2: Co-recall frequency signal ---
-    // If two memories always appear together in recall results, they might be duplicates
-    // that slipped through dedup (threshold was too high).
+    // If two memories always appear together in recall results, they are
+    // candidates for review and may justify a lower shadow suggestion.
     //
     // v0.25.2 — same gate-and-stay fix as Part 1. The outer `>= 5` gate
     // is the one that matters here: when it fires, real side effects
-    // happen (UPDATE memories SET needs_vec_dedup = 1, plus
-    // global/per-cluster threshold tweaks). Below the gate, leave events
-    // queued for the next cycle.
+    // happen (UPDATE memories SET needs_vec_dedup = 1, plus global/per-cluster
+    // shadow-suggestion tweaks). Below the gate, leave events queued.
     let raw_recall_events =
         crate::store::adaptive::peek_events(conn, "m6_corecall", &["recall_complete"], 100)
             .unwrap_or_default();
@@ -3844,20 +3849,20 @@ fn run_m6_threshold_learning(
             }
         }
 
-        // If many co-recall pairs found, threshold is probably too high
+        // Many suspicious pairs support lowering the shadow suggestion.
         if suspicious_pairs > 0 && event_count >= 10 {
             let pair_ratio = suspicious_pairs as f64 / event_count as f64;
             if pair_ratio > 0.2 {
                 state.global_dedup_threshold =
                     (state.global_dedup_threshold - 0.02).clamp(0.40, 0.90);
                 tracing::info!(
-                    "M6: co-recall signal lowered threshold to {:.3} ({suspicious_pairs} suspicious pairs in {event_count} events)",
+                    "M6 shadow: co-recall lowered global suggestion to {:.3} ({suspicious_pairs} suspicious pairs in {event_count} events)",
                     state.global_dedup_threshold
                 );
             }
         }
 
-        // Persist per-cluster threshold adjustments from co-recall signal
+        // Persist per-cluster shadow-suggestion adjustments.
         for (cluster_id, count) in &cluster_suspicious {
             if *count >= 2 {
                 let current = state
@@ -3868,13 +3873,13 @@ fn run_m6_threshold_learning(
                 let adjusted = (current - 0.02).clamp(0.40, 0.90);
                 state.dedup_thresholds.insert(*cluster_id, adjusted);
                 tracing::info!(
-                    "M6: co-recall lowered cluster {cluster_id} threshold {current:.3} → {adjusted:.3} ({count} suspicious pairs)",
+                    "M6 shadow: co-recall lowered cluster {cluster_id} suggestion {current:.3} → {adjusted:.3} ({count} suspicious pairs)",
                 );
             }
         }
 
         // Outer gate fired → DB writes (`needs_vec_dedup = 1`) plus
-        // global / per-cluster threshold tweaks have happened. Bump the
+        // global / per-cluster shadow tweaks have happened. Bump the
         // watermark to peeked-max and ask the orchestrator to commit
         // the cursor on save success. Without this paired bump,
         // re-applying the same batch would double-count pair occurrences
@@ -3910,9 +3915,10 @@ fn run_m6_threshold_learning(
     }
 }
 
-/// Compute per-cluster dedup thresholds from intra-cluster content similarity.
+/// Compute non-destructive per-cluster dedup shadow suggestions from
+/// intra-cluster content similarity.
 /// For each cluster with >= 5 members, compute pairwise Jaccard/Containment similarity
-/// and use P90 as that cluster's dedup threshold (SemDeDup-inspired approach).
+/// and use P90 as that cluster's review suggestion (SemDeDup-inspired).
 fn compute_per_cluster_dedup_thresholds(
     store: &SqliteStore,
     state: &mut crate::store::adaptive::AdaptiveState,
@@ -3964,19 +3970,19 @@ fn compute_per_cluster_dedup_thresholds(
 
         if sims.len() >= 3 {
             sims.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            // P90: the threshold where 90% of intra-cluster pairs are below
+            // P90 shadow suggestion: 90% of intra-cluster pairs are below it.
             let p90_idx = (sims.len() as f64 * 0.90).floor() as usize;
             let p90_idx = p90_idx.min(sims.len() - 1);
             let threshold = sims[p90_idx].clamp(0.40, 0.90); // Clamp to sane range
             state.dedup_thresholds.insert(*cluster_id, threshold);
             tracing::debug!(
-                "A1: cluster {cluster_id} dedup threshold = {threshold:.3} (from {} pairs)",
+                "A1 shadow: cluster {cluster_id} suggestion = {threshold:.3} (from {} pairs)",
                 sims.len()
             );
         }
     }
 
-    // Update global threshold from all-clusters distribution
+    // Update the global shadow suggestion from the all-cluster distribution.
     if all_sims.len() >= 10 {
         all_sims.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p90_idx = (all_sims.len() as f64 * 0.90).floor() as usize;
@@ -3984,7 +3990,7 @@ fn compute_per_cluster_dedup_thresholds(
         let global = all_sims[p90_idx].clamp(0.40, 0.90);
         state.global_dedup_threshold = global;
         tracing::debug!(
-            "A1: global dedup threshold = {global:.3} (from {} total pairs)",
+            "A1 shadow: global suggestion = {global:.3} (from {} total pairs)",
             all_sims.len()
         );
     }
@@ -4404,6 +4410,62 @@ mod tests {
 
     fn emit(store: &SqliteStore, event: FeedbackEvent) -> i64 {
         adaptive::emit_event(store.conn(), event).unwrap()
+    }
+
+    #[test]
+    fn unlabeled_cluster_p90_must_not_lower_destructive_global_threshold() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        for (index, content) in [
+            "amber badger canyon",
+            "birch dolphin ember",
+            "cobalt falcon grove",
+            "denim gecko harbor",
+            "elm heron island",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut memory = test_memory("p90-shadow", &format!("sample-{index}"), 0);
+            memory.content = content.to_string();
+            memory.cluster_id = Some(42);
+            state.memory_clusters.insert(memory.id.clone(), 42);
+            store.store(memory).unwrap();
+        }
+
+        compute_per_cluster_dedup_thresholds(&store, &mut state);
+
+        assert_eq!(state.get_dedup_shadow_threshold(Some(42)), 0.40);
+        assert_eq!(state.get_dedup_shadow_threshold(None), 0.40);
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.70);
+    }
+
+    #[test]
+    fn unlabeled_cluster_high_p90_remains_shadow_only() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        for index in 0..5 {
+            let mut memory = test_memory("p90-high-shadow", &format!("sample-{index}"), 0);
+            memory.content = "identical content produces a high p90 suggestion".to_string();
+            memory.cluster_id = Some(43);
+            state.memory_clusters.insert(memory.id.clone(), 43);
+            store.store(memory).unwrap();
+        }
+
+        compute_per_cluster_dedup_thresholds(&store, &mut state);
+
+        assert_eq!(state.get_dedup_shadow_threshold(Some(43)), 0.90);
+        assert_eq!(state.get_dedup_shadow_threshold(None), 0.90);
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.70);
+        assert_eq!(state.get_hard_dedup_threshold(Some(43), 0.70), 0.70);
     }
 
     /// v0.28.7+ audit M-8 (test fixture): post-fix `compute_shadow_fusion_weight_replay`
@@ -6398,6 +6460,83 @@ mod tests {
             "global_dedup_threshold should be in [0.40, 0.90], got {}",
             state.global_dedup_threshold
         );
+    }
+
+    #[test]
+    fn m6_threshold_exploration_only_lowers_shadow_suggestion() {
+        let store = SqliteStore::in_memory().unwrap();
+        for i in 0..10 {
+            let lowering_arm = i >= 5;
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::ParamUpdate,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: None,
+                    query: None,
+                    query_type: Some("threshold_exploration".into()),
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "offset": if lowering_arm { -0.05 } else { 0.05 },
+                        "would_dedup_shadow": lowering_arm,
+                    })),
+                },
+            );
+        }
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+
+        run_m6_threshold_learning(&store, &mut state);
+
+        assert!((state.get_dedup_shadow_threshold(None) - 0.68).abs() < f32::EPSILON);
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.70);
+    }
+
+    #[test]
+    fn m6_corecall_only_lowers_shadow_suggestion() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.70,
+            ..AdaptiveState::default()
+        };
+        state.dedup_thresholds.insert(7, 0.70);
+
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let mut memory = test_memory("corecall-shadow", &format!("pair-{index}"), 0);
+            memory.content = "shared duplicate content for deterministic similarity".into();
+            memory.cluster_id = Some(7);
+            state.memory_clusters.insert(memory.id.clone(), 7);
+            ids.push(memory.id.clone());
+            store.store(memory).unwrap();
+        }
+        for i in 0..10 {
+            emit(
+                &store,
+                FeedbackEvent {
+                    event_type: EventType::RecallComplete,
+                    request_id: Some(format!("corecall-shadow-{i}")),
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some("same query".into()),
+                    query_type: None,
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "candidates": ids.iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>()
+                    })),
+                },
+            );
+        }
+
+        run_m6_threshold_learning(&store, &mut state);
+
+        assert!((state.get_dedup_shadow_threshold(None) - 0.68).abs() < f32::EPSILON);
+        assert!((state.get_dedup_shadow_threshold(Some(7)) - 0.68).abs() < f32::EPSILON);
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.70);
+        assert_eq!(state.get_hard_dedup_threshold(Some(7), 0.70), 0.70);
     }
 
     // ── v0.25.2 M6 gate-and-stay regression suite ───────────────────────────

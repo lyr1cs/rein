@@ -472,13 +472,16 @@ pub struct AdaptiveState {
     pub hot_threshold: f64,
     pub cold_threshold: f64,
 
-    /// A1: Per-cluster dedup thresholds (replaces fixed 0.70).
-    /// Key = cluster_id, Value = similarity threshold for that cluster.
-    /// Computed from intra-cluster pairwise similarity distribution (P90).
+    /// A1: Per-cluster non-destructive dedup shadow suggestions.
+    /// Key = cluster_id, Value = suggested similarity threshold for that
+    /// cluster. Computed from intra-cluster pairwise similarity distribution
+    /// (P90). The serialized legacy field name is retained for compatibility;
+    /// destructive callers must resolve it through `get_hard_dedup_threshold`.
     #[serde(default)]
     pub dedup_thresholds: HashMap<u32, f32>,
 
-    /// A1: Global (fallback) dedup threshold when no cluster-specific value exists.
+    /// A1: Global fallback shadow suggestion when no cluster value exists.
+    /// The serialized legacy field name is retained for compatibility.
     #[serde(default = "default_global_dedup_threshold")]
     pub global_dedup_threshold: f32,
 
@@ -540,8 +543,8 @@ pub struct AdaptiveState {
     pub concept_refresh_stats: Option<ConceptRefreshStats>,
 
     /// v0.24 peek+commit replay-safety (Codex Tier-B+C round-1 HIGH):
-    /// highest event id whose threshold-nudge effect is already in the
-    /// durable snapshot of `global_dedup_threshold`. Caller of M6 filters
+    /// highest event id whose shadow-suggestion nudge is already in the
+    /// durable legacy snapshot field `global_dedup_threshold`. Caller of M6 filters
     /// peek events by `id > m6_threshold_last_id` so a `commit_offset`
     /// failure after `save_snapshot` doesn't double-nudge on the next
     /// pass. `0` on fresh install / pre-v0.24 snapshots.
@@ -972,8 +975,9 @@ impl AdaptiveState {
         self.learned_shadow_fusion.get("global").filter(eligible)
     }
 
-    /// Get dedup threshold for a cluster, with fallback to global threshold.
-    pub fn get_dedup_threshold(&self, cluster_id: Option<u32>) -> f32 {
+    /// Get the non-destructive dedup shadow suggestion for a cluster, with
+    /// fallback to the global shadow suggestion.
+    pub fn get_dedup_shadow_threshold(&self, cluster_id: Option<u32>) -> f32 {
         if let Some(cid) = cluster_id {
             if let Some(&threshold) = self.dedup_thresholds.get(&cid) {
                 return threshold;
@@ -986,22 +990,24 @@ impl AdaptiveState {
         }
     }
 
+    /// Legacy compatibility wrapper for the non-destructive shadow suggestion.
+    ///
+    /// New call sites should use [`Self::get_dedup_shadow_threshold`] so this
+    /// value cannot be mistaken for a destructive/effective threshold.
+    pub fn get_dedup_threshold(&self, cluster_id: Option<u32>) -> f32 {
+        self.get_dedup_shadow_threshold(cluster_id)
+    }
+
     /// Get the threshold for a destructive lexical dedup decision.
     ///
-    /// Learned values may raise the operator's static threshold, but cannot
-    /// lower it. Invalid learned values fall back to the static threshold.
-    pub fn get_hard_dedup_threshold(&self, cluster_id: Option<u32>, static_threshold: f32) -> f32 {
+    /// Until an independently labeled adoption policy exists, unlabeled shadow
+    /// suggestions never affect destructive actions in either direction. The
+    /// cluster parameter is retained for API compatibility and future policy.
+    pub fn get_hard_dedup_threshold(&self, _cluster_id: Option<u32>, static_threshold: f32) -> f32 {
         if !static_threshold.is_finite() || !(0.0..=1.0).contains(&static_threshold) {
             return 1.0;
         }
-        let learned = cluster_id
-            .and_then(|cid| self.dedup_thresholds.get(&cid).copied())
-            .unwrap_or(self.global_dedup_threshold);
-        if learned.is_finite() {
-            learned.max(static_threshold)
-        } else {
-            static_threshold
-        }
+        static_threshold
     }
 
     /// v0.23: Per-cluster canonical length p25, with minimum-sample guard.
@@ -5056,7 +5062,7 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
-    fn hard_dedup_threshold_never_falls_below_static_without_override() {
+    fn hard_dedup_threshold_ignores_shadow_below_static() {
         let mut state = AdaptiveState {
             global_dedup_threshold: 0.40,
             ..Default::default()
@@ -5068,19 +5074,19 @@ mod tests {
     }
 
     #[test]
-    fn hard_dedup_threshold_preserves_learned_value_above_static() {
+    fn unlabeled_shadow_above_static_does_not_raise_hard_threshold() {
         let mut state = AdaptiveState {
             global_dedup_threshold: 0.80,
             ..Default::default()
         };
         state.dedup_thresholds.insert(7, 0.85);
 
-        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.80);
-        assert_eq!(state.get_hard_dedup_threshold(Some(7), 0.70), 0.85);
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.70);
+        assert_eq!(state.get_hard_dedup_threshold(Some(7), 0.70), 0.70);
     }
 
     #[test]
-    fn hard_dedup_threshold_falls_back_to_supplied_static_for_nonfinite_learned_values() {
+    fn hard_dedup_threshold_ignores_nonfinite_shadow_values() {
         for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let global_state = AdaptiveState {
                 global_dedup_threshold: nonfinite,

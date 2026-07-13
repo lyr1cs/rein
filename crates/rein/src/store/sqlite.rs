@@ -1892,9 +1892,9 @@ impl SqliteStore {
                 DedupAction::CreateNew => memory.cluster_id,
             };
 
-            // Per-cluster adaptive threshold recheck — honor [adaptive] enabled=false
-            // so disabling adaptive actually disables it end-to-end (not just in the
-            // outer effective_dedup_threshold helper).
+            // Re-resolve the hard policy inside the transaction so the static
+            // config used for the destructive action cannot drift from the
+            // outer preview. Cluster remains a compatibility input only.
             let dedup_action = {
                 let loaded_config = crate::config::ReinConfig::load().unwrap_or_default();
                 if loaded_config.adaptive.enabled {
@@ -2285,9 +2285,8 @@ impl SqliteStore {
         let inferred_cluster = memory
             .cluster_id
             .or_else(|| self.infer_cluster_from_cache(memory));
-        // Honor [adaptive] enabled=false throughout — otherwise preflight picks
-        // the learned threshold while in-transaction recheck picks the static one,
-        // creating a mismatch that defeats the content-hash race guard.
+        // Keep preflight on the same hard policy as the in-transaction recheck;
+        // unlabeled shadow suggestions are not action-authorizing inputs.
         let effective_threshold = if config.adaptive.enabled {
             crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
                 .map(|s| {
@@ -3871,7 +3870,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(global_state)]
-    fn store_time_lexical_recheck_floors_learned_value_at_static() {
+    fn store_time_lexical_recheck_ignores_shadow_below_static() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore_config = EnvRestore {
             key: "REIN_CONFIG",
@@ -3921,7 +3920,7 @@ mod tests {
                 .final_score;
         assert!(
             score > 0.55 && score < 0.60,
-            "fixture must stay above learned exploration and below static exploration: {score}"
+            "fixture must stay above shadow exploration and below static exploration: {score}"
         );
         let existing_id = store.store(existing).unwrap();
         let mut incoming =

@@ -1067,6 +1067,66 @@ async fn vec_dedup_accepts_updated_canonical_as_strong_match_candidate() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn vec_dedup_strong_threshold_ignores_lexical_shadow() {
+    use rein::embed::{EmbedderKind, MockEmbedder};
+    use rein::ops::dedup::run_vec_dedup_with_embedder;
+
+    let store = SqliteStore::in_memory().unwrap();
+    let dims = 3072usize;
+    let mut config = ReinConfig::default();
+    config.embedding.dimensions = dims;
+    config.cleanup.vec_dedup_strong_threshold = 0.80;
+
+    let mut candidate = make_memory("vec-threshold-units", "existing canonical body");
+    candidate.access_count = 1;
+    candidate.cluster_id = Some(7);
+    let candidate_id = store.store(candidate).unwrap();
+
+    let mut pending = make_memory("vec-threshold-units", "incoming candidate body");
+    pending.cluster_id = Some(7);
+    let pending_id = store.store(pending).unwrap();
+    store
+        .conn()
+        .execute(
+            "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+            rusqlite::params![&pending_id],
+        )
+        .unwrap();
+
+    let mut state = AdaptiveState {
+        global_dedup_threshold: 0.90,
+        version: 1,
+        ..Default::default()
+    };
+    state.dedup_thresholds.insert(7, 0.90);
+    state.memory_clusters.insert(candidate_id.clone(), 7);
+    state.memory_clusters.insert(pending_id.clone(), 7);
+    state.save_snapshot(store.conn()).unwrap();
+
+    let mut pending_embedding = vec![0.0f32; dims];
+    pending_embedding[0] = 1.0;
+    let cosine = 0.85f32;
+    let mut candidate_embedding = vec![0.0f32; dims];
+    candidate_embedding[0] = cosine;
+    candidate_embedding[1] = (1.0 - cosine * cosine).sqrt();
+    rein::store::vec::insert_embedding(store.conn(), &candidate_id, &candidate_embedding).unwrap();
+    assert!(
+        cosine > config.cleanup.vec_dedup_strong_threshold as f32 && cosine < 0.90,
+        "fixture cosine must sit between vector config and lexical shadow"
+    );
+
+    let mock = EmbedderKind::Mock(MockEmbedder::with_fixed_vector(dims, pending_embedding));
+    run_vec_dedup_with_embedder(&store, &config, mock);
+
+    let pending_after = store.get(&pending_id).unwrap();
+    assert_eq!(
+        pending_after.superseded_by.as_deref(),
+        Some(candidate_id.as_str()),
+        "vector strong merge must use the vector config boundary, not lexical shadow learning"
+    );
+}
+
 /// Codex round-7 MEDIUM regression guard: a failed strong-match merge must
 /// preserve `needs_vec_dedup = 1` so the row can retry on the next sweep.
 /// Pre-fix the savepoint rolled back, but the end-of-loop clear still fired.

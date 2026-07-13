@@ -102,9 +102,9 @@ pub fn build_memory(
 
 /// Return the dedup similarity to use for a run.
 ///
-/// A1 full rollout: destructive lexical dedup may use a higher learned global
-/// threshold, but never one below the operator's static config value. Callers
-/// that know a specific cluster should use
+/// Destructive lexical dedup currently uses the validated operator static
+/// threshold. Unlabeled shadow suggestions remain observable only. Callers
+/// that know a specific cluster still use
 /// `AdaptiveState::get_hard_dedup_threshold(Some(cluster), static_threshold)`;
 /// this helper is for "global default" call sites.
 pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &ReinConfig) -> f32 {
@@ -148,9 +148,9 @@ pub fn store_memory(
     memory: Memory,
 ) -> crate::types::ReinResult<String> {
     let original_id = memory.id.clone();
-    // A1: use adaptive threshold when available, fall back to static config.
-    // store_with_dedup internally resolves per-cluster threshold per candidate;
-    // this is the coarse pre-filter default.
+    // Resolve the hard-effective global threshold. `store_with_dedup`
+    // resolves each candidate cluster through the same static floor; this is
+    // the coarse pre-filter default.
     let dedup_sim = effective_dedup_threshold(store, config);
     let id = store.store_with_dedup(memory, dedup_sim, config.search.dedup_time_window_days)?;
     let stored_memory = store.get(&id)?;
@@ -1600,10 +1600,17 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         })
         .unwrap_or_default();
 
-    // Dedup thresholds
+    // Dedup threshold observability. `per_cluster` / `global` retain the
+    // legacy JSON shape and carry shadow suggestions; the explicit fields
+    // keep those suggestions distinct from the destructive hard threshold.
+    let dedup_threshold_shadow = state.get_dedup_shadow_threshold(None);
+    let dedup_threshold_hard_effective =
+        state.get_hard_dedup_threshold(None, config.search.dedup_similarity as f32);
     let dedup_thresholds = serde_json::json!({
         "per_cluster": state.dedup_thresholds,
-        "global": state.global_dedup_threshold,
+        "global": dedup_threshold_shadow,
+        "dedup_threshold_shadow": dedup_threshold_shadow,
+        "dedup_threshold_hard_effective": dedup_threshold_hard_effective,
     });
 
     let recent_avg: f64 = conn
@@ -1662,11 +1669,20 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
                 .map(crate::search::survival::promotion_access_threshold)
                 .unwrap_or(5);
             let median_survival = survival_lookup.get(cid).and_then(|curve| curve.median_survival);
+            let dedup_threshold_shadow = state.get_dedup_shadow_threshold(Some(*cid));
+            let dedup_threshold_hard_effective = state.get_hard_dedup_threshold(
+                Some(*cid),
+                config.search.dedup_similarity as f32,
+            );
             Some(serde_json::json!({
                 "cluster_id": cid,
                 "memory_count": memory_count,
                 "avg_strength": avg_strength,
-                "dedup_threshold": state.get_dedup_threshold(Some(*cid)),
+                "dedup_threshold_shadow": dedup_threshold_shadow,
+                "dedup_threshold_hard_effective": dedup_threshold_hard_effective,
+                // Compatibility field: historical clients expect this name.
+                // It now means the destructive hard-effective threshold.
+                "dedup_threshold": dedup_threshold_hard_effective,
                 "admission_threshold": admission_threshold,
                 "promotion_threshold": promotion_threshold,
                 "median_survival": median_survival,
@@ -2034,10 +2050,11 @@ mod tests {
     use super::*;
     use crate::config::ReinConfig;
     use crate::store::SqliteStore;
+    use crate::types::traits::MemoryStore;
     use chrono::Utc;
 
     #[test]
-    fn effective_dedup_threshold_floors_learned_value_at_static() {
+    fn effective_dedup_threshold_ignores_shadow_below_static() {
         let store = SqliteStore::in_memory().unwrap();
         let config = ReinConfig::default();
         let state = crate::store::adaptive::AdaptiveState {
@@ -2051,6 +2068,49 @@ mod tests {
             effective_dedup_threshold(&store, &config),
             config.search.dedup_similarity as f32
         );
+    }
+
+    #[test]
+    fn adaptive_status_labels_shadow_and_hard_effective_dedup_thresholds() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.search.dedup_similarity = 0.70;
+        let mut memory = test_memory("adaptive", "threshold profile", "profile content");
+        memory.cluster_id = Some(7);
+        let memory_id = memory.id.clone();
+        store.store(memory).unwrap();
+
+        let mut state = crate::store::adaptive::AdaptiveState {
+            global_dedup_threshold: 0.80,
+            version: 1,
+            ..Default::default()
+        };
+        state.memory_clusters.insert(memory_id, 7);
+        state.dedup_thresholds.insert(7, 0.85);
+        state.save_snapshot(store.conn()).unwrap();
+
+        let status = adaptive_status_with_config(&store, &config);
+        let assert_threshold = |actual: Option<f64>, expected: f64| {
+            assert!((actual.unwrap() - expected).abs() < 1e-6);
+        };
+        assert_threshold(
+            status["dedup_thresholds"]["dedup_threshold_shadow"].as_f64(),
+            0.80,
+        );
+        assert_threshold(
+            status["dedup_thresholds"]["dedup_threshold_hard_effective"].as_f64(),
+            0.70,
+        );
+        let profile = status["cluster_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["cluster_id"].as_u64() == Some(7))
+            .unwrap();
+
+        assert_threshold(profile["dedup_threshold_shadow"].as_f64(), 0.85);
+        assert_threshold(profile["dedup_threshold_hard_effective"].as_f64(), 0.70);
+        assert_threshold(profile["dedup_threshold"].as_f64(), 0.70);
     }
 
     fn test_memory(topic: &str, summary: &str, content: &str) -> Memory {
