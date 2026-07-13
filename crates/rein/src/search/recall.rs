@@ -36,7 +36,7 @@ pub struct RecallResult {
 /// Read-only A12 replay output: production's pre-MMR legacy order plus the
 /// existing six-dimensional optimizer input.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct A12RecallTrace {
     pub legacy_order: Vec<String>,
     pub event: crate::search::alpha_optimizer::RecallEvent,
@@ -45,14 +45,24 @@ pub(crate) struct A12RecallTrace {
 #[derive(Debug, Clone, Copy)]
 enum RecallExecutionMode<'a> {
     Live,
-    A12Loo(&'a crate::ops::a12_autocalibration::A12LooCase),
+    A12Loo {
+        case: &'a crate::ops::a12_autocalibration::A12LooCase,
+        evaluation_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl<'a> RecallExecutionMode<'a> {
     fn loo_case(self) -> Option<&'a crate::ops::a12_autocalibration::A12LooCase> {
         match self {
             Self::Live => None,
-            Self::A12Loo(case) => Some(case),
+            Self::A12Loo { case, .. } => Some(case),
+        }
+    }
+
+    fn evaluation_at(self) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::Live => chrono::Utc::now(),
+            Self::A12Loo { evaluation_at, .. } => evaluation_at,
         }
     }
 
@@ -705,6 +715,19 @@ pub(crate) fn recall_loo_trace(
     case: &crate::ops::a12_autocalibration::A12LooCase,
     limit: usize,
 ) -> ReinResult<A12RecallTrace> {
+    recall_loo_trace_at(store, config, case, limit, chrono::Utc::now())
+}
+
+/// Deterministic A12 replay at the generation's single captured wall-clock
+/// instant. Callers must bind `evaluation_at` into the generation fingerprint.
+#[allow(dead_code)]
+pub(crate) fn recall_loo_trace_at(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    case: &crate::ops::a12_autocalibration::A12LooCase,
+    limit: usize,
+    evaluation_at: chrono::DateTime<chrono::Utc>,
+) -> ReinResult<A12RecallTrace> {
     let execution = recall_temporal_with_execution_mode(
         store,
         config,
@@ -717,7 +740,10 @@ pub(crate) fn recall_loo_trace(
         Some(false),
         true,
         None,
-        RecallExecutionMode::A12Loo(case),
+        RecallExecutionMode::A12Loo {
+            case,
+            evaluation_at,
+        },
     )?;
     Ok(execution
         .trace
@@ -743,6 +769,7 @@ fn recall_temporal_with_execution_mode(
     let total_start = std::time::Instant::now();
     let loo_case = execution_mode.loo_case();
     let is_loo = execution_mode.is_loo();
+    let evaluation_at = execution_mode.evaluation_at();
 
     // === Query classification (FT-3: autonomous retrieval routing) ===
     let strategy = crate::search::classify::classify(query, time_from.is_some(), time_to.is_some());
@@ -752,8 +779,8 @@ fn recall_temporal_with_execution_mode(
     let (time_from, time_to) =
         if strategy.force_temporal && time_from.is_none() && time_to.is_none() {
             if let Some(days) = strategy.temporal_days_back {
-                let from = chrono::Utc::now() - chrono::Duration::days(days);
-                (Some(from), Some(chrono::Utc::now()))
+                let from = evaluation_at - chrono::Duration::days(days);
+                (Some(from), Some(evaluation_at))
             } else {
                 (time_from, time_to)
             }
@@ -1111,6 +1138,7 @@ fn recall_temporal_with_execution_mode(
         query: &str,
         effective_limit: usize,
         is_episodic: bool,
+        fixed_evaluation_at: Option<chrono::DateTime<chrono::Utc>>,
         time_from: Option<chrono::DateTime<chrono::Utc>>,
         time_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> (
@@ -1124,7 +1152,22 @@ fn recall_temporal_with_execution_mode(
             crate::search::kg_search::search_concepts_ranked_from(&seed_concepts, effective_limit);
         let seed_ids: Vec<String> = seed_concepts.iter().map(|c| c.id.clone()).collect();
         let bfs_expanded = if !seed_ids.is_empty() {
-            crate::search::kg_search::bfs_expand_memories_by_id(s, &seed_ids, 2, effective_limit)
+            if let Some(evaluation_at) = fixed_evaluation_at {
+                crate::search::kg_search::bfs_expand_memories_by_id_at(
+                    s,
+                    &seed_ids,
+                    2,
+                    effective_limit,
+                    evaluation_at,
+                )
+            } else {
+                crate::search::kg_search::bfs_expand_memories_by_id(
+                    s,
+                    &seed_ids,
+                    2,
+                    effective_limit,
+                )
+            }
         } else {
             vec![]
         };
@@ -1161,6 +1204,7 @@ fn recall_temporal_with_execution_mode(
             query,
             channel_retrieval_limit,
             kg_is_episodic,
+            is_loo.then_some(evaluation_at),
             time_from,
             time_to,
         );
@@ -1205,6 +1249,7 @@ fn recall_temporal_with_execution_mode(
                         &kg_query_str,
                         kg_effective_limit,
                         kg_is_episodic,
+                        None,
                         kg_time_from,
                         kg_time_to,
                     );
@@ -1225,6 +1270,7 @@ fn recall_temporal_with_execution_mode(
                 &kg_query_str,
                 kg_effective_limit,
                 kg_is_episodic,
+                None,
                 kg_time_from,
                 kg_time_to,
             );
@@ -1368,6 +1414,7 @@ fn recall_temporal_with_execution_mode(
                     eq,
                     effective_limit,
                     kg_is_episodic,
+                    is_loo.then_some(evaluation_at),
                     time_from,
                     time_to,
                 );
@@ -1406,7 +1453,8 @@ fn recall_temporal_with_execution_mode(
                             if let Some(guard) = pool.try_get() {
                                 let (conn, detached) = guard.detach();
                                 let s = SqliteStore::from_conn(conn, db_path.clone(), dims);
-                                let result = run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to);
+                                let result =
+                                    run_kg_search(&s, &eq_str, limit, is_ep, None, t_from, t_to);
                                 let conn_back = s.into_conn();
                                 detached.put_back(conn_back);
                                 return result;
@@ -1418,7 +1466,7 @@ fn recall_temporal_with_execution_mode(
                         let Ok(s) = SqliteStore::new(&db_path, &model, dims) else {
                             return empty();
                         };
-                        run_kg_search(&s, &eq_str, limit, is_ep, t_from, t_to)
+                        run_kg_search(&s, &eq_str, limit, is_ep, None, t_from, t_to)
                     })
                 })
                 .collect();
@@ -2071,8 +2119,11 @@ fn recall_temporal_with_execution_mode(
                 .cluster_id
                 .and_then(|cid| survival_cache.get(&cid))
                 .or(global_prior.as_ref());
-            let final_score = crate::search::scoring::apply_strength_weighting_with_curve(
-                rrf_score, &memory, curve,
+            let final_score = crate::search::scoring::apply_strength_weighting_with_curve_at(
+                rrf_score,
+                &memory,
+                curve,
+                evaluation_at,
             );
             local_results.push((memory, final_score));
         }
@@ -2128,7 +2179,7 @@ fn recall_temporal_with_execution_mode(
                 vec_score: vec,
                 kg_score: kg,
                 episode_score: episode,
-                recency_days: (chrono::Utc::now() - mem.created_at).num_hours() as f32 / 24.0,
+                recency_days: (evaluation_at - mem.created_at).num_hours() as f32 / 24.0,
                 access_count: mem.access_count,
                 strength: mem.strength as f32,
                 importance_weight: importance_weight(&mem.importance),
@@ -2142,7 +2193,7 @@ fn recall_temporal_with_execution_mode(
                 channel_coverage,
                 canonical_support: mem.support_count as f32 / (mem.support_count as f32 + 1.0),
                 source_diversity: mem.source_diversity / (mem.source_diversity + 1.0),
-                usage_recency: (chrono::Utc::now() - mem.last_accessed).num_hours() as f32 / 24.0,
+                usage_recency: (evaluation_at - mem.last_accessed).num_hours() as f32 / 24.0,
                 connectivity: (mem.related_ids.len().min(10) as f32) / 10.0,
                 concept_richness: (mem.concept_ids.len().min(5) as f32) / 5.0,
                 tier_score: match mem.tier {
@@ -2162,8 +2213,7 @@ fn recall_temporal_with_execution_mode(
                     .and_then(|cid| survival_cache.get(&cid))
                     .or(global_prior.as_ref())
                     .map(|curve| {
-                        let days =
-                            (chrono::Utc::now() - mem.last_accessed).num_hours() as f64 / 24.0;
+                        let days = (evaluation_at - mem.last_accessed).num_hours() as f64 / 24.0;
                         curve.probability_at(days) as f32
                     })
                     .unwrap_or(0.5),
@@ -2422,7 +2472,7 @@ fn recall_temporal_with_execution_mode(
             candidates,
             accessed_ids,
             negative_ids: vec![],
-            timestamp: chrono::Utc::now(),
+            timestamp: evaluation_at,
             query_cluster_id_at_recall: query_cluster_id_from_snapshot,
             cluster_version_at_recall: adaptive_state_snapshot
                 .as_ref()
@@ -2912,10 +2962,10 @@ fn retain_loo_channel_scores(
     scores.retain(|memory_id, _| !execution_mode.excludes_memory(store, memory_id));
 }
 
-/// Read-only lexical acquisition for evaluation. A clean existing Tantivy
-/// index may be searched, but marker repair/rebuild paths are never entered;
-/// dirty or rebuilding indexes fall back to FTS5. Both sources remove LOO
-/// exclusions before their cutoffs and rank encoding.
+/// Read-only lexical acquisition for evaluation. A12 deliberately uses only
+/// transaction-scoped FTS5: Tantivy is an external side index that cannot join
+/// the SQLite snapshot/cutoff used to prove a single replay generation.
+/// Exclusions are removed before cutoffs and rank encoding.
 fn try_local_fts_read_only_loo(
     store: &SqliteStore,
     query: &str,
@@ -2926,37 +2976,6 @@ fn try_local_fts_read_only_loo(
     let fetch_limit = execution_mode.channel_fetch_limit(store, limit);
     let mut memories = Vec::new();
     let mut ranked = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-
-    let db_path = store.db_path();
-    let tantivy_dirty = crate::search::warmup::tantivy_dirty_path(db_path);
-    let tantivy_rebuilding = crate::search::warmup::tantivy_rebuilding_path(db_path);
-    if db_path.to_str() != Some(":memory:")
-        && !tantivy_dirty.exists()
-        && !tantivy_rebuilding.exists()
-    {
-        let tantivy_path = db_path.with_extension("tantivy");
-        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open_existing(&tantivy_path) {
-            if let Ok(results) = tantivy.search(query, topic, fetch_limit) {
-                let mut retained_rank = 0_usize;
-                for (memory_id, score) in results {
-                    if execution_mode.excludes_memory(store, &memory_id) {
-                        continue;
-                    }
-                    let rank = retained_rank;
-                    retained_rank += 1;
-                    if rank >= limit || seen_ids.contains(&memory_id) {
-                        continue;
-                    }
-                    if let Ok(memory) = store.get(&memory_id) {
-                        seen_ids.insert(memory_id.clone());
-                        ranked.push((memory_id, if score > 0.0 { score } else { -(rank as f32) }));
-                        memories.push(memory);
-                    }
-                }
-            }
-        }
-    }
 
     let fts_results = crate::store::fts::search_fts(store.conn(), query, topic, fetch_limit)?;
     let mut retained_rank = 0_usize;
@@ -2966,7 +2985,7 @@ fn try_local_fts_read_only_loo(
         }
         let rank = retained_rank;
         retained_rank += 1;
-        if rank >= limit || !seen_ids.insert(memory.id.clone()) {
+        if rank >= limit {
             continue;
         }
         ranked.push((memory.id.clone(), -(rank as f32)));
@@ -3859,7 +3878,10 @@ mod tests {
             .store(test_memory("retained-four-channel", 1, 1.0))
             .unwrap();
         let case = a12_test_case(query, &held_out_id, &retained_id, vec![excluded_id.clone()]);
-        let mode = RecallExecutionMode::A12Loo(&case);
+        let mode = RecallExecutionMode::A12Loo {
+            case: &case,
+            evaluation_at: Utc::now(),
+        };
         let channel = || {
             std::collections::HashMap::from([
                 (excluded_id.clone(), 100.0_f32),
@@ -3881,7 +3903,11 @@ mod tests {
     #[test]
     fn recall_loo_trace_policy_disables_dynamic_six_weights_but_keeps_legacy_alpha() {
         let case = a12_test_case("policy needle", "held-out", "positive", vec![]);
-        assert!(!RecallExecutionMode::A12Loo(&case).allows_dynamic_six_weights());
+        assert!(!RecallExecutionMode::A12Loo {
+            case: &case,
+            evaluation_at: Utc::now(),
+        }
+        .allows_dynamic_six_weights());
         assert!(RecallExecutionMode::Live.allows_dynamic_six_weights());
         assert_eq!(legacy_cc_alpha(Some(0.73), Some(0.11), 0.4), 0.73);
         assert_eq!(legacy_cc_alpha(None, Some(0.11), 0.4), 0.11);

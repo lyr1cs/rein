@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 // ---------------------------------------------------------------------------
 
 /// A single candidate's normalized scores from a recall event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateLog {
     pub memory_id: String,
     pub bm25_norm: f32,
@@ -27,7 +27,7 @@ pub struct CandidateLog {
 }
 
 /// A logged recall event with outcome.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallEvent {
     pub request_id: String,
     pub candidates: Vec<CandidateLog>,
@@ -135,7 +135,7 @@ pub struct LearnedAlpha {
 ///
 /// This is deliberately a pure offline helper: production recall still uses
 /// scalar alpha until a later activation slice wires these weights in.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ShadowFusionWeights {
     pub bm25: f64,
     pub vec: f64,
@@ -210,6 +210,27 @@ pub struct LearnedShadowWeights {
     pub weights: ShadowFusionWeights,
     pub sample_count: usize,
     pub last_updated: DateTime<Utc>,
+}
+
+/// One canonical family worth of A12 self-supervised recall traces.
+///
+/// The optimizer groups duplicate `stable_family_id` rows defensively, so a
+/// caller cannot increase a family's influence by splitting its views across
+/// multiple values.
+#[derive(Debug, Clone)]
+pub(crate) struct FamilyShadowObservation {
+    pub stable_family_id: String,
+    pub events: Vec<RecallEvent>,
+}
+
+/// Pure, snapshot-local result of family-equal six-dimensional optimization.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FamilyLearnedShadowWeights {
+    pub weights: ShadowFusionWeights,
+    /// Number of distinct families with at least one informative case.
+    pub family_ess: usize,
+    /// Number of informative cases averaged inside those families.
+    pub case_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +861,140 @@ pub fn optimize_shadow_weights(
     })
 }
 
+/// Optimize a deterministic six-dimensional simplex with one unit of weight
+/// per canonical family, regardless of how many evidence views it contains.
+///
+/// Each case first reuses [`optimal_shadow_weights_for_event`] for the existing
+/// informativeness contract. The union of those events' existing deterministic
+/// simplex candidates is then scored by mean reciprocal-rank reward within
+/// each family and mean family reward across families. This is deliberately an
+/// argmax of the family-equal objective, not an average of per-event argmaxes.
+/// Sorting events and candidates makes the exact floating-point output
+/// independent of caller iteration order. Families without an informative
+/// case do not enter ESS or the learned value.
+pub(crate) fn optimize_family_equal_shadow_weights(
+    observations: &[FamilyShadowObservation],
+) -> Option<FamilyLearnedShadowWeights> {
+    let mut grouped: std::collections::BTreeMap<&str, Vec<&RecallEvent>> =
+        std::collections::BTreeMap::new();
+    for observation in observations {
+        grouped
+            .entry(observation.stable_family_id.as_str())
+            .or_default()
+            .extend(observation.events.iter());
+    }
+
+    let mut family_events = Vec::new();
+    let mut candidates = Vec::new();
+    let mut case_count = 0_usize;
+    for events in grouped.values() {
+        let mut informative = events
+            .iter()
+            .copied()
+            .filter(|event| optimal_shadow_weights_for_event(event).is_some())
+            .collect::<Vec<_>>();
+        informative.sort_by(recall_event_total_cmp);
+        if informative.is_empty() {
+            continue;
+        }
+        for event in &informative {
+            for weights in shadow_weight_candidates_for_event(event) {
+                push_shadow_weight_candidate(&mut candidates, weights);
+            }
+        }
+        case_count += informative.len();
+        family_events.push(informative);
+    }
+
+    if family_events.is_empty() {
+        return None;
+    }
+    candidates.sort_by(shadow_weights_total_cmp);
+    let family_ess = family_events.len();
+    let objective = |weights: ShadowFusionWeights| {
+        family_events
+            .iter()
+            .map(|events| {
+                events
+                    .iter()
+                    .map(|event| normalized_shadow_reciprocal_rank_reward(event, weights))
+                    .sum::<f64>()
+                    / events.len() as f64
+            })
+            .sum::<f64>()
+            / family_ess as f64
+    };
+    let mut best_weights = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for weights in candidates {
+        let score = objective(weights);
+        if score > best_score + 1e-12 {
+            best_score = score;
+            best_weights = Some(weights);
+        }
+    }
+
+    Some(FamilyLearnedShadowWeights {
+        weights: best_weights?,
+        family_ess,
+        case_count,
+    })
+}
+
+fn shadow_weights_total_cmp(
+    left: &ShadowFusionWeights,
+    right: &ShadowFusionWeights,
+) -> std::cmp::Ordering {
+    for (left, right) in left.as_array().iter().zip(right.as_array().iter()) {
+        let ordering = left.total_cmp(right);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn recall_event_total_cmp(left: &&RecallEvent, right: &&RecallEvent) -> std::cmp::Ordering {
+    let mut ordering = left.request_id.cmp(&right.request_id);
+    if ordering != std::cmp::Ordering::Equal {
+        return ordering;
+    }
+    for (left, right) in left.candidates.iter().zip(&right.candidates) {
+        ordering = candidate_log_total_cmp(left, right);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    ordering = left.candidates.len().cmp(&right.candidates.len());
+    if ordering != std::cmp::Ordering::Equal {
+        return ordering;
+    }
+    ordering = sorted_string_slice_cmp(&left.accessed_ids, &right.accessed_ids);
+    if ordering != std::cmp::Ordering::Equal {
+        return ordering;
+    }
+    sorted_string_slice_cmp(&left.negative_ids, &right.negative_ids)
+}
+
+fn candidate_log_total_cmp(left: &CandidateLog, right: &CandidateLog) -> std::cmp::Ordering {
+    left.memory_id
+        .cmp(&right.memory_id)
+        .then_with(|| left.bm25_norm.total_cmp(&right.bm25_norm))
+        .then_with(|| left.vec_norm.total_cmp(&right.vec_norm))
+        .then_with(|| left.kg_norm.total_cmp(&right.kg_norm))
+        .then_with(|| left.episode_norm.total_cmp(&right.episode_norm))
+        .then_with(|| left.support_count.cmp(&right.support_count))
+        .then_with(|| left.source_diversity.total_cmp(&right.source_diversity))
+}
+
+fn sorted_string_slice_cmp(left: &[String], right: &[String]) -> std::cmp::Ordering {
+    let mut left = left.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut right = right.iter().map(String::as_str).collect::<Vec<_>>();
+    left.sort_unstable();
+    right.sort_unstable();
+    left.cmp(&right)
+}
+
 pub fn shrink_shadow_weights_toward_parent(
     bucket_weights: ShadowFusionWeights,
     parent_prior: ShadowFusionWeights,
@@ -925,6 +1080,45 @@ fn shadow_reciprocal_rank_sum(event: &RecallEvent, weights: ShadowFusionWeights)
         group_start = group_end;
     }
     mrr_sum
+}
+
+/// Normalize the signed reciprocal-rank reward by the number of labels that
+/// can actually be evaluated against this event's candidate set. A case with
+/// three independently supported positives therefore still contributes one
+/// case worth of reward, rather than three times the influence of a
+/// single-positive case. Duplicate labels are counted once; when an id is
+/// (invalidly) present in both sets, the positive wins just as it does in
+/// [`shadow_reciprocal_rank_sum`].
+fn normalized_shadow_reciprocal_rank_reward(
+    event: &RecallEvent,
+    weights: ShadowFusionWeights,
+) -> f64 {
+    let label_count = valid_shadow_label_count(event);
+    if label_count == 0 {
+        return 0.0;
+    }
+    shadow_reciprocal_rank_sum(event, weights) / label_count as f64
+}
+
+fn valid_shadow_label_count(event: &RecallEvent) -> usize {
+    let candidate_ids = event
+        .candidates
+        .iter()
+        .map(|candidate| candidate.memory_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let positives = event
+        .accessed_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|memory_id| candidate_ids.contains(memory_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let negatives = event
+        .negative_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|memory_id| candidate_ids.contains(memory_id) && !positives.contains(memory_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    positives.len().saturating_add(negatives.len())
 }
 
 fn shadow_features(candidate: &CandidateLog) -> [f64; SHADOW_DIMENSIONS] {
@@ -1509,6 +1703,289 @@ mod tests {
             + (a.episode - b.episode).abs()
             + (a.support - b.support).abs()
             + (a.diversity - b.diversity).abs()
+    }
+
+    fn bm25_shadow_event(request_id: &str) -> RecallEvent {
+        let mut event = shadow_event();
+        event.request_id = request_id.to_string();
+        event.candidates[0].bm25_norm = 1.0;
+        event.candidates[0].kg_norm = 0.0;
+        event.candidates[1].bm25_norm = 0.0;
+        event.candidates[1].kg_norm = 1.0;
+        event
+    }
+
+    #[test]
+    fn family_shadow_optimizer_weights_each_family_once() {
+        let kg_event = shadow_event();
+        let bm25_event = bm25_shadow_event("bm25-0");
+        let many_bm25_cases = (0..64)
+            .map(|index| bm25_shadow_event(&format!("bm25-{index:02}")))
+            .collect();
+
+        let one_case_each = optimize_family_equal_shadow_weights(&[
+            FamilyShadowObservation {
+                stable_family_id: "one-case-family".to_string(),
+                events: vec![kg_event.clone()],
+            },
+            FamilyShadowObservation {
+                stable_family_id: "many-case-family".to_string(),
+                events: vec![bm25_event],
+            },
+        ])
+        .expect("both families are informative");
+        let learned = optimize_family_equal_shadow_weights(&[
+            FamilyShadowObservation {
+                stable_family_id: "one-case-family".to_string(),
+                events: vec![kg_event],
+            },
+            FamilyShadowObservation {
+                stable_family_id: "many-case-family".to_string(),
+                events: many_bm25_cases,
+            },
+        ])
+        .expect("both families are informative");
+
+        assert_eq!(learned.weights, one_case_each.weights);
+        assert_eq!(learned.family_ess, 2);
+        assert_eq!(learned.case_count, 65);
+        assert_eq!(one_case_each.case_count, 2);
+    }
+
+    #[test]
+    fn family_shadow_optimizer_normalizes_each_case_by_valid_label_count() {
+        let positive = |memory_id: &str| CandidateLog {
+            memory_id: memory_id.to_string(),
+            bm25_norm: 0.0,
+            vec_norm: 0.0,
+            kg_norm: 1.0,
+            episode_norm: 0.0,
+            support_count: 1,
+            source_diversity: 1.0,
+        };
+        let multi_positive = RecallEvent {
+            request_id: "three-label-case".to_string(),
+            candidates: vec![
+                positive("p1"),
+                positive("p2"),
+                positive("p3"),
+                CandidateLog {
+                    memory_id: "bm25-competitor".to_string(),
+                    bm25_norm: 1.0,
+                    vec_norm: 0.0,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["p1".to_string(), "p2".to_string(), "p3".to_string()],
+            negative_ids: Vec::new(),
+            timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        let single_positive = RecallEvent {
+            request_id: "one-label-case".to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "target".to_string(),
+                    bm25_norm: 1.0,
+                    vec_norm: 0.0,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "kg-competitor".to_string(),
+                    bm25_norm: 0.0,
+                    vec_norm: 0.0,
+                    kg_norm: 1.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["target".to_string()],
+            negative_ids: Vec::new(),
+            timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        };
+        let observations = [
+            FamilyShadowObservation {
+                stable_family_id: "multi-positive-family".to_string(),
+                events: vec![multi_positive.clone()],
+            },
+            FamilyShadowObservation {
+                stable_family_id: "single-positive-family".to_string(),
+                events: vec![single_positive.clone()],
+            },
+        ];
+
+        let learned = optimize_family_equal_shadow_weights(&observations).unwrap();
+
+        let pure_bm25 = ShadowFusionWeights::from_array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let pure_kg = ShadowFusionWeights::from_array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+        let objective = |weights| {
+            (normalized_shadow_reciprocal_rank_reward(&multi_positive, weights)
+                + normalized_shadow_reciprocal_rank_reward(&single_positive, weights))
+                / 2.0
+        };
+        assert!(objective(pure_bm25) > objective(pure_kg));
+
+        assert!(
+            learned.weights.bm25 > learned.weights.kg,
+            "three labels in one case must not overpower the equally weighted single-label family: {:?}",
+            learned.weights
+        );
+        assert_eq!(valid_shadow_label_count(&multi_positive), 3);
+        assert_eq!(valid_shadow_label_count(&single_positive), 1);
+    }
+
+    #[test]
+    fn family_shadow_optimizer_is_permutation_deterministic() {
+        let forward = vec![
+            FamilyShadowObservation {
+                stable_family_id: "z-family".to_string(),
+                events: vec![bm25_shadow_event("b"), shadow_event()],
+            },
+            FamilyShadowObservation {
+                stable_family_id: "a-family".to_string(),
+                events: vec![bm25_shadow_event("a")],
+            },
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        for family in &mut reversed {
+            family.events.reverse();
+        }
+
+        assert_eq!(
+            optimize_family_equal_shadow_weights(&forward),
+            optimize_family_equal_shadow_weights(&reversed)
+        );
+    }
+
+    #[test]
+    fn family_optimizer_totally_orders_duplicate_ids_with_different_evidence() {
+        let mut first = shadow_event();
+        first.request_id = "duplicate-request".to_string();
+        let mut second = first.clone();
+        second.candidates[0].bm25_norm = 0.875;
+        second.candidates[1].source_diversity = 3.25;
+        second.accessed_ids = vec!["bm25_noise".to_string()];
+        let mut third = first.clone();
+        third.candidates[0].support_count = 9;
+        third.accessed_ids = vec!["vec_noise".to_string()];
+        third.negative_ids = vec!["target".to_string()];
+
+        assert_ne!(
+            recall_event_total_cmp(&&first, &&second),
+            std::cmp::Ordering::Equal
+        );
+        assert_ne!(
+            recall_event_total_cmp(&&second, &&third),
+            std::cmp::Ordering::Equal
+        );
+        let forward = FamilyShadowObservation {
+            stable_family_id: "same-family".to_string(),
+            events: vec![first, second, third],
+        };
+        let mut reversed = forward.clone();
+        reversed.events.reverse();
+
+        assert_eq!(
+            optimize_family_equal_shadow_weights(&[forward]),
+            optimize_family_equal_shadow_weights(&[reversed])
+        );
+    }
+
+    fn threshold_shadow_event(
+        request_id: &str,
+        target: (f32, f32),
+        competitor: (f32, f32),
+    ) -> RecallEvent {
+        RecallEvent {
+            request_id: request_id.to_string(),
+            candidates: vec![
+                CandidateLog {
+                    memory_id: "target".to_string(),
+                    bm25_norm: target.0,
+                    vec_norm: target.1,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+                CandidateLog {
+                    memory_id: "competitor".to_string(),
+                    bm25_norm: competitor.0,
+                    vec_norm: competitor.1,
+                    kg_norm: 0.0,
+                    episode_norm: 0.0,
+                    support_count: 1,
+                    source_diversity: 1.0,
+                },
+            ],
+            accessed_ids: vec!["target".to_string()],
+            negative_ids: Vec::new(),
+            timestamp: Utc::now(),
+            query_cluster_id_at_recall: None,
+            cluster_version_at_recall: None,
+            query_top_vec_memory_id_at_recall: None,
+        }
+    }
+
+    fn mean_family_reward(events: &[RecallEvent], weights: ShadowFusionWeights) -> f64 {
+        events
+            .iter()
+            .map(|event| shadow_reciprocal_rank_sum(event, weights))
+            .sum::<f64>()
+            / events.len() as f64
+    }
+
+    #[test]
+    fn family_optimizer_maximizes_mean_objective_not_mean_of_argmaxes() {
+        // These two cases have a shared best plateau, but averaging their
+        // individual argmax vectors falls off it (reward 0.625 vs 0.75).
+        let events = vec![
+            threshold_shadow_event("bm25-floor", (1.0, 0.0), (0.0, 1.0)),
+            threshold_shadow_event("vec-floor", (0.0, 1.0), (1.2, 0.0)),
+        ];
+        let per_case_mean = ShadowFusionWeights::from_array(std::array::from_fn(|index| {
+            events
+                .iter()
+                .map(|event| optimal_shadow_weights_for_event(event).unwrap().as_array()[index])
+                .sum::<f64>()
+                / events.len() as f64
+        }))
+        .normalized_or_default();
+        let mut candidates = Vec::new();
+        for event in &events {
+            for weights in shadow_weight_candidates_for_event(event) {
+                push_shadow_weight_candidate(&mut candidates, weights);
+            }
+        }
+        candidates.sort_by(shadow_weights_total_cmp);
+        let best_reward = candidates
+            .iter()
+            .map(|weights| mean_family_reward(&events, *weights))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(mean_family_reward(&events, per_case_mean), 0.625);
+        assert_eq!(best_reward, 0.75);
+
+        let learned = optimize_family_equal_shadow_weights(&[FamilyShadowObservation {
+            stable_family_id: "adversarial-family".to_string(),
+            events: events.clone(),
+        }])
+        .unwrap();
+
+        assert_eq!(mean_family_reward(&events, learned.weights), best_reward);
+        assert!(candidates.contains(&learned.weights));
     }
 
     #[test]

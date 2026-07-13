@@ -12,10 +12,20 @@ pub fn calculate_strength(memory: &Memory) -> f64 {
 /// When a per-cluster survival curve is available and has sufficient data,
 /// it replaces the fixed Ebbinghaus formula for data-driven decay.
 pub fn calculate_strength_with_curve(memory: &Memory, curve: Option<&SurvivalCurve>) -> f64 {
+    calculate_strength_with_curve_at(memory, curve, chrono::Utc::now())
+}
+
+/// Deterministic variant used by offline replay so one calibration generation
+/// evaluates every case at the same instant.
+pub(crate) fn calculate_strength_with_curve_at(
+    memory: &Memory,
+    curve: Option<&SurvivalCurve>,
+    evaluation_at: chrono::DateTime<chrono::Utc>,
+) -> f64 {
     if memory.importance == crate::types::Importance::Critical {
         return 1.0; // Critical never decays
     }
-    let days = (chrono::Utc::now() - memory.last_accessed).num_seconds() as f64 / 86400.0;
+    let days = (evaluation_at - memory.last_accessed).num_seconds() as f64 / 86400.0;
     if days <= 0.0 {
         return 1.0;
     }
@@ -30,7 +40,11 @@ pub fn calculate_strength_with_curve(memory: &Memory, curve: Option<&SurvivalCur
 /// Recency boost: recent memories get higher scores.
 /// 24h → +50%, 7 days → linearly decays to +0%, older → no boost.
 pub fn recency_boost(memory: &Memory) -> f32 {
-    let hours = (chrono::Utc::now() - memory.created_at).num_hours() as f64;
+    recency_boost_at(memory, chrono::Utc::now())
+}
+
+fn recency_boost_at(memory: &Memory, evaluation_at: chrono::DateTime<chrono::Utc>) -> f32 {
+    let hours = (evaluation_at - memory.created_at).num_hours() as f64;
     if hours <= 24.0 {
         1.5
     } else if hours <= 168.0 {
@@ -53,8 +67,18 @@ pub fn apply_strength_weighting_with_curve(
     memory: &Memory,
     curve: Option<&SurvivalCurve>,
 ) -> f32 {
-    let strength = calculate_strength_with_curve(memory, curve);
-    let recency = recency_boost(memory);
+    apply_strength_weighting_with_curve_at(rrf_score, memory, curve, chrono::Utc::now())
+}
+
+/// Deterministic variant used by A12's snapshot-scoped replay.
+pub(crate) fn apply_strength_weighting_with_curve_at(
+    rrf_score: f32,
+    memory: &Memory,
+    curve: Option<&SurvivalCurve>,
+    evaluation_at: chrono::DateTime<chrono::Utc>,
+) -> f32 {
+    let strength = calculate_strength_with_curve_at(memory, curve, evaluation_at);
+    let recency = recency_boost_at(memory, evaluation_at);
     rrf_score * strength as f32 * (1.0 + memory.access_count as f32 * 0.2) * recency
 }
 
