@@ -130,7 +130,7 @@ provider = "google"
 inject_existing_context = false  # inject prior memory summaries into extraction prompts (opt-in)
 
 [extract.google]
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 max_input_chars = 0   # 0 = no truncation (1M token model). Set a limit if using a smaller model.
 # endpoint defaults to "https://generativelanguage.googleapis.com"
 # endpoint = "https://your-proxy.example.com"
@@ -149,7 +149,7 @@ provider = "google"           # "google", "omlx", or "none"
 max_expansions = 3            # Number of query variants to generate
 
 [query_expansion.google]
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 # api_key auto-reads from GEMINI_API_KEY env
 # endpoint defaults to "https://generativelanguage.googleapis.com"
 

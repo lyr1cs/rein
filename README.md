@@ -427,7 +427,7 @@ rein upgrade --topic debug  # convert specific topic only
 provider = "google"    # or "omlx" or "none"
 
 [extract.google]
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 max_input_chars = 0    # 0 = no truncation (1M token model)
 
 [extract.omlx]
@@ -1423,7 +1423,7 @@ rein upgrade              # 将旧记忆转为知识图谱
 provider = "google"    # 或 "omlx" 或 "none"
 
 [extract.google]
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 max_input_chars = 0    # 0 = 不截断（1M token 模型）
 
 [extract.omlx]

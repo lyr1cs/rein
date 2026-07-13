@@ -756,7 +756,7 @@ pub struct LlmDefaultsConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LlmProviderTable {
-    /// Model name (e.g. `"gemini-3.1-flash-lite-preview"`,
+    /// Model name (e.g. `"gemini-3.1-flash-lite"`,
     /// `"gemini-3.1-pro"`, `"default"`).
     #[serde(default)]
     pub model: Option<String>,
@@ -1338,7 +1338,7 @@ pub struct AsyncMemoryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleExtractConfig {
-    /// Gemini model id. Default: "gemini-3.1-flash-lite-preview".
+    /// Gemini model id. Default: "gemini-3.1-flash-lite".
     pub model: String,
     /// Gemini API key. Default: None (populated from GEMINI_API_KEY at load time).
     #[serde(default)]
@@ -1347,7 +1347,7 @@ pub struct GoogleExtractConfig {
     /// Default: "https://generativelanguage.googleapis.com"
     #[serde(default = "default_google_endpoint")]
     pub endpoint: String,
-    /// Max input characters. 0 = no truncation (default for gemini-3.1-flash-lite-preview which supports 1M tokens).
+    /// Max input characters. 0 = no truncation (default for gemini-3.1-flash-lite which supports 1M tokens).
     #[serde(default)]
     pub max_input_chars: usize,
 }
@@ -1407,7 +1407,7 @@ fn default_max_expansions() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleExpandConfig {
-    /// Gemini model id for query expansion. Default: "gemini-3.1-flash-lite-preview".
+    /// Gemini model id for query expansion. Default: "gemini-3.1-flash-lite".
     #[serde(default = "default_expand_google_model")]
     pub model: String,
     /// Gemini API key. Default: None (falls back to GEMINI_API_KEY).
@@ -1420,7 +1420,7 @@ pub struct GoogleExpandConfig {
 }
 
 fn default_expand_google_model() -> String {
-    "gemini-3.1-flash-lite-preview".to_string()
+    "gemini-3.1-flash-lite".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1766,7 +1766,7 @@ impl Default for AsyncMemoryConfig {
 impl Default for GoogleExtractConfig {
     fn default() -> Self {
         Self {
-            model: "gemini-3.1-flash-lite-preview".to_string(),
+            model: "gemini-3.1-flash-lite".to_string(),
             api_key: None,
             endpoint: default_google_endpoint(),
             max_input_chars: 0, // 0 = no truncation (1M token model)
@@ -3517,6 +3517,22 @@ mod tests {
         // guard.
         assert!(!cfg.ars.llm_judge.enabled);
         assert!(!cfg.ars.llm_judge.nightly_cron.enabled);
+    }
+
+    #[test]
+    fn gemini_flash_lite_built_in_defaults_use_stable_model_id() {
+        const STABLE: &str = "gemini-3.1-flash-lite";
+        const RETIRED_PREVIEW: &str = "gemini-3.1-flash-lite-preview";
+
+        let rust_defaults = ReinConfig::default();
+        assert_eq!(rust_defaults.extract.google.model, STABLE);
+        assert_eq!(rust_defaults.query_expansion.google.model, STABLE);
+
+        let embedded = include_str!("../config/default.toml");
+        assert!(!embedded.contains(RETIRED_PREVIEW));
+        let loaded = ReinConfig::load_from_str("").unwrap();
+        assert_eq!(loaded.extract.google.model, STABLE);
+        assert_eq!(loaded.query_expansion.google.model, STABLE);
     }
 
     #[test]
