@@ -312,6 +312,12 @@ fn summarize_one(
             &prompt,
             summary,
             judge_sample_rate_adoption_weight,
+            crate::ops::ars_tuning::resolve_judge_structural_trust(
+                store.conn(),
+                config,
+                crate::store::adaptive::JudgeSurface::ConceptSummary,
+                chrono::Utc::now().timestamp(),
+            ),
         );
     }
 
@@ -767,17 +773,53 @@ pub fn effective_concept_summary_gate_parameters(
     query_type: &str,
     runtime_adoption_weight: f64,
 ) -> (u64, f64) {
+    effective_concept_summary_gate_parameters_with_structural_trust(
+        config,
+        adaptive_state,
+        cluster_id,
+        query_type,
+        runtime_adoption_weight,
+        crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+    )
+}
+
+pub fn effective_concept_summary_gate_parameters_with_structural_trust(
+    config: &ReinConfig,
+    adaptive_state: Option<&AdaptiveState>,
+    cluster_id: Option<i64>,
+    query_type: &str,
+    runtime_adoption_weight: f64,
+    structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+) -> (u64, f64) {
     let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
+    let scope_trust_allows_change = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+        structural,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    )
+    .action_allowed;
+    let drift_active = crate::ops::ars_tuning::judge_surface_drift_active(
+        calibration,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+    );
+    let scope_adoption_weight = if scope_trust_allows_change && !drift_active {
+        runtime_adoption_weight
+    } else {
+        0.0
+    };
     let previous_cold_start = adaptive_state.and_then(|state| {
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N)
     });
-    let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
-        config.ars.concept_summary_cold_start_n,
-        calibration,
-        runtime_adoption_weight,
-        previous_cold_start,
-        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
-    );
+    let cold_start_n =
+        crate::ops::ars_tuning::effective_cold_start_n_with_previous_and_structural_trust(
+            config.ars.concept_summary_cold_start_n,
+            calibration,
+            runtime_adoption_weight,
+            previous_cold_start,
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            structural,
+        );
     let previous_threshold = adaptive_state.and_then(|state| {
         state.ars_effective_scalar(
             crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
@@ -788,7 +830,7 @@ pub fn effective_concept_summary_gate_parameters(
     // static config default so `effective_useful_rate_threshold_with_previous`'s
     // !production_canary early-return collapses to the config value
     // (NOT the canary-blended scalar persisted via ARS_SCALAR_*).
-    let static_threshold = if runtime_adoption_weight <= f64::EPSILON {
+    let static_threshold = if scope_adoption_weight <= f64::EPSILON {
         CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD
     } else {
         previous_threshold.unwrap_or(CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD)
@@ -811,15 +853,16 @@ pub fn effective_concept_summary_gate_parameters(
         .saturating_add(bucket.explicit_up)
         .saturating_add(bucket.explicit_down);
     let useful_rate_threshold =
-        crate::ops::ars_tuning::effective_useful_rate_threshold_with_previous(
+        crate::ops::ars_tuning::effective_useful_rate_threshold_with_previous_and_structural_trust(
             static_threshold,
             bucket.useful_rate,
             human_count,
             bucket.llm_judge_count,
             calibration,
-            runtime_adoption_weight,
+            scope_adoption_weight,
             previous_threshold,
             crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            structural,
         );
     (cold_start_n, useful_rate_threshold)
 }
@@ -972,6 +1015,7 @@ fn enqueue_judge_for_concept_summary(
     prompt: &str,
     candidate: &str,
     judge_sample_rate_adoption_weight: f64,
+    structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, concept_summary_cache_path_for_config, judge_queue_path_for_config,
@@ -1058,31 +1102,35 @@ fn enqueue_judge_for_concept_summary(
     // shared scalars for first-tick-after-upgrade continuity. See
     // `ars_effective_scalar_with_legacy_fallback` doc and the synthesis
     // mirror in `ops/recall_synthesis.rs`.
-    let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_cold_start,
-        calibration,
-        judge_sample_rate_adoption_weight,
-        true,
-        crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
-            adaptive_state,
-            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY,
-            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
-        ),
-        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
-    );
-    let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_warm,
-        calibration,
-        judge_sample_rate_adoption_weight,
-        false,
-        crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
-            adaptive_state,
-            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_CONCEPT_SUMMARY,
-            crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
-        ),
-        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
-    )
-    .min(cold_rate);
+    let cold_rate =
+        crate::ops::ars_tuning::effective_judge_sample_rate_with_previous_and_structural_trust(
+            config.ars.llm_judge.sample_rate_cold_start,
+            calibration,
+            judge_sample_rate_adoption_weight,
+            true,
+            crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+                adaptive_state,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_CONCEPT_SUMMARY,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+            ),
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            structural,
+        );
+    let warm_rate =
+        crate::ops::ars_tuning::effective_judge_sample_rate_with_previous_and_structural_trust(
+            config.ars.llm_judge.sample_rate_warm,
+            calibration,
+            judge_sample_rate_adoption_weight,
+            false,
+            crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+                adaptive_state,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_CONCEPT_SUMMARY,
+                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+            ),
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            structural,
+        )
+        .min(cold_rate);
     let rate = current_sample_rate_concept_summary_with_rates(
         bucket,
         config.ars.llm_judge.human_signal_threshold,
@@ -1711,6 +1759,7 @@ mod tests {
             prompt,
             candidate,
             0.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
         );
 
         // Read the cache jsonl line back and assert the routing fields.
@@ -1760,6 +1809,7 @@ mod tests {
             &prompt,
             &candidate,
             0.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
         );
 
         let cache_path =
@@ -1857,5 +1907,70 @@ mod tests {
             "canary path must use persisted scalar as anchor when no bucket exists \
              (got {threshold_canary})"
         );
+    }
+
+    #[test]
+    fn enforced_structural_failure_snaps_concept_scope_before_policy_refresh() {
+        let config = ReinConfig::default();
+        let mut state = AdaptiveState::default();
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N,
+            3.0,
+        );
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+            0.88,
+        );
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState::default();
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            calibration
+                .recent_pairs_concept
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        }
+        state.judge_calibration_state = Some(calibration);
+
+        let (cold_start, threshold) =
+            effective_concept_summary_gate_parameters_with_structural_trust(
+                &config,
+                Some(&state),
+                Some(11),
+                "Semantic",
+                1.0,
+                crate::ops::ars_tuning::JudgeStructuralTrustContext {
+                    status: crate::judge::contract::JudgeStructuralStatus::Failed,
+                    enforce: true,
+                    gate_required: true,
+                },
+            );
+
+        assert_eq!(cold_start, config.ars.concept_summary_cold_start_n);
+        assert_eq!(threshold, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
+    }
+
+    #[test]
+    fn drift_alert_snaps_concept_scope_before_policy_refresh() {
+        let config = ReinConfig::default();
+        let mut state = AdaptiveState::default();
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD,
+            0.88,
+        );
+        state.judge_calibration_state = Some(crate::store::adaptive::JudgeCalibrationState {
+            judge_drift_alert_concept: 1,
+            ..Default::default()
+        });
+
+        let (cold_start, threshold) =
+            effective_concept_summary_gate_parameters_with_structural_trust(
+                &config,
+                Some(&state),
+                None,
+                "Semantic",
+                1.0,
+                crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+            );
+
+        assert_eq!(cold_start, config.ars.concept_summary_cold_start_n);
+        assert_eq!(threshold, CONCEPT_SUMMARY_USEFUL_RATE_THRESHOLD);
     }
 }

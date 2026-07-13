@@ -18,6 +18,8 @@ fn persist_ars_effective_scalars(
     synthesis_gate_adoption_weight: f64,
     concept_summary_gate_adoption_weight: f64,
     judge_sample_rate_adoption_weight: f64,
+    synthesis_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+    concept_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 ) {
     let calibration_snapshot = state.judge_calibration_state.clone();
     let calibration = calibration_snapshot.as_ref();
@@ -35,26 +37,56 @@ fn persist_ars_effective_scalars(
     } else {
         0
     };
-
-    let synthesis_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
-        config.ars.synthesis_cold_start_n,
+    let synthesis_scope_adoption_weight = if crate::ops::ars_tuning::judge_trust_decision(
         calibration,
-        synthesis_gate_adoption_weight,
-        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
-        crate::ops::ars_tuning::JudgeSurface::Synthesis,
-    );
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        synthesis_structural,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    )
+    .action_allowed
+    {
+        synthesis_gate_adoption_weight
+    } else {
+        0.0
+    };
+    let concept_scope_adoption_weight = if crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+        concept_structural,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    )
+    .action_allowed
+    {
+        concept_summary_gate_adoption_weight
+    } else {
+        0.0
+    };
+
+    let synthesis_cold_start =
+        crate::ops::ars_tuning::effective_cold_start_n_with_previous_and_structural_trust(
+            config.ars.synthesis_cold_start_n,
+            calibration,
+            synthesis_gate_adoption_weight,
+            state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N),
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            synthesis_structural,
+        );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N,
         synthesis_cold_start as f64,
     );
 
-    let concept_cold_start = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
-        config.ars.concept_summary_cold_start_n,
-        calibration,
-        concept_summary_gate_adoption_weight,
-        state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N),
-        crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
-    );
+    let concept_cold_start =
+        crate::ops::ars_tuning::effective_cold_start_n_with_previous_and_structural_trust(
+            config.ars.concept_summary_cold_start_n,
+            calibration,
+            concept_summary_gate_adoption_weight,
+            state.ars_effective_scalar(
+                crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N,
+            ),
+            crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            concept_structural,
+        );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_CONCEPT_SUMMARY_COLD_START_N,
         concept_cold_start as f64,
@@ -83,6 +115,7 @@ fn persist_ars_effective_scalars(
         calibration,
         judge_sample_rate_adoption_weight,
         config,
+        synthesis_structural,
     );
     let (_concept_judge_cold, _concept_judge_warm) = compute_and_persist_judge_sample_rate(
         state,
@@ -92,6 +125,7 @@ fn persist_ars_effective_scalars(
         calibration,
         judge_sample_rate_adoption_weight,
         config,
+        concept_structural,
     );
     // Downgrade-compat: keep writing the legacy cluster-shared keys
     // with the synthesis-surface value (the pre-fix behavior). A
@@ -112,8 +146,8 @@ fn persist_ars_effective_scalars(
 
     let threshold_inputs = crate::ops::ars_tuning::TrustInputs {
         enabled: config.ars.acceleration.enabled,
-        production_canary: synthesis_gate_adoption_weight > f64::EPSILON,
-        runtime_adoption_weight: synthesis_gate_adoption_weight,
+        production_canary: synthesis_scope_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight: synthesis_scope_adoption_weight,
         human_count: prior_count,
         llm_count: 0,
         llm_reliability: 0.0,
@@ -138,8 +172,8 @@ fn persist_ars_effective_scalars(
     );
 
     let concept_threshold_inputs = crate::ops::ars_tuning::TrustInputs {
-        production_canary: concept_summary_gate_adoption_weight > f64::EPSILON,
-        runtime_adoption_weight: concept_summary_gate_adoption_weight,
+        production_canary: concept_scope_adoption_weight > f64::EPSILON,
+        runtime_adoption_weight: concept_scope_adoption_weight,
         drift_alert: concept_drift_alert,
         ..threshold_inputs
     };
@@ -180,20 +214,23 @@ fn compute_and_persist_judge_sample_rate(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     judge_sample_rate_adoption_weight: f64,
     config: &ReinConfig,
+    structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 ) -> (f64, f64) {
     let previous_cold = crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
         state,
         cold_key,
         crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
     );
-    let cold = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_cold_start,
-        calibration,
-        judge_sample_rate_adoption_weight,
-        true,
-        previous_cold,
-        surface,
-    );
+    let cold =
+        crate::ops::ars_tuning::effective_judge_sample_rate_with_previous_and_structural_trust(
+            config.ars.llm_judge.sample_rate_cold_start,
+            calibration,
+            judge_sample_rate_adoption_weight,
+            true,
+            previous_cold,
+            surface,
+            structural,
+        );
     state.set_ars_effective_scalar(cold_key, cold);
 
     let previous_warm = crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
@@ -201,15 +238,17 @@ fn compute_and_persist_judge_sample_rate(
         warm_key,
         crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
     );
-    let warm = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_warm,
-        calibration,
-        judge_sample_rate_adoption_weight,
-        false,
-        previous_warm,
-        surface,
-    )
-    .min(cold);
+    let warm =
+        crate::ops::ars_tuning::effective_judge_sample_rate_with_previous_and_structural_trust(
+            config.ars.llm_judge.sample_rate_warm,
+            calibration,
+            judge_sample_rate_adoption_weight,
+            false,
+            previous_warm,
+            surface,
+            structural,
+        )
+        .min(cold);
     state.set_ars_effective_scalar(warm_key, warm);
 
     (cold, warm)
@@ -467,6 +506,19 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         &bootstrap_priors,
         signal_hint_priors_adoption_weight,
     );
+    let judge_trust_now = chrono::Utc::now().timestamp();
+    let synthesis_structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
+        store.conn(),
+        config,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        judge_trust_now,
+    );
+    let concept_structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
+        store.conn(),
+        config,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+        judge_trust_now,
+    );
     persist_ars_effective_scalars(
         &mut state,
         config,
@@ -474,14 +526,17 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         synthesis_gate_adoption_weight,
         concept_summary_gate_adoption_weight,
         judge_sample_rate_adoption_weight,
+        synthesis_structural,
+        concept_structural,
     );
     let effective_judge_weight_decay_rate =
-        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous_and_structural_trust(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
             llm_feedback_decay_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
             crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            synthesis_structural,
         );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
@@ -516,12 +571,13 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // and judge_calibration_state are folded so concept-summary judge
     // events flow into useful_rate / κ pairs identically to synthesis.
     let effective_judge_weight_decay_rate =
-        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous_and_structural_trust(
             config.ars.llm_judge.weight_decay_rate,
             state.judge_calibration_state.as_ref(),
             llm_feedback_decay_adoption_weight,
             state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE),
             crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+            concept_structural,
         );
     state.set_ars_effective_scalar(
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
@@ -864,10 +920,29 @@ fn refresh_ars_parameter_policy(
         ArsParameterPolicyMode::Canary => None,
     };
     let current = loaded.policy;
+    let now = chrono::Utc::now().timestamp();
+    let synthesis_structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
+        conn,
+        config,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        now,
+    );
+    let concept_structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
+        conn,
+        config,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+        now,
+    );
     let runtime_adoption_weight =
         next_runtime_adoption_weight(config, state, desired_mode, current.runtime_adoption_weight);
-    let adoption_weights =
-        next_scoped_adoption_weights(config, state, desired_mode, &current.adoption_weights);
+    let adoption_weights = next_scoped_adoption_weights(
+        config,
+        state,
+        desired_mode,
+        &current.adoption_weights,
+        synthesis_structural,
+        concept_structural,
+    );
     if current.mode == desired_mode
         && current.source_adaptive_version == state.version
         && current.disabled_reason == disabled_reason
@@ -929,6 +1004,8 @@ fn next_scoped_adoption_weights(
     state: &crate::store::adaptive::AdaptiveState,
     desired_mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode,
     current_weights: &HashMap<String, f64>,
+    synthesis_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+    concept_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 ) -> HashMap<String, f64> {
     if !matches!(
         desired_mode,
@@ -938,32 +1015,165 @@ fn next_scoped_adoption_weights(
     }
 
     let mut weights = HashMap::new();
+    let recall_decisions = enabled_judge_trust_decisions(
+        config,
+        state,
+        synthesis_structural,
+        concept_structural,
+        crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+        true,
+        false,
+    );
     for (bucket, entry) in &state.learned_shadow_fusion {
         let Some(target) = runtime_adoption_target(config, entry.sample_count) else {
             continue;
         };
         let key = recall_fusion_adoption_key(bucket);
         let current = current_weights.get(&key).copied().unwrap_or(0.0);
-        weights.insert(key, step_runtime_adoption_weight(current, target));
+        weights.insert(
+            key,
+            gated_policy_weight(current, target, &recall_decisions, false),
+        );
+    }
+    // Recall readers fall back to the global policy weight when this key is
+    // absent. Keep an explicit zero while judge trust disallows promotion so
+    // a sparse learned-bucket map cannot bypass the typed gate.
+    if !recall_decisions.is_empty()
+        && !recall_decisions
+            .iter()
+            .all(|decision| decision.action_allowed)
+    {
+        weights
+            .entry("recall_fusion:global".to_string())
+            .or_insert(0.0);
     }
 
     if let Some(target) = max_runtime_adoption_target(config, state) {
-        for key in [
-            "synthesis_gate",
-            "concept_summary_gate",
-            "judge_sample_rate",
-            "llm_feedback_decay",
-            "signal_hint_priors",
+        let synthesis_scope = enabled_judge_trust_decisions(
+            config,
+            state,
+            synthesis_structural,
+            concept_structural,
+            crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+            true,
+            false,
+        );
+        let concept_scope = enabled_judge_trust_decisions(
+            config,
+            state,
+            synthesis_structural,
+            concept_structural,
+            crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+            false,
+            true,
+        );
+        let sample_rate = enabled_judge_trust_decisions(
+            config,
+            state,
+            synthesis_structural,
+            concept_structural,
+            crate::judge::contract::JudgeTrustAction::IncreaseSampleRate,
+            true,
+            true,
+        );
+        let feedback_decay = enabled_judge_trust_decisions(
+            config,
+            state,
+            synthesis_structural,
+            concept_structural,
+            crate::judge::contract::JudgeTrustAction::IncreaseJudgeWeight,
+            true,
+            true,
+        );
+        let signal_hint = enabled_judge_trust_decisions(
+            config,
+            state,
+            synthesis_structural,
+            concept_structural,
+            crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+            true,
+            true,
+        );
+        for (key, decisions, preserve_configured_baseline) in [
+            ("synthesis_gate", &synthesis_scope, false),
+            ("concept_summary_gate", &concept_scope, false),
+            ("judge_sample_rate", &sample_rate, true),
+            ("llm_feedback_decay", &feedback_decay, true),
+            ("signal_hint_priors", &signal_hint, false),
         ] {
             let current = current_weights.get(key).copied().unwrap_or(0.0);
             weights.insert(
                 key.to_string(),
-                step_runtime_adoption_weight(current, target),
+                gated_policy_weight(current, target, decisions, preserve_configured_baseline),
             );
         }
     }
 
     weights
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enabled_judge_trust_decisions(
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    synthesis_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+    concept_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+    action: crate::judge::contract::JudgeTrustAction,
+    include_synthesis: bool,
+    include_concept: bool,
+) -> Vec<crate::judge::contract::JudgeTrustDecision> {
+    if !config.ars.llm_judge.enabled {
+        return Vec::new();
+    }
+    let calibration = state.judge_calibration_state.as_ref();
+    let mut decisions = Vec::with_capacity(2);
+    if include_synthesis && config.ars.llm_judge.synthesis_enabled {
+        decisions.push(crate::ops::ars_tuning::judge_trust_decision(
+            calibration,
+            crate::store::adaptive::JudgeSurface::Synthesis,
+            synthesis_structural,
+            action,
+        ));
+    }
+    if include_concept && config.ars.llm_judge.concept_summary_enabled {
+        decisions.push(crate::ops::ars_tuning::judge_trust_decision(
+            calibration,
+            crate::store::adaptive::JudgeSurface::ConceptSummary,
+            concept_structural,
+            action,
+        ));
+    }
+    decisions
+}
+
+fn gated_policy_weight(
+    current: f64,
+    target: f64,
+    decisions: &[crate::judge::contract::JudgeTrustDecision],
+    preserve_configured_baseline: bool,
+) -> f64 {
+    let current = if current.is_finite() {
+        current.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if decisions.is_empty() {
+        return step_runtime_adoption_weight(current, target);
+    }
+    if decisions
+        .iter()
+        .any(|decision| decision.configured_baseline_scale <= f64::EPSILON)
+    {
+        return 0.0;
+    }
+    if decisions.iter().all(|decision| decision.action_allowed) {
+        return step_runtime_adoption_weight(current, target);
+    }
+    if preserve_configured_baseline {
+        current
+    } else {
+        0.0
+    }
 }
 
 fn max_runtime_adoption_target(
@@ -4163,6 +4373,80 @@ mod tests {
             loaded.adoption_weights["signal_hint_priors"],
             loaded.runtime_adoption_weight
         );
+    }
+
+    #[test]
+    fn zero_human_ready_structural_policy_cannot_promote_scopes() {
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        let state = eligible_shadow_state();
+        let mut current = HashMap::new();
+        current.insert("judge_sample_rate".to_string(), 0.25);
+        current.insert("llm_feedback_decay".to_string(), 0.20);
+        let ready = crate::ops::ars_tuning::JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Ready,
+            enforce: true,
+            gate_required: true,
+        };
+
+        let weights = next_scoped_adoption_weights(
+            &config,
+            &state,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            &current,
+            ready,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
+
+        assert_eq!(weights["recall_fusion:global"], 0.0);
+        assert_eq!(weights["synthesis_gate"], 0.0);
+        assert_eq!(weights["signal_hint_priors"], 0.0);
+        assert_eq!(weights["judge_sample_rate"], 0.25);
+        assert_eq!(weights["llm_feedback_decay"], 0.20);
+    }
+
+    #[test]
+    fn enforced_structural_failure_immediately_rolls_back_affected_policy_scopes() {
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        let state = eligible_shadow_state();
+        let current = [
+            ("recall_fusion:global".to_string(), 0.50),
+            ("synthesis_gate".to_string(), 0.50),
+            ("judge_sample_rate".to_string(), 0.50),
+            ("llm_feedback_decay".to_string(), 0.50),
+            ("signal_hint_priors".to_string(), 0.50),
+        ]
+        .into_iter()
+        .collect();
+        let failed = crate::ops::ars_tuning::JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Failed,
+            enforce: true,
+            gate_required: true,
+        };
+
+        let weights = next_scoped_adoption_weights(
+            &config,
+            &state,
+            crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            &current,
+            failed,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
+
+        for key in [
+            "recall_fusion:global",
+            "synthesis_gate",
+            "judge_sample_rate",
+            "llm_feedback_decay",
+            "signal_hint_priors",
+        ] {
+            assert_eq!(weights[key], 0.0, "{key} must fail closed immediately");
+        }
     }
 
     #[test]
@@ -7657,6 +7941,7 @@ mod tests {
             Some(&calibration),
             1.0, // adoption_weight
             &config,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
         );
         assert_eq!(
             synth_cold, 0.0,
@@ -7682,6 +7967,7 @@ mod tests {
             Some(&calibration),
             1.0, // adoption_weight
             &config,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
         );
         assert!(
             concept_cold > f64::EPSILON,
@@ -7759,6 +8045,7 @@ mod tests {
             Some(&calibration),
             1.0,
             &config,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
         );
 
         // The legacy fallback must have been consulted (per-surface key

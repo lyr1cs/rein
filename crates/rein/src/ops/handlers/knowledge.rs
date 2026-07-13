@@ -1108,15 +1108,23 @@ impl OpsRuntime {
                             &adaptive_state,
                             "llm_feedback_decay",
                         );
+                    let concept_structural =
+                        crate::ops::ars_tuning::resolve_judge_structural_trust(
+                            store.conn(),
+                            self.config(),
+                            crate::store::adaptive::JudgeSurface::ConceptSummary,
+                            chrono::Utc::now().timestamp(),
+                        );
                     let synthetic_cid =
                         crate::ops::concept_summary::synthetic_cluster_id_for_concept(&concept.id);
                     let (route_cold_start_n, route_useful_rate_threshold) =
-                        crate::ops::concept_summary::effective_concept_summary_gate_parameters(
+                        crate::ops::concept_summary::effective_concept_summary_gate_parameters_with_structural_trust(
                             self.config(),
                             Some(&adaptive_state),
                             effective_cluster_id,
                             qtype,
                             concept_summary_gate_adoption_weight,
+                            concept_structural,
                         );
                     let route_key = crate::store::adaptive::concept_summary_bucket_key(
                         effective_cluster_id,
@@ -1145,12 +1153,13 @@ impl OpsRuntime {
                             )
                         } else {
                             let (synthetic_cold_start_n, synthetic_useful_rate_threshold) =
-                                crate::ops::concept_summary::effective_concept_summary_gate_parameters(
+                                crate::ops::concept_summary::effective_concept_summary_gate_parameters_with_structural_trust(
                                     self.config(),
                                     Some(&adaptive_state),
                                     Some(synthetic_cid),
                                     crate::ops::concept_summary::CONCEPT_SUMMARY_QUERY_TYPE_REFRESH,
                                     concept_summary_gate_adoption_weight,
+                                    concept_structural,
                                 );
                             (
                                 Some(synthetic_cid),
@@ -1160,7 +1169,7 @@ impl OpsRuntime {
                             )
                         };
                     let judge_weight_decay_rate =
-                        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+                        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous_and_structural_trust(
                             self.config().ars.llm_judge.weight_decay_rate,
                             adaptive_state.judge_calibration_state.as_ref(),
                             llm_feedback_decay_adoption_weight,
@@ -1168,6 +1177,7 @@ impl OpsRuntime {
                                 crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
                             ),
                             crate::ops::ars_tuning::JudgeSurface::ConceptSummary,
+                            concept_structural,
                         );
                     match crate::ops::concept_summary::decide_concept_summary_quality_with_threshold(
                         global_enabled,

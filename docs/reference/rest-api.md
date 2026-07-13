@@ -216,7 +216,7 @@ defines ship criteria.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "purpose": "read_only_release_eval_gate_for_ars_acceleration",
   "signals": {
     "adaptive_enabled": true,
@@ -228,12 +228,22 @@ defines ship criteria.
     "runtime_adoption_weight": 0.0,
     "runtime_adoption_weights": {},
     "shadow_fusion_status": "insufficient_samples",
-    "judge_drift_alert": false
+    "judge_drift_alert": false,
+    "judge_human_pairs_synthesis": 0,
+    "judge_human_pairs_concept_summary": 0,
+    "judge_structural_status_synthesis": "disabled",
+    "judge_structural_status_concept_summary": "disabled",
+    "judge_calibration_basis_synthesis": "configured_baseline",
+    "judge_calibration_basis_concept_summary": "configured_baseline",
+    "judge_calibration_pairs": 0
   },
   "canary": {
     "allowed": false,
-    "blockers": ["ars_parameter_policy_missing"],
-    "warnings": ["shadow_fusion_replay_not_ready:insufficient_samples"]
+    "blockers": [
+      "ars_parameter_policy_missing",
+      "shadow_fusion_replay_not_ready:insufficient_samples"
+    ],
+    "warnings": []
   },
   "default_on": {
     "allowed": false,
@@ -242,6 +252,12 @@ defines ship criteria.
   }
 }
 ```
+
+Schema v2 separates judge evidence by surface. The
+`judge_human_kappa_synthesis` and `judge_human_kappa_concept_summary` fields
+are omitted until that surface has at least 30 human pairs; structural probes
+never populate them. Runtime-versus-nightly agreement remains a drift signal
+only.
 
 ## `/api/trust-measurement`
 

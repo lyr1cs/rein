@@ -731,6 +731,12 @@ impl OpsRuntime {
                         &adaptive_state,
                         "llm_feedback_decay",
                     ),
+                judge_structural: crate::ops::ars_tuning::resolve_judge_structural_trust(
+                    store.conn(),
+                    &self.config,
+                    crate::store::adaptive::JudgeSurface::Synthesis,
+                    chrono::Utc::now().timestamp(),
+                ),
             };
             Ok((results, adaptive_state, runtime_adoption))
         })?;

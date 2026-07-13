@@ -14,13 +14,20 @@ use crate::store::ars_parameter_policy::{
 };
 use crate::store::SqliteStore;
 
-pub const ARS_ACCELERATION_RELEASE_GATE_SCHEMA_VERSION: u32 = 1;
+pub const ARS_ACCELERATION_RELEASE_GATE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JudgeStructuralReleaseInput {
+    pub synthesis: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+    pub concept_summary: crate::ops::ars_tuning::JudgeStructuralTrustContext,
+}
 
 pub struct ReleaseGateInput<'a> {
     pub config: &'a ReinConfig,
     pub state: &'a AdaptiveState,
     pub policy: &'a ArsParameterPolicyLoad,
     pub shadow_fusion_status: &'a serde_json::Value,
+    pub judge_structural: JudgeStructuralReleaseInput,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -56,6 +63,16 @@ pub struct ReleaseGateSignals {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow_fusion_min_samples: Option<u64>,
     pub judge_drift_alert: bool,
+    pub judge_human_pairs_synthesis: usize,
+    pub judge_human_pairs_concept_summary: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_human_kappa_synthesis: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_human_kappa_concept_summary: Option<f64>,
+    pub judge_structural_status_synthesis: String,
+    pub judge_structural_status_concept_summary: String,
+    pub judge_calibration_basis_synthesis: String,
+    pub judge_calibration_basis_concept_summary: String,
     pub judge_calibration_pairs: usize,
     pub doctor_ars_parameter_policy_level: String,
     pub doctor_ars_parameter_policy_message: String,
@@ -77,12 +94,28 @@ pub fn ars_acceleration_release_gate_report(
     let state = AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
     let policy = crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
     let shadow_fusion_status = crate::ops::adaptive::shadow_fusion_status(store, config);
+    let now = chrono::Utc::now().timestamp();
+    let judge_structural = JudgeStructuralReleaseInput {
+        synthesis: crate::ops::ars_tuning::resolve_judge_structural_trust(
+            store.conn(),
+            config,
+            crate::store::adaptive::JudgeSurface::Synthesis,
+            now,
+        ),
+        concept_summary: crate::ops::ars_tuning::resolve_judge_structural_trust(
+            store.conn(),
+            config,
+            crate::store::adaptive::JudgeSurface::ConceptSummary,
+            now,
+        ),
+    };
 
     evaluate_ars_acceleration_release_gate(ReleaseGateInput {
         config,
         state: &state,
         policy: &policy,
         shadow_fusion_status: &shadow_fusion_status,
+        judge_structural,
     })
 }
 
@@ -147,19 +180,30 @@ pub fn evaluate_ars_acceleration_release_gate(
                 || calibration.judge_drift_alert_concept > 0
         })
         .unwrap_or(false);
-    let judge_calibration_pairs = state
-        .judge_calibration_state
-        .as_ref()
-        .map(|calibration| {
-            calibration
-                .recent_pairs_synthesis
-                .len()
-                .saturating_add(calibration.recent_pairs_concept.len())
-                .saturating_add(calibration.recent_pairs_runtime_vs_offline.len())
-                .saturating_add(calibration.recent_pairs_runtime_vs_offline_synthesis.len())
-                .saturating_add(calibration.recent_pairs_runtime_vs_offline_concept.len())
-        })
-        .unwrap_or(0);
+    let calibration = state.judge_calibration_state.as_ref();
+    let synthesis_human = crate::ops::ars_tuning::human_judge_calibration(
+        calibration,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+    );
+    let concept_human = crate::ops::ars_tuning::human_judge_calibration(
+        calibration,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+    );
+    let synthesis_promotion = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        input.judge_structural.synthesis,
+        crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+    );
+    let concept_promotion = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        crate::store::adaptive::JudgeSurface::ConceptSummary,
+        input.judge_structural.concept_summary,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    );
+    let judge_calibration_pairs = synthesis_human
+        .pair_count
+        .saturating_add(concept_human.pair_count);
 
     let live_allowed = config.adaptive.enabled
         && config.ars.acceleration.enabled
@@ -193,6 +237,22 @@ pub fn evaluate_ars_acceleration_release_gate(
         shadow_fusion_eligible_samples: json_u64(input.shadow_fusion_status, "eligible_samples"),
         shadow_fusion_min_samples: json_u64(input.shadow_fusion_status, "min_samples"),
         judge_drift_alert,
+        judge_human_pairs_synthesis: synthesis_human.pair_count,
+        judge_human_pairs_concept_summary: concept_human.pair_count,
+        judge_human_kappa_synthesis: valid_kappa(synthesis_human.kappa),
+        judge_human_kappa_concept_summary: valid_kappa(concept_human.kappa),
+        judge_structural_status_synthesis: structural_status_name(
+            input.judge_structural.synthesis.status,
+        )
+        .to_string(),
+        judge_structural_status_concept_summary: structural_status_name(
+            input.judge_structural.concept_summary.status,
+        )
+        .to_string(),
+        judge_calibration_basis_synthesis: calibration_basis_name(synthesis_promotion.basis)
+            .to_string(),
+        judge_calibration_basis_concept_summary: calibration_basis_name(concept_promotion.basis)
+            .to_string(),
         judge_calibration_pairs,
         doctor_ars_parameter_policy_level: doctor_level.to_string(),
         doctor_ars_parameter_policy_message: doctor_message,
@@ -240,6 +300,26 @@ pub fn evaluate_ars_acceleration_release_gate(
     if judge_drift_alert {
         canary_blockers.push("judge_drift_alert".to_string());
     }
+    if config.ars.llm_judge.enabled {
+        if config.ars.llm_judge.synthesis_enabled {
+            append_judge_promotion_blocker(
+                &mut canary_blockers,
+                "synthesis",
+                input.judge_structural.synthesis.status,
+                synthesis_human,
+                synthesis_promotion,
+            );
+        }
+        if config.ars.llm_judge.concept_summary_enabled {
+            append_judge_promotion_blocker(
+                &mut canary_blockers,
+                "concept_summary",
+                input.judge_structural.concept_summary.status,
+                concept_human,
+                concept_promotion,
+            );
+        }
+    }
     // v1.2 (#A12 activation prerequisite — 2026-06-02 algorithm-directions
     // recommendation 2): shadow-fusion replay readiness is a BLOCKER, not a
     // warning. The volume blockers above only prove data exists
@@ -277,6 +357,85 @@ pub fn evaluate_ars_acceleration_release_gate(
                 "default_on_gate_is_report_only_and_does_not_change_runtime_defaults".to_string(),
             ],
         },
+    }
+}
+
+fn valid_kappa(value: Option<f64>) -> Option<f64> {
+    value.filter(|kappa| kappa.is_finite() && (-1.0..=1.0).contains(kappa))
+}
+
+fn append_judge_promotion_blocker(
+    blockers: &mut Vec<String>,
+    surface: &str,
+    structural_status: crate::judge::contract::JudgeStructuralStatus,
+    human: crate::ops::ars_tuning::HumanJudgeCalibration,
+    decision: crate::judge::contract::JudgeTrustDecision,
+) {
+    use crate::judge::contract::JudgeTrustReason;
+
+    match decision.reason {
+        JudgeTrustReason::HumanKappaBelowFloor => {
+            blockers.push(format!("judge_human_kappa_below_floor:{surface}"));
+            return;
+        }
+        JudgeTrustReason::HumanKappaMissingOrInvalid
+            if human.pair_count >= crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS =>
+        {
+            blockers.push(format!("judge_human_kappa_invalid:{surface}"));
+            return;
+        }
+        _ => {}
+    }
+
+    if decision.reason == JudgeTrustReason::StructuralHealthEnforced {
+        blockers.push(format!(
+            "judge_structural_unhealthy:{surface}:{}",
+            structural_status_name(structural_status)
+        ));
+        return;
+    }
+
+    if !decision.action_allowed || decision.blocks_release {
+        blockers.push(format!(
+            "judge_trust_disallows_promotion:{surface}:{}",
+            trust_reason_name(decision.reason)
+        ));
+    }
+}
+
+fn structural_status_name(status: crate::judge::contract::JudgeStructuralStatus) -> &'static str {
+    use crate::judge::contract::JudgeStructuralStatus;
+    match status {
+        JudgeStructuralStatus::Disabled => "disabled",
+        JudgeStructuralStatus::Collecting => "collecting",
+        JudgeStructuralStatus::Ready => "ready",
+        JudgeStructuralStatus::Failed => "failed",
+        JudgeStructuralStatus::Stale => "stale",
+        JudgeStructuralStatus::FingerprintMismatch => "fingerprint_mismatch",
+        JudgeStructuralStatus::Corrupt => "corrupt",
+        JudgeStructuralStatus::Unknown => "unknown",
+    }
+}
+
+fn calibration_basis_name(basis: crate::judge::contract::JudgeCalibrationBasis) -> &'static str {
+    use crate::judge::contract::JudgeCalibrationBasis;
+    match basis {
+        JudgeCalibrationBasis::HumanKappa => "human_kappa",
+        JudgeCalibrationBasis::StructuralAnchors => "structural_anchors",
+        JudgeCalibrationBasis::ConfiguredBaseline => "configured_baseline",
+        JudgeCalibrationBasis::Untrusted => "untrusted",
+    }
+}
+
+fn trust_reason_name(reason: crate::judge::contract::JudgeTrustReason) -> &'static str {
+    use crate::judge::contract::JudgeTrustReason;
+    match reason {
+        JudgeTrustReason::HumanKappaHealthy => "human_kappa_healthy",
+        JudgeTrustReason::HumanKappaBelowFloor => "human_kappa_below_floor",
+        JudgeTrustReason::HumanKappaMissingOrInvalid => "human_kappa_missing_or_invalid",
+        JudgeTrustReason::StructuralAnchorsReady => "structural_anchors_ready",
+        JudgeTrustReason::ConfiguredBaselineFallback => "configured_baseline_fallback",
+        JudgeTrustReason::StructuralHealthEnforced => "structural_health_enforced",
     }
 }
 
@@ -415,6 +574,7 @@ mod tests {
                 "eligible_samples": 12,
                 "min_samples": 10
             }),
+            judge_structural: JudgeStructuralReleaseInput::default(),
         });
 
         assert_eq!(report.signals.runtime_adoption_weight, 0.25);
@@ -444,6 +604,7 @@ mod tests {
             state: &state,
             policy: &policy,
             shadow_fusion_status: &serde_json::json!({ "status": "ready" }),
+            judge_structural: JudgeStructuralReleaseInput::default(),
         });
 
         assert!(!report.canary.allowed);

@@ -1079,6 +1079,12 @@ fn recall_synthesis_adaptive_state(
             &state,
             "llm_feedback_decay",
         ),
+        judge_structural: crate::ops::ars_tuning::resolve_judge_structural_trust(
+            store.conn(),
+            config,
+            crate::store::adaptive::JudgeSurface::Synthesis,
+            chrono::Utc::now().timestamp(),
+        ),
     };
     (Some(state), runtime_adoption)
 }

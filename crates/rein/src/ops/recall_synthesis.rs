@@ -315,18 +315,37 @@ fn effective_synthesis_gate_parameters(
     cluster_id: Option<i64>,
     query_type: &str,
     runtime_adoption_weight: f64,
+    structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 ) -> (u64, f64) {
     let calibration = adaptive_state.and_then(|state| state.judge_calibration_state.as_ref());
+    let scope_trust_allows_change = crate::ops::ars_tuning::judge_trust_decision(
+        calibration,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        structural,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    )
+    .action_allowed;
+    let drift_active = crate::ops::ars_tuning::judge_surface_drift_active(
+        calibration,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+    );
+    let scope_adoption_weight = if scope_trust_allows_change && !drift_active {
+        runtime_adoption_weight
+    } else {
+        0.0
+    };
     let previous_cold_start = adaptive_state.and_then(|state| {
         state.ars_effective_scalar(crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N)
     });
-    let cold_start_n = crate::ops::ars_tuning::effective_cold_start_n_with_previous(
-        config.ars.synthesis_cold_start_n,
-        calibration,
-        runtime_adoption_weight,
-        previous_cold_start,
-        crate::ops::ars_tuning::JudgeSurface::Synthesis,
-    );
+    let cold_start_n =
+        crate::ops::ars_tuning::effective_cold_start_n_with_previous_and_structural_trust(
+            config.ars.synthesis_cold_start_n,
+            calibration,
+            runtime_adoption_weight,
+            previous_cold_start,
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            structural,
+        );
     let previous_threshold = adaptive_state.and_then(|state| {
         state.ars_effective_scalar(
             crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
@@ -344,7 +363,7 @@ fn effective_synthesis_gate_parameters(
     // (`runtime_adoption_weight > EPSILON`) we still pass the persisted
     // value — it is the correct continuity anchor for step-bound
     // smoothing.
-    let static_threshold = if runtime_adoption_weight <= f64::EPSILON {
+    let static_threshold = if scope_adoption_weight <= f64::EPSILON {
         SYNTHESIS_USEFUL_RATE_THRESHOLD
     } else {
         previous_threshold.unwrap_or(SYNTHESIS_USEFUL_RATE_THRESHOLD)
@@ -367,15 +386,16 @@ fn effective_synthesis_gate_parameters(
         .saturating_add(bucket.explicit_up)
         .saturating_add(bucket.explicit_down);
     let useful_rate_threshold =
-        crate::ops::ars_tuning::effective_useful_rate_threshold_with_previous(
+        crate::ops::ars_tuning::effective_useful_rate_threshold_with_previous_and_structural_trust(
             static_threshold,
             bucket.useful_rate,
             human_count,
             bucket.llm_judge_count,
             calibration,
-            runtime_adoption_weight,
+            scope_adoption_weight,
             previous_threshold,
             crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            structural,
         );
     (cold_start_n, useful_rate_threshold)
 }
@@ -385,6 +405,7 @@ pub struct RecallSynthesisRuntimeAdoption {
     pub synthesis_gate: f64,
     pub judge_sample_rate: f64,
     pub llm_feedback_decay: f64,
+    pub judge_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 }
 
 impl RecallSynthesisRuntimeAdoption {
@@ -393,6 +414,11 @@ impl RecallSynthesisRuntimeAdoption {
             synthesis_gate: weight,
             judge_sample_rate: weight,
             llm_feedback_decay: weight,
+            judge_structural: crate::ops::ars_tuning::JudgeStructuralTrustContext {
+                status: crate::judge::contract::JudgeStructuralStatus::Disabled,
+                enforce: false,
+                gate_required: false,
+            },
         }
     }
 }
@@ -517,9 +543,10 @@ pub fn run_recall_synthesis_with_policy(
             cluster_id,
             query_type,
             runtime_adoption.synthesis_gate,
+            runtime_adoption.judge_structural,
         );
     let effective_judge_weight_decay_rate =
-        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous(
+        crate::ops::ars_tuning::effective_judge_weight_decay_rate_with_previous_and_structural_trust(
             config.ars.llm_judge.weight_decay_rate,
             adaptive_state.and_then(|state| state.judge_calibration_state.as_ref()),
             runtime_adoption.llm_feedback_decay,
@@ -529,6 +556,7 @@ pub fn run_recall_synthesis_with_policy(
                 )
             }),
             crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            runtime_adoption.judge_structural,
         );
     match decide_synthesize_with_threshold(
         config.ars.recall_synthesis_enabled,
@@ -649,6 +677,7 @@ pub fn run_recall_synthesis_with_policy(
                             &clean,
                             included_count,
                             runtime_adoption.judge_sample_rate,
+                            runtime_adoption.judge_structural,
                         );
                     }
                 }
@@ -1073,6 +1102,7 @@ fn enqueue_judge_for_synthesis(
     candidate: &str,
     source_count: usize,
     runtime_adoption_weight: f64,
+    structural: crate::ops::ars_tuning::JudgeStructuralTrustContext,
 ) {
     use crate::ops::handlers::judge::{
         append_jsonl_line, judge_queue_path_for_config, synthesis_cache_path_for_config,
@@ -1124,35 +1154,39 @@ fn enqueue_judge_for_synthesis(
     // per-surface scalars, falling back to the legacy cluster-shared
     // scalars for first-tick-after-upgrade continuity. See
     // `ars_effective_scalar_with_legacy_fallback` doc.
-    let cold_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_cold_start,
-        calibration,
-        runtime_adoption_weight,
-        true,
-        adaptive_state.and_then(|state| {
-            crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
-                state,
-                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS,
-                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
-            )
-        }),
-        crate::ops::ars_tuning::JudgeSurface::Synthesis,
-    );
-    let warm_rate = crate::ops::ars_tuning::effective_judge_sample_rate_with_previous(
-        config.ars.llm_judge.sample_rate_warm,
-        calibration,
-        runtime_adoption_weight,
-        false,
-        adaptive_state.and_then(|state| {
-            crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
-                state,
-                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_SYNTHESIS,
-                crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
-            )
-        }),
-        crate::ops::ars_tuning::JudgeSurface::Synthesis,
-    )
-    .min(cold_rate);
+    let cold_rate =
+        crate::ops::ars_tuning::effective_judge_sample_rate_with_previous_and_structural_trust(
+            config.ars.llm_judge.sample_rate_cold_start,
+            calibration,
+            runtime_adoption_weight,
+            true,
+            adaptive_state.and_then(|state| {
+                crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+                    state,
+                    crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START_SYNTHESIS,
+                    crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_COLD_START,
+                )
+            }),
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            structural,
+        );
+    let warm_rate =
+        crate::ops::ars_tuning::effective_judge_sample_rate_with_previous_and_structural_trust(
+            config.ars.llm_judge.sample_rate_warm,
+            calibration,
+            runtime_adoption_weight,
+            false,
+            adaptive_state.and_then(|state| {
+                crate::store::adaptive::ars_effective_scalar_with_legacy_fallback(
+                    state,
+                    crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM_SYNTHESIS,
+                    crate::store::adaptive::ARS_SCALAR_JUDGE_SAMPLE_RATE_WARM,
+                )
+            }),
+            crate::ops::ars_tuning::JudgeSurface::Synthesis,
+            structural,
+        )
+        .min(cold_rate);
     let rate = current_sample_rate_with_rates(
         bucket,
         config.ars.llm_judge.human_signal_threshold,
@@ -1773,6 +1807,7 @@ mod tests {
             &candidate,
             3,
             0.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
         );
 
         let cache_path = crate::ops::handlers::judge::synthesis_cache_path_for_config(&config);
@@ -2838,6 +2873,16 @@ mod tests {
     fn m5_synthesis_threshold_snaps_to_config_on_rollback() {
         let config = ReinConfig::default();
         let mut state = AdaptiveState::default();
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.9,
+            ..Default::default()
+        };
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        }
+        state.judge_calibration_state = Some(calibration);
         // Persist a blended canary value well above the static default.
         state.set_ars_effective_scalar(
             crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
@@ -2856,8 +2901,14 @@ mod tests {
 
         // Rollback: adoption_weight=0.0. Threshold must equal the static
         // default — NOT the blended 0.92.
-        let (_cold_start, threshold_rollback) =
-            effective_synthesis_gate_parameters(&config, Some(&state), Some(7), "Semantic", 0.0);
+        let (_cold_start, threshold_rollback) = effective_synthesis_gate_parameters(
+            &config,
+            Some(&state),
+            Some(7),
+            "Semantic",
+            0.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
         assert!(
             (threshold_rollback - SYNTHESIS_USEFUL_RATE_THRESHOLD).abs() < 1e-9,
             "rollback threshold = {threshold_rollback}; expected static default \
@@ -2872,8 +2923,14 @@ mod tests {
         // `effective_useful_rate_threshold_with_previous`, so we can't
         // assert exact equality here — only that the anchor differs from
         // the rollback path's pure config default.
-        let (_cold_start, threshold_canary) =
-            effective_synthesis_gate_parameters(&config, Some(&state), Some(7), "Semantic", 1.0);
+        let (_cold_start, threshold_canary) = effective_synthesis_gate_parameters(
+            &config,
+            Some(&state),
+            Some(7),
+            "Semantic",
+            1.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
         // The canary path's exact output depends on bucket presence and
         // calibration; here `Some(&state)` has neither so it falls
         // through the "no bucket" branch and returns `static_threshold`,
@@ -2883,5 +2940,71 @@ mod tests {
             "canary path must use persisted scalar as anchor when no bucket exists \
              (got {threshold_canary}); this asserts M-5 fix did NOT regress canary continuity"
         );
+    }
+
+    #[test]
+    fn enforced_structural_failure_snaps_synthesis_scope_before_policy_refresh() {
+        let config = ReinConfig::default();
+        let mut state = AdaptiveState::default();
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_SYNTHESIS_COLD_START_N,
+            3.0,
+        );
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+            0.92,
+        );
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.9,
+            ..Default::default()
+        };
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        }
+        state.judge_calibration_state = Some(calibration);
+
+        let (cold_start, threshold) = effective_synthesis_gate_parameters(
+            &config,
+            Some(&state),
+            Some(7),
+            "Semantic",
+            1.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext {
+                status: crate::judge::contract::JudgeStructuralStatus::Failed,
+                enforce: true,
+                gate_required: true,
+            },
+        );
+
+        assert_eq!(cold_start, config.ars.synthesis_cold_start_n);
+        assert_eq!(threshold, SYNTHESIS_USEFUL_RATE_THRESHOLD);
+    }
+
+    #[test]
+    fn drift_alert_snaps_synthesis_scope_before_policy_refresh() {
+        let config = ReinConfig::default();
+        let mut state = AdaptiveState::default();
+        state.set_ars_effective_scalar(
+            crate::store::adaptive::ARS_SCALAR_SYNTHESIS_USEFUL_RATE_THRESHOLD,
+            0.92,
+        );
+        state.judge_calibration_state = Some(crate::store::adaptive::JudgeCalibrationState {
+            judge_drift_alert_synthesis: 1,
+            ..Default::default()
+        });
+
+        let (cold_start, threshold) = effective_synthesis_gate_parameters(
+            &config,
+            Some(&state),
+            None,
+            "Semantic",
+            1.0,
+            crate::ops::ars_tuning::JudgeStructuralTrustContext::default(),
+        );
+
+        assert_eq!(cold_start, config.ars.synthesis_cold_start_n);
+        assert_eq!(threshold, SYNTHESIS_USEFUL_RATE_THRESHOLD);
     }
 }

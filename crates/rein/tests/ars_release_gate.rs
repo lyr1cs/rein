@@ -1,5 +1,9 @@
 use rein::config::ReinConfig;
-use rein::ops::ars_release_gate::{evaluate_ars_acceleration_release_gate, ReleaseGateInput};
+use rein::judge::contract::JudgeStructuralStatus;
+use rein::ops::ars_release_gate::{
+    evaluate_ars_acceleration_release_gate, JudgeStructuralReleaseInput, ReleaseGateInput,
+};
+use rein::ops::ars_tuning::JudgeStructuralTrustContext;
 use rein::store::adaptive::{
     AdaptiveState, JudgeCalibrationState, LearnedShadowFusionEntry, ShadowFusionWeightEntry,
 };
@@ -91,7 +95,175 @@ fn input<'a>(
         state,
         policy,
         shadow_fusion_status,
+        judge_structural: JudgeStructuralReleaseInput::default(),
     }
+}
+
+fn structural_input(status: JudgeStructuralStatus, enforce: bool) -> JudgeStructuralReleaseInput {
+    JudgeStructuralReleaseInput {
+        synthesis: JudgeStructuralTrustContext {
+            status,
+            enforce,
+            gate_required: true,
+        },
+        concept_summary: JudgeStructuralTrustContext::default(),
+    }
+}
+
+#[test]
+fn failed_stale_and_mismatched_structural_health_block_without_faking_human_kappa() {
+    for status in [
+        JudgeStructuralStatus::Failed,
+        JudgeStructuralStatus::Stale,
+        JudgeStructuralStatus::FingerprintMismatch,
+        JudgeStructuralStatus::Corrupt,
+        JudgeStructuralStatus::Unknown,
+    ] {
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        let state = eligible_state(12);
+        let policy = loaded_canary_policy(state.version);
+        let shadow_fusion_status = ready_shadow_status();
+        let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+            config: &config,
+            state: &state,
+            policy: &policy,
+            shadow_fusion_status: &shadow_fusion_status,
+            judge_structural: structural_input(status, true),
+        });
+
+        assert!(!report.canary.allowed, "{status:?} must block promotion");
+        assert!(report.canary.blockers.iter().any(|blocker| {
+            blocker
+                == &format!(
+                    "judge_structural_unhealthy:synthesis:{}",
+                    match status {
+                        JudgeStructuralStatus::Failed => "failed",
+                        JudgeStructuralStatus::Stale => "stale",
+                        JudgeStructuralStatus::FingerprintMismatch => "fingerprint_mismatch",
+                        JudgeStructuralStatus::Corrupt => "corrupt",
+                        JudgeStructuralStatus::Unknown => "unknown",
+                        _ => unreachable!(),
+                    }
+                )
+        }));
+        assert_eq!(report.signals.judge_human_pairs_synthesis, 0);
+        assert_eq!(report.signals.judge_human_kappa_synthesis, None);
+        assert_eq!(report.signals.judge_calibration_pairs, 0);
+    }
+}
+
+#[test]
+fn ready_structural_anchors_do_not_authorize_release_promotion() {
+    let mut config = ReinConfig::default();
+    config.ars.llm_judge.enabled = true;
+    config.ars.llm_judge.synthesis_enabled = true;
+    config.ars.llm_judge.concept_summary_enabled = false;
+    let state = eligible_state(12);
+    let policy = loaded_canary_policy(state.version);
+    let shadow_fusion_status = ready_shadow_status();
+    let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+        config: &config,
+        state: &state,
+        policy: &policy,
+        shadow_fusion_status: &shadow_fusion_status,
+        judge_structural: structural_input(JudgeStructuralStatus::Ready, true),
+    });
+
+    assert!(!report.canary.allowed);
+    assert_eq!(report.schema_version, 2);
+    assert!(report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker
+            == "judge_trust_disallows_promotion:synthesis:structural_anchors_ready"));
+    assert_eq!(
+        report.signals.judge_calibration_basis_synthesis,
+        "structural_anchors"
+    );
+    assert_eq!(report.signals.judge_human_kappa_synthesis, None);
+}
+
+#[test]
+fn monitor_failure_does_not_override_healthy_human_calibration() {
+    let mut config = ReinConfig::default();
+    config.ars.llm_judge.enabled = true;
+    config.ars.llm_judge.synthesis_enabled = true;
+    config.ars.llm_judge.concept_summary_enabled = false;
+    let mut state = eligible_state(12);
+    let mut calibration = JudgeCalibrationState {
+        kappa: 0.9,
+        ..JudgeCalibrationState::default()
+    };
+    for idx in 0..rein::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+        calibration
+            .recent_pairs_synthesis
+            .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+    }
+    state.judge_calibration_state = Some(calibration);
+    let policy = loaded_canary_policy(state.version);
+    let shadow_fusion_status = ready_shadow_status();
+    let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+        config: &config,
+        state: &state,
+        policy: &policy,
+        shadow_fusion_status: &shadow_fusion_status,
+        judge_structural: structural_input(JudgeStructuralStatus::Failed, false),
+    });
+
+    assert!(
+        report.canary.allowed,
+        "monitor status must not be an enforce blocker"
+    );
+    assert!(!report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("judge_structural_unhealthy:")));
+}
+
+#[test]
+fn human_negative_evidence_precedes_structural_failure_in_release_gate() {
+    let mut config = ReinConfig::default();
+    config.ars.llm_judge.enabled = true;
+    config.ars.llm_judge.synthesis_enabled = true;
+    config.ars.llm_judge.concept_summary_enabled = false;
+    let mut state = eligible_state(12);
+    let mut calibration = JudgeCalibrationState {
+        kappa: 0.1,
+        ..JudgeCalibrationState::default()
+    };
+    for idx in 0..rein::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+        calibration
+            .recent_pairs_synthesis
+            .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+    }
+    state.judge_calibration_state = Some(calibration);
+    let policy = loaded_canary_policy(state.version);
+    let shadow_fusion_status = ready_shadow_status();
+    let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+        config: &config,
+        state: &state,
+        policy: &policy,
+        shadow_fusion_status: &shadow_fusion_status,
+        judge_structural: structural_input(JudgeStructuralStatus::Failed, true),
+    });
+
+    assert!(report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "judge_human_kappa_below_floor:synthesis"));
+    assert!(!report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("judge_structural_unhealthy:synthesis")));
+    assert_eq!(report.signals.judge_human_pairs_synthesis, 30);
+    assert_eq!(report.signals.judge_human_kappa_synthesis, Some(0.1));
 }
 
 #[test]

@@ -128,6 +128,157 @@ pub fn effective_simplex(
 /// only zero their own surface.
 pub use crate::store::adaptive::JudgeSurface;
 
+/// Structural half of judge trust. Human-pair evidence remains in
+/// `JudgeCalibrationState`; keeping these separate prevents deterministic
+/// probes from being mistaken for human agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JudgeStructuralTrustContext {
+    pub status: crate::judge::contract::JudgeStructuralStatus,
+    pub enforce: bool,
+    /// True when the runtime judge is enabled for this surface, even if the
+    /// structural-anchor mode itself is off. Non-judge deployments must not
+    /// lose their ordinary human-feedback adaptive scopes.
+    pub gate_required: bool,
+}
+
+impl Default for JudgeStructuralTrustContext {
+    fn default() -> Self {
+        Self {
+            status: crate::judge::contract::JudgeStructuralStatus::Disabled,
+            enforce: false,
+            gate_required: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HumanJudgeCalibration {
+    pub pair_count: usize,
+    pub kappa: Option<f64>,
+}
+
+/// Surface-local human agreement only. Runtime-vs-nightly pairs are drift
+/// evidence and are intentionally absent from this projection.
+pub fn human_judge_calibration(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+) -> HumanJudgeCalibration {
+    let Some(calibration) = calibration else {
+        return HumanJudgeCalibration {
+            pair_count: 0,
+            kappa: None,
+        };
+    };
+    let (pair_count, raw_kappa) = match surface {
+        JudgeSurface::Synthesis => (calibration.recent_pairs_synthesis.len(), calibration.kappa),
+        JudgeSurface::ConceptSummary => (
+            calibration.recent_pairs_concept.len(),
+            crate::store::adaptive::compute_cohens_kappa(&calibration.recent_pairs_concept),
+        ),
+    };
+    HumanJudgeCalibration {
+        pair_count,
+        kappa: (pair_count >= crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS).then_some(raw_kappa),
+    }
+}
+
+pub fn judge_calibration_evidence(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+) -> crate::judge::contract::JudgeCalibrationEvidence {
+    let human = human_judge_calibration(calibration, surface);
+    crate::judge::contract::JudgeCalibrationEvidence {
+        human_pair_count: human.pair_count,
+        human_kappa: human.kappa,
+        structural_status: structural.status,
+        enforce_structural_anchors: structural.enforce,
+    }
+}
+
+pub fn judge_trust_decision(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+    action: crate::judge::contract::JudgeTrustAction,
+) -> crate::judge::contract::JudgeTrustDecision {
+    if !structural.gate_required {
+        return crate::judge::contract::JudgeTrustDecision {
+            basis: crate::judge::contract::JudgeCalibrationBasis::ConfiguredBaseline,
+            action_allowed: true,
+            configured_baseline_scale: 1.0,
+            blocks_release: false,
+            reason: crate::judge::contract::JudgeTrustReason::ConfiguredBaselineFallback,
+        };
+    }
+    crate::judge::contract::judge_trust_gate(
+        &judge_calibration_evidence(calibration, surface, structural),
+        action,
+    )
+}
+
+/// Read-only projection of current structural health. Missing/unreadable state
+/// is `Unknown`; enforce mode then fails closed through `judge_trust_gate`.
+pub fn resolve_judge_structural_trust(
+    conn: &rusqlite::Connection,
+    config: &crate::config::ReinConfig,
+    surface: JudgeSurface,
+    now: i64,
+) -> JudgeStructuralTrustContext {
+    use crate::config::JudgeStructuralAnchorMode;
+    use crate::judge::contract::JudgeStructuralStatus;
+    use crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus;
+
+    let mode = config.ars.llm_judge.structural_anchors.mode;
+    let surface_enabled = match surface {
+        JudgeSurface::Synthesis => config.ars.llm_judge.synthesis_enabled,
+        JudgeSurface::ConceptSummary => config.ars.llm_judge.concept_summary_enabled,
+    };
+    if !config.ars.llm_judge.enabled || !surface_enabled {
+        return JudgeStructuralTrustContext::default();
+    }
+    if mode == JudgeStructuralAnchorMode::Off {
+        return JudgeStructuralTrustContext {
+            status: JudgeStructuralStatus::Disabled,
+            enforce: false,
+            gate_required: true,
+        };
+    }
+
+    let loaded =
+        crate::store::judge_structural_calibration::load_judge_structural_calibration(conn);
+    let status = match loaded.status {
+        JudgeStructuralCalibrationLoadStatus::Missing => JudgeStructuralStatus::Unknown,
+        JudgeStructuralCalibrationLoadStatus::Corrupt => JudgeStructuralStatus::Corrupt,
+        JudgeStructuralCalibrationLoadStatus::UnsupportedSchema
+        | JudgeStructuralCalibrationLoadStatus::StorageError => JudgeStructuralStatus::Unknown,
+        JudgeStructuralCalibrationLoadStatus::Loaded => {
+            let Some((model_fingerprint, rubric_fingerprint)) =
+                crate::ops::llm_judge_worker::structural_fingerprints_for_config(config, surface)
+            else {
+                return JudgeStructuralTrustContext {
+                    status: JudgeStructuralStatus::Unknown,
+                    enforce: mode == JudgeStructuralAnchorMode::Enforce,
+                    gate_required: true,
+                };
+            };
+            loaded.state.surface(surface).status_for(
+                now,
+                i64::try_from(config.ars.llm_judge.structural_anchors.interval_secs)
+                    .unwrap_or(i64::MAX),
+                &model_fingerprint,
+                &rubric_fingerprint,
+                crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION,
+            )
+        }
+    };
+    JudgeStructuralTrustContext {
+        status,
+        enforce: mode == JudgeStructuralAnchorMode::Enforce,
+        gate_required: true,
+    }
+}
+
 /// True when judge drift should kill `llm_feedback_reliability` (and hence
 /// all `effective_*` ladders) for the given surface. Cross-surface
 /// `judge_drift_alert` is a global kill switch; per-surface counters only
@@ -143,6 +294,15 @@ fn surface_drift_active(
     calibration.judge_drift_alert > 0 || surface_count > 0
 }
 
+pub fn judge_surface_drift_active(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+) -> bool {
+    calibration
+        .map(|calibration| surface_drift_active(calibration, surface))
+        .unwrap_or(false)
+}
+
 pub fn llm_feedback_reliability(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     surface: JudgeSurface,
@@ -154,24 +314,11 @@ pub fn llm_feedback_reliability(
         return 0.0;
     }
 
-    let mut parts = Vec::new();
-    if calibration.recent_pairs_synthesis.len() >= 10 {
-        parts.push(clamp01(calibration.kappa));
-    }
-    if calibration.recent_pairs_runtime_vs_offline.len() >= 30 {
-        parts.push(clamp01(calibration.runtime_vs_offline_kappa));
-    }
-    if calibration.recent_pairs_runtime_vs_offline_synthesis.len() >= 30 {
-        parts.push(clamp01(calibration.runtime_vs_offline_kappa_synthesis));
-    }
-    if calibration.recent_pairs_runtime_vs_offline_concept.len() >= 30 {
-        parts.push(clamp01(calibration.runtime_vs_offline_kappa_concept));
-    }
-    if parts.is_empty() {
-        0.0
-    } else {
-        parts.iter().sum::<f64>() / parts.len() as f64
-    }
+    human_judge_calibration(Some(calibration), surface)
+        .kappa
+        .filter(|kappa| kappa.is_finite() && (-1.0..=1.0).contains(kappa))
+        .map(clamp01)
+        .unwrap_or(0.0)
 }
 
 pub fn effective_judge_weight_decay_rate(
@@ -196,6 +343,24 @@ pub fn effective_judge_weight_decay_rate_with_previous(
     previous_effective: Option<f64>,
     surface: JudgeSurface,
 ) -> f64 {
+    effective_judge_weight_decay_rate_with_previous_and_structural_trust(
+        static_rate,
+        calibration,
+        runtime_adoption_weight,
+        previous_effective,
+        surface,
+        JudgeStructuralTrustContext::default(),
+    )
+}
+
+pub fn effective_judge_weight_decay_rate_with_previous_and_structural_trust(
+    static_rate: f64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    runtime_adoption_weight: f64,
+    previous_effective: Option<f64>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+) -> f64 {
     let production_canary = runtime_adoption_weight > f64::EPSILON;
     // v0.28.7 audit R4 P1 — drift check MUST run before the static fallback,
     // otherwise a drift alert that demoted the policy to Shadow (→ caller
@@ -208,26 +373,27 @@ pub fn effective_judge_weight_decay_rate_with_previous(
     if drift_alert {
         return 0.0;
     }
+    let trust = judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        crate::judge::contract::JudgeTrustAction::IncreaseJudgeWeight,
+    );
+    let configured_baseline = finite_non_negative(static_rate) * trust.configured_baseline_scale;
     // v0.28.7 audit R3 P2 — `weight_decay_rate` is NOT an LLM call rate; it
     // is the weight applied when folding *already-emitted* judge events into
     // feedback stats. Outside canary the static configured rate is the right
     // baseline (so historical/manual judge data is still folded). Only the
     // dynamic blend toward calibrated κ is gated to canary.
     if !production_canary {
-        return finite_non_negative(static_rate);
+        return configured_baseline;
     }
-    let pair_count = calibration
-        .map(|cal| {
-            cal.recent_pairs_synthesis
-                .len()
-                .saturating_add(cal.recent_pairs_concept.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline_synthesis.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline_concept.len())
-        })
-        .unwrap_or(0) as u64;
+    if !trust.action_allowed {
+        return configured_baseline;
+    }
+    let pair_count = calibration_pair_count(calibration, surface);
     effective_scalar(
-        static_rate,
+        configured_baseline,
         llm_feedback_reliability(calibration, surface),
         previous_effective,
         bounds01(0.10),
@@ -272,6 +438,27 @@ pub fn effective_judge_sample_rate_with_previous(
     previous_effective: Option<f64>,
     surface: JudgeSurface,
 ) -> f64 {
+    effective_judge_sample_rate_with_previous_and_structural_trust(
+        static_rate,
+        calibration,
+        runtime_adoption_weight,
+        cold_start,
+        previous_effective,
+        surface,
+        JudgeStructuralTrustContext::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn effective_judge_sample_rate_with_previous_and_structural_trust(
+    static_rate: f64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    runtime_adoption_weight: f64,
+    cold_start: bool,
+    previous_effective: Option<f64>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+) -> f64 {
     let max_rate = if cold_start { 1.0 } else { 0.5 };
     let static_rate = finite_non_negative(static_rate).min(max_rate);
     let production_canary = runtime_adoption_weight > f64::EPSILON;
@@ -292,8 +479,18 @@ pub fn effective_judge_sample_rate_with_previous(
     if drift_alert {
         return 0.0;
     }
+    let trust = judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        crate::judge::contract::JudgeTrustAction::IncreaseSampleRate,
+    );
+    let static_rate = static_rate * trust.configured_baseline_scale;
+    if !trust.action_allowed {
+        return static_rate;
+    }
     let reliability = llm_feedback_reliability(calibration, surface);
-    let pair_count = calibration_pair_count(calibration);
+    let pair_count = calibration_pair_count(calibration, surface);
     let learned_rate = if cold_start {
         static_rate * (1.0 - 0.5 * reliability)
     } else {
@@ -346,12 +543,36 @@ pub fn effective_cold_start_n_with_previous(
     previous_effective: Option<f64>,
     surface: JudgeSurface,
 ) -> u64 {
+    effective_cold_start_n_with_previous_and_structural_trust(
+        static_n,
+        calibration,
+        runtime_adoption_weight,
+        previous_effective,
+        surface,
+        JudgeStructuralTrustContext::default(),
+    )
+}
+
+pub fn effective_cold_start_n_with_previous_and_structural_trust(
+    static_n: u64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    runtime_adoption_weight: f64,
+    previous_effective: Option<f64>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+) -> u64 {
     let production_canary = runtime_adoption_weight > f64::EPSILON;
     // v0.28.7 M-1 — per-surface drift gate.
     let drift_alert = calibration
         .map(|cal| surface_drift_active(cal, surface))
         .unwrap_or(false);
-    if !production_canary || drift_alert || static_n == 0 {
+    let trust = judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    );
+    if !production_canary || drift_alert || static_n == 0 || !trust.action_allowed {
         return static_n;
     }
 
@@ -370,7 +591,7 @@ pub fn effective_cold_start_n_with_previous(
             enabled: true,
             production_canary,
             runtime_adoption_weight,
-            human_count: calibration_pair_count(calibration),
+            human_count: calibration_pair_count(calibration, surface),
             llm_count: 0,
             llm_reliability: 0.0,
             calibration: 1.0,
@@ -417,13 +638,44 @@ pub fn effective_useful_rate_threshold_with_previous(
     previous_effective: Option<f64>,
     surface: JudgeSurface,
 ) -> f64 {
+    effective_useful_rate_threshold_with_previous_and_structural_trust(
+        static_threshold,
+        observed_useful_rate,
+        human_count,
+        llm_count,
+        calibration,
+        runtime_adoption_weight,
+        previous_effective,
+        surface,
+        JudgeStructuralTrustContext::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn effective_useful_rate_threshold_with_previous_and_structural_trust(
+    static_threshold: f64,
+    observed_useful_rate: f64,
+    human_count: u64,
+    llm_count: u64,
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    runtime_adoption_weight: f64,
+    previous_effective: Option<f64>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+) -> f64 {
     let static_threshold = clamp01(finite_or(static_threshold, 0.0));
     let production_canary = runtime_adoption_weight > f64::EPSILON;
     // v0.28.7 M-1 — per-surface drift gate.
     let drift_alert = calibration
         .map(|cal| surface_drift_active(cal, surface))
         .unwrap_or(false);
-    if !production_canary || drift_alert {
+    let trust = judge_trust_decision(
+        calibration,
+        surface,
+        structural,
+        crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+    );
+    if !production_canary || drift_alert || !trust.action_allowed {
         return static_threshold;
     }
 
@@ -550,18 +802,9 @@ fn adoption_weight_from_canary(production_canary: bool) -> f64 {
 
 fn calibration_pair_count(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
 ) -> u64 {
-    calibration
-        .map(|cal| {
-            cal.recent_pairs_synthesis
-                .len()
-                .saturating_add(cal.recent_pairs_concept.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline_synthesis.len())
-                .saturating_add(cal.recent_pairs_runtime_vs_offline_concept.len())
-                as u64
-        })
-        .unwrap_or(0)
+    human_judge_calibration(calibration, surface).pair_count as u64
 }
 
 fn normalize_simplex(values: [f64; 6]) -> Option<[f64; 6]> {
@@ -602,6 +845,390 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_vs_nightly_kappa_is_drift_only_not_reliability() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            runtime_vs_offline_kappa: 1.0,
+            runtime_vs_offline_kappa_synthesis: 1.0,
+            runtime_vs_offline_kappa_concept: 1.0,
+            ..Default::default()
+        };
+        for idx in 0..40 {
+            calibration
+                .recent_pairs_runtime_vs_offline
+                .push_back((true, true, idx));
+            calibration
+                .recent_pairs_runtime_vs_offline_synthesis
+                .push_back((true, true, idx));
+            calibration
+                .recent_pairs_runtime_vs_offline_concept
+                .push_back((true, true, idx));
+        }
+
+        assert_eq!(
+            llm_feedback_reliability(Some(&calibration), JudgeSurface::Synthesis),
+            0.0
+        );
+        assert_eq!(
+            llm_feedback_reliability(Some(&calibration), JudgeSurface::ConceptSummary),
+            0.0
+        );
+    }
+
+    #[test]
+    fn concept_reliability_uses_only_concept_human_pairs() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 1.0,
+            ..Default::default()
+        };
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            let hit = idx % 2 == 0;
+            calibration
+                .recent_pairs_synthesis
+                .push_back((hit, hit, idx as i64));
+            calibration
+                .recent_pairs_concept
+                .push_back((hit, !hit, idx as i64));
+        }
+
+        assert_eq!(
+            llm_feedback_reliability(Some(&calibration), JudgeSurface::Synthesis),
+            1.0
+        );
+        assert_eq!(
+            llm_feedback_reliability(Some(&calibration), JudgeSurface::ConceptSummary),
+            0.0
+        );
+    }
+
+    #[test]
+    fn human_kappa_is_undefined_until_the_thirtieth_surface_pair() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 1.0,
+            ..Default::default()
+        };
+        for idx in 0..(crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS - 1) {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        }
+        assert_eq!(
+            human_judge_calibration(Some(&calibration), JudgeSurface::Synthesis).kappa,
+            None
+        );
+
+        let idx = crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS - 1;
+        calibration
+            .recent_pairs_synthesis
+            .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        assert_eq!(
+            human_judge_calibration(Some(&calibration), JudgeSurface::Synthesis).kappa,
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn ready_structural_anchors_preserve_configured_baselines_without_learning() {
+        let calibration = crate::store::adaptive::JudgeCalibrationState::default();
+        let structural = JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Ready,
+            enforce: true,
+            gate_required: true,
+        };
+
+        let weight = effective_judge_weight_decay_rate_with_previous_and_structural_trust(
+            0.3,
+            Some(&calibration),
+            1.0,
+            Some(0.9),
+            JudgeSurface::Synthesis,
+            structural,
+        );
+        let sample = effective_judge_sample_rate_with_previous_and_structural_trust(
+            0.4,
+            Some(&calibration),
+            1.0,
+            false,
+            Some(0.9),
+            JudgeSurface::Synthesis,
+            structural,
+        );
+
+        assert_eq!(weight, 0.3);
+        assert_eq!(sample, 0.4);
+    }
+
+    #[test]
+    fn monitor_failure_preserves_baselines_but_does_not_learn() {
+        let calibration = crate::store::adaptive::JudgeCalibrationState::default();
+        let structural = JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Failed,
+            enforce: false,
+            gate_required: true,
+        };
+        assert_eq!(
+            effective_judge_weight_decay_rate_with_previous_and_structural_trust(
+                0.3,
+                Some(&calibration),
+                1.0,
+                Some(0.9),
+                JudgeSurface::Synthesis,
+                structural,
+            ),
+            0.3
+        );
+        assert_eq!(
+            effective_judge_sample_rate_with_previous_and_structural_trust(
+                0.4,
+                Some(&calibration),
+                1.0,
+                false,
+                Some(0.9),
+                JudgeSurface::Synthesis,
+                structural,
+            ),
+            0.4
+        );
+    }
+
+    #[test]
+    fn stale_positive_policy_cannot_keep_judge_scope_scalars_dynamic() {
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 0.9,
+            ..Default::default()
+        };
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            calibration
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        }
+        let failed = JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Failed,
+            enforce: true,
+            gate_required: true,
+        };
+
+        assert_eq!(
+            effective_cold_start_n_with_previous_and_structural_trust(
+                10,
+                Some(&calibration),
+                1.0,
+                Some(3.0),
+                JudgeSurface::Synthesis,
+                failed,
+            ),
+            10
+        );
+        assert_eq!(
+            effective_useful_rate_threshold_with_previous_and_structural_trust(
+                0.5,
+                0.35,
+                100,
+                100,
+                Some(&calibration),
+                1.0,
+                Some(0.35),
+                JudgeSurface::Synthesis,
+                failed,
+            ),
+            0.5
+        );
+    }
+
+    #[test]
+    fn unhealthy_enforced_structural_anchors_zero_configured_baselines() {
+        let calibration = crate::store::adaptive::JudgeCalibrationState::default();
+        for status in [
+            crate::judge::contract::JudgeStructuralStatus::Failed,
+            crate::judge::contract::JudgeStructuralStatus::Stale,
+            crate::judge::contract::JudgeStructuralStatus::FingerprintMismatch,
+            crate::judge::contract::JudgeStructuralStatus::Corrupt,
+            crate::judge::contract::JudgeStructuralStatus::Unknown,
+        ] {
+            let structural = JudgeStructuralTrustContext {
+                status,
+                enforce: true,
+                gate_required: true,
+            };
+            assert_eq!(
+                effective_judge_weight_decay_rate_with_previous_and_structural_trust(
+                    0.3,
+                    Some(&calibration),
+                    0.0,
+                    None,
+                    JudgeSurface::Synthesis,
+                    structural,
+                ),
+                0.0,
+                "{status:?}"
+            );
+            assert_eq!(
+                effective_judge_sample_rate_with_previous_and_structural_trust(
+                    0.4,
+                    Some(&calibration),
+                    1.0,
+                    false,
+                    None,
+                    JudgeSurface::Synthesis,
+                    structural,
+                ),
+                0.0,
+                "{status:?}"
+            );
+        }
+    }
+
+    fn structural_config(
+        mode: crate::config::JudgeStructuralAnchorMode,
+    ) -> crate::config::ReinConfig {
+        let mut config = crate::config::ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        config.ars.llm_judge.structural_anchors.mode = mode;
+        config.ars.llm_judge.structural_anchors.interval_secs = 100;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-model-a".to_string());
+        config
+    }
+
+    #[test]
+    fn structural_trust_resolver_is_off_by_default_and_unknown_when_enabled_without_state() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let off = resolve_judge_structural_trust(
+            store.conn(),
+            &crate::config::ReinConfig::default(),
+            JudgeSurface::Synthesis,
+            1_000,
+        );
+        assert_eq!(
+            off.status,
+            crate::judge::contract::JudgeStructuralStatus::Disabled
+        );
+        assert!(!off.enforce);
+        assert!(!off.gate_required);
+
+        let judge_on_anchors_off = structural_config(crate::config::JudgeStructuralAnchorMode::Off);
+        let anchors_off = resolve_judge_structural_trust(
+            store.conn(),
+            &judge_on_anchors_off,
+            JudgeSurface::Synthesis,
+            1_000,
+        );
+        assert_eq!(
+            anchors_off.status,
+            crate::judge::contract::JudgeStructuralStatus::Disabled
+        );
+        assert!(anchors_off.gate_required);
+
+        let enforce = structural_config(crate::config::JudgeStructuralAnchorMode::Enforce);
+        let missing =
+            resolve_judge_structural_trust(store.conn(), &enforce, JudgeSurface::Synthesis, 1_000);
+        assert_eq!(
+            missing.status,
+            crate::judge::contract::JudgeStructuralStatus::Unknown
+        );
+        assert!(missing.enforce);
+        assert!(missing.gate_required);
+    }
+
+    #[test]
+    fn structural_trust_resolver_projects_ready_stale_and_fingerprint_mismatch() {
+        use crate::store::judge_structural_calibration::{
+            compare_and_swap_judge_structural_calibration, JudgeStructuralCalibrationState,
+            JudgeStructuralSurfaceState,
+        };
+
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let mut config = structural_config(crate::config::JudgeStructuralAnchorMode::Enforce);
+        let (model_fingerprint, rubric_fingerprint) =
+            crate::ops::llm_judge_worker::structural_fingerprints_for_config(
+                &config,
+                JudgeSurface::Synthesis,
+            )
+            .unwrap();
+        let surface = JudgeStructuralSurfaceState {
+            run_id: Some("run-a".to_string()),
+            probe_set_version: crate::ops::llm_judge_worker::JUDGE_STRUCTURAL_PROBE_SET_VERSION
+                .to_string(),
+            model_fingerprint,
+            rubric_fingerprint,
+            run_token_hashes: crate::store::adaptive::JudgeStructuralProbeKind::ALL
+                .into_iter()
+                .map(|kind| (kind, "0".repeat(64)))
+                .collect(),
+            seen_kinds: crate::store::adaptive::JudgeStructuralProbeKind::ALL
+                .into_iter()
+                .collect(),
+            failed_kinds: Default::default(),
+            run_started_at: 900,
+            last_probe_at: 1_000,
+            completed_at: Some(1_000),
+            status: crate::judge::contract::JudgeStructuralStatus::Ready,
+            alert_count: 0,
+        };
+        let state = JudgeStructuralCalibrationState {
+            revision: 1,
+            synthesis: surface,
+            updated_at: 1_000,
+            ..JudgeStructuralCalibrationState::default()
+        };
+        assert!(compare_and_swap_judge_structural_calibration(store.conn(), &state, 0).unwrap());
+
+        assert_eq!(
+            resolve_judge_structural_trust(store.conn(), &config, JudgeSurface::Synthesis, 1_200,)
+                .status,
+            crate::judge::contract::JudgeStructuralStatus::Ready
+        );
+        assert_eq!(
+            resolve_judge_structural_trust(store.conn(), &config, JudgeSurface::Synthesis, 1_201,)
+                .status,
+            crate::judge::contract::JudgeStructuralStatus::Stale
+        );
+
+        config.llm.omlx.model = Some("judge-model-b".to_string());
+        assert_eq!(
+            resolve_judge_structural_trust(store.conn(), &config, JudgeSurface::Synthesis, 1_100,)
+                .status,
+            crate::judge::contract::JudgeStructuralStatus::FingerprintMismatch
+        );
+    }
+
+    #[test]
+    fn structural_trust_resolver_preserves_corrupt_and_future_rows_fail_closed() {
+        let config = structural_config(crate::config::JudgeStructuralAnchorMode::Enforce);
+        for (raw, expected) in [
+            (
+                "{not-json}".to_string(),
+                crate::judge::contract::JudgeStructuralStatus::Corrupt,
+            ),
+            (
+                serde_json::json!({"schema_version": 999, "revision": 1}).to_string(),
+                crate::judge::contract::JudgeStructuralStatus::Unknown,
+            ),
+        ] {
+            let store = crate::store::SqliteStore::in_memory().unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        crate::store::judge_structural_calibration::JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY,
+                        raw
+                    ],
+                )
+                .unwrap();
+            let resolved = resolve_judge_structural_trust(
+                store.conn(),
+                &config,
+                JudgeSurface::Synthesis,
+                1_000,
+            );
+            assert_eq!(resolved.status, expected);
+            assert!(resolved.enforce);
+        }
+    }
 
     #[test]
     fn trust_is_zero_when_policy_is_not_allowed_to_affect_runtime() {
@@ -758,15 +1385,10 @@ mod tests {
             runtime_vs_offline_kappa: 0.6,
             ..Default::default()
         };
-        for idx in 0..12 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
                 .recent_pairs_synthesis
-                .push_back((true, true, idx));
-        }
-        for idx in 0..35 {
-            calibration
-                .recent_pairs_runtime_vs_offline
-                .push_back((true, true, idx));
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
         let effective = effective_judge_weight_decay_rate(
             0.3,
@@ -847,10 +1469,10 @@ mod tests {
             runtime_vs_offline_kappa: 0.8,
             ..Default::default()
         };
-        for idx in 0..40 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
-                .recent_pairs_runtime_vs_offline
-                .push_back((true, true, idx));
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
 
         let effective = effective_judge_sample_rate(
@@ -944,10 +1566,10 @@ mod tests {
             kappa: 0.9,
             ..Default::default()
         };
-        for idx in 0..20 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
                 .recent_pairs_synthesis
-                .push_back((true, true, idx));
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
 
         let effective =
@@ -963,10 +1585,10 @@ mod tests {
             kappa: 0.8,
             ..Default::default()
         };
-        for idx in 0..12 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
                 .recent_pairs_synthesis
-                .push_back((true, true, idx));
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
 
         let effective = effective_useful_rate_threshold(
@@ -1231,10 +1853,10 @@ mod tests {
             judge_drift_alert: 0,
             ..Default::default()
         };
-        for idx in 0..40 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
-                .recent_pairs_runtime_vs_offline
-                .push_back((true, true, idx));
+                .recent_pairs_concept
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
 
         // Concept reliability survives; synthesis is zeroed.
@@ -1257,10 +1879,10 @@ mod tests {
             judge_drift_alert_concept: 0,
             ..Default::default()
         };
-        for idx in 0..40 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
-                .recent_pairs_runtime_vs_offline
-                .push_back((true, true, idx));
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
 
         assert_eq!(
@@ -1285,10 +1907,10 @@ mod tests {
             judge_drift_alert: 0,
             ..Default::default()
         };
-        for idx in 0..40 {
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
             calibration
-                .recent_pairs_runtime_vs_offline
-                .push_back((true, true, idx));
+                .recent_pairs_synthesis
+                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
         }
 
         assert!(llm_feedback_reliability(Some(&calibration), JudgeSurface::Synthesis) > 0.0);

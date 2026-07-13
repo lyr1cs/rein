@@ -20,7 +20,7 @@
 //! `judge::contract::J1_ALLOWED_WRITE_TABLES`. This is the reason the judge
 //! worker stays out of the v0.26.x 4-way pipeline-interaction matrix.
 
-use crate::config::JudgeStructuralAnchorMode;
+use crate::config::{JudgeStructuralAnchorMode, Provider};
 use crate::extract::llm::ExtractorKind;
 use crate::judge::contract::{
     self, JudgeContext, JudgePayload, ReservationToken, LLM_JUDGE_DAILY_CALL_CAP_DEFAULT,
@@ -164,7 +164,7 @@ fn structural_model_fingerprint(extractor: &ExtractorKind) -> String {
     }
 }
 
-fn structural_rubric_fingerprint(surface: JudgeSurface) -> String {
+pub(crate) fn structural_rubric_fingerprint(surface: JudgeSurface) -> String {
     let mut hasher = Sha256::new();
     for part in [
         "judge-structural-rubric-v1",
@@ -185,6 +185,38 @@ fn structural_rubric_fingerprint(surface: JudgeSurface) -> String {
         hasher.update([0xff]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Resolve the exact fingerprints used by the structural probe runner without
+/// constructing an extractor or requiring an API key. Trust/read paths use
+/// this to invalidate old probe state immediately after provider, model,
+/// endpoint, rubric, or OMLX thinking-mode changes.
+pub(crate) fn structural_fingerprints_for_config(
+    config: &crate::config::ReinConfig,
+    surface: JudgeSurface,
+) -> Option<(String, String)> {
+    let resolved = config.resolve_llm_for("ars.llm_judge").ok()?;
+    let model = match resolved.provider {
+        Provider::None => return None,
+        Provider::Google => structural_fingerprint(&[
+            "judge-model-v1",
+            "gemini",
+            &resolved.model,
+            &resolved.endpoint,
+        ]),
+        Provider::Omlx => structural_fingerprint(&[
+            "judge-model-v1",
+            "omlx",
+            &resolved.model,
+            &resolved.endpoint,
+            if config.extract.omlx.disable_thinking {
+                "disable_thinking"
+            } else {
+                "thinking_enabled"
+            },
+        ]),
+    };
+    Some((model, structural_rubric_fingerprint(surface)))
 }
 
 fn structural_surface_due(
@@ -1631,6 +1663,21 @@ mod tests {
             ExtractorKind::Mock(mock) => mock.call_count(),
             _ => 0,
         }
+    }
+
+    #[test]
+    fn config_fingerprint_matches_the_runtime_extractor_fingerprint() {
+        let mut config = crate::config::ReinConfig::default();
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-model-a".to_string());
+        config.llm.omlx.endpoint = Some("http://127.0.0.1:9999/v1".to_string());
+        config.extract.omlx.disable_thinking = true;
+        let extractor =
+            crate::ops::concept_summary::create_ars_extractor(&config, "ars.llm_judge").unwrap();
+        let (resolved, _) =
+            structural_fingerprints_for_config(&config, JudgeSurface::Synthesis).unwrap();
+
+        assert_eq!(resolved, structural_model_fingerprint(&extractor));
     }
 
     #[test]
