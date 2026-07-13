@@ -81,6 +81,7 @@ pub struct ArsRecallFusionEvidence {
     pub calibrated_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluated_at: Option<i64>,
+    /// Earliest Unix millisecond at which fixed-time A12 evidence expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a12_valid_until_exclusive: Option<i64>,
     #[serde(default)]
@@ -568,9 +569,13 @@ fn validate_recall_fusion_evidence(
             "recall-fusion evidence `{key}` gate evaluation predates calibration"
         ));
     }
-    if evidence
-        .a12_valid_until_exclusive
-        .is_some_and(|boundary| boundary <= evidence.evaluated_at.unwrap_or(i64::MAX))
+    let evaluated_at_millis = evidence
+        .evaluated_at
+        .and_then(|evaluated| evaluated.checked_mul(1_000));
+    if evidence.evaluated_at.is_some() && evaluated_at_millis.is_none()
+        || evidence
+            .a12_valid_until_exclusive
+            .is_some_and(|boundary| boundary <= evaluated_at_millis.unwrap_or(i64::MAX))
     {
         return Err(format!(
             "recall-fusion evidence `{key}` validity boundary must follow evaluation"
@@ -730,7 +735,7 @@ mod tests {
                 recall_gate_fixture_fingerprint: Some("fixture-fp".to_string()),
                 calibrated_at: Some(1_000),
                 evaluated_at: Some(1_010),
-                a12_valid_until_exclusive: Some(2_000),
+                a12_valid_until_exclusive: Some(2_000_000),
                 reason: "human and holdout-approved automatic evidence".to_string(),
             },
         );

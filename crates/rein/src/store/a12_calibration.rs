@@ -264,7 +264,7 @@ pub struct A12ScopeEntry {
     pub evaluation_fingerprint: String,
     pub calibrated_at: i64,
     pub evaluated_at: i64,
-    /// Earliest wall-clock second at which fixed-time replay may diverge from
+    /// Earliest Unix millisecond at which fixed-time replay may diverge from
     /// production because a relative temporal window or KG validity edge
     /// changes membership. `None` means this scope observed no such boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,13 +306,13 @@ impl A12ScopeEntry {
         &self,
         state: &A12CalibrationState,
         expected_noise_floor: f64,
-        now: i64,
+        now_unix_ms: i64,
     ) -> bool {
-        now >= 0
+        now_unix_ms >= 0
             && self.is_current_for(state, expected_noise_floor)
             && self
                 .valid_until_exclusive
-                .is_none_or(|boundary| now < boundary)
+                .is_none_or(|boundary| now_unix_ms < boundary)
     }
 
     fn validate(&self, state: &A12CalibrationState) -> Result<(), String> {
@@ -346,11 +346,13 @@ impl A12ScopeEntry {
         {
             return Err("A12 scope fingerprints must be non-empty".to_string());
         }
+        let evaluated_at_millis = self.evaluated_at.checked_mul(1_000);
         if self.calibrated_at < 0
             || self.evaluated_at < self.calibrated_at
+            || evaluated_at_millis.is_none()
             || self
                 .valid_until_exclusive
-                .is_some_and(|boundary| boundary <= self.evaluated_at)
+                .is_some_and(|boundary| boundary <= evaluated_at_millis.unwrap_or(i64::MAX))
             || self
                 .invalidation
                 .is_some_and(|value| value.invalidated_at < self.evaluated_at)
@@ -1381,10 +1383,10 @@ mod tests {
     fn a12_scope_validity_boundary_expires_fail_closed_at_boundary() {
         let state = state(1, 1);
         let mut entry = state.scopes["global"].clone();
-        entry.valid_until_exclusive = Some(1_100);
+        entry.valid_until_exclusive = Some(1_100_000);
 
-        assert!(entry.is_current_for_at(&state, A12_DEFAULT_NOISE_FLOOR, 1_099));
-        assert!(!entry.is_current_for_at(&state, A12_DEFAULT_NOISE_FLOOR, 1_100));
+        assert!(entry.is_current_for_at(&state, A12_DEFAULT_NOISE_FLOOR, 1_099_999));
+        assert!(!entry.is_current_for_at(&state, A12_DEFAULT_NOISE_FLOOR, 1_100_000));
     }
 
     fn raw(conn: &Connection) -> String {
