@@ -7,6 +7,7 @@ use crate::extract::llm::ExtractedMemory;
 use crate::store::SqliteStore;
 use crate::types::*;
 
+pub mod a12_autocalibration;
 pub mod adaptive;
 pub mod ars_release_gate;
 pub mod ars_tuning;
