@@ -59,19 +59,26 @@ use crate::eval::llm_judge::kappa_runtime_vs_offline;
 use crate::store::adaptive::{
     commit_offset, emit_event, peek_events, AdaptiveState,
     ConceptSummaryLlmJudgeOfflineCronPayload, ConceptSummaryLlmJudgePayload, EventType,
-    FeedbackEvent, JudgeCalibrationState, JudgeMetadata, JudgeSurface, SignalHint,
-    SynthesisLlmJudgeOfflineCronPayload, SynthesisLlmJudgePayload, JUDGE_DRIFT_MIN_PAIRS,
-    JUDGE_DRIFT_THRESHOLD, JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
+    FeedbackEvent, JudgeCalibrationState, JudgeMetadata, JudgeStructuralAnchorPayload,
+    JudgeSurface, SignalHint, SynthesisLlmJudgeOfflineCronPayload, SynthesisLlmJudgePayload,
+    JUDGE_DRIFT_MIN_PAIRS, JUDGE_DRIFT_THRESHOLD, JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
+};
+use crate::store::judge_structural_calibration::{
+    compare_and_swap_judge_structural_calibration, load_judge_structural_calibration,
+    JudgeStructuralCalibrationLoadStatus, JudgeStructuralCalibrationState, JudgeStructuralStatus,
+    JudgeStructuralSurfaceState,
 };
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Fixed consumer name for `consumer_offsets` row.
 pub const JUDGE_CALIBRATION_CONSUMER: &str = "judge_calibration";
+pub const JUDGE_STRUCTURAL_ANCHOR_CONSUMER: &str = "judge_structural_anchor";
 
 /// Maximum events the consumer drains in one pass. Above this it re-enters
 /// on the next slow-channel cycle. Mirrors `recompute_synthesis_feedback_stats`'
@@ -499,6 +506,277 @@ fn db_scoped_queue_dir(config: &ReinConfig, create: bool) -> PathBuf {
         let _ = std::fs::create_dir_all(&queue_dir);
     }
     queue_dir
+}
+
+// ── Structural-anchor consumer ──────────────────────────────────────────────
+
+const JUDGE_STRUCTURAL_CAS_RETRIES: usize = 3;
+const JUDGE_STRUCTURAL_TOKEN_MAX_CHARS: usize = 256;
+
+fn structural_token_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= JUDGE_STRUCTURAL_TOKEN_MAX_CHARS
+        && !value.chars().any(char::is_control)
+}
+
+fn structural_payload_is_valid(payload: &JudgeStructuralAnchorPayload) -> bool {
+    structural_token_is_valid(&payload.run_id)
+        && structural_token_is_valid(&payload.model_fingerprint)
+        && structural_token_is_valid(&payload.rubric_fingerprint)
+        && structural_token_is_valid(&payload.probe_set_version)
+        && structural_token_is_valid(&payload.run_token)
+}
+
+fn structural_run_token_hash(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn structural_payload_is_attested(
+    state: &JudgeStructuralSurfaceState,
+    payload: &JudgeStructuralAnchorPayload,
+) -> bool {
+    state.run_id.as_deref() == Some(payload.run_id.as_str())
+        && state.model_fingerprint == payload.model_fingerprint
+        && state.rubric_fingerprint == payload.rubric_fingerprint
+        && state.probe_set_version == payload.probe_set_version
+        && !state.seen_kinds.contains(&payload.probe_kind)
+        && state
+            .run_token_hashes
+            .get(&payload.probe_kind)
+            .is_some_and(|hash| hash == &structural_run_token_hash(&payload.run_token))
+}
+
+fn fold_structural_anchor(
+    state: &mut JudgeStructuralCalibrationState,
+    payload: JudgeStructuralAnchorPayload,
+    observed_at: i64,
+) {
+    let surface = state.surface_mut(payload.surface);
+    if !structural_payload_is_attested(surface, &payload) {
+        surface.alert_count = surface.alert_count.saturating_add(1);
+        tracing::warn!(
+            run_id = %payload.run_id,
+            "judge_structural_anchor: event lacks the active runner seal, ignoring"
+        );
+        return;
+    }
+
+    let was_ready = surface.status == JudgeStructuralStatus::Ready;
+    surface.last_probe_at = surface.last_probe_at.max(observed_at);
+    surface.seen_kinds.insert(payload.probe_kind);
+    if payload.observed_hit != payload.probe_kind.expected_hit()
+        && surface.failed_kinds.insert(payload.probe_kind)
+    {
+        surface.alert_count = surface.alert_count.saturating_add(1);
+    }
+
+    if !surface.failed_kinds.is_empty() {
+        surface.status = JudgeStructuralStatus::Failed;
+        surface.completed_at.get_or_insert(observed_at);
+    } else if surface.seen_kinds.len()
+        == crate::store::adaptive::JudgeStructuralProbeKind::ALL.len()
+    {
+        surface.status = JudgeStructuralStatus::Ready;
+        if !was_ready {
+            surface.completed_at = Some(observed_at);
+        }
+    } else {
+        surface.status = JudgeStructuralStatus::Collecting;
+        surface.completed_at = None;
+    }
+}
+
+/// Seal a probe run before any event is emitted. The opaque token is returned
+/// only to the in-crate runner; durable state stores its SHA-256. Consequently,
+/// callers that can use the generic public feedback-event API cannot fabricate
+/// a Ready suite without first obtaining a runner-owned credential.
+#[derive(Clone)]
+#[allow(dead_code)] // Task 4 passes these per-kind tokens to the runner.
+pub(crate) struct JudgeStructuralProbeRunCredentials {
+    run_tokens: BTreeMap<crate::store::adaptive::JudgeStructuralProbeKind, String>,
+}
+
+#[allow(dead_code)]
+impl JudgeStructuralProbeRunCredentials {
+    pub(crate) fn token_for(&self, kind: crate::store::adaptive::JudgeStructuralProbeKind) -> &str {
+        self.run_tokens
+            .get(&kind)
+            .expect("runner seals all structural probe kinds")
+    }
+}
+
+#[allow(dead_code)] // Task 4 wires the bounded probe runner to this API.
+pub(crate) fn start_judge_structural_probe_run(
+    store: &SqliteStore,
+    surface: JudgeSurface,
+    run_id: &str,
+    model_fingerprint: &str,
+    rubric_fingerprint: &str,
+    probe_set_version: &str,
+    started_at: i64,
+) -> ReinResult<JudgeStructuralProbeRunCredentials> {
+    if started_at <= 0
+        || ![
+            run_id,
+            model_fingerprint,
+            rubric_fingerprint,
+            probe_set_version,
+        ]
+        .into_iter()
+        .all(structural_token_is_valid)
+    {
+        return Err(ReinError::Config(
+            "invalid judge structural probe-run identity".to_string(),
+        ));
+    }
+    let run_tokens: BTreeMap<_, _> = crate::store::adaptive::JudgeStructuralProbeKind::ALL
+        .into_iter()
+        .map(|kind| (kind, ulid::Ulid::new().to_string()))
+        .collect();
+    let run_token_hashes: BTreeMap<_, _> = run_tokens
+        .iter()
+        .map(|(kind, token)| (*kind, structural_run_token_hash(token)))
+        .collect();
+    for _ in 0..JUDGE_STRUCTURAL_CAS_RETRIES {
+        let loaded = load_judge_structural_calibration(store.conn());
+        let (mut state, expected_revision) = match loaded.status {
+            JudgeStructuralCalibrationLoadStatus::Missing => {
+                (JudgeStructuralCalibrationState::default(), 0)
+            }
+            JudgeStructuralCalibrationLoadStatus::Loaded => {
+                let revision = loaded.state.revision;
+                (loaded.state, revision)
+            }
+            status => {
+                return Err(ReinError::Config(format!(
+                    "cannot seal judge structural run while state is {status:?}: {}",
+                    loaded.error.unwrap_or_else(|| "no detail".to_string())
+                )));
+            }
+        };
+        let alert_count = state.surface(surface).alert_count;
+        *state.surface_mut(surface) = JudgeStructuralSurfaceState {
+            run_id: Some(run_id.to_string()),
+            probe_set_version: probe_set_version.to_string(),
+            model_fingerprint: model_fingerprint.to_string(),
+            rubric_fingerprint: rubric_fingerprint.to_string(),
+            run_token_hashes: run_token_hashes.clone(),
+            run_started_at: started_at,
+            last_probe_at: started_at,
+            status: JudgeStructuralStatus::Collecting,
+            alert_count,
+            ..JudgeStructuralSurfaceState::default()
+        };
+        state.updated_at = started_at;
+        state.revision = expected_revision.saturating_add(1);
+        if compare_and_swap_judge_structural_calibration(store.conn(), &state, expected_revision)? {
+            return Ok(JudgeStructuralProbeRunCredentials { run_tokens });
+        }
+    }
+    Err(ReinError::Config(
+        "judge structural probe-run seal CAS retries exhausted".to_string(),
+    ))
+}
+
+fn mark_structural_payload_corrupt(state: &mut JudgeStructuralCalibrationState) {
+    for surface in [&mut state.synthesis, &mut state.concept_summary] {
+        surface.status = JudgeStructuralStatus::Corrupt;
+        surface.alert_count = surface.alert_count.saturating_add(1);
+    }
+}
+
+/// Drain structural-anchor events into their own metadata-backed CAS state,
+/// then advance an independent consumer offset. A crash after state persistence
+/// but before offset commit is replay-safe because `state.last_event_id` is the
+/// applied-prefix watermark.
+pub fn run_judge_structural_anchor_consumer(
+    store: &SqliteStore,
+) -> ReinResult<JudgeStructuralCalibrationState> {
+    for _ in 0..JUDGE_STRUCTURAL_CAS_RETRIES {
+        let loaded = load_judge_structural_calibration(store.conn());
+        let (mut state, expected_revision) = match loaded.status {
+            JudgeStructuralCalibrationLoadStatus::Missing => {
+                (JudgeStructuralCalibrationState::default(), 0)
+            }
+            JudgeStructuralCalibrationLoadStatus::Loaded => {
+                let revision = loaded.state.revision;
+                (loaded.state, revision)
+            }
+            status => {
+                return Err(ReinError::Config(format!(
+                    "judge structural calibration state is {status:?}: {}",
+                    loaded.error.unwrap_or_else(|| "no detail".to_string())
+                )));
+            }
+        };
+
+        let events = peek_events(
+            store.conn(),
+            JUDGE_STRUCTURAL_ANCHOR_CONSUMER,
+            &[EventType::JudgeStructuralAnchor.as_str()],
+            PEEK_BATCH_LIMIT,
+        )?;
+        let Some(max_event_id) = events.last().map(|event| event.id) else {
+            return Ok(state);
+        };
+        let prior_high_water = state.last_event_id;
+        if max_event_id <= prior_high_water {
+            commit_offset(
+                store.conn(),
+                &[(JUDGE_STRUCTURAL_ANCHOR_CONSUMER, max_event_id)],
+            )?;
+            return Ok(state);
+        }
+
+        state.last_event_id = state.last_event_id.max(max_event_id);
+        let now = chrono::Utc::now().timestamp();
+        for event in events
+            .into_iter()
+            .filter(|event| event.id > prior_high_water)
+        {
+            let parsed = event
+                .payload
+                .as_deref()
+                .ok_or_else(|| "missing payload".to_string())
+                .and_then(|raw| {
+                    serde_json::from_str::<JudgeStructuralAnchorPayload>(raw)
+                        .map_err(|error| error.to_string())
+                });
+            match parsed {
+                Ok(payload) if structural_payload_is_valid(&payload) => {
+                    let observed_at = event.ts_to_unix().unwrap_or(now);
+                    fold_structural_anchor(&mut state, payload, observed_at);
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        event_id = event.id,
+                        "judge_structural_anchor: invalid bounded token, failing closed"
+                    );
+                    mark_structural_payload_corrupt(&mut state);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event_id = event.id,
+                        error = %error,
+                        "judge_structural_anchor: malformed payload, failing closed"
+                    );
+                    mark_structural_payload_corrupt(&mut state);
+                }
+            }
+        }
+        state.updated_at = now;
+        state.revision = expected_revision.saturating_add(1);
+        if compare_and_swap_judge_structural_calibration(store.conn(), &state, expected_revision)? {
+            commit_offset(
+                store.conn(),
+                &[(JUDGE_STRUCTURAL_ANCHOR_CONSUMER, max_event_id)],
+            )?;
+            return Ok(state);
+        }
+    }
+    Err(ReinError::Config(
+        "judge structural calibration CAS retries exhausted".to_string(),
+    ))
 }
 
 // ── M1 consumer — `judge_calibration` ───────────────────────────────────────
@@ -1739,6 +2017,9 @@ pub fn run_judge_calibration_consumer(
     state: &mut AdaptiveState,
     drift_log_path: Option<&std::path::Path>,
 ) -> Option<Vec<(&'static str, i64)>> {
+    if let Err(error) = run_judge_structural_anchor_consumer(store) {
+        tracing::warn!("failed to consume judge structural anchors: {error}");
+    }
     match recompute_judge_calibration_state(
         store.conn(),
         state.judge_calibration_state.clone(),
@@ -1806,6 +2087,9 @@ impl StoredEventExt for crate::store::adaptive::StoredEvent {
 mod tests {
     use super::*;
     use crate::store::adaptive::{commit_offset, peek_events};
+    use crate::store::judge_structural_calibration::{
+        JudgeStructuralProbeKind, JudgeStructuralStatus,
+    };
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1905,6 +2189,461 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn emit_structural_anchor(
+        store: &SqliteStore,
+        surface: JudgeSurface,
+        run_id: &str,
+        run_token: &str,
+        probe_kind: JudgeStructuralProbeKind,
+        observed_hit: bool,
+        model_fingerprint: &str,
+        rubric_fingerprint: &str,
+    ) -> i64 {
+        emit_event(
+            store.conn(),
+            FeedbackEvent {
+                event_type: EventType::JudgeStructuralAnchor,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: None,
+                query_type: None,
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "surface": surface,
+                    "probe_kind": probe_kind,
+                    "observed_hit": observed_hit,
+                    // An emitter-supplied label must be ignored. The consumer
+                    // derives truth solely from `probe_kind`.
+                    "expected_hit": !probe_kind.expected_hit(),
+                    "run_id": run_id,
+                    "model_fingerprint": model_fingerprint,
+                    "rubric_fingerprint": rubric_fingerprint,
+                    "probe_set_version": "judge-anchors-v1",
+                    "run_token": run_token
+                })),
+            },
+        )
+        .unwrap()
+    }
+
+    fn start_structural_run(
+        store: &SqliteStore,
+        surface: JudgeSurface,
+        run_id: &str,
+        model_fingerprint: &str,
+        rubric_fingerprint: &str,
+    ) -> JudgeStructuralProbeRunCredentials {
+        start_judge_structural_probe_run(
+            store,
+            surface,
+            run_id,
+            model_fingerprint,
+            rubric_fingerprint,
+            "judge-anchors-v1",
+            1_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn judge_structural_anchor_all_four_ready_per_surface() {
+        let store = SqliteStore::in_memory().unwrap();
+        for surface in [JudgeSurface::Synthesis, JudgeSurface::ConceptSummary] {
+            let run_id = match surface {
+                JudgeSurface::Synthesis => "run-synthesis",
+                JudgeSurface::ConceptSummary => "run-concept",
+            };
+            let run_token = start_structural_run(&store, surface, run_id, "model-a", "rubric-a");
+            for kind in JudgeStructuralProbeKind::ALL {
+                emit_structural_anchor(
+                    &store,
+                    surface,
+                    run_id,
+                    run_token.token_for(kind),
+                    kind,
+                    kind.expected_hit(),
+                    "model-a",
+                    "rubric-a",
+                );
+            }
+        }
+
+        let state = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(state.synthesis.status, JudgeStructuralStatus::Ready);
+        assert_eq!(state.concept_summary.status, JudgeStructuralStatus::Ready);
+        assert_eq!(state.synthesis.seen_kinds.len(), 4);
+        assert_eq!(state.concept_summary.seen_kinds.len(), 4);
+    }
+
+    #[test]
+    fn judge_structural_anchor_missing_kind_stays_collecting() {
+        let store = SqliteStore::in_memory().unwrap();
+        let run_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            run_token.token_for(JudgeStructuralProbeKind::SupportedExactSingle),
+            JudgeStructuralProbeKind::SupportedExactSingle,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+
+        let state = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(state.synthesis.status, JudgeStructuralStatus::Collecting);
+        assert!(state.synthesis.failed_kinds.is_empty());
+    }
+
+    #[test]
+    fn judge_structural_anchor_derives_expected_hit_and_fails_wrong_probe() {
+        let store = SqliteStore::in_memory().unwrap();
+        let run_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            run_token.token_for(JudgeStructuralProbeKind::UnsupportedNonce),
+            JudgeStructuralProbeKind::UnsupportedNonce,
+            false,
+            "model-a",
+            "rubric-a",
+        );
+        let collecting = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(
+            collecting.synthesis.status,
+            JudgeStructuralStatus::Collecting,
+            "payload-supplied expected_hit must not override probe-kind truth"
+        );
+        assert!(collecting.synthesis.failed_kinds.is_empty());
+
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            run_token.token_for(JudgeStructuralProbeKind::QueryMismatch),
+            JudgeStructuralProbeKind::QueryMismatch,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+        let failed = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(failed.synthesis.status, JudgeStructuralStatus::Failed);
+        assert_eq!(failed.synthesis.alert_count, 1);
+    }
+
+    #[test]
+    fn judge_structural_anchor_replay_is_idempotent() {
+        let store = SqliteStore::in_memory().unwrap();
+        let run_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            run_token.token_for(JudgeStructuralProbeKind::QueryMismatch),
+            JudgeStructuralProbeKind::QueryMismatch,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+        let first = run_judge_structural_anchor_consumer(&store).unwrap();
+
+        store
+            .conn()
+            .execute(
+                "UPDATE consumer_offsets SET last_event_id = 0 WHERE consumer = ?1",
+                rusqlite::params![JUDGE_STRUCTURAL_ANCHOR_CONSUMER],
+            )
+            .unwrap();
+        let replayed = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(replayed, first);
+    }
+
+    #[test]
+    fn judge_structural_anchor_model_change_starts_fresh_collecting_run() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        for kind in JudgeStructuralProbeKind::ALL {
+            emit_structural_anchor(
+                &store,
+                JudgeSurface::Synthesis,
+                "run-1",
+                first_token.token_for(kind),
+                kind,
+                kind.expected_hit(),
+                "model-a",
+                "rubric-a",
+            );
+        }
+        let ready = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(ready.synthesis.status, JudgeStructuralStatus::Ready);
+
+        let second_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-2",
+            "model-b",
+            "rubric-b",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-2",
+            second_token.token_for(JudgeStructuralProbeKind::SupportedExactSingle),
+            JudgeStructuralProbeKind::SupportedExactSingle,
+            true,
+            "model-b",
+            "rubric-b",
+        );
+        let reset = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(reset.synthesis.status, JudgeStructuralStatus::Collecting);
+        assert_eq!(reset.synthesis.model_fingerprint, "model-b");
+        assert_eq!(reset.synthesis.rubric_fingerprint, "rubric-b");
+        assert_eq!(reset.synthesis.seen_kinds.len(), 1);
+    }
+
+    #[test]
+    fn judge_structural_anchor_requires_runner_seal() {
+        let store = SqliteStore::in_memory().unwrap();
+        let _real_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "forged-public-event-token",
+            JudgeStructuralProbeKind::SupportedExactSingle,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+
+        let state = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(state.synthesis.status, JudgeStructuralStatus::Collecting);
+        assert!(state.synthesis.seen_kinds.is_empty());
+        assert_eq!(state.synthesis.alert_count, 1);
+    }
+
+    #[test]
+    fn judge_structural_anchor_token_leak_cannot_attest_other_kinds() {
+        let store = SqliteStore::in_memory().unwrap();
+        let credentials = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        let first_kind = JudgeStructuralProbeKind::SupportedExactSingle;
+        let leaked_token = credentials.token_for(first_kind);
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            leaked_token,
+            first_kind,
+            first_kind.expected_hit(),
+            "model-a",
+            "rubric-a",
+        );
+        let first = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(first.synthesis.seen_kinds.len(), 1);
+
+        for forged_kind in [
+            JudgeStructuralProbeKind::SupportedExactMulti,
+            JudgeStructuralProbeKind::UnsupportedNonce,
+            JudgeStructuralProbeKind::QueryMismatch,
+        ] {
+            emit_structural_anchor(
+                &store,
+                JudgeSurface::Synthesis,
+                "run-1",
+                leaked_token,
+                forged_kind,
+                forged_kind.expected_hit(),
+                "model-a",
+                "rubric-a",
+            );
+        }
+        let forged = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(forged.synthesis.status, JudgeStructuralStatus::Collecting);
+        assert_eq!(forged.synthesis.seen_kinds.len(), 1);
+        assert_eq!(forged.synthesis.alert_count, 3);
+    }
+
+    #[test]
+    fn judge_structural_anchor_ready_completion_is_immutable_within_run() {
+        let store = SqliteStore::in_memory().unwrap();
+        let run_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        for kind in JudgeStructuralProbeKind::ALL {
+            emit_structural_anchor(
+                &store,
+                JudgeSurface::Synthesis,
+                "run-1",
+                run_token.token_for(kind),
+                kind,
+                kind.expected_hit(),
+                "model-a",
+                "rubric-a",
+            );
+        }
+        let ready = run_judge_structural_anchor_consumer(&store).unwrap();
+        let completed_at = ready.synthesis.completed_at.unwrap();
+
+        let repeated_id = emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            run_token.token_for(JudgeStructuralProbeKind::SupportedExactSingle),
+            JudgeStructuralProbeKind::SupportedExactSingle,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE feedback_events SET ts = '2030-01-01T00:00:00.000Z' WHERE id = ?1",
+                rusqlite::params![repeated_id],
+            )
+            .unwrap();
+        let repeated = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(repeated.synthesis.completed_at, Some(completed_at));
+        assert_eq!(
+            repeated.synthesis.status_at(completed_at + 201, 100),
+            JudgeStructuralStatus::Stale,
+            "one repeated probe must not renew the completed four-probe suite"
+        );
+    }
+
+    #[test]
+    fn judge_structural_anchor_alert_count_survives_run_rotation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            first_token.token_for(JudgeStructuralProbeKind::QueryMismatch),
+            JudgeStructuralProbeKind::QueryMismatch,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+        assert_eq!(
+            run_judge_structural_anchor_consumer(&store)
+                .unwrap()
+                .synthesis
+                .alert_count,
+            1
+        );
+
+        let second_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-2",
+            "model-b",
+            "rubric-b",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-2",
+            second_token.token_for(JudgeStructuralProbeKind::QueryMismatch),
+            JudgeStructuralProbeKind::QueryMismatch,
+            false,
+            "model-b",
+            "rubric-b",
+        );
+        let rotated = run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(rotated.synthesis.status, JudgeStructuralStatus::Collecting);
+        assert_eq!(rotated.synthesis.alert_count, 1);
+    }
+
+    #[test]
+    fn judge_structural_anchor_is_isolated_from_useful_rate_and_kappa_pairs() {
+        let store = SqliteStore::in_memory().unwrap();
+        let run_token = start_structural_run(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            "model-a",
+            "rubric-a",
+        );
+        emit_structural_anchor(
+            &store,
+            JudgeSurface::Synthesis,
+            "run-1",
+            run_token.token_for(JudgeStructuralProbeKind::SupportedExactSingle),
+            JudgeStructuralProbeKind::SupportedExactSingle,
+            true,
+            "model-a",
+            "rubric-a",
+        );
+
+        let (drift, drift_max) =
+            recompute_judge_calibration_state(store.conn(), None, None).unwrap();
+        assert!(drift_max.is_none());
+        assert!(drift.recent_pairs_runtime_vs_offline.is_empty());
+        assert!(drift.recent_pairs_synthesis.is_empty());
+
+        let (useful, pending, human, useful_max) =
+            crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge(
+                store.conn(),
+                None,
+                std::collections::HashMap::new(),
+                JudgeCalibrationState::default(),
+                crate::store::adaptive::LLM_JUDGE_WEIGHT_DECAY_RATE,
+            )
+            .unwrap();
+        assert!(useful_max.is_none());
+        assert_eq!(useful.total_events, 0);
+        assert!(pending.is_empty());
+        assert!(human.recent_pairs_synthesis.is_empty());
     }
 
     fn emit_runtime_synth_with_hint(

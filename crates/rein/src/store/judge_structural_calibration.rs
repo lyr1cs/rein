@@ -2,9 +2,10 @@
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use crate::judge::contract::JudgeStructuralStatus;
+pub use crate::store::adaptive::JudgeStructuralProbeKind;
 use crate::store::adaptive::JudgeSurface;
 
 pub const JUDGE_STRUCTURAL_CALIBRATION_METADATA_KEY: &str = "judge_structural_calibration";
@@ -12,30 +13,6 @@ pub const JUDGE_STRUCTURAL_CALIBRATION_SCHEMA_VERSION: u32 = 1;
 
 fn default_schema_version() -> u32 {
     JUDGE_STRUCTURAL_CALIBRATION_SCHEMA_VERSION
-}
-
-/// Deterministic probe kinds. Expected outcomes are intentionally encoded by
-/// the enum so event payloads cannot supply their own ground-truth labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JudgeStructuralProbeKind {
-    SupportedExactSingle,
-    SupportedExactMulti,
-    UnsupportedNonce,
-    QueryMismatch,
-}
-
-impl JudgeStructuralProbeKind {
-    pub const ALL: [Self; 4] = [
-        Self::SupportedExactSingle,
-        Self::SupportedExactMulti,
-        Self::UnsupportedNonce,
-        Self::QueryMismatch,
-    ];
-
-    pub const fn expected_hit(self) -> bool {
-        matches!(self, Self::SupportedExactSingle | Self::SupportedExactMulti)
-    }
 }
 
 /// One surface's current sealed probe run. Synthesis and concept-summary use
@@ -50,6 +27,10 @@ pub struct JudgeStructuralSurfaceState {
     pub model_fingerprint: String,
     #[serde(default)]
     pub rubric_fingerprint: String,
+    /// Per-kind SHA-256 hashes of opaque tokens minted by the in-crate probe
+    /// runner. A token exposed by one event cannot attest any other kind.
+    #[serde(default)]
+    pub run_token_hashes: BTreeMap<JudgeStructuralProbeKind, String>,
     #[serde(default)]
     pub seen_kinds: BTreeSet<JudgeStructuralProbeKind>,
     #[serde(default)]
@@ -77,6 +58,7 @@ impl Default for JudgeStructuralSurfaceState {
             probe_set_version: String::new(),
             model_fingerprint: String::new(),
             rubric_fingerprint: String::new(),
+            run_token_hashes: BTreeMap::new(),
             seen_kinds: BTreeSet::new(),
             failed_kinds: BTreeSet::new(),
             run_started_at: 0,
@@ -246,11 +228,23 @@ fn validate_surface(surface: &JudgeStructuralSurfaceState) -> Result<(), String>
     if !surface.failed_kinds.is_subset(&surface.seen_kinds) {
         return Err("failed probe kinds must be a subset of seen kinds".to_string());
     }
+    if !surface.run_token_hashes.is_empty()
+        && (surface.run_token_hashes.len() != JudgeStructuralProbeKind::ALL.len()
+            || JudgeStructuralProbeKind::ALL.iter().any(|kind| {
+                surface
+                    .run_token_hashes
+                    .get(kind)
+                    .is_none_or(|hash| hash.len() != 64)
+            }))
+    {
+        return Err("probe-run token hashes must cover all four kinds".to_string());
+    }
     if surface.status == JudgeStructuralStatus::Ready
         && (surface.run_id.as_deref().is_none_or(str::is_empty)
             || surface.probe_set_version.is_empty()
             || surface.model_fingerprint.is_empty()
             || surface.rubric_fingerprint.is_empty()
+            || surface.run_token_hashes.len() != JudgeStructuralProbeKind::ALL.len()
             || surface.completed_at.is_none()
             || surface.seen_kinds.len() != JudgeStructuralProbeKind::ALL.len()
             || !surface.failed_kinds.is_empty())
@@ -340,9 +334,6 @@ pub fn load_judge_structural_calibration(
     }
 }
 
-// Task 3 wires the consumer to this CAS API; keep Task 2 independently
-// testable without exporting a trust-state writer outside the crate.
-#[allow(dead_code)]
 fn validation_error(error: String) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -351,7 +342,6 @@ fn validation_error(error: String) -> rusqlite::Error {
 }
 
 #[must_use = "callers must handle a compare-and-swap miss"]
-#[allow(dead_code)]
 pub(crate) fn compare_and_swap_judge_structural_calibration(
     conn: &rusqlite::Connection,
     state: &JudgeStructuralCalibrationState,
@@ -424,6 +414,16 @@ mod tests {
             probe_set_version: "judge-anchors-v1".to_string(),
             model_fingerprint: "model-a".to_string(),
             rubric_fingerprint: "rubric-a".to_string(),
+            run_token_hashes: JudgeStructuralProbeKind::ALL
+                .into_iter()
+                .map(|kind| {
+                    (
+                        kind,
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                    )
+                })
+                .collect(),
             seen_kinds: JudgeStructuralProbeKind::ALL.into_iter().collect(),
             failed_kinds: Default::default(),
             run_started_at: 900,

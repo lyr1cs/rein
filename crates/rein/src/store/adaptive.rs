@@ -78,6 +78,9 @@ pub enum EventType {
     SynthesisLlmJudgeOfflineCron,
     /// v0.27.1 E direction Cap A Layer 2 mirror.
     ConceptSummaryLlmJudgeOfflineCron,
+    /// Deterministic health probe for the judge. This event has a dedicated
+    /// replay consumer and must never enter useful-rate or human-pair folds.
+    JudgeStructuralAnchor,
 }
 
 impl EventType {
@@ -100,6 +103,7 @@ impl EventType {
             Self::ConceptSummaryLlmJudge => "concept_summary_llm_judge",
             Self::SynthesisLlmJudgeOfflineCron => "synthesis_llm_judge_offline_cron",
             Self::ConceptSummaryLlmJudgeOfflineCron => "concept_summary_llm_judge_offline_cron",
+            Self::JudgeStructuralAnchor => "judge_structural_anchor",
         }
     }
 }
@@ -4604,6 +4608,47 @@ pub enum JudgeSurface {
     #[default]
     Synthesis,
     ConceptSummary,
+}
+
+/// Deterministic structural-anchor kinds. Ground truth is intrinsic to the
+/// kind; payloads cannot supply or override an expected label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeStructuralProbeKind {
+    SupportedExactSingle,
+    SupportedExactMulti,
+    UnsupportedNonce,
+    QueryMismatch,
+}
+
+impl JudgeStructuralProbeKind {
+    pub const ALL: [Self; 4] = [
+        Self::SupportedExactSingle,
+        Self::SupportedExactMulti,
+        Self::UnsupportedNonce,
+        Self::QueryMismatch,
+    ];
+
+    pub const fn expected_hit(self) -> bool {
+        matches!(self, Self::SupportedExactSingle | Self::SupportedExactMulti)
+    }
+}
+
+/// Event payload for [`EventType::JudgeStructuralAnchor`]. Unknown JSON fields
+/// are ignored for forward compatibility, but no expected-label field exists:
+/// consumers derive it exclusively from [`JudgeStructuralProbeKind`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgeStructuralAnchorPayload {
+    pub surface: JudgeSurface,
+    pub probe_kind: JudgeStructuralProbeKind,
+    pub observed_hit: bool,
+    pub run_id: String,
+    pub model_fingerprint: String,
+    pub rubric_fingerprint: String,
+    pub probe_set_version: String,
+    /// Opaque credential minted when the in-crate runner seals this run.
+    /// The consumer compares its SHA-256 against persisted state.
+    pub run_token: String,
 }
 
 /// LRU cap for `pending_kappa_half_pairs` (spec §6.2.1). Bounds memory
