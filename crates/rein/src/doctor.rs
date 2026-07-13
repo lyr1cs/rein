@@ -152,6 +152,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_resummerize(&store));
                             checks.push(check_pool_saturation(config));
                             checks.push(check_ars_parameter_policy(&store, config));
+                            checks.push(check_dedup_threshold_observability(&store, config));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -2695,6 +2696,143 @@ fn check_ars_parameter_policy(
     }
 }
 
+fn check_dedup_threshold_observability(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    let observability = crate::ops::dedup_threshold_observability(store, config);
+    project_dedup_threshold_doctor_check(&observability)
+}
+
+fn project_dedup_threshold_doctor_check(
+    observability: &crate::ops::DedupThresholdObservability,
+) -> DoctorCheck {
+    use crate::store::dedup_calibration::{DedupCalibrationLoadStatus, DedupCalibrationStatus};
+
+    let calibration = &observability.calibration;
+    let policy = &calibration.policy;
+    let slices = policy
+        .required_slices
+        .iter()
+        .map(|slice| {
+            format!(
+                "{}:+{}/-{}:{:?}",
+                slice.name, slice.positive_count, slice.negative_count, slice.status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let counts = &calibration.counterfactual_counts;
+    let message = format!(
+        "static={:.3} shadow={:.3} hard_effective={:.3} source={} hard_source={} \
+         adaptive_enabled={} evidence_verified={} applied={} reason={} \
+         policy_schema={} seal_schema={:?} policy_revision={} policy_status={:?} load_status={:?} \
+         seal_status={:?} runtime_status={:?} scale={:?} provenance={:?} \
+         train=+{}/-{} sealed=+{}/-{} supplemental_exact={} supplemental_structural={} \
+         fp_count={} fp_ucb95={:?} utility_status={:?} utility_n={} \
+         utility_baseline_only={} utility_candidate_only={} utility_miss_ucb95={:?} \
+         confusion=tp{}/fp{}/tn{}/fn{} slices=[{}] \
+         train_fingerprint={} holdout_fingerprint={} corpus_fingerprint={} \
+         counterfactual=total{}/evaluable{}/probed_shadow{}/hard_effective{}",
+        observability.static_threshold,
+        observability.shadow_threshold,
+        observability.hard_effective_threshold,
+        observability.source,
+        observability.hard_effective_source,
+        calibration.adaptive_enabled,
+        calibration.evidence_verified,
+        calibration.applied,
+        calibration.reason,
+        calibration.policy_schema_version,
+        calibration.seal_schema_version,
+        policy.revision,
+        policy.status,
+        calibration.load_status,
+        calibration.seal_status,
+        calibration.runtime_status,
+        policy.scale,
+        policy.provenance,
+        policy.train_positive_count,
+        policy.train_negative_count,
+        policy.sealed_positive_count,
+        policy.sealed_negative_count,
+        policy.sealed_exact_positive_count,
+        policy.sealed_structural_negative_count,
+        policy.false_positive_count,
+        policy.false_positive_upper_95,
+        policy.utility.status,
+        policy.utility.n,
+        policy.utility.baseline_only_hits,
+        policy.utility.candidate_only_hits,
+        policy.utility.miss_rate_upper_95,
+        policy.holdout_confusion.true_positives,
+        policy.holdout_confusion.false_positives,
+        policy.holdout_confusion.true_negatives,
+        policy.holdout_confusion.false_negatives,
+        slices,
+        policy.train_fingerprint,
+        policy.holdout_fingerprint,
+        policy.corpus_fingerprint,
+        counts.total_events,
+        counts.evaluable_events,
+        counts.would_merge_at_probed_shadow,
+        counts.would_merge_at_hard_effective,
+    );
+
+    let static_is_valid = observability.static_threshold.is_finite()
+        && (0.0..=1.0).contains(&observability.static_threshold);
+    let hard_is_valid = observability.hard_effective_threshold.is_finite()
+        && (0.0..=1.0).contains(&observability.hard_effective_threshold);
+    let hard_below_static = static_is_valid
+        && hard_is_valid
+        && observability.hard_effective_threshold + f64::EPSILON < observability.static_threshold;
+    if !static_is_valid || !hard_is_valid || hard_below_static {
+        return fail_with_hint(
+            DoctorCategory::Configuration,
+            "dedup_threshold_observability",
+            format!("destructive dedup resolver violated the static safety floor; {message}"),
+            "stop destructive dedup, reset the calibration policy and independent seal atomically, then run a fresh sealed recalibration; this diagnostic never mutates calibration state",
+        );
+    }
+
+    let unhealthy_load = !matches!(
+        calibration.runtime_status,
+        DedupCalibrationLoadStatus::Missing | DedupCalibrationLoadStatus::Loaded
+    ) || !matches!(
+        calibration.seal_status,
+        DedupCalibrationLoadStatus::Missing | DedupCalibrationLoadStatus::Loaded
+    ) || (calibration.load_status == DedupCalibrationLoadStatus::Missing
+        && calibration.seal_status == DedupCalibrationLoadStatus::Loaded)
+        || (calibration.load_status == DedupCalibrationLoadStatus::Loaded
+            && calibration.seal_status == DedupCalibrationLoadStatus::Missing);
+    let terminal_needs_attention = calibration.evidence_verified
+        && matches!(
+            policy.status,
+            DedupCalibrationStatus::Bail | DedupCalibrationStatus::NoData
+        );
+    if unhealthy_load || terminal_needs_attention {
+        return DoctorCheck {
+            name: "dedup_threshold_observability",
+            category: DoctorCategory::Configuration,
+            severity: DoctorSeverity::Warning,
+            status: CheckStatus::Warn,
+            fixable: false,
+            message,
+            repair_hint: observability.repair_advice.first().cloned(),
+        };
+    }
+
+    DoctorCheck {
+        name: "dedup_threshold_observability",
+        category: DoctorCategory::Configuration,
+        severity: DoctorSeverity::Info,
+        status: CheckStatus::Ok,
+        fixable: false,
+        message,
+        repair_hint: observability.repair_advice.first().cloned(),
+    }
+}
+
 /// v0.27.1 — surface `JudgeCalibrationState` stats so operators know
 /// the runtime LLM judge is producing usable signal. Reports κ values,
 /// pair counts, drift alert count, and last-computed timestamp.
@@ -2992,6 +3130,56 @@ provider = "inherit"
             tempdir.path().display()
         );
         ReinConfig::load_from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn dedup_threshold_observability_reports_legacy_shadow_as_fail_closed() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.search.dedup_similarity = 0.70;
+        let state = crate::store::adaptive::AdaptiveState {
+            global_dedup_threshold: 0.40,
+            version: 1,
+            ..Default::default()
+        };
+        state.save_snapshot(store.conn()).unwrap();
+
+        let check = check_dedup_threshold_observability(&store, &config);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("static=0.700"), "{}", check.message);
+        assert!(check.message.contains("shadow=0.400"), "{}", check.message);
+        assert!(
+            check.message.contains("hard_effective=0.700"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check.message.contains("source=legacy_unlabeled_shadow"),
+            "{}",
+            check.message
+        );
+        assert!(!check.fixable);
+        let advice = check.repair_hint.as_deref().unwrap_or_default();
+        assert!(advice.contains("recalibrat"), "advice={advice}");
+        assert!(!advice.contains("doctor --fix"), "advice={advice}");
+    }
+
+    #[test]
+    fn dedup_threshold_observability_fails_if_destructive_resolver_drops_below_static() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.search.dedup_similarity = 0.70;
+        let mut observability = crate::ops::dedup_threshold_observability(&store, &config);
+        observability.hard_effective_threshold = 0.40;
+
+        let check = project_dedup_threshold_doctor_check(&observability);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.severity, DoctorSeverity::Error);
+        assert!(!check.fixable);
+        let advice = check.repair_hint.as_deref().unwrap_or_default();
+        assert!(advice.contains("recalibrat"), "advice={advice}");
+        assert!(advice.contains("atomically"), "advice={advice}");
+        assert!(!advice.contains("doctor --fix"), "advice={advice}");
     }
 
     fn queue_file(config: &ReinConfig, prefix: &str) -> PathBuf {
@@ -4286,5 +4474,84 @@ provider = "inherit"
             load_parameter_policy(store2.conn()).status,
             ArsParameterPolicyLoadStatus::UnsupportedSchema
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_fix_preserves_future_schema_dedup_policy_and_seal_bytes() {
+        use crate::store::dedup_calibration::{
+            DEDUP_CALIBRATION_METADATA_KEY, DEDUP_CALIBRATION_SEAL_METADATA_KEY,
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        let policy_raw = r#"{"schema_version":9999,"revision":41,"future_policy":"keep"}"#;
+        let seal_raw = r#"{"schema_version":9999,"revision":41,"future_seal":"keep"}"#;
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![DEDUP_CALIBRATION_METADATA_KEY, policy_raw],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![DEDUP_CALIBRATION_SEAL_METADATA_KEY, seal_raw],
+            )
+            .unwrap();
+        drop(store);
+
+        let report = run(
+            &config,
+            DoctorOptions {
+                network: false,
+                fix: true,
+            },
+        )
+        .await;
+
+        assert!(
+            !report
+                .fixes_applied
+                .iter()
+                .any(|line| line.contains("dedup_calibration")),
+            "doctor must not mutate dedup calibration state: {:?}",
+            report.fixes_applied
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "dedup_threshold_observability")
+            .expect("dedup observability check");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(!check.fixable);
+        assert!(
+            check.message.contains("policy_schema=9999"),
+            "message={}",
+            check.message
+        );
+        let hint = check.repair_hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("upgrade"), "hint={hint}");
+        assert!(hint.contains("preserve"), "hint={hint}");
+        assert!(!hint.contains("reset"), "hint={hint}");
+        assert!(!hint.contains("doctor --fix"), "hint={hint}");
+
+        let store = config.open_store().unwrap();
+        for (key, expected) in [
+            (DEDUP_CALIBRATION_METADATA_KEY, policy_raw),
+            (DEDUP_CALIBRATION_SEAL_METADATA_KEY, seal_raw),
+        ] {
+            let actual: String = store
+                .conn()
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = ?1",
+                    rusqlite::params![key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "future-schema row {key} changed");
+        }
     }
 }

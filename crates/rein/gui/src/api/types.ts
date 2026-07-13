@@ -241,12 +241,37 @@ export interface AdaptiveStatus {
   tier_boundaries: { hot_threshold: number; cold_threshold: number };
   event_counts: Record<string, number>;
   survival_curves: Array<{ cluster_id: string; median_survival: number | null; steps?: number[][] }>;
-  dedup_thresholds: { per_cluster: Record<string, number>; global: number };
+  dedup_thresholds: {
+    /** Legacy wire field; now carries unlabeled per-cluster shadow suggestions. */
+    per_cluster: Record<string, number>;
+    /** Legacy wire field; now carries the unlabeled global shadow suggestion. */
+    global: number;
+    dedup_threshold_static?: number;
+    dedup_threshold_shadow?: number;
+    dedup_threshold_hard_effective?: number;
+    source?: string;
+    hard_effective_source?: string;
+    calibration?: {
+      adaptive_enabled: boolean;
+      evidence_verified: boolean;
+      applied: boolean;
+      reason: string;
+      counterfactual_counts?: {
+        total_events: number;
+        evaluable_events: number;
+        would_merge_at_probed_shadow: number;
+        would_merge_at_hard_effective: number;
+      };
+    };
+    repair_advice?: string[];
+  };
   cluster_profiles: Array<{
     cluster_id: number;
     memory_count: number;
     avg_strength: number;
     dedup_threshold: number;
+    dedup_threshold_shadow?: number;
+    dedup_threshold_hard_effective?: number;
     admission_threshold: number;
     promotion_threshold: number;
     median_survival: number | null;

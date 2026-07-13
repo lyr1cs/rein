@@ -136,6 +136,351 @@ pub(crate) fn effective_hard_dedup_threshold_from_conn(
     crate::store::dedup_calibration::resolve_hard_lexical_threshold(configured_static, &loaded)
 }
 
+pub const DEDUP_LEGACY_SHADOW_SOURCE: &str = "legacy_unlabeled_shadow";
+
+const DEDUP_ATOMIC_RECALIBRATION_ADVICE: &str =
+    "reset the dedup calibration policy and its independent seal atomically, then run a fresh sealed recalibration; doctor never mutates calibration state";
+
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct DedupCounterfactualCounts {
+    pub total_events: u64,
+    pub evaluable_events: u64,
+    pub would_merge_at_probed_shadow: u64,
+    pub would_merge_at_hard_effective: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct DedupCalibrationObservability {
+    pub policy: crate::store::dedup_calibration::DedupCalibrationPolicy,
+    pub policy_schema_version: u64,
+    pub seal_schema_version: Option<u64>,
+    pub load_status: crate::store::dedup_calibration::DedupCalibrationLoadStatus,
+    pub seal_status: crate::store::dedup_calibration::DedupCalibrationLoadStatus,
+    pub runtime_status: crate::store::dedup_calibration::DedupCalibrationLoadStatus,
+    pub adaptive_enabled: bool,
+    pub evidence_verified: bool,
+    pub applied: bool,
+    pub reason: String,
+    pub false_positive_upper_95: Option<f64>,
+    pub utility_miss_rate_upper_95: Option<f64>,
+    pub counterfactual_counts: DedupCounterfactualCounts,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct DedupThresholdObservability {
+    pub static_threshold: f64,
+    pub shadow_threshold: f64,
+    pub hard_effective_threshold: f64,
+    pub source: String,
+    pub hard_effective_source: String,
+    pub calibration: DedupCalibrationObservability,
+    pub repair_advice: Vec<String>,
+}
+
+fn dedup_counterfactual_counts(
+    conn: &rusqlite::Connection,
+    hard_effective_threshold: f32,
+) -> DedupCounterfactualCounts {
+    // Event payloads serialize `similarity: f32` to the shortest decimal that
+    // round-trips to that f32. Use the same representation for the current
+    // hard boundary; widening the binary f32 directly to f64 would turn 0.70
+    // into 0.699999988... and incorrectly count equality as `>`.
+    let serialized_hard_threshold = hard_effective_threshold
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or_else(|_| f64::from(hard_effective_threshold));
+    let result = conn.query_row(
+        "SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE
+                WHEN json_valid(payload)
+                 AND json_type(payload, '$.similarity') IN ('integer', 'real')
+                 AND json_type(payload, '$.would_dedup_shadow') IN ('true', 'false')
+                 AND CAST(json_extract(payload, '$.similarity') AS REAL) BETWEEN 0.0 AND 1.0
+                THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN json_valid(payload)
+                 AND json_type(payload, '$.similarity') IN ('integer', 'real')
+                 AND CAST(json_extract(payload, '$.similarity') AS REAL) BETWEEN 0.0 AND 1.0
+                 AND json_type(payload, '$.would_dedup_shadow') IN ('true', 'false')
+                 AND json_extract(payload, '$.would_dedup_shadow') = 1
+                THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN json_valid(payload)
+                 AND json_type(payload, '$.similarity') IN ('integer', 'real')
+                 AND json_type(payload, '$.would_dedup_shadow') IN ('true', 'false')
+                 AND CAST(json_extract(payload, '$.similarity') AS REAL) BETWEEN 0.0 AND 1.0
+                 AND CAST(json_extract(payload, '$.similarity') AS REAL) > ?1
+                THEN 1 ELSE 0 END), 0)
+         FROM feedback_events
+         WHERE event_type = 'param_update'
+           AND query_type = 'threshold_exploration'
+           AND CASE WHEN json_valid(payload)
+                    THEN json_extract(payload, '$.semantics') = 'shadow_counterfactual'
+                    ELSE 0 END",
+        rusqlite::params![serialized_hard_threshold],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    );
+    let Ok((total, evaluable, shadow, hard)) = result else {
+        return DedupCounterfactualCounts::default();
+    };
+    DedupCounterfactualCounts {
+        total_events: total.max(0) as u64,
+        evaluable_events: evaluable.max(0) as u64,
+        would_merge_at_probed_shadow: shadow.max(0) as u64,
+        would_merge_at_hard_effective: hard.max(0) as u64,
+    }
+}
+
+fn serialized_f32_as_f64(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or_else(|_| f64::from(value))
+}
+
+fn dedup_metadata_schema_version(conn: &rusqlite::Connection, key: &str) -> Option<u64> {
+    let raw = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("schema_version")?
+        .as_u64()
+}
+
+fn dedup_calibration_reason(
+    adaptive_enabled: bool,
+    evidence_verified: bool,
+    applied: bool,
+    policy_loaded: &crate::store::dedup_calibration::DedupCalibrationLoad,
+    seal_loaded: &crate::store::dedup_calibration::DedupCalibrationSealLoad,
+    runtime_loaded: &crate::store::dedup_calibration::DedupCalibrationLoad,
+) -> &'static str {
+    use crate::store::dedup_calibration::{DedupCalibrationLoadStatus, DedupCalibrationStatus};
+
+    if !adaptive_enabled {
+        return "adaptive_disabled";
+    }
+    if applied {
+        return "verified_ship_applied";
+    }
+    if policy_loaded.status == DedupCalibrationLoadStatus::Missing
+        && seal_loaded.status == DedupCalibrationLoadStatus::Loaded
+    {
+        return "orphan_seal_policy_missing";
+    }
+    if policy_loaded.status == DedupCalibrationLoadStatus::Loaded
+        && seal_loaded.status == DedupCalibrationLoadStatus::Missing
+    {
+        return "sealed_manifest_missing_not_applied";
+    }
+    if evidence_verified {
+        return match runtime_loaded.policy.status {
+            DedupCalibrationStatus::Ship => "verified_ship_shadow_only_production_cohort_missing",
+            DedupCalibrationStatus::Bail => "verified_bail_not_applied",
+            DedupCalibrationStatus::NoData => "verified_legacy_no_data_not_applied",
+        };
+    }
+    match runtime_loaded.status {
+        DedupCalibrationLoadStatus::Missing => "no_powered_terminal_policy",
+        DedupCalibrationLoadStatus::Stale => "stale_evidence_not_applied",
+        DedupCalibrationLoadStatus::Corrupt => "corrupt_evidence_not_applied",
+        DedupCalibrationLoadStatus::UnsupportedSchema => "unsupported_evidence_schema_not_applied",
+        DedupCalibrationLoadStatus::FingerprintMismatch => {
+            "evidence_fingerprint_mismatch_not_applied"
+        }
+        DedupCalibrationLoadStatus::StorageError => "evidence_storage_error_not_applied",
+        DedupCalibrationLoadStatus::Loaded => "unverified_evidence_not_applied",
+    }
+}
+
+fn dedup_repair_advice_for_statuses(
+    policy_load_status: crate::store::dedup_calibration::DedupCalibrationLoadStatus,
+    runtime_status: crate::store::dedup_calibration::DedupCalibrationLoadStatus,
+    seal_status: crate::store::dedup_calibration::DedupCalibrationLoadStatus,
+    evidence_verified: bool,
+    policy_status: crate::store::dedup_calibration::DedupCalibrationStatus,
+    legacy_shadow_present: bool,
+) -> Vec<String> {
+    use crate::store::dedup_calibration::{DedupCalibrationLoadStatus, DedupCalibrationStatus};
+
+    if matches!(policy_load_status, DedupCalibrationLoadStatus::StorageError)
+        || matches!(runtime_status, DedupCalibrationLoadStatus::StorageError)
+        || matches!(seal_status, DedupCalibrationLoadStatus::StorageError)
+    {
+        return vec![
+            "repair the SQLite storage error and retry the read-only dedup calibration check; leave policy and seal state unchanged after a transient storage failure"
+                .to_string(),
+        ];
+    }
+    if matches!(
+        policy_load_status,
+        DedupCalibrationLoadStatus::UnsupportedSchema
+    ) || matches!(
+        runtime_status,
+        DedupCalibrationLoadStatus::UnsupportedSchema
+    ) || matches!(seal_status, DedupCalibrationLoadStatus::UnsupportedSchema)
+    {
+        return vec![
+            "upgrade rein to a reader that supports this dedup calibration schema and preserve the future-schema policy and seal byte-for-byte unchanged"
+                .to_string(),
+        ];
+    }
+    if matches!(policy_load_status, DedupCalibrationLoadStatus::Corrupt)
+        || matches!(runtime_status, DedupCalibrationLoadStatus::Corrupt)
+        || matches!(seal_status, DedupCalibrationLoadStatus::Corrupt)
+        || (policy_load_status == DedupCalibrationLoadStatus::Missing
+            && seal_status == DedupCalibrationLoadStatus::Loaded)
+        || (policy_load_status == DedupCalibrationLoadStatus::Loaded
+            && seal_status == DedupCalibrationLoadStatus::Missing)
+    {
+        return vec![DEDUP_ATOMIC_RECALIBRATION_ADVICE.to_string()];
+    }
+    if matches!(
+        policy_load_status,
+        DedupCalibrationLoadStatus::Stale | DedupCalibrationLoadStatus::FingerprintMismatch
+    ) || matches!(
+        runtime_status,
+        DedupCalibrationLoadStatus::Stale | DedupCalibrationLoadStatus::FingerprintMismatch
+    ) || matches!(seal_status, DedupCalibrationLoadStatus::Stale)
+    {
+        return vec![
+            "start a fresh sealed dedup recalibration generation and replace the stale or mismatched policy and seal together atomically; do not reuse a revealed holdout"
+                .to_string(),
+        ];
+    }
+    if evidence_verified
+        && matches!(
+            policy_status,
+            DedupCalibrationStatus::Bail | DedupCalibrationStatus::NoData
+        )
+    {
+        return vec![
+            "start a fresh sealed dedup recalibration generation and replace the policy and seal together atomically; do not reuse a revealed holdout"
+            .to_string(),
+        ];
+    }
+    if runtime_status == DedupCalibrationLoadStatus::Missing && legacy_shadow_present {
+        return vec![
+            "collect independent duplicate/distinct labels and run a fresh sealed dedup recalibration generation; keep the legacy unlabeled value as read-only shadow state"
+                .to_string(),
+        ];
+    }
+    Vec::new()
+}
+
+pub(crate) fn dedup_threshold_observability_from_state(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+) -> DedupThresholdObservability {
+    let static_threshold = config.search.dedup_similarity as f32;
+    let shadow_threshold = state.get_dedup_shadow_threshold(None);
+    let now = chrono::Utc::now().timestamp();
+    let policy_loaded = crate::store::dedup_calibration::load_dedup_calibration(store.conn(), now);
+    let seal_loaded =
+        crate::store::dedup_calibration::load_dedup_calibration_seal(store.conn(), now);
+    let runtime_loaded = crate::store::dedup_calibration::load_dedup_calibration_for_runtime(
+        store.conn(),
+        now,
+        static_threshold,
+    );
+    let policy_schema_version = dedup_metadata_schema_version(
+        store.conn(),
+        crate::store::dedup_calibration::DEDUP_CALIBRATION_METADATA_KEY,
+    )
+    .unwrap_or_else(|| u64::from(policy_loaded.policy.schema_version));
+    let seal_schema_version = dedup_metadata_schema_version(
+        store.conn(),
+        crate::store::dedup_calibration::DEDUP_CALIBRATION_SEAL_METADATA_KEY,
+    );
+    let evidence_verified = runtime_loaded.context_verified();
+    let hard_effective_threshold = effective_dedup_threshold(store, config);
+    let applied = config.adaptive.enabled
+        && evidence_verified
+        && matches!(
+            runtime_loaded.policy.status,
+            crate::store::dedup_calibration::DedupCalibrationStatus::Ship
+        )
+        && (hard_effective_threshold - static_threshold).abs() > f32::EPSILON;
+    let reason = dedup_calibration_reason(
+        config.adaptive.enabled,
+        evidence_verified,
+        applied,
+        &policy_loaded,
+        &seal_loaded,
+        &runtime_loaded,
+    )
+    .to_string();
+    let hard_effective_source = if applied {
+        "verified_sealed_calibration"
+    } else if !config.adaptive.enabled {
+        "configured_static_adaptive_disabled"
+    } else {
+        "configured_static_fail_closed"
+    }
+    .to_string();
+    let legacy_shadow_present = shadow_threshold.is_finite()
+        && static_threshold.is_finite()
+        && (shadow_threshold - static_threshold).abs() > f32::EPSILON;
+    let repair_advice = dedup_repair_advice_for_statuses(
+        policy_loaded.status,
+        runtime_loaded.status,
+        seal_loaded.status,
+        evidence_verified,
+        policy_loaded.policy.status,
+        legacy_shadow_present,
+    );
+    let counterfactual_counts = dedup_counterfactual_counts(store.conn(), hard_effective_threshold);
+    let false_positive_upper_95 = policy_loaded.policy.false_positive_upper_95;
+    let utility_miss_rate_upper_95 = policy_loaded.policy.utility.miss_rate_upper_95;
+
+    DedupThresholdObservability {
+        static_threshold: serialized_f32_as_f64(static_threshold),
+        shadow_threshold: serialized_f32_as_f64(shadow_threshold),
+        hard_effective_threshold: serialized_f32_as_f64(hard_effective_threshold),
+        source: DEDUP_LEGACY_SHADOW_SOURCE.to_string(),
+        hard_effective_source,
+        calibration: DedupCalibrationObservability {
+            policy: policy_loaded.policy,
+            policy_schema_version,
+            seal_schema_version,
+            load_status: policy_loaded.status,
+            seal_status: seal_loaded.status,
+            runtime_status: runtime_loaded.status,
+            adaptive_enabled: config.adaptive.enabled,
+            evidence_verified,
+            applied,
+            reason,
+            false_positive_upper_95,
+            utility_miss_rate_upper_95,
+            counterfactual_counts,
+        },
+        repair_advice,
+    }
+}
+
+pub(crate) fn dedup_threshold_observability(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DedupThresholdObservability {
+    let state =
+        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
+    dedup_threshold_observability_from_state(store, config, &state)
+}
+
 const AUTO_CONCEPT_MEMOIR: &str = "auto-discovered";
 const AUTO_CONCEPT_MAX: usize = 3;
 const AUTO_CONCEPT_MIN_CHARS: usize = 80;
@@ -1617,88 +1962,22 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         .unwrap_or_default();
 
     // Dedup threshold observability. `per_cluster` / `global` retain the
-    // legacy JSON shape and carry shadow suggestions; the explicit fields
-    // keep those suggestions distinct from the destructive hard threshold.
-    let dedup_threshold_shadow = state.get_dedup_shadow_threshold(None);
-    let dedup_calibration = crate::store::dedup_calibration::load_dedup_calibration_for_runtime(
-        conn,
-        chrono::Utc::now().timestamp(),
-        config.search.dedup_similarity as f32,
-    );
-    let evidence_verified = dedup_calibration.context_verified();
-    // `applied` means the calibration policy changed the destructive hard
-    // boundary. It is intentionally false while production-cohort calibration
-    // is absent, even when the stored statistical evidence is verified Ship.
-    let calibration_applied = false;
-    let calibration_reason = if !config.adaptive.enabled {
-        "adaptive_disabled"
-    } else if evidence_verified {
-        match dedup_calibration.policy.status {
-            crate::store::dedup_calibration::DedupCalibrationStatus::Ship => {
-                "verified_ship_shadow_only_production_cohort_missing"
-            }
-            crate::store::dedup_calibration::DedupCalibrationStatus::Bail => {
-                "verified_bail_not_applied"
-            }
-            crate::store::dedup_calibration::DedupCalibrationStatus::NoData => {
-                "verified_legacy_no_data_not_applied"
-            }
-        }
-    } else {
-        match dedup_calibration.status {
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Missing => {
-                "no_powered_terminal_policy"
-            }
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Stale => {
-                "stale_evidence_not_applied"
-            }
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Corrupt => {
-                "corrupt_evidence_not_applied"
-            }
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::UnsupportedSchema => {
-                "unsupported_evidence_schema_not_applied"
-            }
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::FingerprintMismatch => {
-                "evidence_fingerprint_mismatch_not_applied"
-            }
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::StorageError => {
-                "evidence_storage_error_not_applied"
-            }
-            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Loaded => {
-                "unverified_evidence_not_applied"
-            }
-        }
-    };
-    let mut dedup_calibration_json =
-        serde_json::to_value(&dedup_calibration).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(object) = dedup_calibration_json.as_object_mut() {
-        object.insert(
-            "adaptive_enabled".to_string(),
-            serde_json::Value::Bool(config.adaptive.enabled),
-        );
-        object.insert(
-            "evidence_verified".to_string(),
-            serde_json::Value::Bool(evidence_verified),
-        );
-        object.insert(
-            "applied".to_string(),
-            serde_json::Value::Bool(calibration_applied),
-        );
-        object.insert(
-            "reason".to_string(),
-            serde_json::Value::String(calibration_reason.to_string()),
-        );
-    }
-    // Use the same top-level resolver as runtime so `[adaptive] enabled=false`
-    // and any future policy gating cannot diverge between status and actions.
-    let dedup_threshold_hard_effective = effective_hard_dedup_threshold_from_conn(conn, config);
+    // legacy JSON shape and carry shadow suggestions; the typed shared
+    // projection keeps Adaptive, Trust, and doctor on the runtime resolver.
+    let dedup_observability = dedup_threshold_observability_from_state(store, config, &state);
+    // Preserve the legacy Adaptive JSON number representation (`f32`) while
+    // the typed Trust/doctor projector uses normalized `f64` display values.
+    let dedup_threshold_hard_effective = dedup_observability.hard_effective_threshold as f32;
     let dedup_thresholds = serde_json::json!({
-        "per_cluster": state.dedup_thresholds,
-        "global": dedup_threshold_shadow,
-        "dedup_threshold_static": config.search.dedup_similarity,
-        "dedup_threshold_shadow": dedup_threshold_shadow,
+        "per_cluster": &state.dedup_thresholds,
+        "global": dedup_observability.shadow_threshold,
+        "dedup_threshold_static": dedup_observability.static_threshold,
+        "dedup_threshold_shadow": dedup_observability.shadow_threshold,
         "dedup_threshold_hard_effective": dedup_threshold_hard_effective,
-        "calibration": dedup_calibration_json,
+        "source": dedup_observability.source,
+        "hard_effective_source": dedup_observability.hard_effective_source,
+        "calibration": dedup_observability.calibration,
+        "repair_advice": dedup_observability.repair_advice,
     });
 
     let recent_avg: f64 = conn
@@ -2155,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_status_labels_shadow_and_hard_effective_dedup_thresholds() {
+    fn dedup_threshold_observability_labels_legacy_shadow_and_counterfactuals() {
         let store = SqliteStore::in_memory().unwrap();
         let mut config = ReinConfig::default();
         config.search.dedup_similarity = 0.70;
@@ -2165,13 +2444,106 @@ mod tests {
         store.store(memory).unwrap();
 
         let mut state = crate::store::adaptive::AdaptiveState {
-            global_dedup_threshold: 0.80,
+            global_dedup_threshold: 0.40,
             version: 1,
             ..Default::default()
         };
         state.memory_clusters.insert(memory_id, 7);
-        state.dedup_thresholds.insert(7, 0.85);
+        state.dedup_thresholds.insert(7, 0.45);
         state.save_snapshot(store.conn()).unwrap();
+
+        for (similarity, recorded_shadow_match) in [(0.50, true), (0.70, true), (0.80, true)] {
+            crate::store::adaptive::emit_event(
+                store.conn(),
+                crate::store::adaptive::FeedbackEvent {
+                    event_type: crate::store::adaptive::EventType::ParamUpdate,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some(format!("m6_explore:{similarity:.3}")),
+                    query_type: Some("threshold_exploration".to_string()),
+                    topic: None,
+                    payload: Some(serde_json::json!({
+                        "similarity": similarity,
+                        "threshold_used": 0.40,
+                        "threshold_base": 0.70,
+                        "would_dedup_shadow": recorded_shadow_match,
+                        "semantics": "shadow_counterfactual",
+                    })),
+                },
+            )
+            .unwrap();
+        }
+        crate::store::adaptive::emit_event(
+            store.conn(),
+            crate::store::adaptive::FeedbackEvent {
+                event_type: crate::store::adaptive::EventType::ParamUpdate,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: Some("m6_explore:invalid".to_string()),
+                query_type: Some("threshold_exploration".to_string()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "similarity": 1.50,
+                    "would_dedup_shadow": true,
+                    "semantics": "shadow_counterfactual",
+                })),
+            },
+        )
+        .unwrap();
+        crate::store::adaptive::emit_event(
+            store.conn(),
+            crate::store::adaptive::FeedbackEvent {
+                event_type: crate::store::adaptive::EventType::ParamUpdate,
+                request_id: None,
+                memory_id: None,
+                concept_id: None,
+                query: Some("m6_explore:legacy".to_string()),
+                query_type: Some("threshold_exploration".to_string()),
+                topic: None,
+                payload: Some(serde_json::json!({
+                    "similarity": 0.90,
+                    "was_dedup": true,
+                })),
+            },
+        )
+        .unwrap();
+        for (label, would_dedup_shadow) in [
+            ("missing_bool", None),
+            ("string_bool", Some(serde_json::json!("true"))),
+            ("null_bool", Some(serde_json::Value::Null)),
+        ] {
+            let mut payload = serde_json::json!({
+                "similarity": 0.90,
+                "semantics": "shadow_counterfactual",
+            });
+            if let Some(value) = would_dedup_shadow {
+                payload["would_dedup_shadow"] = value;
+            }
+            crate::store::adaptive::emit_event(
+                store.conn(),
+                crate::store::adaptive::FeedbackEvent {
+                    event_type: crate::store::adaptive::EventType::ParamUpdate,
+                    request_id: None,
+                    memory_id: None,
+                    concept_id: None,
+                    query: Some(format!("m6_explore:{label}")),
+                    query_type: Some("threshold_exploration".to_string()),
+                    topic: None,
+                    payload: Some(payload),
+                },
+            )
+            .unwrap();
+        }
+        store
+            .conn()
+            .execute(
+                "INSERT INTO feedback_events(event_type, query_type, payload) \
+                 VALUES ('param_update', 'threshold_exploration', '{malformed')",
+                [],
+            )
+            .unwrap();
 
         let status = adaptive_status_with_config(&store, &config);
         let assert_threshold = |actual: Option<f64>, expected: f64| {
@@ -2179,17 +2551,57 @@ mod tests {
         };
         assert_threshold(
             status["dedup_thresholds"]["dedup_threshold_shadow"].as_f64(),
-            0.80,
+            0.40,
+        );
+        assert_threshold(
+            status["dedup_thresholds"]["dedup_threshold_static"].as_f64(),
+            0.70,
         );
         assert_threshold(
             status["dedup_thresholds"]["dedup_threshold_hard_effective"].as_f64(),
             0.70,
+        );
+        assert_eq!(
+            status["dedup_thresholds"]["source"],
+            "legacy_unlabeled_shadow"
         );
         let calibration = &status["dedup_thresholds"]["calibration"];
         assert_eq!(calibration["adaptive_enabled"], true);
         assert_eq!(calibration["applied"], false);
         assert_eq!(calibration["evidence_verified"], false);
         assert_eq!(calibration["reason"], "no_powered_terminal_policy");
+        assert_eq!(calibration["counterfactual_counts"]["total_events"], 7);
+        assert_eq!(calibration["counterfactual_counts"]["evaluable_events"], 3);
+        assert_eq!(
+            calibration["counterfactual_counts"]["would_merge_at_probed_shadow"],
+            3
+        );
+        assert_eq!(
+            calibration["counterfactual_counts"]["would_merge_at_hard_effective"],
+            1
+        );
+        for required in [
+            "schema_version",
+            "status",
+            "scale",
+            "train_positive_count",
+            "train_negative_count",
+            "sealed_positive_count",
+            "sealed_negative_count",
+            "utility",
+            "required_slices",
+            "train_fingerprint",
+            "holdout_fingerprint",
+            "corpus_fingerprint",
+            "provenance",
+        ] {
+            assert!(
+                calibration["policy"].get(required).is_some(),
+                "missing policy observability field {required}"
+            );
+        }
+        assert!(calibration.get("false_positive_upper_95").is_some());
+        assert!(calibration.get("utility_miss_rate_upper_95").is_some());
         let profile = status["cluster_profiles"]
             .as_array()
             .unwrap()
@@ -2197,9 +2609,40 @@ mod tests {
             .find(|profile| profile["cluster_id"].as_u64() == Some(7))
             .unwrap();
 
-        assert_threshold(profile["dedup_threshold_shadow"].as_f64(), 0.85);
+        assert_threshold(profile["dedup_threshold_shadow"].as_f64(), 0.45);
         assert_threshold(profile["dedup_threshold_hard_effective"].as_f64(), 0.70);
         assert_threshold(profile["dedup_threshold"].as_f64(), 0.70);
+    }
+
+    #[test]
+    fn dedup_repair_advice_distinguishes_future_schema_and_storage_errors() {
+        use crate::store::dedup_calibration::DedupCalibrationLoadStatus;
+
+        let future = dedup_repair_advice_for_statuses(
+            DedupCalibrationLoadStatus::UnsupportedSchema,
+            DedupCalibrationLoadStatus::UnsupportedSchema,
+            DedupCalibrationLoadStatus::UnsupportedSchema,
+            false,
+            crate::store::dedup_calibration::DedupCalibrationStatus::NoData,
+            true,
+        )
+        .join(" ");
+        assert!(future.contains("upgrade"), "advice={future}");
+        assert!(future.contains("preserve"), "advice={future}");
+        assert!(!future.contains("reset"), "advice={future}");
+
+        let storage = dedup_repair_advice_for_statuses(
+            DedupCalibrationLoadStatus::StorageError,
+            DedupCalibrationLoadStatus::StorageError,
+            DedupCalibrationLoadStatus::StorageError,
+            false,
+            crate::store::dedup_calibration::DedupCalibrationStatus::NoData,
+            true,
+        )
+        .join(" ");
+        assert!(storage.contains("retry"), "advice={storage}");
+        assert!(storage.contains("storage"), "advice={storage}");
+        assert!(!storage.contains("reset"), "advice={storage}");
     }
 
     fn test_memory(topic: &str, summary: &str, content: &str) -> Memory {

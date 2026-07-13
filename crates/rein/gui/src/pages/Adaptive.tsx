@@ -145,6 +145,9 @@ export default function Adaptive() {
 
   /* Panel 6: Cluster & convergence */
   const { cluster_info, tier_boundaries, dedup_thresholds } = adaptive;
+  const dedupStatic = dedup_thresholds.dedup_threshold_static;
+  const dedupShadow = dedup_thresholds.dedup_threshold_shadow ?? dedup_thresholds.global;
+  const dedupHardEffective = dedup_thresholds.dedup_threshold_hard_effective;
   const clusterProfiles = [...(adaptive.cluster_profiles ?? [])]
     .sort((a, b) => b.memory_count - a.memory_count)
     .slice(0, 8);
@@ -310,10 +313,24 @@ export default function Adaptive() {
             <Row label="Unique Clusters" value={cluster_info.unique_clusters} />
             <Row label="Assigned Memories" value={cluster_info.assigned_memories} />
             <Divider />
-            <Row label="Global Dedup" value={dedup_thresholds.global.toFixed(3)} />
+            <Row
+              label="Dedup Static"
+              value={dedupStatic?.toFixed(3) ?? 'Legacy backend'}
+            />
+            <Row label="Dedup Shadow (unlabeled)" value={dedupShadow.toFixed(3)} />
+            <Row
+              label="Dedup Hard Effective"
+              value={dedupHardEffective?.toFixed(3) ?? 'Unavailable'}
+            />
+            <div className="text-[10px] text-[var(--text-muted)]">
+              Shadow source: {dedup_thresholds.source ?? 'legacy_backend_unknown'}
+              {dedup_thresholds.calibration?.reason
+                ? ` · ${dedup_thresholds.calibration.reason.replace(/_/g, ' ')}`
+                : ''}
+            </div>
             {Object.entries(dedup_thresholds.per_cluster).length > 0 && (
               <div className="text-xs text-[var(--text-muted)]">
-                Per-cluster thresholds:
+                Per-cluster shadow suggestions:
                 <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-[10px]">
                   {Object.entries(dedup_thresholds.per_cluster).slice(0, 10).map(([cid, val]) => (
                     <div key={cid}>C{cid}: {val.toFixed(3)}</div>
@@ -345,9 +362,18 @@ export default function Adaptive() {
                       {cluster.memory_count} memories
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
                     <Metric label="Avg strength" value={cluster.avg_strength.toFixed(3)} color="var(--success)" />
-                    <Metric label="Dedup" value={cluster.dedup_threshold.toFixed(3)} color="var(--accent)" />
+                    <Metric
+                      label="Dedup shadow"
+                      value={(cluster.dedup_threshold_shadow ?? cluster.dedup_threshold).toFixed(3)}
+                      color="var(--accent)"
+                    />
+                    <Metric
+                      label="Dedup hard"
+                      value={cluster.dedup_threshold_hard_effective?.toFixed(3) ?? 'Unavailable'}
+                      color="var(--accent)"
+                    />
                     <Metric label="Admission" value={cluster.admission_threshold.toFixed(3)} color="var(--warm)" />
                     <Metric label="Promote @ access" value={cluster.promotion_threshold} color="var(--hot)" />
                   </div>

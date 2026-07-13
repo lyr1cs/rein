@@ -7,7 +7,7 @@ use crate::ops::ars_release_gate::ArsAccelerationReleaseGateReport;
 use crate::ops::system_health::SystemHealthSnapshot;
 use crate::store::SqliteStore;
 
-pub const TRUST_MEASUREMENT_SCHEMA_VERSION: u32 = 1;
+pub const TRUST_MEASUREMENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MeasurementGate {
@@ -72,6 +72,7 @@ pub struct TrustMeasurementReport {
     pub release_gate: ArsAccelerationReleaseGateReport,
     pub eval_gates: Vec<MeasurementGate>,
     pub index_consistency: IndexConsistencyReport,
+    pub dedup_calibration: crate::ops::DedupThresholdObservability,
     pub background_observability: BackgroundObservabilityReport,
     pub active_learning: ActiveLearningReport,
 }
@@ -95,6 +96,9 @@ pub fn collect(store: &SqliteStore, config: &ReinConfig) -> TrustMeasurementRepo
         ),
         eval_gates: eval_gates(),
         index_consistency,
+        dedup_calibration: crate::ops::dedup_threshold_observability_from_state(
+            store, config, &state,
+        ),
         background_observability: BackgroundObservabilityReport {
             status: background_status.to_string(),
             adaptive_version: state.version,
@@ -387,9 +391,18 @@ mod tests {
         config.ars.llm_judge.nightly_cron.enabled = true;
         let store = SqliteStore::new(&db_path, "text-embedding-3-small", 3072).unwrap();
 
+        let state = crate::store::adaptive::AdaptiveState {
+            global_dedup_threshold: 0.40,
+            version: 1,
+            ..Default::default()
+        };
+        state.save_snapshot(store.conn()).unwrap();
+
         let report = collect(&store, &config);
+        let report_json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(report.schema_version, TRUST_MEASUREMENT_SCHEMA_VERSION);
+        assert_eq!(report.schema_version, 2);
         for gate in ["recall", "dedup", "admission", "latency"] {
             assert!(
                 report.eval_gates.iter().any(|item| item.name == gate),
@@ -409,6 +422,107 @@ mod tests {
         assert!(report.active_learning.nightly_cron_enabled);
         // No judge calibration row yet on this fresh store.
         assert_eq!(report.active_learning.judge_drift_alert_total, 0);
+        let dedup = &report_json["dedup_calibration"];
+        assert_eq!(dedup["source"], "legacy_unlabeled_shadow");
+        assert_eq!(dedup["static_threshold"], 0.70);
+        assert_eq!(dedup["shadow_threshold"], 0.40);
+        assert_eq!(dedup["hard_effective_threshold"], 0.70);
+        assert_eq!(dedup["calibration"]["adaptive_enabled"], true);
+        assert_eq!(dedup["calibration"]["evidence_verified"], false);
+        assert_eq!(dedup["calibration"]["applied"], false);
+        assert_eq!(dedup["calibration"]["reason"], "no_powered_terminal_policy");
+        assert!(dedup["calibration"]["policy"]["utility"].is_object());
+        assert!(dedup["calibration"]["policy"]["required_slices"].is_array());
+        assert!(dedup["calibration"]["counterfactual_counts"].is_object());
+        assert!(dedup["repair_advice"].is_array());
+        let advice = dedup["repair_advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(advice.contains("recalibrat"), "advice={advice}");
+        assert!(advice.contains("shadow"), "advice={advice}");
+    }
+
+    #[test]
+    fn corrupt_dedup_policy_advice_requires_atomic_reset_and_recalibration() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    crate::store::dedup_calibration::DEDUP_CALIBRATION_METADATA_KEY,
+                    "{not json"
+                ],
+            )
+            .unwrap();
+
+        let report = serde_json::to_value(collect(&store, &config)).unwrap();
+        let serialized = report.to_string();
+        assert!(!serialized.contains("{not json"));
+        assert!(!serialized.contains("/Users/"));
+        assert!(!serialized.contains("/home/"));
+        let advice = report["dedup_calibration"]["repair_advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(advice.contains("recalibrat"), "advice={advice}");
+        assert!(advice.contains("atomically"), "advice={advice}");
+        assert!(!advice.contains("doctor --fix"), "advice={advice}");
+        assert!(!advice.contains("automatically"), "advice={advice}");
+    }
+
+    #[test]
+    fn orphan_dedup_seal_is_reported_as_half_written_bundle() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let now = chrono::Utc::now().timestamp();
+        let seal = crate::store::dedup_calibration::DedupCalibrationSeal {
+            schema_version: crate::store::dedup_calibration::DEDUP_CALIBRATION_SCHEMA_VERSION,
+            revision: 1,
+            generation: 1,
+            cutoff: now - 1,
+            scale: crate::store::dedup_calibration::DedupCalibrationScale::Lexical,
+            configured_static_threshold_bits: (0.70_f32).to_bits(),
+            train_fingerprint: "train".to_string(),
+            holdout_fingerprint: "holdout".to_string(),
+            corpus_fingerprint: "corpus".to_string(),
+            policy_digest: "policy-digest".to_string(),
+            calibrated_at: now - 1,
+            valid_until: now + 3_600,
+        };
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    crate::store::dedup_calibration::DEDUP_CALIBRATION_SEAL_METADATA_KEY,
+                    serde_json::to_string(&seal).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let report = serde_json::to_value(collect(&store, &config)).unwrap();
+        let calibration = &report["dedup_calibration"]["calibration"];
+        assert_eq!(calibration["load_status"], "missing");
+        assert_eq!(calibration["seal_status"], "loaded");
+        assert_eq!(calibration["reason"], "orphan_seal_policy_missing");
+        let advice = report["dedup_calibration"]["repair_advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(advice.contains("atomically"), "advice={advice}");
+        assert!(advice.contains("recalibrat"), "advice={advice}");
     }
 
     // v0.35 T&M Phase 3 — index-consistency repair advice builder.
