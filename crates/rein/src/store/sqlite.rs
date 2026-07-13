@@ -1876,51 +1876,26 @@ impl SqliteStore {
                 inferred_cluster,
             )?;
 
-            let candidate_cluster = match &dedup_action {
-                DedupAction::MergeInto(id)
-                | DedupAction::Supersede(id)
-                | DedupAction::GrayZone(id, _)
-                | DedupAction::TemporalSupersede(id, _) => {
-                    self.get(id).ok().and_then(|m| m.cluster_id)
-                }
-                // v0.27 Track 2 #6: winner drives cluster inference; losers
-                // fold into the same canonical so the cluster_id of the
-                // winner is the right anchor for adaptive-threshold lookup.
-                DedupAction::MergeIntoMany(winner, _) => {
-                    self.get(winner).ok().and_then(|m| m.cluster_id)
-                }
-                DedupAction::CreateNew => memory.cluster_id,
-            };
-
             // Re-resolve the hard policy inside the transaction so the static
             // config used for the destructive action cannot drift from the
-            // outer preview. Cluster remains a compatibility input only.
+            // outer preview.
             let dedup_action = {
                 let loaded_config = crate::config::ReinConfig::load().unwrap_or_default();
-                if loaded_config.adaptive.enabled {
-                    if let Some(state) =
-                        crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
-                    {
-                        let effective = state.get_hard_dedup_threshold(
-                            candidate_cluster,
-                            loaded_config.search.dedup_similarity as f32,
-                        );
-                        if dedup_threshold_changed(effective, similarity_threshold) {
-                            crate::extract::check_dedup(
-                                self,
-                                &memory.topic,
-                                &memory.summary,
-                                &memory.content,
-                                effective,
-                                time_window_days,
-                                inferred_cluster,
-                            )?
-                        } else {
-                            dedup_action
-                        }
-                    } else {
-                        dedup_action
-                    }
+                let effective = crate::ops::effective_hard_dedup_threshold_from_conn(
+                    &self.conn,
+                    &loaded_config,
+                )
+                .max(similarity_threshold);
+                if dedup_threshold_changed(effective, similarity_threshold) {
+                    crate::extract::check_dedup(
+                        self,
+                        &memory.topic,
+                        &memory.summary,
+                        &memory.content,
+                        effective,
+                        time_window_days,
+                        inferred_cluster,
+                    )?
                 } else {
                     dedup_action
                 }
@@ -2287,18 +2262,9 @@ impl SqliteStore {
             .or_else(|| self.infer_cluster_from_cache(memory));
         // Keep preflight on the same hard policy as the in-transaction recheck;
         // unlabeled shadow suggestions are not action-authorizing inputs.
-        let effective_threshold = if config.adaptive.enabled {
-            crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
-                .map(|s| {
-                    s.get_hard_dedup_threshold(
-                        inferred_cluster,
-                        config.search.dedup_similarity as f32,
-                    )
-                })
-                .unwrap_or(similarity_threshold)
-        } else {
-            similarity_threshold
-        };
+        let effective_threshold =
+            crate::ops::effective_hard_dedup_threshold_from_conn(&self.conn, &config)
+                .max(similarity_threshold);
 
         let preview = crate::extract::check_dedup(
             self,

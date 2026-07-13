@@ -1018,13 +1018,8 @@ pub fn run_dedup_scoped(
     let mut changed = false;
     let llm_budget = vec_dedup_llm_budget(config);
     let mut llm_calls_used = 0usize;
-    // Load adaptive suggestions once; each destructive comparison below
-    // resolves a hard-effective threshold against static config.
-    let adaptive_state = if config.adaptive.enabled {
-        crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
-    } else {
-        None
-    };
+    let sealed_hard_threshold =
+        crate::ops::effective_hard_dedup_threshold_from_conn(store.conn(), config).max(threshold);
     for group in groups {
         let mems: Vec<_> = load_group_memories(store, group)?
             .into_iter()
@@ -1047,14 +1042,10 @@ pub fn run_dedup_scoped(
 
         // Compare within each cluster group (much smaller than full pairwise)
         for (cluster_id, indices) in &cluster_groups {
-            // Unlabeled per-cluster suggestions are shadow-only; the hard
-            // getter keeps this destructive lexical merge on static config.
-            let cluster_threshold = adaptive_state
-                .as_ref()
-                .map(|s| {
-                    s.get_hard_dedup_threshold(*cluster_id, config.search.dedup_similarity as f32)
-                })
-                .unwrap_or(threshold);
+            // Per-cluster suggestions and sealed calibration candidates remain
+            // shadow-only. Production keeps the operator static boundary until
+            // an end-to-end production score-space cohort exists.
+            let cluster_threshold = sealed_hard_threshold;
             for ii in 0..indices.len() {
                 let i = indices[ii];
                 if processed.contains(&mems[i].id) {
