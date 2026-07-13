@@ -36,6 +36,158 @@ pub const LLM_JUDGE_DAILY_CALL_CAP_DEFAULT: u64 = 10_000;
 /// resummerize claim-token discipline.
 pub const LLM_JUDGE_STALE_CLAIM_SECS: i64 = 5 * 60;
 
+/// Health of the deterministic structural-anchor suite for one judge surface.
+/// Structural anchors are deliberately separate from human-pair κ evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeStructuralStatus {
+    Disabled,
+    Collecting,
+    Ready,
+    Failed,
+    Stale,
+    FingerprintMismatch,
+    Corrupt,
+    Unknown,
+}
+
+/// Evidence consumed by [`judge_trust_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JudgeCalibrationEvidence {
+    pub human_pair_count: usize,
+    pub human_kappa: Option<f64>,
+    pub structural_status: JudgeStructuralStatus,
+    pub enforce_structural_anchors: bool,
+}
+
+/// A requested use of judge trust. Structural anchors may preserve the
+/// configured baseline, but never authorize any of the automatic increases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeTrustAction {
+    KeepConfiguredBaseline,
+    IncreaseJudgeWeight,
+    IncreaseSampleRate,
+    PromoteJudgeScope,
+    PromoteRecallFusion,
+}
+
+/// Evidence source that actually authorized the returned decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeCalibrationBasis {
+    HumanKappa,
+    StructuralAnchors,
+    ConfiguredBaseline,
+    Untrusted,
+}
+
+/// Stable reason for a trust-gate outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeTrustReason {
+    HumanKappaHealthy,
+    HumanKappaBelowFloor,
+    HumanKappaMissingOrInvalid,
+    StructuralAnchorsReady,
+    ConfiguredBaselineFallback,
+    StructuralHealthEnforced,
+}
+
+/// Fully resolved trust policy. Callers must use `configured_baseline_scale`
+/// rather than re-deriving whether the judge contribution stays configured or
+/// is forced to zero.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JudgeTrustDecision {
+    pub basis: JudgeCalibrationBasis,
+    pub action_allowed: bool,
+    /// Only `0.0` (fail closed) or `1.0` (retain configured baseline).
+    pub configured_baseline_scale: f64,
+    pub blocks_release: bool,
+    pub reason: JudgeTrustReason,
+}
+
+/// Resolve whether `requested_action` is authorized and whether the configured
+/// judge baseline remains live.
+pub fn judge_trust_gate(
+    evidence: &JudgeCalibrationEvidence,
+    requested_action: JudgeTrustAction,
+) -> JudgeTrustDecision {
+    let human_kappa_is_authoritative = evidence.human_pair_count >= LLM_JUDGE_J3_MIN_PAIRS;
+
+    if human_kappa_is_authoritative {
+        match evidence.human_kappa {
+            Some(kappa) if kappa.is_finite() && kappa < LLM_JUDGE_KAPPA_FLOOR => {
+                return JudgeTrustDecision {
+                    basis: JudgeCalibrationBasis::Untrusted,
+                    action_allowed: false,
+                    configured_baseline_scale: 0.0,
+                    blocks_release: true,
+                    reason: JudgeTrustReason::HumanKappaBelowFloor,
+                };
+            }
+            Some(kappa) if kappa.is_finite() => {}
+            _ => {
+                return JudgeTrustDecision {
+                    basis: JudgeCalibrationBasis::Untrusted,
+                    action_allowed: false,
+                    configured_baseline_scale: 0.0,
+                    blocks_release: true,
+                    reason: JudgeTrustReason::HumanKappaMissingOrInvalid,
+                };
+            }
+        }
+    }
+
+    let structural_failure = matches!(
+        evidence.structural_status,
+        JudgeStructuralStatus::Failed
+            | JudgeStructuralStatus::Stale
+            | JudgeStructuralStatus::FingerprintMismatch
+            | JudgeStructuralStatus::Corrupt
+            | JudgeStructuralStatus::Unknown
+    );
+    if evidence.enforce_structural_anchors && structural_failure {
+        return JudgeTrustDecision {
+            basis: JudgeCalibrationBasis::Untrusted,
+            action_allowed: false,
+            configured_baseline_scale: 0.0,
+            blocks_release: true,
+            reason: JudgeTrustReason::StructuralHealthEnforced,
+        };
+    }
+
+    if human_kappa_is_authoritative {
+        return JudgeTrustDecision {
+            basis: JudgeCalibrationBasis::HumanKappa,
+            action_allowed: true,
+            configured_baseline_scale: 1.0,
+            blocks_release: false,
+            reason: JudgeTrustReason::HumanKappaHealthy,
+        };
+    }
+
+    let (basis, reason) = if evidence.structural_status == JudgeStructuralStatus::Ready {
+        (
+            JudgeCalibrationBasis::StructuralAnchors,
+            JudgeTrustReason::StructuralAnchorsReady,
+        )
+    } else {
+        (
+            JudgeCalibrationBasis::ConfiguredBaseline,
+            JudgeTrustReason::ConfiguredBaselineFallback,
+        )
+    };
+
+    JudgeTrustDecision {
+        basis,
+        action_allowed: requested_action == JudgeTrustAction::KeepConfiguredBaseline,
+        configured_baseline_scale: 1.0,
+        blocks_release: false,
+        reason,
+    }
+}
+
 /// v0.27.1 — discriminated payload variants the contract validates against.
 /// Lets J5 (link-present) / J7 (stamp-time) operate uniformly across both
 /// runtime payloads without monomorphizing every invariant.
@@ -515,6 +667,273 @@ mod tests {
         let payload = JudgePayload::Synthesis(&p);
         let ctx = ctx_for("h", 0, 0.0, false);
         assert!(validate_pre_emit(&ctx, &payload).is_ok());
+    }
+
+    #[test]
+    fn zero_human_pairs_failed_structural_anchor_blocks_trust_increase() {
+        let evidence = JudgeCalibrationEvidence {
+            human_pair_count: 0,
+            human_kappa: None,
+            structural_status: JudgeStructuralStatus::Failed,
+            enforce_structural_anchors: true,
+        };
+
+        let decision = judge_trust_gate(&evidence, JudgeTrustAction::IncreaseJudgeWeight);
+
+        assert!(!decision.action_allowed);
+        assert_eq!(decision.configured_baseline_scale, 0.0);
+        assert!(decision.blocks_release);
+    }
+
+    const ALL_TRUST_ACTIONS: [JudgeTrustAction; 5] = [
+        JudgeTrustAction::KeepConfiguredBaseline,
+        JudgeTrustAction::IncreaseJudgeWeight,
+        JudgeTrustAction::IncreaseSampleRate,
+        JudgeTrustAction::PromoteJudgeScope,
+        JudgeTrustAction::PromoteRecallFusion,
+    ];
+
+    #[test]
+    fn insufficient_human_structural_status_action_matrix() {
+        use JudgeCalibrationBasis::{ConfiguredBaseline, StructuralAnchors, Untrusted};
+        use JudgeStructuralStatus::{
+            Collecting, Corrupt, Disabled, Failed, FingerprintMismatch, Ready, Stale, Unknown,
+        };
+        use JudgeTrustReason::{
+            ConfiguredBaselineFallback, StructuralAnchorsReady, StructuralHealthEnforced,
+        };
+
+        let cases = [
+            (
+                Disabled,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                Disabled,
+                true,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                Collecting,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                Collecting,
+                true,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                Ready,
+                false,
+                StructuralAnchors,
+                1.0,
+                false,
+                StructuralAnchorsReady,
+            ),
+            (
+                Ready,
+                true,
+                StructuralAnchors,
+                1.0,
+                false,
+                StructuralAnchorsReady,
+            ),
+            (
+                Failed,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (Failed, true, Untrusted, 0.0, true, StructuralHealthEnforced),
+            (
+                Stale,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (Stale, true, Untrusted, 0.0, true, StructuralHealthEnforced),
+            (
+                FingerprintMismatch,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                FingerprintMismatch,
+                true,
+                Untrusted,
+                0.0,
+                true,
+                StructuralHealthEnforced,
+            ),
+            (
+                Corrupt,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                Corrupt,
+                true,
+                Untrusted,
+                0.0,
+                true,
+                StructuralHealthEnforced,
+            ),
+            (
+                Unknown,
+                false,
+                ConfiguredBaseline,
+                1.0,
+                false,
+                ConfiguredBaselineFallback,
+            ),
+            (
+                Unknown,
+                true,
+                Untrusted,
+                0.0,
+                true,
+                StructuralHealthEnforced,
+            ),
+        ];
+
+        for (status, enforce, basis, baseline_scale, blocks_release, reason) in cases {
+            let evidence = JudgeCalibrationEvidence {
+                human_pair_count: 0,
+                human_kappa: None,
+                structural_status: status,
+                enforce_structural_anchors: enforce,
+            };
+
+            for action in ALL_TRUST_ACTIONS {
+                let decision = judge_trust_gate(&evidence, action);
+                assert_eq!(
+                    decision.basis, basis,
+                    "status={status:?}, action={action:?}"
+                );
+                assert_eq!(
+                    decision.action_allowed,
+                    baseline_scale == 1.0 && action == JudgeTrustAction::KeepConfiguredBaseline,
+                    "status={status:?}, action={action:?}"
+                );
+                assert_eq!(
+                    decision.configured_baseline_scale, baseline_scale,
+                    "status={status:?}, action={action:?}"
+                );
+                assert_eq!(
+                    decision.blocks_release, blocks_release,
+                    "status={status:?}, action={action:?}"
+                );
+                assert_eq!(
+                    decision.reason, reason,
+                    "status={status:?}, action={action:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn healthy_human_kappa_authorizes_all_actions_unless_enforced_structure_fails() {
+        let healthy = JudgeCalibrationEvidence {
+            human_pair_count: LLM_JUDGE_J3_MIN_PAIRS,
+            human_kappa: Some(LLM_JUDGE_KAPPA_FLOOR),
+            structural_status: JudgeStructuralStatus::Collecting,
+            enforce_structural_anchors: true,
+        };
+
+        for action in ALL_TRUST_ACTIONS {
+            let decision = judge_trust_gate(&healthy, action);
+            assert_eq!(decision.basis, JudgeCalibrationBasis::HumanKappa);
+            assert!(decision.action_allowed, "action={action:?}");
+            assert_eq!(decision.configured_baseline_scale, 1.0);
+            assert!(!decision.blocks_release);
+            assert_eq!(decision.reason, JudgeTrustReason::HumanKappaHealthy);
+        }
+
+        let failed = JudgeCalibrationEvidence {
+            structural_status: JudgeStructuralStatus::Failed,
+            ..healthy
+        };
+        for action in ALL_TRUST_ACTIONS {
+            let decision = judge_trust_gate(&failed, action);
+            assert_eq!(decision.basis, JudgeCalibrationBasis::Untrusted);
+            assert!(!decision.action_allowed, "action={action:?}");
+            assert_eq!(decision.configured_baseline_scale, 0.0);
+            assert!(decision.blocks_release);
+            assert_eq!(decision.reason, JudgeTrustReason::StructuralHealthEnforced);
+        }
+    }
+
+    #[test]
+    fn human_negative_evidence_wins_over_ready_structural_anchors() {
+        for kappa in [Some(LLM_JUDGE_KAPPA_FLOOR - 0.01), Some(f64::NAN), None] {
+            let evidence = JudgeCalibrationEvidence {
+                human_pair_count: LLM_JUDGE_J3_MIN_PAIRS,
+                human_kappa: kappa,
+                structural_status: JudgeStructuralStatus::Ready,
+                enforce_structural_anchors: true,
+            };
+
+            for action in ALL_TRUST_ACTIONS {
+                let decision = judge_trust_gate(&evidence, action);
+                assert_eq!(decision.basis, JudgeCalibrationBasis::Untrusted);
+                assert!(
+                    !decision.action_allowed,
+                    "kappa={kappa:?}, action={action:?}"
+                );
+                assert_eq!(decision.configured_baseline_scale, 0.0);
+                assert!(decision.blocks_release);
+                let expected_reason = if kappa.is_some_and(f64::is_finite) {
+                    JudgeTrustReason::HumanKappaBelowFloor
+                } else {
+                    JudgeTrustReason::HumanKappaMissingOrInvalid
+                };
+                assert_eq!(decision.reason, expected_reason);
+            }
+        }
+    }
+
+    #[test]
+    fn human_kappa_below_minimum_pair_count_is_not_authoritative() {
+        let evidence = JudgeCalibrationEvidence {
+            human_pair_count: LLM_JUDGE_J3_MIN_PAIRS - 1,
+            human_kappa: Some(0.0),
+            structural_status: JudgeStructuralStatus::Ready,
+            enforce_structural_anchors: true,
+        };
+
+        let baseline = judge_trust_gate(&evidence, JudgeTrustAction::KeepConfiguredBaseline);
+        assert_eq!(baseline.basis, JudgeCalibrationBasis::StructuralAnchors);
+        assert!(baseline.action_allowed);
+        assert_eq!(baseline.configured_baseline_scale, 1.0);
+
+        let increase = judge_trust_gate(&evidence, JudgeTrustAction::IncreaseSampleRate);
+        assert_eq!(increase.basis, JudgeCalibrationBasis::StructuralAnchors);
+        assert!(!increase.action_allowed);
+        assert_eq!(increase.configured_baseline_scale, 1.0);
     }
 
     fn setup_ledger_db() -> Connection {
