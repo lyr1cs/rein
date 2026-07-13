@@ -1080,7 +1080,7 @@ pub fn run_dedup_scoped(
                     let sim = crate::extract::similarity(&mems[i].content, &mems[j].content);
                     let gray_zone_floor =
                         (cluster_threshold - 0.15).max(0.50).min(cluster_threshold);
-                    let relation = if sim >= cluster_threshold {
+                    let relation = if sim > cluster_threshold {
                         DedupRelation::Duplicate
                     } else if !dry_run && sim >= gray_zone_floor && llm_calls_used < llm_budget {
                         llm_calls_used += 1;
@@ -1513,6 +1513,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found, 0, "shadow threshold must not affect the hard policy");
+        assert_eq!(merged, 0);
+    }
+
+    #[test]
+    fn batch_lexical_dedup_does_not_merge_at_exact_threshold() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = false;
+        let left = "alpha beta";
+        let right = "alpha gamma";
+        let threshold = crate::extract::similarity(left, right);
+        assert_eq!(threshold, 0.50, "fixture must exercise exact equality");
+
+        store
+            .store(test_memory_with_cluster("equality-boundary", left, 17))
+            .unwrap();
+        store
+            .store(test_memory_with_cluster("equality-boundary", right, 17))
+            .unwrap();
+
+        let (found, merged) = run_dedup(&store, &config, threshold, true, false).unwrap();
+        assert_eq!(found, 0, "equality must remain below the hard merge bound");
         assert_eq!(merged, 0);
     }
 

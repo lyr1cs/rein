@@ -3,9 +3,9 @@
 //!
 //! Hermetic + pure: scores each pair with `extract::dedup::similarity` (max of
 //! Jaccard / containment over normalized tokens) and classifies it a duplicate
-//! when `similarity >= DEDUP_THRESHOLD`.  No store, no config, no LLM — the
+//! when `similarity > DEDUP_THRESHOLD`.  No store, no config, no LLM — the
 //! same input always produces the same hit, which is what a reproducible gate
-//! needs.  `hit = (similarity(a, b) >= threshold) == is_duplicate`.
+//! needs.  `hit = (similarity(a, b) > threshold) == is_duplicate`.
 
 use std::path::PathBuf;
 
@@ -72,7 +72,7 @@ impl Gate for DedupGate {
 
 /// `hit` = the similarity classifier agrees with the ground-truth label.
 fn classify_one(fx: &DedupFixture) -> bool {
-    let predicted_duplicate = similarity(&fx.text_a, &fx.text_b) >= DEDUP_THRESHOLD;
+    let predicted_duplicate = similarity(&fx.text_a, &fx.text_b) > DEDUP_THRESHOLD;
     predicted_duplicate == fx.is_duplicate
 }
 
@@ -225,7 +225,8 @@ pub struct DedupSweepReport {
 }
 
 /// Sweep similarity thresholds over `[0.30, 0.95]` step `0.05`, scoring the
-/// labeled corpus at each. `similarity` is computed once per pair.
+/// labeled corpus at each with the production hard-boundary rule
+/// `similarity > threshold`. `similarity` is computed once per pair.
 pub fn sweep_thresholds(sims: &[(f32, bool)]) -> Vec<ThresholdStat> {
     let n = sims.len();
     let mut curve = Vec::new();
@@ -235,7 +236,7 @@ pub fn sweep_thresholds(sims: &[(f32, bool)]) -> Vec<ThresholdStat> {
         let threshold = step as f32 / 100.0;
         let (mut tp, mut fp, mut tn, mut false_neg) = (0usize, 0usize, 0usize, 0usize);
         for (sim, is_dup) in sims {
-            match (*sim >= threshold, *is_dup) {
+            match (*sim > threshold, *is_dup) {
                 (true, true) => tp += 1,
                 (true, false) => fp += 1,
                 (false, false) => tn += 1,
@@ -512,6 +513,34 @@ mod tests {
         assert!((row.recall - 1.0).abs() < 1e-9);
         assert!((row.f1 - 1.0).abs() < 1e-9);
         assert!((row.accuracy - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn classify_one_does_not_predict_duplicate_at_exact_threshold() {
+        let fixture = DedupFixture {
+            id: "equality-boundary".to_string(),
+            text_a: "alpha beta".to_string(),
+            text_b: "alpha gamma".to_string(),
+            is_duplicate: false,
+        };
+
+        assert_eq!(
+            similarity(&fixture.text_a, &fixture.text_b),
+            DEDUP_THRESHOLD,
+            "fixture must exercise exact threshold equality"
+        );
+        assert!(classify_one(&fixture));
+    }
+
+    #[test]
+    fn sweep_does_not_count_exact_threshold_as_false_positive() {
+        let curve = sweep_thresholds(&[(0.50, false)]);
+        let row = curve
+            .iter()
+            .find(|row| row.threshold == 0.50)
+            .expect("0.50 row exists");
+
+        assert_eq!((row.tp, row.fp, row.tn, row.false_neg), (0, 0, 1, 0));
     }
 
     #[test]
