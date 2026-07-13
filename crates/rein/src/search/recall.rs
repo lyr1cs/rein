@@ -33,6 +33,109 @@ pub struct RecallResult {
     pub archival_summary: Option<String>,
 }
 
+/// Read-only A12 replay output: production's pre-MMR legacy order plus the
+/// existing six-dimensional optimizer input.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct A12RecallTrace {
+    pub legacy_order: Vec<String>,
+    pub event: crate::search::alpha_optimizer::RecallEvent,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecallExecutionMode<'a> {
+    Live,
+    A12Loo(&'a crate::ops::a12_autocalibration::A12LooCase),
+}
+
+impl<'a> RecallExecutionMode<'a> {
+    fn loo_case(self) -> Option<&'a crate::ops::a12_autocalibration::A12LooCase> {
+        match self {
+            Self::Live => None,
+            Self::A12Loo(case) => Some(case),
+        }
+    }
+
+    fn is_loo(self) -> bool {
+        self.loo_case().is_some()
+    }
+
+    fn allows_dynamic_six_weights(self) -> bool {
+        !self.is_loo()
+    }
+
+    fn exclusion(self) -> Option<&'a crate::ops::a12_autocalibration::A12LooExclusion> {
+        self.loo_case().map(|case| &case.exclusion)
+    }
+
+    fn directly_excludes(self, memory_id: &str) -> bool {
+        self.exclusion().is_some_and(|exclusion| {
+            exclusion
+                .held_out_memory_ids
+                .iter()
+                .chain(exclusion.equal_content_memory_ids.iter())
+                .chain(exclusion.near_duplicate_memory_ids.iter())
+                .any(|candidate| candidate == memory_id)
+        })
+    }
+
+    /// Exclude both a raw channel row and its transitive canonical tip. A
+    /// broken canonical chain fails closed in evaluation mode rather than
+    /// admitting a candidate whose leakage status cannot be established.
+    fn excludes_memory(self, store: &SqliteStore, memory_id: &str) -> bool {
+        if !self.is_loo() {
+            return false;
+        }
+        if self.directly_excludes(memory_id) {
+            return true;
+        }
+        let Ok(canonical_id) = store.canonical_id_for(memory_id) else {
+            return true;
+        };
+        if self.directly_excludes(&canonical_id) {
+            return true;
+        }
+        store
+            .get(&canonical_id)
+            .map(|memory| !is_live_canonical(&memory))
+            .unwrap_or(true)
+    }
+
+    /// Over-fetch enough rows that exclusions cannot consume the channel's
+    /// requested cutoff before ranks are compacted.
+    fn channel_fetch_limit(self, store: &SqliteStore, limit: usize) -> usize {
+        if !self.is_loo() {
+            return limit;
+        }
+        // One excluded canonical can have many raw predecessors, so adding
+        // only the explicit exclusion-list length is not a safe over-fetch.
+        // LOO is an offline path: scan at most the local corpus, then apply
+        // the production cutoff after exclusions have been removed.
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap_or(limit)
+            .max(limit)
+    }
+}
+
+struct RecallExecutionResult {
+    results: Vec<RecallResult>,
+    trace: Option<A12RecallTrace>,
+}
+
+fn legacy_cc_alpha(
+    adaptive_alpha: Option<f32>,
+    strategy_alpha: Option<f32>,
+    configured_alpha: f32,
+) -> f32 {
+    adaptive_alpha
+        .or(strategy_alpha)
+        .unwrap_or(configured_alpha)
+}
+
 /// v0.26 Cap C: populate `RecallResult.archival_summary` when the gate
 /// permits — separated as a pure helper so tests can drive it without a
 /// full `SqliteStore` dance. Mirror of the gate condition in contract §2.6.
@@ -343,6 +446,16 @@ fn apply_evidence_rerank(
     results: &mut [RecallResult],
     evidence_limit: usize,
 ) {
+    apply_evidence_rerank_excluding(store, query, results, evidence_limit, &[]);
+}
+
+fn apply_evidence_rerank_excluding(
+    store: &SqliteStore,
+    query: &str,
+    results: &mut [RecallResult],
+    evidence_limit: usize,
+    excluded_evidence_ids: &[String],
+) {
     for result in results {
         if result.memory.support_count <= 1
             || (result.confidence >= 0.85 && result.sources_hit >= 2)
@@ -350,10 +463,16 @@ fn apply_evidence_rerank(
             continue;
         }
         let evidence = store
-            .list_memory_evidence(&result.memory.id, evidence_limit.saturating_add(1))
+            .list_memory_evidence(
+                &result.memory.id,
+                evidence_limit
+                    .saturating_add(1)
+                    .saturating_add(excluded_evidence_ids.len()),
+            )
             .unwrap_or_default();
         let best_sim = evidence
             .into_iter()
+            .filter(|item| !excluded_evidence_ids.iter().any(|id| id == &item.id))
             .filter(|item| item.memory_id.as_deref() != Some(result.memory.id.as_str()))
             .map(|item| {
                 crate::extract::similarity(query, &item.summary)
@@ -560,8 +679,70 @@ pub fn recall_temporal_with_request_id(
     fast: bool,
     request_id: Option<String>,
 ) -> ReinResult<Vec<RecallResult>> {
+    Ok(recall_temporal_with_execution_mode(
+        store,
+        config,
+        query,
+        topic,
+        keyword,
+        limit,
+        time_from,
+        time_to,
+        expand_override,
+        fast,
+        request_id,
+        RecallExecutionMode::Live,
+    )?
+    .results)
+}
+
+/// Replay one Task-1 case through the local production pipeline without
+/// mutating feedback, access, quality, embedding-cache, or side-index state.
+#[allow(dead_code)]
+pub(crate) fn recall_loo_trace(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    case: &crate::ops::a12_autocalibration::A12LooCase,
+    limit: usize,
+) -> ReinResult<A12RecallTrace> {
+    let execution = recall_temporal_with_execution_mode(
+        store,
+        config,
+        &case.query_text,
+        None,
+        None,
+        limit,
+        None,
+        None,
+        Some(false),
+        true,
+        None,
+        RecallExecutionMode::A12Loo(case),
+    )?;
+    Ok(execution
+        .trace
+        .expect("A12 LOO execution mode must return a trace"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recall_temporal_with_execution_mode(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    query: &str,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    limit: usize,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+    expand_override: Option<bool>,
+    fast: bool,
+    request_id: Option<String>,
+    execution_mode: RecallExecutionMode<'_>,
+) -> ReinResult<RecallExecutionResult> {
     let _span = tracing::info_span!("recall", query_len = query.len()).entered();
     let total_start = std::time::Instant::now();
+    let loo_case = execution_mode.loo_case();
+    let is_loo = execution_mode.is_loo();
 
     // === Query classification (FT-3: autonomous retrieval routing) ===
     let strategy = crate::search::classify::classify(query, time_from.is_some(), time_to.is_some());
@@ -582,14 +763,15 @@ pub fn recall_temporal_with_request_id(
 
     // Apply limit multiplier from strategy
     let effective_limit = (limit as f32 * strategy.limit_multiplier) as usize;
+    let channel_retrieval_limit = execution_mode.channel_fetch_limit(store, effective_limit);
 
     // === Supermemory config (channel launched after the strong-signal decision) ===
     // Skip in fast mode (proxy/hook_prompt) — store-local only. The thread is
     // spawned below, only when the strong signal is NOT confirmed (v0.36 #P1):
     // a confirmed dominant local hit needs no cloud cross-validation, so we
     // never start a request we would discard.
-    let sm_enabled = !fast && config.sync.supermemory_enabled;
-    let am_enabled = !fast && config.sync.auto_memory_enabled;
+    let sm_enabled = !is_loo && !fast && config.sync.supermemory_enabled;
+    let am_enabled = !is_loo && !fast && config.sync.auto_memory_enabled;
     let sm_api_key = config.sync.api_key.clone();
     let sm_endpoint = config.sync.endpoint.clone();
     let q_sm = query.to_string();
@@ -603,7 +785,11 @@ pub fn recall_temporal_with_request_id(
         )
     } else {
         let fts_start = std::time::Instant::now();
-        let (results, ranked) = try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?;
+        let (results, ranked) = if is_loo {
+            try_local_fts_read_only_loo(store, query, topic, effective_limit * 2, execution_mode)?
+        } else {
+            try_tantivy_then_fts5(store, query, topic, effective_limit * 2)?
+        };
         let scores: std::collections::HashMap<String, f32> = ranked.into_iter().collect();
         let ranked_vec: Vec<(String, f32)> = scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let ss = crate::search::rerank_llm::detect_strong_signal_with_thresholds(
@@ -757,7 +943,7 @@ pub fn recall_temporal_with_request_id(
     };
 
     // === Query expansion: launch AFTER strong signal check to avoid unnecessary LLM calls ===
-    let should_expand = if fast {
+    let should_expand = if is_loo || fast {
         false // Fast mode: no expansion
     } else {
         match expand_override {
@@ -808,13 +994,15 @@ pub fn recall_temporal_with_request_id(
 
     // Step 1: check embedding cache on the main thread (fast, no I/O).
     // Done even in fast mode so cached embeddings get HNSW search without any API call.
-    let maybe_cached_emb: Option<Vec<f32>> = if !strategy.skip_vec {
+    let maybe_cached_emb: Option<Vec<f32>> = if strategy.skip_vec {
+        None
+    } else if let Some(case) = loo_case {
+        stored_loo_query_embedding(store, case)
+    } else {
         let model = config.embedding_model();
         crate::embed::EmbedCache::get(store.conn(), query, &model)
             .ok()
             .flatten()
-    } else {
-        None
     };
 
     // Step 2: launch Vec search — sync for cache hit, background thread for miss
@@ -826,16 +1014,21 @@ pub fn recall_temporal_with_request_id(
     let vec_state: VecSearchState = if strategy.skip_vec {
         VecSearchState::Skip
     } else if let Some(emb) = maybe_cached_emb {
-        // Cache hit: synchronous HNSW search (no new connection, no API call)
+        // A12 LOO bypasses HNSW entirely: even its clean read path creates a
+        // lock file, while dirty paths claim markers and spawn rebuilds.
         let vec_start = std::time::Instant::now();
-        let results = vec_search_direct(store, &emb, topic, effective_limit, Some(config));
+        let results = if is_loo {
+            vec_search_read_only_loo(store, &emb, topic, effective_limit, execution_mode)
+        } else {
+            vec_search_direct(store, &emb, topic, effective_limit, Some(config))
+        };
         tracing::debug!(
             elapsed_ms = vec_start.elapsed().as_millis() as u64,
             hits = results.len(),
             "vector search (cache hit, sync)"
         );
         VecSearchState::Sync(results)
-    } else if !fast && !strong_signal {
+    } else if !is_loo && !fast && !strong_signal {
         // Cache miss + normal mode + no strong FTS signal: background thread overlaps with KG.
         //
         // v0.22 P1 pool path: if the store has a pool attached AND we are
@@ -959,14 +1152,14 @@ pub fn recall_temporal_with_request_id(
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
         )
-    } else if fast || is_memory_db {
+    } else if is_loo || fast || is_memory_db {
         // Fast mode or in-memory DB: run synchronously on main thread.
         // In-memory DBs cannot be shared across threads (each new connection gets an empty DB).
         let kg_start = std::time::Instant::now();
         let (kg_scores, episode_scores) = run_kg_search(
             store,
             query,
-            effective_limit,
+            channel_retrieval_limit,
             kg_is_episodic,
             time_from,
             time_to,
@@ -989,7 +1182,7 @@ pub fn recall_temporal_with_request_id(
         let kg_query_str = query.to_string();
         let kg_model = config.embedding_model();
         let kg_dims = config.embedding.dimensions;
-        let kg_effective_limit = effective_limit;
+        let kg_effective_limit = channel_retrieval_limit;
         let kg_time_from = time_from;
         let kg_time_to = time_to;
         let kg_pool = store.pool().cloned();
@@ -1249,6 +1442,18 @@ pub fn recall_temporal_with_request_id(
         }
     }
 
+    // LOO exclusions are applied to every local channel before sorting,
+    // cutoff, rank assignment, normalization, and fusion. FTS/Vec already
+    // compact ranks inside their read-only acquisition helpers; retaining
+    // again here is a fail-closed guard and covers KG/Episode raw scores.
+    if is_loo {
+        fts_results.retain(|memory| !execution_mode.excludes_memory(store, &memory.id));
+        retain_loo_channel_scores(store, execution_mode, &mut fts_scores);
+        retain_loo_channel_scores(store, execution_mode, &mut vec_scores);
+        retain_loo_channel_scores(store, execution_mode, &mut kg_scores);
+        retain_loo_channel_scores(store, execution_mode, &mut episode_scores);
+    }
+
     // Convert to ranked vecs for fusion — MUST sort by descending score
     // because RRF uses list position (rank), not score value.
     let mut fts_ranked: Vec<(String, f32)> = fts_scores.into_iter().collect();
@@ -1388,27 +1593,34 @@ pub fn recall_temporal_with_request_id(
     // shadow weights so `apply_ars_dynamic_fusion_scores` can outer-blend
     // simplex against legacy by the same scalar that the inner trust blend
     // uses. Default 0.0 falls cleanly into the "no canary" branch.
-    let (ars_dynamic_fusion_weights, ars_runtime_adoption_weight) = adaptive_state_snapshot
-        .as_ref()
-        .map(|s| {
-            let runtime_adoption_weight =
-                crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
-                    store.conn(),
-                    config,
-                    s,
-                    &query_type_label,
-                    query_cluster_id,
-                );
-            let weights = ready_shadow_fusion_weights_for_recall(
-                s,
-                config,
-                &query_type_label,
-                query_cluster_id,
-                runtime_adoption_weight,
-            );
-            (weights, runtime_adoption_weight)
-        })
-        .unwrap_or((None, 0.0));
+    let (ars_dynamic_fusion_weights, ars_runtime_adoption_weight) =
+        if !execution_mode.allows_dynamic_six_weights() {
+            // The learner must observe the legacy policy, never labels created by
+            // an already-active six-dimensional policy.
+            (None, 0.0)
+        } else {
+            adaptive_state_snapshot
+                .as_ref()
+                .map(|s| {
+                    let runtime_adoption_weight =
+                    crate::ops::ars_tuning::parameter_policy_recall_fusion_runtime_adoption_weight(
+                        store.conn(),
+                        config,
+                        s,
+                        &query_type_label,
+                        query_cluster_id,
+                    );
+                    let weights = ready_shadow_fusion_weights_for_recall(
+                        s,
+                        config,
+                        &query_type_label,
+                        query_cluster_id,
+                        runtime_adoption_weight,
+                    );
+                    (weights, runtime_adoption_weight)
+                })
+                .unwrap_or((None, 0.0))
+        };
     let ars_dynamic_fusion_active = ars_dynamic_fusion_weights.is_some();
 
     // Capture per-channel scores for reranking and M2 logging.
@@ -1489,9 +1701,11 @@ pub fn recall_temporal_with_request_id(
     };
 
     let fused = if config.search.fusion_method == "cc" {
-        let alpha = adaptive_alpha
-            .or(strategy.cc_alpha)
-            .unwrap_or(config.search.cc_alpha as f32);
+        let alpha = legacy_cc_alpha(
+            adaptive_alpha,
+            strategy.cc_alpha,
+            config.search.cc_alpha as f32,
+        );
         // Run CC normalization on clean vec/fts channels first, then boost with KG/episode
         let mut fused =
             crate::search::rrf::convex_combination(&fts_for_fusion, &vec_for_fusion, alpha);
@@ -1657,6 +1871,15 @@ pub fn recall_temporal_with_request_id(
             kept = memory_map.len(),
             "recall: live-status filter excluded deprecated rows from memory_map"
         );
+    }
+    if let Some(case) = loo_case {
+        for memory in memory_map.values_mut() {
+            decontaminate_loo_evidence_aggregates(
+                store,
+                memory,
+                &case.exclusion.held_out_evidence_ids,
+            )?;
+        }
     }
 
     // v0.26.2 R2 Codex finding F1 (recall side): also prune `fused` so
@@ -1976,7 +2199,8 @@ pub fn recall_temporal_with_request_id(
         .resolve_llm_for("search.llm_reranker")
         .map(|r| r.provider)
         .unwrap_or(crate::config::Provider::None);
-    let llm_rerank_state: Option<(Vec<String>, std::sync::mpsc::Receiver<Vec<f32>>)> = if !fast
+    let llm_rerank_state: Option<(Vec<String>, std::sync::mpsc::Receiver<Vec<f32>>)> = if !is_loo
+        && !fast
         && !strong_signal
         && !linear_clear
         && reranker_resolved_provider != crate::config::Provider::None
@@ -2070,6 +2294,18 @@ pub fn recall_temporal_with_request_id(
         })
         .collect();
     results = collapse_results_to_canonicals(store, results)?;
+    if is_loo {
+        results.retain(|result| !execution_mode.excludes_memory(store, &result.memory.id));
+    }
+    if let Some(case) = loo_case {
+        for result in &mut results {
+            decontaminate_loo_evidence_aggregates(
+                store,
+                &mut result.memory,
+                &case.exclusion.held_out_evidence_ids,
+            )?;
+        }
+    }
     // codex remediation R8 P2: re-assert the keyword filter on the COLLAPSED
     // canonicals. The pre-take filter (audit F10) evaluates raw rows for slot
     // economy, but a superseded predecessor can match the keyword while its
@@ -2085,7 +2321,17 @@ pub fn recall_temporal_with_request_id(
                 || r.memory.content.to_lowercase().contains(&kw_lower)
         });
     }
-    apply_evidence_rerank(store, query, &mut results, 3);
+    if let Some(case) = loo_case {
+        apply_evidence_rerank_excluding(
+            store,
+            query,
+            &mut results,
+            3,
+            &case.exclusion.held_out_evidence_ids,
+        );
+    } else {
+        apply_evidence_rerank(store, query, &mut results, 3);
+    }
 
     sort_recall_results(&mut results);
 
@@ -2134,6 +2380,64 @@ pub fn recall_temporal_with_request_id(
         }
     }
 
+    // A12 returns at the same pre-MMR seam used by RecallComplete, but builds
+    // the typed optimizer event in memory and exits before every write path.
+    if let Some(case) = loo_case {
+        let fts_trace_log = canonicalize_loo_channel_log(store, execution_mode, &fts_norm_log)?;
+        let vec_trace_log = canonicalize_loo_channel_log(store, execution_mode, &vec_norm_log)?;
+        let kg_trace_log = canonicalize_loo_channel_log(store, execution_mode, &kg_norm_log)?;
+        let episode_trace_log =
+            canonicalize_loo_channel_log(store, execution_mode, &episode_norm_log)?;
+        let legacy_order = results
+            .iter()
+            .map(|result| result.memory.id.clone())
+            .collect();
+        let candidates = results
+            .iter()
+            .filter(|result| {
+                !result.memory.id.starts_with("sm:") && !result.memory.id.starts_with("auto:")
+            })
+            .map(|result| crate::search::alpha_optimizer::CandidateLog {
+                memory_id: result.memory.id.clone(),
+                bm25_norm: fts_trace_log.get(&result.memory.id).copied().unwrap_or(0.0),
+                vec_norm: vec_trace_log.get(&result.memory.id).copied().unwrap_or(0.0),
+                kg_norm: kg_trace_log.get(&result.memory.id).copied().unwrap_or(0.0),
+                episode_norm: episode_trace_log
+                    .get(&result.memory.id)
+                    .copied()
+                    .unwrap_or(0.0),
+                support_count: result.memory.support_count,
+                source_diversity: result.memory.source_diversity,
+            })
+            .collect();
+        let accessed_ids = case
+            .positives
+            .iter()
+            .map(|positive| positive.live_tip_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let event = crate::search::alpha_optimizer::RecallEvent {
+            request_id: format!("a12-loo:{}", case.held_out_evidence_id),
+            candidates,
+            accessed_ids,
+            negative_ids: vec![],
+            timestamp: chrono::Utc::now(),
+            query_cluster_id_at_recall: query_cluster_id_from_snapshot,
+            cluster_version_at_recall: adaptive_state_snapshot
+                .as_ref()
+                .map(|state| state.cluster_version),
+            query_top_vec_memory_id_at_recall,
+        };
+        return Ok(RecallExecutionResult {
+            results: vec![],
+            trace: Some(A12RecallTrace {
+                legacy_order,
+                event,
+            }),
+        });
+    }
+
     // === M1: Emit recall_complete BEFORE truncation (full candidate set for counterfactual replay) ===
     if config.adaptive.enabled {
         let request_id = request_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -2173,9 +2477,11 @@ pub fn recall_temporal_with_request_id(
                 })
             })
             .collect();
-        let alpha_used = adaptive_alpha
-            .or(strategy.cc_alpha)
-            .unwrap_or(config.search.cc_alpha as f32);
+        let alpha_used = legacy_cc_alpha(
+            adaptive_alpha,
+            strategy.cc_alpha,
+            config.search.cc_alpha as f32,
+        );
         let _ = crate::store::adaptive::emit_event(
             store.conn(),
             crate::store::adaptive::FeedbackEvent {
@@ -2308,7 +2614,10 @@ pub fn recall_temporal_with_request_id(
         results = results.len(),
         "recall complete"
     );
-    Ok(results)
+    Ok(RecallExecutionResult {
+        results,
+        trace: None,
+    })
 }
 
 /// Try vector search: check cache first, then call API if available.
@@ -2508,6 +2817,182 @@ fn rank_and_filter(
         .enumerate()
         .map(|(i, (id, _))| (id, -(i as f32)))
         .collect()
+}
+
+fn stored_loo_query_embedding(
+    store: &SqliteStore,
+    case: &crate::ops::a12_autocalibration::A12LooCase,
+) -> Option<Vec<f32>> {
+    use sha2::Digest;
+
+    let query_hash = format!("{:x}", sha2::Sha256::digest(case.query_text.as_bytes()));
+    if query_hash != case.exclusion.content_hash {
+        return None;
+    }
+    let original_memory_id = case.original_memory_id.as_deref()?;
+    let original = store.get(original_memory_id).ok()?;
+    let stored_content_hash = format!("{:x}", sha2::Sha256::digest(original.content.as_bytes()));
+    if stored_content_hash != case.exclusion.content_hash {
+        return None;
+    }
+    crate::store::vec::get_embedding(store.conn(), original_memory_id)
+        .ok()
+        .flatten()
+}
+
+/// Recompute the two evidence-derived candidate dimensions in memory after
+/// removing the held-out evidence row. The persistent canonical aggregate is
+/// intentionally left untouched; errors abort the trace rather than silently
+/// returning contaminated training data.
+fn decontaminate_loo_evidence_aggregates(
+    store: &SqliteStore,
+    memory: &mut Memory,
+    excluded_evidence_ids: &[String],
+) -> ReinResult<()> {
+    if excluded_evidence_ids.is_empty() {
+        return Ok(());
+    }
+    let canonical_id = store.canonical_id_for(&memory.id)?;
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT id, source FROM memory_evidence WHERE canonical_id = ?1")?;
+    let rows = stmt.query_map(rusqlite::params![canonical_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut removed_held_out = false;
+    let mut retained_count = 0_u32;
+    let mut retained_sources = std::collections::HashSet::new();
+    for row in rows {
+        let (evidence_id, source) = row?;
+        if excluded_evidence_ids
+            .iter()
+            .any(|excluded| excluded == &evidence_id)
+        {
+            removed_held_out = true;
+        } else {
+            retained_count = retained_count.saturating_add(1);
+            retained_sources.insert(source);
+        }
+    }
+    if removed_held_out {
+        memory.support_count = retained_count;
+        memory.merge_count = retained_count.saturating_sub(1);
+        memory.source_diversity = retained_sources.len() as f32;
+    }
+    Ok(())
+}
+
+/// Collapse raw channel features to the same transitive live-tip identity as
+/// `collapse_results_to_canonicals`. Multiple predecessors contribute their
+/// strongest normalized value, matching the result collapse's max-score rule.
+fn canonicalize_loo_channel_log(
+    store: &SqliteStore,
+    execution_mode: RecallExecutionMode<'_>,
+    scores: &std::collections::HashMap<String, f32>,
+) -> ReinResult<std::collections::HashMap<String, f32>> {
+    let mut canonical_scores = std::collections::HashMap::<String, f32>::new();
+    for (memory_id, score) in scores {
+        let canonical_id = store.canonical_id_for(memory_id)?;
+        if execution_mode.excludes_memory(store, &canonical_id) {
+            continue;
+        }
+        canonical_scores
+            .entry(canonical_id)
+            .and_modify(|current| *current = current.max(*score))
+            .or_insert(*score);
+    }
+    Ok(canonical_scores)
+}
+
+fn retain_loo_channel_scores(
+    store: &SqliteStore,
+    execution_mode: RecallExecutionMode<'_>,
+    scores: &mut std::collections::HashMap<String, f32>,
+) {
+    scores.retain(|memory_id, _| !execution_mode.excludes_memory(store, memory_id));
+}
+
+/// Read-only lexical acquisition for evaluation. A clean existing Tantivy
+/// index may be searched, but marker repair/rebuild paths are never entered;
+/// dirty or rebuilding indexes fall back to FTS5. Both sources remove LOO
+/// exclusions before their cutoffs and rank encoding.
+fn try_local_fts_read_only_loo(
+    store: &SqliteStore,
+    query: &str,
+    topic: Option<&str>,
+    limit: usize,
+    execution_mode: RecallExecutionMode<'_>,
+) -> ReinResult<(Vec<Memory>, Vec<(String, f32)>)> {
+    let fetch_limit = execution_mode.channel_fetch_limit(store, limit);
+    let mut memories = Vec::new();
+    let mut ranked = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+
+    let db_path = store.db_path();
+    let tantivy_dirty = crate::search::warmup::tantivy_dirty_path(db_path);
+    let tantivy_rebuilding = crate::search::warmup::tantivy_rebuilding_path(db_path);
+    if db_path.to_str() != Some(":memory:")
+        && !tantivy_dirty.exists()
+        && !tantivy_rebuilding.exists()
+    {
+        let tantivy_path = db_path.with_extension("tantivy");
+        if let Ok(tantivy) = crate::store::tantivy_fts::TantivyFts::open_existing(&tantivy_path) {
+            if let Ok(results) = tantivy.search(query, topic, fetch_limit) {
+                let mut retained_rank = 0_usize;
+                for (memory_id, score) in results {
+                    if execution_mode.excludes_memory(store, &memory_id) {
+                        continue;
+                    }
+                    let rank = retained_rank;
+                    retained_rank += 1;
+                    if rank >= limit || seen_ids.contains(&memory_id) {
+                        continue;
+                    }
+                    if let Ok(memory) = store.get(&memory_id) {
+                        seen_ids.insert(memory_id.clone());
+                        ranked.push((memory_id, if score > 0.0 { score } else { -(rank as f32) }));
+                        memories.push(memory);
+                    }
+                }
+            }
+        }
+    }
+
+    let fts_results = crate::store::fts::search_fts(store.conn(), query, topic, fetch_limit)?;
+    let mut retained_rank = 0_usize;
+    for (memory, _) in fts_results {
+        if execution_mode.excludes_memory(store, &memory.id) {
+            continue;
+        }
+        let rank = retained_rank;
+        retained_rank += 1;
+        if rank >= limit || !seen_ids.insert(memory.id.clone()) {
+            continue;
+        }
+        ranked.push((memory.id.clone(), -(rank as f32)));
+        memories.push(memory);
+    }
+
+    Ok((memories, ranked))
+}
+
+/// sqlite-vec-only acquisition for evaluation. HNSW is deliberately skipped
+/// because even a clean search creates `.usearch.lock` and dirty searches can
+/// claim/rewrite markers. Exclusions precede rank encoding and normalization.
+fn vec_search_read_only_loo(
+    store: &SqliteStore,
+    embedding: &[f32],
+    topic: Option<&str>,
+    limit: usize,
+    execution_mode: RecallExecutionMode<'_>,
+) -> Vec<(String, f32)> {
+    let fetch_limit = execution_mode.channel_fetch_limit(store, limit);
+    let retained = crate::store::vec::search_vec(store.conn(), embedding, topic, fetch_limit)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(memory_id, _)| !execution_mode.excludes_memory(store, memory_id))
+        .collect();
+    rank_and_filter(retained, store, topic, limit)
 }
 
 /// Direct vector search using HNSW index first, falling back to sqlite-vec.
@@ -2935,8 +3420,12 @@ fn collect_episode_memory_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::a12_autocalibration::{
+        A12LooCase, A12LooExclusion, A12LooPositive, A12OutcomeProvenance,
+    };
     use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
     use chrono::Utc;
+    use sha2::{Digest, Sha256};
 
     fn test_memory(id: &str, support_count: u32, source_diversity: f32) -> Memory {
         Memory {
@@ -2971,6 +3460,515 @@ mod tests {
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
         }
+    }
+
+    fn a12_test_case(
+        query: &str,
+        original_memory_id: &str,
+        positive_id: &str,
+        mut near_duplicate_memory_ids: Vec<String>,
+    ) -> A12LooCase {
+        near_duplicate_memory_ids.sort();
+        A12LooCase {
+            held_out_evidence_id: format!("evidence-{original_memory_id}"),
+            original_memory_id: Some(original_memory_id.to_string()),
+            query_text: query.to_string(),
+            exclusion: A12LooExclusion {
+                held_out_memory_ids: vec![original_memory_id.to_string()],
+                held_out_evidence_ids: vec![format!("evidence-{original_memory_id}")],
+                content_hash: format!("{:x}", Sha256::digest(query.as_bytes())),
+                equal_content_memory_ids: vec![],
+                near_duplicate_memory_ids,
+            },
+            positives: vec![A12LooPositive {
+                stable_family_id: format!("family-{positive_id}"),
+                live_tip_id: positive_id.to_string(),
+                provenance: vec![A12OutcomeProvenance::CanonicalLoo],
+            }],
+        }
+    }
+
+    fn marker_snapshot(paths: &[std::path::PathBuf]) -> Vec<Option<Vec<u8>>> {
+        paths.iter().map(|path| std::fs::read(path).ok()).collect()
+    }
+
+    fn recall_hit_sum(store: &SqliteStore) -> u64 {
+        store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) \
+                 FROM metadata WHERE key LIKE 'recall_hit:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn recall_quality_metadata(store: &SqliteStore) -> Vec<(String, String)> {
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "SELECT key, value FROM metadata \
+                 WHERE key LIKE 'recall_hit:%' OR key LIKE 'quality:%' ORDER BY key",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn recall_loo_trace_does_not_mutate_feedback_hits_access_or_dirty_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = SqliteStore::new(&db_path, "gemini-embedding-001", 3072).unwrap();
+        let query = "activation calibration needle";
+
+        let mut held_out = test_memory("held-out", 1, 1.0);
+        held_out.content = query.to_string();
+        held_out.summary = query.to_string();
+        held_out.embedding = Some({
+            let mut vector = vec![0.0; 3072];
+            vector[0] = 1.0;
+            vector
+        });
+        let held_out_id = store.store(held_out).unwrap();
+
+        let mut survivor = test_memory("survivor", 2, 2.0);
+        survivor.content = format!("{query} survivor");
+        survivor.summary = query.to_string();
+        survivor.access_count = 5;
+        survivor.embedding = Some({
+            let mut vector = vec![0.0; 3072];
+            vector[0] = 0.9;
+            vector[1] = 0.1;
+            vector
+        });
+        let survivor_id = store.store(survivor).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET last_accessed = '2020-01-02T03:04:05+00:00', \
+                 layer = 'STM', decay_lambda = 0.123, tier = 'warm' WHERE id = ?1",
+                rusqlite::params![survivor_id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?1, '49')",
+                rusqlite::params![format!("recall_hit:{survivor_id}")],
+            )
+            .unwrap();
+
+        let hnsw_root = db_path.with_extension("");
+        let hnsw_dirty = crate::store::hnsw::HnswIndex::dirty_marker_path(&hnsw_root);
+        let hnsw_rebuilding = crate::store::hnsw::HnswIndex::rebuilding_marker_path(&hnsw_root);
+        let hnsw_lock = hnsw_root.with_extension("usearch.lock");
+        let tantivy_dirty = crate::search::warmup::tantivy_dirty_path(&db_path);
+        let tantivy_rebuilding = crate::search::warmup::tantivy_rebuilding_path(&db_path);
+        let tantivy_lock = crate::search::warmup::tantivy_rebuild_lock_path(&db_path);
+        std::fs::write(&hnsw_dirty, b"a12-hnsw-sentinel").unwrap();
+        std::fs::write(&tantivy_dirty, b"a12-tantivy-sentinel").unwrap();
+        let marker_paths = vec![
+            hnsw_dirty,
+            hnsw_rebuilding,
+            hnsw_lock,
+            tantivy_dirty,
+            tantivy_rebuilding,
+            tantivy_lock,
+        ];
+
+        let feedback_before = crate::store::adaptive::event_count(store.conn());
+        let recall_hits_before = recall_hit_sum(&store);
+        let quality_before = recall_quality_metadata(&store);
+        let memory_before: (u32, String, String, f64, String) = store
+            .conn()
+            .query_row(
+                "SELECT access_count, last_accessed, layer, decay_lambda, tier \
+                 FROM memories WHERE id = ?1",
+                rusqlite::params![survivor_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let markers_before = marker_snapshot(&marker_paths);
+
+        let case = a12_test_case(query, &held_out_id, &survivor_id, vec![]);
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.sync.supermemory_enabled = true;
+        config.sync.auto_memory_enabled = true;
+        config.sync.api_key = Some("must-not-be-used".to_string());
+        config.sync.endpoint = "http://127.0.0.1:9".to_string();
+        config.embedding.provider = "omlx".to_string();
+        config.embedding.omlx.endpoint = "http://127.0.0.1:9/v1".to_string();
+        config.search.mmr_lambda = 0.1;
+
+        let trace = recall_loo_trace(&store, &config, &case, 3).unwrap();
+        assert!(trace.legacy_order.contains(&survivor_id));
+        assert!(trace
+            .event
+            .candidates
+            .iter()
+            .any(|candidate| candidate.memory_id == survivor_id));
+
+        let memory_after: (u32, String, String, f64, String) = store
+            .conn()
+            .query_row(
+                "SELECT access_count, last_accessed, layer, decay_lambda, tier \
+                 FROM memories WHERE id = ?1",
+                rusqlite::params![survivor_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            crate::store::adaptive::event_count(store.conn()),
+            feedback_before,
+            "trace must not emit RecallComplete or RecallAccess"
+        );
+        assert_eq!(recall_hit_sum(&store), recall_hits_before);
+        assert_eq!(recall_quality_metadata(&store), quality_before);
+        assert_eq!(memory_after, memory_before);
+        assert_eq!(marker_snapshot(&marker_paths), markers_before);
+    }
+
+    #[test]
+    fn recall_loo_trace_missing_stored_vector_drops_vec_channel_and_ignores_query_cache() {
+        let store = SqliteStore::in_memory().unwrap();
+        let query = "stored vector only needle";
+
+        let mut held_out = test_memory("held-out-no-vector", 1, 1.0);
+        held_out.content = query.to_string();
+        held_out.summary = query.to_string();
+        held_out.embedding = None;
+        let held_out_id = store.store(held_out).unwrap();
+
+        let mut candidate = test_memory("vector-candidate", 1, 1.0);
+        candidate.content = format!("{query} candidate");
+        candidate.summary = query.to_string();
+        candidate.embedding = Some({
+            let mut vector = vec![0.0; 3072];
+            vector[0] = 1.0;
+            vector
+        });
+        let candidate_id = store.store(candidate).unwrap();
+
+        let mut config = ReinConfig::default();
+        config.embedding.provider = "omlx".to_string();
+        config.embedding.omlx.endpoint = "http://127.0.0.1:9/v1".to_string();
+        let cached_query_vector = {
+            let mut vector = vec![0.0; 3072];
+            vector[0] = 1.0;
+            vector
+        };
+        EmbedCache::put(
+            store.conn(),
+            query,
+            &config.embedding_model(),
+            &cached_query_vector,
+        )
+        .unwrap();
+        let cache_rows_before: u64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))
+            .unwrap();
+
+        let case = a12_test_case(query, &held_out_id, &candidate_id, vec![]);
+        let trace = recall_loo_trace(&store, &config, &case, 3).unwrap();
+        let logged = trace
+            .event
+            .candidates
+            .iter()
+            .find(|candidate| candidate.memory_id == candidate_id)
+            .unwrap();
+        assert_eq!(logged.vec_norm, 0.0);
+        let cache_rows_after: u64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM embed_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_rows_after, cache_rows_before);
+    }
+
+    #[test]
+    fn recall_loo_trace_ignores_held_out_evidence_during_legacy_rerank() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memory_id = store.store(test_memory("supported", 3, 2.0)).unwrap();
+        let held_out_evidence_id = "held-out-evidence".to_string();
+        store
+            .add_memory_evidence(crate::types::MemoryEvidence {
+                id: held_out_evidence_id.clone(),
+                canonical_id: memory_id.clone(),
+                memory_id: Some("source-memory".to_string()),
+                source_topic: "docker".to_string(),
+                summary: "exact held out evidence needle".to_string(),
+                content: "exact held out evidence needle".to_string(),
+                keywords: vec![],
+                source: Source::Manual,
+                created_at: Utc::now(),
+                imported_at: Utc::now(),
+            })
+            .unwrap();
+        let result = RecallResult {
+            memory: test_memory(&memory_id, 3, 2.0),
+            score: 0.5,
+            confidence: 0.7,
+            sources_hit: 1,
+            evidence_count: 0,
+            evidence_preview: vec![],
+            archival_summary: None,
+        };
+
+        let mut leaked = vec![result.clone()];
+        apply_evidence_rerank(&store, "exact held out evidence needle", &mut leaked, 3);
+        assert!(leaked[0].score > result.score, "fixture must carry a boost");
+
+        let mut excluded = vec![result];
+        apply_evidence_rerank_excluding(
+            &store,
+            "exact held out evidence needle",
+            &mut excluded,
+            3,
+            &[held_out_evidence_id],
+        );
+        assert_eq!(excluded[0].score, 0.5);
+    }
+
+    #[test]
+    fn recall_loo_trace_removes_held_out_evidence_from_support_and_diversity() {
+        let store = SqliteStore::in_memory().unwrap();
+        let query = "decontaminated support needle";
+        let mut held_out = test_memory("held-out-support", 1, 1.0);
+        held_out.content = query.to_string();
+        held_out.summary = query.to_string();
+        let held_out_id = store.store(held_out).unwrap();
+
+        let mut candidate = test_memory("supported-candidate", 1, 1.0);
+        candidate.content = format!("{query} candidate");
+        candidate.summary = query.to_string();
+        let candidate_id = store.store(candidate).unwrap();
+        let held_out_evidence_id = "held-out-support-evidence".to_string();
+        store
+            .add_memory_evidence(crate::types::MemoryEvidence {
+                id: held_out_evidence_id.clone(),
+                canonical_id: candidate_id.clone(),
+                memory_id: Some(held_out_id.clone()),
+                source_topic: "docker".to_string(),
+                summary: query.to_string(),
+                content: query.to_string(),
+                keywords: vec![],
+                source: Source::Hook,
+                created_at: Utc::now(),
+                imported_at: Utc::now(),
+            })
+            .unwrap();
+        store.refresh_canonical_state(&candidate_id).unwrap();
+        let contaminated = store.get(&candidate_id).unwrap();
+        assert_eq!(contaminated.support_count, 2);
+        assert_eq!(contaminated.source_diversity, 2.0);
+
+        let mut case = a12_test_case(query, &held_out_id, &candidate_id, vec![]);
+        case.held_out_evidence_id = held_out_evidence_id.clone();
+        case.exclusion.held_out_evidence_ids = vec![held_out_evidence_id];
+        let trace = recall_loo_trace(&store, &ReinConfig::default(), &case, 3).unwrap();
+        let logged = trace
+            .event
+            .candidates
+            .iter()
+            .find(|candidate| candidate.memory_id == candidate_id)
+            .unwrap();
+        assert_eq!(logged.support_count, 1);
+        assert_eq!(logged.source_diversity, 1.0);
+    }
+
+    #[test]
+    fn recall_loo_trace_preserves_channel_features_after_canonical_collapse() {
+        let store = SqliteStore::in_memory().unwrap();
+        let query = "canonical predecessor needle";
+        let embedding = |first: f32, second: f32| {
+            let mut vector = vec![0.0; 3072];
+            vector[0] = first;
+            vector[1] = second;
+            vector
+        };
+
+        let mut held_out = test_memory("held-out-canonical", 1, 1.0);
+        held_out.content = query.to_string();
+        held_out.summary = query.to_string();
+        held_out.embedding = Some(embedding(1.0, 0.0));
+        let held_out_id = store.store(held_out).unwrap();
+
+        let mut live_tip = test_memory("live-tip", 1, 1.0);
+        live_tip.content = "new canonical wording without the old tokens".to_string();
+        live_tip.summary = "new canonical wording".to_string();
+        let live_tip_id = store.store(live_tip).unwrap();
+
+        let mut predecessor = test_memory("matching-predecessor", 1, 1.0);
+        predecessor.content = format!("{query} historical wording");
+        predecessor.summary = query.to_string();
+        predecessor.embedding = Some(embedding(0.9, 0.1));
+        let predecessor_id = store.store(predecessor).unwrap();
+        store
+            .mark_superseded(&predecessor_id, &live_tip_id)
+            .unwrap();
+
+        let case = a12_test_case(query, &held_out_id, &live_tip_id, vec![]);
+        let trace = recall_loo_trace(&store, &ReinConfig::default(), &case, 3).unwrap();
+        let logged = trace
+            .event
+            .candidates
+            .iter()
+            .find(|candidate| candidate.memory_id == live_tip_id)
+            .unwrap();
+        assert!(logged.bm25_norm > 0.0);
+        assert!(logged.vec_norm > 0.0);
+        assert!(!trace
+            .event
+            .candidates
+            .iter()
+            .any(|candidate| candidate.memory_id == predecessor_id));
+    }
+
+    #[test]
+    fn recall_loo_trace_filters_all_four_channel_outliers_before_normalization() {
+        let store = SqliteStore::in_memory().unwrap();
+        let query = "four channel exclusion needle";
+        let mut held_out = test_memory("held-out-four-channel", 1, 1.0);
+        held_out.content = query.to_string();
+        let held_out_id = store.store(held_out).unwrap();
+        let excluded_id = store
+            .store(test_memory("excluded-four-channel", 1, 1.0))
+            .unwrap();
+        let retained_id = store
+            .store(test_memory("retained-four-channel", 1, 1.0))
+            .unwrap();
+        let case = a12_test_case(query, &held_out_id, &retained_id, vec![excluded_id.clone()]);
+        let mode = RecallExecutionMode::A12Loo(&case);
+        let channel = || {
+            std::collections::HashMap::from([
+                (excluded_id.clone(), 100.0_f32),
+                (retained_id.clone(), 2.0_f32),
+            ])
+        };
+        let mut fts = channel();
+        let mut vec = channel();
+        let mut kg = channel();
+        let mut episode = channel();
+        for scores in [&mut fts, &mut vec, &mut kg, &mut episode] {
+            retain_loo_channel_scores(&store, mode, scores);
+            let max = scores.values().copied().fold(0.0_f32, f32::max);
+            assert!(!scores.contains_key(&excluded_id));
+            assert_eq!(scores[&retained_id] / max, 1.0);
+        }
+    }
+
+    #[test]
+    fn recall_loo_trace_policy_disables_dynamic_six_weights_but_keeps_legacy_alpha() {
+        let case = a12_test_case("policy needle", "held-out", "positive", vec![]);
+        assert!(!RecallExecutionMode::A12Loo(&case).allows_dynamic_six_weights());
+        assert!(RecallExecutionMode::Live.allows_dynamic_six_weights());
+        assert_eq!(legacy_cc_alpha(Some(0.73), Some(0.11), 0.4), 0.73);
+        assert_eq!(legacy_cc_alpha(None, Some(0.11), 0.4), 0.11);
+        assert_eq!(legacy_cc_alpha(None, None, 0.4), 0.4);
+    }
+
+    fn recall_loo_normalization_fixture(
+        with_excluded_outlier: bool,
+    ) -> (Vec<String>, std::collections::BTreeMap<String, [f32; 6]>) {
+        let store = SqliteStore::in_memory().unwrap();
+        let query = "activation calibration needle";
+        let embedding = |first: f32, second: f32| {
+            let mut vector = vec![0.0; 3072];
+            vector[0] = first;
+            vector[1] = second;
+            vector
+        };
+
+        let mut held_out = test_memory("held-out", 1, 1.0);
+        held_out.content = query.to_string();
+        held_out.summary = query.to_string();
+        held_out.embedding = Some(embedding(1.0, 0.0));
+        let held_out_id = store.store(held_out).unwrap();
+
+        for (id, tail, vector, support, diversity) in [
+            ("retained-a", "alpha", embedding(0.9, 0.1), 2, 2.0),
+            ("retained-b", "beta", embedding(0.8, 0.2), 1, 1.0),
+        ] {
+            let mut memory = test_memory(id, support, diversity);
+            memory.content = format!("{query} {tail}");
+            memory.summary = query.to_string();
+            memory.embedding = Some(vector);
+            store.store(memory).unwrap();
+        }
+
+        let mut excluded = vec![];
+        if with_excluded_outlier {
+            let mut outlier = test_memory("excluded-outlier", 99, 99.0);
+            outlier.content = format!("{query} {query} {query}");
+            outlier.summary = query.to_string();
+            outlier.embedding = Some(embedding(1.0, 0.0));
+            store.store(outlier).unwrap();
+            let mut predecessor = test_memory("excluded-predecessor", 50, 50.0);
+            predecessor.content = format!("{query} predecessor");
+            predecessor.summary = query.to_string();
+            predecessor.embedding = Some(embedding(1.0, 0.0));
+            store.store(predecessor).unwrap();
+            store
+                .mark_superseded("excluded-predecessor", "excluded-outlier")
+                .unwrap();
+            excluded.push("excluded-outlier".to_string());
+        }
+
+        let case = a12_test_case(query, &held_out_id, "retained-a", excluded);
+        let trace = recall_loo_trace(&store, &ReinConfig::default(), &case, 3).unwrap();
+        let matrix = trace
+            .event
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.memory_id.clone(),
+                    [
+                        candidate.bm25_norm,
+                        candidate.vec_norm,
+                        candidate.kg_norm,
+                        candidate.episode_norm,
+                        candidate.support_count as f32,
+                        candidate.source_diversity,
+                    ],
+                )
+            })
+            .collect();
+        (trace.legacy_order, matrix)
+    }
+
+    #[test]
+    fn recall_loo_trace_excludes_candidates_before_channel_normalization() {
+        let baseline = recall_loo_normalization_fixture(false);
+        let with_excluded_outlier = recall_loo_normalization_fixture(true);
+
+        assert_eq!(with_excluded_outlier, baseline);
+        assert!(!with_excluded_outlier.1.contains_key("excluded-outlier"));
+        assert!(!with_excluded_outlier.1.contains_key("excluded-predecessor"));
+        let retained_a = with_excluded_outlier.1.get("retained-a").unwrap();
+        assert_eq!(retained_a[0], 1.0, "FTS rank must compact before logging");
+        assert_eq!(retained_a[1], 1.0, "Vec rank must compact before logging");
     }
 
     // ---- v0.36 #P1: strong_hit_survives_filters gate (closes R1–R3) ----
