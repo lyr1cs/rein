@@ -103,11 +103,9 @@ pub fn build_memory(
 
 /// Return the dedup similarity to use for a run.
 ///
-/// Destructive lexical dedup currently uses the validated operator static
-/// threshold. Unlabeled shadow suggestions remain observable only. Callers
-/// that know a specific cluster still use
-/// `AdaptiveState::get_hard_dedup_threshold(Some(cluster), static_threshold)`;
-/// this helper is for "global default" call sites.
+/// Destructive lexical dedup uses the validated operator static threshold.
+/// Calibration candidates and unlabeled cluster suggestions remain observable
+/// shadow state until production-cohort calibration exists.
 pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &ReinConfig) -> f32 {
     // Honor [adaptive] enabled=false: when the operator has explicitly disabled
     // the adaptive engine we must not silently keep applying a stale learned
@@ -115,10 +113,27 @@ pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &Rei
     if !config.adaptive.enabled {
         return config.search.dedup_similarity as f32;
     }
-    match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
-        Some(state) => state.get_hard_dedup_threshold(None, config.search.dedup_similarity as f32),
-        None => config.search.dedup_similarity as f32,
+    effective_hard_dedup_threshold_from_conn(store.conn(), config)
+}
+
+/// Resolve the global destructive lexical threshold. The sealed bundle is
+/// loaded and validated for observability, but promotion is deliberately
+/// disabled until the evaluator uses the exact production score space; every
+/// state therefore returns the validated static configuration unchanged.
+pub(crate) fn effective_hard_dedup_threshold_from_conn(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+) -> f32 {
+    let configured_static = config.search.dedup_similarity as f32;
+    if !config.adaptive.enabled {
+        return configured_static;
     }
+    let loaded = crate::store::dedup_calibration::load_dedup_calibration_for_runtime(
+        conn,
+        chrono::Utc::now().timestamp(),
+        configured_static,
+    );
+    crate::store::dedup_calibration::resolve_hard_lexical_threshold(configured_static, &loaded)
 }
 
 const AUTO_CONCEPT_MEMOIR: &str = "auto-discovered";
@@ -1605,13 +1620,85 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
     // legacy JSON shape and carry shadow suggestions; the explicit fields
     // keep those suggestions distinct from the destructive hard threshold.
     let dedup_threshold_shadow = state.get_dedup_shadow_threshold(None);
-    let dedup_threshold_hard_effective =
-        state.get_hard_dedup_threshold(None, config.search.dedup_similarity as f32);
+    let dedup_calibration = crate::store::dedup_calibration::load_dedup_calibration_for_runtime(
+        conn,
+        chrono::Utc::now().timestamp(),
+        config.search.dedup_similarity as f32,
+    );
+    let evidence_verified = dedup_calibration.context_verified();
+    // `applied` means the calibration policy changed the destructive hard
+    // boundary. It is intentionally false while production-cohort calibration
+    // is absent, even when the stored statistical evidence is verified Ship.
+    let calibration_applied = false;
+    let calibration_reason = if !config.adaptive.enabled {
+        "adaptive_disabled"
+    } else if evidence_verified {
+        match dedup_calibration.policy.status {
+            crate::store::dedup_calibration::DedupCalibrationStatus::Ship => {
+                "verified_ship_shadow_only_production_cohort_missing"
+            }
+            crate::store::dedup_calibration::DedupCalibrationStatus::Bail => {
+                "verified_bail_not_applied"
+            }
+            crate::store::dedup_calibration::DedupCalibrationStatus::NoData => {
+                "verified_legacy_no_data_not_applied"
+            }
+        }
+    } else {
+        match dedup_calibration.status {
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Missing => {
+                "no_powered_terminal_policy"
+            }
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Stale => {
+                "stale_evidence_not_applied"
+            }
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Corrupt => {
+                "corrupt_evidence_not_applied"
+            }
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::UnsupportedSchema => {
+                "unsupported_evidence_schema_not_applied"
+            }
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::FingerprintMismatch => {
+                "evidence_fingerprint_mismatch_not_applied"
+            }
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::StorageError => {
+                "evidence_storage_error_not_applied"
+            }
+            crate::store::dedup_calibration::DedupCalibrationLoadStatus::Loaded => {
+                "unverified_evidence_not_applied"
+            }
+        }
+    };
+    let mut dedup_calibration_json =
+        serde_json::to_value(&dedup_calibration).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = dedup_calibration_json.as_object_mut() {
+        object.insert(
+            "adaptive_enabled".to_string(),
+            serde_json::Value::Bool(config.adaptive.enabled),
+        );
+        object.insert(
+            "evidence_verified".to_string(),
+            serde_json::Value::Bool(evidence_verified),
+        );
+        object.insert(
+            "applied".to_string(),
+            serde_json::Value::Bool(calibration_applied),
+        );
+        object.insert(
+            "reason".to_string(),
+            serde_json::Value::String(calibration_reason.to_string()),
+        );
+    }
+    // Use the same top-level resolver as runtime so `[adaptive] enabled=false`
+    // and any future policy gating cannot diverge between status and actions.
+    let dedup_threshold_hard_effective = effective_hard_dedup_threshold_from_conn(conn, config);
     let dedup_thresholds = serde_json::json!({
         "per_cluster": state.dedup_thresholds,
         "global": dedup_threshold_shadow,
+        "dedup_threshold_static": config.search.dedup_similarity,
         "dedup_threshold_shadow": dedup_threshold_shadow,
         "dedup_threshold_hard_effective": dedup_threshold_hard_effective,
+        "calibration": dedup_calibration_json,
     });
 
     let recent_avg: f64 = conn
@@ -1671,10 +1758,6 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
                 .unwrap_or(5);
             let median_survival = survival_lookup.get(cid).and_then(|curve| curve.median_survival);
             let dedup_threshold_shadow = state.get_dedup_shadow_threshold(Some(*cid));
-            let dedup_threshold_hard_effective = state.get_hard_dedup_threshold(
-                Some(*cid),
-                config.search.dedup_similarity as f32,
-            );
             Some(serde_json::json!({
                 "cluster_id": cid,
                 "memory_count": memory_count,
@@ -2102,6 +2185,11 @@ mod tests {
             status["dedup_thresholds"]["dedup_threshold_hard_effective"].as_f64(),
             0.70,
         );
+        let calibration = &status["dedup_thresholds"]["calibration"];
+        assert_eq!(calibration["adaptive_enabled"], true);
+        assert_eq!(calibration["applied"], false);
+        assert_eq!(calibration["evidence_verified"], false);
+        assert_eq!(calibration["reason"], "no_powered_terminal_policy");
         let profile = status["cluster_profiles"]
             .as_array()
             .unwrap()

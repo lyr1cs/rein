@@ -676,6 +676,23 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         }
     };
     if snapshot_saved {
+        let now = chrono::Utc::now().timestamp();
+        let validity_secs = config
+            .adaptive
+            .event_retention_days
+            .max(1)
+            .saturating_mul(2)
+            .saturating_mul(24 * 60 * 60)
+            .min(i64::MAX as u64) as i64;
+        if let Err(error) = crate::eval::gates::dedup::refresh_dedup_calibration_policy(
+            store,
+            config.search.dedup_similarity as f32,
+            state.get_dedup_shadow_threshold(None),
+            now,
+            validity_secs,
+        ) {
+            tracing::warn!(%error, "dedup calibration bundle refresh skipped");
+        }
         refresh_ars_parameter_policy(store.conn(), config, &state);
     }
 

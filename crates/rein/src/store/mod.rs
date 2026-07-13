@@ -1,5 +1,6 @@
 pub mod adaptive;
 pub mod ars_parameter_policy;
+pub(crate) mod dedup_calibration;
 pub mod fts;
 pub mod hdbscan;
 pub mod hnsw;
