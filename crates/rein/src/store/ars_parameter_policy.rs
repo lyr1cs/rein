@@ -3,9 +3,11 @@
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io;
 
 pub const ARS_PARAMETER_POLICY_METADATA_KEY: &str = "ars_parameter_policy";
-const ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 2;
+const LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +16,73 @@ pub enum ArsParameterPolicyMode {
     Disabled,
     Shadow,
     Canary,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArsRecallFusionEvidenceBasis {
+    #[default]
+    Static,
+    Human,
+    SelfSupervised,
+    Blended,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArsRecallGateStatus {
+    Ship,
+    Bail,
+    #[default]
+    NoData,
+}
+
+/// Sealed evidence behind one `recall_fusion:*` policy scope.
+///
+/// The policy owns the resolved simplex so an automatic-only scope does not
+/// need to masquerade as human `AdaptiveState` feedback. Fingerprints bind the
+/// entry to the immutable A12 revision and current recall-gate attestation;
+/// Task 5's shared resolver revalidates them before runtime use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArsRecallFusionEvidence {
+    #[serde(default)]
+    pub basis: ArsRecallFusionEvidenceBasis,
+    #[serde(default)]
+    pub resolved_simplex: crate::store::a12_calibration::A12FusionSimplex,
+    #[serde(default)]
+    pub human_ess: u64,
+    #[serde(default)]
+    pub self_supervised_train_family_ess: u64,
+    #[serde(default)]
+    pub self_supervised_holdout_family_ess: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a12_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a12_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a12_verdict: Option<crate::store::a12_calibration::A12CalibrationVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a12_noise_floor: Option<f64>,
+    #[serde(default)]
+    pub recall_gate_status: ArsRecallGateStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_gate_build_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_gate_fixture_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluated_at: Option<i64>,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +109,10 @@ pub struct ArsParameterPolicy {
     /// `runtime_adoption_weight`.
     #[serde(default)]
     pub adoption_weights: HashMap<String, f64>,
+    /// Evidence records exist only for recall-fusion scopes. Scalar policy
+    /// surfaces deliberately have no equivalent automatic-evidence map.
+    #[serde(default)]
+    pub recall_fusion_evidence: HashMap<String, ArsRecallFusionEvidence>,
     #[serde(default)]
     pub last_event_id: i64,
     #[serde(default)]
@@ -56,6 +129,7 @@ impl Default for ArsParameterPolicy {
             source_adaptive_version: 0,
             runtime_adoption_weight: 0.0,
             adoption_weights: HashMap::new(),
+            recall_fusion_evidence: HashMap::new(),
             last_event_id: 0,
             last_updated: String::new(),
         }
@@ -155,80 +229,77 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
         };
     };
 
-    // R8 P2 #1 (2026-05-04): peek `schema_version` BEFORE the typed
-    // deserialize. Pre-fix, a future-schema row whose payload added an
-    // unknown `mode` enum variant (or any other field this binary
-    // cannot deserialize) failed the typed parse outright and fell
-    // into the `Corrupt` arm; `doctor --fix` would then delete valid
-    // future canary state on a downgrade. Inspecting the raw JSON
-    // first makes `UnsupportedSchema` win for every future-vs-current
-    // mismatch, regardless of whether the additive change is purely
-    // field-additive or breaks the older binary's enum coverage.
-    //
-    // R15 P2 (2026-05-04): the comparison MUST be `>`, not `!=`.
-    // An older row with `schema_version=0` (hand-edited, manually
-    // restored from a backup, or otherwise corrupt) is NOT future
-    // schema and must NOT receive the downgrade-preservation
-    // treatment. Pre-R15 the `!=` check classified `0` as
-    // `UnsupportedSchema`, `refresh_ars_parameter_policy` skipped
-    // it as unhealthy, and `doctor --fix` refused to delete it —
-    // policy refresh stalled permanently.  Only schemas STRICTLY
-    // GREATER than the binary's current schema get preserved;
-    // older or zero schemas fall through to typed deserialize and
-    // are classified `Corrupt` so the recovery path can unblock
-    // refresh.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-        if let Some(schema) = value.get("schema_version").and_then(|v| v.as_u64()) {
-            if schema > u64::from(ARS_PARAMETER_POLICY_SCHEMA_VERSION) {
-                return ArsParameterPolicyLoad {
-                    policy: ArsParameterPolicy::disabled("unsupported policy schema version"),
-                    status: ArsParameterPolicyLoadStatus::UnsupportedSchema,
-                    error: Some(format!(
-                        "policy schema_version={} is newer than binary \
-                         schema_version={}; treat as future-schema row and \
-                         preserve until the newer binary is restored",
-                        schema, ARS_PARAMETER_POLICY_SCHEMA_VERSION
-                    )),
-                };
-            }
+    // Inspect the raw JSON before typed deserialization. Future schemas may
+    // add enum variants this binary cannot parse; they must still classify as
+    // UnsupportedSchema so a downgraded doctor never deletes their bytes.
+    let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return corrupt_parameter_policy_load(error.to_string());
         }
+    };
+    let detected_schema = match value.get("schema_version") {
+        None => LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+        Some(schema) => match schema.as_u64().and_then(|value| u32::try_from(value).ok()) {
+            Some(schema) => schema,
+            None => {
+                return corrupt_parameter_policy_load(
+                    "policy schema_version must be a non-negative u32".to_string(),
+                );
+            }
+        },
+    };
+    if detected_schema > ARS_PARAMETER_POLICY_SCHEMA_VERSION {
+        return ArsParameterPolicyLoad {
+            policy: ArsParameterPolicy::disabled("unsupported policy schema version"),
+            status: ArsParameterPolicyLoadStatus::UnsupportedSchema,
+            error: Some(format!(
+                "policy schema_version={} is newer than binary schema_version={}; \
+                 preserve until the newer binary is restored",
+                detected_schema, ARS_PARAMETER_POLICY_SCHEMA_VERSION
+            )),
+        };
+    }
+    if !matches!(
+        detected_schema,
+        LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION | ARS_PARAMETER_POLICY_SCHEMA_VERSION
+    ) {
+        return corrupt_parameter_policy_load(format!(
+            "policy schema_version={} is older or invalid (supported schemas are {} and {})",
+            detected_schema,
+            LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            ARS_PARAMETER_POLICY_SCHEMA_VERSION
+        ));
     }
 
-    match serde_json::from_str::<ArsParameterPolicy>(&raw) {
-        Ok(mut policy) if policy.schema_version == ARS_PARAMETER_POLICY_SCHEMA_VERSION => {
+    match serde_json::from_value::<ArsParameterPolicy>(value) {
+        Ok(mut policy) => {
+            // `#[serde(default)]` deliberately describes newly-created values,
+            // not historical on-disk identity. Preserve the schema detected
+            // above so legacy rows remain fail-closed until a schema-2 CAS.
+            policy.schema_version = detected_schema;
             clamp_policy_weights(&mut policy);
+            if detected_schema == LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION {
+                policy.recall_fusion_evidence.clear();
+                return ArsParameterPolicyLoad {
+                    policy,
+                    status: ArsParameterPolicyLoadStatus::Loaded,
+                    error: Some(
+                        "legacy policy schema loaded fail-closed; next policy refresh must migrate it"
+                            .to_string(),
+                    ),
+                };
+            }
+            if let Err(error) = validate_parameter_policy(&policy) {
+                return corrupt_parameter_policy_load(error);
+            }
             ArsParameterPolicyLoad {
                 policy,
                 status: ArsParameterPolicyLoadStatus::Loaded,
                 error: None,
             }
         }
-        Ok(policy) => ArsParameterPolicyLoad {
-            policy: ArsParameterPolicy::disabled("older or invalid policy schema version"),
-            // R15 P2 (2026-05-04): the peek above already filtered
-            // out FUTURE schemas (`> current`). If the typed
-            // deserialize lands here with a non-current
-            // `schema_version`, the value is necessarily older or
-            // hand-edited (e.g., literal `0`).  Pre-R15 this was
-            // `UnsupportedSchema`, which `doctor --fix` refused to
-            // delete and `refresh_ars_parameter_policy` skipped as
-            // unhealthy — leaving an older-schema row in a
-            // refresh-stalled state forever. Treat it as recoverable
-            // corruption so the doctor recovery path can delete and
-            // refresh-as-fresh-INSERT can re-establish the row at
-            // the current schema.
-            status: ArsParameterPolicyLoadStatus::Corrupt,
-            error: Some(format!(
-                "policy schema_version={} is older or invalid (current binary schema={}); \
-                 row will be recovered by doctor --fix",
-                policy.schema_version, ARS_PARAMETER_POLICY_SCHEMA_VERSION
-            )),
-        },
-        Err(e) => ArsParameterPolicyLoad {
-            policy: ArsParameterPolicy::disabled("corrupt policy row"),
-            status: ArsParameterPolicyLoadStatus::Corrupt,
-            error: Some(e.to_string()),
-        },
+        Err(error) => corrupt_parameter_policy_load(error.to_string()),
     }
 }
 
@@ -239,7 +310,9 @@ pub fn save_parameter_policy_cas(
     expected_revision: u64,
 ) -> rusqlite::Result<bool> {
     let mut policy = policy.clone();
+    policy.schema_version = ARS_PARAMETER_POLICY_SCHEMA_VERSION;
     clamp_policy_weights(&mut policy);
+    validate_parameter_policy(&policy).map_err(invalid_parameter_policy_error)?;
     let json = serde_json::to_string(&policy)
         .expect("ArsParameterPolicy serialization cannot fail for finite fields");
 
@@ -254,31 +327,20 @@ pub fn save_parameter_policy_cas(
     // future code paths that bypass the refresh-layer early-return —
     // and the row survives the downgrade window untouched.
     //
-    // R8 P2 #2 (2026-05-04): the COALESCE default for the schema_version
-    // guard MUST be the current binary's `ARS_PARAMETER_POLICY_SCHEMA_VERSION`,
-    // not 0. A row that omits the field entirely (e.g., one written by
-    // an older binary before the field was introduced) deserializes via
-    // `#[serde(default)]` to schema=1 and `load_parameter_policy`
-    // reports `Loaded`, so the refresh layer hands the policy back at
-    // its current revision. With the old `COALESCE(..., 0) = ?4`
-    // predicate, the missing-field row coalesced to 0 ≠ 1 and every
-    // refresh silently missed; the existing-row check then prevented
-    // INSERT and policy promotion or rollback stalled forever.
-    // Defaulting the COALESCE to `?4` makes a missing field interpret
-    // as the current schema (matches), an explicit `?4` match
-    // (matches), and any future schema (e.g., 2) NOT match — the
-    // future-row preservation property the R6 guard added is preserved.
+    // Schema 1 and missing-schema rows are explicitly migratable to schema 2.
+    // Future rows cannot satisfy the allowlist and retain their exact bytes.
     let updated = conn.execute(
         "UPDATE metadata
             SET value = ?1
           WHERE key = ?2
             AND json_valid(value)
             AND COALESCE(json_extract(value, '$.revision'), 0) = ?3
-            AND COALESCE(json_extract(value, '$.schema_version'), ?4) = ?4",
+            AND COALESCE(json_extract(value, '$.schema_version'), ?4) IN (?4, ?5)",
         params![
             json,
             ARS_PARAMETER_POLICY_METADATA_KEY,
             expected_revision,
+            LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION,
             ARS_PARAMETER_POLICY_SCHEMA_VERSION,
         ],
     )?;
@@ -396,6 +458,157 @@ fn default_schema_version() -> u32 {
     ARS_PARAMETER_POLICY_SCHEMA_VERSION
 }
 
+fn corrupt_parameter_policy_load(error: String) -> ArsParameterPolicyLoad {
+    ArsParameterPolicyLoad {
+        policy: ArsParameterPolicy::disabled("corrupt policy row"),
+        status: ArsParameterPolicyLoadStatus::Corrupt,
+        error: Some(error),
+    }
+}
+
+fn invalid_parameter_policy_error(error: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        error,
+    )))
+}
+
+fn validate_parameter_policy(policy: &ArsParameterPolicy) -> Result<(), String> {
+    if policy.schema_version != ARS_PARAMETER_POLICY_SCHEMA_VERSION {
+        return Err(format!(
+            "policy writer requires schema_version={} (observed {})",
+            ARS_PARAMETER_POLICY_SCHEMA_VERSION, policy.schema_version
+        ));
+    }
+    for (key, evidence) in &policy.recall_fusion_evidence {
+        let Some(scope) = key.strip_prefix("recall_fusion:") else {
+            return Err(format!(
+                "recall-fusion evidence key `{key}` is outside the recall_fusion namespace"
+            ));
+        };
+        if scope.is_empty() || scope.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "recall-fusion evidence key `{key}` has an invalid scope"
+            ));
+        }
+        validate_recall_fusion_evidence(key, evidence)?;
+    }
+    Ok(())
+}
+
+fn validate_recall_fusion_evidence(
+    key: &str,
+    evidence: &ArsRecallFusionEvidence,
+) -> Result<(), String> {
+    let simplex = evidence.resolved_simplex;
+    let values = [
+        simplex.bm25,
+        simplex.vector,
+        simplex.kg,
+        simplex.episode,
+        simplex.support,
+        simplex.diversity,
+    ];
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` has a non-finite or out-of-range simplex"
+        ));
+    }
+    let sum = values.iter().sum::<f64>();
+    if (sum - 1.0).abs() > 1e-6 {
+        return Err(format!(
+            "recall-fusion evidence `{key}` simplex must sum to 1 (observed {sum})"
+        ));
+    }
+    for (label, fingerprint) in [
+        ("generation", evidence.generation_fingerprint.as_deref()),
+        ("corpus", evidence.corpus_fingerprint.as_deref()),
+        ("optimizer", evidence.optimizer_fingerprint.as_deref()),
+        ("evaluation", evidence.evaluation_fingerprint.as_deref()),
+        (
+            "recall-gate build",
+            evidence.recall_gate_build_fingerprint.as_deref(),
+        ),
+        (
+            "recall-gate fixture",
+            evidence.recall_gate_fixture_fingerprint.as_deref(),
+        ),
+    ] {
+        if fingerprint.is_some_and(|value| value.trim().is_empty()) {
+            return Err(format!(
+                "recall-fusion evidence `{key}` has an empty {label} fingerprint"
+            ));
+        }
+    }
+    if evidence
+        .a12_noise_floor
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value) || value == 0.0)
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` A12 noise floor must be finite and in (0, 1]"
+        ));
+    }
+    if evidence.calibrated_at.is_some_and(|value| value <= 0)
+        || evidence.evaluated_at.is_some_and(|value| value <= 0)
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` timestamps must be positive"
+        ));
+    }
+    if matches!(
+        (evidence.calibrated_at, evidence.evaluated_at),
+        (Some(calibrated), Some(evaluated)) if evaluated < calibrated
+    ) {
+        return Err(format!(
+            "recall-fusion evidence `{key}` gate evaluation predates calibration"
+        ));
+    }
+
+    let uses_human = matches!(
+        evidence.basis,
+        ArsRecallFusionEvidenceBasis::Human | ArsRecallFusionEvidenceBasis::Blended
+    );
+    let uses_automatic = matches!(
+        evidence.basis,
+        ArsRecallFusionEvidenceBasis::SelfSupervised | ArsRecallFusionEvidenceBasis::Blended
+    );
+    if uses_human && evidence.human_ess == 0 {
+        return Err(format!(
+            "recall-fusion evidence `{key}` declares human evidence with zero ESS"
+        ));
+    }
+    if uses_automatic {
+        let missing_identity = evidence.a12_generation.is_none()
+            || evidence.a12_revision.is_none()
+            || evidence.generation_fingerprint.is_none()
+            || evidence.corpus_fingerprint.is_none()
+            || evidence.optimizer_fingerprint.is_none()
+            || evidence.evaluation_fingerprint.is_none()
+            || evidence.a12_verdict.is_none()
+            || evidence.a12_noise_floor.is_none()
+            || evidence.recall_gate_build_fingerprint.is_none()
+            || evidence.recall_gate_fixture_fingerprint.is_none()
+            || evidence.calibrated_at.is_none()
+            || evidence.evaluated_at.is_none();
+        if missing_identity {
+            return Err(format!(
+                "recall-fusion evidence `{key}` has incomplete self-supervised attestation"
+            ));
+        }
+        if evidence.self_supervised_train_family_ess == 0
+            || evidence.self_supervised_holdout_family_ess == 0
+        {
+            return Err(format!(
+                "recall-fusion evidence `{key}` has zero self-supervised family ESS"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn clamp01(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
@@ -469,9 +682,128 @@ mod tests {
             source_adaptive_version: 7,
             runtime_adoption_weight: 1.0,
             adoption_weights: HashMap::new(),
+            recall_fusion_evidence: HashMap::new(),
             last_event_id: 99,
             last_updated: "2026-05-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn parameter_policy_schema_two_round_trips_recall_fusion_evidence() {
+        let conn = conn();
+        let mut policy = canary_policy(1);
+        policy.recall_fusion_evidence.insert(
+            "recall_fusion:semantic".to_string(),
+            ArsRecallFusionEvidence {
+                basis: ArsRecallFusionEvidenceBasis::Blended,
+                resolved_simplex: crate::store::a12_calibration::A12FusionSimplex {
+                    bm25: 0.4,
+                    vector: 0.3,
+                    kg: 0.1,
+                    episode: 0.1,
+                    support: 0.05,
+                    diversity: 0.05,
+                },
+                human_ess: 40,
+                self_supervised_train_family_ess: 80,
+                self_supervised_holdout_family_ess: 20,
+                a12_generation: Some(7),
+                a12_revision: Some(9),
+                generation_fingerprint: Some("generation-fp".to_string()),
+                corpus_fingerprint: Some("corpus-fp".to_string()),
+                optimizer_fingerprint: Some("optimizer-fp".to_string()),
+                evaluation_fingerprint: Some("evaluation-fp".to_string()),
+                a12_verdict: Some(crate::store::a12_calibration::A12CalibrationVerdict::Ship),
+                a12_noise_floor: Some(0.02),
+                recall_gate_status: ArsRecallGateStatus::Ship,
+                recall_gate_build_fingerprint: Some("build-fp".to_string()),
+                recall_gate_fixture_fingerprint: Some("fixture-fp".to_string()),
+                calibrated_at: Some(1_000),
+                evaluated_at: Some(1_010),
+                reason: "human and holdout-approved automatic evidence".to_string(),
+            },
+        );
+
+        assert!(save_parameter_policy_cas(&conn, &policy, 0).unwrap());
+        let loaded = load_parameter_policy(&conn);
+
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
+        assert_eq!(loaded.policy.schema_version, 2);
+        assert_eq!(loaded.policy, policy);
+    }
+
+    #[test]
+    fn parameter_policy_schema_one_loads_fail_closed_then_migrates_by_cas() {
+        let conn = conn();
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "revision": 4,
+            "mode": "canary",
+            "source_adaptive_version": 7,
+            "runtime_adoption_weight": 1.0,
+            "adoption_weights": {"recall_fusion:global": 0.5},
+            "last_event_id": 99,
+            "last_updated": "2026-05-01T00:00:00Z"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![ARS_PARAMETER_POLICY_METADATA_KEY, legacy],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
+        assert_eq!(loaded.policy.schema_version, 1);
+        assert_eq!(loaded.policy.runtime_adoption_weight(7), 0.0);
+
+        let migrated = ArsParameterPolicy {
+            schema_version: ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            revision: 5,
+            mode: ArsParameterPolicyMode::Canary,
+            disabled_reason: None,
+            source_adaptive_version: 7,
+            runtime_adoption_weight: 0.0,
+            adoption_weights: HashMap::from([("recall_fusion:global".to_string(), 0.05)]),
+            recall_fusion_evidence: HashMap::new(),
+            last_event_id: 99,
+            last_updated: "2026-07-13T00:00:00Z".to_string(),
+        };
+        assert!(save_parameter_policy_cas(&conn, &migrated, 4).unwrap());
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.policy.schema_version, 2);
+        assert_eq!(loaded.policy.revision, 5);
+        assert_eq!(
+            loaded
+                .policy
+                .runtime_adoption_weight_for(7, "recall_fusion:global"),
+            0.05
+        );
+    }
+
+    #[test]
+    fn parameter_policy_missing_schema_is_treated_as_legacy_one_not_current_two() {
+        let conn = conn();
+        let legacy = serde_json::json!({
+            "revision": 3,
+            "mode": "canary",
+            "source_adaptive_version": 7,
+            "runtime_adoption_weight": 1.0,
+            "adoption_weights": {},
+            "last_event_id": 0,
+            "last_updated": "2026-05-01T00:00:00Z"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![ARS_PARAMETER_POLICY_METADATA_KEY, legacy],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
+        assert_eq!(loaded.policy.schema_version, 1);
+        assert_eq!(loaded.policy.runtime_adoption_weight(7), 0.0);
     }
 
     #[test]
@@ -652,28 +984,30 @@ mod tests {
         )
         .unwrap();
 
-        // Sanity: load reports Loaded with schema_version defaulted to
-        // ARS_PARAMETER_POLICY_SCHEMA_VERSION via #[serde(default)].
+        // Missing schema is historical schema 1, not whatever schema this
+        // binary happens to write today. It loads for migration but cannot
+        // activate runtime behavior.
         let loaded = load_parameter_policy(&conn);
         assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Loaded);
         assert_eq!(
             loaded.policy.schema_version,
-            ARS_PARAMETER_POLICY_SCHEMA_VERSION
+            LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION
         );
         assert_eq!(loaded.policy.revision, 7);
+        assert_eq!(loaded.policy.runtime_adoption_weight(5), 0.0);
 
         // Build a refresh against the loaded policy at revision 7 (matches
         // the row's stored revision). The CAS UPDATE predicate must accept
         // this even though the on-disk JSON omits schema_version entirely.
         let mut refreshed = loaded.policy.clone();
+        refreshed.schema_version = ARS_PARAMETER_POLICY_SCHEMA_VERSION;
         refreshed.revision = 8;
         refreshed.runtime_adoption_weight = 0.6;
 
         assert!(
             save_parameter_policy_cas(&conn, &refreshed, 7).unwrap(),
             "CAS UPDATE must succeed against a row that omits schema_version \
-             (treated as the current binary's schema via COALESCE default). \
-             Pre-R8 fix this returned false and refresh stalled forever."
+             (treated as migratable legacy schema 1 by the CAS allowlist)."
         );
 
         // Verify the new bytes landed and now include schema_version.
@@ -954,6 +1288,96 @@ mod tests {
         assert_eq!(loaded.runtime_adoption_weight, 0.0);
         assert_eq!(loaded.adoption_weights["judge_sample_rate"], 1.0);
         assert_eq!(loaded.adoption_weights["llm_feedback_decay"], 0.0);
+    }
+
+    #[test]
+    fn parameter_policy_rejects_invalid_recall_fusion_evidence_on_save() {
+        let conn = conn();
+        let mut policy = canary_policy(1);
+        policy.recall_fusion_evidence.insert(
+            "judge_sample_rate".to_string(),
+            ArsRecallFusionEvidence {
+                basis: ArsRecallFusionEvidenceBasis::Human,
+                human_ess: 1,
+                resolved_simplex: crate::store::a12_calibration::A12FusionSimplex::default(),
+                self_supervised_train_family_ess: 0,
+                self_supervised_holdout_family_ess: 0,
+                a12_generation: None,
+                a12_revision: None,
+                generation_fingerprint: None,
+                corpus_fingerprint: None,
+                optimizer_fingerprint: None,
+                evaluation_fingerprint: None,
+                a12_verdict: None,
+                a12_noise_floor: None,
+                recall_gate_status: ArsRecallGateStatus::NoData,
+                recall_gate_build_fingerprint: None,
+                recall_gate_fixture_fingerprint: None,
+                calibrated_at: None,
+                evaluated_at: None,
+                reason: "human feedback".to_string(),
+            },
+        );
+
+        assert!(save_parameter_policy_cas(&conn, &policy, 0).is_err());
+        assert_eq!(
+            load_parameter_policy(&conn).status,
+            ArsParameterPolicyLoadStatus::Missing
+        );
+    }
+
+    #[test]
+    fn parameter_policy_invalid_current_evidence_loads_fail_closed() {
+        let conn = conn();
+        let invalid = serde_json::json!({
+            "schema_version": ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            "revision": 1,
+            "mode": "canary",
+            "source_adaptive_version": 7,
+            "runtime_adoption_weight": 0.0,
+            "adoption_weights": {"recall_fusion:global": 0.05},
+            "recall_fusion_evidence": {
+                "recall_fusion:global": {
+                    "basis": "self_supervised",
+                    "resolved_simplex": {
+                        "bm25": 0.5,
+                        "vector": 0.5,
+                        "kg": 0.5,
+                        "episode": 0.0,
+                        "support": 0.0,
+                        "diversity": 0.0
+                    },
+                    "self_supervised_train_family_ess": 10,
+                    "self_supervised_holdout_family_ess": 4,
+                    "a12_generation": 1,
+                    "a12_revision": 1,
+                    "generation_fingerprint": "generation",
+                    "corpus_fingerprint": "corpus",
+                    "optimizer_fingerprint": "optimizer",
+                    "evaluation_fingerprint": "evaluation",
+                    "a12_verdict": "ship",
+                    "a12_noise_floor": 0.02,
+                    "recall_gate_status": "ship",
+                    "recall_gate_build_fingerprint": "build",
+                    "recall_gate_fixture_fingerprint": "fixture",
+                    "calibrated_at": 100,
+                    "evaluated_at": 101
+                }
+            },
+            "last_event_id": 0,
+            "last_updated": "2026-07-13T00:00:00Z"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params![ARS_PARAMETER_POLICY_METADATA_KEY, invalid],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Corrupt);
+        assert_eq!(loaded.policy.runtime_adoption_weight(7), 0.0);
+        assert!(loaded.error.unwrap().contains("simplex must sum to 1"));
     }
 
     #[test]

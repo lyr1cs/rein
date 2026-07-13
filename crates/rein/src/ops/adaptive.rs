@@ -943,7 +943,9 @@ fn refresh_ars_parameter_policy(
         synthesis_structural,
         concept_structural,
     );
-    if current.mode == desired_mode
+    if current.schema_version
+        == crate::store::ars_parameter_policy::ARS_PARAMETER_POLICY_SCHEMA_VERSION
+        && current.mode == desired_mode
         && current.source_adaptive_version == state.version
         && current.disabled_reason == disabled_reason
         && (current.runtime_adoption_weight - runtime_adoption_weight).abs() <= f64::EPSILON
@@ -4280,6 +4282,46 @@ mod tests {
             crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
         );
         assert!(loaded.policy.allows_runtime_adoption(state.version));
+    }
+
+    #[test]
+    fn ars_parameter_policy_refresh_migrates_legacy_schema_even_when_values_match() {
+        let conn = metadata_conn();
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "revision": 4,
+            "mode": "disabled",
+            "disabled_reason": "adaptive or ars acceleration disabled",
+            "source_adaptive_version": 7,
+            "runtime_adoption_weight": 0.0,
+            "adoption_weights": {},
+            "last_event_id": 0,
+            "last_updated": "2026-05-01T00:00:00Z"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                crate::store::ars_parameter_policy::ARS_PARAMETER_POLICY_METADATA_KEY,
+                legacy
+            ],
+        )
+        .unwrap();
+
+        let config = ReinConfig::default();
+        let state = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        refresh_ars_parameter_policy(&conn, &config, &state);
+
+        let loaded = crate::store::ars_parameter_policy::load_parameter_policy(&conn);
+        assert_eq!(
+            loaded.policy.schema_version,
+            crate::store::ars_parameter_policy::ARS_PARAMETER_POLICY_SCHEMA_VERSION
+        );
+        assert_eq!(loaded.policy.revision, 5);
+        assert_eq!(loaded.policy.runtime_adoption_weight(7), 0.0);
     }
 
     #[test]
