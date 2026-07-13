@@ -77,6 +77,11 @@ pub struct ArsRecallFusionEvidence {
     pub recall_gate_build_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_gate_fixture_fingerprint: Option<String>,
+    /// Creation time of the current-build recall gate scorecard (Unix
+    /// seconds). Kept separate from A12's own evaluation time because the
+    /// build gate and local calibration have no causal ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_gate_evaluated_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibrated_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -556,6 +561,9 @@ fn validate_recall_fusion_evidence(
     }
     if evidence.calibrated_at.is_some_and(|value| value <= 0)
         || evidence.evaluated_at.is_some_and(|value| value <= 0)
+        || evidence
+            .recall_gate_evaluated_at
+            .is_some_and(|value| value <= 0)
     {
         return Err(format!(
             "recall-fusion evidence `{key}` timestamps must be positive"
@@ -566,7 +574,7 @@ fn validate_recall_fusion_evidence(
         (Some(calibrated), Some(evaluated)) if evaluated < calibrated
     ) {
         return Err(format!(
-            "recall-fusion evidence `{key}` gate evaluation predates calibration"
+            "recall-fusion evidence `{key}` A12 evaluation predates calibration"
         ));
     }
     let evaluated_at_millis = evidence
@@ -606,6 +614,7 @@ fn validate_recall_fusion_evidence(
             || evidence.a12_noise_floor.is_none()
             || evidence.recall_gate_build_fingerprint.is_none()
             || evidence.recall_gate_fixture_fingerprint.is_none()
+            || evidence.recall_gate_evaluated_at.is_none()
             || evidence.calibrated_at.is_none()
             || evidence.evaluated_at.is_none();
         if missing_identity {
@@ -733,6 +742,7 @@ mod tests {
                 recall_gate_status: ArsRecallGateStatus::Ship,
                 recall_gate_build_fingerprint: Some("build-fp".to_string()),
                 recall_gate_fixture_fingerprint: Some("fixture-fp".to_string()),
+                recall_gate_evaluated_at: Some(990),
                 calibrated_at: Some(1_000),
                 evaluated_at: Some(1_010),
                 a12_valid_until_exclusive: Some(2_000_000),
@@ -1329,6 +1339,7 @@ mod tests {
                 recall_gate_status: ArsRecallGateStatus::NoData,
                 recall_gate_build_fingerprint: None,
                 recall_gate_fixture_fingerprint: None,
+                recall_gate_evaluated_at: None,
                 calibrated_at: None,
                 evaluated_at: None,
                 a12_valid_until_exclusive: None,
