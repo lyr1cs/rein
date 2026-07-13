@@ -102,11 +102,11 @@ pub fn build_memory(
 
 /// Return the dedup similarity to use for a run.
 ///
-/// A1 full rollout: prefer the learned per-cluster / global threshold from
-/// AdaptiveState, fall back to the static config value only when no adaptive
-/// snapshot exists yet (first run, tests). Callers that know a specific
-/// cluster should call `AdaptiveState::get_dedup_threshold(Some(cluster))`
-/// directly; this helper is for "global default" call sites.
+/// A1 full rollout: destructive lexical dedup may use a higher learned global
+/// threshold, but never one below the operator's static config value. Callers
+/// that know a specific cluster should use
+/// `AdaptiveState::get_hard_dedup_threshold(Some(cluster), static_threshold)`;
+/// this helper is for "global default" call sites.
 pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &ReinConfig) -> f32 {
     // Honor [adaptive] enabled=false: when the operator has explicitly disabled
     // the adaptive engine we must not silently keep applying a stale learned
@@ -115,7 +115,7 @@ pub fn effective_dedup_threshold(store: &crate::store::SqliteStore, config: &Rei
         return config.search.dedup_similarity as f32;
     }
     match crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
-        Some(state) => state.get_dedup_threshold(None),
+        Some(state) => state.get_hard_dedup_threshold(None, config.search.dedup_similarity as f32),
         None => config.search.dedup_similarity as f32,
     }
 }
@@ -2035,6 +2035,23 @@ mod tests {
     use crate::config::ReinConfig;
     use crate::store::SqliteStore;
     use chrono::Utc;
+
+    #[test]
+    fn effective_dedup_threshold_floors_learned_value_at_static() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let state = crate::store::adaptive::AdaptiveState {
+            global_dedup_threshold: 0.40,
+            version: 1,
+            ..Default::default()
+        };
+        state.save_snapshot(store.conn()).unwrap();
+
+        assert_eq!(
+            effective_dedup_threshold(&store, &config),
+            config.search.dedup_similarity as f32
+        );
+    }
 
     fn test_memory(topic: &str, summary: &str, content: &str) -> Memory {
         Memory {

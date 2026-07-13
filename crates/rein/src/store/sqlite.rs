@@ -72,6 +72,10 @@ pub(crate) fn memory_select_base() -> String {
     )
 }
 
+fn dedup_threshold_changed(left: f32, right: f32) -> bool {
+    left.to_bits() != right.to_bits()
+}
+
 impl SqliteStore {
     fn cached_embedding_for_memory(&self, memory: &Memory) -> Option<Vec<f32>> {
         let config = crate::config::ReinConfig::load().ok()?;
@@ -1897,8 +1901,11 @@ impl SqliteStore {
                     if let Some(state) =
                         crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
                     {
-                        let effective = state.get_dedup_threshold(candidate_cluster);
-                        if (effective - similarity_threshold).abs() > 0.01 {
+                        let effective = state.get_hard_dedup_threshold(
+                            candidate_cluster,
+                            loaded_config.search.dedup_similarity as f32,
+                        );
+                        if dedup_threshold_changed(effective, similarity_threshold) {
                             crate::extract::check_dedup(
                                 self,
                                 &memory.topic,
@@ -2283,7 +2290,12 @@ impl SqliteStore {
         // creating a mismatch that defeats the content-hash race guard.
         let effective_threshold = if config.adaptive.enabled {
             crate::store::adaptive::AdaptiveState::restore_snapshot(&self.conn)
-                .map(|s| s.get_dedup_threshold(inferred_cluster))
+                .map(|s| {
+                    s.get_hard_dedup_threshold(
+                        inferred_cluster,
+                        config.search.dedup_similarity as f32,
+                    )
+                })
                 .unwrap_or(similarity_threshold)
         } else {
             similarity_threshold
@@ -3274,6 +3286,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dedup_threshold_changed_uses_exact_float_identity() {
+        assert!(dedup_threshold_changed(0.700, 0.705));
+        assert!(!dedup_threshold_changed(0.700, 0.700));
+    }
+
     fn test_memory(topic: &str, summary: &str, importance: Importance) -> Memory {
         Memory {
             id: ulid::Ulid::new().to_string(),
@@ -3849,6 +3867,72 @@ mod tests {
         assert_ne!(id1, id2);
         let stats = store.stats().unwrap();
         assert_eq!(stats.total_memories, 2);
+    }
+
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn store_time_lexical_recheck_floors_learned_value_at_static() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore_config = EnvRestore {
+            key: "REIN_CONFIG",
+            value: std::env::var("REIN_CONFIG").ok(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rein.toml");
+        std::fs::write(
+            &config_path,
+            "[adaptive]\nenabled = true\n[search]\ndedup_similarity = 0.70\n",
+        )
+        .unwrap();
+        std::env::set_var("REIN_CONFIG", &config_path);
+
+        let store = SqliteStore::in_memory().unwrap();
+        let mut state = crate::store::adaptive::AdaptiveState {
+            global_dedup_threshold: 0.40,
+            version: 1,
+            ..Default::default()
+        };
+        state.dedup_thresholds.insert(7, 0.45);
+        state.save_snapshot(store.conn()).unwrap();
+
+        let shared = (0..20)
+            .map(|i| format!("shared{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let left = format!(
+            "{shared} {}",
+            (0..23)
+                .map(|i| format!("left{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let right = format!(
+            "{shared} {}",
+            (0..23)
+                .map(|i| format!("right{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut existing =
+            test_memory_with_content("threshold-floor", "left", &left, Importance::High);
+        existing.cluster_id = Some(7);
+        let score =
+            crate::extract::dedup::score_candidate("threshold-floor", &right, &existing, Some(7))
+                .final_score;
+        assert!(
+            score > 0.55 && score < 0.60,
+            "fixture must stay above learned exploration and below static exploration: {score}"
+        );
+        let existing_id = store.store(existing).unwrap();
+        let mut incoming =
+            test_memory_with_content("threshold-floor", "right", &right, Importance::High);
+        incoming.cluster_id = Some(7);
+        let incoming_id = incoming.id.clone();
+        let stored_id = store.store_with_dedup(incoming, 0.70, 7).unwrap();
+
+        assert_eq!(stored_id, incoming_id);
+        assert_ne!(stored_id, existing_id);
+        assert_eq!(store.stats().unwrap().total_memories, 2);
     }
 
     #[test]

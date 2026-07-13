@@ -2036,9 +2036,12 @@ impl ReinConfig {
                 self.search.cc_alpha
             );
         }
-        if self.search.dedup_similarity < 0.0 || self.search.dedup_similarity > 1.0 {
+        if !self.search.dedup_similarity.is_finite()
+            || self.search.dedup_similarity < 0.0
+            || self.search.dedup_similarity > 1.0
+        {
             anyhow::bail!(
-                "search.dedup_similarity must be in [0.0, 1.0], got {}",
+                "search.dedup_similarity must be finite and in [0.0, 1.0], got {}",
                 self.search.dedup_similarity
             );
         }
@@ -4225,6 +4228,16 @@ unknown_knob = true
         let mut cfg = ReinConfig::default();
         cfg.embedding.provider = "bogus".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_nan_dedup_similarity_rejected_by_validate() {
+        let error = ReinConfig::load_from_str("[search]\ndedup_similarity = nan\n")
+            .expect_err("NaN dedup similarity must fail validation");
+        assert!(
+            error.to_string().contains("search.dedup_similarity"),
+            "unexpected validation error: {error}"
+        );
     }
 
     #[test]

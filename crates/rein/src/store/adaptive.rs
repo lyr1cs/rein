@@ -986,6 +986,24 @@ impl AdaptiveState {
         }
     }
 
+    /// Get the threshold for a destructive lexical dedup decision.
+    ///
+    /// Learned values may raise the operator's static threshold, but cannot
+    /// lower it. Invalid learned values fall back to the static threshold.
+    pub fn get_hard_dedup_threshold(&self, cluster_id: Option<u32>, static_threshold: f32) -> f32 {
+        if !static_threshold.is_finite() || !(0.0..=1.0).contains(&static_threshold) {
+            return 1.0;
+        }
+        let learned = cluster_id
+            .and_then(|cid| self.dedup_thresholds.get(&cid).copied())
+            .unwrap_or(self.global_dedup_threshold);
+        if learned.is_finite() {
+            learned.max(static_threshold)
+        } else {
+            static_threshold
+        }
+    }
+
     /// v0.23: Per-cluster canonical length p25, with minimum-sample guard.
     /// Returns `None` when the cluster has fewer than
     /// `RESUMMERIZE_CLUSTER_MIN_SAMPLES` observations.
@@ -5036,6 +5054,62 @@ pub fn compute_concept_summary_useful_rate_with_judge_and_weights(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn hard_dedup_threshold_never_falls_below_static_without_override() {
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.40,
+            ..Default::default()
+        };
+        state.dedup_thresholds.insert(7, 0.45);
+
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.70);
+        assert_eq!(state.get_hard_dedup_threshold(Some(7), 0.70), 0.70);
+    }
+
+    #[test]
+    fn hard_dedup_threshold_preserves_learned_value_above_static() {
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.80,
+            ..Default::default()
+        };
+        state.dedup_thresholds.insert(7, 0.85);
+
+        assert_eq!(state.get_hard_dedup_threshold(None, 0.70), 0.80);
+        assert_eq!(state.get_hard_dedup_threshold(Some(7), 0.70), 0.85);
+    }
+
+    #[test]
+    fn hard_dedup_threshold_falls_back_to_supplied_static_for_nonfinite_learned_values() {
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let global_state = AdaptiveState {
+                global_dedup_threshold: nonfinite,
+                ..Default::default()
+            };
+            assert_eq!(global_state.get_hard_dedup_threshold(None, 0.60), 0.60);
+
+            let mut cluster_state = AdaptiveState {
+                global_dedup_threshold: 0.80,
+                ..Default::default()
+            };
+            cluster_state.dedup_thresholds.insert(7, nonfinite);
+            assert_eq!(cluster_state.get_hard_dedup_threshold(Some(7), 0.60), 0.60);
+        }
+    }
+
+    #[test]
+    fn hard_dedup_threshold_fails_closed_for_invalid_static_values() {
+        let mut state = AdaptiveState {
+            global_dedup_threshold: 0.80,
+            ..Default::default()
+        };
+        state.dedup_thresholds.insert(7, 0.90);
+
+        for invalid_static in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            assert_eq!(state.get_hard_dedup_threshold(None, invalid_static), 1.0);
+            assert_eq!(state.get_hard_dedup_threshold(Some(7), invalid_static), 1.0);
+        }
+    }
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

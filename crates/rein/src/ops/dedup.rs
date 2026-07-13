@@ -1055,10 +1055,13 @@ pub fn run_dedup_scoped(
 
         // Compare within each cluster group (much smaller than full pairwise)
         for (cluster_id, indices) in &cluster_groups {
-            // A1: use per-cluster adaptive dedup threshold when available
+            // A1: learned per-cluster values may raise, but never lower, the
+            // operator's static floor for a destructive lexical merge.
             let cluster_threshold = adaptive_state
                 .as_ref()
-                .map(|s| s.get_dedup_threshold(*cluster_id))
+                .map(|s| {
+                    s.get_hard_dedup_threshold(*cluster_id, config.search.dedup_similarity as f32)
+                })
                 .unwrap_or(threshold);
             for ii in 0..indices.len() {
                 let i = indices[ii];
@@ -1480,6 +1483,45 @@ mod tests {
         // Should find duplicates only within each cluster, not cross-cluster
         assert_eq!(found, 2, "should find 2 within-cluster duplicate pairs");
         assert_eq!(merged, 2, "should merge 2 within-cluster duplicate pairs");
+    }
+
+    #[test]
+    fn batch_lexical_dedup_threshold_floors_learned_value_at_static() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let mut state = crate::store::adaptive::AdaptiveState {
+            global_dedup_threshold: 0.40,
+            version: 1,
+            ..Default::default()
+        };
+        state.dedup_thresholds.insert(7, 0.45);
+        state.save_snapshot(store.conn()).unwrap();
+
+        let left = "alpha bravo charlie delta echo";
+        let right = "alpha bravo charlie foxtrot golf";
+        let similarity = crate::extract::similarity(left, right);
+        assert!(
+            similarity > 0.45 && similarity < config.search.dedup_similarity as f32,
+            "test fixture must sit between learned and static thresholds: {similarity}"
+        );
+
+        store
+            .store(test_memory_with_cluster("threshold-floor", left, 7))
+            .unwrap();
+        store
+            .store(test_memory_with_cluster("threshold-floor", right, 7))
+            .unwrap();
+
+        let (found, merged) = run_dedup(
+            &store,
+            &config,
+            config.search.dedup_similarity as f32,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(found, 0, "learned threshold must not lower the hard floor");
+        assert_eq!(merged, 0);
     }
 
     #[test]
