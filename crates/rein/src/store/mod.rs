@@ -1,3 +1,4 @@
+pub mod a12_calibration;
 pub mod adaptive;
 pub mod ars_parameter_policy;
 pub(crate) mod dedup_calibration;

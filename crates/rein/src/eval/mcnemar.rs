@@ -105,8 +105,6 @@ pub struct McNemarResult {
 /// outcomes vector yields `n=0` with all zeros and a p-value of 1.0 (no
 /// evidence of a difference).
 pub fn mcnemar(outcomes: &[PairedOutcome]) -> McNemarResult {
-    let n = outcomes.len() as u32;
-
     // Tally the 2×2 contingency table.
     let mut a = 0u32;
     let mut b = 0u32;
@@ -121,9 +119,19 @@ pub fn mcnemar(outcomes: &[PairedOutcome]) -> McNemarResult {
         }
     }
 
+    mcnemar_from_counts(a, b, c, d)
+        .expect("a tally derived from one outcome slice cannot overflow u32")
+}
+
+/// Run the same paired non-inferiority calculation from an already aggregated
+/// contingency table. Returns `None` only when the four counts overflow the
+/// public [`McNemarResult`] `u32` total.
+pub fn mcnemar_from_counts(a: u32, b: u32, c: u32, d: u32) -> Option<McNemarResult> {
+    let n = a.checked_add(b)?.checked_add(c)?.checked_add(d)?;
+
     // Empty input: return a neutral result (no discordant pairs → p=1.0).
     if n == 0 {
-        return McNemarResult {
+        return Some(McNemarResult {
             n: 0,
             a: 0,
             b: 0,
@@ -135,7 +143,7 @@ pub fn mcnemar(outcomes: &[PairedOutcome]) -> McNemarResult {
             diff_point: 0.0,
             ci_lower: 0.0,
             ci_upper: 0.0,
-        };
+        });
     }
 
     let bc_sum = b + c;
@@ -166,7 +174,7 @@ pub fn mcnemar(outcomes: &[PairedOutcome]) -> McNemarResult {
     let ci_lower = diff_point - margin;
     let ci_upper = diff_point + margin;
 
-    McNemarResult {
+    Some(McNemarResult {
         n,
         a,
         b,
@@ -178,7 +186,7 @@ pub fn mcnemar(outcomes: &[PairedOutcome]) -> McNemarResult {
         diff_point,
         ci_lower,
         ci_upper,
-    }
+    })
 }
 
 /// Exact one-sided Clopper-Pearson upper confidence bound for a binomial
@@ -467,6 +475,25 @@ mod tests {
         assert_eq!(r.diff_point, 0.0);
         assert_eq!(r.ci_lower, 0.0);
         assert_eq!(r.ci_upper, 0.0);
+    }
+
+    #[test]
+    fn count_based_mcnemar_matches_expanded_outcomes_and_rejects_overflow() {
+        let expanded = mcnemar(&from_counts(158, 12, 15, 15));
+        let counted = mcnemar_from_counts(158, 12, 15, 15).unwrap();
+
+        assert_eq!(counted.n, expanded.n);
+        assert_eq!(counted.a, expanded.a);
+        assert_eq!(counted.b, expanded.b);
+        assert_eq!(counted.c, expanded.c);
+        assert_eq!(counted.d, expanded.d);
+        assert_eq!(counted.used_exact, expanded.used_exact);
+        assert!((counted.chi_squared - expanded.chi_squared).abs() < 1e-12);
+        assert!((counted.p_value - expanded.p_value).abs() < 1e-12);
+        assert!((counted.diff_point - expanded.diff_point).abs() < 1e-12);
+        assert!((counted.ci_lower - expanded.ci_lower).abs() < 1e-12);
+        assert!((counted.ci_upper - expanded.ci_upper).abs() < 1e-12);
+        assert!(mcnemar_from_counts(u32::MAX, 1, 0, 0).is_none());
     }
 
     #[test]
