@@ -305,11 +305,11 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
             // not historical on-disk identity. Preserve the schema detected
             // above so legacy rows remain fail-closed until a schema-3 CAS.
             policy.schema_version = detected_schema;
-            clamp_policy_weights(&mut policy);
             if detected_schema == LEGACY_ARS_PARAMETER_POLICY_SCHEMA_VERSION {
                 policy.recall_fusion_evidence.clear();
             }
             if detected_schema != ARS_PARAMETER_POLICY_SCHEMA_VERSION {
+                clamp_policy_weights(&mut policy);
                 return ArsParameterPolicyLoad {
                     policy,
                     status: ArsParameterPolicyLoadStatus::Loaded,
@@ -318,9 +318,13 @@ pub fn load_parameter_policy(conn: &rusqlite::Connection) -> ArsParameterPolicyL
                     )),
                 };
             }
+            // Validation must observe the raw persisted values: clamping first
+            // would silently launder a non-finite or out-of-range adoption
+            // weight into a healthy load instead of failing closed as Corrupt.
             if let Err(error) = validate_parameter_policy(&policy) {
                 return corrupt_parameter_policy_load(error);
             }
+            clamp_policy_weights(&mut policy);
             ArsParameterPolicyLoad {
                 policy,
                 status: ArsParameterPolicyLoadStatus::Loaded,
@@ -509,6 +513,21 @@ fn validate_parameter_policy(policy: &ArsParameterPolicy) -> Result<(), String> 
             "policy writer requires schema_version={} (observed {})",
             ARS_PARAMETER_POLICY_SCHEMA_VERSION, policy.schema_version
         ));
+    }
+    if !policy.runtime_adoption_weight.is_finite()
+        || !(0.0..=1.0).contains(&policy.runtime_adoption_weight)
+    {
+        return Err(format!(
+            "policy runtime_adoption_weight must be finite and in [0, 1] (observed {})",
+            policy.runtime_adoption_weight
+        ));
+    }
+    for (key, weight) in &policy.adoption_weights {
+        if !weight.is_finite() || !(0.0..=1.0).contains(weight) {
+            return Err(format!(
+                "policy adoption weight `{key}` must be finite and in [0, 1] (observed {weight})"
+            ));
+        }
     }
     for (key, evidence) in &policy.recall_fusion_evidence {
         let Some(scope) = key.strip_prefix("recall_fusion:") else {
@@ -1731,5 +1750,101 @@ mod tests {
         for value in policy.adoption_weights.values() {
             assert!((0.0..=1.0).contains(value));
         }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_adoption_weights() {
+        let mut policy = canary_policy(1);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), f64::NAN);
+        assert!(validate_parameter_policy(&policy).is_err());
+
+        let mut policy = canary_policy(1);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), f64::INFINITY);
+        assert!(validate_parameter_policy(&policy).is_err());
+
+        let mut policy = canary_policy(1);
+        policy.runtime_adoption_weight = f64::NAN;
+        assert!(validate_parameter_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_adoption_weights() {
+        let mut policy = canary_policy(1);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), 1.5);
+        assert!(validate_parameter_policy(&policy).is_err());
+
+        let mut policy = canary_policy(1);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), -0.25);
+        assert!(validate_parameter_policy(&policy).is_err());
+    }
+
+    /// JSON cannot encode NaN, but `1e999` parses to +inf; a tampered or
+    /// bit-rotted row must load fail-closed as Corrupt (disabled policy →
+    /// static resolution), never silently sanitized to a healthy load.
+    #[test]
+    fn infinite_adoption_weight_row_loads_fail_closed_as_corrupt() {
+        let conn = conn();
+        let mut policy = canary_policy(1);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), 0.4375);
+        assert!(save_parameter_policy_cas(&conn, &policy, 0).unwrap());
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![ARS_PARAMETER_POLICY_METADATA_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tampered = raw.replace("0.4375", "1e999");
+        assert_ne!(raw, tampered, "fixture weight must appear exactly once");
+        conn.execute(
+            "UPDATE metadata SET value = ?1 WHERE key = ?2",
+            params![tampered, ARS_PARAMETER_POLICY_METADATA_KEY],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Corrupt);
+        assert_eq!(loaded.policy.mode, ArsParameterPolicyMode::Disabled);
+        assert_eq!(loaded.policy.runtime_adoption_weight, 0.0);
+        assert!(loaded.error.is_some());
+    }
+
+    #[test]
+    fn out_of_range_adoption_weight_row_loads_fail_closed_as_corrupt() {
+        let conn = conn();
+        let mut policy = canary_policy(1);
+        policy
+            .adoption_weights
+            .insert("recall_fusion:global".to_string(), 0.4375);
+        assert!(save_parameter_policy_cas(&conn, &policy, 0).unwrap());
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![ARS_PARAMETER_POLICY_METADATA_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tampered = raw.replace("0.4375", "1.5");
+        conn.execute(
+            "UPDATE metadata SET value = ?1 WHERE key = ?2",
+            params![tampered, ARS_PARAMETER_POLICY_METADATA_KEY],
+        )
+        .unwrap();
+
+        let loaded = load_parameter_policy(&conn);
+
+        assert_eq!(loaded.status, ArsParameterPolicyLoadStatus::Corrupt);
+        assert_eq!(loaded.policy.mode, ArsParameterPolicyMode::Disabled);
     }
 }

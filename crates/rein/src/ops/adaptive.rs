@@ -1398,10 +1398,25 @@ fn refresh_ars_parameter_policy(
 ) {
     let active_a12 = crate::store::a12_calibration::load_a12_calibration(conn);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let baseline_path = cwd.join("docs/eval-baselines/recall.json");
+    let run_path = cwd.join("target/eval-gates/recall-run.json");
     let recall_gate = crate::ops::a12_activation::recall_eval_gate_attestation(
-        &cwd.join("docs/eval-baselines/recall.json"),
-        &cwd.join("target/eval-gates/recall-run.json"),
+        &baseline_path,
+        &run_path,
         crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+    );
+    // Scorecards resolve against the process working directory, so a daemon
+    // started outside the repository attests NoData on every refresh and
+    // automatic activation never arms. Log the resolved paths and attestation
+    // outcome so operators can see why; the paths themselves are never
+    // persisted into the sealed policy.
+    tracing::info!(
+        baseline_path = %baseline_path.display(),
+        run_path = %run_path.display(),
+        status = ?recall_gate.status,
+        reason_code = ?recall_gate.reason_code,
+        reason = %recall_gate.reason,
+        "resolved recall eval-gate scorecards for ARS parameter policy refresh"
     );
     refresh_ars_parameter_policy_with_inputs(
         conn,

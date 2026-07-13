@@ -745,45 +745,6 @@ pub fn parameter_policy_runtime_adoption_weight_for(
         .runtime_adoption_weight_for(state.version, key)
 }
 
-pub fn parameter_policy_recall_fusion_runtime_adoption_weight(
-    conn: &rusqlite::Connection,
-    config: &crate::config::ReinConfig,
-    state: &crate::store::adaptive::AdaptiveState,
-    query_type: &str,
-    cluster_id: Option<u32>,
-) -> f64 {
-    if !config.adaptive.enabled
-        || !config.ars.acceleration.enabled
-        || config.ars.acceleration.shadow_only
-    {
-        return 0.0;
-    }
-    let loaded = crate::store::ars_parameter_policy::load_parameter_policy(conn);
-    if !matches!(
-        loaded.status,
-        crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
-    ) {
-        return 0.0;
-    }
-    let policy = loaded.policy;
-    let query_key = crate::store::adaptive::AdaptiveState::bucket_key(query_type, None);
-    let mut keys = Vec::new();
-    if let Some(cluster) = cluster_id {
-        let cluster_key =
-            crate::store::adaptive::AdaptiveState::bucket_key(query_type, Some(cluster));
-        keys.push(format!("recall_fusion:{cluster_key}"));
-    }
-    keys.push(format!("recall_fusion:{query_key}"));
-    keys.push("recall_fusion:global".to_string());
-
-    for key in keys {
-        if policy.adoption_weights.contains_key(&key) {
-            return policy.runtime_adoption_weight_for(state.version, &key);
-        }
-    }
-    policy.runtime_adoption_weight(state.version)
-}
-
 pub fn parameter_policy_allows_runtime(
     conn: &rusqlite::Connection,
     config: &crate::config::ReinConfig,
@@ -1659,66 +1620,6 @@ mod tests {
                 "recall_fusion:semantic"
             ),
             0.0
-        );
-    }
-
-    #[test]
-    fn parameter_policy_recall_fusion_weight_falls_back_cluster_query_global() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
-            .unwrap();
-        let mut policy = crate::store::ars_parameter_policy::ArsParameterPolicy {
-            revision: 1,
-            mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
-            disabled_reason: None,
-            source_adaptive_version: 7,
-            runtime_adoption_weight: 0.25,
-            ..Default::default()
-        };
-        policy
-            .adoption_weights
-            .insert("recall_fusion:global".to_string(), 0.40);
-        policy
-            .adoption_weights
-            .insert("recall_fusion:semantic".to_string(), 0.60);
-        policy
-            .adoption_weights
-            .insert("recall_fusion:semantic:7".to_string(), 0.80);
-        crate::store::ars_parameter_policy::save_parameter_policy_cas(&conn, &policy, 0).unwrap();
-
-        let mut config = crate::config::ReinConfig::default();
-        config.ars.acceleration.enabled = true;
-        config.ars.acceleration.shadow_only = false;
-        let state = crate::store::adaptive::AdaptiveState {
-            version: 7,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            parameter_policy_recall_fusion_runtime_adoption_weight(
-                &conn,
-                &config,
-                &state,
-                "Semantic",
-                Some(7)
-            ),
-            0.80
-        );
-        assert_eq!(
-            parameter_policy_recall_fusion_runtime_adoption_weight(
-                &conn,
-                &config,
-                &state,
-                "Semantic",
-                Some(8)
-            ),
-            0.60
-        );
-        assert_eq!(
-            parameter_policy_recall_fusion_runtime_adoption_weight(
-                &conn, &config, &state, "Episodic", None
-            ),
-            0.40
         );
     }
 
