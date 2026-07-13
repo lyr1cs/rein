@@ -95,8 +95,8 @@ pub enum JudgeTrustReason {
 }
 
 /// Fully resolved trust policy. Callers must use `configured_baseline_scale`
-/// rather than re-deriving whether the judge contribution stays configured or
-/// is forced to zero.
+/// for both judge contribution and configured sample rate rather than
+/// re-deriving whether either surface stays configured or is forced to zero.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JudgeTrustDecision {
     pub basis: JudgeCalibrationBasis,
@@ -117,7 +117,16 @@ pub fn judge_trust_gate(
 
     if human_kappa_is_authoritative {
         match evidence.human_kappa {
-            Some(kappa) if kappa.is_finite() && kappa < LLM_JUDGE_KAPPA_FLOOR => {
+            Some(kappa) if !kappa.is_finite() || !(-1.0..=1.0).contains(&kappa) => {
+                return JudgeTrustDecision {
+                    basis: JudgeCalibrationBasis::Untrusted,
+                    action_allowed: false,
+                    configured_baseline_scale: 0.0,
+                    blocks_release: true,
+                    reason: JudgeTrustReason::HumanKappaMissingOrInvalid,
+                };
+            }
+            Some(kappa) if kappa < LLM_JUDGE_KAPPA_FLOOR => {
                 return JudgeTrustDecision {
                     basis: JudgeCalibrationBasis::Untrusted,
                     action_allowed: false,
@@ -126,7 +135,7 @@ pub fn judge_trust_gate(
                     reason: JudgeTrustReason::HumanKappaBelowFloor,
                 };
             }
-            Some(kappa) if kappa.is_finite() => {}
+            Some(_) => {}
             _ => {
                 return JudgeTrustDecision {
                     basis: JudgeCalibrationBasis::Untrusted,
@@ -912,6 +921,30 @@ mod tests {
                     JudgeTrustReason::HumanKappaMissingOrInvalid
                 };
                 assert_eq!(decision.reason, expected_reason);
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_human_kappa_outside_theoretical_range_fails_closed() {
+        for kappa in [1.000_1, -1.000_1] {
+            let evidence = JudgeCalibrationEvidence {
+                human_pair_count: LLM_JUDGE_J3_MIN_PAIRS,
+                human_kappa: Some(kappa),
+                structural_status: JudgeStructuralStatus::Ready,
+                enforce_structural_anchors: true,
+            };
+
+            for action in ALL_TRUST_ACTIONS {
+                let decision = judge_trust_gate(&evidence, action);
+                assert_eq!(decision.basis, JudgeCalibrationBasis::Untrusted);
+                assert!(!decision.action_allowed);
+                assert_eq!(decision.configured_baseline_scale, 0.0);
+                assert!(decision.blocks_release);
+                assert_eq!(
+                    decision.reason,
+                    JudgeTrustReason::HumanKappaMissingOrInvalid
+                );
             }
         }
     }
