@@ -5,6 +5,7 @@ pub mod fts;
 pub mod hdbscan;
 pub mod hnsw;
 pub mod jieba_tokenizer;
+pub mod judge_structural_calibration;
 pub mod knowledge;
 pub mod memoir;
 pub mod migrate;
