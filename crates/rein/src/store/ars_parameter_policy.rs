@@ -81,6 +81,8 @@ pub struct ArsRecallFusionEvidence {
     pub calibrated_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a12_valid_until_exclusive: Option<i64>,
     #[serde(default)]
     pub reason: String,
 }
@@ -566,6 +568,14 @@ fn validate_recall_fusion_evidence(
             "recall-fusion evidence `{key}` gate evaluation predates calibration"
         ));
     }
+    if evidence
+        .a12_valid_until_exclusive
+        .is_some_and(|boundary| boundary <= evidence.evaluated_at.unwrap_or(i64::MAX))
+    {
+        return Err(format!(
+            "recall-fusion evidence `{key}` validity boundary must follow evaluation"
+        ));
+    }
 
     let uses_human = matches!(
         evidence.basis,
@@ -720,6 +730,7 @@ mod tests {
                 recall_gate_fixture_fingerprint: Some("fixture-fp".to_string()),
                 calibrated_at: Some(1_000),
                 evaluated_at: Some(1_010),
+                a12_valid_until_exclusive: Some(2_000),
                 reason: "human and holdout-approved automatic evidence".to_string(),
             },
         );
@@ -1315,6 +1326,7 @@ mod tests {
                 recall_gate_fixture_fingerprint: None,
                 calibrated_at: None,
                 evaluated_at: None,
+                a12_valid_until_exclusive: None,
                 reason: "human feedback".to_string(),
             },
         );

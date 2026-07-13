@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 /// [`A12_CALIBRATION_REVISION_KEY_PREFIX`] and are immutable.
 pub const A12_CALIBRATION_METADATA_KEY: &str = "a12_calibration_active";
 pub const A12_CALIBRATION_REVISION_KEY_PREFIX: &str = "a12_calibration_revision:";
-pub const A12_CALIBRATION_SCHEMA_VERSION: u32 = 1;
+pub const A12_CALIBRATION_SCHEMA_VERSION: u32 = 2;
 pub const A12_DEFAULT_NOISE_FLOOR: f64 = 0.02;
 const SIMPLEX_SUM_TOLERANCE: f64 = 1e-6;
 const FLOAT_COMPARISON_RELATIVE_TOLERANCE: f64 = 1e-12;
@@ -264,6 +264,11 @@ pub struct A12ScopeEntry {
     pub evaluation_fingerprint: String,
     pub calibrated_at: i64,
     pub evaluated_at: i64,
+    /// Earliest wall-clock second at which fixed-time replay may diverge from
+    /// production because a relative temporal window or KG validity edge
+    /// changes membership. `None` means this scope observed no such boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until_exclusive: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +297,22 @@ impl A12ScopeEntry {
             && self.snapshot_cutoff == state.snapshot_cutoff
             && self.corpus_fingerprint == state.corpus_fingerprint
             && self.matches_noise_floor(expected_noise_floor)
+    }
+
+    /// Identity check plus the fixed-time replay validity horizon. Expiry is
+    /// exclusive and fail-closed: at the first recorded transition second the
+    /// sealed holdout evidence can no longer activate.
+    pub fn is_current_for_at(
+        &self,
+        state: &A12CalibrationState,
+        expected_noise_floor: f64,
+        now: i64,
+    ) -> bool {
+        now >= 0
+            && self.is_current_for(state, expected_noise_floor)
+            && self
+                .valid_until_exclusive
+                .is_none_or(|boundary| now < boundary)
     }
 
     fn validate(&self, state: &A12CalibrationState) -> Result<(), String> {
@@ -327,6 +348,9 @@ impl A12ScopeEntry {
         }
         if self.calibrated_at < 0
             || self.evaluated_at < self.calibrated_at
+            || self
+                .valid_until_exclusive
+                .is_some_and(|boundary| boundary <= self.evaluated_at)
             || self
                 .invalidation
                 .is_some_and(|value| value.invalidated_at < self.evaluated_at)
@@ -1311,6 +1335,7 @@ mod tests {
             evaluation_fingerprint: "evaluation-v1".to_string(),
             calibrated_at: 1_000,
             evaluated_at: 1_010,
+            valid_until_exclusive: None,
             cluster_generation,
             invalidation: None,
         }
@@ -1350,6 +1375,16 @@ mod tests {
             created_at: 990,
             updated_at: 1_010,
         }
+    }
+
+    #[test]
+    fn a12_scope_validity_boundary_expires_fail_closed_at_boundary() {
+        let state = state(1, 1);
+        let mut entry = state.scopes["global"].clone();
+        entry.valid_until_exclusive = Some(1_100);
+
+        assert!(entry.is_current_for_at(&state, A12_DEFAULT_NOISE_FLOOR, 1_099));
+        assert!(!entry.is_current_for_at(&state, A12_DEFAULT_NOISE_FLOOR, 1_100));
     }
 
     fn raw(conn: &Connection) -> String {
@@ -1432,14 +1467,17 @@ mod tests {
     #[test]
     fn repair_corrupt_a12_calibration_preserves_future_schema_bytes() {
         let conn = conn();
-        let future = r#"{
-  "schema_version": 2,
+        let future_schema = A12_CALIBRATION_SCHEMA_VERSION + 1;
+        let future = format!(
+            r#"{{
+  "schema_version": {future_schema},
   "revision": 7,
   "future_field": ["preserve", "exactly"]
-}"#;
+}}"#
+        );
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
-            params![A12_CALIBRATION_METADATA_KEY, future],
+            params![A12_CALIBRATION_METADATA_KEY, &future],
         )
         .unwrap();
 
@@ -1575,15 +1613,18 @@ mod tests {
     #[test]
     fn a12_calibration_future_schema_bytes_are_preserved() {
         let conn = conn();
-        let future = r#"{
-  "schema_version": 2,
+        let future_schema = A12_CALIBRATION_SCHEMA_VERSION + 1;
+        let future = format!(
+            r#"{{
+  "schema_version": {future_schema},
   "revision": 1,
   "generation": 99,
-  "future_scope": {"kind":"new_variant"}
-}"#;
+  "future_scope": {{"kind":"new_variant"}}
+}}"#
+        );
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
-            params![A12_CALIBRATION_METADATA_KEY, future],
+            params![A12_CALIBRATION_METADATA_KEY, &future],
         )
         .unwrap();
 
