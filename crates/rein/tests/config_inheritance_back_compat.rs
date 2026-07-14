@@ -239,11 +239,11 @@ fn fixture_04_resummerize_explicit_google_overrides_inherit_path() {
 fn fixture_05_extract_uses_compiled_default_google() {
     let cfg = load_fixture("05_minimal_defaults_only.toml");
     let r = cfg.resolve_llm_for("extract").unwrap();
-    // ExtractConfig::default() sets provider = "google" + the
-    // gemini-3.1-flash-lite-preview model. Resolver reads through that
-    // level-1 explicit branch.
+    // ExtractConfig::default() sets provider = "google" + the stable
+    // gemini-3.1-flash-lite model (preview ID retired 2026-05-25). Resolver
+    // reads through that level-1 explicit branch.
     assert_eq!(r.provider, Provider::Google);
-    assert_eq!(r.model, "gemini-3.1-flash-lite-preview");
+    assert_eq!(r.model, "gemini-3.1-flash-lite");
     assert_eq!(r.api_key_env.as_deref(), Some("GEMINI_API_KEY"));
 }
 
@@ -261,7 +261,7 @@ fn fixture_05_ars_defaults_inherit_to_extract() {
     let r = cfg.resolve_llm_for("ars.recall_synthesis").unwrap();
     // ArsConfig default llm_backend = "inherit" → walks to extract default = google
     assert_eq!(r.provider, Provider::Google);
-    assert_eq!(r.model, "gemini-3.1-flash-lite-preview");
+    assert_eq!(r.model, "gemini-3.1-flash-lite");
 }
 
 #[test]
