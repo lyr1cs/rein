@@ -437,6 +437,52 @@ fn blend_simplexes(
     }
 }
 
+/// Machine-readable classification of one recall-fusion scope's condition.
+/// The `reason` strings next to it are for humans only: health rollups and
+/// doctor attention key on this code, so reworded prose can never silently
+/// mute an alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallFusionScopeHealthCode {
+    /// Active on current, fully attested evidence (or on sealed human
+    /// evidence exactly as the policy intended).
+    Healthy,
+    /// Active, but serving only the sealed human fallback because the
+    /// blended automatic candidate is currently blocked — deliberately
+    /// degraded, not healthy.
+    HumanFallback,
+    /// Benign absence: disabled, unresolved, static, zero adoption, or no
+    /// evidence for this scope.
+    Inactive,
+    /// Evidence exists but is no longer current for the active generation,
+    /// noise floor, eligibility floor, or live human state.
+    Stale,
+    /// The fixed-time replay validity horizon has passed.
+    Expired,
+    /// Sealed identity (generation/revision/fingerprints/timestamps) does not
+    /// match the active evidence.
+    FingerprintMismatch,
+    /// Sealed and live values disagree in a way identity checks cannot
+    /// explain (simplex/ESS/adoption inconsistencies).
+    Tampered,
+    /// The active A12 calibration run is not a completed Task-5 run.
+    RunIncomplete,
+    /// The recall eval gate is not current Ship evidence for this binary.
+    GateNotShip,
+    /// The A12 holdout verdict backing the seal is not Ship.
+    HoldoutNotShip,
+    /// A judge drift alert blocks automatic recall fusion.
+    JudgeDrift,
+}
+
+impl RecallFusionScopeHealthCode {
+    /// True for every condition that deserves operator attention. `Healthy`
+    /// and `Inactive` are the only benign codes.
+    pub fn is_degraded(self) -> bool {
+        !matches!(self, Self::Healthy | Self::Inactive)
+    }
+}
+
 /// Result consumed by online recall. A non-zero adoption always carries a
 /// usable simplex; any attestation mismatch returns `None` plus zero adoption.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -445,6 +491,7 @@ pub struct RuntimeRecallFusionResolution {
     pub basis: ArsRecallFusionEvidenceBasis,
     pub simplex: Option<A12FusionSimplex>,
     pub adoption_weight: f64,
+    pub code: RecallFusionScopeHealthCode,
     pub reason: String,
 }
 
@@ -470,6 +517,7 @@ pub fn resolve_runtime_recall_fusion(
         return runtime_disabled(
             None,
             ArsRecallFusionEvidenceBasis::Static,
+            RecallFusionScopeHealthCode::Inactive,
             "adaptive recall-fusion activation is disabled or shadow-only",
         );
     }
@@ -479,6 +527,7 @@ pub fn resolve_runtime_recall_fusion(
         return runtime_disabled(
             None,
             ArsRecallFusionEvidenceBasis::Static,
+            RecallFusionScopeHealthCode::Inactive,
             "policy is not a current canary",
         );
     }
@@ -509,6 +558,7 @@ pub fn resolve_runtime_recall_fusion(
         Some(ArsRecallFusionEvidenceBasis::Static) => runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Static,
+            RecallFusionScopeHealthCode::Inactive,
             evidence
                 .map(|value| value.reason.as_str())
                 .unwrap_or("scope is explicitly static"),
@@ -542,13 +592,19 @@ pub fn resolve_runtime_recall_fusion(
                         min_samples_alpha,
                     );
                 }
-                return runtime_disabled(Some(key), evidence.basis, blocker.into_reason());
+                return runtime_disabled(
+                    Some(key),
+                    evidence.basis,
+                    blocker.code(),
+                    blocker.into_reason(),
+                );
             }
             let adoption_weight = policy.runtime_adoption_weight_for(adaptive.version, &key);
             if adoption_weight <= f64::EPSILON {
                 return runtime_disabled(
                     Some(key),
                     evidence.basis,
+                    RecallFusionScopeHealthCode::Inactive,
                     "automatic scope has zero runtime adoption",
                 );
             }
@@ -564,6 +620,7 @@ pub fn resolve_runtime_recall_fusion(
                     adoption_weight,
                 )),
                 adoption_weight,
+                code: RecallFusionScopeHealthCode::Healthy,
                 reason: "sealed automatic recall fusion is current".to_string(),
             }
         }
@@ -629,28 +686,38 @@ fn resolve_runtime_sealed_human_boundary(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Stale,
             "sealed human fallback source adaptive version is not exact",
         );
     }
-    if let Some(reason) = automatic_candidate_identity_mismatch(active_a12, policy_key, evidence) {
-        return runtime_disabled(selected, ArsRecallFusionEvidenceBasis::Human, reason);
+    if let Some((code, reason)) =
+        automatic_candidate_identity_mismatch(active_a12, policy_key, evidence)
+    {
+        return runtime_disabled(selected, ArsRecallFusionEvidenceBasis::Human, code, reason);
     }
     let Some(sealed_human) = evidence.human_simplex else {
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Tampered,
             "automatic boundary is missing its sealed human simplex",
         );
     };
     if let Some(reason) =
         sealed_human_fallback_relation_mismatch(active_a12, policy_key, evidence, sealed_human)
     {
-        return runtime_disabled(selected, ArsRecallFusionEvidenceBasis::Human, reason);
+        return runtime_disabled(
+            selected,
+            ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Tampered,
+            reason,
+        );
     }
     let Some(adoption_weight) = evidence.human_runtime_adoption_weight else {
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Tampered,
             "automatic boundary is missing its sealed human adoption",
         );
     };
@@ -661,6 +728,7 @@ fn resolve_runtime_sealed_human_boundary(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Inactive,
             "automatic boundary has zero or invalid sealed human adoption",
         );
     }
@@ -668,6 +736,7 @@ fn resolve_runtime_sealed_human_boundary(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Tampered,
             "sealed human policy key is outside recall_fusion",
         );
     };
@@ -676,6 +745,7 @@ fn resolve_runtime_sealed_human_boundary(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Stale,
             "automatic boundary has no matching live human fallback",
         );
     };
@@ -684,6 +754,7 @@ fn resolve_runtime_sealed_human_boundary(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Tampered,
             "automatic boundary has an invalid live human fallback",
         );
     };
@@ -691,6 +762,7 @@ fn resolve_runtime_sealed_human_boundary(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Tampered,
             "live human fallback does not match sealed simplex or ESS",
         );
     }
@@ -705,6 +777,15 @@ fn resolve_runtime_sealed_human_boundary(
             adoption_weight,
         )),
         adoption_weight,
+        // A Blended seal served through its human fallback is deliberately
+        // degraded: the automatic candidate is blocked, so operators must see
+        // this scope as HumanFallback, never Healthy. A pure Human seal with
+        // an automatic candidate boundary is the sealed intent and healthy.
+        code: if evidence.basis == ArsRecallFusionEvidenceBasis::Blended {
+            RecallFusionScopeHealthCode::HumanFallback
+        } else {
+            RecallFusionScopeHealthCode::Healthy
+        },
         reason: "authoritative scoped human fallback".to_string(),
     }
 }
@@ -755,15 +836,24 @@ fn automatic_candidate_identity_mismatch(
     active_a12: &A12CalibrationLoad,
     policy_key: &str,
     evidence: &ArsRecallFusionEvidence,
-) -> Option<String> {
+) -> Option<(RecallFusionScopeHealthCode, String)> {
     if active_a12.status != A12CalibrationLoadStatus::Loaded {
-        return Some("active A12 calibration is unavailable for human fallback".to_string());
+        return Some((
+            RecallFusionScopeHealthCode::Stale,
+            "active A12 calibration is unavailable for human fallback".to_string(),
+        ));
     }
     let Some(scope) = policy_key.strip_prefix("recall_fusion:") else {
-        return Some("human fallback policy key is outside recall_fusion".to_string());
+        return Some((
+            RecallFusionScopeHealthCode::Tampered,
+            "human fallback policy key is outside recall_fusion".to_string(),
+        ));
     };
     let Some(entry) = active_a12.state.scopes.get(scope) else {
-        return Some("active A12 calibration has no matching fallback boundary".to_string());
+        return Some((
+            RecallFusionScopeHealthCode::Stale,
+            "active A12 calibration has no matching fallback boundary".to_string(),
+        ));
     };
     if evidence.a12_generation != Some(active_a12.state.generation)
         || evidence.a12_revision != Some(active_a12.state.revision)
@@ -781,9 +871,10 @@ fn automatic_candidate_identity_mismatch(
             .a12_noise_floor
             .is_none_or(|noise_floor| !same_f64(noise_floor, entry.noise_floor))
     {
-        return Some(
+        return Some((
+            RecallFusionScopeHealthCode::FingerprintMismatch,
             "sealed A12 candidate identity mismatched human fallback boundary".to_string(),
-        );
+        ));
     }
     None
 }
@@ -821,6 +912,7 @@ fn resolve_runtime_human(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Inactive,
             "human recall-fusion policy has zero runtime adoption",
         );
     }
@@ -829,6 +921,7 @@ fn resolve_runtime_human(
         return runtime_disabled(
             selected,
             ArsRecallFusionEvidenceBasis::Human,
+            RecallFusionScopeHealthCode::Inactive,
             "no eligible live human recall-fusion entry",
         );
     };
@@ -848,6 +941,7 @@ fn resolve_runtime_human(
             adoption_weight,
         )),
         adoption_weight,
+        code: RecallFusionScopeHealthCode::Healthy,
         reason: "legacy-compatible live human recall fusion".to_string(),
     }
 }
@@ -902,26 +996,32 @@ fn effective_runtime_simplex(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AutomaticRuntimeBlocker {
-    Eligibility(String),
-    FailClosed(String),
+    Eligibility(RecallFusionScopeHealthCode, String),
+    FailClosed(RecallFusionScopeHealthCode, String),
 }
 
 impl AutomaticRuntimeBlocker {
-    fn eligibility(reason: impl Into<String>) -> Self {
-        Self::Eligibility(reason.into())
+    fn eligibility(code: RecallFusionScopeHealthCode, reason: impl Into<String>) -> Self {
+        Self::Eligibility(code, reason.into())
     }
 
-    fn fail_closed(reason: impl Into<String>) -> Self {
-        Self::FailClosed(reason.into())
+    fn fail_closed(code: RecallFusionScopeHealthCode, reason: impl Into<String>) -> Self {
+        Self::FailClosed(code, reason.into())
     }
 
     fn allows_human_fallback(&self) -> bool {
-        matches!(self, Self::Eligibility(_))
+        matches!(self, Self::Eligibility(..))
+    }
+
+    fn code(&self) -> RecallFusionScopeHealthCode {
+        match self {
+            Self::Eligibility(code, _) | Self::FailClosed(code, _) => *code,
+        }
     }
 
     fn into_reason(self) -> String {
         match self {
-            Self::Eligibility(reason) | Self::FailClosed(reason) => reason,
+            Self::Eligibility(_, reason) | Self::FailClosed(_, reason) => reason,
         }
     }
 }
@@ -955,26 +1055,31 @@ fn automatic_runtime_ineligibility_reason(
 ) -> Option<AutomaticRuntimeBlocker> {
     if policy.source_adaptive_version != adaptive.version {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Stale,
             "automatic policy source adaptive version is not exact",
         ));
     }
     if !policy.adoption_weights.contains_key(policy_key) {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Tampered,
             "automatic policy is missing its explicit scoped adoption weight",
         ));
     }
     if active_a12.status != A12CalibrationLoadStatus::Loaded {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Stale,
             "active A12 calibration is unavailable",
         ));
     }
     let Some(scope) = policy_key.strip_prefix("recall_fusion:") else {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Tampered,
             "automatic policy key is outside recall_fusion",
         ));
     };
     let Some(entry) = active_a12.state.scopes.get(scope) else {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Stale,
             "active A12 calibration has no matching scope",
         ));
     };
@@ -983,6 +1088,7 @@ fn automatic_runtime_ineligibility_reason(
         || evidence.a12_verdict != Some(A12CalibrationVerdict::Ship)
     {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::HoldoutNotShip,
             "automatic A12 holdout attestation is not Ship",
         ));
     }
@@ -990,6 +1096,7 @@ fn automatic_runtime_ineligibility_reason(
         || evidence.self_supervised_holdout_family_ess != entry.holdout_family_ess
     {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Tampered,
             "automatic A12 ESS attestation is mismatched",
         ));
     }
@@ -1004,6 +1111,7 @@ fn automatic_runtime_ineligibility_reason(
         || evidence.a12_valid_until_exclusive != entry.valid_until_exclusive
     {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::FingerprintMismatch,
             "sealed A12 pointer or fingerprint identity mismatched",
         ));
     }
@@ -1012,6 +1120,7 @@ fn automatic_runtime_ineligibility_reason(
         .is_none_or(|noise_floor| !same_f64(noise_floor, entry.noise_floor))
     {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::FingerprintMismatch,
             "sealed A12 noise floor mismatched active evidence",
         ));
     }
@@ -1022,11 +1131,13 @@ fn automatic_runtime_ineligibility_reason(
         evidence.recall_gate_evaluated_at,
     ) {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::GateNotShip,
             "sealed recall eval gate is not current Ship evidence",
         ));
     }
     if !simplex_is_valid(evidence.resolved_simplex) {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Tampered,
             "sealed recall-fusion simplex is invalid",
         ));
     }
@@ -1034,18 +1145,21 @@ fn automatic_runtime_ineligibility_reason(
         && evidence.resolved_simplex != entry.simplex
     {
         return Some(AutomaticRuntimeBlocker::fail_closed(
+            RecallFusionScopeHealthCode::Tampered,
             "self-supervised simplex does not match active A12 scope",
         ));
     }
     if evidence.basis == ArsRecallFusionEvidenceBasis::Blended {
         let Some(human) = human_for_scope(adaptive, scope, floor) else {
             return Some(AutomaticRuntimeBlocker::fail_closed(
+                RecallFusionScopeHealthCode::Tampered,
                 "blended evidence has no matching live human scope",
             ));
         };
         let human_ess = u64::try_from(human.sample_count).unwrap_or(u64::MAX);
         let Some(human_simplex) = human_simplex(human) else {
             return Some(AutomaticRuntimeBlocker::fail_closed(
+                RecallFusionScopeHealthCode::Tampered,
                 "blended evidence has an invalid live human simplex",
             ));
         };
@@ -1061,6 +1175,7 @@ fn automatic_runtime_ineligibility_reason(
             )
         {
             return Some(AutomaticRuntimeBlocker::fail_closed(
+                RecallFusionScopeHealthCode::Tampered,
                 "blended simplex or human ESS mismatched sealed evidence",
             ));
         }
@@ -1071,21 +1186,32 @@ fn automatic_runtime_ineligibility_reason(
     // matches; eligibility must never mask a concurrent tamper.
     if has_judge_drift(adaptive) {
         return Some(AutomaticRuntimeBlocker::eligibility(
+            RecallFusionScopeHealthCode::JudgeDrift,
             "judge drift blocks automatic recall fusion",
         ));
     }
     if entry.train_family_ess < floor || entry.holdout_family_ess < floor {
         return Some(AutomaticRuntimeBlocker::eligibility(
+            RecallFusionScopeHealthCode::Stale,
             "automatic A12 ESS is below the current eligibility floor",
         ));
     }
     if !entry.matches_noise_floor(expected_noise_floor) {
         return Some(AutomaticRuntimeBlocker::eligibility(
+            RecallFusionScopeHealthCode::Stale,
             "active A12 noise floor is stale for the current runtime",
         ));
     }
     if !entry.is_current_for_at(&active_a12.state, expected_noise_floor, now_millis) {
+        let expired = entry
+            .valid_until_exclusive
+            .is_some_and(|boundary| now_millis >= boundary);
         return Some(AutomaticRuntimeBlocker::eligibility(
+            if expired {
+                RecallFusionScopeHealthCode::Expired
+            } else {
+                RecallFusionScopeHealthCode::Stale
+            },
             "active A12 scope is stale or expired",
         ));
     }
@@ -1115,6 +1241,7 @@ fn simplex_matches(left: A12FusionSimplex, right: A12FusionSimplex) -> bool {
 fn runtime_disabled(
     scope_key: Option<String>,
     basis: ArsRecallFusionEvidenceBasis,
+    code: RecallFusionScopeHealthCode,
     reason: impl Into<String>,
 ) -> RuntimeRecallFusionResolution {
     RuntimeRecallFusionResolution {
@@ -1122,6 +1249,7 @@ fn runtime_disabled(
         basis,
         simplex: None,
         adoption_weight: 0.0,
+        code,
         reason: reason.into(),
     }
 }
@@ -1159,6 +1287,9 @@ pub struct RecallFusionActivationScopeReport {
     /// Basis sealed in the exact policy scope, retained as provenance only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sealed_basis: Option<ArsRecallFusionEvidenceBasis>,
+    /// Typed condition code. Health rollups and doctor attention key on this
+    /// field; `reason` below is human prose only.
+    pub health_code: RecallFusionScopeHealthCode,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_simplex: Option<A12FusionSimplex>,
@@ -1421,6 +1552,7 @@ fn recall_fusion_activation_scope_report(
             None => runtime_disabled(
                 Some(policy_key.clone()),
                 evidence.map_or(ArsRecallFusionEvidenceBasis::Static, |value| value.basis),
+                RecallFusionScopeHealthCode::Inactive,
                 "scope cannot be represented by the runtime resolver",
             ),
         }
@@ -1428,6 +1560,7 @@ fn recall_fusion_activation_scope_report(
         runtime_disabled(
             Some(policy_key.clone()),
             evidence.map_or(ArsRecallFusionEvidenceBasis::Static, |value| value.basis),
+            RecallFusionScopeHealthCode::Inactive,
             format!(
                 "parameter policy load status is {}",
                 parameter_policy_load_status_name(&policy.status)
@@ -1466,12 +1599,19 @@ fn recall_fusion_activation_scope_report(
         && live_attestation_blocker.is_none()
         && resolution.adoption_weight > f64::EPSILON
         && resolution.simplex.is_some();
+    let health_code = if !owns_resolution {
+        RecallFusionScopeHealthCode::Inactive
+    } else if let Some((code, _)) = &live_attestation_blocker {
+        *code
+    } else {
+        resolution.code
+    };
     let reason = if !owns_resolution {
         resolution.scope_key.as_ref().map_or_else(
             || "runtime fallback is not owned by this exact recall-fusion scope".to_string(),
             |resolved| format!("runtime resolves this request through broader scope {resolved}"),
         )
-    } else if let Some(blocker) = live_attestation_blocker {
+    } else if let Some((_, blocker)) = live_attestation_blocker {
         blocker
     } else {
         resolution.reason.clone()
@@ -1482,6 +1622,7 @@ fn recall_fusion_activation_scope_report(
         resolved_policy_key: resolution.scope_key.clone(),
         basis: resolution.basis,
         sealed_basis: evidence.map(|value| value.basis),
+        health_code,
         reason,
         effective_simplex: active.then_some(resolution.simplex).flatten(),
         adoption_weight: if active {
@@ -1582,14 +1723,20 @@ fn automatic_live_attestation_blocker(
     evidence: Option<&ArsRecallFusionEvidence>,
     current_gate: &RecallEvalGateAttestation,
     calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
-) -> Option<String> {
+) -> Option<(RecallFusionScopeHealthCode, String)> {
     if calibration_run.is_none_or(|run| !complete_calibration_run(run)) {
-        return Some("current A12 calibration run is not complete".to_string());
+        return Some((
+            RecallFusionScopeHealthCode::RunIncomplete,
+            "current A12 calibration run is not complete".to_string(),
+        ));
     }
     if current_gate.status != ArsRecallGateStatus::Ship {
-        return Some(format!(
-            "current recall eval gate is {}",
-            recall_gate_status_name(current_gate.status)
+        return Some((
+            RecallFusionScopeHealthCode::GateNotShip,
+            format!(
+                "current recall eval gate is {}",
+                recall_gate_status_name(current_gate.status)
+            ),
         ));
     }
     if !current_ship_gate_identity(
@@ -1598,10 +1745,16 @@ fn automatic_live_attestation_blocker(
         current_gate.fixture_fingerprint.as_deref(),
         current_gate.evaluated_at,
     ) {
-        return Some("current recall eval gate is not current Ship evidence".to_string());
+        return Some((
+            RecallFusionScopeHealthCode::GateNotShip,
+            "current recall eval gate is not current Ship evidence".to_string(),
+        ));
     }
     let Some(evidence) = evidence else {
-        return Some("sealed automatic recall evidence is missing".to_string());
+        return Some((
+            RecallFusionScopeHealthCode::Tampered,
+            "sealed automatic recall evidence is missing".to_string(),
+        ));
     };
     // Strict exact-match on the sealed identity is fail-closed by design: a
     // newer Ship re-run of the eval gate still blocks automatic activation
@@ -1612,9 +1765,10 @@ fn automatic_live_attestation_blocker(
         || evidence.recall_gate_fixture_fingerprint != current_gate.fixture_fingerprint
         || evidence.recall_gate_evaluated_at != current_gate.evaluated_at
     {
-        return Some(
+        return Some((
+            RecallFusionScopeHealthCode::FingerprintMismatch,
             "current recall eval gate identity mismatched sealed policy evidence".to_string(),
-        );
+        ));
     }
     None
 }
@@ -1671,22 +1825,9 @@ fn recall_fusion_report_health(
         })
     {
         "static"
-    } else if scopes.iter().any(|scope| {
-        (!scope.active
-            && (scope.a12_generation.is_some()
-                || matches!(
-                    scope.sealed_basis,
-                    Some(
-                        ArsRecallFusionEvidenceBasis::SelfSupervised
-                            | ArsRecallFusionEvidenceBasis::Blended
-                    )
-                )))
-            || scope.reason.contains("mismatch")
-            || scope.reason.contains("stale")
-            || scope.reason.contains("expired")
-            || scope.reason.contains("not complete")
-            || scope.reason.contains("current recall eval gate")
-    }) {
+    } else if scopes.iter().any(|scope| scope.health_code.is_degraded()) {
+        // Keyed on the typed code, never on reason prose: a reworded resolver
+        // message must not be able to silently mute the degraded rollup.
         "degraded"
     } else if active {
         "healthy"
@@ -2115,6 +2256,80 @@ mod tests {
         assert!(!json.contains("/Users/"));
         assert!(!json.contains("docs/eval-baselines"));
         assert!(!json.contains("target/eval-gates"));
+    }
+
+    /// P3-2: an ACTIVE Blended scope that is currently serving only its
+    /// sealed human fallback (automatic candidate expired) must classify as
+    /// degraded `HumanFallback`, never healthy.
+    #[test]
+    fn active_sealed_human_fallback_for_blocked_blended_candidate_is_degraded() {
+        let config = runtime_config();
+        let mut adaptive = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        adaptive.learned_shadow_fusion.insert(
+            "global".to_string(),
+            human_entry([0.20, 0.25, 0.20, 0.15, 0.10, 0.10], 12),
+        );
+        let mut a12 = a12_loaded(
+            A12CalibrationScope::Global,
+            [0.10, 0.20, 0.30, 0.15, 0.15, 0.10],
+            12,
+            12,
+            A12CalibrationVerdict::Ship,
+        );
+        a12.state
+            .scopes
+            .get_mut("global")
+            .unwrap()
+            .valid_until_exclusive = Some(1_700_000_061_000);
+        let mut evidence = resolve_recall_fusion_evidence(
+            &adaptive,
+            &a12,
+            10,
+            0.02,
+            1_700_000_060_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let sealed = evidence.get_mut("recall_fusion:global").unwrap();
+        assert_eq!(sealed.basis, ArsRecallFusionEvidenceBasis::Blended);
+        // The production sealer records the human fallback adoption; mirror it.
+        sealed.human_runtime_adoption_weight = Some(0.25);
+        let policy = loaded_policy(canary_policy(
+            adaptive.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.40)]),
+            evidence,
+        ));
+        let run = recall_fusion_calibration_run_attestation(&a12);
+
+        let report = recall_fusion_activation_report(
+            &config,
+            &adaptive,
+            &policy,
+            &a12,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_061_000,
+        );
+
+        let scope = &report.scopes[0];
+        assert!(report.active);
+        assert!(scope.active, "{}", scope.reason);
+        assert_eq!(scope.basis, ArsRecallFusionEvidenceBasis::Human);
+        assert_eq!(
+            scope.sealed_basis,
+            Some(ArsRecallFusionEvidenceBasis::Blended)
+        );
+        assert_eq!(
+            scope.health_code,
+            RecallFusionScopeHealthCode::HumanFallback
+        );
+        assert_eq!(report.activation_status, "active");
+        assert_eq!(report.health_status, "degraded");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["scopes"][0]["health_code"], "human_fallback");
     }
 
     #[test]

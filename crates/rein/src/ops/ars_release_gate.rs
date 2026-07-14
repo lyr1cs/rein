@@ -399,15 +399,17 @@ pub fn evaluate_ars_acceleration_release_gate_with_a12(
     if !recall_self_supervised_runtime_allowed && eligible_learned_shadow_fusion_buckets == 0 {
         canary_blockers.push("insufficient_learned_shadow_fusion".to_string());
     }
-    // Scalar isolation deliberately does not fire when human recall runtime
-    // adoption is also allowed: with live human evidence the scalar scopes may
-    // legitimately be human-driven. Only when self-supervised recall fusion is
-    // the sole runtime basis must the scalars stay at zero, because automatic
-    // evidence may create `recall_fusion:*` adoption only.
-    if recall_self_supervised_runtime_allowed
-        && !recall_human_runtime_allowed
-        && scalar_runtime_allowed
-    {
+    // Scalar isolation deliberately does not fire when resolved human recall
+    // evidence also exists: with live human evidence the scalar scopes may
+    // legitimately be human-driven. The carve-out keys on the resolved
+    // evidence itself (`resolved_human_recall`), not on
+    // `recall_human_runtime_allowed`, because the latter is additionally
+    // gated on shadow-replay readiness — a genuine human+automatic blend with
+    // replay still warming up must not be misread as automatic-only. Only
+    // when self-supervised recall fusion is the sole evidence basis must the
+    // scalars stay at zero, because automatic evidence may create
+    // `recall_fusion:*` adoption only.
+    if recall_self_supervised_runtime_allowed && !resolved_human_recall && scalar_runtime_allowed {
         canary_blockers.push("automatic_recall_fusion_scalar_isolation".to_string());
     }
     if judge_drift_alert {

@@ -2970,9 +2970,11 @@ fn project_dedup_threshold_doctor_check(
     }
 }
 
-/// Format the shared A12 activation projection without reading scorecard
-/// paths or changing the active pointer/policy. Recovery is always an
-/// operator/producer action; doctor never repairs calibration evidence.
+/// Format the shared A12 activation projection. The projection reads the
+/// cwd-resolved recall scorecards (read-only) to attest the current eval
+/// gate; it never persists those paths and never changes the active pointer
+/// or policy. Recovery is always an operator/producer action; doctor never
+/// repairs calibration evidence.
 fn check_recall_fusion_calibration(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
@@ -2990,11 +2992,12 @@ fn check_recall_fusion_calibration(
             .iter()
             .map(|scope| {
                 format!(
-                    "{}[basis={:?} active={} adoption={:.3} human_ess={} train_ess={} \
+                    "{}[basis={:?} code={:?} active={} adoption={:.3} human_ess={} train_ess={} \
                      holdout_ess={} verdict={:?} gate={:?} generation={:?} revision={:?} \
                      valid_now={} calibrated_at={:?} evaluated_at={:?} valid_until={:?} reason={}]",
                     scope.scope,
                     scope.basis,
+                    scope.health_code,
                     scope.active,
                     scope.adoption_weight,
                     scope.human_ess,
@@ -3031,6 +3034,11 @@ fn check_recall_fusion_calibration(
         report.reason,
         scope_summary,
     );
+    // Keyed on typed codes, never on reason prose. Benign absence — fresh
+    // install, disabled/shadow-only config, or a policy without recall-fusion
+    // evidence — reports Ok like the sibling ars_parameter_policy and dedup
+    // observability checks; only corrupt-class loads, Bail/NoData verdicts,
+    // and genuinely degraded scopes warrant operator attention.
     let unhealthy_scope = report.scopes.iter().any(|scope| {
         matches!(
             scope.verdict,
@@ -3038,16 +3046,17 @@ fn check_recall_fusion_calibration(
                 crate::store::a12_calibration::A12CalibrationVerdict::Bail
                     | crate::store::a12_calibration::A12CalibrationVerdict::NoData
             )
-        ) || (scope.a12_generation.is_some() && !scope.valid_now)
-            || scope.reason.contains("mismatch")
-            || scope.reason.contains("stale")
-            || scope.reason.contains("expired")
+        ) || scope.health_code.is_degraded()
     });
-    let attention = !report.active
-        || report.a12_load_status == "corrupt"
-        || report.a12_load_status == "unsupported_schema"
-        || report.a12_load_status == "storage_error"
-        || unhealthy_scope;
+    let unhealthy_load =
+        |status: &str| matches!(status, "corrupt" | "unsupported_schema" | "storage_error");
+    let attention = unhealthy_scope
+        || unhealthy_load(&report.a12_load_status)
+        || unhealthy_load(&report.policy_load_status)
+        || matches!(
+            report.health_status.as_str(),
+            "bail" | "no_data" | "degraded"
+        );
     if !attention {
         return ok_in(
             DoctorCategory::Configuration,
@@ -3070,7 +3079,7 @@ fn check_recall_fusion_calibration(
             "Preserve the policy/A12 evidence for diagnosis, restore the producer or storage invariant, then seal a new immutable revision. This check never deletes or repairs calibration rows."
         }
         _ => {
-            "Refresh the stale, expired, or fingerprint-mismatched A12 generation and seal a matching policy revision. This check reports evidence only and performs no repair."
+            "Refresh the stale, expired, fingerprint-mismatched, or tampered A12 generation and seal a matching policy revision. A scope serving only its sealed human fallback recovers the same way: recalibrate so the automatic candidate is current again. This check reports evidence only and performs no repair."
         }
     };
     let mut check = warn_in(
@@ -4903,7 +4912,11 @@ provider = "inherit"
             .unwrap();
 
         assert_eq!(check.name, "recall_fusion_calibration");
-        assert_eq!(check.status, CheckStatus::Warn);
+        // Benign absence (fresh store, no policy row) is Ok like the sibling
+        // ars_parameter_policy / dedup observability checks — the summary
+        // still carries the full projection for operators.
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(shared.health_status, "policy_missing");
         assert!(!check.fixable);
         assert!(check
             .message
@@ -4917,6 +4930,21 @@ provider = "inherit"
         );
         assert_eq!(before, after, "doctor check must not mutate metadata");
         assert!(!check.message.contains("/Users/"));
+    }
+
+    /// P1-1: disabled or shadow-only configuration is a benign state, not a
+    /// permanently degraded doctor report.
+    #[test]
+    fn recall_fusion_doctor_reports_ok_when_activation_is_disabled_by_config() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.shadow_only = true;
+
+        let check = check_recall_fusion_calibration(&store, &config);
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("activation_status=disabled"));
+        assert!(check.repair_hint.is_none());
     }
 
     #[test]
@@ -4954,6 +4982,206 @@ provider = "inherit"
             .as_deref()
             .unwrap_or_default()
             .contains("--fix"));
+    }
+
+    /// P2-1: a fail-closed tampered scope must raise doctor attention even
+    /// when another scope is active and its reason prose carries none of the
+    /// old stale/expired/mismatch keywords — attention keys on the typed
+    /// health code, not on reason strings.
+    #[test]
+    fn recall_fusion_doctor_flags_tampered_scope_despite_another_active_scope() {
+        use crate::store::a12_calibration::{
+            A12CalibrationPhase, A12CalibrationRunMetadata, A12CalibrationScope,
+            A12CalibrationState, A12CalibrationVerdict, A12FusionSimplex, A12PairedTop3Stats,
+            A12ProvenanceCounts, A12ScopeEntry, A12_CALIBRATION_SCHEMA_VERSION,
+        };
+        use crate::store::adaptive::{AdaptiveState, LearnedShadowFusionEntry};
+
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.min_samples_alpha = 10;
+
+        let human_entry = |sample_count: usize| LearnedShadowFusionEntry {
+            weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                bm25: 0.20,
+                vec: 0.25,
+                kg: 0.20,
+                episode: 0.15,
+                support: 0.10,
+                diversity: 0.10,
+            },
+            sample_count,
+            last_updated: "2026-07-14T00:00:00Z".to_string(),
+        };
+        let mut adaptive = AdaptiveState {
+            version: 9,
+            ..AdaptiveState::default()
+        };
+        adaptive
+            .learned_shadow_fusion
+            .insert("global".to_string(), human_entry(12));
+        adaptive
+            .learned_shadow_fusion
+            .insert("semantic".to_string(), human_entry(12));
+
+        let mcnemar = crate::eval::mcnemar::mcnemar_from_counts(12, 0, 0, 0).unwrap();
+        let entry = A12ScopeEntry {
+            scope: A12CalibrationScope::Global,
+            canonical_generation: 2,
+            generation_fingerprint: "generation-fingerprint".to_string(),
+            source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+            snapshot_cutoff: 1_700_000_000,
+            corpus_fingerprint: "corpus-fingerprint".to_string(),
+            // Below the eligibility floor so the seal records a Human basis
+            // with an automatic candidate boundary.
+            train_family_ess: 5,
+            train_case_count: 5,
+            holdout_family_ess: 12,
+            simplex: A12FusionSimplex {
+                bm25: 0.10,
+                vector: 0.20,
+                kg: 0.30,
+                episode: 0.15,
+                support: 0.15,
+                diversity: 0.10,
+            },
+            verdict: A12CalibrationVerdict::Ship,
+            noise_floor: 0.02,
+            paired_top3: A12PairedTop3Stats {
+                n: u64::from(mcnemar.n),
+                both_hit: u64::from(mcnemar.a),
+                baseline_only: u64::from(mcnemar.b),
+                treatment_only: u64::from(mcnemar.c),
+                neither_hit: u64::from(mcnemar.d),
+                chi_squared: mcnemar.chi_squared,
+                p_value: mcnemar.p_value,
+                diff_point: mcnemar.diff_point,
+                ci_lower: mcnemar.ci_lower,
+                ci_upper: mcnemar.ci_upper,
+                used_exact: mcnemar.used_exact,
+            },
+            provenance: A12ProvenanceCounts {
+                canonical_loo: 5,
+                concept_loo: 0,
+                episode_loo: 0,
+            },
+            training_fingerprint: "training-fingerprint".to_string(),
+            holdout_fingerprint: "holdout-fingerprint".to_string(),
+            optimizer_fingerprint: "optimizer-fingerprint".to_string(),
+            evaluation_fingerprint: "evaluation-fingerprint".to_string(),
+            holdout_reason: "holdout evaluated".to_string(),
+            calibrated_at: 1_700_000_000,
+            evaluated_at: 1_700_000_050,
+            valid_until_exclusive: None,
+            cluster_generation: None,
+            invalidation: None,
+        };
+        let a12_state = A12CalibrationState {
+            schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+            revision: 3,
+            generation: 2,
+            generation_fingerprint: "generation-fingerprint".to_string(),
+            snapshot_cutoff: 1_700_000_000,
+            corpus_fingerprint: "corpus-fingerprint".to_string(),
+            cluster_generation: 4,
+            scopes: std::collections::BTreeMap::from([("global".to_string(), entry)]),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_050,
+            run: Some(A12CalibrationRunMetadata {
+                phase: A12CalibrationPhase::Complete,
+                source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
+                behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
+            }),
+        };
+        assert!(
+            crate::store::a12_calibration::compare_and_swap_a12_calibration(
+                store.conn(),
+                &a12_state,
+                0
+            )
+            .unwrap()
+        );
+        let a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
+        assert_eq!(
+            a12.status,
+            crate::store::a12_calibration::A12CalibrationLoadStatus::Loaded
+        );
+
+        // Seal policy evidence against the untampered live human state.
+        let gate = crate::ops::a12_activation::RecallEvalGateAttestation {
+            status: crate::store::ars_parameter_policy::ArsRecallGateStatus::Ship,
+            reason_code: crate::ops::a12_activation::RecallEvalGateReasonCode::Compared,
+            build_fingerprint: Some(env!("REIN_BUILD_FINGERPRINT").to_string()),
+            fixture_fingerprint: Some("recall-fixtures".to_string()),
+            evaluated_at: Some(1_700_000_100),
+            reason: "paired recall gate shipped".to_string(),
+        };
+        let mut evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence(
+            &adaptive,
+            &a12,
+            10,
+            0.02,
+            1_700_000_060_000,
+            &gate,
+        );
+        let sealed_global = evidence.get_mut("recall_fusion:global").unwrap();
+        assert_eq!(
+            sealed_global.basis,
+            crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Human
+        );
+        assert!(sealed_global.automatic_candidate_present);
+        sealed_global.human_runtime_adoption_weight = Some(0.25);
+        let policy = crate::store::ars_parameter_policy::ArsParameterPolicy {
+            schema_version: crate::store::ars_parameter_policy::ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            revision: 1,
+            mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            disabled_reason: None,
+            source_adaptive_version: 9,
+            runtime_adoption_weight: 0.0,
+            adoption_weights: std::collections::HashMap::from([
+                ("recall_fusion:global".to_string(), 0.40),
+                ("recall_fusion:semantic".to_string(), 0.40),
+            ]),
+            recall_fusion_evidence: evidence.into_iter().collect(),
+            last_event_id: 0,
+            last_updated: "2026-07-14T00:00:00Z".to_string(),
+        };
+        assert!(
+            crate::store::ars_parameter_policy::save_parameter_policy_cas(store.conn(), &policy, 0)
+                .unwrap()
+        );
+
+        // Tamper: the live human entry behind the sealed `global` fallback
+        // changes after sealing. Its fail-closed reason ("live human fallback
+        // does not match sealed simplex or ESS") carries no legacy keyword.
+        adaptive
+            .learned_shadow_fusion
+            .get_mut("global")
+            .unwrap()
+            .sample_count = 13;
+        adaptive.save_snapshot(store.conn()).unwrap();
+
+        let report = crate::ops::a12_activation::collect_recall_fusion_activation_report(
+            &store,
+            &config,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let check = check_recall_fusion_calibration(&store, &config);
+
+        assert!(report.active, "the untampered human scope stays active");
+        let tampered = report
+            .scopes
+            .iter()
+            .find(|scope| scope.scope == "global")
+            .unwrap();
+        assert!(!tampered.active);
+        assert_eq!(
+            tampered.health_code,
+            crate::ops::a12_activation::RecallFusionScopeHealthCode::Tampered
+        );
+        assert_eq!(report.health_status, "degraded");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.repair_hint.is_some());
     }
 
     #[test]

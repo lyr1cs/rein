@@ -476,6 +476,38 @@ fn scalar_adoption_is_not_isolated_when_human_recall_runtime_is_also_allowed() {
     assert!(report.canary.allowed, "{:?}", report.canary.blockers);
 }
 
+/// P3-1: the isolation carve-out keys on resolved human evidence, not on
+/// `recall_human_runtime_allowed`. A genuine human+automatic blend whose
+/// shadow replay is still warming up (human runtime NOT yet allowed) must not
+/// be misread as automatic-only and scalar-isolated.
+#[test]
+fn blended_human_evidence_with_replay_warming_up_is_not_scalar_isolated() {
+    let mut config = ReinConfig::default();
+    config.ars.acceleration.enabled = true;
+    config.ars.acceleration.shadow_only = false;
+    config.adaptive.min_samples_alpha = 10;
+    let state = eligible_state(12);
+    let a12 = a12_global(12, 12, None);
+    let policy = auto_policy(&state, &a12, 0.25, 0.40, 1_700_000_060_000);
+    let shadow = serde_json::json!({ "status": "insufficient_samples" });
+
+    let report = evaluate_with_complete_a12(
+        input(&config, &state, &policy, &shadow),
+        &a12,
+        1_700_000_060_000,
+    );
+
+    assert!(!report.signals.recall_human_runtime_allowed);
+    assert!(report.signals.recall_self_supervised_runtime_allowed);
+    assert!(report.signals.scalar_runtime_adoption_weight > 0.0);
+    assert!(!report
+        .canary
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "automatic_recall_fusion_scalar_isolation"));
+    assert!(report.canary.allowed, "{:?}", report.canary.blockers);
+}
+
 #[test]
 fn nonrecall_scalar_scope_cannot_unlock_recall_canary() {
     let mut config = ReinConfig::default();
