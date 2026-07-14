@@ -227,6 +227,50 @@ pub enum A12ScopeInvalidationReason {
     Reclustered,
 }
 
+/// Family-level paired holdout cells for one label-provenance source.
+/// Derived diagnostics only: deterministic for a fixed holdout trace and
+/// deliberately excluded from every fingerprint/unchanged-skip identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A12ProvenanceHoldoutCells {
+    /// Families with at least one holdout view carrying this provenance.
+    pub family_count: u64,
+    pub both_hit: u64,
+    pub baseline_only: u64,
+    pub treatment_only: u64,
+    pub neither_hit: u64,
+}
+
+/// Per-provenance paired holdout cells for one scope, keyed by the same
+/// three label sources as [`A12ProvenanceCounts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A12ProvenanceHoldoutStats {
+    pub canonical_loo: A12ProvenanceHoldoutCells,
+    pub concept_loo: A12ProvenanceHoldoutCells,
+    pub episode_loo: A12ProvenanceHoldoutCells,
+}
+
+impl A12ProvenanceHoldoutStats {
+    fn cells(&self) -> [A12ProvenanceHoldoutCells; 3] {
+        [self.canonical_loo, self.concept_loo, self.episode_loo]
+    }
+
+    /// True iff two label-provenance sources pull the holdout in opposite
+    /// directions: one source has strictly more treatment-only families and
+    /// another strictly more baseline-only families. A strict majority in
+    /// either direction implies at least one discordant pair, so a single
+    /// disagreement in each direction already reports a conflict — raw
+    /// evidence only, no tunable rate threshold anywhere.
+    pub fn direction_conflict(&self) -> bool {
+        self.cells()
+            .iter()
+            .any(|cells| cells.treatment_only > cells.baseline_only)
+            && self
+                .cells()
+                .iter()
+                .any(|cells| cells.baseline_only > cells.treatment_only)
+    }
+}
+
 /// A cluster-scope tombstone. The calibrated weights and holdout statistics
 /// stay in the row for diagnostics, but runtime resolution must ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +309,10 @@ pub struct A12ScopeEntry {
     pub noise_floor: f64,
     pub paired_top3: A12PairedTop3Stats,
     pub provenance: A12ProvenanceCounts,
+    /// Per-provenance paired holdout cells. Derived diagnostics; absent on
+    /// rows sealed before this field existed, so it must stay optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_holdout: Option<A12ProvenanceHoldoutStats>,
     pub training_fingerprint: String,
     pub holdout_fingerprint: String,
     pub optimizer_fingerprint: String,
@@ -344,6 +392,20 @@ impl A12ScopeEntry {
                 "A12 holdout ESS {} does not match paired n {}",
                 self.holdout_family_ess, self.paired_top3.n
             ));
+        }
+        if let Some(stats) = self.provenance_holdout {
+            for cells in [stats.canonical_loo, stats.concept_loo, stats.episode_loo] {
+                let total = cells
+                    .both_hit
+                    .checked_add(cells.baseline_only)
+                    .and_then(|sum| sum.checked_add(cells.treatment_only))
+                    .and_then(|sum| sum.checked_add(cells.neither_hit));
+                if total != Some(cells.family_count) {
+                    return Err(
+                        "A12 provenance holdout cells do not sum to their family count".to_string(),
+                    );
+                }
+            }
         }
         if [
             self.training_fingerprint.as_str(),
@@ -1410,6 +1472,7 @@ mod tests {
                 concept_loo: 7,
                 episode_loo: 3,
             },
+            provenance_holdout: None,
             training_fingerprint: "train-fingerprint".to_string(),
             holdout_fingerprint: "holdout-fingerprint".to_string(),
             optimizer_fingerprint: "optimizer-v1".to_string(),
@@ -2079,5 +2142,88 @@ mod tests {
         stale_cluster.cluster_generation = Some(4);
 
         assert!(!stale_cluster.is_current_for(&state, A12_DEFAULT_NOISE_FLOOR));
+    }
+
+    fn provenance_cells(
+        family_count: u64,
+        both_hit: u64,
+        baseline_only: u64,
+        treatment_only: u64,
+        neither_hit: u64,
+    ) -> A12ProvenanceHoldoutCells {
+        A12ProvenanceHoldoutCells {
+            family_count,
+            both_hit,
+            baseline_only,
+            treatment_only,
+            neither_hit,
+        }
+    }
+
+    #[test]
+    fn provenance_direction_conflict_requires_opposite_discordant_signs() {
+        // Opposite net signs: canonical favors the treatment, concept the
+        // baseline. One discordant pair in each direction already conflicts.
+        let conflicting = A12ProvenanceHoldoutStats {
+            canonical_loo: provenance_cells(3, 1, 0, 2, 0),
+            concept_loo: provenance_cells(2, 0, 1, 0, 1),
+            episode_loo: A12ProvenanceHoldoutCells::default(),
+        };
+        assert!(conflicting.direction_conflict());
+
+        // Same net sign everywhere: no conflict.
+        let aligned = A12ProvenanceHoldoutStats {
+            canonical_loo: provenance_cells(3, 1, 0, 2, 0),
+            concept_loo: provenance_cells(2, 1, 0, 1, 0),
+            episode_loo: A12ProvenanceHoldoutCells::default(),
+        };
+        assert!(!aligned.direction_conflict());
+
+        // A source without discordant pairs contributes no direction.
+        let one_sided = A12ProvenanceHoldoutStats {
+            canonical_loo: provenance_cells(3, 1, 0, 2, 0),
+            concept_loo: provenance_cells(2, 1, 0, 0, 1),
+            episode_loo: A12ProvenanceHoldoutCells::default(),
+        };
+        assert!(!one_sided.direction_conflict());
+
+        // Balanced discordant pairs (baseline_only == treatment_only) have no
+        // net sign and therefore no direction.
+        let balanced = A12ProvenanceHoldoutStats {
+            canonical_loo: provenance_cells(3, 1, 1, 1, 0),
+            concept_loo: provenance_cells(2, 1, 0, 1, 0),
+            episode_loo: A12ProvenanceHoldoutCells::default(),
+        };
+        assert!(!balanced.direction_conflict());
+    }
+
+    #[test]
+    fn provenance_holdout_stats_round_trip_and_legacy_rows_load_none() {
+        let stats = A12ProvenanceHoldoutStats {
+            canonical_loo: provenance_cells(3, 1, 0, 2, 0),
+            concept_loo: provenance_cells(2, 0, 1, 0, 1),
+            episode_loo: A12ProvenanceHoldoutCells::default(),
+        };
+        let mut state = state(3, 1);
+        state.scopes.get_mut("global").unwrap().provenance_holdout = Some(stats);
+
+        let conn = conn();
+        assert!(compare_and_swap_a12_calibration(&conn, &state, 0).unwrap());
+        let loaded = load_a12_calibration(&conn);
+        assert_eq!(loaded.status, A12CalibrationLoadStatus::Loaded);
+        assert_eq!(
+            loaded.state.scopes["global"].provenance_holdout,
+            Some(stats)
+        );
+
+        // Rows sealed before this field existed carry no key and load None.
+        let mut legacy_json = serde_json::to_value(&state.scopes["global"]).unwrap();
+        assert!(legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance_holdout")
+            .is_some());
+        let legacy: A12ScopeEntry = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.provenance_holdout, None);
     }
 }

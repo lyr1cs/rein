@@ -1097,6 +1097,9 @@ pub(crate) struct A12ScopeCalibration {
     pub holdout_status: crate::eval::gates::ScorecardStatus,
     pub holdout_reason: String,
     pub provenance: A12ProvenanceCounts,
+    /// Per-provenance paired holdout cells (present whenever a learned
+    /// simplex existed to evaluate). Derived diagnostics only.
+    pub provenance_holdout: Option<crate::store::a12_calibration::A12ProvenanceHoldoutStats>,
     /// Minimum next production-semantics boundary across every train/holdout
     /// case in this scope, expressed as Unix milliseconds.
     pub valid_until_exclusive: Option<i64>,
@@ -1312,6 +1315,8 @@ pub(crate) fn train_and_evaluate_a12_traces(
 
         let provenance = provenance_by_scope.get(&scope).copied().unwrap_or_default();
         let valid_until_exclusive = valid_until_by_scope.get(&scope).copied();
+        let provenance_holdout =
+            learned_weights.map(|weights| provenance_holdout_for_scope(holdout_families, weights));
         calibrations.push(A12ScopeCalibration {
             scope,
             learned_weights,
@@ -1323,6 +1328,7 @@ pub(crate) fn train_and_evaluate_a12_traces(
             holdout_status,
             holdout_reason,
             provenance,
+            provenance_holdout,
             valid_until_exclusive,
             snapshot_fingerprint: context.snapshot_fingerprint.clone(),
             corpus_fingerprint: context.corpus_fingerprint.clone(),
@@ -1335,6 +1341,55 @@ pub(crate) fn train_and_evaluate_a12_traces(
     }
 
     calibrations
+}
+
+/// Aggregate family-level paired holdout cells per label-provenance source.
+///
+/// A view is attributed to every provenance path it carries — a case whose
+/// positive is independently supported by both canonical and episode paths
+/// counts toward each source — and the family majority outcome is recomputed
+/// over exactly the views carrying that provenance BEFORE the per-family cell
+/// increments. A family therefore contributes at most one cell per provenance
+/// regardless of its view count, mirroring the family-ESS-one rule of the
+/// overall paired table.
+fn provenance_holdout_for_scope(
+    holdout_families: Option<&BTreeMap<String, Vec<&A12CaseRecallTrace>>>,
+    weights: crate::search::alpha_optimizer::ShadowFusionWeights,
+) -> crate::store::a12_calibration::A12ProvenanceHoldoutStats {
+    fn aggregate(
+        holdout_families: Option<&BTreeMap<String, Vec<&A12CaseRecallTrace>>>,
+        weights: crate::search::alpha_optimizer::ShadowFusionWeights,
+        carries_provenance: fn(&A12ProvenanceCounts) -> bool,
+    ) -> crate::store::a12_calibration::A12ProvenanceHoldoutCells {
+        let mut cells = crate::store::a12_calibration::A12ProvenanceHoldoutCells::default();
+        for (family_id, cases) in holdout_families.into_iter().flatten() {
+            let supported = cases
+                .iter()
+                .copied()
+                .filter(|case| carries_provenance(&case.provenance))
+                .collect::<Vec<_>>();
+            if supported.is_empty() {
+                continue;
+            }
+            let Some(outcome) = family_top3_outcome(family_id, &supported, weights) else {
+                continue;
+            };
+            cells.family_count += 1;
+            match (outcome.baseline_hit, outcome.treatment_hit) {
+                (true, true) => cells.both_hit += 1,
+                (true, false) => cells.baseline_only += 1,
+                (false, true) => cells.treatment_only += 1,
+                (false, false) => cells.neither_hit += 1,
+            }
+        }
+        cells
+    }
+
+    crate::store::a12_calibration::A12ProvenanceHoldoutStats {
+        canonical_loo: aggregate(holdout_families, weights, |counts| counts.canonical_loo > 0),
+        concept_loo: aggregate(holdout_families, weights, |counts| counts.concept_loo > 0),
+        episode_loo: aggregate(holdout_families, weights, |counts| counts.episode_loo > 0),
+    }
 }
 
 fn a12_scope_keys(case: &A12CaseRecallTrace) -> Vec<String> {
@@ -2523,6 +2578,88 @@ mod tests {
         assert_eq!(calibration.paired_top3.baseline_only, 0);
         assert_eq!(calibration.paired_top3.treatment_only, 10);
         assert_eq!(calibration.mcnemar.n, 10);
+    }
+
+    #[test]
+    fn provenance_holdout_aggregates_paired_cells_per_source_and_flags_conflict() {
+        use crate::store::a12_calibration::A12ProvenanceHoldoutCells;
+
+        let mut families = optimizer_families("kg-train", A12Fold::Training, 10, "kg", false);
+        // H1: canonical-only view; learned kg weights hit where legacy missed.
+        let mut h1 = optimizer_family(
+            id_for_fold("holdout-canonical", A12Fold::ActivationHoldout),
+            "kg",
+            false,
+        );
+        h1.cases[0].provenance = A12ProvenanceCounts {
+            canonical_loo: 1,
+            ..Default::default()
+        };
+        // H2: concept-only view; legacy hit while the kg weights miss the
+        // bm25-flagged target — the opposite discordant direction.
+        let mut h2 = optimizer_family(
+            id_for_fold("holdout-concept", A12Fold::ActivationHoldout),
+            "bm25",
+            true,
+        );
+        h2.cases[0].provenance = A12ProvenanceCounts {
+            concept_loo: 1,
+            ..Default::default()
+        };
+        // H3: one view independently supported by BOTH canonical and episode
+        // paths; the view is attributed to each provenance it carries.
+        let mut h3 = optimizer_family(
+            id_for_fold("holdout-mixed", A12Fold::ActivationHoldout),
+            "kg",
+            false,
+        );
+        h3.cases[0].provenance = A12ProvenanceCounts {
+            canonical_loo: 1,
+            episode_loo: 1,
+            ..Default::default()
+        };
+        families.extend([h1, h2, h3]);
+
+        let calibration = global_calibration(&families, 1);
+
+        let stats = calibration
+            .provenance_holdout
+            .expect("learned weights imply provenance holdout stats");
+        assert_eq!(
+            stats.canonical_loo,
+            A12ProvenanceHoldoutCells {
+                family_count: 2,
+                both_hit: 0,
+                baseline_only: 0,
+                treatment_only: 2,
+                neither_hit: 0,
+            }
+        );
+        assert_eq!(
+            stats.concept_loo,
+            A12ProvenanceHoldoutCells {
+                family_count: 1,
+                both_hit: 0,
+                baseline_only: 1,
+                treatment_only: 0,
+                neither_hit: 0,
+            }
+        );
+        assert_eq!(
+            stats.episode_loo,
+            A12ProvenanceHoldoutCells {
+                family_count: 1,
+                both_hit: 0,
+                baseline_only: 0,
+                treatment_only: 1,
+                neither_hit: 0,
+            }
+        );
+        assert!(stats.direction_conflict());
+        // The overall paired table stays family-level and provenance-agnostic.
+        assert_eq!(calibration.paired_top3.treatment_only, 2);
+        assert_eq!(calibration.paired_top3.baseline_only, 1);
+        assert_eq!(calibration.holdout_family_ess, 3);
     }
 
     #[test]

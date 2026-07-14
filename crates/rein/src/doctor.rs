@@ -5065,6 +5065,7 @@ provider = "inherit"
                 concept_loo: 0,
                 episode_loo: 0,
             },
+            provenance_holdout: None,
             training_fingerprint: "training-fingerprint".to_string(),
             holdout_fingerprint: "holdout-fingerprint".to_string(),
             optimizer_fingerprint: "optimizer-fingerprint".to_string(),

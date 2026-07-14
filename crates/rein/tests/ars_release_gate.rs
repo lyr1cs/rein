@@ -165,6 +165,7 @@ fn a12_global(train_ess: u64, holdout_ess: u64, valid_until: Option<i64>) -> A12
             concept_loo: 0,
             episode_loo: 0,
         },
+        provenance_holdout: None,
         training_fingerprint: "training-fingerprint".to_string(),
         holdout_fingerprint: "holdout-fingerprint".to_string(),
         optimizer_fingerprint: "optimizer-fingerprint".to_string(),

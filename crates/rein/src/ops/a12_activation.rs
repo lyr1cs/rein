@@ -1254,7 +1254,10 @@ fn runtime_disabled(
     }
 }
 
-pub const RECALL_FUSION_ACTIVATION_REPORT_SCHEMA_VERSION: u32 = 1;
+/// Version 2 covers two additive extensions: the typed `health_code` scope
+/// classification and the per-provenance holdout diagnostics
+/// (`provenance_holdout` + `provenance_direction_conflict`).
+pub const RECALL_FUSION_ACTIVATION_REPORT_SCHEMA_VERSION: u32 = 2;
 
 /// Task-5 run state projected without coupling consumers to the persisted A12
 /// schema. Legacy A12 rows have no run metadata and therefore never satisfy
@@ -1303,6 +1306,14 @@ pub struct RecallFusionActivationScopeReport {
     pub paired_top3: Option<crate::store::a12_calibration::A12PairedTop3Stats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<crate::store::a12_calibration::A12ProvenanceCounts>,
+    /// Per-provenance paired holdout cells sealed with the active A12 scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_holdout: Option<crate::store::a12_calibration::A12ProvenanceHoldoutStats>,
+    /// True when two label-provenance sources pull the holdout in opposite
+    /// discordant directions — the deterministic cue that a second-opinion
+    /// arbiter would become worthwhile. Derived from the raw paired cells;
+    /// no numeric threshold anywhere.
+    pub provenance_direction_conflict: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a12_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1653,6 +1664,10 @@ fn recall_fusion_activation_scope_report(
             .or_else(|| evidence.and_then(|value| value.a12_verdict)),
         paired_top3: entry.map(|value| value.paired_top3),
         provenance: entry.map(|value| value.provenance),
+        provenance_holdout: entry.and_then(|value| value.provenance_holdout),
+        provenance_direction_conflict: entry
+            .and_then(|value| value.provenance_holdout)
+            .is_some_and(|stats| stats.direction_conflict()),
         a12_generation: evidence
             .and_then(|value| value.a12_generation)
             .or_else(|| entry.map(|_| active_a12.state.generation)),
@@ -2061,6 +2076,7 @@ mod tests {
                 concept_loo: 0,
                 episode_loo: 0,
             },
+            provenance_holdout: None,
             training_fingerprint: "training-fingerprint".to_string(),
             holdout_fingerprint: "holdout-fingerprint".to_string(),
             optimizer_fingerprint: "optimizer-fingerprint".to_string(),
@@ -2199,6 +2215,94 @@ mod tests {
             Some(env!("REIN_BUILD_FINGERPRINT"))
         );
         assert!(scope.valid_now);
+        // Rows without provenance diagnostics render without the optional
+        // field and never report a conflict.
+        assert_eq!(scope.provenance_holdout, None);
+        assert!(!scope.provenance_direction_conflict);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert!(json["scopes"][0].get("provenance_holdout").is_none());
+        assert_eq!(json["scopes"][0]["provenance_direction_conflict"], false);
+    }
+
+    #[test]
+    fn activation_report_projects_provenance_disagreement_diagnostics() {
+        use crate::store::a12_calibration::{A12ProvenanceHoldoutCells, A12ProvenanceHoldoutStats};
+
+        let config = runtime_config();
+        let adaptive = AdaptiveState {
+            version: 7,
+            ..AdaptiveState::default()
+        };
+        let mut a12 = a12_loaded(
+            A12CalibrationScope::Global,
+            [0.10, 0.20, 0.30, 0.15, 0.15, 0.10],
+            12,
+            12,
+            A12CalibrationVerdict::Ship,
+        );
+        let stats = A12ProvenanceHoldoutStats {
+            canonical_loo: A12ProvenanceHoldoutCells {
+                family_count: 8,
+                both_hit: 5,
+                baseline_only: 0,
+                treatment_only: 3,
+                neither_hit: 0,
+            },
+            concept_loo: A12ProvenanceHoldoutCells {
+                family_count: 4,
+                both_hit: 2,
+                baseline_only: 1,
+                treatment_only: 0,
+                neither_hit: 1,
+            },
+            episode_loo: A12ProvenanceHoldoutCells::default(),
+        };
+        a12.state
+            .scopes
+            .get_mut("global")
+            .unwrap()
+            .provenance_holdout = Some(stats);
+        let evidence = resolve_recall_fusion_evidence(
+            &adaptive,
+            &a12,
+            10,
+            0.02,
+            1_700_000_060_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let policy = loaded_policy(canary_policy(
+            adaptive.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.25)]),
+            evidence,
+        ));
+        let run = recall_fusion_calibration_run_attestation(&a12);
+
+        let report = recall_fusion_activation_report(
+            &config,
+            &adaptive,
+            &policy,
+            &a12,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_060_000,
+        );
+
+        assert_eq!(report.schema_version, 2);
+        let scope = &report.scopes[0];
+        assert_eq!(scope.provenance_holdout, Some(stats));
+        assert!(scope.provenance_direction_conflict);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["scopes"][0]["provenance_holdout"]["canonical_loo"]["treatment_only"],
+            3
+        );
+        assert_eq!(
+            json["scopes"][0]["provenance_holdout"]["concept_loo"]["baseline_only"],
+            1
+        );
+        assert_eq!(json["scopes"][0]["provenance_direction_conflict"], true);
     }
 
     #[test]

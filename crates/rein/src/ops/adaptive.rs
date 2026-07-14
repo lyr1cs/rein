@@ -233,6 +233,7 @@ fn map_a12_scope_calibration(
                     "episode provenance count",
                 )?,
             },
+            provenance_holdout: calibration.provenance_holdout,
             training_fingerprint: calibration.training_fingerprint.clone(),
             holdout_fingerprint: calibration.holdout_fingerprint.clone(),
             optimizer_fingerprint: calibration.optimizer_fingerprint.clone(),
@@ -392,6 +393,38 @@ where
             inputs.source_snapshot_fingerprint
         )));
     }
+
+    // Once per calibration run: surface the structural-signal agreement so an
+    // operator can see when the label sources start disagreeing about
+    // direction — the deterministic cue that a second-opinion arbiter would
+    // become worthwhile. Raw cells only; no thresholds.
+    let provenance_summary = batch
+        .scopes
+        .iter()
+        .map(|calibration| {
+            let stats = calibration.provenance_holdout.unwrap_or_default();
+            format!(
+                "{}[canonical(fam={} base={} treat={}) concept(fam={} base={} treat={}) \
+                 episode(fam={} base={} treat={}) conflict={}]",
+                calibration.scope,
+                stats.canonical_loo.family_count,
+                stats.canonical_loo.baseline_only,
+                stats.canonical_loo.treatment_only,
+                stats.concept_loo.family_count,
+                stats.concept_loo.baseline_only,
+                stats.concept_loo.treatment_only,
+                stats.episode_loo.family_count,
+                stats.episode_loo.baseline_only,
+                stats.episode_loo.treatment_only,
+                stats.direction_conflict(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::info!(
+        provenance_summary = %provenance_summary,
+        "A12 per-provenance holdout agreement for this calibration run"
+    );
 
     let final_generation = pending
         .generation
@@ -5059,6 +5092,17 @@ mod tests {
                 concept_loo: 5,
                 episode_loo: 2,
             },
+            provenance_holdout: Some(crate::store::a12_calibration::A12ProvenanceHoldoutStats {
+                canonical_loo: crate::store::a12_calibration::A12ProvenanceHoldoutCells {
+                    family_count: 20,
+                    both_hit: 14,
+                    baseline_only: 0,
+                    treatment_only: 4,
+                    neither_hit: 2,
+                },
+                concept_loo: crate::store::a12_calibration::A12ProvenanceHoldoutCells::default(),
+                episode_loo: crate::store::a12_calibration::A12ProvenanceHoldoutCells::default(),
+            }),
             valid_until_exclusive,
             snapshot_fingerprint: "snapshot-fingerprint".to_string(),
             corpus_fingerprint: "corpus-fingerprint".to_string(),
@@ -5538,6 +5582,7 @@ mod tests {
                 concept_loo: 0,
                 episode_loo: 0,
             },
+            provenance_holdout: None,
             training_fingerprint: "training-fingerprint".to_string(),
             holdout_fingerprint: "holdout-fingerprint".to_string(),
             optimizer_fingerprint: "optimizer-fingerprint".to_string(),
